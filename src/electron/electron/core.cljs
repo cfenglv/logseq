@@ -390,72 +390,99 @@
            (-> (.default devtoolsInstaller (.-REACT_DEVELOPER_TOOLS devtoolsInstaller))
                (.then #(js/console.log "Added Extension:" (.-REACT_DEVELOPER_TOOLS devtoolsInstaller)))))
 
-         (let [t0 (setup-interceptor! app')
-               ^js win (win/create-main-window!)
-               _ (reset! *win win)]
+         (-> (-> (utils/<restore-proxy-settings)
+                 (p/timeout 15000))
+             (p/catch (fn [e]
+                        (logger/error :restore-proxy-settings-failed e)
+                        (let [choice (.showMessageBoxSync
+                                      dialog
+                                      (clj->js
+                                       {:type "error"
+                                        :title (t :settings.advanced/network-proxy)
+                                        :message (t :settings.advanced/network-proxy)
+                                        :detail (str e)
+                                        :buttons [(t :ui/cancel) (t :plugin.proxy/direct)]
+                                        :defaultId 0
+                                        :cancelId 0}))]
+                          (if (= 1 choice)
+                            ;; Direct mode is only activated after explicit user
+                            ;; consent, and is persisted so UI and runtime agree.
+                            (-> (p/do!
+                                 (utils/<set-proxy {:type "direct"})
+                                 (utils/save-proxy-settings {:type "direct"}))
+                                (p/catch (fn [fallback-error]
+                                           (logger/error :restore-proxy-direct-fallback-failed
+                                                         fallback-error)
+                                           (.quit app')
+                                           (p/rejected fallback-error))))
+                            (do
+                              (.quit app')
+                              (p/rejected e))))))
+             (p/then
+              (fn [_]
+                (let [t0 (setup-interceptor! app')
+                      ^js win (win/create-main-window!)
+                      _ (reset! *win win)]
+                  (js-utils/disableXFrameOptions win)
 
-           (utils/<restore-proxy-settings)
+                  (db/ensure-graphs-dir!)
+                  (install-cli-launcher!)
 
-           (js-utils/disableXFrameOptions win)
+                  ;; Windows/Linux: handle deeplink URL passed on first launch via argv
+                  (handle-initial-deeplink! win)
+                  (maybe-warn-wrong-release!)
 
-           (db/ensure-graphs-dir!)
-           (install-cli-launcher!)
+                  (vreset! *setup-fn
+                           (fn []
+                             (let [t1 (setup-updater! win)
+                                   t2 (setup-app-manager! win)
+                                   t3 (handler/set-ipc-handler! win)
+                                   t4 (server/setup! win)
+                                   t5 (when (cfgs/semantic-search-enabled?)
+                                        (embedding-server/setup! app'))
+                                   tt (exceptions/setup-exception-listeners!)]
 
-           ;; Windows/Linux: handle deeplink URL passed on first launch via argv
-           (handle-initial-deeplink! win)
-           (maybe-warn-wrong-release!)
+                               (vreset! *teardown-fn
+                                        #(-> (handler/stop-all-db-workers!)
+                                             (p/finally
+                                               (fn []
+                                                 (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
+                                                   (and f (f))))))))))
 
-           (vreset! *setup-fn
-                    (fn []
-                      (let [t1 (setup-updater! win)
-                            t2 (setup-app-manager! win)
-                            t3 (handler/set-ipc-handler! win)
-                            t4 (server/setup! win)
-                            t5 (when (cfgs/semantic-search-enabled?)
-                                 (embedding-server/setup! app'))
-                            tt (exceptions/setup-exception-listeners!)]
+                  ;; setup effects
+                  (@*setup-fn)
 
-                        (vreset! *teardown-fn
-                                 #(-> (handler/stop-all-db-workers!)
-                                      (p/finally
-                                        (fn []
-                                          (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
-                                            (and f (f))))))))))
+                  ;; main window events
+                  (.on win "close" (fn [e]
+                                     (when @*quit-dirty? ;; when not updating
+                                       (.preventDefault e)
 
-           ;; setup effects
-           (@*setup-fn)
+                                       (let [windows (win/get-all-windows)
+                                             window @*win
+                                             multiple-windows? (> (count windows) 1)]
+                                         (cond
+                                           (or multiple-windows? (not mac?) @win/*quitting?)
+                                           (when window
+                                             (win/close-handler win e)
+                                             (reset! *win nil))
 
-           ;; main window events
-           (.on win "close" (fn [e]
-                              (when @*quit-dirty? ;; when not updating
-                                (.preventDefault e)
+                                           (and mac? (not multiple-windows?))
+                                               ;; Just hiding - don't do any actual closing operation
+                                           (do (.preventDefault ^js/Event e)
+                                               (if (and mac? (.isFullScreen win))
+                                                 (do (.once win "leave-full-screen" #(.hide win))
+                                                     (.setFullScreen win false))
+                                                 (.hide win)))
+                                           :else
+                                           nil)))))
+                  (.on app' "before-quit" (fn [_e]
+                                            (reset! win/*quitting? true)
+                                            (-> (handler/stop-all-db-workers!)
+                                                (p/finally
+                                                  (fn []
+                                                    (embedding-server/stop!))))))
 
-                                (let [windows (win/get-all-windows)
-                                      window @*win
-                                      multiple-windows? (> (count windows) 1)]
-                                  (cond
-                                    (or multiple-windows? (not mac?) @win/*quitting?)
-                                    (when window
-                                      (win/close-handler win e)
-                                      (reset! *win nil))
-
-                                    (and mac? (not multiple-windows?))
-                                        ;; Just hiding - don't do any actual closing operation
-                                    (do (.preventDefault ^js/Event e)
-                                        (if (and mac? (.isFullScreen win))
-                                          (do (.once win "leave-full-screen" #(.hide win))
-                                              (.setFullScreen win false))
-                                          (.hide win)))
-                                    :else
-                                    nil)))))
-           (.on app' "before-quit" (fn [_e]
-                                     (reset! win/*quitting? true)
-                                     (-> (handler/stop-all-db-workers!)
-                                         (p/finally
-                                           (fn []
-                                             (embedding-server/stop!))))))
-
-           (.on app' "activate" #(when @*win (.show win)))))))
+                  (.on app' "activate" #(when @*win (.show win))))))))))
 
 (defn main []
   (if-not (.requestSingleInstanceLock app)

@@ -371,7 +371,8 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: ./static
 
-      - name: Build/Release Electron app
+      - name: Build/Release signed Electron app
+        if: ${{ github.repository == 'logseq/logseq' }}
         shell: pwsh
         run: |
           $signCfg = @'
@@ -395,6 +396,11 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build/Release unsigned Electron app for forks
+        if: ${{ github.repository != 'logseq/logseq' }}
+        run: pnpm exec electron-builder --publish never
+        working-directory: ./static
 
       - name: Save Artifact
         run: |
@@ -445,7 +451,8 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: ./static
 
-      - name: Build/Release Electron app
+      - name: Build/Release signed Electron app
+        if: ${{ github.repository == 'logseq/logseq' }}
         shell: pwsh
         run: |
           $signCfg = @'
@@ -469,6 +476,11 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build/Release unsigned Electron app for forks
+        if: ${{ github.repository != 'logseq/logseq' }}
+        run: pnpm exec electron-builder --win nsis zip --arm64 --publish never
+        working-directory: ./static
 
       - name: Save Artifact
         run: |

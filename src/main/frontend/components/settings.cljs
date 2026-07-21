@@ -1253,15 +1253,17 @@
    (settings-rtc-members)])
 
 (hsx/defc forgot-password
-  [token refresh-token user-uuid]
+  [user-uuid]
   (let [[new-password set-new-password!] (hooks/use-state "")
         [force-reset-status set-force-reset-status!] (hooks/use-state nil)
         <force-reset-password-fn
         (fn []
-          (-> (p/do!
+          (-> (p/let [fresh-auth (rtc-handler/<sync-auth-state-to-db-worker!)
+                       fresh-token (:auth/id-token fresh-auth)
+                       fresh-refresh-token (:auth/refresh-token fresh-auth)]
                (set-force-reset-status! (t :encryption/force-resetting-password))
                (state/<invoke-db-worker :thread-api/reset-user-rsa-key-pair
-                                        token refresh-token user-uuid new-password)
+                                        fresh-token fresh-refresh-token user-uuid new-password)
                (set-force-reset-status! (t :encryption/force-reset-password-successfully)))
               (p/catch (fn [e]
                          (log/error :forgot-password e)
@@ -1285,11 +1287,11 @@
                                          set-current-password!
                                          reset-password-status
                                          on-click forgot? set-forgot!
-                                         token refresh-token user-uuid]}]
+                                         user-uuid]}]
   (let [[reset? set-reset!] (hooks/use-state false)]
     (cond
       forgot?
-      (forgot-password token refresh-token user-uuid)
+      (forgot-password user-uuid)
       reset?
       [:div.flex.flex-col.gap-4
        [:label.opacity-70 {:for "current-password"} (t :encryption/current-password)]
@@ -1324,21 +1326,53 @@
         [current-password set-current-password!] (hooks/use-state nil)
         [new-password set-new-password!] (hooks/use-state nil)
         [reset-password-status set-reset-password-status!] (hooks/use-state nil)
-        [forgot? set-forgot!] (hooks/use-state false)]
+        [forgot? set-forgot!] (hooks/use-state false)
+        [encryption-user-uuid set-encryption-user-uuid!] (hooks/use-state nil)]
     [:div.panel-wrap.is-encryption.mb-8
      (hooks/use-effect!
       (fn []
-        (when (and user-uuid token)
-          (-> (p/let [r (state/<invoke-db-worker :thread-api/get-user-rsa-key-pair token user-uuid)]
-                (set-rsa-key-pair! r))
-              (p/catch set-get-key-err!))
-          (-> (p/let [{:keys [password]} (state/<invoke-db-worker :thread-api/get-e2ee-password refresh-token)]
-                (set-current-password! password))
-              (p/catch (fn [_] (set-current-password! ""))))))
-      [user-uuid token])
+        ;; This component remains mounted across account changes. Reset all
+        ;; account-scoped plaintext and key state before rendering the new user.
+        (set-encryption-user-uuid! user-uuid)
+        (set-rsa-key-pair! :not-inited)
+        (set-init-key-err! nil)
+        (set-get-key-err! nil)
+        (set-current-password! nil)
+        (set-new-password! nil)
+        (set-reset-password-status! nil)
+        (set-forgot! false))
+      [user-uuid])
+     (hooks/use-effect!
+      (fn []
+        (let [active? (volatile! true)]
+          (when (and user-uuid token)
+            (set-get-key-err! nil)
+            (let [auth-synced (rtc-handler/<sync-auth-state-to-db-worker!)]
+              (-> (p/let [fresh-auth auth-synced
+                          fresh-token (:auth/id-token fresh-auth)
+                          r (state/<invoke-db-worker :thread-api/get-user-rsa-key-pair fresh-token user-uuid)]
+                    (when @active?
+                      (set-rsa-key-pair! r)))
+                  (p/catch (fn [e]
+                             (when @active?
+                               (set-get-key-err! e)))))
+              (-> (p/let [fresh-auth auth-synced
+                          fresh-refresh-token (:auth/refresh-token fresh-auth)
+                          {:keys [password]} (state/<invoke-db-worker :thread-api/get-e2ee-password
+                                                                      fresh-refresh-token)]
+                    (when @active?
+                      (set-current-password! password)))
+                  (p/catch (fn [_]
+                             (when @active?
+                               (set-current-password! "")))))))
+          (fn []
+            (vreset! active? false))))
+      [user-uuid token refresh-token])
      [:div.flex.flex-col.gap-2.mt-4
       (when (and user-uuid token)
         (cond
+          (not= encryption-user-uuid user-uuid)
+          [:p (t :encryption/fetching-key-pair)]
           get-key-err
           [:p (t :encryption/fetch-key-pair-error get-key-err)]
           (= rsa-key-pair :not-inited)
@@ -1348,21 +1382,27 @@
            (when init-key-err [:p (t :encryption/init-key-pair-error init-key-err)])
            (shui/button
             {:on-click (fn []
-                         (-> (p/do!
+                         (-> (p/let [fresh-auth (rtc-handler/<sync-auth-state-to-db-worker!)
+                                     fresh-token (:auth/id-token fresh-auth)
+                                     fresh-refresh-token (:auth/refresh-token fresh-auth)]
                               (state/<invoke-db-worker :thread-api/init-user-rsa-key-pair
-                                                       token
-                                                       refresh-token
+                                                       fresh-token
+                                                       fresh-refresh-token
                                                        user-uuid)
-                              (p/let [r (state/<invoke-db-worker :thread-api/get-user-rsa-key-pair token user-uuid)]
+                              (p/let [r (state/<invoke-db-worker :thread-api/get-user-rsa-key-pair
+                                                                 fresh-token user-uuid)]
                                 (set-rsa-key-pair! r)))
                              (p/catch set-init-key-err!)))}
             (t :encryption/init-key-pair))]
           rsa-key-pair
           (let [on-submit (fn []
-                            (-> (p/do!
+                            (-> (p/let [fresh-auth (rtc-handler/<sync-auth-state-to-db-worker!)
+                                        fresh-token (:auth/id-token fresh-auth)
+                                        fresh-refresh-token (:auth/refresh-token fresh-auth)]
                                  (set-reset-password-status! (t :encryption/updating-password))
                                  (state/<invoke-db-worker :thread-api/change-e2ee-password
-                                                          token refresh-token user-uuid current-password new-password)
+                                                          fresh-token fresh-refresh-token user-uuid
+                                                          current-password new-password)
                                  (set-reset-password-status! (t :encryption/password-updated-successfully)))
                                 (p/catch (fn [e]
                                            (log/error :reset-password-failed e)
@@ -1378,10 +1418,8 @@
                                          :set-new-password! set-new-password!
                                          :set-current-password! set-current-password!
                                          :on-click on-submit
-                                         :token token
                                          :forgot? forgot?
                                          :set-forgot! set-forgot!
-                                         :refresh-token refresh-token
                                          :user-uuid user-uuid})])))]]))
 
 (hsx/defc mcp-server-row

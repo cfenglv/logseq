@@ -1793,6 +1793,28 @@
        (sync-app-state! new-state)
        (is (= new-state (select-keys @worker-state/*state [:git/current-repo :theme])))))))
 
+(deftest sync-app-state-auth-only-preserves-repo-and-config
+  (restoring-worker-state
+   (fn []
+     (let [sync-app-state! (get @thread-api/*thread-apis :thread-api/sync-app-state)]
+       (swap! worker-state/*state assoc
+              :git/current-repo test-repo
+              :config {:existing true})
+       (sync-app-state! {:auth/id-token "fresh-token"})
+       (is (= test-repo (:git/current-repo @worker-state/*state)))
+       (is (= {:existing true} (:config @worker-state/*state)))
+       (is (= "fresh-token" (:auth/id-token @worker-state/*state)))))))
+
+(deftest sync-app-state-nil-repo-does-not-clear-bound-repo
+  (restoring-worker-state
+   (fn []
+     (let [sync-app-state! (get @thread-api/*thread-apis :thread-api/sync-app-state)]
+       (swap! worker-state/*state assoc :git/current-repo test-repo)
+       (sync-app-state! {:git/current-repo nil
+                         :auth/id-token "fresh-token"})
+       (is (= test-repo (:git/current-repo @worker-state/*state)))
+       (is (= "fresh-token" (:auth/id-token @worker-state/*state)))))))
+
 ;; ---- get-block-parents thread-api test ----
 
 (deftest get-block-parents-returns-parents

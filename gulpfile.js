@@ -409,6 +409,11 @@ exports.electronMaker = async () => {
   runStaticScript('electron:make')
 }
 
+exports.electronMakerLocalSigned = async () => {
+  await prepareElectronMaker()
+  runStaticScript('electron:make-local-signed')
+}
+
 exports.electronMakerUnsigned = async () => {
   await prepareElectronMaker()
   runStaticScript('electron:make-unsigned')
