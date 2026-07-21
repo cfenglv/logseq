@@ -20,6 +20,14 @@ on:
         description: "Release Git Ref (Which branch or tag to build?)"
         required: true
         default: "master"
+      desktop-platforms:
+        description: "Desktop platforms to build"
+        type: choice
+        required: true
+        options:
+          - all
+          - windows-only
+        default: "all"
       is-draft:
         description: 'Draft Release? (Beta only, Nightly will always be a non-draft)'
         type: boolean
@@ -202,6 +210,7 @@ jobs:
         working-directory: ./static
 
       - name: Upload Sentry Sourcemaps (beta only)
+        if: ${{ github.repository == 'logseq/logseq' }}
         # if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'beta' }}
         run: |
           curl -sL https://sentry.io/get-cli/ | SENTRY_CLI_VERSION=2.58.4 bash
@@ -222,6 +231,7 @@ jobs:
           include-hidden-files: true
 
   build-linux-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
     steps:
@@ -279,6 +289,7 @@ jobs:
           path: builds
 
   build-linux-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
     steps:
@@ -497,6 +508,7 @@ jobs:
           path: builds
 
   build-macos-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-15-intel
     steps:
@@ -580,6 +592,7 @@ jobs:
           path: builds
 
   build-macos-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-14
     steps:
