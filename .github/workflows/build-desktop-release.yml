@@ -10,8 +10,7 @@ on:
         type: choice
         required: true
         options:
-          # NOTE: For now, we only have beta channel to be released on GitHub
-          # - stable
+          - stable
           - beta
           - nightly
           - non-release
