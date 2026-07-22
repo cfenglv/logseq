@@ -1,0 +1,10 @@
+extends: ./electron-builder.yml
+afterPack: ../scripts/electron-builder-local-signed-after-pack.cjs
+afterSign: ../scripts/electron-builder-adhoc-after-sign.cjs
+
+mac:
+  hardenedRuntime: false
+  entitlements: ../resources/entitlements.local-signed.plist
+  entitlementsInherit: ../resources/entitlements.local-signed.plist
+  signIgnore:
+    - "\\.pak$"

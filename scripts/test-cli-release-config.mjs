@@ -18,6 +18,9 @@ const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
 const desktopPackagingGulpfile = readText("gulpfile.js");
 const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const unsignedDesktopBuilder = readText("scripts/electron-builder-unsigned.mjs");
+const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
+const adhocAfterSign = readText("scripts/electron-builder-adhoc-after-sign.cjs");
 const verifyDesktopRuntimeRevisionsScript = readText(
   "scripts/verify-desktop-runtime-revisions.mjs",
 );
@@ -203,6 +206,41 @@ assert.match(
   desktopReleaseWorkflow,
   /xcrun stapler validate/,
   "desktop release workflow should verify stapled notarization tickets",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --x64/,
+  "fork desktop release workflow should build an unsigned macOS x64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --arm64/,
+  "fork desktop release workflow should build an unsigned macOS arm64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /ELECTRON_RUN_AS_NODE=1/,
+  "fork desktop release workflow should smoke-test the packaged Electron runtime",
+);
+assert.match(
+  unsignedDesktopBuilder,
+  /electron-builder\.unsigned\.yml/,
+  "unsigned desktop builds should use the ad-hoc signing configuration",
+);
+assert.match(
+  unsignedDesktopConfig,
+  /afterSign: \.\.\/scripts\/electron-builder-adhoc-after-sign\.cjs/,
+  "unsigned macOS builds should re-sign the completed application bundle",
+);
+assert.match(
+  adhocAfterSign,
+  /"--sign",\s+"-"/,
+  "the fork afterSign hook should use an ad-hoc identity",
+);
+assert.match(
+  adhocAfterSign,
+  /entitlements\.local-signed\.plist/,
+  "the fork afterSign hook should disable library validation",
 );
 
 const shadowCljs = readText("shadow-cljs.edn");

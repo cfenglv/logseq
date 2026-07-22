@@ -1,21 +1,21 @@
-## Self-hosted RTC fork / 自建实时协作版
+## Self-hosted RTC fork
 
-本分支在 Logseq DB 版基础上补齐了团队自建 RTC（实时同步与协作）所需的客户端、Cloudflare Worker 和桌面发布流程。它不是 Logseq 官方发行版，请先用测试图谱验证，并为重要图谱保留独立备份。
+This branch extends the Logseq DB version with the client, Cloudflare Worker, and desktop release changes needed to run RTC (real-time sync and collaboration) for a self-hosted team. It is not an official Logseq release. Test it with a non-critical graph first and keep independent backups of important graphs.
 
-与上游版本相比，本分支主要增加或修复：
+Compared with upstream Logseq, this fork adds or fixes:
 
-- 可在设置中填写团队自己的 Sync Server 基础 URL，并同时用于 HTTP 与 WebSocket 通信。
-- macOS、Windows 和 Linux 的系统代理兼容，包含 WebSocket 代理路径。
-- 睡眠、待机、网络切换后的心跳检测和自动重连；离线编辑仍然保留，恢复网络后继续同步。
-- 单笔事务被拒绝时不再阻塞整个发送队列，并修复共享图谱中 `created-by-ref` 缺失导致无法编辑的问题。
-- GitHub Actions 可生成 macOS Intel/Apple Silicon、Windows x64/ARM64 和 Linux 安装包。
-- Electron 42.4.1，减少 macOS Safe Storage 过早初始化引起的钥匙串提示。
+- A configurable Sync Server base URL used by both HTTP and WebSocket traffic.
+- System proxy support on macOS, Windows, and Linux, including proxied WebSocket connections.
+- Heartbeats and automatic reconnection after sleep, standby, and network changes. Offline edits remain local and resume syncing when connectivity returns.
+- Recovery from individual rejected transactions, plus a fix for missing `created-by-ref` user entities that could make a shared graph uneditable.
+- GitHub Actions builds for macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64.
+- Electron 42.4.1, including upstream Safe Storage initialization fixes that reduce unnecessary macOS Keychain prompts.
 
-客户端快速配置：打开 **Settings → Advanced → Sync Server URL**，填写 Worker 的基础地址，例如 `https://team-logseq-sync.example.workers.dev`，然后保存。不要填写 `/health`、`/sync/%s` 或其他路径。所有协作者必须使用同一个服务器地址。
+To configure a client, open **Settings → Advanced → Sync Server URL**, enter the Worker base URL (for example, `https://team-logseq-sync.example.workers.dev`), and save it. Do not append `/health`, `/sync/%s`, or another path. Every collaborator must use the same server URL.
 
-完整流程见 [自建 Logseq DB Sync / RTC 指南](docs/selfhost-sync.md)，本版本变更见 [2.0.2 发布说明](docs/releases/2.0.2.md)。发行包请从[本 fork 的 Releases](https://github.com/cfenglv/logseq/releases)下载。
+See the [self-hosted Logseq DB Sync / RTC guide](docs/selfhost-sync.md) for the full setup process and the [2.0.2 release notes](docs/releases/2.0.2.md) for this release. Installers are available from [this fork's Releases](https://github.com/cfenglv/logseq/releases).
 
-> 数据兼容说明：本 fork 保持 `Logseq` / `com.logseq.logseq` 应用身份，以便原地读取现有 Logseq 用户目录、设置和本地图谱。请勿同时运行官方版与本 fork；升级或切换版本前先退出 Logseq 并备份图谱。未经 Apple Developer ID 签名和公证的 macOS 包仍可能触发 Gatekeeper 警告。
+> Data compatibility: this fork intentionally keeps the `Logseq` product name and `com.logseq.logseq` application ID so it can continue using existing Logseq user data, settings, authentication state, and local graphs. Do not run official Logseq and this fork at the same time. Quit Logseq and back up your graphs before installing or switching builds. macOS packages that are not signed and notarized with an Apple Developer ID may still trigger Gatekeeper warnings.
 
 <!-- logo -->
 <p align="center">
