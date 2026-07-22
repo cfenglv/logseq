@@ -16,6 +16,11 @@ const readJson = (relativePath) =>
 
 const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
+const desktopPackagingGulpfile = readText("gulpfile.js");
+const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const verifyDesktopRuntimeRevisionsScript = readText(
+  "scripts/verify-desktop-runtime-revisions.mjs",
+);
 
 const zvecOptionalRuntimeDependencies = [
   "@zvec/bindings-darwin-arm64",
@@ -47,6 +52,39 @@ const assertRootScriptDoesNotBuildShadowCli = (scriptName, command) => {
     `${scriptName} should not build the old Shadow CLI`,
   );
 };
+
+assert.match(
+  rootPackage.scripts["desktop:verify-runtime-revisions"],
+  /verify-desktop-runtime-revisions\.mjs/,
+  "package.json should expose desktop runtime revision verification",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop packaging should reject inconsistent runtime revisions",
+);
+assert.match(
+  desktopPackagingWorkflow,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop release CI should reject inconsistent runtime revisions",
+);
+for (const relativePath of [
+  "static/electron.js",
+  "static/db-worker-node.js",
+  "static/logseq-cli.js",
+  "dist/db-worker-node.js",
+  "static/js/db-worker-node.js",
+  "static/js/logseq-cli.js",
+  "static/js/main.js",
+  "static/js/db-worker.js",
+  "static/js/publishing/main.js",
+]) {
+  assert.match(
+    verifyDesktopRuntimeRevisionsScript,
+    new RegExp(relativePath.replaceAll("/", "[\\\\/]")),
+    `runtime revision verification should cover ${relativePath}`,
+  );
+}
 
 const assertCliReleaseCommand = (command, label) => {
   assert.match(command, /pnpm --dir cli bundle/, `${label} should bundle cli/`);

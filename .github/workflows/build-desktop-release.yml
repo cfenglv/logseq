@@ -171,6 +171,7 @@ jobs:
           opam exec -- pnpm cli:release
           pnpm webpack-app-build
           pnpm desktop:prepare-runtime-js
+          pnpm desktop:verify-runtime-revisions
         env:
           LOGSEQ_SENTRY_DSN: ${{ secrets.LOGSEQ_SENTRY_DSN }}
           LOGSEQ_POSTHOG_TOKEN: ${{ secrets.LOGSEQ_POSTHOG_TOKEN }}
@@ -191,6 +192,7 @@ jobs:
           test -f ./static/js/db-worker-node.js
           test -f ./static/js/logseq-cli.js
           test -f ./static/.agents/skills/logseq-cli/SKILL.md
+          pnpm desktop:verify-runtime-revisions
 
       - name: Update APP Version
         run: |

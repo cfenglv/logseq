@@ -372,6 +372,9 @@ const prepareElectronMaker = async () => {
   cp.execSync('pnpm desktop:prepare-runtime-js', {
     stdio: 'inherit',
   })
+  cp.execSync('pnpm desktop:verify-runtime-revisions', {
+    stdio: 'inherit',
+  })
 
   const pkgPath = path.join(outputPath, 'package.json')
   const pkg = require(pkgPath)
