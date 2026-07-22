@@ -1755,9 +1755,11 @@
           raw-message (js/JSON.stringify
                        (clj->js {:type "tx/reject"
                                  :reason "db transact failed"
-                                 :t 3
+                                 :t 5
+                                 :error-detail "server transact exception"
                                  :success-tx-ids [(str success-tx-id)]
                                  :failed-tx-id (str failed-tx-id)}))
+          flush-calls (atom [])
           client {:repo test-repo
                   :graph-id "graph-1"
                   :inflight (atom [success-tx-id failed-tx-id untouched-tx-id])
@@ -1776,28 +1778,35 @@
             {:db-sync/tx-id untouched-tx-id
              :db-sync/created-at 3
              :db-sync/pending? true}])
-          (with-redefs [client-op/get-local-tx (constantly 0)]
-            (let [error (try
+          (client-op/update-local-tx test-repo 4)
+          (let [error (with-redefs [sync-apply/enqueue-flush-pending!
+                                    (fn [repo client]
+                                      (swap! flush-calls conj [repo client]))]
+                        (try
                           (with-silenced-console-error
                             #(sync-handle-message/handle-message! test-repo client raw-message))
                           nil
                           (catch :default e
-                            e))
-                  success-ent (client-op-tx-row client-ops-conn success-tx-id)
-                  failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
-                  untouched-ent (client-op-tx-row client-ops-conn untouched-tx-id)]
-              (is (some? error))
-              (is (= :db-sync/tx-rejected
-                     (:type (ex-data error))))
-              (is (= "db transact failed"
-                     (:reason (ex-data error))))
-              (is (= [] @(:inflight client)))
-              (is (= 0 (aget success-ent "pending")))
-              (is (not= 1 (aget success-ent "failed")))
-              (is (= 0 (aget failed-ent "pending")))
-              (is (= 1 (aget failed-ent "failed")))
-              (is (= 1 (aget untouched-ent "pending")))
-              (is (not= 1 (aget untouched-ent "failed"))))))))))
+                            e)))
+                success-ent (client-op-tx-row client-ops-conn success-tx-id)
+                failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
+                untouched-ent (client-op-tx-row client-ops-conn untouched-tx-id)]
+            (is (some? error))
+            (is (= :db-sync/tx-rejected
+                   (:type (ex-data error))))
+            (is (= "db transact failed"
+                   (:reason (ex-data error))))
+            (is (= "server transact exception"
+                   (:error-detail (ex-data error))))
+            (is (= 5 (client-op/get-local-tx test-repo)))
+            (is (= [[test-repo client]] @flush-calls))
+            (is (= [] @(:inflight client)))
+            (is (= 0 (aget success-ent "pending")))
+            (is (not= 1 (aget success-ent "failed")))
+            (is (= 0 (aget failed-ent "pending")))
+            (is (= 1 (aget failed-ent "failed")))
+            (is (= 1 (aget untouched-ent "pending")))
+            (is (not= 1 (aget untouched-ent "failed")))))))))
 
 (deftest tx-reject-missing-blocks-marks-failed-tx-failed-test
   (testing "tx/reject with missing block ids should fail the rejected tx"
