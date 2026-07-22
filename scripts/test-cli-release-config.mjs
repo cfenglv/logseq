@@ -214,8 +214,18 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
+  /Build\/Release Electron App for x64[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace[\s\S]*?pnpm rebuild:all/,
+  "macOS x64 dependencies should be installed outside the root workspace",
+);
+assert.match(
+  desktopReleaseWorkflow,
   /electron:make-unsigned --mac dmg zip --arm64/,
   "fork desktop release workflow should build an unsigned macOS arm64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Fetch deps[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace --config\.supportedArchitectures\.os=darwin --config\.supportedArchitectures\.cpu=arm64/,
+  "macOS arm64 dependencies should be installed outside the root workspace",
 );
 assert.match(
   desktopReleaseWorkflow,
