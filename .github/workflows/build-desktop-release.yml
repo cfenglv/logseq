@@ -513,6 +513,8 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-15-intel
+    env:
+      APPLE_CERTIFICATES_P12: ${{ secrets.APPLE_CERTIFICATES_P12 }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -557,10 +559,10 @@ jobs:
             ${{ runner.os }}-pnpm-
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
+          p12-file-base64: ${{ env.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
 
       # - name: Cache Node Modules
@@ -577,6 +579,15 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify Developer ID signature and notarization
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+          xcrun stapler validate "$app_path"
 
       - name: Save x64 artifacts
         run: |
@@ -597,6 +608,8 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-14
+    env:
+      APPLE_CERTIFICATES_P12: ${{ secrets.APPLE_CERTIFICATES_P12 }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -638,10 +651,10 @@ jobs:
           python-version: '3.11'
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
+          p12-file-base64: ${{ env.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
 
       # - name: Cache Node Modules
@@ -662,6 +675,15 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify Developer ID signature and notarization
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+          xcrun stapler validate "$app_path"
 
       - name: Save arm64 artifacts
         run: |

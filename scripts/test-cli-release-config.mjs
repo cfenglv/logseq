@@ -179,6 +179,31 @@ assertNotContains(
   "clojure -M:cljs release logseq-cli",
   "desktop release workflow",
 );
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /name: Signing By Apple Developer ID\s+if: \$\{\{ github\.repository == 'logseq\/logseq' \}\}/,
+  "desktop release workflow Apple signing should not exclude forks",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /APPLE_CERTIFICATES_P12: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 \}\}/,
+  "desktop release workflow should make fork-owned Apple signing secrets available",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /if: \$\{\{ env\.APPLE_CERTIFICATES_P12 != '' \}\}/,
+  "desktop release workflow should import Apple certificates when a fork configures them",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /spctl --assess --type execute/,
+  "desktop release workflow should verify notarized apps with Gatekeeper",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /xcrun stapler validate/,
+  "desktop release workflow should verify stapled notarization tickets",
+);
 
 const shadowCljs = readText("shadow-cljs.edn");
 assertNotContains(shadowCljs, ":logseq-cli", "shadow-cljs.edn");
