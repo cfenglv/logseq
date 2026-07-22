@@ -18,9 +18,9 @@ const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
 const desktopPackagingGulpfile = readText("gulpfile.js");
 const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
-const unsignedDesktopBuilder = readText("scripts/electron-builder-unsigned.mjs");
+const unsignedDesktopBuilder = readText("resources/electron-builder-unsigned.mjs");
 const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
-const adhocAfterSign = readText("scripts/electron-builder-adhoc-after-sign.cjs");
+const adhocAfterSign = readText("resources/electron-builder-adhoc-after-sign.cjs");
 const verifyDesktopRuntimeRevisionsScript = readText(
   "scripts/verify-desktop-runtime-revisions.mjs",
 );
@@ -55,6 +55,17 @@ const assertRootScriptDoesNotBuildShadowCli = (scriptName, command) => {
     `${scriptName} should not build the old Shadow CLI`,
   );
 };
+
+assert.equal(
+  desktopPackage.scripts["electron:make-unsigned"],
+  "node ./electron-builder-unsigned.mjs",
+  "the standalone desktop artifact should run its bundled unsigned builder",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /resourceFilePath = path\.join\(resourcesPath, '\*\*'\)/,
+  "desktop resource sync should include the bundled signing scripts",
+);
 
 assert.match(
   rootPackage.scripts["desktop:verify-runtime-revisions"],
@@ -239,7 +250,7 @@ assert.match(
 );
 assert.match(
   unsignedDesktopConfig,
-  /afterSign: \.\.\/scripts\/electron-builder-adhoc-after-sign\.cjs/,
+  /afterSign: \.\/electron-builder-adhoc-after-sign\.cjs/,
   "unsigned macOS builds should re-sign the completed application bundle",
 );
 assert.match(

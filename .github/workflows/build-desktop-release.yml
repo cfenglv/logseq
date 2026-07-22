@@ -518,11 +518,6 @@ jobs:
     env:
       APPLE_CERTIFICATES_P12: ${{ secrets.APPLE_CERTIFICATES_P12 }}
     steps:
-      - name: Check out Git repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.git-ref }}
-
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
         with:
@@ -635,11 +630,6 @@ jobs:
     env:
       APPLE_CERTIFICATES_P12: ${{ secrets.APPLE_CERTIFICATES_P12 }}
     steps:
-      - name: Check out Git repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.git-ref }}
-
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
         with:

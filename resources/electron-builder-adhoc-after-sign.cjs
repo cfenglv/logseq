@@ -23,7 +23,7 @@ module.exports = async ({ electronPlatformName, appOutDir, packager }) => {
   );
   const entitlements = path.resolve(
     __dirname,
-    "../resources/entitlements.local-signed.plist",
+    "entitlements.local-signed.plist",
   );
 
   // electron-builder can leave an ad-hoc outer signature around nested
