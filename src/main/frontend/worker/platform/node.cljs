@@ -559,10 +559,106 @@
       (-> (fs/rm full-path #js {:force true})
           (p/catch (constantly nil))))))
 
+(defn- proxy-env-value
+  [env keys]
+  (some (fn [key]
+          (let [value (gobj/get env key)]
+            (when (and (string? value) (not (string/blank? value)))
+              value)))
+        keys))
+
+(defn- url-default-port
+  [^js url]
+  (or (not-empty (.-port url))
+      (case (.-protocol url)
+        ("wss:" "https:") "443"
+        ("ws:" "http:") "80"
+        nil)))
+
+(defn- normalize-host
+  [host]
+  (let [host (string/lower-case (or host ""))]
+    (if (and (string/starts-with? host "[")
+             (string/ends-with? host "]"))
+      (subs host 1 (dec (count host)))
+      host)))
+
+(defn- parse-no-proxy-entry
+  [entry]
+  (let [entry (-> entry string/trim string/lower-case)
+        ipv6-match (re-matches #"^\[([^\]]+)\](?::(\d+))?$" entry)
+        host-port-match (re-matches #"^([^:]+?)(?::(\d+))?$" entry)
+        [_ host port] (or ipv6-match host-port-match)
+        host (some-> host
+                     (string/replace-first #"^\*\." "")
+                     (string/replace-first #"^\." ""))]
+    {:host host :port port :wildcard? (= entry "*")}))
+
+(defn- no-proxy-entry-matches?
+  [target-host target-port entry]
+  (let [{:keys [host port wildcard?]} (parse-no-proxy-entry entry)]
+    (and (or wildcard?
+             (and (seq host)
+                  (or (= target-host host)
+                      (string/ends-with? target-host (str "." host)))))
+         (or (nil? port) (= target-port port)))))
+
+(defn- bypass-websocket-proxy?
+  [^js target env]
+  (let [target-host (normalize-host (.-hostname target))
+        target-port (url-default-port target)
+        no-proxy (proxy-env-value env ["NO_PROXY" "no_proxy"])]
+    (and (string? no-proxy)
+         (some #(no-proxy-entry-matches? target-host target-port %)
+               (string/split no-proxy #",")))))
+
+(defn- websocket-proxy-url
+  [url env]
+  (try
+    (let [target (js/URL. url)
+          env-keys (case (.-protocol target)
+                     "wss:" ["HTTPS_PROXY" "https_proxy" "ALL_PROXY" "all_proxy"
+                              "HTTP_PROXY" "http_proxy"]
+                     "ws:" ["HTTP_PROXY" "http_proxy" "ALL_PROXY" "all_proxy"
+                             "HTTPS_PROXY" "https_proxy"]
+                     [])]
+      (when-not (bypass-websocket-proxy? target env)
+        (proxy-env-value env env-keys)))
+    (catch :default error
+      (log/warn :db-sync/ws-proxy-resolution-failed {:url url :error error})
+      nil)))
+
+(defn- build-websocket-proxy-agent
+  [proxy-url]
+  (try
+    (let [protocol (.-protocol (js/URL. proxy-url))]
+      (case protocol
+        ("http:" "https:")
+        (let [module (js/require "https-proxy-agent")]
+          (new (.-HttpsProxyAgent module) proxy-url))
+
+        ("socks:" "socks4:" "socks5:")
+        (let [module (js/require "socks-proxy-agent")]
+          (new (.-SocksProxyAgent module) proxy-url))
+
+        (do
+          (log/warn :db-sync/ws-proxy-unsupported {:protocol protocol})
+          nil)))
+    (catch :default error
+      (log/warn :db-sync/ws-proxy-agent-failed {:error error})
+      nil)))
+
 (defn- websocket-connect
   [url]
-  (let [WebSocket (js/require "ws")]
-    (new WebSocket url)))
+  (let [WebSocket (js/require "ws")
+        proxy-url (websocket-proxy-url url (.-env js/process))]
+    (if-let [agent (some-> proxy-url build-websocket-proxy-agent)]
+      (do
+        (log/info :db-sync/ws-proxy
+                  {:target-host (some-> (js/URL. url) .-hostname)
+                   :proxy-protocol (some-> (js/URL. proxy-url) .-protocol)})
+        (new WebSocket url #js {:agent agent}))
+      (new WebSocket url))))
 
 (def ^:private kv-transit-writer
   (transit/writer

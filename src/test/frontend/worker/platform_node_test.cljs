@@ -76,6 +76,37 @@
     (is (string/includes? source "\"node:sqlite\""))
     (is (not (string/includes? source "\"better-sqlite3\"")))))
 
+(deftest node-platform-websocket-proxy-env-resolution
+  (let [resolve-proxy #'platform-node/websocket-proxy-url]
+    (testing "wss prefers HTTPS_PROXY and supports lowercase fallback"
+      (is (= "http://127.0.0.1:7897"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                 "HTTP_PROXY" "http://127.0.0.1:7898"})))
+      (is (= "http://127.0.0.1:7899"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"https_proxy" "http://127.0.0.1:7899"}))))
+
+    (testing "ws prefers HTTP_PROXY and supports SOCKS through ALL_PROXY"
+      (is (= "http://127.0.0.1:7898"
+             (resolve-proxy "ws://team.example/sync/graph"
+                            #js {"HTTP_PROXY" "http://127.0.0.1:7898"})))
+      (is (= "socks5://127.0.0.1:1080"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"ALL_PROXY" "socks5://127.0.0.1:1080"}))))
+
+    (testing "NO_PROXY bypasses exact hosts, subdomains, ports, and wildcard"
+      (is (nil? (resolve-proxy "wss://team.example:8443/sync/graph"
+                               #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                    "NO_PROXY" "localhost,.example:8443"})))
+      (is (= "http://127.0.0.1:7897"
+             (resolve-proxy "wss://team.example:443/sync/graph"
+                            #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                 "NO_PROXY" ".example:8443"})))
+      (is (nil? (resolve-proxy "wss://anything.example/sync/graph"
+                               #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                    "NO_PROXY" "*"}))))))
+
 (deftest node-platform-loads-zvec-lazily
   (let [source (node-platform-source)]
     (is (not (string/includes? source "[\"@zvec/zvec\" :as zvec]")))
