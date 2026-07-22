@@ -179,8 +179,8 @@ export const setupLocalMacCodesign = () => {
     ]);
   }
 
-  run("security", ["set-keychain-settings", "-lut", "21600", keychainPath]);
   run("security", ["unlock-keychain", "-p", keychainPassword, keychainPath]);
+  run("security", ["set-keychain-settings", "-lut", "21600", keychainPath]);
 
   const certificateInstalled = spawnSync(
     "security",
