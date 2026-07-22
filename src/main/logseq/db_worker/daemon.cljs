@@ -276,7 +276,8 @@
                         (seq embedding-model-id) (conj "--embedding-model-id" embedding-model-id)))
         env (apply-proxy-env!
              (js/Object.assign #js {} (.-env js/process) #js {:ELECTRON_RUN_AS_NODE "1"
-                                                               :NODE_USE_ENV_PROXY "1"}))]
+                                                               :NODE_USE_ENV_PROXY "1"
+                                                               :NODE_USE_SYSTEM_CA "1"}))]
     (when (and (= :electron owner-source)
                (not (seq embedding-endpoint)))
       (js-delete env embedding-url-env))

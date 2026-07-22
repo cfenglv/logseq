@@ -11,6 +11,7 @@
             [electron.configs :as cfgs]
             [electron.interop :as interop]
             [electron.logger :as logger]
+            [electron.proxy :as electron-proxy]
             [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
             [logseq.common.graph-dir :as graph-dir]
@@ -324,57 +325,15 @@
            (p/timeout 10000))
        (p/resolved nil)))))
 
-(defn- parse-pac-rule
-  "Parse Proxy Auto Config(PAC) line"
-  [line]
-  (try
-    (let [[type address] (string/split (string/trim line) #"\s+" 2)]
-      (cond
-        (= type "DIRECT")
-        {:protocol "direct"}
-
-        (and (contains? #{"PROXY" "HTTP" "HTTPS" "SOCKS" "SOCKS4" "SOCKS5"} type)
-             (not (string/blank? address)))
-        (let [url (js/URL. (str "http://" address))]
-          {:protocol (cond
-                       (= type "HTTPS") "https"
-                       (= type "SOCKS4") "socks4"
-                       (contains? #{"SOCKS" "SOCKS5"} type) "socks5"
-                       :else "http")
-           :host (url-hostname url)
-           :port (.-port url)})
-
-        :else
-        (do
-          (logger/warn "Unknown PAC rule:" line)
-          nil)))
-    (catch :default e
-      (logger/warn "Invalid PAC rule:" line (.-message e))
-      nil)))
-
 (defn- <resolve-session-proxy
   [^js sess for-url]
-  (p/let [proxy (.resolveProxy sess for-url)
-          clauses (->> (string/split proxy #";")
-                       (map string/trim)
-                       (remove string/blank?)
-                       vec)
-          pac-opts (mapv parse-pac-rule clauses)]
-    (cond
-      (or (empty? pac-opts) (some nil? pac-opts))
-      (p/rejected (ex-info "system proxy returned no supported route"
-                           {:code :unsupported-system-proxy
-                            :result proxy
-                            :url for-url}))
-
-      (> (count pac-opts) 1)
-      (p/rejected (ex-info "system proxy fallback chains are not supported for db-worker"
-                           {:code :unsupported-system-proxy-chain
-                            :result proxy
-                            :url for-url}))
-
-      :else
-      (first pac-opts))))
+  (p/let [result (.resolveProxy sess for-url)]
+    (try
+      (electron-proxy/select-pac-route result)
+      (catch :default error
+        (p/rejected (ex-info (ex-message error)
+                             (assoc (ex-data error) :url for-url)
+                             error))))))
 
 (defn <get-system-proxy
   "Get system proxy for url, requires proxy to be set to system"

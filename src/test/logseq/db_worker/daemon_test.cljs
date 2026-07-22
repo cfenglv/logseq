@@ -45,6 +45,7 @@
       (is (= "1" (get-in @captured [:opts :env :LOGSEQ_DB_WORKER_NODE_STDIO_REDIRECTED_TO_LOG])))
       (is (= "1" (get-in @captured [:opts :env :ELECTRON_RUN_AS_NODE])))
       (is (= "1" (get-in @captured [:opts :env :NODE_USE_ENV_PROXY])))
+      (is (= "1" (get-in @captured [:opts :env :NODE_USE_SYSTEM_CA])))
       (is (= true @unref-called?))
       (finally
         (set! (.-spawn child-process) original-spawn)))))
@@ -91,6 +92,7 @@
       (doseq [key [:ALL_PROXY :all_proxy]]
         (is (nil? (get-in @captured [:env key]))))
       (is (= "1" (get-in @captured [:env :NODE_USE_ENV_PROXY])))
+      (is (= "1" (get-in @captured [:env :NODE_USE_SYSTEM_CA])))
       (finally
         (daemon/configure-proxy-env! :inherit)
         (set! (.-spawn child-process) original-spawn)))))
