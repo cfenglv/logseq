@@ -22,8 +22,8 @@
 (def ^:private reconnect-base-delay-ms 1000)
 (def ^:private reconnect-max-delay-ms 30000)
 (def ^:private reconnect-jitter-ms 250)
-(def ^:private ws-stale-kill-interval-ms 60000)
-(def ^:private ws-stale-timeout-ms 600000)
+(def ^:private ws-heartbeat-interval-ms 30000)
+(def ^:private ws-stale-timeout-ms 90000)
 (def fail-fast sync-util/fail-fast)
 
 (defonce *repo->latest-remote-tx sync-apply/*repo->latest-remote-tx)
@@ -148,6 +148,11 @@
   (when-let [*ts (:last-ws-message-ts client)]
     (reset! *ts (common-util/time-ms))))
 
+(defn- stale-connection?
+  [client]
+  (when-let [last-ts (some-> (:last-ws-message-ts client) deref)]
+    (>= (- (common-util/time-ms) last-ts) ws-stale-timeout-ms)))
+
 (defn- ready-state
   [ws]
   (sync-transport/ready-state ws))
@@ -206,7 +211,7 @@
    :online-users (atom [])
    :ws-state (atom :closed)})
 
-(declare connect!)
+(declare connect! detach-ws-handlers! start!)
 
 (defn- schedule-reconnect!
   [repo client url reason]
@@ -233,23 +238,34 @@
           (log/info :db-sync/ws-reconnect-scheduled
                     {:repo repo :delay delay :attempt attempt :reason reason}))))))
 
+(defn- invalidate-connection!
+  [repo client ws url reason close-ws?]
+  (clear-stale-ws-loop-timer! client)
+  (sync-apply/clear-upload-response-timeout! client)
+  (clear-inflight! client)
+  (update-online-users! client [])
+  (set-ws-state! client :closed)
+  (when ws
+    (detach-ws-handlers! ws)
+    (when close-ws?
+      (try (.close ws) (catch :default _ nil))))
+  (schedule-reconnect! repo client url reason))
+
 (defn- attach-ws-handlers!
   [repo client ws url]
   (set! (.-onmessage ws)
         (fn [event]
-          (touch-last-ws-message! client)
-          (enqueue-receive-message! client
-                                    (fn []
-                                      (sync-handle-message/handle-message! repo client (.-data event))))))
+          (when (identical? ws (:ws @worker-state/*db-sync-client))
+            (touch-last-ws-message! client)
+            (enqueue-receive-message! client
+                                      (fn []
+                                        (sync-handle-message/handle-message! repo client (.-data event)))))))
   (set! (.-onerror ws) (fn [error] (log/error :db-sync/ws-error error)))
   (set! (.-onclose ws)
         (fn [_]
-          (log/info :db-sync/ws-closed {:repo repo})
-          (clear-stale-ws-loop-timer! client)
-          (clear-inflight! client)
-          (update-online-users! client [])
-          (set-ws-state! client :closed)
-          (schedule-reconnect! repo client url :close))))
+          (when (identical? ws (:ws @worker-state/*db-sync-client))
+            (log/info :db-sync/ws-closed {:repo repo})
+            (invalidate-connection! repo client ws url :close false)))))
 
 (defn- detach-ws-handlers!
   [ws]
@@ -275,19 +291,22 @@
                            (let [now (common-util/time-ms)
                                  last-ts (or (some-> (:last-ws-message-ts current) deref) now)
                                  stale-ms (- now last-ts)]
-                             (when (>= stale-ms ws-stale-timeout-ms)
-                               (log/warn :db-sync/ws-stale-timeout {:repo repo :stale-ms stale-ms})
-                               (try (.close ws) (catch :default _ nil))))
+                             (if (>= stale-ms ws-stale-timeout-ms)
+                               (do
+                                 (log/warn :db-sync/ws-stale-timeout {:repo repo :stale-ms stale-ms})
+                                 (invalidate-connection! repo current ws url :heartbeat-timeout true))
+                               (try
+                                 (send! ws {:type "ping"})
+                                 (catch :default error
+                                   (log/warn :db-sync/ws-heartbeat-send-failed
+                                             {:repo repo :error error})
+                                   (invalidate-connection! repo current ws url :heartbeat-send-failed true)))))
 
                            (contains? #{2 3} (ready-state ws))
                            (do
                              (log/warn :db-sync/ws-stale-closed {:repo repo :ready-state (ready-state ws)})
-                             (clear-stale-ws-loop-timer! current)
-                             (clear-inflight! current)
-                             (update-online-users! current [])
-                             (set-ws-state! current :closed)
-                             (schedule-reconnect! repo current url :stale-closed))))))
-                   ws-stale-kill-interval-ms)]
+                             (invalidate-connection! repo current ws url :stale-closed false))))))
+                   ws-heartbeat-interval-ms)]
         (reset! *timer timer))))
   client)
 
@@ -308,7 +327,35 @@
   (when (and client (= repo (:repo client)) (= graph-id (:graph-id client)))
     (let [ws (:ws client)
           ws-ready-state (when ws (ready-state ws))]
-      (contains? #{0 1} ws-ready-state))))
+      (or (= 0 ws-ready-state)
+          (and (= 1 ws-ready-state)
+               (not (stale-connection? client)))))))
+
+(defn resume!
+  [repo]
+  (let [client @worker-state/*db-sync-client
+        graph-id (sync-util/get-graph-id repo)
+        reconnect (:reconnect client)
+        reconnect-scheduled? (some? (:timer (some-> reconnect deref)))]
+    (cond
+      (and client
+           (= repo (:repo client))
+           (= graph-id (:graph-id client))
+           reconnect-scheduled?)
+      (p/resolved nil)
+
+      (and client
+           (= repo (:repo client))
+           (= graph-id (:graph-id client)))
+      (let [base (ws-base-url)
+            url (sync-transport/format-ws-url base graph-id)]
+        (log/info :db-sync/resume-reconnect {:repo repo})
+        (reset-reconnect! client)
+        (invalidate-connection! repo client (:ws client) url :system-resume true)
+        (p/resolved nil))
+
+      :else
+      (start! repo))))
 
 (defn- connect!
   [repo client url token]

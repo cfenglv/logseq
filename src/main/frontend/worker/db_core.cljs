@@ -743,6 +743,14 @@
      (start-db! repo {:close-other-db? false})
      (db-sync/start! repo))))
 
+(def-thread-api :thread-api/db-sync-resume
+  [repo]
+  (if (db-sync-dbs-open? repo)
+    (db-sync/resume! repo)
+    (p/do!
+     (start-db! repo {:close-other-db? false})
+     (db-sync/start! repo))))
+
 (def-thread-api :thread-api/db-sync-stop
   []
   (db-sync/stop!))

@@ -403,6 +403,40 @@
                             (reset! state/*db-worker worker-prev)
                             (reset! state/state state-prev)))))))
 
+(deftest rtc-resume-syncs-auth-state-before-forcing-reconnect-test
+  (async done
+         (let [worker-prev @state/*db-worker
+               state-prev @state/state
+               calls (atom [])]
+           (reset! state/*db-worker :worker)
+           (reset! state/state (assoc state-prev
+                                      :git/current-repo "demo-graph"
+                                      :auth/id-token "id-token"
+                                      :auth/refresh-token "refresh-token"
+                                      :rtc/uploading? false
+                                      :rtc/loading-graphs? false))
+           (-> (p/with-redefs [user-handler/task--ensure-id&access-token
+                               (fn [resolve _reject] (resolve true))
+                               state/get-rtc-graphs
+                               (fn [] [{:url "demo-graph"
+                                        :graph-ready-for-use? true}])
+                               state/<invoke-db-worker
+                               (fn [& args]
+                                 (swap! calls conj args)
+                                 (p/resolved :ok))]
+                 (db-sync/<rtc-resume! "demo-graph"))
+               (p/then (fn [_]
+                         (is (= :thread-api/sync-app-state (ffirst @calls)))
+                         (is (= [:thread-api/db-sync-resume "demo-graph"]
+                                (second @calls)))
+                         (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))
+               (p/finally (fn []
+                            (reset! state/*db-worker worker-prev)
+                            (reset! state/state state-prev)))))))
+
 (deftest sync-auth-state-waits-for-worker-and-uses-refreshed-token-test
   (async done
          (let [state-prev @state/state

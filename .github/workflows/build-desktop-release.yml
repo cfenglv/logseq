@@ -52,7 +52,7 @@ on:
         description: 'Build Android App'
         type: boolean
         required: true
-        default: true
+        default: false
       publish-linux-stores:
         description: 'Publish Flathub and Snap'
         type: boolean
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check build options
-        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
+        if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
         run: |
           echo "::error title=CheckFail::Nightly, Beta and Stable Release MUST be built from master"
           exit 1
@@ -755,6 +755,7 @@ jobs:
           path: ./
 
       - name: Download Android Artifacts
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: logseq-android-builds
@@ -762,10 +763,17 @@ jobs:
 
       - name: Generate SHA256 checksums
         run: |
-          sha256sum *-darwin-* > SHA256SUMS.txt
-          sha256sum *-win-* >> SHA256SUMS.txt
-          sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          files=()
+          for pattern in '*-darwin-*' '*-win-*' '*-linux-*' '*.apk'; do
+            for file in $pattern; do
+              if [ -f "$file" ]; then files+=("$file"); fi
+            done
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No release files found" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: List files
@@ -800,6 +808,11 @@ jobs:
     outputs:
       version: ${{ steps.ref.outputs.version }}
     steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref }}
+
       - name: Download MacOS x64 Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -854,10 +867,17 @@ jobs:
 
       - name: Generate SHA256 checksums
         run: |
-          sha256sum *-darwin-* > SHA256SUMS.txt
-          sha256sum *-win-* >> SHA256SUMS.txt
-          sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          files=()
+          for pattern in '*-darwin-*' '*-win-*' '*-linux-*' '*.apk'; do
+            for file in $pattern; do
+              if [ -f "$file" ]; then files+=("$file"); fi
+            done
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No release files found" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create Release Draft
@@ -867,7 +887,7 @@ jobs:
         with:
           tag_name: ${{ steps.ref.outputs.version }}
           name: ${{ github.event.inputs.build-target == 'beta' && format('Desktop APP {0} (Beta Testing)', steps.ref.outputs.version) || format('Desktop APP {0}', steps.ref.outputs.version) }}
-          body: "TODO: Fill this changelog. Sorry for the inconvenience!"
+          body_path: docs/releases/${{ steps.ref.outputs.version }}.md
           draft: ${{ github.event.inputs.is-draft }}
           prerelease: ${{ github.event.inputs.is-pre-release }}
           files: |

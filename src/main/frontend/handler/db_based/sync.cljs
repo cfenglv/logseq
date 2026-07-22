@@ -231,6 +231,16 @@
                                        :has-local-rtc-id? (graph-has-local-rtc-id? repo)})
         (<rtc-stop!)))))
 
+(defn <rtc-resume!
+  [repo]
+  (p/let [_ (<wait-for-db-worker-ready!)]
+    (if (should-start-rtc? repo)
+      (do
+        (log/info :db-sync/system-resume {:repo repo})
+        (p/let [_ (<sync-auth-state-to-db-worker!)]
+          (state/<invoke-db-worker :thread-api/db-sync-resume repo)))
+      (p/resolved nil))))
+
 (defonce ^:private debounced-update-presence
   (util/debounce
    (fn [editing-block-uuid]

@@ -17,7 +17,8 @@
   - Upload a batch of txs based on `t-before` (required).
   - `tx-id` is optional but recommended for per-entry ack/reject mapping.
 - `{"type":"ping"}`
-  - Optional keepalive; server replies `pong`.
+  - Client keepalive, sent every 30 seconds while the connection is otherwise healthy.
+  - Cloudflare Durable Objects reply through `setWebSocketAutoResponse` without waking a hibernating object.
 
 ## Server -> Client
 - `{"type":"hello","t":<t>,"checksum":"<hex>"}`
@@ -42,7 +43,7 @@
 - `{"type":"tx/reject","reason":"empty tx data"|"invalid tx"|"invalid t-before"|"snapshot upload in progress"}`
   - Invalid batch.
 - `{"type":"pong"}`
-  - Keepalive response.
+  - Keepalive response. The client replaces the connection after 90 seconds without any server message.
 - `{"type":"error","message":"..."}`
   - Invalid/unknown message. Current messages: `"unknown type"`, `"invalid request"`, `"server error"`, `"invalid since"`.
 

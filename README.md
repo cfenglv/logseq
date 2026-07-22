@@ -1,3 +1,22 @@
+## Self-hosted RTC fork / 自建实时协作版
+
+本分支在 Logseq DB 版基础上补齐了团队自建 RTC（实时同步与协作）所需的客户端、Cloudflare Worker 和桌面发布流程。它不是 Logseq 官方发行版，请先用测试图谱验证，并为重要图谱保留独立备份。
+
+与上游版本相比，本分支主要增加或修复：
+
+- 可在设置中填写团队自己的 Sync Server 基础 URL，并同时用于 HTTP 与 WebSocket 通信。
+- macOS、Windows 和 Linux 的系统代理兼容，包含 WebSocket 代理路径。
+- 睡眠、待机、网络切换后的心跳检测和自动重连；离线编辑仍然保留，恢复网络后继续同步。
+- 单笔事务被拒绝时不再阻塞整个发送队列，并修复共享图谱中 `created-by-ref` 缺失导致无法编辑的问题。
+- GitHub Actions 可生成 macOS Intel/Apple Silicon、Windows x64/ARM64 和 Linux 安装包。
+- Electron 42.4.1，减少 macOS Safe Storage 过早初始化引起的钥匙串提示。
+
+客户端快速配置：打开 **Settings → Advanced → Sync Server URL**，填写 Worker 的基础地址，例如 `https://team-logseq-sync.example.workers.dev`，然后保存。不要填写 `/health`、`/sync/%s` 或其他路径。所有协作者必须使用同一个服务器地址。
+
+完整流程见 [自建 Logseq DB Sync / RTC 指南](docs/selfhost-sync.md)，本版本变更见 [2.0.2 发布说明](docs/releases/2.0.2.md)。发行包请从[本 fork 的 Releases](https://github.com/cfenglv/logseq/releases)下载。
+
+> 数据兼容说明：本 fork 保持 `Logseq` / `com.logseq.logseq` 应用身份，以便原地读取现有 Logseq 用户目录、设置和本地图谱。请勿同时运行官方版与本 fork；升级或切换版本前先退出 Logseq 并备份图谱。未经 Apple Developer ID 签名和公证的 macOS 包仍可能触发 Gatekeeper 警告。
+
 <!-- logo -->
 <p align="center">
     <a href="https://logseq.com" alt="Logseq Logo">

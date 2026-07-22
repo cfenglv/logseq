@@ -1,6 +1,6 @@
 (ns electron.core
   (:require ["/electron/utils" :as js-utils]
-            ["electron" :refer [BrowserWindow Menu app protocol ipcMain dialog shell] :as electron]
+            ["electron" :refer [BrowserWindow Menu app protocol ipcMain dialog shell powerMonitor] :as electron]
             ["fs-extra" :as fs]
 
             ["os" :as os]
@@ -15,6 +15,7 @@
             [electron.handler :as handler]
             [electron.i18n :as i18n :refer [t]]
             [electron.logger :as logger]
+            [electron.power-monitor :as power-monitor]
             [electron.release-warning :as release-warning]
             [electron.server :as server]
             [electron.updater :refer [init-updater] :as updater]
@@ -440,13 +441,16 @@
                                    t4 (server/setup! win)
                                    t5 (when (cfgs/semantic-search-enabled?)
                                         (embedding-server/setup! app'))
+                                   t6 (power-monitor/setup! powerMonitor
+                                                            win/get-all-windows
+                                                            send-to-renderer)
                                    tt (exceptions/setup-exception-listeners!)]
 
                                (vreset! *teardown-fn
                                         #(-> (handler/stop-all-db-workers!)
                                              (p/finally
                                                (fn []
-                                                 (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
+                                                 (doseq [f [t0 t1 t2 t3 t4 t5 t6 tt]]
                                                    (and f (f))))))))))
 
                   ;; setup effects

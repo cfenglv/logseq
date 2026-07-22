@@ -9,6 +9,7 @@
             [logseq.db-sync.node-server-test]
             [logseq.db-sync.normalize-test]
             [logseq.db-sync.platform-test]
+            [logseq.db-sync.protocol-test]
             [logseq.db-sync.storage-test]
             [logseq.db-sync.tx-sanitize-test]
             [logseq.db-sync.worker-auth-test]

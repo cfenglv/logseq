@@ -9,6 +9,7 @@
             [frontend.context.i18n :as i18n]
             [frontend.db :as db]
             [frontend.db.async :as db-async]
+            [frontend.handler.db-based.sync :as db-sync]
             [frontend.handler.notification :as notification]
             [frontend.handler.route :as route-handler]
             [frontend.handler.search :as search-handler]
@@ -16,6 +17,7 @@
             [frontend.handler.user :as user]
             [frontend.state :as state]
             [frontend.ui :as ui]
+            [lambdaisland.glogi :as log]
             [promesa.core :as p]))
 
 (defn- safe-api-call
@@ -50,6 +52,14 @@
                  (fn []
                    (when-let [graph (state/get-current-repo)]
                      (ipc/ipc :setCurrentGraph graph))))
+
+  (safe-api-call "power-resume"
+                 (fn [_data]
+                   (when-let [repo (state/get-current-repo)]
+                     (-> (db-sync/<rtc-resume! repo)
+                         (p/catch (fn [error]
+                                    (log/error :db-sync/system-resume-failed
+                                               {:repo repo :error error})))))))
 
   (safe-api-call "redirect"
                  (fn [data]

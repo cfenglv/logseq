@@ -2,6 +2,8 @@
   (:require [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
             [frontend.worker.pipeline :as worker-pipeline]
+            [frontend.worker.state :as worker-state]
+            [frontend.worker-common.util :as worker-util]
             [logseq.common.util :as common-util]
             [logseq.common.util.date-time :as date-time-util]
             [logseq.common.util.page-ref :as page-ref]
@@ -34,6 +36,24 @@
       (f)
       (finally
         (set! (.-write js/process.stderr) orig-write)))))
+
+(deftest metadata-only-transaction-does-not-create-current-user-test
+  (testing "non-persisted graph metadata must not create an unsyncable local user entity"
+    (let [conn (db-test/create-conn-with-blocks [])
+          user-uuid #uuid "11111111-1111-4111-8111-111111111111"]
+      (with-redefs [worker-state/get-id-token (constantly "token")
+                    worker-util/parse-jwt (constantly {:sub (str user-uuid)
+                                                       :cognito:username "cfenglv"
+                                                       :email "member@example.test"})]
+        (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+        (try
+          (ldb/transact! conn
+                         [(ldb/kv :logseq.kv/graph-uuid (random-uuid))
+                          (ldb/kv :logseq.kv/graph-remote? true)]
+                         {:persist-op? false})
+          (is (nil? (d/entity @conn [:block/uuid user-uuid])))
+          (finally
+            (ldb/register-transact-pipeline-fn! identity)))))))
 
 (deftest test-built-in-page-updates-that-should-be-reverted
   (let [conn (db-test/create-conn-with-blocks
