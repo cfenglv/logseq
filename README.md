@@ -20,6 +20,18 @@ See the [self-hosted Logseq DB Sync / RTC guide](docs/selfhost-sync.md) for the 
 
 > Data compatibility: this fork intentionally keeps the `Logseq` product name and `com.logseq.logseq` application ID so it can continue using existing Logseq user data, settings, authentication state, and local graphs. Do not run official Logseq and this fork at the same time. Quit Logseq and back up your graphs before installing or switching builds. macOS packages that are not signed and notarized with an Apple Developer ID may still trigger Gatekeeper warnings.
 
+### Release verification
+
+Desktop releases use a staged verification process so deterministic source, dependency, packaging, and asset errors are caught before a GitHub Release is created:
+
+1. Run `pnpm desktop:release-preflight:quick` for fast source, version, environment, workflow, and release-configuration checks. CI runs its strict mode and rejects a dirty tracked worktree.
+2. Run `pnpm desktop:release-preflight` before pushing to install from frozen lockfiles, execute the RTC and Electron test gates, build the production client, package the current host platform in an isolated `static/` dependency root, and verify the packaged executable and native modules. This full check expects the repository-local `cli/` opam switch to use OCaml 5.4.0, matching CI.
+3. Push the exact release commit to `selfhost/cloudflare-rtc`. GitHub Actions automatically rehearses all six desktop targets: macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64. Each job inspects the packaged application, its Electron version, and the architecture of its main executable and native `keytar` module.
+4. Start a manual beta or stable build only after that exact commit has a successful push rehearsal. The workflow enforces this by commit SHA.
+5. Before a draft is created, the workflow validates the exact installer/update-file set, updater metadata, sizes and SHA-512 digests, and writes a complete `SHA256SUMS.txt`.
+
+This process catches deterministic release failures before publication. External runner, package-registry, or CDN outages can still cause transient CI failures and should be retried only after the logs confirm that the failure is external.
+
 <!-- logo -->
 <p align="center">
     <a href="https://logseq.com" alt="Logseq Logo">

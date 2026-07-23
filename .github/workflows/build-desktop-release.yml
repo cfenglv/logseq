@@ -1,8 +1,12 @@
 # This is the main desktop application release workflow for both nightly and beta/stable releases.
 
 name: Build-Desktop-Release
+run-name: ${{ github.event_name == 'push' && format('Desktop release rehearsal · {0}', github.sha) || 'Build-Desktop-Release' }}
 
 on:
+  push:
+    branches:
+      - selfhost/cloudflare-rtc
   workflow_dispatch:
     inputs:
       build-target:
@@ -69,15 +73,94 @@ env:
 permissions:
   contents: read
 
+concurrency:
+  group: desktop-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
 jobs:
+  source-preflight:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Run deterministic release preflight
+        run: pnpm desktop:release-preflight:quick -- --strict
+
+  release-rehearsal-gate:
+    needs: [ source-preflight ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out requested release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve requested commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify successful push rehearsal
+        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = '${{ steps.source.outputs.sha }}';
+            const response = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'build-desktop-release.yml',
+              event: 'push',
+              status: 'success',
+              head_sha: sha,
+              per_page: 10,
+            });
+            if (response.data.workflow_runs.length === 0) {
+              core.setFailed(
+                `No successful six-platform push rehearsal exists for ${sha}. ` +
+                `Push this exact commit and wait for Build-Desktop-Release to pass before publishing.`,
+              );
+            }
+
   rtc-release-gate:
+    needs: [ source-preflight, release-rehearsal-gate ]
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - name: Check out Git repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref }}
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
           persist-credentials: false
 
       - name: Install Node.js
@@ -156,7 +239,7 @@ jobs:
       - name: Check out Git repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref }}
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
           persist-credentials: false
 
       - name: Install Node.js
@@ -232,12 +315,10 @@ jobs:
         run: |
           sed -i 's/defonce version ".*"/defonce version "${{ steps.ref.outputs.version }}"/g' src/main/frontend/version.cljs
 
-      - name: Set Build Environment Variables (only when workflow_dispatch)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        # if scheduled, use default settings
+      - name: Set build environment variables
         run: |
-          echo "ENABLE_PLUGINS=${{ github.event_name == 'schedule' || github.event.inputs.enable-plugins == 'true' }}" >> $GITHUB_ENV
-          echo "ENABLE_FILE_SYNC_PRODUCTION=${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}" >> $GITHUB_ENV
+          echo "ENABLE_PLUGINS=${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event.inputs.enable-plugins == 'true' }}" >> $GITHUB_ENV
+          echo "ENABLE_FILE_SYNC_PRODUCTION=${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}" >> $GITHUB_ENV
 
       - name: Compile CLJS
         run: |
@@ -349,6 +430,10 @@ jobs:
         run: pnpm install --frozen-lockfile && pnpm electron:make
         working-directory: ./static
 
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform linux --arch x64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
+
       - name: Save artifacts
         run: |
           mkdir -p builds
@@ -406,6 +491,10 @@ jobs:
 
       - name: Build/Release Electron App
         run: pnpm electron:make-linux-arm64
+        working-directory: ./static
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform linux --arch arm64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
       - name: Save artifacts
@@ -494,6 +583,10 @@ jobs:
         run: pnpm exec electron-builder --publish never
         working-directory: ./static
 
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform win32 --arch x64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
+
       - name: Save Artifact
         run: |
           mkdir builds
@@ -572,6 +665,10 @@ jobs:
       - name: Build/Release unsigned Electron app for forks
         if: ${{ github.repository != 'logseq/logseq' }}
         run: pnpm exec electron-builder --win nsis zip --arm64 --publish never
+        working-directory: ./static
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform win32 --arch arm64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
       - name: Save Artifact
@@ -665,6 +762,10 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch x64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
 
       - name: Verify fork macOS app can load Electron
         if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
@@ -777,6 +878,10 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch arm64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
+
       - name: Verify fork macOS app can load Electron
         if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
         run: |
@@ -831,6 +936,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out release verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
       - name: Download MacOS x64 Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -874,19 +985,12 @@ jobs:
           name: logseq-android-builds
           path: ./
 
-      - name: Generate SHA256 checksums
+      - name: Verify desktop release assets
         run: |
-          files=()
-          for pattern in '*-darwin-*' '*-win-*' '*-linux-*' '*.apk'; do
-            for file in $pattern; do
-              if [ -f "$file" ]; then files+=("$file"); fi
-            done
-          done
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No release files found" >&2
-            exit 1
-          fi
-          sha256sum "${files[@]}" > SHA256SUMS.txt
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir . \
+            --version "$(cat VERSION)" \
+            --write-checksums
           cat SHA256SUMS.txt
 
       - name: List files
@@ -926,7 +1030,7 @@ jobs:
       - name: Check out release notes
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref }}
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
           persist-credentials: false
 
       - name: Download MacOS x64 Artifacts
@@ -981,19 +1085,14 @@ jobs:
           pkgver=$(cat VERSION)
           echo "version=$pkgver" >> $GITHUB_OUTPUT
 
-      - name: Generate SHA256 checksums
+      - name: Verify desktop release assets
         run: |
-          files=()
-          for pattern in '*-darwin-*' '*-win-*' '*-linux-*' '*.apk'; do
-            for file in $pattern; do
-              if [ -f "$file" ]; then files+=("$file"); fi
-            done
-          done
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No release files found" >&2
-            exit 1
-          fi
-          sha256sum "${files[@]}" > SHA256SUMS.txt
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir . \
+            --version "${{ steps.ref.outputs.version }}" \
+            --write-checksums \
+            --require-release-notes \
+            --release-notes-root .
           cat SHA256SUMS.txt
 
       - name: Create Release Draft

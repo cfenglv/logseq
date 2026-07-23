@@ -26,6 +26,15 @@ const adhocAfterSign = readText("resources/electron-builder-adhoc-after-sign.cjs
 const verifyDesktopRuntimeRevisionsScript = readText(
   "scripts/verify-desktop-runtime-revisions.mjs",
 );
+const desktopReleasePreflight = readText(
+  "scripts/desktop-release-preflight.mjs",
+);
+const desktopReleaseAssetVerifier = readText(
+  "scripts/verify-desktop-release-assets.mjs",
+);
+const packagedDesktopVerifier = readText(
+  "resources/verify-packaged-desktop.mjs",
+);
 
 const zvecOptionalRuntimeDependencies = [
   "@zvec/bindings-darwin-arm64",
@@ -62,6 +71,16 @@ assert.equal(
   desktopPackage.scripts["electron:make-unsigned"],
   "node ./electron-builder-unsigned.mjs",
   "the standalone desktop artifact should run its bundled unsigned builder",
+);
+assert.equal(
+  desktopPackage.scripts["electron:verify-package"],
+  "node ./verify-packaged-desktop.mjs",
+  "the standalone desktop artifact should expose package verification",
+);
+assert.equal(
+  desktopPackage.devDependencies["@electron/asar"],
+  "3.4.1",
+  "package verification must not rely on a transitive asar dependency",
 );
 assert.match(
   desktopPackagingGulpfile,
@@ -239,6 +258,36 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
+  /push:[\s\S]*?selfhost\/cloudflare-rtc/,
+  "desktop release workflow should automatically rehearse every pushed selfhost commit",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /source-preflight:[\s\S]*?pnpm desktop:release-preflight:quick -- --strict/,
+  "desktop release workflow should fail on source and environment drift before expensive builds",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /release-rehearsal-gate:[\s\S]*?Verify successful push rehearsal[\s\S]*?head_sha: sha/,
+  "stable and beta releases should require a successful rehearsal of the exact commit",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Verify packaged desktop/g,
+  "desktop release workflow should verify packaged applications",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /node scripts\/verify-desktop-release-assets\.mjs[\s\S]*?--write-checksums/,
+  "desktop release workflow should validate the complete asset set before publishing",
+);
+assertNotContains(
+  desktopReleaseWorkflow,
+  "sha256sum *.apk",
+  "desktop release workflow",
+);
+assert.match(
+  desktopReleaseWorkflow,
   /clojure -M:test release db-sync-backup-memory-test[\s\S]*?node --expose-gc --max-old-space-size=128[\s\S]*?static\/db-sync-backup-memory-test\.js/,
   "RTC release gate should exercise durable client backup under a 128 MB heap",
 );
@@ -352,6 +401,27 @@ assert.match(
   /entitlements\.local-signed\.plist/,
   "the fork afterSign hook should disable library validation",
 );
+assert.match(
+  desktopReleasePreflight,
+  /tracked worktree changes must be committed before release/,
+  "desktop preflight should reject dirty tracked release inputs in strict mode",
+);
+assert.match(
+  desktopReleaseAssetVerifier,
+  /release artifact set mismatch/,
+  "desktop release asset verification should reject incomplete or unexpected assets",
+);
+for (const [format, pattern] of [
+  ["PE", /0x8664[\s\S]*?0xaa64/],
+  ["ELF", /machine === 62[\s\S]*?machine === 183/],
+  ["Mach-O", /0x01000007[\s\S]*?0x0100000c/],
+]) {
+  assert.match(
+    packagedDesktopVerifier,
+    pattern,
+    `packaged desktop verification should understand ${format} binaries`,
+  );
+}
 
 const shadowCljs = readText("shadow-cljs.edn");
 assertNotContains(shadowCljs, ":logseq-cli", "shadow-cljs.edn");

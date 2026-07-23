@@ -14,6 +14,7 @@
     "electron:make": "electron-builder --config electron-builder.yml --publish never",
     "electron:make-local-signed": "node ../scripts/electron-builder-local-signed.mjs",
     "electron:make-unsigned": "node ./electron-builder-unsigned.mjs",
+    "electron:verify-package": "node ./verify-packaged-desktop.mjs",
     "electron:make-linux-arm64": "electron-builder --config electron-builder.yml --linux AppImage zip --arm64 --publish never",
     "electron:publish-snap": "electron-builder --linux snap --x64 --publish always",
     "electron:make-macos-arm64": "electron-builder --config electron-builder.yml --mac dmg zip --arm64 --publish never",
@@ -53,6 +54,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "electron": "42.4.1",
     "electron-builder": "26.8.2",
     "electron-devtools-installer": "4.0.0"
