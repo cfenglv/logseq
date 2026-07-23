@@ -75,6 +75,41 @@
                    (:block/uuid ent)))))
        vec))
 
+(deftest cloudflare-transaction-sync-rolls-back-all-sql-writes-test
+  (testing "the Durable Object transactionSync adapter is used atomically"
+    (let [db (new sqlite ":memory:" nil)
+          calls (atom 0)
+          sql #js {:exec (fn [sql-str & args]
+                           (let [stmt (.prepare db sql-str)]
+                             (if (select-sql? sql-str)
+                               (all-sql stmt args)
+                               (do
+                                 (run-sql stmt args)
+                                 nil))))}]
+      (try
+        (storage/init-schema! sql)
+        (storage/register-transaction-sync!
+         sql
+         (fn [f]
+           (swap! calls inc)
+           (let [tx-fn (.transaction db f)]
+             (tx-fn))))
+        (let [result (try
+                       (storage/with-sql-transaction!
+                        sql
+                        (fn []
+                          (storage/set-meta! sql :t 12)
+                          (throw (js/Error. "abort transaction"))))
+                       :unexpected-success
+                       (catch :default error
+                         error))]
+          (is (instance? js/Error result))
+          (is (= 1 @calls))
+          (is (= 0 (storage/get-t sql))
+              "a failed callback must not leave partial Durable Object writes"))
+        (finally
+          (.close db))))))
+
 (deftest t-meta-test
   (let [sql (test-sql/make-sql)]
     (storage/init-schema! sql)

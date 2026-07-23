@@ -486,6 +486,34 @@
             _ (ensure-dir! dir)]
       (fs/writeFile full-path (->buffer data)))))
 
+(defn- copy-db-file!
+  [write-guard-fn ^js pool source-path target-path]
+  (let [pool-repo-dir (.-repoDir pool)
+        source-path (if (or (node-path/isAbsolute source-path)
+                            (and (string? pool-repo-dir)
+                                 (string/starts-with?
+                                  source-path pool-repo-dir)))
+                      source-path
+                      (pool-path pool source-path))
+        ;; Targets use the same pool-relative logical paths as import-db and
+        ;; unlink-db-file!, where a leading slash is not an OS root.
+        target-path (pool-path pool target-path)]
+    (p/let [_ (when write-guard-fn
+                (write-guard-fn))
+            _ (ensure-dir! (node-path/dirname target-path))]
+      (fs/copyFile source-path target-path))))
+
+(defn- unlink-db-file!
+  [write-guard-fn pool path]
+  (p/let [_ (when write-guard-fn
+              (write-guard-fn))]
+    (-> (fs/unlink (pool-path pool path))
+        (p/then (fn [_] true))
+        (p/catch (fn [error]
+                   (if (= "ENOENT" (.-code error))
+                     false
+                     (throw error)))))))
+
 (defn- remove-vfs!
   [^js pool]
   (when pool
@@ -812,6 +840,14 @@
                                     (pool-path pool path))
                  :export-file export-file
                  :import-db (fn [pool path data] (import-db write-guard-fn pool path data))
+                 :copy-db-file! (fn [pool source-path target-path]
+                                  (copy-db-file!
+                                   write-guard-fn
+                                   pool
+                                   source-path
+                                   target-path))
+                 :unlink-db-file! (fn [pool path]
+                                    (unlink-db-file! write-guard-fn pool path))
                  :remove-vfs! (fn [pool] (remove-vfs! pool))
                  :read-text! (fn [path] (read-text! data-dir path))
                  :write-text! (fn [path text] (write-text! write-guard-fn data-dir path text))

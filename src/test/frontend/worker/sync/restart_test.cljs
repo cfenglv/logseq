@@ -147,6 +147,65 @@
                     (platform/set-platform! prev-platform))
                   (done)))))))
 
+(deftest concurrent-start-for-same-graph-shares-one-auth-and-connect-test
+  (async done
+         (let [repo "concurrent-start-repo"
+               graph-id "graph-1"
+               prev-client @worker-state/*db-sync-client
+               prev-config @worker-state/*db-sync-config
+               prev-start-inflight @sync/*start-inflight
+               token-resolve* (atom nil)
+               token-calls* (atom 0)
+               connect-calls* (atom 0)
+               token-promise
+               (js/Promise.
+                (fn [resolve _reject]
+                  (reset! token-resolve* resolve)))]
+           (reset! worker-state/*db-sync-config
+                   {:ws-url "wss://sync.example.test/sync/%s"})
+           (reset! worker-state/*db-sync-client nil)
+           (reset! sync/*start-inflight nil)
+           (-> (p/with-redefs
+                 [worker-state/get-client-ops-conn (fn [_repo] true)
+                  client-op/get-local-tx (fn [_repo] 0)
+                  client-op/update-graph-uuid (fn [& _] nil)
+                  sync-util/get-graph-id (fn [_repo] graph-id)
+                  sync/<resolve-ws-token
+                  (fn []
+                    (swap! token-calls* inc)
+                    token-promise)
+                  sync/connect!
+                  (fn [_repo client _url token]
+                    (is (= "token" token))
+                    (swap! connect-calls* inc)
+                    (assoc client
+                           :ws #js {:readyState 0
+                                    :close (fn [] nil)}
+                           :ws-state (atom :connecting)))
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (let [first-start (sync/start! repo)
+                       second-start (sync/start! repo)]
+                   (p/let [_ (p/delay 10)
+                           _ (do
+                               (is (= 1 @token-calls*))
+                               (is (zero? @connect-calls*))
+                               (@token-resolve* "token"))
+                           _ (p/all [first-start second-start])]
+                     (is (= 1 @token-calls*))
+                     (is (= 1 @connect-calls*))
+                     (is (= repo (:repo @worker-state/*db-sync-client)))
+                     (is (= graph-id
+                            (:graph-id @worker-state/*db-sync-client))))))
+               (p/catch
+                (fn [error]
+                  (is false (str "unexpected error: " error))))
+               (p/finally
+                (fn []
+                  (reset! worker-state/*db-sync-client prev-client)
+                  (reset! worker-state/*db-sync-config prev-config)
+                  (reset! sync/*start-inflight prev-start-inflight)
+                  (done)))))))
+
 (deftest resume-invalidates-half-open-ws-and-deduplicates-reconnect-test
   (async done
          (let [repo "suspended-repo"
@@ -186,6 +245,163 @@
                             (reset! worker-state/*db-sync-config prev-config)
                             (set! js/setTimeout original-set-timeout)
                             (done)))))))
+
+(deftest repair-required-error-stops-reconnect-without-dropping-local-queue-test
+  (let [prev-client @worker-state/*db-sync-client
+        close-calls (atom 0)
+        ws #js {:readyState 1
+                :close (fn [] (swap! close-calls inc))}
+        pending-id (random-uuid)
+        client {:repo "repair-repo"
+                :graph-id "graph-1"
+                :ws ws
+                :ws-state (atom :open)
+                :last-sync-error (atom nil)
+                :last-ws-message-ts (atom (js/Date.now))
+                :inflight (atom [pending-id])
+                :online-users (atom [])
+                :reconnect (atom {:attempt 0 :timer nil})
+                :stale-kill-timer (atom nil)}
+        error (ex-info "checksum mismatch"
+                       {:type :db-sync/checksum-mismatch})]
+    (reset! worker-state/*db-sync-client client)
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (#'sync/handle-runtime-sync-failure!
+         "repair-repo"
+         client
+         ws
+         "wss://sync.example.test/sync/graph-1"
+         error
+         :message-failed)
+        (is (= 1 @close-calls))
+        (is (= :repair-required @(:ws-state client)))
+        (is (empty? @(:inflight client))
+            "inflight transport state is cleared so pending storage can retry explicitly")
+        (is (nil? (:timer @(:reconnect client))))
+        (is (= :db-sync/checksum-mismatch
+               (get-in @(:last-sync-error client) [:data :type])))
+        (finally
+          (reset! worker-state/*db-sync-client prev-client))))))
+
+(deftest tx-reject-is-surfaced-without-reconnecting-a-healthy-socket-test
+  (let [prev-client @worker-state/*db-sync-client
+        close-calls (atom 0)
+        ws #js {:readyState 1
+                :close (fn [] (swap! close-calls inc))}
+        client {:repo "reject-repo"
+                :graph-id "graph-1"
+                :ws ws
+                :ws-state (atom :open)
+                :last-sync-error (atom nil)
+                :inflight (atom [])
+                :online-users (atom [])
+                :reconnect (atom {:attempt 0 :timer nil})
+                :stale-kill-timer (atom nil)}
+        error (ex-info "transaction rejected"
+                       {:type :db-sync/tx-rejected})]
+    (reset! worker-state/*db-sync-client client)
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (#'sync/handle-runtime-sync-failure!
+         "reject-repo"
+         client
+         ws
+         "wss://sync.example.test/sync/graph-1"
+         error
+         :message-failed)
+        (is (zero? @close-calls))
+        (is (= :open @(:ws-state client)))
+        (is (nil? (:timer @(:reconnect client))))
+        (is (= :db-sync/tx-rejected
+               (get-in @(:last-sync-error client) [:data :type])))
+        (finally
+          (reset! worker-state/*db-sync-client prev-client))))))
+
+(deftest visibility-resume-does-not-loop-a-repair-required-client-test
+  (async done
+         (let [repo "repair-repo"
+               graph-id "graph-1"
+               prev-client @worker-state/*db-sync-client
+               prev-config @worker-state/*db-sync-config
+               close-calls (atom 0)
+               client {:repo repo
+                       :graph-id graph-id
+                       :ws #js {:readyState 3
+                                :close (fn [] (swap! close-calls inc))}
+                       :ws-state (atom :repair-required)
+                       :last-sync-error (atom {:code :checksum-mismatch})
+                       :inflight (atom [])
+                       :online-users (atom [])
+                       :reconnect (atom {:attempt 0 :timer nil})
+                       :stale-kill-timer (atom nil)}]
+           (reset! worker-state/*db-sync-config
+                   {:ws-url "wss://sync.example.test/sync/%s"})
+           (reset! worker-state/*db-sync-client client)
+           (-> (p/with-redefs [sync-util/get-graph-id (fn [_] graph-id)]
+                 (sync/resume! repo))
+               (p/then
+                (fn [_]
+                  (is (zero? @close-calls))
+                  (is (= :repair-required @(:ws-state client)))
+                  (is (nil? (:timer @(:reconnect client))))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally
+                (fn []
+                  (reset! worker-state/*db-sync-client prev-client)
+                  (reset! worker-state/*db-sync-config prev-config)
+                  (done)))))))
+
+(deftest resume-replaces-a-pre-suspend-reconnect-timer-test
+  (let [repo "suspended-backoff-repo"
+        graph-id "graph-1"
+        original-set-timeout js/setTimeout
+        original-clear-timeout js/clearTimeout
+        prev-client @worker-state/*db-sync-client
+        prev-config @worker-state/*db-sync-config
+        close-calls (atom 0)
+        cleared-timers (atom [])
+        scheduled-delays (atom [])
+        ws #js {:readyState 3
+                :close (fn [] (swap! close-calls inc))}
+        client {:repo repo
+                :graph-id graph-id
+                :ws ws
+                :ws-state (atom :closed)
+                :last-ws-message-ts (atom 0)
+                :inflight (atom [(random-uuid)])
+                :online-users (atom [])
+                :reconnect (atom {:attempt 7 :timer :pre-suspend-timeout})
+                :stale-kill-timer (atom nil)}]
+    (set! js/setTimeout
+          (fn [_f delay]
+            (swap! scheduled-delays conj delay)
+            :resume-timeout))
+    (set! js/clearTimeout
+          (fn [timer]
+            (swap! cleared-timers conj timer)))
+    (reset! worker-state/*db-sync-config {:ws-url "wss://sync.example.test/sync/%s"})
+    (reset! worker-state/*db-sync-client client)
+    (with-redefs [sync-util/get-graph-id (fn [_] graph-id)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (sync/resume! repo)
+        (is (= [:pre-suspend-timeout] @cleared-timers)
+            "resume must not trust a timer that may have stopped during sleep")
+        (is (= 1 @close-calls))
+        (is (= 1 (count @scheduled-delays)))
+        (is (<= 1000 (first @scheduled-delays) 1250)
+            "resume should restart from the first reconnect delay")
+        (is (= {:attempt 1
+                :timer :resume-timeout
+                :reason :system-resume}
+               @(:reconnect client)))
+        (finally
+          (reset! worker-state/*db-sync-client prev-client)
+          (reset! worker-state/*db-sync-config prev-config)
+          (set! js/setTimeout original-set-timeout)
+          (set! js/clearTimeout original-clear-timeout))))))
 
 (deftest start-reconnects-closed-ws-with-stale-open-state-test
   (async done
@@ -396,3 +612,314 @@
       (finally
         (reset! worker-state/*db-sync-client prev-client)
         (set! js/setTimeout original-set-timeout)))))
+
+(deftest ws-error-without-close-invalidates-and-schedules-reconnect-test
+  (let [original-set-timeout js/setTimeout
+        prev-client @worker-state/*db-sync-client
+        close-calls* (atom 0)
+        ws #js {:readyState 1
+                :close (fn [] (swap! close-calls* inc))}
+        client {:repo "error-repo"
+                :graph-id "graph-1"
+                :ws ws
+                :ws-state (atom :open)
+                :inflight (atom [(random-uuid)])
+                :online-users (atom [])
+                :reconnect (atom {:attempt 0 :timer nil})
+                :stale-kill-timer (atom nil)}]
+    (set! js/setTimeout (fn [& _] :timeout-id))
+    (reset! worker-state/*db-sync-client client)
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (#'sync/attach-ws-handlers!
+         "error-repo" client ws "wss://sync.example.test/sync/graph-1")
+        ((.-onerror ws) (js/Error. "transport failed"))
+        (is (= 1 @close-calls*))
+        (is (= :closed @(:ws-state client)))
+        (is (empty? @(:inflight client)))
+        (is (= :timeout-id (:timer @(:reconnect client))))
+        (finally
+          (reset! worker-state/*db-sync-client prev-client)
+          (set! js/setTimeout original-set-timeout))))))
+
+(deftest upload-response-timeout-invalidates-only-the-current-websocket-test
+  (let [repo "upload-timeout-repo"
+        graph-id "graph-1"
+        url "wss://sync.example.test/sync/graph-1"
+        original-set-interval js/setInterval
+        original-clear-interval js/clearInterval
+        original-set-timeout js/setTimeout
+        prev-client @worker-state/*db-sync-client
+        prev-platform (try
+                        (platform/current)
+                        (catch :default _ nil))
+        close-calls (atom 0)
+        ws #js {:readyState 1
+                :send (fn [& _] nil)
+                :close (fn [] (swap! close-calls inc))}
+        client {:repo repo
+                :graph-id graph-id
+                :ws-state (atom :open)
+                :last-ws-message-ts (atom (js/Date.now))
+                :inflight (atom [(random-uuid)])
+                :upload-request (atom nil)
+                :online-users (atom [])
+                :reconnect (atom {:attempt 0 :timer nil})
+                :stale-kill-timer (atom nil)}]
+    (set! js/setInterval (fn [& _] :interval-id))
+    (set! js/clearInterval (fn [& _] nil))
+    (set! js/setTimeout (fn [& _] :timeout-id))
+    (platform/set-platform!
+     {:env {:runtime :node}
+      :storage {}
+      :kv {}
+      :broadcast {}
+      :websocket {:connect (fn [_url] ws)}
+      :crypto {}
+      :timers {}
+      :sqlite {}})
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (let [connected (#'sync/connect! repo client url "token")]
+          (reset! worker-state/*db-sync-client connected)
+          ((:upload-response-timeout-f connected) {:tx-ids [(random-uuid)]})
+          (is (= 1 @close-calls))
+          (is (= :closed @(:ws-state connected)))
+          (is (empty? @(:inflight connected)))
+          (is (= :timeout-id (:timer @(:reconnect connected))))
+          (let [replacement-ws #js {:readyState 1 :close (fn [] nil)}
+                replacement (assoc connected
+                                   :ws replacement-ws
+                                   :ws-state (atom :open)
+                                   :inflight (atom [(random-uuid)])
+                                   :reconnect (atom {:attempt 0 :timer nil}))]
+            (reset! worker-state/*db-sync-client replacement)
+            ((:upload-response-timeout-f connected) {:tx-ids [(random-uuid)]})
+            (is (= 1 @close-calls)
+                "a late timeout from an old socket must not close its replacement")
+            (is (= :open @(:ws-state replacement)))
+            (is (= 1 (count @(:inflight replacement))))))
+        (finally
+          (reset! worker-state/*db-sync-client prev-client)
+          (when prev-platform
+            (platform/set-platform! prev-platform))
+          (set! js/setInterval original-set-interval)
+          (set! js/clearInterval original-clear-interval)
+          (set! js/setTimeout original-set-timeout))))))
+
+(deftest reconnect-retries-token-failure-and-recovers-test
+  (async done
+         (let [repo "retry-repo"
+               graph-id "graph-1"
+               url "wss://sync.example.test/sync/graph-1"
+               original-set-timeout js/setTimeout
+               prev-client @worker-state/*db-sync-client
+               prev-platform (try
+                               (platform/current)
+                               (catch :default _ nil))
+               callbacks* (atom [])
+               token-calls* (atom 0)
+               sent* (atom [])
+               new-ws #js {:readyState 0
+                           :send (fn [payload] (swap! sent* conj payload))
+                           :close (fn [] nil)}
+               old-ws #js {:readyState 3
+                           :close (fn [] nil)}
+               client {:repo repo
+                       :graph-id graph-id
+                       :ws old-ws
+                       :ws-state (atom :closed)
+                       :last-ws-message-ts (atom 0)
+                       :inflight (atom [(random-uuid)])
+                       :online-users (atom [])
+                       :reconnect (atom {:attempt 0 :timer nil})
+                       :stale-kill-timer (atom nil)}]
+           (set! js/setTimeout
+                 (fn [f delay]
+                   (swap! callbacks* conj {:f f :delay delay})
+                   (keyword (str "timeout-" (count @callbacks*)))))
+           (reset! worker-state/*db-sync-client client)
+           (platform/set-platform!
+            {:env {:runtime :node}
+             :storage {}
+             :kv {}
+             :broadcast {}
+             :websocket {:connect (fn [_url] new-ws)}
+             :crypto {}
+             :timers {}
+             :sqlite {}})
+           (-> (p/with-redefs [sync/<resolve-ws-token
+                               (fn []
+                                 (if (= 1 (swap! token-calls* inc))
+                                   (p/resolved nil)
+                                   (p/resolved "token")))
+                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (#'sync/schedule-reconnect! repo client url :test)
+                 (p/let [_ ((:f (first @callbacks*)))
+                         _ (is (= 2 (count @callbacks*)))
+                         _ ((:f (second @callbacks*)))]
+                   (is (= 2 @token-calls*))
+                   (is (some? @worker-state/*db-sync-client))
+                   (is (identical? new-ws (:ws @worker-state/*db-sync-client)))
+                   (aset new-ws "readyState" 1)
+                   ((.-onopen new-ws) #js {})
+                   (is (= ["{\"type\":\"hello\",\"client\":\"retry-repo\"}"] @sent*))
+                   (is (= :open @(:ws-state client)))
+                   (is (= {:attempt 2 :timer nil} @(:reconnect client))
+                       "opening the socket alone must not erase repeated catch-up failures")
+                   ((:sync-succeeded-f @worker-state/*db-sync-client))
+                   (is (= {:attempt 0 :timer nil} @(:reconnect client)))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-client prev-client)
+                            (when prev-platform
+                              (platform/set-platform! prev-platform))
+                            (set! js/setTimeout original-set-timeout)
+                            (done)))))))
+
+(deftest reconnect-retries-websocket-construction-failure-test
+  (async done
+         (let [repo "proxy-retry-repo"
+               graph-id "graph-1"
+               url "wss://sync.example.test/sync/graph-1"
+               original-set-timeout js/setTimeout
+               prev-client @worker-state/*db-sync-client
+               prev-platform (try
+                               (platform/current)
+                               (catch :default _ nil))
+               callbacks* (atom [])
+               connect-calls* (atom 0)
+               replacement-ws #js {:readyState 0
+                                   :send (fn [& _] nil)
+                                   :close (fn [] nil)}
+               client {:repo repo
+                       :graph-id graph-id
+                       :ws #js {:readyState 3 :close (fn [] nil)}
+                       :ws-state (atom :closed)
+                       :last-ws-message-ts (atom 0)
+                       :inflight (atom [])
+                       :online-users (atom [])
+                       :reconnect (atom {:attempt 0 :timer nil})
+                       :stale-kill-timer (atom nil)}]
+           (set! js/setTimeout
+                 (fn [f delay]
+                   (swap! callbacks* conj {:f f :delay delay})
+                   (keyword (str "timeout-" (count @callbacks*)))))
+           (reset! worker-state/*db-sync-client client)
+           (platform/set-platform!
+            {:env {:runtime :node}
+             :storage {}
+             :kv {}
+             :broadcast {}
+             :websocket {:connect
+                         (fn [_url]
+                           (if (= 1 (swap! connect-calls* inc))
+                             (throw (js/Error. "proxy is not ready"))
+                             replacement-ws))}
+             :crypto {}
+             :timers {}
+             :sqlite {}})
+           (-> (p/with-redefs [sync/<resolve-ws-token
+                               (fn [] (p/resolved "token"))
+                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (#'sync/schedule-reconnect! repo client url :test)
+                 (p/let [_ ((:f (first @callbacks*)))
+                         _ (is (= 2 (count @callbacks*))
+                               "a synchronous proxy/WebSocket failure must retry")
+                         _ ((:f (second @callbacks*)))]
+                   (is (= 2 @connect-calls*))
+                   (is (identical? replacement-ws
+                                   (:ws @worker-state/*db-sync-client)))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-client prev-client)
+                            (when prev-platform
+                              (platform/set-platform! prev-platform))
+                            (set! js/setTimeout original-set-timeout)
+                            (done)))))))
+
+(deftest resume-supersedes-a-reconnect-waiting-for-an-auth-token-test
+  (async done
+         (let [repo "resume-during-auth-repo"
+               graph-id "graph-1"
+               url "wss://sync.example.test/sync/graph-1"
+               original-set-timeout js/setTimeout
+               original-clear-timeout js/clearTimeout
+               prev-client @worker-state/*db-sync-client
+               prev-config @worker-state/*db-sync-config
+               prev-platform (try
+                               (platform/current)
+                               (catch :default _ nil))
+               callbacks* (atom [])
+               first-token-resolve* (atom nil)
+               token-calls* (atom 0)
+               connect-calls* (atom 0)
+               old-ws #js {:readyState 3
+                           :close (fn [] nil)}
+               replacement-ws #js {:readyState 0
+                                   :send (fn [& _] nil)
+                                   :close (fn [] nil)}
+               client {:repo repo
+                       :graph-id graph-id
+                       :ws old-ws
+                       :ws-state (atom :closed)
+                       :last-ws-message-ts (atom 0)
+                       :inflight (atom [])
+                       :online-users (atom [])
+                       :reconnect (atom {:attempt 0 :timer nil})
+                       :stale-kill-timer (atom nil)}
+               first-token-promise
+               (js/Promise.
+                (fn [resolve _reject]
+                  (reset! first-token-resolve* resolve)))]
+           (set! js/setTimeout
+                 (fn [f delay]
+                   (swap! callbacks* conj {:f f :delay delay})
+                   (keyword (str "timeout-" (count @callbacks*)))))
+           (set! js/clearTimeout (fn [& _] nil))
+           (reset! worker-state/*db-sync-config
+                   {:ws-url "wss://sync.example.test/sync/%s"})
+           (reset! worker-state/*db-sync-client client)
+           (platform/set-platform!
+            {:env {:runtime :node}
+             :storage {}
+             :kv {}
+             :broadcast {}
+             :websocket {:connect (fn [_url]
+                                    (swap! connect-calls* inc)
+                                    replacement-ws)}
+             :crypto {}
+             :timers {}
+             :sqlite {}})
+           (-> (p/with-redefs [sync/<resolve-ws-token
+                               (fn []
+                                 (if (= 1 (swap! token-calls* inc))
+                                   first-token-promise
+                                   (p/resolved "fresh-token")))
+                               sync-util/get-graph-id (fn [_repo] graph-id)
+                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (#'sync/schedule-reconnect! repo client url :system-resume)
+                 (let [old-attempt ((:f (first @callbacks*)))]
+                   (sync/resume! repo)
+                   (@first-token-resolve* "stale-token")
+                   (p/let [_ old-attempt]
+                     (is (zero? @connect-calls*)
+                         "a token result from before resume must not install a websocket")
+                     (is (= 2 (count @callbacks*))
+                         "resume should own the only replacement reconnect attempt")
+                     ((:f (second @callbacks*)))
+                     (is (= 1 @connect-calls*))
+                     (is (identical? replacement-ws
+                                     (:ws @worker-state/*db-sync-client))))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-client prev-client)
+                            (reset! worker-state/*db-sync-config prev-config)
+                            (when prev-platform
+                              (platform/set-platform! prev-platform))
+                            (set! js/setTimeout original-set-timeout)
+                            (set! js/clearTimeout original-clear-timeout)
+                            (done)))))))

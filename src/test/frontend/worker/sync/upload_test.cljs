@@ -53,6 +53,8 @@
                    :first-batch? true
                    :finished? true
                    :checksum "abc+123="
+                   :row-count 3
+                   :upload-id "upload-session-1"
                    :auth-fetch-f
                    (fn [url headers body]
                      (swap! calls* conj {:url url
@@ -62,6 +64,10 @@
                (p/then
                 (fn [_]
                   (is (= 3 (count @calls*)))
+                  (is (every? #(string/includes?
+                                (:url %)
+                                "/snapshot/upload-v2?")
+                              @calls*))
                   (is (string/includes? (:url (nth @calls* 0)) "reset=true"))
                   (is (string/includes? (:url (nth @calls* 0)) "finished=false"))
                   (is (string/includes? (:url (nth @calls* 1)) "reset=false"))
@@ -69,11 +75,132 @@
                   (is (string/includes? (:url (nth @calls* 2)) "reset=false"))
                   (is (string/includes? (:url (nth @calls* 2)) "finished=true"))
                   (is (string/includes? (:url (nth @calls* 2)) "checksum=abc%2B123%3D"))
+                  (is (every? #(string/includes? (:url %) "row-count=3")
+                              @calls*))
+                  (is (every? #(string/includes? (:url %) "upload-id=upload-session-1")
+                              @calls*))
                   (done)))
                (p/catch
                 (fn [error]
                   (is false (str error))
                   (done)))))))
+
+(deftest upload-empty-snapshot-still-sends-finished-request-test
+  (async done
+         (let [calls* (atom [])]
+           (-> (p/with-redefs [sync-upload/<snapshot-upload-body
+                               (fn [rows]
+                                 (p/resolved {:body rows
+                                              :encoding nil}))]
+                 (#'sync-upload/<upload-snapshot-rows-batches!
+                  []
+                  {:base "https://sync.example.test"
+                   :graph-id "graph-1"
+                   :first-batch? true
+                   :finished? true
+                   :checksum "empty-checksum"
+                   :row-count 0
+                   :auth-fetch-f
+                   (fn [url headers body]
+                     (swap! calls* conj {:url url
+                                         :headers headers
+                                         :body body})
+                     (p/resolved true))}))
+               (p/then
+                (fn [_]
+                  (is (= 1 (count @calls*)))
+                  (is (string/includes? (:url (first @calls*)) "reset=true"))
+                  (is (string/includes? (:url (first @calls*)) "finished=true"))
+                  (is (string/includes? (:url (first @calls*)) "checksum=empty-checksum"))
+                  (is (= [] (:body (first @calls*))))
+                  (done)))
+               (p/catch
+                (fn [error]
+                  (is false (str error))
+                  (done)))))))
+
+(deftest interrupted-snapshot-upload-retry-starts-new-reset-session-test
+  (async done
+         (let [first-calls* (atom [])
+               retry-calls* (atom [])
+               request-count* (atom 0)
+               first-error* (atom nil)
+               rows-batches [[[1 "a" nil]]
+                             [[2 "b" nil]]
+                             [[3 "c" nil]]]
+               opts {:base "https://sync.example.test"
+                     :graph-id "graph-1"
+                     :first-batch? true
+                     :finished? true
+                     :row-count 3
+                     :checksum "checksum-1"}]
+           (-> (p/with-redefs [sync-upload/<snapshot-upload-body
+                               (fn [rows]
+                                 (p/resolved {:body rows
+                                              :encoding nil}))]
+                 (p/let [_ (-> (#'sync-upload/<upload-snapshot-rows-batches!
+                                rows-batches
+                                (assoc opts
+                                       :upload-id "interrupted-session"
+                                       :auth-fetch-f
+                                       (fn [url _headers _body]
+                                         (swap! first-calls* conj url)
+                                         (if (= 2 (swap! request-count* inc))
+                                           (p/rejected (ex-info "network interrupted" {}))
+                                           (p/resolved true)))))
+                               (p/catch (fn [error]
+                                          (reset! first-error* error)
+                                          nil)))
+                         _ (is (= "network interrupted" (ex-message @first-error*)))
+                         _ (#'sync-upload/<upload-snapshot-rows-batches!
+                            rows-batches
+                            (assoc opts
+                                   :upload-id "retry-session"
+                                   :auth-fetch-f
+                                   (fn [url _headers _body]
+                                     (swap! retry-calls* conj url)
+                                     (p/resolved true))))]
+                   (is (= 2 (count @first-calls*)))
+                   (is (string/includes? (first @first-calls*) "reset=true"))
+                   (is (every? #(string/includes? % "upload-id=interrupted-session")
+                               @first-calls*))
+                   (is (= 3 (count @retry-calls*)))
+                   (is (string/includes? (first @retry-calls*) "reset=true"))
+                   (is (string/includes? (last @retry-calls*) "finished=true"))
+                   (is (every? #(string/includes? % "upload-id=retry-session")
+                               @retry-calls*))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest snapshot-v2-404-restarts-complete-upload-with-v1-test
+  (async done
+         (let [attempts* (atom [])
+               opts {:base "https://sync.example.test"
+                     :graph-id "graph-1"
+                     :snapshot-checksum "checksum-1"
+                     :upload-id "upload-1"
+                     :total-rows 2
+                     :update-progress (fn [_] nil)}]
+           (-> (p/with-redefs
+                 [sync-upload/<upload-temp-snapshot!
+                  (fn [_db attempt-opts]
+                    (swap! attempts* conj attempt-opts)
+                    (if (:v2? attempt-opts)
+                      (p/rejected
+                       (ex-info "v2 route unavailable" {:status 404}))
+                      (p/resolved :uploaded-v1)))]
+                 (#'sync-upload/<upload-temp-snapshot-with-fallback!
+                  :db opts))
+               (p/then
+                (fn [result]
+                  (is (= :uploaded-v1 result))
+                  (is (= [true false] (mapv :v2? @attempts*)))
+                  (is (= [opts opts]
+                         (mapv #(dissoc % :v2?) @attempts*)))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
 
 (deftest drop-oversized-upload-datoms-drops-large-tldraw-page-values-test
   (let [datoms [{:e 1 :a :block/title :v "safe"}
@@ -184,6 +311,74 @@
                           (is (= :db-sync/graph-already-exists (:code (ex-data error))))
                           (is (= "repo-1" (:graph-name (ex-data error))))
                           (is (false? @create-aux-called?))))
+               (p/finally done)))))
+
+(deftest create-remote-graph-reuses-matching-incomplete-graph-for-same-local-id-test
+  (async done
+         (let [calls* (atom [])
+               graph {:graph-id "existing-graph-id"
+                      :graph-name "repo-1"
+                      :graph-e2ee? true
+                      :graph-ready-for-use? false}]
+           (-> (p/with-redefs [sync-upload/list-remote-graphs!
+                               (fn []
+                                 (p/resolved [graph]))
+                               sync-util/get-graph-id
+                               (fn [repo]
+                                 (is (= "repo-1" repo))
+                                 "existing-graph-id")
+                               sync-upload/persist-upload-graph-identity!
+                               (fn [repo graph-id graph-e2ee?]
+                                 (swap! calls* conj [repo graph-id graph-e2ee?])
+                                 {:graph-id graph-id
+                                  :graph-e2ee? graph-e2ee?})]
+                 (sync-upload/create-remote-graph!
+                  "repo-1"
+                  {:graph-e2ee? true
+                   :graph-ready-for-use? false}))
+               (p/then (fn [identity]
+                         (is (= {:graph-id "existing-graph-id"
+                                 :graph-e2ee? true}
+                                identity))
+                         (is (= [["repo-1" "existing-graph-id" true]]
+                                @calls*))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally done)))))
+
+(deftest create-remote-graph-recovers-owned-incomplete-graph-after-lost-response-test
+  (async done
+         (let [calls* (atom [])
+               graph {:graph-id "committed-graph-id"
+                      :graph-name "repo-1"
+                      :graph-e2ee? true
+                      :graph-ready-for-use? false
+                      :owned? true}]
+           (-> (p/with-redefs
+                 [sync-upload/list-remote-graphs!
+                  (fn []
+                    (p/resolved [graph]))
+                  sync-util/get-graph-id
+                  (fn [_repo] nil)
+                  sync-upload/persist-upload-graph-identity!
+                  (fn [repo graph-id graph-e2ee?]
+                    (swap! calls* conj [repo graph-id graph-e2ee?])
+                    {:graph-id graph-id
+                     :graph-e2ee? graph-e2ee?})]
+                 (sync-upload/create-remote-graph!
+                  "repo-1"
+                  {:graph-e2ee? true
+                   :graph-ready-for-use? false}))
+               (p/then
+                (fn [identity]
+                  (is (= {:graph-id "committed-graph-id"
+                          :graph-e2ee? true}
+                         identity))
+                  (is (= [["repo-1" "committed-graph-id" true]]
+                         @calls*))))
+               (p/catch
+                (fn [error]
+                  (is false (str "unexpected error: " error))))
                (p/finally done)))))
 
 (deftest create-remote-graph-missing-e2ee-password-does-not-create-remote-graph-test

@@ -241,6 +241,15 @@
           (state/<invoke-db-worker :thread-api/db-sync-resume repo)))
       (p/resolved nil))))
 
+(defn <rtc-start-from-trigger!
+  [start-reason repo]
+  (if (contains? #{:document-visible&rtc-not-running
+                   :network-online&rtc-not-running
+                   :mobile-app-active&rtc-not-running}
+                 start-reason)
+    (<rtc-resume! repo)
+    (<rtc-start! repo)))
+
 (defonce ^:private debounced-update-presence
   (util/debounce
    (fn [editing-block-uuid]
@@ -403,7 +412,8 @@
                _ (<rtc-get-users-info true)]
          (notification/show! (t :sync/invitation-sent) :success))
        (p/catch (fn [e]
-                  (if (= "user not found" (get-in (ex-data e) [:body :error]))
+                  (if (= :user-not-found
+                         (:response-error-code (ex-data e)))
                     (notification/show! (t :sync/user-doesnt-exist-yet) :warning)
                     (do
                       (notification/show! (t :sync/something-wrong) :error)

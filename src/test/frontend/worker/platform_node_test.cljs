@@ -510,3 +510,49 @@
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
+
+(deftest unlink-db-file-removes-only-selected-file
+  (async done
+    (let [root-dir
+          (node-helper/create-tmp-dir "platform-node-unlink-db-file")]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage) nil "logseq_db_demo")
+                  repo-dir (gobj/get pool "repoDir")
+                  db-path (node-path/join repo-dir "db.sqlite")
+                  backup-path
+                  (node-path/join repo-dir "db-sync-backup.sqlite")
+                  _ (fs/writeFileSync db-path "db" "utf8")
+                  _ (fs/writeFileSync backup-path "backup" "utf8")
+                  removed? ((:unlink-db-file! storage) pool "/db.sqlite")
+                  missing? ((:unlink-db-file! storage) pool "/db.sqlite")]
+            (is (true? removed?))
+            (is (false? missing?))
+            (is (not (fs/existsSync db-path)))
+            (is (fs/existsSync backup-path)))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest copy-db-file-copies-into-pool-without-using-os-root
+  (async done
+    (let [root-dir
+          (node-helper/create-tmp-dir "platform-node-copy-db-file")]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage)
+                        nil "logseq_db_demo")
+                  repo-dir (gobj/get pool "repoDir")
+                  source-path (node-path/join repo-dir "db.sqlite")
+                  target-path
+                  (node-path/join repo-dir "db-sync-backup.sqlite")
+                  _ (fs/writeFileSync source-path "database-bytes" "utf8")
+                  _ ((:copy-db-file! storage)
+                     pool source-path "/db-sync-backup.sqlite")]
+            (is (= "database-bytes"
+                   (fs/readFileSync target-path "utf8"))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))

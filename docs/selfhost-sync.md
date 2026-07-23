@@ -26,11 +26,11 @@ Cloudflare 免费额度通常足够小团队测试，但不是“永远零费用
 
 ```bash
 pnpm install --frozen-lockfile
-pnpm --dir deps/db-sync install --frozen-lockfile --ignore-workspace
+pnpm --dir deps/db-sync install --frozen-lockfile
 pnpm --dir deps/db-sync release
 ```
 
-如果 pnpm 报 `ERR_PNPM_IGNORED_BUILDS`，执行 `pnpm approve-builds`，只批准本仓库需要的 `better-sqlite3`（以及实际列出的可信构建依赖），再重新安装。不要为了绕过错误而全局关闭构建脚本保护。
+本分支已在 `deps/db-sync/pnpm-workspace.yaml` 中提交所需原生构建依赖的最小白名单。不要添加 `--ignore-workspace`，否则会绕过这份策略。如果依赖升级后 pnpm 仍报告 `ERR_PNPM_IGNORED_BUILDS`，先审查新增依赖；确有需要时只在该独立 workspace 中运行 `pnpm --dir deps/db-sync approve-builds`，不要全局关闭构建脚本保护。
 
 ## 2. 登录 Cloudflare 并创建存储
 

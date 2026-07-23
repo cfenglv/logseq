@@ -80,3 +80,74 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))
+
+(deftest assets-put-streams-when-new-client-declares-exact-size-test
+  (async done
+         (let [payload (js/Uint8Array. #js [1 2 3 4])
+               request (js/Request.
+                        "http://localhost/assets/graph-1/image-id.png"
+                        #js {:method "PUT"
+                             :headers #js {"content-type" "image/png"
+                                           "x-amz-meta-checksum" "checksum-1"
+                                           "x-logseq-asset-size" "4"}
+                             :body payload})
+               array-buffer-calls (atom 0)
+               puts (atom [])
+               env #js {:LOGSEQ_SYNC_ASSETS
+                        #js {:put (fn [key body opts]
+                                   (swap! puts conj {:key key
+                                                     :body body
+                                                     :opts opts})
+                                   (p/let [buf (.arrayBuffer (js/Response. body))]
+                                     (is (= 4 (.-byteLength buf)))
+                                     true))}}]
+           ;; The new path must not fall back to Request.arrayBuffer.
+           (aset request "arrayBuffer"
+                 (fn []
+                   (swap! array-buffer-calls inc)
+                   (p/rejected (js/Error. "unexpected buffering"))))
+           (-> (p/let [resp (assets/handle request env)]
+                 (is (= 200 (.-status resp)))
+                 (is (= 0 @array-buffer-calls))
+                 (is (= 1 (count @puts)))
+                 (is (= "graph-1/image-id.png" (:key (first @puts))))
+                 (is (fn? (some-> (:body (first @puts)) .-getReader)))
+                 (is (= "checksum-1"
+                        (some-> (:opts (first @puts))
+                                (aget "customMetadata")
+                                (aget "checksum")))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest assets-put-keeps-legacy-buffered-request-contract-test
+  (async done
+         (let [payload (js/Uint8Array. #js [1 2 3 4])
+               request (js/Request.
+                        "http://localhost/assets/graph-1/legacy-id.png"
+                        #js {:method "PUT"
+                             :headers #js {"content-type" "image/png"
+                                           "x-amz-meta-checksum" "legacy-checksum"}
+                             :body payload})
+               original-array-buffer (.bind (.-arrayBuffer request) request)
+               array-buffer-calls (atom 0)
+               puts (atom [])
+               env #js {:LOGSEQ_SYNC_ASSETS
+                        #js {:put (fn [key body _opts]
+                                   (swap! puts conj {:key key :body body})
+                                   (p/resolved true))}}]
+           (aset request "arrayBuffer"
+                 (fn []
+                   (swap! array-buffer-calls inc)
+                   (original-array-buffer)))
+           (-> (p/let [resp (assets/handle request env)]
+                 (is (= 200 (.-status resp)))
+                 (is (= 1 @array-buffer-calls))
+                 (is (= 1 (count @puts)))
+                 (is (= "graph-1/legacy-id.png" (:key (first @puts))))
+                 (is (= 4 (.-byteLength (:body (first @puts))))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))

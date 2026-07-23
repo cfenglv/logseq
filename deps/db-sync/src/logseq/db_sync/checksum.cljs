@@ -56,7 +56,7 @@
      (or (parse-hex32 (subs checksum 8 16)) 0)]
     [0 0]))
 
-(defn- valid-checksum?
+(defn valid-checksum?
   [checksum]
   (boolean
    (and (string? checksum)

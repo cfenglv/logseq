@@ -27,7 +27,13 @@
 
 (def ops-schema [:sequential op-schema])
 (def ops-coercer (ma/coercer ops-schema mt/json-transformer nil
-                             #(do (log/error ::bad-ops (:value %))
+                             #(do (log/error ::bad-ops
+                                             {:value-shape
+                                              (cond
+                                                (nil? (:value %)) :nil
+                                                (sequential? (:value %)) :sequential
+                                                (map? (:value %)) :map
+                                                :else :other)})
                                   (ma/-fail! ::ops-schema (select-keys % [:value])))))
 
 (defonce *repo->pending-local-tx-count (atom {}))

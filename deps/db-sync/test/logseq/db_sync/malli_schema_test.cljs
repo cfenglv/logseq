@@ -18,10 +18,50 @@
   [schema-key body]
   ((get db-sync-schema/http-request-coercers schema-key) body))
 
+(def ^:private legacy-v1-ws-client-samples
+  [{:type "hello"
+    :client "legacy-repo"}
+   {:type "presence"
+    :editing-block-uuid nil}
+   {:type "pull"
+    :since 0}
+   {:type "tx/batch"
+    :t-before 0
+    :txs [{:tx "legacy-transit"}]}
+   {:type "ping"}])
+
+(def ^:private legacy-v1-ws-server-samples
+  [{:type "hello"
+    :t 0}
+   {:type "presence"
+    :user-id "legacy-user"
+    :editing-block-uuid nil}
+   {:type "pull/ok"
+    :t 0
+    :txs []}
+   {:type "tx/batch/ok"
+    :t 0}
+   {:type "changed"
+    :t 0}
+   {:type "tx/reject"
+    :reason "stale"
+    :t 0}
+   {:type "pong"}])
+
 (deftest http-request-client-revision-is-optional-test
   (doseq [[schema-key body] request-samples]
     (testing schema-key
       (is (= body (coerce-request schema-key body))))))
+
+(deftest legacy-v1-websocket-messages-remain-valid-test
+  (testing "client messages without optional revision fields"
+    (doseq [message legacy-v1-ws-client-samples]
+      (is (= message
+             (db-sync-schema/ws-client-message-coercer message)))))
+  (testing "server messages without optional checksum fields"
+    (doseq [message legacy-v1-ws-server-samples]
+      (is (= message
+             (db-sync-schema/ws-server-message-coercer message))))))
 
 (deftest tx-batch-request-client-revision-accepts-string-test
   (let [body' (assoc (:sync/tx-batch request-samples)

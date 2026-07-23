@@ -1,6 +1,7 @@
 (ns frontend.worker.sync.util
   "Helpers for sync"
-  (:require [lambdaisland.glogi :as log]
+  (:require [clojure.string :as string]
+            [lambdaisland.glogi :as log]
             [frontend.worker.platform :as platform]
             [frontend.worker.state :as worker-state]
             [logseq.db :as ldb]
@@ -10,8 +11,26 @@
             [logseq.db-sync.malli-schema :as db-sync-schema]
             [promesa.core :as p]))
 
+(def ^:private diagnostic-data-keys
+  [:type :code :error :status :field :message-type :stage :operation
+   :local-tx :remote-tx :expected-count :actual-count :payload-bytes
+   :response-error-code])
+
+(defn- safe-diagnostic-value?
+  [value]
+  (or (keyword? value)
+      (string? value)
+      (number? value)
+      (boolean? value)))
+
+(defn- diagnostic-data
+  [data]
+  (->> (select-keys (or data {}) diagnostic-data-keys)
+       (filter (comp safe-diagnostic-value? val))
+       (into {})))
+
 (defn fail-fast [tag data]
-  (log/error tag data)
+  (log/error tag (diagnostic-data data))
   (throw (ex-info (name tag) data)))
 
 (defn cli-node-owner?
@@ -48,16 +67,23 @@
              (re-matches #"[a-zA-Z0-9._/\-]+" message))
     (keyword message)))
 
-(defn- error->diagnostic
+(defn error->diagnostic
   [error]
   (let [data (or (ex-data error) {})
-        code (or (:code data)
-                 (ex-message->code (ex-message error))
-                 :exception)]
+        raw-code (or (:code data)
+                     (ex-message->code (ex-message error))
+                     (:type data)
+                     (:error data))
+        code (if (safe-diagnostic-value? raw-code)
+               raw-code
+               :exception)
+        safe-data (diagnostic-data data)]
     {:code code
-     :message (or (ex-message error) (str error))
+     ;; Never retain arbitrary exception messages or ex-data in state shown by
+     ;; the RTC indicator. They can contain transaction or response payloads.
+     :message (if (keyword? code) (name code) (str code))
      :at (common-util/time-ms)
-     :data (when (seq data) data)}))
+     :data (when (seq safe-data) safe-data)}))
 
 (defn set-last-sync-error!
   [client error]
@@ -76,7 +102,10 @@
   (try
     (coercer value)
     (catch :default e
-      (log/error :db-sync/malli-coerce-failed (merge context {:error e :value value}))
+      (log/error :db-sync/malli-coerce-failed
+                 (merge context
+                        {:error-name (or (.-name e) "Error")
+                         :message-type (when (map? value) (:type value))}))
       invalid-coerce)))
 
 (defn- with-client-revision
@@ -127,7 +156,12 @@
           (throw (ex-info "db-sync invalid response"
                           {:status (.-status resp)
                            :url url
-                           :body body}))))
+                           :response-error-code
+                           (some-> (:error body)
+                                   str
+                                   string/lower-case
+                                   (string/replace #"\s+" "-")
+                                   ex-message->code)}))))
       (let [body (when data (js->clj data :keywordize-keys true))
             body (if error-schema
                    (coerce-http-response error-schema body)
@@ -135,4 +169,9 @@
         (throw (ex-info "db-sync request failed"
                         {:status (.-status resp)
                          :url url
-                         :body body}))))))
+                         :response-error-code
+                         (some-> (:error body)
+                                 str
+                                 string/lower-case
+                                 (string/replace #"\s+" "-")
+                                 ex-message->code)}))))))

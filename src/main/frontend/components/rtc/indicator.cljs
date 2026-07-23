@@ -31,6 +31,8 @@
          :remote-tx nil
          :local-checksum nil
          :remote-checksum nil
+         :ws-state nil
+         :last-sync-error nil
          :rtc-state :open
          :download-logs nil
          :upload-logs nil
@@ -68,6 +70,8 @@
                                          :remote-tx (:remote-tx state)
                                          :local-checksum (:local-checksum state)
                                          :remote-checksum (:remote-checksum state)
+                                         :ws-state (get-in state [:rtc-state :ws-state])
+                                         :last-sync-error (:last-sync-error state)
                                          :rtc-state (if (:rtc-lock state) :open :close)))
                                 rtc-flows/rtc-state-flow)))]
       (reset! *update-detail-info-canceler canceler))))
@@ -186,7 +190,7 @@
         show-checksums? (or config/dev? util/node-test?)
         {:keys [graph-uuid local-tx remote-tx local-checksum remote-checksum rtc-state
                 download-logs upload-logs misc-logs pending-local-ops pending-asset-ops
-                missing-asset-upload-files pending-server-ops]}
+                missing-asset-upload-files pending-server-ops ws-state last-sync-error]}
         (hooks/use-flow-state (m/watch *detail-info))
         asset-rows (asset-status-rows {:pending-asset-ops pending-asset-ops
                                        :missing-asset-upload-files missing-asset-upload-files
@@ -220,6 +224,8 @@
                remote-tx (assoc :remote-tx remote-tx)
                (and show-checksums? local-checksum) (assoc :local-checksum local-checksum)
                (and show-checksums? remote-checksum) (assoc :remote-checksum remote-checksum)
+               ws-state (assoc :ws-state ws-state)
+               last-sync-error (assoc :last-sync-error last-sync-error)
                rtc-state (assoc :rtc-state rtc-state))
              pprint/pprint
              with-out-str)]])

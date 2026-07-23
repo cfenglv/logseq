@@ -146,6 +146,10 @@
 
 (def repo-path "/db.sqlite")
 (def client-ops-repo-path (str "client-ops" repo-path))
+(def ^:private sync-backup-db-path "/db-sync-backup.sqlite")
+(def ^:private sync-backup-client-ops-path
+  "/db-sync-client-ops-backup.sqlite")
+(def ^:private sync-backup-marker-path "/db-sync-recovery.sqlite")
 
 (defn- resolve-db-path
   [repo pool path]
@@ -213,10 +217,168 @@
                 (p/resolved nil)))]
       (try-export paths))))
 
+(defn- <import-db-at-path
+  [^js pool path data]
+  (let [storage (platform/storage (platform/current))]
+    ((:import-db storage) pool path data)))
+
 (defn- <import-db
   [^js pool data]
-  (let [storage (platform/storage (platform/current))]
-    ((:import-db storage) pool repo-path data)))
+  (<import-db-at-path pool repo-path data))
+
+(defn- <unlink-db-file!
+  [^js pool path]
+  (let [storage (platform/storage (platform/current))
+        unlink-f (:unlink-db-file! storage)]
+    (when-not (fn? unlink-f)
+      (throw (ex-info "platform storage/unlink-db-file! missing"
+                      {:path path})))
+    (p/resolved (unlink-f pool path))))
+
+(defn- <export-pool-file-if-present
+  [repo path]
+  (-> (<export-db-file repo path)
+      (p/catch (fn [_] nil))))
+
+(defn- open-sync-backup-marker-db
+  [repo pool]
+  (platform/sqlite-open
+   (platform/current)
+   {:sqlite @*sqlite
+    :pool pool
+    :path (resolve-db-path repo pool sync-backup-marker-path)
+    :mode "c"}))
+
+(defn- ensure-sync-backup-marker-schema!
+  [^js db]
+  (.exec db
+         (str "create table if not exists recovery ("
+              "id integer primary key check (id = 1), "
+              "phase text not null, "
+              "has_client_ops integer not null)")))
+
+(defn- <write-sync-backup-marker!
+  [repo phase has-client-ops?]
+  (p/let [pool (<get-opfs-pool repo)
+          ^js db (open-sync-backup-marker-db repo pool)]
+    (try
+      (ensure-sync-backup-marker-schema! db)
+      (.exec db
+             #js {:sql
+                  (str "insert into recovery (id, phase, has_client_ops) "
+                       "values (1, ?, ?) "
+                       "on conflict(id) do update set "
+                       "phase = excluded.phase, "
+                       "has_client_ops = excluded.has_client_ops")
+                  :bind #js [phase (if has-client-ops? 1 0)]})
+      (finally
+        (.close db)))))
+
+(defn- <read-sync-backup-marker
+  [repo]
+  (p/let [marker-bytes
+          (<export-pool-file-if-present repo sync-backup-marker-path)]
+    (when (and marker-bytes
+               (number? (.-byteLength marker-bytes))
+               (pos? (.-byteLength marker-bytes)))
+      (when (< (.-byteLength marker-bytes) 512)
+        (throw
+         (ex-info "snapshot recovery marker is truncated"
+                  {:type :db-sync/invalid-snapshot-recovery-marker
+                   :repo repo
+                   :marker-size (.-byteLength marker-bytes)})))
+      (p/let [pool (<get-opfs-pool repo)
+              ^js db (open-sync-backup-marker-db repo pool)]
+        (try
+          (ensure-sync-backup-marker-schema! db)
+          (if-let [row
+                   (first
+                    (.exec db
+                           #js {:sql
+                                (str "select phase, has_client_ops "
+                                     "from recovery where id = 1")
+                                :rowMode "object"}))]
+            {:phase (aget row "phase")
+             :has-client-ops? (= 1 (aget row "has_client_ops"))}
+            (throw
+             (ex-info "snapshot recovery marker row is missing"
+                      {:type :db-sync/invalid-snapshot-recovery-marker
+                       :repo repo})))
+          (finally
+            (.close db)))))))
+
+(defn- <cleanup-sync-backup-files!
+  [repo]
+  (p/let [pool (<get-opfs-pool repo)
+          _ (<unlink-db-file! pool sync-backup-db-path)
+          _ (<unlink-db-file! pool sync-backup-client-ops-path)
+          _ (<unlink-db-file! pool sync-backup-marker-path)]
+    nil))
+
+(defn- <cleanup-committed-sync-backup-files!
+  [repo]
+  ;; A committed marker means the live graph is authoritative. Cleanup is
+  ;; deliberately non-fatal: the marker is deleted last, so an interrupted
+  ;; cleanup is safe and will be retried on the next open.
+  (-> (<cleanup-sync-backup-files! repo)
+      (p/catch
+       (fn [error]
+         (log/warn :db-sync/snapshot-backup-cleanup-failed
+                   {:repo repo
+                    :error-name (or (.-name error) "Error")})
+         nil))))
+
+(defn- <reset-sync-target-files!
+  [repo]
+  (p/let [pool (<get-opfs-pool repo)
+          _ (<unlink-db-file! pool repo-path)
+          _ (<unlink-db-file! pool (str "search" repo-path))
+          _ (<unlink-db-file! pool (str "client-ops-" repo-path))]
+    nil))
+
+(defn- <restore-durable-sync-backup!
+  [repo {:keys [has-client-ops?]}]
+  (p/let [db-data (<export-db-file repo sync-backup-db-path)
+          client-ops-data
+          (when has-client-ops?
+            (<export-db-file repo sync-backup-client-ops-path))
+          pool (<get-opfs-pool repo)
+          _ (<reset-sync-target-files! repo)
+          _ (<import-db-at-path pool repo-path db-data)
+          _ (when client-ops-data
+              (<import-db-at-path
+               pool
+               (str "client-ops-" repo-path)
+               client-ops-data))]
+    nil))
+
+(defn- <recover-pending-sync-backup!
+  [repo]
+  (p/let [marker (<read-sync-backup-marker repo)]
+    (if-not marker
+      nil
+      (case (:phase marker)
+        "pending"
+        (p/let [_ (<restore-durable-sync-backup! repo marker)
+                ;; Commit the restored target before cleanup. If the process
+                ;; crashes again, startup must retain the restored graph
+                ;; rather than require sidecars that may already be gone.
+                _ (<write-sync-backup-marker!
+                   repo "committed" (:has-client-ops? marker))
+                _ (<cleanup-committed-sync-backup-files! repo)]
+          (log/warn :db-sync/recovered-interrupted-snapshot-activation
+                    {:repo repo})
+          :restored)
+
+        "committed"
+        (p/let [_ (<cleanup-committed-sync-backup-files! repo)]
+          :committed)
+
+        (throw
+         (ex-info "snapshot recovery marker phase is invalid"
+                  {:type :db-sync/invalid-snapshot-recovery-marker
+                   :repo repo
+                   :phase (:phase marker)}))))))
 
 (defn upsert-addr-content!
   "Upsert addr+data-seq. Update sqlite-cli/upsert-addr-content! when making changes"
@@ -266,11 +428,13 @@
       (restore-data-from-addr db addr))))
 
 (defn- close-db-aux!
-  [repo ^Object db ^Object search ^Object client-ops]
+  [repo ^Object db ^Object search ^Object client-ops
+   & [{:keys [preserve-sync-import?]}]]
   (checkpoint-db! repo db)
   (checkpoint-db! repo search)
   (checkpoint-db! repo client-ops)
-  (sync-download/close-import-state-for-repo! repo)
+  (when-not preserve-sync-import?
+    (sync-download/close-import-state-for-repo! repo))
   (when-let [timer (get @*client-ops-cleanup-timers repo)]
     (js/clearInterval timer))
   (swap! *client-ops-cleanup-timers dissoc repo)
@@ -298,9 +462,11 @@
       (close-db-aux! r db search client-ops))))
 
 (defn close-db!
-  [repo]
-  (let [{:keys [db search client-ops]} (get @*sqlite-conns repo)]
-    (close-db-aux! repo db search client-ops)))
+  ([repo]
+   (close-db! repo nil))
+  ([repo opts]
+   (let [{:keys [db search client-ops]} (get @*sqlite-conns repo)]
+     (close-db-aux! repo db search client-ops opts))))
 
 (defn- <invalidate-search-db!
   [repo]
@@ -523,7 +689,8 @@
                (nil? (client-op/get-local-tx repo)))
       (client-op/update-local-tx repo 0)))
   (when-not (worker-state/get-sqlite-conn repo)
-    (p/let [[db search-db client-ops-db vector-index] (get-dbs repo)
+    (p/let [recovery-result (<recover-pending-sync-backup! repo)
+            [db search-db client-ops-db vector-index] (get-dbs repo)
             dbs (cond-> [db search-db]
                   client-ops-db (conj client-ops-db))
             storage (new-sqlite-storage db)]
@@ -532,6 +699,8 @@
                                        :client-ops client-ops-db})
       (when vector-index
         (swap! *vector-indexes assoc repo vector-index))
+      (when (= :restored recovery-result)
+        (search/truncate-vector-index! vector-index))
       (doseq [db' dbs]
         (enable-sqlite-wal-mode! db'))
       (common-sqlite/create-kvs-table! db)
@@ -1140,8 +1309,13 @@
         (maybe-run-recycle-gc! conn)
         nil)
       (catch :default e
-        (prn :debug :worker-transact-failed :tx-meta tx-meta :tx-data tx-data)
-        (log/error ::worker-transact-failed e)
+        (log/error ::worker-transact-failed
+                   {:tx-meta (select-keys tx-meta [:op :outliner-op])
+                    :tx-count (count tx-data)
+                    :error-code (or (:error (ex-data e))
+                                    (:type (ex-data e))
+                                    :transact-failed)
+                    :error-name (or (.-name e) "Error")})
         (throw e)))))
 
 (def-thread-api :thread-api/undo-redo-set-pending-editor-info
@@ -1211,10 +1385,10 @@
   nil)
 
 (def-thread-api :thread-api/db-sync-close-db
-  [repo]
+  [repo & [opts]]
   (sync-crypt/cancel-ui-requests! {:reason :db-sync-close-db
                                    :repo repo})
-  (close-db! repo))
+  (close-db! repo opts))
 
 (def-thread-api :thread-api/db-sync-invalidate-search-db
   [repo]
@@ -1225,6 +1399,115 @@
   (if-let [recreate-lock-fn (get-in (platform/current) [:env :recreate-lock-fn])]
     (recreate-lock-fn repo)
     nil))
+
+(def-thread-api :thread-api/db-sync-export-local-backup
+  [repo]
+  (when-let [^js db (worker-state/get-sqlite-conn repo :db)]
+    (checkpoint-db! repo db)
+    (when-let [^js client-ops-db
+               (worker-state/get-sqlite-conn repo :client-ops)]
+      (checkpoint-db! repo client-ops-db))
+    (p/let [pool (<get-opfs-pool repo)
+            storage (platform/storage (platform/current))
+            copy-db-file! (:copy-db-file! storage)
+            ^js client-ops-db
+            (worker-state/get-sqlite-conn repo :client-ops)
+            db-source-path
+            (or (some-> db .-filename)
+                (resolve-db-path repo pool repo-path))
+            client-ops-source-path
+            (when client-ops-db
+              (or (some-> client-ops-db .-filename)
+                  (resolve-db-path
+                   repo pool (str "client-ops-" repo-path))))
+            db-data
+            (when-not copy-db-file!
+              (<export-db-file repo))
+            client-ops-data
+            (when-not copy-db-file!
+              ((@thread-api/*thread-apis
+                :thread-api/export-client-ops-db-binary)
+               repo))
+            has-client-ops?
+            (or (some? client-ops-source-path)
+                (some? client-ops-data))
+            _ (<unlink-db-file! pool sync-backup-db-path)
+            _ (<unlink-db-file! pool sync-backup-client-ops-path)
+            _ (<unlink-db-file! pool sync-backup-marker-path)
+            _ (if copy-db-file!
+                (copy-db-file!
+                 pool db-source-path sync-backup-db-path)
+                (<import-db-at-path
+                 pool sync-backup-db-path (->uint8array db-data)))
+            _ (if (and copy-db-file! client-ops-source-path)
+                (copy-db-file!
+                 pool
+                 client-ops-source-path
+                 sync-backup-client-ops-path)
+                (when client-ops-data
+                  (<import-db-at-path
+                   pool
+                   sync-backup-client-ops-path
+                   (->uint8array client-ops-data))))
+            ;; Write the recovery marker last. Before this point the live
+            ;; database has not been touched, so orphaned backup files are
+            ;; harmless. Once this commits, startup recovery can always
+            ;; restore the durable sidecar files.
+            _ (<write-sync-backup-marker!
+               repo "pending" has-client-ops?)]
+      {:durable? true
+       :has-client-ops? has-client-ops?})))
+
+(def-thread-api :thread-api/db-sync-reset-target-preserving-backup
+  [repo]
+  (p/let [_ (sync-crypt/cancel-ui-requests!
+             {:reason :db-sync-reset-target-preserving-backup
+              :repo repo})
+          _ (close-db! repo {:preserve-sync-import? true})
+          _ (<reset-sync-target-files! repo)]
+    nil))
+
+(def-thread-api :thread-api/db-sync-restore-local-backup
+  [repo {:keys [durable? db-data client-ops-data]}]
+  (if durable?
+    (p/let [_ (sync-crypt/cancel-ui-requests!
+               {:reason :db-sync-restore-local-backup
+                :repo repo})
+            _ (close-db! repo {:preserve-sync-import? true})
+            _ (<recover-pending-sync-backup! repo)
+            recreate-lock-fn
+            (get-in (platform/current) [:env :recreate-lock-fn])
+            _ (when (fn? recreate-lock-fn)
+                (recreate-lock-fn repo))
+            _ (<create-or-open-db! repo {:close-other-db? true})]
+      nil)
+    (when db-data
+    (p/let [_ (sync-crypt/cancel-ui-requests!
+               {:reason :db-sync-restore-local-backup
+                :repo repo})
+            _ (close-db! repo {:preserve-sync-import? true})
+            pool (<get-opfs-pool repo)
+            _ (remove-vfs! pool)
+            recreate-lock-fn
+            (get-in (platform/current) [:env :recreate-lock-fn])
+            _ (when (fn? recreate-lock-fn)
+                (recreate-lock-fn repo))
+            _ (<import-db pool db-data)
+            _ (when client-ops-data
+                (<import-db-at-path pool
+                                    (str "client-ops-" repo-path)
+                                    client-ops-data))
+            _ (<create-or-open-db! repo {:close-other-db? true})]
+      nil))))
+
+(def-thread-api :thread-api/db-sync-commit-local-backup
+  [repo {:keys [durable? has-client-ops?]}]
+  (when durable?
+    (p/let [_ (<write-sync-backup-marker!
+               repo "committed" has-client-ops?)]
+      ;; Once the marker is committed, cleanup failure is not an activation
+      ;; failure: startup will retain the new graph and retry sidecar cleanup.
+      (<cleanup-committed-sync-backup-files! repo))))
 
 (def-thread-api :thread-api/db-sync-rehydrate-large-titles
   [repo graph-id]

@@ -7,6 +7,8 @@
             [logseq.db-sync.worker.routes.index :as routes]
             [promesa.core :as p]))
 
+(declare invalidate-graph-access-cache!)
+
 (defn- index-db [^js self]
   (let [db (.-d1 self)]
     (when-not db
@@ -37,6 +39,41 @@
                          :status (.-status resp)})))
       resp)))
 
+(defn- <revoke-graph-user-sockets!
+  [^js env ^js url graph-id user-id]
+  (if-let [revoke-fn (aget env "DB_SYNC_REVOKE_GRAPH_USER")]
+    (p/resolved (revoke-fn graph-id user-id))
+    (let [^js namespace (.-LOGSEQ_SYNC_DO env)
+          _ (when-not namespace
+              (throw (ex-info "missing LOGSEQ_SYNC_DO binding"
+                              {:graph-id graph-id
+                               :user-id user-id
+                               :binding "LOGSEQ_SYNC_DO"})))
+          do-id (.idFromName namespace graph-id)
+          stub (.get namespace do-id)
+          revoke-url (str (.-origin url)
+                          "/internal/revoke-user?user-id="
+                          (js/encodeURIComponent user-id))]
+      (p/let [resp (.fetch stub (js/Request. revoke-url #js {:method "POST"}))]
+        (when-not (.-ok resp)
+          (throw (ex-info "graph socket revocation failed"
+                          {:graph-id graph-id
+                           :user-id user-id
+                           :status (.-status resp)})))
+        resp))))
+
+(defn- <revoke-graph-user-sockets-with-retry!
+  [env url graph-id user-id]
+  (letfn [(attempt! [attempt]
+            (-> (<revoke-graph-user-sockets! env url graph-id user-id)
+                (p/catch
+                 (fn [error]
+                   (if (< attempt 2)
+                     (p/let [_ (p/delay (* 100 (inc attempt)))]
+                       (attempt! (inc attempt)))
+                     (p/rejected error))))))]
+    (attempt! 0)))
+
 (defn- <delete-graph-storage!
   [^js env ^js url graph-id]
   (let [delete-graph-fn (aget env "DB_SYNC_DELETE_GRAPH")]
@@ -46,8 +83,8 @@
 
 (defn- <delete-graph! [db ^js env ^js url graph-id]
   (p/do!
-   (index/<graph-delete-metadata! db graph-id)
    (<delete-graph-storage! env url graph-id)
+   (index/<graph-delete-metadata! db graph-id)
    (index/<graph-delete-index-entry! db graph-id)))
 
 (defn- <safe-user-activity-touch!
@@ -58,12 +95,12 @@
           (p/catch (fn [error]
                      (log/warn :db-sync/activity-touch-user-failed
                                {:user-id user-id
-                                :error error})
+                                :error (common/error-log-data error)})
                      nil)))
       (catch :default error
         (log/warn :db-sync/activity-touch-user-failed
                   {:user-id user-id
-                   :error error})
+                   :error (common/error-log-data error)})
         (p/resolved nil)))
     (p/resolved nil)))
 
@@ -75,12 +112,12 @@
           (p/catch (fn [error]
                      (log/warn :db-sync/activity-touch-graph-failed
                                {:graph-id graph-id
-                                :error error})
+                                :error (common/error-log-data error)})
                      nil)))
       (catch :default error
         (log/warn :db-sync/activity-touch-graph-failed
                   {:graph-id graph-id
-                   :error error})
+                   :error (common/error-log-data error)})
         (p/resolved nil)))
     (p/resolved nil)))
 
@@ -131,7 +168,22 @@
                          (if (and graph-e2ee? (not has-user-rsa-key-pair?))
                            (http/bad-request "missing user rsa key pair")
                            (p/let [_ (index/<index-upsert! db graph-id graph-name user-id schema-version graph-e2ee? graph-ready-for-use?)
-                                   _ (index/<graph-member-upsert! db graph-id user-id "manager" user-id)]
+                                   _ (-> (index/<graph-member-upsert!
+                                          db graph-id user-id "manager" user-id)
+                                         (p/catch
+                                          (fn [error]
+                                            ;; Avoid leaving a name-blocking
+                                            ;; owner graph if the second write
+                                            ;; fails. A failed compensating
+                                            ;; delete is still recoverable by
+                                            ;; the owned incomplete-graph
+                                            ;; client path.
+                                            (-> (index/<graph-delete-index-entry!
+                                                 db graph-id)
+                                                (p/catch (fn [_] nil))
+                                                (p/then
+                                                 (fn []
+                                                   (throw error)))))))]
                              (http/json-response :graphs/create {:graph-id graph-id
                                                                  :graph-e2ee? graph-e2ee?
                                                                  :graph-ready-for-use? graph-ready-for-use?}))))))))))
@@ -191,7 +243,8 @@
                            (http/forbidden)
                            (if-not (string? resolved-id)
                              (http/bad-request "user not found")
-                             (p/let [_ (index/<graph-member-upsert! db graph-id resolved-id role user-id)]
+                             (p/let [_ (index/<graph-member-upsert! db graph-id resolved-id role user-id)
+                                     _ (invalidate-graph-access-cache! graph-id)]
                                (http/json-response :graph-members/create {:ok true})))))))))))
 
       :graph-members/update
@@ -218,7 +271,8 @@
                        (p/let [manager? (index/<user-is-manager? db graph-id user-id)]
                          (if (not manager?)
                            (http/forbidden)
-                           (p/let [_ (index/<graph-member-update-role! db graph-id member-id role)]
+                           (p/let [_ (index/<graph-member-update-role! db graph-id member-id role)
+                                   _ (invalidate-graph-access-cache! graph-id)]
                              (http/json-response :graph-members/update {:ok true}))))))))))
 
       :graph-members/delete
@@ -236,11 +290,23 @@
                                  (= "member" target-role))]
           (cond
             (and manager? (not= "manager" target-role))
-            (p/let [_ (index/<graph-member-delete! db graph-id member-id)]
+            (p/let [_ (<revoke-graph-user-sockets-with-retry!
+                       env url graph-id member-id)
+                    _ (index/<graph-member-delete! db graph-id member-id)
+                    _ (invalidate-graph-access-cache! graph-id)
+                    ;; Close any connection established in the narrow window
+                    ;; between the first revocation and membership deletion.
+                    _ (<revoke-graph-user-sockets-with-retry!
+                       env url graph-id member-id)]
               (http/json-response :graph-members/delete {:ok true}))
 
             self-leave?
-            (p/let [_ (index/<graph-member-delete! db graph-id member-id)]
+            (p/let [_ (<revoke-graph-user-sockets-with-retry!
+                       env url graph-id member-id)
+                    _ (index/<graph-member-delete! db graph-id member-id)
+                    _ (invalidate-graph-access-cache! graph-id)
+                    _ (<revoke-graph-user-sockets-with-retry!
+                       env url graph-id member-id)]
               (http/json-response :graph-members/delete {:ok true}))
 
             :else
@@ -255,15 +321,17 @@
         (http/unauthorized)
 
         :else
-        (p/let [owns? (index/<user-has-access-to-graph? db graph-id user-id)]
+        (p/let [owns? (index/<user-owns-graph? db graph-id user-id)]
           (if (not owns?)
             (http/forbidden)
-            (p/let [_ (<delete-graph! db env url graph-id)]
+            (p/let [_ (<delete-graph! db env url graph-id)
+                    _ (invalidate-graph-access-cache! graph-id)]
               (http/json-response :graphs/delete {:graph-id graph-id :deleted true})))))
 
       :admin-graphs/delete
       (if (seq graph-id)
-        (p/let [_ (<delete-graph! db env url graph-id)]
+        (p/let [_ (<delete-graph! db env url graph-id)
+                _ (invalidate-graph-access-cache! graph-id)]
           (http/json-response :graphs/delete {:graph-id graph-id :deleted true}))
         (http/bad-request "missing graph id"))
 
@@ -419,13 +487,22 @@
                             (<safe-graph-activity-touch! db graph-id))]
                     response))))))
       (catch :default error
-        (js/console.error "DEBUG handle-fetch error:" error)
-        (log/error :db-sync/index-error error)
-        (http/error-response (str "server error: " error) 500)))))
+        (log/error :db-sync/index-error (common/error-log-data error))
+        (http/error-response "server error" 500)))))
 
 (def ^:private graph-access-cache-ttl-ms 5000)
 (def ^:private graph-access-cache-capacity 256)
 (defonce ^:private *graph-access-cache (atom {}))
+
+(defn invalidate-graph-access-cache!
+  [graph-id]
+  (swap! *graph-access-cache
+         (fn [cache]
+           (into {}
+                 (remove (fn [[[cached-graph-id _token] _entry]]
+                           (= graph-id cached-graph-id)))
+                 cache)))
+  nil)
 
 (defn- now-ms []
   (.now js/Date))
@@ -529,11 +606,37 @@
                                  :access-query-ms access-query-ms
                                  :access-check-ms access-check-ms}})))))
              (p/catch (fn [error]
-                        (log/error :db-sync/index-error error)
-                        (p/resolved {:response (http/error-response (str "server error: " error) 500)
+                        (log/error :db-sync/index-error (common/error-log-data error))
+                        (p/resolved {:response (http/error-response "server error" 500)
                                      :timing {:access-ok? false
                                               :cache-hit? false}}))))))))))
 
 (defn graph-access-response [request env graph-id]
   (p/let [{:keys [response]} (graph-access-response-with-timing request env graph-id)]
     response))
+
+(defn graph-owner-response
+  [request env graph-id]
+  (let [db (aget env "DB")]
+    (cond
+      (not (seq graph-id))
+      (p/resolved (http/bad-request "missing graph id"))
+
+      (nil? db)
+      (p/resolved (http/error-response "server error" 500))
+
+      :else
+      (->
+       (p/let [claims (auth/auth-claims request env)]
+         (if (nil? claims)
+           (http/unauthorized)
+           (let [user-id (aget claims "sub")]
+             (if-not (string? user-id)
+               (http/unauthorized)
+               (p/let [owns? (index/<user-owns-graph? db graph-id user-id)]
+                 (if owns?
+                   (http/json-response :graphs/access {:ok true})
+                   (http/forbidden)))))))
+       (p/catch (fn [error]
+                  (log/error :db-sync/index-error (common/error-log-data error))
+                  (http/error-response "server error" 500)))))))

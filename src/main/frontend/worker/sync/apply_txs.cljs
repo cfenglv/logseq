@@ -41,8 +41,10 @@
 ;; still pull/rebase remote txs, but skip local tx batch uploads.
 (defonce *repo->upload-stopped? (atom {}))
 
-(def ^:private max-remote-apply-snapshot-retries 3)
-(def ^:private remote-apply-snapshot-retry-delay-ms 50)
+(def ^:private eager-remote-apply-snapshot-retries 3)
+(def ^:private max-remote-apply-snapshot-retries 6)
+(def ^:private remote-apply-snapshot-retry-base-delay-ms 50)
+(def ^:private remote-apply-snapshot-retry-max-delay-ms 1000)
 (def ^:private upload-response-timeout-ms (* 2 60 1000))
 (def ^:private max-upload-request-datoms 5000)
 (defonce ^:private *repo->large-upload-progress (atom {}))
@@ -266,7 +268,9 @@
                    (fn []
                      (when (= request' (dissoc @*upload-request :timer))
                        (reset! *upload-request nil)
-                       (report-upload-response-timeout! client request')))
+                       (report-upload-response-timeout! client request')
+                       (when-let [recover! (:upload-response-timeout-f client)]
+                         (recover! request'))))
                    upload-response-timeout-ms)]
         (reset! *upload-request (assoc request' :timer timer))))))
 
@@ -745,6 +749,47 @@
                  next-datom-count)))
       result)))
 
+(defn- cap-upload-request-bytes
+  [message-base tx-entries payload]
+  (let [tx-entries (vec tx-entries)
+        payload (vec payload)
+        entry-count (count tx-entries)
+        message-for-count (fn [n]
+                            (assoc message-base :txs (subvec payload 0 n)))
+        encoded-size (fn [n]
+                       (sync-transport/encoded-message-byte-length
+                        (message-for-count n)))]
+    (if (zero? entry-count)
+      {:tx-entries []
+       :payload []
+       :message (message-for-count 0)}
+      (let [first-size (encoded-size 1)]
+        (when (> first-size sync-transport/max-ws-message-bytes)
+          (let [entry (first tx-entries)]
+            (throw (ex-info "transaction exceeds safe websocket byte limit"
+                            {:type :db-sync/tx-batch-too-large
+                             :tx-id (some-> (:tx-id entry) str)
+                             :encoded-bytes first-size
+                             :max-bytes sync-transport/max-ws-message-bytes
+                             :datom-count (count (:tx-data entry))}))))
+        ;; JSON message size grows monotonically with appended transaction
+        ;; entries. Binary search avoids repeatedly serializing every growing
+        ;; prefix of a large offline backlog.
+        (loop [low 1
+               high entry-count
+               selected-count 1]
+          (if (> low high)
+            (let [selected-entries (subvec tx-entries 0 selected-count)
+                  selected-payload (subvec payload 0 selected-count)]
+              {:tx-entries selected-entries
+               :payload selected-payload
+               :message (assoc message-base :txs selected-payload)})
+            (let [middle (quot (+ low high) 2)
+                  size (encoded-size middle)]
+              (if (<= size sync-transport/max-ws-message-bytes)
+                (recur (inc middle) high middle)
+                (recur low (dec middle) selected-count)))))))))
+
 (defn- commit-large-upload-progress!
   [repo tx-entries]
   (doseq [{:keys [large-upload-original-tx-id
@@ -991,28 +1036,36 @@
                                               outliner-op
                                               (assoc :outliner-op outliner-op)))
                                           tx-entries*)
-                            tx-ids (into [] (keep :tx-id) tx-entries)]
-                      (when (seq tx-entries)
+                            message-base {:type "tx/batch"
+                                          :client-revision (build-version/revision)
+                                          :t-before local-tx}
+                            capped (cap-upload-request-bytes message-base tx-entries* payload)
+                            tx-entries-to-send (:tx-entries capped)
+                            tx-ids (into [] (keep :tx-id) tx-entries-to-send)]
+                      (when (seq tx-entries-to-send)
                         (reset! (:inflight client) tx-ids)
                         (p/do!
-                         (send! ws {:type "tx/batch"
-                                    :client-revision (build-version/revision)
-                                    :t-before local-tx
-                                    :txs payload})
+                         (send! ws (:message capped))
                          (start-upload-response-timeout!
                           client
                           {:tx-ids tx-ids
-                           :outliner-ops (->> tx-entries
+                           :outliner-ops (->> tx-entries-to-send
                                               (keep :outliner-op)
                                               distinct
                                               vec)
-                           :large-upload-progress (large-upload-progress tx-entries*)
+                           :large-upload-progress (large-upload-progress tx-entries-to-send)
                            :t-before local-tx}))))
                     (p/catch (fn [error]
                                (sync-util/set-last-sync-error! client error)
+                               (when (seq @(:inflight client))
+                                 (when-let [recover! (:upload-send-failed-f client)]
+                                   (recover! error)))
                                (log/error :db-sync/flush-pending-failed
                                           {:repo repo
-                                           :error error}))))))))))))
+                                           :diagnostic
+                                           (dissoc
+                                            (sync-util/error->diagnostic error)
+                                            :at)}))))))))))))
 
 (defn enqueue-flush-pending!
   [repo client]
@@ -1026,7 +1079,10 @@
                  (p/catch (fn [error]
                             (log/error :db-sync/flush-pending-queue-failed
                                        {:repo repo
-                                        :error error}))))))
+                                        :diagnostic
+                                        (dissoc
+                                         (sync-util/error->diagnostic error)
+                                         :at)}))))))
     (flush-pending! repo client)))
 
 (defn- block-ref?
@@ -1277,8 +1333,10 @@
                  (do
                    (log/error ::reverse-local-tx-error
                               {:index index
-                               :local-tx local-tx
-                               :local-txs local-txs})
+                               :tx-id (:tx-id local-tx)
+                               :outliner-op (:outliner-op local-tx)
+                               :local-tx-count (count local-txs)
+                               :error-name (or (.-name e) "Error")})
                    (throw e)))))))
         (keep identity)
         vec)))
@@ -1613,7 +1671,10 @@
                           :outliner-op (:outliner-op local-tx)
                           :undo? (:undo? local-tx)
                           :redo? (:redo? local-tx)
-                          :error error}]
+                          :diagnostic
+                          (dissoc
+                           (sync-util/error->diagnostic error)
+                           :at)}]
             (when-not (expected-stale-rebase-error? error)
               (log/warn :db-sync/drop-op-driven-pending-tx drop-log))
             {:tx-id (:tx-id local-tx)
@@ -1742,21 +1803,24 @@
 
 (defn- report-apply-remote-txs-error!
   [error {:keys [has-local-changes? remote-txs local-txs]}]
-  (try
-    (platform/post-message!
-     (platform/current)
-     :capture-error
-     (cond-> {:error (js/Error. "Sync apply remote txs failed")
-              :payload {:source "db-sync"
-                        :operation "apply-remote-txs"
-                        :has-local-changes? has-local-changes?
-                        :remote-tx-count (count remote-txs)
-                        :local-tx-count (count local-txs)}}
-       (ex-data error)
-       (assoc :extra {:error-data (ex-data error)})))
-    (catch :default report-error
-      (log/error :db-sync/report-apply-remote-txs-error-failed
-                 {:error report-error}))))
+  (let [safe-error-data (select-keys (or (ex-data error) {})
+                                     [:type :code :error :failed-tx-id
+                                      :successful-tx-ids :missing-block-uuids])]
+    (try
+      (platform/post-message!
+       (platform/current)
+       :capture-error
+       (cond-> {:error (js/Error. "Sync apply remote txs failed")
+                :payload {:source "db-sync"
+                          :operation "apply-remote-txs"
+                          :has-local-changes? has-local-changes?
+                          :remote-tx-count (count remote-txs)
+                          :local-tx-count (count local-txs)}}
+         (seq safe-error-data)
+         (assoc :extra {:error-data safe-error-data})))
+      (catch :default report-error
+        (log/error :db-sync/report-apply-remote-txs-error-failed
+                   {:error-name (or (.-name report-error) "Error")})))))
 
 (defn- eager-remote-asset-download-owner?
   []
@@ -1776,6 +1840,31 @@
       (when (seq candidates)
         (sync-assets/download-remote-assets-if-missing! repo (:graph-id client) candidates)))))
 
+(defn- finish-owner-asset-download!
+  [repo download-result]
+  (when download-result
+    (if (= :cli
+           (try
+             (platform/env-flag (platform/current) :owner-source)
+             (catch :default _
+               nil)))
+      ;; A CLI sync command promises a fully hydrated local graph when it
+      ;; exits, so retain the awaited behavior there.
+      download-result
+      (do
+        ;; Desktop text/database sync must not be serialized behind large
+        ;; attachment downloads. The remote metadata is already committed, so
+        ;; missing files can be hydrated safely in the background.
+        (-> download-result
+            (p/catch
+             (fn [error]
+               (log/error :db-sync/remote-asset-background-download-failed
+                          {:repo repo
+                           :error-name
+                           (or (some-> error .-name) "Error")})
+               nil)))
+        nil))))
+
 (defn- finish-apply-remote-txs!
   [repo client remote-tx-data remote-asset-tx-data]
   (when-let [*inflight (:inflight client)]
@@ -1786,15 +1875,37 @@
               (p/catch result
                        (fn [error]
                          (log/error :db-sync/large-title-rehydrate-failed
-                                    {:repo repo :error error}))))
-          _ (download-missing-remote-assets-for-owner! repo client remote-asset-tx-data)]
+                                    {:repo repo
+                                     :diagnostic
+                                     (dissoc
+                                      (sync-util/error->diagnostic error)
+                                      :at)}))))
+          asset-download
+          (download-missing-remote-assets-for-owner!
+           repo client remote-asset-tx-data)
+          _ (finish-owner-asset-download! repo asset-download)]
     nil))
 
-(defn- <retry-apply-remote-txs!
-  [repo client remote-txs snapshot-retry-count]
-  (p/then (p/resolved nil)
-          (fn [_]
-            (apply-remote-txs! repo client remote-txs snapshot-retry-count))))
+(defn- remote-apply-snapshot-retry-action
+  [snapshot-retry-count]
+  (if (< snapshot-retry-count eager-remote-apply-snapshot-retries)
+    :immediate
+    :delayed))
+
+(defn- remote-apply-snapshot-retry-delay-ms
+  [snapshot-retry-count]
+  (let [delayed-attempt (max 0 (- snapshot-retry-count
+                                  eager-remote-apply-snapshot-retries))]
+    (min remote-apply-snapshot-retry-max-delay-ms
+         (* remote-apply-snapshot-retry-base-delay-ms
+            (js/Math.pow 2 delayed-attempt)))))
+
+(defn- pending-tx-log-summary
+  [txs]
+  (let [ids (pending-tx-ids txs)]
+    (cond-> {:count (count ids)}
+      (seq ids) (assoc :first-tx-id (first ids)
+                       :last-tx-id (last ids)))))
 
 (defn- apply-remote-txs-with-retry!
   [{:keys [repo client has-local-changes? remote-txs local-txs apply-context remote-tx-data
@@ -1806,71 +1917,167 @@
                        (catch :default error
                          (if (or (= :pending-tx-snapshot-changed (:code (ex-data error)))
                                  (pending-tx-snapshot-changed? repo local-txs))
-                           (let [retry-payload {:repo repo
+                           (if (>= snapshot-retry-count
+                                   max-remote-apply-snapshot-retries)
+                             (throw
+                              (ex-info
+                               "remote apply deferred until local edits settle"
+                               {:type :db-sync/remote-apply-deferred
+                                :repo repo
+                                :snapshot-retry-count snapshot-retry-count
+                                :remote-tx-count (count remote-txs)}
+                               error))
+                             (let [error-data (ex-data error)
+                                 current-local-txs (pending-txs repo)
+                                 retry-payload {:repo repo
                                                 :snapshot-retry-count snapshot-retry-count
                                                 :remote-tx-count (count remote-txs)
-                                                :local-tx-ids (pending-tx-ids local-txs)
-                                                :current-local-tx-ids (pending-tx-ids (pending-txs repo))
-                                                :error error}]
-                             (if (< snapshot-retry-count max-remote-apply-snapshot-retries)
+                                                :local-txs (pending-tx-log-summary local-txs)
+                                                :current-local-txs
+                                                (pending-tx-log-summary current-local-txs)
+                                                :error-code (or (:code error-data)
+                                                                (:type error-data)
+                                                                :snapshot-drift)}]
+                             (case (remote-apply-snapshot-retry-action snapshot-retry-count)
+                               :immediate
                                (do
                                  (log/warn :db-sync/retry-remote-apply-after-local-tx-snapshot-drift
                                            retry-payload)
-                                 {::retry-result
-                                  (<retry-apply-remote-txs! repo client remote-txs (inc snapshot-retry-count))})
+                                 {::retry-delay-ms 0})
+
+                               :delayed
                                (do
                                  (log/warn :db-sync/delay-remote-apply-after-local-tx-snapshot-drift
                                            retry-payload)
-                                 {::retry-result
-                                  (p/then (p/delay remote-apply-snapshot-retry-delay-ms)
-                                          (fn [_]
-                                            (apply-remote-txs! repo client remote-txs 0)))})))
+                                 {::retry-delay-ms
+                                  (remote-apply-snapshot-retry-delay-ms
+                                   snapshot-retry-count)}))))
                            (do
                              (log/error :db-sync/apply-remote-txs-failed
                                         {:repo repo
                                          :has-local-changes? has-local-changes?
                                          :remote-tx-count (count remote-txs)
                                          :local-tx-count (count local-txs)
-                                         :remote-txs remote-txs
-                                         :local-txs local-txs
-                                         :error error})
+                                         :remote-tx-ids (into [] (keep :tx-id) remote-txs)
+                                         :local-tx-ids (pending-tx-ids local-txs)
+                                         :error-code (or (:code (ex-data error))
+                                                         (:type (ex-data error))
+                                                         :apply-failed)
+                                         :error-name (or (.-name error) "Error")})
                              (report-apply-remote-txs-error!
                               error
                               {:has-local-changes? has-local-changes?
                                :remote-txs remote-txs
                                :local-txs local-txs})
-                             (throw error)))))]
-    (if (contains? apply-result ::retry-result)
-      (::retry-result apply-result)
+                             (throw
+                              (ex-info
+                               "remote transaction apply failed"
+                               (cond-> {:type :db-sync/remote-apply-failed
+                                        :repo repo
+                                        :remote-tx-count (count remote-txs)
+                                        :local-tx-count (count local-txs)}
+                                 (:type (ex-data error))
+                                 (assoc :cause-type (:type (ex-data error)))
+                                 (:code (ex-data error))
+                                 (assoc :cause-code (:code (ex-data error))))
+                               error))))))]
+    (if (contains? apply-result ::retry-delay-ms)
+      apply-result
       (finish-apply-remote-txs! repo client remote-tx-data (:remote-asset-tx-data apply-result)))))
+
+(defn- apply-remote-txs-once!
+  [repo client remote-txs snapshot-retry-count]
+  (if-let [conn (worker-state/get-datascript-conn repo)]
+    (let [local-txs (pending-txs repo)
+          has-local-changes? (boolean (seq local-txs))
+          remote-tx-data* (mapcat :tx-data remote-txs)
+          db-migrate? (remote-txs-db-migrate? remote-txs)
+          apply-context {:repo repo
+                         :conn conn
+                         :local-txs local-txs
+                         :remote-txs remote-txs
+                         :temp-tx-meta {:rtc-tx? true
+                                        :gen-undo-ops? false}
+                         :db-migrate? db-migrate?
+                         :skip-final-validate? db-migrate?}
+          apply-args {:repo repo
+                      :client client
+                      :has-local-changes? has-local-changes?
+                      :remote-txs remote-txs
+                      :local-txs local-txs
+                      :apply-context apply-context
+                      :remote-tx-data remote-tx-data*
+                      :snapshot-retry-count snapshot-retry-count}]
+      (apply-remote-txs-with-retry! apply-args))
+    (fail-fast :db-sync/missing-db {:repo repo :op :apply-remote-txs})))
+
+(defn- retry-apply-remote-txs!
+  [repo client remote-txs initial-snapshot-retry-count initial-delay-ms]
+  ;; Keep a single outer promise for the whole retry period. Delayed attempts
+  ;; are scheduled independently instead of returning a recursively nested
+  ;; promise chain, so continuous editing cannot retain unbounded retry state.
+  (js/Promise.
+   (fn [resolve reject]
+     (letfn [(schedule! [snapshot-retry-count delay-ms]
+               (if (zero? delay-ms)
+                 ;; Yield one microtask so DB listeners can persist a racing
+                 ;; local edit before the next pending-tx snapshot is read.
+                 (js/queueMicrotask #(attempt! snapshot-retry-count))
+                 (js/setTimeout #(attempt! snapshot-retry-count) delay-ms)))
+             (attempt! [snapshot-retry-count]
+               (let [current (current-client repo)
+                     generation (:connection-generation client)
+                     current-generation? (or (nil? generation)
+                                             (and current
+                                                  (= generation
+                                                     (:connection-generation current))))
+                     result
+                     (cond
+                       (not current-generation?)
+                       {::terminal-error
+                        (ex-info "stale remote apply attempt"
+                                 {:type :db-sync/stale-remote-apply
+                                  :repo repo})}
+
+                       :else
+                       (try
+                         (apply-remote-txs-once!
+                          repo client remote-txs snapshot-retry-count)
+                         (catch :default error
+                           {::terminal-error error})))]
+                 (cond
+                   (and (map? result)
+                        (contains? result ::terminal-error))
+                   (reject (::terminal-error result))
+
+                   (and (map? result)
+                        (contains? result ::retry-delay-ms))
+                   (schedule! (inc snapshot-retry-count)
+                              (::retry-delay-ms result))
+
+                   :else
+                   (-> (p/resolved result)
+                       (p/then resolve)
+                       (p/catch reject)))))]
+       (schedule! initial-snapshot-retry-count initial-delay-ms)))))
 
 (defn apply-remote-txs!
   ([repo client remote-txs]
    (apply-remote-txs! repo client remote-txs 0))
   ([repo client remote-txs snapshot-retry-count]
-   (if-let [conn (worker-state/get-datascript-conn repo)]
-     (let [local-txs (pending-txs repo)
-           has-local-changes? (boolean (seq local-txs))
-           remote-tx-data* (mapcat :tx-data remote-txs)
-           db-migrate? (remote-txs-db-migrate? remote-txs)
-           apply-context {:repo repo
-                          :conn conn
-                          :local-txs local-txs
-                          :remote-txs remote-txs
-                          :temp-tx-meta {:rtc-tx? true
-                                         :gen-undo-ops? false}
-                          :db-migrate? db-migrate?
-                          :skip-final-validate? db-migrate?}
-           apply-args {:repo repo
-                       :client client
-                       :has-local-changes? has-local-changes?
-                       :remote-txs remote-txs
-                       :local-txs local-txs
-                       :apply-context apply-context
-                       :remote-tx-data remote-tx-data*
-                       :snapshot-retry-count snapshot-retry-count}]
-       (apply-remote-txs-with-retry! apply-args))
-     (fail-fast :db-sync/missing-db {:repo repo :op :apply-remote-txs}))))
+   ;; Preserve the historical synchronous exception behavior for the first
+   ;; attempt. Only snapshot drift enters the asynchronous retry driver.
+   (let [result (apply-remote-txs-once!
+                 repo client remote-txs snapshot-retry-count)]
+     (if (and (map? result)
+              (contains? result ::retry-delay-ms))
+       (retry-apply-remote-txs!
+        repo
+        client
+        remote-txs
+        (inc snapshot-retry-count)
+        (::retry-delay-ms result))
+       result))))
 
 (defn apply-remote-tx!
   [repo client tx-data]

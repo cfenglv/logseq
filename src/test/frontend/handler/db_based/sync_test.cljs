@@ -437,6 +437,41 @@
                             (reset! state/*db-worker worker-prev)
                             (reset! state/state state-prev)))))))
 
+(deftest rtc-resume-like-triggers-force-reconnect-test
+  (async done
+         (let [calls (atom [])]
+           (-> (p/with-redefs [db-sync/<rtc-resume!
+                               (fn [repo]
+                                 (swap! calls conj [:resume repo])
+                                 (p/resolved nil))
+                               db-sync/<rtc-start!
+                               (fn [repo & _]
+                                 (swap! calls conj [:start repo])
+                                 (p/resolved nil))]
+                 (p/do!
+                  (db-sync/<rtc-start-from-trigger!
+                   :document-visible&rtc-not-running
+                   "desktop-graph")
+                  (db-sync/<rtc-start-from-trigger!
+                   :network-online&rtc-not-running
+                   "network-graph")
+                  (db-sync/<rtc-start-from-trigger!
+                   :mobile-app-active&rtc-not-running
+                   "mobile-graph")
+                  (db-sync/<rtc-start-from-trigger!
+                   :graph-switch
+                   "other-graph")))
+               (p/then (fn [_]
+                         (is (= [[:resume "desktop-graph"]
+                                 [:resume "network-graph"]
+                                 [:resume "mobile-graph"]
+                                 [:start "other-graph"]]
+                                @calls))
+                         (done)))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))
+                          (done)))))))
+
 (deftest sync-auth-state-waits-for-worker-and-uses-refreshed-token-test
   (async done
          (let [state-prev @state/state

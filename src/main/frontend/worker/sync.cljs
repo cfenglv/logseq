@@ -24,11 +24,16 @@
 (def ^:private reconnect-jitter-ms 250)
 (def ^:private ws-heartbeat-interval-ms 30000)
 (def ^:private ws-stale-timeout-ms 90000)
+(def ^:private repair-required-error-types
+  #{:db-sync/checksum-mismatch
+    :db-sync/pull-history-gap
+    :db-sync/remote-apply-failed
+    :db-sync/server-cursor-regressed})
 (def fail-fast sync-util/fail-fast)
 
 (defonce *repo->latest-remote-tx sync-apply/*repo->latest-remote-tx)
 (defonce *repo->latest-remote-checksum sync-apply/*repo->latest-remote-checksum)
-(defonce *start-inflight-target (atom nil))
+(defonce *start-inflight (atom nil))
 
 (defn- current-client
   [repo]
@@ -127,8 +132,12 @@
 (defn- clear-reconnect-timer!
   [reconnect]
   (when-let [timer (:timer @reconnect)]
-    (js/clearTimeout timer)
-    (swap! reconnect assoc :timer nil)))
+    (js/clearTimeout timer))
+  (swap! reconnect
+         (fn [state]
+           (-> state
+               (assoc :timer nil)
+               (dissoc :reason)))))
 
 (defn- reset-reconnect!
   [client]
@@ -165,6 +174,8 @@
   [ws message]
   (sync-transport/send! sync-transport/coerce-ws-client-message ws message))
 
+(declare invalidate-connection!)
+
 (defn- enqueue-receive-message!
   [client task]
   (if-let [queue (:receive-queue client)]
@@ -173,12 +184,27 @@
              (-> (or prev (p/resolved nil))
                  ;; Keep queue alive even if one message handler fails.
                  (p/catch (fn [_] nil))
-                 (p/then (fn [_] (task)))
-                 (p/catch (fn [error]
-                            (sync-util/set-last-sync-error! client error)
-                            (log/error :db-sync/ws-handle-message-failed
-                                       {:repo (:repo client)
-                                        :error error}))))))
+                 (p/then
+                  (fn [_]
+                    (let [current @worker-state/*db-sync-client
+                          generation (:connection-generation client)]
+                      (when (or (nil? generation)
+                                (and current
+                                     (= (:repo client) (:repo current))
+                                     (= generation
+                                        (:connection-generation current))))
+                        (task)))))
+                 (p/catch
+                  (fn [error]
+                    (if-let [message-failed-f (:message-failed-f client)]
+                      (message-failed-f error)
+                      (sync-util/set-last-sync-error! client error))
+                    (log/error :db-sync/ws-handle-message-failed
+                               {:repo (:repo client)
+                                :diagnostic
+                                (dissoc
+                                 (sync-util/error->diagnostic error)
+                                 :at)}))))))
     (task)))
 
 (defn update-presence!
@@ -208,6 +234,7 @@
    :reconnect (atom {:attempt 0 :timer nil})
    :stale-kill-timer (atom nil)
    :last-ws-message-ts (atom (common-util/time-ms))
+   :connection-generation (str (random-uuid))
    :online-users (atom [])
    :ws-state (atom :closed)})
 
@@ -219,22 +246,57 @@
     (let [{:keys [attempt timer]} @reconnect]
       (when (nil? timer)
         (let [delay (reconnect-delay-ms attempt)
-              timeout-id (js/setTimeout
-                          (fn []
-                            (log/info :db-sync/ws-reconnect {:repo repo
-                                                             :db-sync-client-exists? (some? @worker-state/*db-sync-client)})
-                            (swap! reconnect assoc :timer nil)
-                            (when-let [current @worker-state/*db-sync-client]
-                              (when (and (= (:repo current) repo)
-                                         (= (:graph-id current) (:graph-id client)))
-                                (-> (p/let [token (<resolve-ws-token)
-                                            updated (connect! repo current url token)]
-                                      (reset! worker-state/*db-sync-client updated))
-                                    (p/catch (fn [error]
-                                               (log/error :db-sync/ws-reconnect-failed {:repo repo :error error})
-                                               (schedule-reconnect! repo current url :connect-failed)))))))
-                          delay)]
-          (swap! reconnect assoc :timer timeout-id :attempt (inc attempt))
+              *timeout-id (atom nil)
+              timeout-id
+              (js/setTimeout
+               (fn []
+                 (let [attempt-timeout-id @*timeout-id
+                       current-attempt?
+                       (fn []
+                         (let [current @worker-state/*db-sync-client]
+                           (and current
+                                (= (:repo current) repo)
+                                (= (:graph-id current) (:graph-id client))
+                                (identical? reconnect (:reconnect current))
+                                (identical? attempt-timeout-id
+                                            (:timer @reconnect)))))]
+                   (when (current-attempt?)
+                     ;; The timer has fired. Keep its opaque id as the
+                     ;; generation token while auth is pending, but no longer
+                     ;; describe it as a scheduled resume timer. A later
+                     ;; resume/network event may then supersede a hung auth
+                     ;; request.
+                     (swap! reconnect dissoc :reason)
+                     (log/info :db-sync/ws-reconnect
+                               {:repo repo
+                                :db-sync-client-exists?
+                                (some? @worker-state/*db-sync-client)})
+                     (->
+                      (p/let [token (<resolve-ws-token)]
+                        ;; Resolving auth can outlive a suspend/resume or another
+                        ;; network transition. Never let an obsolete attempt
+                        ;; install a second WebSocket over the current client.
+                        (when (current-attempt?)
+                          (let [current @worker-state/*db-sync-client
+                                updated (connect! repo current url token)]
+                            (reset! worker-state/*db-sync-client updated))))
+                      (p/catch
+                       (fn [error]
+                         (when (current-attempt?)
+                           (clear-reconnect-timer! reconnect)
+                           (log/error :db-sync/ws-reconnect-failed
+                                      {:repo repo :error error})
+                           (schedule-reconnect!
+                            repo
+                            @worker-state/*db-sync-client
+                            url
+                            :connect-failed))))))))
+               delay)]
+          (reset! *timeout-id timeout-id)
+          (swap! reconnect assoc
+                 :timer timeout-id
+                 :attempt (inc attempt)
+                 :reason reason)
           (log/info :db-sync/ws-reconnect-scheduled
                     {:repo repo :delay delay :attempt attempt :reason reason}))))))
 
@@ -243,6 +305,8 @@
   (clear-stale-ws-loop-timer! client)
   (sync-apply/clear-upload-response-timeout! client)
   (clear-inflight! client)
+  (when-let [pending-pull-since (:pending-pull-since client)]
+    (reset! pending-pull-since nil))
   (update-online-users! client [])
   (set-ws-state! client :closed)
   (when ws
@@ -250,6 +314,62 @@
     (when close-ws?
       (try (.close ws) (catch :default _ nil))))
   (schedule-reconnect! repo client url reason))
+
+(defn- error-type
+  [error]
+  (or (:type (ex-data error))
+      (:code (ex-data error))))
+
+(defn- repair-required-error?
+  [error]
+  (contains? repair-required-error-types (error-type error)))
+
+(defn- enter-repair-required!
+  [repo client ws error]
+  ;; Protocol/data inconsistencies cannot be healed by reconnecting to the
+  ;; same cursor. Stop the reconnect loop, retain every pending local op, and
+  ;; let the user explicitly retry after inspecting or repairing the graph.
+  (clear-stale-ws-loop-timer! client)
+  (sync-apply/clear-upload-response-timeout! client)
+  (clear-inflight! client)
+  (when-let [reconnect (:reconnect client)]
+    (clear-reconnect-timer! reconnect))
+  (when-let [pending-pull-since (:pending-pull-since client)]
+    (reset! pending-pull-since nil))
+  (sync-util/set-last-sync-error! client error)
+  (update-online-users! client [])
+  (set-ws-state! client :repair-required)
+  (when ws
+    (detach-ws-handlers! ws)
+    (try (.close ws) (catch :default _ nil)))
+  (log/error :db-sync/repair-required
+             {:repo repo
+              :error-type (error-type error)}))
+
+(defn- handle-runtime-sync-failure!
+  [repo client ws url error source]
+  (sync-util/set-last-sync-error! client error)
+  (cond
+    (repair-required-error? error)
+    (enter-repair-required! repo client ws error)
+
+    (= :db-sync/tx-rejected (error-type error))
+    ;; The reject handler has already rolled back/marked the failed entry and
+    ;; scheduled remaining work. Keep the healthy socket and surface the
+    ;; rejected operation without creating a reconnect storm.
+    (do
+      (broadcast-rtc-state! client)
+      (log/warn :db-sync/transaction-rejected-without-reconnect
+                {:repo repo
+                 :source source}))
+
+    :else
+    (do
+      (log/warn :db-sync/runtime-failure-reconnect
+                {:repo repo
+                 :source source
+                 :error-type (error-type error)})
+      (invalidate-connection! repo client ws url source true))))
 
 (defn- attach-ws-handlers!
   [repo client ws url]
@@ -260,7 +380,11 @@
             (enqueue-receive-message! client
                                       (fn []
                                         (sync-handle-message/handle-message! repo client (.-data event)))))))
-  (set! (.-onerror ws) (fn [error] (log/error :db-sync/ws-error error)))
+  (set! (.-onerror ws)
+        (fn [error]
+          (log/error :db-sync/ws-error error)
+          (when (identical? ws (:ws @worker-state/*db-sync-client))
+            (invalidate-connection! repo client ws url :error true))))
   (set! (.-onclose ws)
         (fn [_]
           (when (identical? ws (:ws @worker-state/*db-sync-client))
@@ -336,12 +460,24 @@
   (let [client @worker-state/*db-sync-client
         graph-id (sync-util/get-graph-id repo)
         reconnect (:reconnect client)
-        reconnect-scheduled? (some? (:timer (some-> reconnect deref)))]
+        reconnect-state (some-> reconnect deref)
+        resume-reconnect-scheduled?
+        (and (some? (:timer reconnect-state))
+             (= :system-resume (:reason reconnect-state)))]
     (cond
       (and client
            (= repo (:repo client))
            (= graph-id (:graph-id client))
-           reconnect-scheduled?)
+           (= :repair-required (some-> client :ws-state deref)))
+      ;; Visibility/network resume events must not turn a deterministic data
+      ;; inconsistency into an infinite reconnect loop. The visible Start sync
+      ;; action still calls start! and creates a fresh client explicitly.
+      (p/resolved nil)
+
+      (and client
+           (= repo (:repo client))
+           (= graph-id (:graph-id client))
+           resume-reconnect-scheduled?)
       (p/resolved nil)
 
       (and client
@@ -359,20 +495,78 @@
 
 (defn- connect!
   [repo client url token]
-  (when (:ws client)
-    (stop-client! client))
-  (log/info :db-sync/connect! {:repo repo
-                               :token-exists? (some? (or token (auth-token)))})
-  (when-let [token' (or token (auth-token))]
-    (let [ws (platform/websocket-connect (platform/current) (sync-transport/append-token url token'))
-          updated (assoc client :ws ws)]
+  (let [token' (or token (auth-token))]
+    (log/info :db-sync/connect! {:repo repo
+                                 :token-exists? (some? token')})
+    (when-not (and (string? token') (seq token'))
+      (fail-fast :db-sync/missing-field {:repo repo :field :ws-token}))
+    ;; Resolve auth and construct the replacement socket before tearing down
+    ;; the current client state. Token, proxy, DNS, or TLS setup failures must
+    ;; leave the reconnect generation recoverable.
+    (let [ws (platform/websocket-connect
+              (platform/current)
+              (sync-transport/append-token url token'))
+          _ (when (:ws client)
+              (stop-client! client))
+          updated (assoc client
+                         :ws ws
+                         :connection-generation (str (random-uuid))
+                         :send-queue (atom (p/resolved nil))
+                         :receive-queue (atom (p/resolved nil))
+                         :asset-queue (atom (p/resolved nil))
+                         :upload-response-timeout-f
+                         (fn [_request]
+                           (when-let [current @worker-state/*db-sync-client]
+                             (when (and (= repo (:repo current))
+                                        (= (:graph-id client) (:graph-id current))
+                                        (identical? ws (:ws current)))
+                               (log/warn :db-sync/upload-response-timeout-reconnect
+                                         {:repo repo})
+                               (invalidate-connection!
+                                repo current ws url :upload-response-timeout true))))
+                         :upload-send-failed-f
+                         (fn [_error]
+                           (when-let [current @worker-state/*db-sync-client]
+                             (when (and (= repo (:repo current))
+                                        (= (:graph-id client) (:graph-id current))
+                                        (identical? ws (:ws current)))
+                               (log/warn :db-sync/upload-send-failed-reconnect
+                                         {:repo repo})
+                               (invalidate-connection!
+                                repo current ws url :upload-send-failed true))))
+                         :pull-failed-f
+                         (fn [error]
+                           (when-let [current @worker-state/*db-sync-client]
+                             (when (and (= repo (:repo current))
+                                        (= (:graph-id client) (:graph-id current))
+                                        (identical? ws (:ws current)))
+                               (handle-runtime-sync-failure!
+                                repo current ws url error :pull-failed))))
+                         :message-failed-f
+                         (fn [error]
+                           (when-let [current @worker-state/*db-sync-client]
+                             (when (and (= repo (:repo current))
+                                        (= (:graph-id client) (:graph-id current))
+                                        (identical? ws (:ws current)))
+                               (handle-runtime-sync-failure!
+                                repo current ws url error :message-failed))))
+                         :sync-succeeded-f
+                         (fn []
+                           (when-let [current @worker-state/*db-sync-client]
+                             (when (and (= repo (:repo current))
+                                        (= (:graph-id client) (:graph-id current))
+                                        (identical? ws (:ws current)))
+                               (reset-reconnect! current)
+                               (sync-util/clear-last-sync-error! current)))))]
       (attach-ws-handlers! repo updated ws url)
       (set! (.-onopen ws)
             (fn [_]
-              (reset-reconnect! updated)
+              ;; Opening a socket is not enough to prove that catch-up worked.
+              ;; Keep the attempt count until hello/pull has completed.
+              (when-let [reconnect (:reconnect updated)]
+                (clear-reconnect-timer! reconnect))
               (touch-last-ws-message! updated)
               (set-ws-state! updated :open)
-              (sync-util/clear-last-sync-error! updated)
               (send! ws {:type "hello" :client repo})
               (sync-assets/enqueue-asset-sync!
                repo updated
@@ -410,53 +604,71 @@
 (defn start!
   [repo]
   (let [base (ws-base-url)
-        graph-id (sync-util/get-graph-id repo)
-        start-target [repo graph-id]
-        inflight-target @*start-inflight-target
-        current @worker-state/*db-sync-client]
+        initial-graph-id (sync-util/get-graph-id repo)]
     (if-not (and (string? base) (seq base))
       (do
-        (log/info :db-sync/start-skipped {:repo repo :graph-id graph-id :base base})
+        (log/info :db-sync/start-skipped
+                  {:repo repo :graph-id initial-graph-id :base base})
         (p/resolved nil))
       (p/let [graph-id (<resolve-start-graph-id repo)]
-        (cond
-          (not (seq graph-id))
-          (do
-            (log/info :db-sync/start-skipped {:repo repo :graph-id graph-id :base base})
-            (p/resolved nil))
+        (let [target [repo graph-id]
+              inflight @*start-inflight
+              current @worker-state/*db-sync-client]
+          (cond
+            (not (seq graph-id))
+            (do
+              (log/info :db-sync/start-skipped
+                        {:repo repo :graph-id graph-id :base base})
+              (p/resolved nil))
 
-          (not (client-op-ready? repo))
-          (do
-            (log/info :db-sync/start-skipped {:repo repo :graph-id graph-id :base base :reason :client-op-not-ready})
-            (p/resolved nil))
+            (not (client-op-ready? repo))
+            (do
+              (log/info :db-sync/start-skipped
+                        {:repo repo
+                         :graph-id graph-id
+                         :base base
+                         :reason :client-op-not-ready})
+              (p/resolved nil))
 
-          (= start-target inflight-target)
-          (p/resolved nil)
+            (= target (:target inflight))
+            (:promise inflight)
 
-          (active-client-for? current repo graph-id)
-          (do
-            (broadcast-rtc-state! current)
-            (sync-apply/enqueue-flush-pending! repo current)
-            (p/resolved nil))
+            inflight
+            (-> (:promise inflight)
+                (p/catch (fn [_] nil))
+                (p/then (fn [_] (start! repo))))
 
-          :else
-          (do
-            (reset! *start-inflight-target start-target)
-            (->
-             (p/do!
-              (stop!)
-              (p/let [client (ensure-client-state! repo)
-                      url (sync-transport/format-ws-url base graph-id)
-                      _ (ensure-client-graph-uuid! repo graph-id)
-                      connected (assoc client :graph-id graph-id)
-                      token (<resolve-ws-token)
-                      connected (connect! repo connected url token)]
-                (reset! worker-state/*db-sync-client connected)
-                nil))
-             (p/finally
-               (fn []
-                 (when (= start-target @*start-inflight-target)
-                   (reset! *start-inflight-target nil)))))))))))
+            (active-client-for? current repo graph-id)
+            (do
+              (broadcast-rtc-state! current)
+              (sync-apply/enqueue-flush-pending! repo current)
+              (p/resolved nil))
+
+            :else
+            (let [start-promise
+                  (->
+                   (p/resolved nil)
+                   (p/then
+                    (fn []
+                      (p/do!
+                       (stop!)
+                       (p/let [client (ensure-client-state! repo)
+                               url (sync-transport/format-ws-url base graph-id)
+                               _ (ensure-client-graph-uuid! repo graph-id)
+                               connected (assoc client :graph-id graph-id)
+                               token (<resolve-ws-token)
+                               connected (connect! repo connected url token)]
+                         (reset! worker-state/*db-sync-client connected)
+                         nil)))))]
+              (reset! *start-inflight
+                      {:target target
+                       :promise start-promise})
+              (-> start-promise
+                  (p/finally
+                   (fn []
+                     (when (= start-promise
+                              (:promise @*start-inflight))
+                       (reset! *start-inflight nil))))))))))))
 
 (defn enqueue-local-tx!
   [repo tx-report]

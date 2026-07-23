@@ -6,6 +6,7 @@
             [logseq.db-sync.malli-schema-test]
             [logseq.db-sync.node-adapter-test]
             [logseq.db-sync.node-config-test]
+            [logseq.db-sync.node-dispatch-test]
             [logseq.db-sync.node-server-test]
             [logseq.db-sync.normalize-test]
             [logseq.db-sync.platform-test]
