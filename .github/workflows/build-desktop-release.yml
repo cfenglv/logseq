@@ -104,6 +104,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install desktop test dependencies
+        run: pnpm --dir static install --frozen-lockfile --ignore-workspace
+
       - name: Install db-sync dependencies
         run: pnpm --dir deps/db-sync install --frozen-lockfile
 
