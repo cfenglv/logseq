@@ -113,7 +113,7 @@ jobs:
       - name: Install desktop test dependencies
         run: |
           cp resources/package.json resources/pnpm-lock.yaml static/
-          pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
+          pnpm --dir static install --frozen-lockfile --ignore-workspace
 
       - name: Run RTC client and Electron tests
         run: |
