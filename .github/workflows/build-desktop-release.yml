@@ -929,9 +929,42 @@ jobs:
       ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
       SENTRY_AUTH_TOKEN: "${{ secrets.SENTRY_AUTH_TOKEN }}"
 
+  release-assets-preflight:
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event.inputs.desktop-platforms != 'windows-only' }}
+    needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out release verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download all desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: logseq-*-builds
+          path: ${{ runner.temp }}/desktop-release-assets
+          merge-multiple: true
+
+      - name: Verify complete desktop release asset set
+        run: |
+          version="$(cat "${RUNNER_TEMP}/desktop-release-assets/VERSION")"
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir "${RUNNER_TEMP}/desktop-release-assets" \
+            --version "$version" \
+            --write-checksums
+          cat "${RUNNER_TEMP}/desktop-release-assets/SHA256SUMS.txt"
+
   nightly-release:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' }}
-    needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
+    needs: [ release-assets-preflight ]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -1020,7 +1053,7 @@ jobs:
 
   release:
     if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
-    needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
+    needs: [ release-assets-preflight ]
     runs-on: ubuntu-22.04
     permissions:
       contents: write

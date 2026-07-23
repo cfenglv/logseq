@@ -273,6 +273,18 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
+  /release-assets-preflight:[\s\S]*?pattern: logseq-\*-builds[\s\S]*?merge-multiple: true[\s\S]*?Verify complete desktop release asset set[\s\S]*?verify-desktop-release-assets\.mjs/,
+  "push rehearsals should merge and validate the exact complete six-platform asset set",
+);
+for (const job of ["nightly-release", "release"]) {
+  assert.match(
+    desktopReleaseWorkflow,
+    new RegExp(`${job}:\\n[\\s\\S]*?needs: \\[ release-assets-preflight \\]`),
+    `${job} should publish only after the aggregate asset preflight`,
+  );
+}
+assert.match(
+  desktopReleaseWorkflow,
   /Verify packaged desktop/g,
   "desktop release workflow should verify packaged applications",
 );

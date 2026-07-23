@@ -28,6 +28,11 @@ const version = args.version?.trim();
 if (!version) {
   throw new Error("--version is required");
 }
+if (version.includes("+")) {
+  throw new Error(
+    `release version ${version} contains SemVer build metadata; electron-builder strips build metadata from updater filenames, so use a prerelease version such as -alpha.nightly.YYYYMMDD`,
+  );
+}
 
 const desktopArtifactNames = [
   `Logseq-darwin-arm64-${version}.dmg`,
