@@ -513,6 +513,8 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-15-intel
+    env:
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -557,7 +559,7 @@ jobs:
             ${{ runner.os }}-pnpm-
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.HAS_APPLE_SIGNING == 'true' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
@@ -571,12 +573,29 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Build/Release Electron App for x64
-        run: pnpm install --frozen-lockfile && pnpm rebuild:all && pnpm electron:make
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm rebuild:all
+          if [ "${HAS_APPLE_SIGNING}" = "true" ]; then
+            pnpm electron:make
+          else
+            pnpm electron:make-unsigned --mac dmg zip --x64
+          fi
         working-directory: ./static
         env:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify fork macOS app can load Electron
+        if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
 
       - name: Save x64 artifacts
         run: |
@@ -597,6 +616,8 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-14
+    env:
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -638,7 +659,7 @@ jobs:
           python-version: '3.11'
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.HAS_APPLE_SIGNING == 'true' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
@@ -652,16 +673,31 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Fetch deps
-        run: pnpm install --frozen-lockfile --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
+        run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
         working-directory: ./static
 
       - name: Build/Release Electron App for arm64
-        run: pnpm electron:make-macos-arm64
+        run: |
+          if [ "${HAS_APPLE_SIGNING}" = "true" ]; then
+            pnpm electron:make-macos-arm64
+          else
+            pnpm electron:make-unsigned --mac dmg zip --arm64
+          fi
         working-directory: ./static
         env:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify fork macOS app can load Electron
+        if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
 
       - name: Save arm64 artifacts
         run: |
