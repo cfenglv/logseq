@@ -143,9 +143,6 @@ jobs:
           node --expose-gc --max-old-space-size=128 \
             static/db-sync-backup-memory-test.js
 
-      - name: Verify release configuration
-        run: node scripts/test-cli-release-config.mjs
-
   compile-cljs:
     needs: [ rtc-release-gate ]
     runs-on: ubuntu-22.04
@@ -273,6 +270,9 @@ jobs:
           test -f ./static/js/logseq-cli.js
           test -f ./static/.agents/skills/logseq-cli/SKILL.md
           pnpm desktop:verify-runtime-revisions
+
+      - name: Verify release configuration
+        run: node scripts/test-cli-release-config.mjs
 
       - name: Update APP Version
         run: pnpm pkg set version="${{ steps.ref.outputs.version }}"
