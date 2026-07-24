@@ -1,38 +1,109 @@
-# 自建 Logseq DB Sync / RTC
+# Self-hosted Logseq DB Sync / RTC
 
-本文说明如何在 Cloudflare 上部署本分支的 DB Sync Worker，并让团队桌面客户端连接它。服务端负责同步加密后的图谱数据和实时事务；它不是传统的文件同步，也不会把多人同时编辑自动合并到官方 Logseq 服务。
+This guide deploys the DB Sync server from this repository to Cloudflare and
+connects team desktop clients to it. The server stores encrypted graph
+snapshots, assets, membership metadata, and the real-time transaction stream.
+It is not a traditional file-sync service.
 
-## 费用与组件
+> Status and safety: Logseq DB RTC is still experimental. Start with a
+> non-critical graph, keep independent backups, and validate two-device sync
+> before moving important data.
 
-部署使用以下 Cloudflare 组件：
+## What is included in this repository
 
-- Workers：HTTP、鉴权与 WebSocket 入口。
-- Durable Objects（SQLite）：每个图谱的实时会话和事务状态。
-- D1：用户、图谱和成员关系等元数据。
-- R2 Standard：加密图谱快照和资源文件。
+The complete reproducible server implementation is version-controlled:
 
-Cloudflare 免费额度通常足够小团队测试，但不是“永远零费用”的保证。R2 必须选择 **Standard**；Standard 有免费额度，超出额度后计费，Cloudflare 也可能要求账户先启用计费方式。部署前请在 Cloudflare Dashboard 查看当前用量限制并设置预算告警。
+- `deps/db-sync/src/logseq/db_sync/worker*.cljs`: Worker and Durable Object
+  entry points.
+- `deps/db-sync/src/logseq/db_sync/worker/`: authentication, routing,
+  WebSockets, snapshots, assets, and presence.
+- `deps/db-sync/worker/migrations/`: ordered D1 schema migrations.
+- `deps/db-sync/worker/wrangler.selfhost.example.toml`: safe deployment
+  template without account-specific resource IDs.
+- `deps/db-sync/test/`: protocol, authorization, compatibility, storage, and
+  Node adapter tests.
 
-## 1. 本地准备
+The private `wrangler.selfhost.toml` file is intentionally ignored by Git
+because it contains the deployer's Cloudflare resource IDs. Reproduction uses
+the committed example template and substitutes resources created in the new
+Cloudflare account.
 
-建议使用与 CI 相同的版本：
+## Cost and Cloudflare components
+
+The deployment uses:
+
+- **Workers** for HTTP, authentication, and WebSocket routing.
+- **Durable Objects (SQLite)** for one graph's real-time session and
+  transaction state.
+- **D1** for users, graphs, memberships, and other metadata.
+- **R2 Standard** for encrypted snapshots and assets.
+
+Cloudflare's free allowances are usually enough for a small team test, but
+they do not guarantee permanently zero cost. R2 must use the Standard storage
+class. Review current Cloudflare pricing and limits, enable usage
+notifications, and set a budget before production use.
+
+## Compatibility guarantees
+
+The self-hosted server keeps the existing unversioned v1 HTTP and WebSocket
+contract. In particular:
+
+- Existing clients continue to use the same Worker base URL and v1 routes.
+- New clients negotiate v2 atomic snapshot routes and restart the whole
+  operation through v1 only when the v2 route returns `404`.
+- The optional asset-size header is additive. A new server accepts old clients
+  that do not send it, and an old server ignores it.
+- Server upgrades do not require changing the Worker name, URL, Durable Object
+  class, D1 database, or R2 bucket.
+- D1 migrations are additive and are applied before the new Worker is
+  deployed.
+
+Do not delete or recreate existing Cloudflare resources during an upgrade.
+Keep `name`, `database_id`, `bucket_name`, Durable Object binding, class name,
+and migration tag unchanged in the private configuration.
+
+The wire-level contract is documented in
+[`docs/agent-guide/db-sync/protocol.md`](agent-guide/db-sync/protocol.md).
+
+## 1. Check out an exact revision
+
+For a repeatable deployment, use a release tag or record the exact commit SHA:
+
+```bash
+git clone https://github.com/cfenglv/logseq.git
+cd logseq
+git checkout selfhost/cloudflare-rtc
+git rev-parse HEAD
+```
+
+For production, prefer a tested `2.0.1-selfhost.*` tag once it is available
+instead of following the moving branch.
+
+## 2. Install the build toolchain
+
+Use the versions pinned by CI:
 
 - Node.js 24
 - pnpm 10.33.0
 - Java 21
 - Clojure CLI
 
-在仓库根目录执行：
+From the repository root:
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm --dir deps/db-sync install --frozen-lockfile
+pnpm --dir deps/db-sync test
 pnpm --dir deps/db-sync release
 ```
 
-本分支已在 `deps/db-sync/pnpm-workspace.yaml` 中提交所需原生构建依赖的最小白名单。不要添加 `--ignore-workspace`，否则会绕过这份策略。如果依赖升级后 pnpm 仍报告 `ERR_PNPM_IGNORED_BUILDS`，先审查新增依赖；确有需要时只在该独立 workspace 中运行 `pnpm --dir deps/db-sync approve-builds`，不要全局关闭构建脚本保护。
+The isolated `deps/db-sync/pnpm-workspace.yaml` contains the minimal native
+build-script allowlist. Do not add `--ignore-workspace`, because that bypasses
+the policy. If an upgrade reports `ERR_PNPM_IGNORED_BUILDS`, review the new
+dependency first. Approve only the required package inside this isolated
+workspace; never disable build-script protection globally.
 
-## 2. 登录 Cloudflare 并创建存储
+## 3. Authenticate and create Cloudflare storage
 
 ```bash
 cd deps/db-sync/worker
@@ -41,91 +112,190 @@ pnpm exec wrangler d1 create team-logseq-sync-meta
 pnpm exec wrangler r2 bucket create team-logseq-sync-assets
 ```
 
-记录 D1 命令输出的 `database_id`。R2 bucket 名称可以更换，但必须和后面的配置一致。
+Save the `database_id` printed by the D1 command. The resource names may be
+changed, but the private configuration must use the same names on every later
+deployment.
 
-## 3. 创建部署配置
-
-复制模板，不要直接修改或提交生产配置：
+## 4. Create the private deployment configuration
 
 ```bash
 cp wrangler.selfhost.example.toml wrangler.selfhost.toml
 ```
 
-编辑 `wrangler.selfhost.toml`：
+Edit `wrangler.selfhost.toml`:
 
-- `name`：你的 Worker 名称。
-- `bucket_name`：刚创建的 R2 bucket。
-- `database_name` 和 `database_id`：刚创建的 D1 数据库。
-- Durable Object 的 binding、class 和迁移名称保持模板值不变。
-- Cognito 三项保持模板值，当前桌面客户端使用 Logseq 账号完成认证。
+- Set `name` to the permanent Worker name.
+- Set `bucket_name` to the R2 bucket created above.
+- Set `database_name` and `database_id` to the D1 database.
+- Keep the `LOGSEQ_SYNC_DO` binding, `SyncDO` class, and `v1` migration tag
+  unchanged.
+- Keep the three Cognito values unless the client is also rebuilt for a
+  different authentication provider.
 
-`wrangler.selfhost.toml` 包含真实资源标识，已作为本地配置使用，不应提交到公开仓库。
+The current desktop client uses Logseq Cognito authentication. Hosting this
+Worker does not by itself create an independent account system.
 
-## 4. 初始化 D1 并部署
+The template intentionally pins its compatibility date to the revision used by
+this fork. Do not change it during an ordinary deployment or rolling upgrade;
+update it only as a separately tested runtime migration.
 
-仍在 `deps/db-sync/worker` 目录执行：
+Do not commit `wrangler.selfhost.toml`, `.dev.vars`, access tokens, admin
+tokens, or other secrets. Store Worker secrets with `wrangler secret put`.
+
+## 5. Apply the schema and deploy
+
+Still in `deps/db-sync/worker`:
 
 ```bash
-pnpm exec wrangler d1 migrations apply DB --remote --config wrangler.selfhost.toml
+pnpm exec wrangler d1 migrations apply DB \
+  --remote \
+  --config wrangler.selfhost.toml
+
 pnpm exec wrangler deploy --config wrangler.selfhost.toml
 ```
 
-部署后测试：
+Verify the public health endpoint:
 
 ```bash
 curl https://YOUR-WORKER.workers.dev/health
 ```
 
-应返回包含 `"ok":true` 的 JSON。如果准备使用自定义域名，请先确认该域名在团队所有网络中都能访问，并确保 WebSocket 未被反向代理或企业防火墙阻断。
+It should return JSON containing `"ok":true`.
 
-## 5. 配置每一台 Logseq 客户端
+If a custom domain is used, verify HTTPS and WebSocket connectivity from every
+team network. A custom domain does not automatically bypass a local firewall,
+DNS block, or network policy.
 
-1. 安装本 fork 同一版本的桌面客户端。
-2. 登录 Logseq 账号。
-3. 打开 **Settings → Advanced → Sync Server URL**。
-4. 输入 Worker 基础 URL，例如 `https://team-logseq-sync.example.workers.dev`。
-5. 点击保存。新地址会立即推送给数据库 Worker，无需重启客户端。
+## 6. Configure every Logseq client
 
-只填基础 URL。客户端会自行生成：
+1. Install the same tested release of this fork.
+2. Sign in to the Logseq account.
+3. Open **Settings → Advanced → Sync Server URL**.
+4. Enter only the Worker base URL, for example
+   `https://team-logseq-sync.example.workers.dev`.
+5. Save the setting.
 
-- HTTP API：该基础 URL；
-- RTC WebSocket：`wss://team-logseq-sync.example.workers.dev/sync/<graph-id>`。
+Do not append `/health`, `/sync/<graph-id>`, or another path. The client derives
+the HTTP routes and:
 
-所有成员必须在创建、上传或下载共享图谱前确认使用同一个 Sync Server URL。恢复默认值会重新连接官方服务器，不会访问自建服务器上的团队图谱。
+```text
+wss://team-logseq-sync.example.workers.dev/sync/<graph-id>
+```
 
-## 6. 创建和共享图谱
+Every collaborator must select the same base URL before creating, uploading,
+accepting, or downloading a shared graph. Restoring the default URL reconnects
+the official service and does not expose graphs stored on the self-hosted
+server.
 
-1. 图谱所有者创建或打开一个 DB 图谱，启动同步并等待 pending local/server changes 都变为 0。
-2. 在 Collaboration 中邀请成员。
-3. 成员先设置相同的 Sync Server URL，再接受邀请并下载共享图谱。
-4. 双方各新增一个测试块，确认另一端收到后再迁移重要内容。
+## 7. Create and share a graph
 
-共享图谱中的事务是端到端加密的。服务器仍能看到账号、图谱成员关系、流量和时间等元数据，因此它不是匿名系统。
+1. The owner creates or opens a DB graph and starts sync.
+2. Wait until pending local and server changes are both zero.
+3. Invite members from **Collaboration**.
+4. Each member configures the same Sync Server URL before accepting and
+   downloading the graph.
+5. Create one test block on each device and confirm bidirectional delivery
+   before migrating important content.
 
-## 7. 离线、待机和重连
+Graph transactions and snapshots are end-to-end encrypted when E2EE is
+enabled. The server can still observe account IDs, memberships, timing, traffic
+volume, and other operational metadata; this is not an anonymous system.
 
-本版本不要求始终在线。离线编辑会进入本地待发送队列；网络恢复、系统唤醒或检测到半开连接后，客户端会重新建立 RTC 连接并继续发送。调试信息中的正常收敛状态为：
+## 8. Offline use, sleep, and reconnection
+
+The client does not require a permanent connection. Offline edits remain in
+the local pending queue. Network recovery, system wake, visibility changes,
+and stale-connection detection trigger a reconnect and resume the queue.
+
+A converged debug state looks like:
 
 ```clojure
 {:pending-local-ops 0, :rtc-state :open}
 ```
 
-短暂出现 `:close` 或非零 pending 数量是正常的；长时间不下降时依次检查：
+A temporary `:close` state or non-zero pending count is normal. If it does not
+converge:
 
-1. `/health` 是否可访问。
-2. 客户端 Sync Server URL 是否完全一致。
-3. 系统代理是否同时允许 HTTPS 和 WSS。
-4. Cloudflare Worker / Durable Object 日志是否出现 `tx/reject`、鉴权或存储错误。
+1. Check that `/health` is reachable.
+2. Confirm that every client has the exact same base URL.
+3. Confirm that the system proxy or direct network permits both HTTPS and WSS.
+4. Inspect Worker and Durable Object logs for authorization, `tx/reject`, or
+   storage errors.
+5. Back up the local graph before attempting repair.
 
-不要在问题发生时删除本地图谱数据库。先退出 Logseq 并备份，再保留 More debug info 和 Worker 日志用于诊断。
+Do not delete the local graph database as the first troubleshooting step.
+Preserve **More debug info**, the application logs, and Worker logs.
 
-## 8. macOS 钥匙串与安装提示
+## 9. Upgrade without changing the URL
 
-为了原地读取旧内容，本 fork 与官方版共用应用名称、bundle id 和用户数据目录。代价是自建签名无法复制官方签名的钥匙串授权：
+Use the same private configuration and resources:
 
-- 从 GitHub 下载但未经 Apple 公证的包，macOS 可能阻止首次打开。
-- 钥匙串提示中的“拒绝”可能导致 Safe Storage、登录 Cookie 或令牌不可用，不建议作为日常方案。
-- 同一台 Mac 的固定本地签名可以减少重复授权，但无法让其他成员自动信任。
-- 面向团队彻底消除 Gatekeeper 警告，需要 Apple Developer ID 签名并完成 notarization。
+```bash
+git fetch origin
+git checkout <tested-release-tag-or-commit>
 
-无论使用何种构建，都不要同时运行官方版和本 fork；切换前先退出应用并备份图谱。
+pnpm install --frozen-lockfile
+pnpm --dir deps/db-sync install --frozen-lockfile
+pnpm --dir deps/db-sync test
+pnpm --dir deps/db-sync release
+
+cd deps/db-sync/worker
+pnpm exec wrangler d1 migrations apply DB \
+  --remote \
+  --config wrangler.selfhost.toml
+pnpm exec wrangler deploy --config wrangler.selfhost.toml
+```
+
+Deploying with the same `name` preserves the `workers.dev` URL. Applying
+migrations to the same D1 database preserves graph and membership metadata.
+The same Durable Object namespace and R2 bucket preserve transaction,
+snapshot, and asset data.
+
+During a rolling upgrade, old and new clients may remain connected at the same
+time. Compatibility tests cover legacy v1 WebSocket messages, snapshot
+forwarding, v2-to-v1 fallback, and optional asset headers. Even so, make a
+backup and test one non-critical shared graph before a team-wide client
+upgrade.
+
+## 10. Reproducibility and release checks
+
+Before publishing a server/client revision:
+
+```bash
+pnpm cljs:test
+
+LOGSEQ_STABLE_IDENTS=1 node static/tests.js \
+  -r '^(electron\.(db-worker-manager|power-monitor|proxy)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
+  -e fix-me
+
+pnpm --dir deps/db-sync test
+pnpm --dir deps/db-sync release
+pnpm --dir deps/db-sync test:large-op-128m
+
+cd deps/db-sync/worker
+pnpm exec wrangler deploy --dry-run --config wrangler.selfhost.toml
+```
+
+Record the commit SHA, test results, Wrangler version, deployed Worker version,
+and D1 migration status. A successful build alone does not prove that
+multi-device sleep, reconnect, proxy, or rolling-upgrade behavior works; keep a
+two-device smoke test in the release checklist.
+
+## 11. macOS Keychain and installation
+
+This fork keeps the official application name, bundle ID, and user-data
+location to preserve existing local graphs and settings. A self-built
+signature cannot inherit Apple's Keychain access trust from the official
+signature:
+
+- A GitHub package without Apple Developer ID notarization may be blocked by
+  Gatekeeper on first launch.
+- Denying Keychain access can make Safe Storage, login cookies, or tokens
+  unavailable and is not recommended as a routine workaround.
+- A stable local signing identity can reduce repeated prompts on one Mac, but
+  it does not make other users trust the package automatically.
+- Removing team-wide Gatekeeper warnings requires an Apple Developer ID
+  signature and notarization.
+
+Never run the official build and this fork at the same time. Quit Logseq and
+back up graphs before switching builds.
