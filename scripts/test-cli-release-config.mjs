@@ -14,6 +14,10 @@ const readText = (relativePath) =>
 const readJson = (relativePath) =>
   JSON.parse(readText(relativePath));
 
+const assertContains = (text, needle, label) => {
+  assert.ok(text.includes(needle), `${label} should contain ${needle}`);
+};
+
 const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
 const dbSyncPackage = readJson("deps/db-sync/package.json");
