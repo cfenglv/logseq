@@ -350,8 +350,8 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
-  /compile-cljs:[\s\S]*?needs: \[ rtc-release-gate \]/,
-  "desktop compilation should wait for the RTC release gate",
+  /compile-cljs:[\s\S]*?needs: \[ rtc-release-gate, rtc-browser-e2e \]/,
+  "desktop compilation should wait for both RTC release and browser E2E gates",
 );
 assert.match(
   desktopReleaseWorkflow,
