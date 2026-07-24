@@ -65,7 +65,7 @@
                (ui/button
                 (t :settings.general/check-for-updates)
                 :class "text-sm mr-1"
-                :href "https://github.com/logseq/logseq/releases")
+                :href fv/releases-url)
 
                (mobile-util/native-ios?)
                (ui/button
@@ -91,7 +91,7 @@
                                             [:span (t :settings.general/current-revision-label)]
                                             [:a {:target "_blank"
                                                  :style {:margin-inline-start "0.25rem"}
-                                                 :href (str "https://github.com/logseq/logseq/commit/" revision)}
+                                                 :href (fv/commit-url revision)}
                                              revision]]
                                            :info
                                            false))}
@@ -99,7 +99,7 @@
 
        [:a.text-sm.fade-link.underline.inline
         {:target "_blank"
-         :href "https://docs.logseq.com/#/page/changelog"}
+         :href fv/changelog-url}
         (t :settings.general/changelog)]]]
 
      (when-not (string/blank? type)
@@ -140,7 +140,7 @@
                 [:a.link.inline-flex.items-center.gap-1
                  {:on-click
                   (fn [e]
-                    (js/window.apis.openExternal "https://github.com/logseq/logseq/releases")
+                    (js/window.apis.openExternal fv/releases-url)
                     (util/stop e))}
                  svg/external-link
                  (t :settings.general/release-channel)]]

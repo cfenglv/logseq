@@ -72,6 +72,16 @@ if (!version) {
 } else if (!semverPattern.test(version)) {
   fail(`invalid SemVer release version: ${version}`);
 }
+if (version?.includes("-selfhost.")) {
+  const selfhostRevision = Number(
+    version.match(/^\d+\.\d+\.\d+-selfhost\.(\d+)$/)?.[1],
+  );
+  if (!selfhostRevision || selfhostRevision < 4) {
+    fail(
+      `automatic updater bootstrap requires a numbered selfhost revision >= 4, got ${version}`,
+    );
+  }
+}
 
 if (desktopPackage.version !== version) {
   fail(
@@ -109,6 +119,7 @@ for (const relativePath of [
   "resources/electron-builder-adhoc-after-sign.cjs",
   "resources/entitlements.local-signed.plist",
   "resources/verify-packaged-desktop.mjs",
+  "resources/verify-updater-provider.mjs",
   "scripts/verify-desktop-release-assets.mjs",
   "scripts/run-rtc-e2e.mjs",
   "scripts/run-rtc-prepush.mjs",
@@ -165,6 +176,14 @@ if (
 ) {
   fail(
     "resources/package.json must expose electron:verify-package from the standalone static package",
+  );
+}
+if (
+  desktopPackage.scripts?.["electron:verify-updater-provider"] !==
+  "node ./verify-updater-provider.mjs"
+) {
+  fail(
+    "resources/package.json must expose the updater provider contract rehearsal",
   );
 }
 if (desktopPackage.devDependencies?.["@electron/asar"] !== "3.4.1") {

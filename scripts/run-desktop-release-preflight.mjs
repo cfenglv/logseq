@@ -102,7 +102,7 @@ run(
   [
     "static/tests.js",
     "-r",
-    "^(electron\\.(db-worker-manager|power-monitor|proxy)-test|frontend\\.handler\\.db-based\\.(rtc-background-tasks|sync)-test|frontend\\.worker\\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\\.worker\\.sync\\..*-test|logseq\\.cli\\.command\\.sync-test|logseq\\.db-worker\\.daemon-test)$",
+    "^(electron\\.(db-worker-manager|power-monitor|proxy|updater-config)-test|frontend\\.handler\\.db-based\\.(rtc-background-tasks|sync)-test|frontend\\.worker\\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\\.worker\\.sync\\..*-test|logseq\\.cli\\.command\\.sync-test|logseq\\.db-worker\\.daemon-test)$",
     "-e",
     "fix-me",
   ],
@@ -161,6 +161,11 @@ pnpm("install CLI pnpm dependencies", [
   "--ignore-workspace",
 ]);
 run("build desktop resources", "pnpm", ["exec", "gulp", "build"]);
+pnpm("verify updater provider contract", [
+  "--dir",
+  "static",
+  "electron:verify-updater-provider",
+]);
 pnpm("compile Electron CLJS", ["cljs:release-electron"]);
 pnpm("bundle db-worker-node", ["db-worker-node:bundle"]);
 run("build and stage CLI", "opam", [

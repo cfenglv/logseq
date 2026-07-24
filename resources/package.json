@@ -1,7 +1,7 @@
 {
   "name": "Logseq",
   "productName": "Logseq",
-  "version": "2.0.1-selfhost.3",
+  "version": "2.0.1-selfhost.4",
   "packageManager": "pnpm@10.33.0",
   "main": "electron.js",
   "author": "Logseq",
@@ -15,6 +15,7 @@
     "electron:make-local-signed": "node ../scripts/electron-builder-local-signed.mjs",
     "electron:make-unsigned": "node ./electron-builder-unsigned.mjs",
     "electron:verify-package": "node ./verify-packaged-desktop.mjs",
+    "electron:verify-updater-provider": "node ./verify-updater-provider.mjs",
     "electron:make-linux-arm64": "electron-builder --config electron-builder.yml --linux AppImage zip --arm64 --publish never",
     "electron:publish-snap": "electron-builder --linux snap --x64 --publish always",
     "electron:make-macos-arm64": "electron-builder --config electron-builder.yml --mac dmg zip --arm64 --publish never",

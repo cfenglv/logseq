@@ -203,7 +203,7 @@ jobs:
       - name: Run RTC client and Electron tests
         run: |
           LOGSEQ_STABLE_IDENTS=1 node static/tests.js \
-            -r '^(electron\.(db-worker-manager|power-monitor|proxy)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
+            -r '^(electron\.(db-worker-manager|power-monitor|proxy|updater-config)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
             -e fix-me
 
       - name: Run db-sync server tests
@@ -434,7 +434,7 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Build/Release Electron App
-        run: pnpm install --frozen-lockfile && pnpm electron:make
+        run: pnpm install --frozen-lockfile && pnpm electron:verify-updater-provider && pnpm electron:make
         working-directory: ./static
 
       - name: Verify packaged desktop
@@ -497,7 +497,7 @@ jobs:
         working-directory: ./static
 
       - name: Build/Release Electron App
-        run: pnpm electron:make-linux-arm64
+        run: pnpm electron:verify-updater-provider && pnpm electron:make-linux-arm64
         working-directory: ./static
 
       - name: Verify packaged desktop
@@ -557,6 +557,10 @@ jobs:
 
       - name: Deps Electron app
         run: pnpm install --frozen-lockfile
+        working-directory: ./static
+
+      - name: Verify updater provider contract
+        run: pnpm electron:verify-updater-provider
         working-directory: ./static
 
       - name: Build/Release signed Electron app
@@ -641,6 +645,10 @@ jobs:
 
       - name: Deps Electron app
         run: pnpm install --frozen-lockfile
+        working-directory: ./static
+
+      - name: Verify updater provider contract
+        run: pnpm electron:verify-updater-provider
         working-directory: ./static
 
       - name: Build/Release signed Electron app
@@ -759,6 +767,7 @@ jobs:
         run: |
           pnpm install --frozen-lockfile --ignore-workspace
           pnpm rebuild:all
+          pnpm electron:verify-updater-provider
           if [ "${HAS_APPLE_SIGNING}" = "true" ]; then
             pnpm electron:make
           else
@@ -869,7 +878,7 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Fetch deps
-        run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
+        run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all && pnpm electron:verify-updater-provider
         working-directory: ./static
 
       - name: Build/Release Electron App for arm64
@@ -1144,7 +1153,7 @@ jobs:
           name: ${{ github.event.inputs.build-target == 'beta' && format('Desktop APP {0} (Beta Testing)', steps.ref.outputs.version) || format('Desktop APP {0}', steps.ref.outputs.version) }}
           body_path: docs/releases/${{ steps.ref.outputs.version }}.md
           draft: ${{ github.event.inputs.is-draft }}
-          prerelease: ${{ github.event.inputs.is-pre-release }}
+          prerelease: ${{ !contains(steps.ref.outputs.version, '-selfhost.') && github.event.inputs.is-pre-release }}
           files: |
             ./VERSION
             ./SHA256SUMS.txt

@@ -13,11 +13,12 @@ Compared with upstream Logseq, this fork adds or fixes:
 - Strict checksum and transaction-cursor validation, bounded-memory retry during continuous editing, and local database restoration if snapshot activation fails.
 - Hardened graph access, member revocation, WebSocket error handling, payload limits, and Node server lifecycle cleanup.
 - GitHub Actions builds for macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64.
+- In-application update discovery for production selfhost releases starting with `2.0.1-selfhost.4`, with architecture-specific metadata and a six-target provider rehearsal.
 - Electron 42.4.1, including upstream Safe Storage initialization fixes that reduce unnecessary macOS Keychain prompts.
 
 To configure a client, open **Settings → Advanced → Sync Server URL**, enter the Worker base URL (for example, `https://team-logseq-sync.example.workers.dev`), and save it. Do not append `/health`, `/sync/%s`, or another path. Every collaborator must use the same server URL.
 
-See the [self-hosted Logseq DB Sync / RTC guide](docs/selfhost-sync.md) for the full setup process and the [2.0.1-selfhost.3 release notes](docs/releases/2.0.1-selfhost.3.md) for this release. Installers are available from [this fork's Releases](https://github.com/cfenglv/logseq/releases).
+See the [self-hosted Logseq DB Sync / RTC guide](docs/selfhost-sync.md) for the full setup process and the [2.0.1-selfhost.4 release notes](docs/releases/2.0.1-selfhost.4.md) for this release. Installers are available from [this fork's Releases](https://github.com/cfenglv/logseq/releases).
 
 > Data compatibility: this fork intentionally keeps the `Logseq` product name and `com.logseq.logseq` application ID so it can continue using existing Logseq user data, settings, authentication state, and local graphs. Do not run official Logseq and this fork at the same time. Quit Logseq and back up your graphs before installing or switching builds. macOS packages that are not signed and notarized with an Apple Developer ID may still trigger Gatekeeper warnings.
 

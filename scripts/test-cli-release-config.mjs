@@ -20,6 +20,7 @@ const dbSyncPackage = readJson("deps/db-sync/package.json");
 const dbSyncWorkspace = readText("deps/db-sync/pnpm-workspace.yaml");
 const desktopPackagingGulpfile = readText("gulpfile.js");
 const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const desktopBuilderConfig = readText("resources/electron-builder.yml");
 const unsignedDesktopBuilder = readText("resources/electron-builder-unsigned.mjs");
 const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
 const adhocAfterSign = readText("resources/electron-builder-adhoc-after-sign.cjs");
@@ -29,11 +30,24 @@ const verifyDesktopRuntimeRevisionsScript = readText(
 const desktopReleasePreflight = readText(
   "scripts/desktop-release-preflight.mjs",
 );
+const fullDesktopReleasePreflight = readText(
+  "scripts/run-desktop-release-preflight.mjs",
+);
 const desktopReleaseAssetVerifier = readText(
   "scripts/verify-desktop-release-assets.mjs",
 );
 const packagedDesktopVerifier = readText(
   "resources/verify-packaged-desktop.mjs",
+);
+const updaterProviderVerifier = readText(
+  "resources/verify-updater-provider.mjs",
+);
+const electronUpdater = readText("src/electron/electron/updater.cljs");
+const electronUpdaterConfig = readText(
+  "src/electron/electron/updater_config.cljs",
+);
+const desktopSettings = readText(
+  "src/main/frontend/components/settings.cljs",
 );
 
 const zvecOptionalRuntimeDependencies = [
@@ -78,6 +92,11 @@ assert.equal(
   "the standalone desktop artifact should expose package verification",
 );
 assert.equal(
+  desktopPackage.scripts["electron:verify-updater-provider"],
+  "node ./verify-updater-provider.mjs",
+  "the standalone desktop artifact should expose updater provider verification",
+);
+assert.equal(
   desktopPackage.devDependencies["@electron/asar"],
   "3.4.1",
   "package verification must not rely on a transitive asar dependency",
@@ -86,6 +105,11 @@ assert.match(
   desktopPackagingGulpfile,
   /resourceFilePath = path\.join\(resourcesPath, '\*\*'\)/,
   "desktop resource sync should include the bundled signing scripts",
+);
+assert.match(
+  desktopBuilderConfig,
+  /publish:\s+- provider: github\s+owner: cfenglv\s+repo: logseq/,
+  "packaged selfhost clients should read updates from the fork release feed",
 );
 
 assert.match(
@@ -293,6 +317,17 @@ assert.match(
   /node scripts\/verify-desktop-release-assets\.mjs[\s\S]*?--write-checksums/,
   "desktop release workflow should validate the complete asset set before publishing",
 );
+assert.equal(
+  desktopReleaseWorkflow.match(/pnpm electron:verify-updater-provider/g)
+    ?.length,
+  6,
+  "all six desktop builders should rehearse the updater provider contract",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /prerelease: \$\{\{ !contains\(steps\.ref\.outputs\.version, '-selfhost\.'\) && github\.event\.inputs\.is-pre-release \}\}/,
+  "selfhost versions must be GitHub production releases so /releases/latest can discover them",
+);
 assertNotContains(
   desktopReleaseWorkflow,
   "sha256sum *.apk",
@@ -422,6 +457,53 @@ assert.match(
   desktopReleasePreflight,
   /tracked worktree changes must be committed before release/,
   "desktop preflight should reject dirty tracked release inputs in strict mode",
+);
+assert.match(
+  desktopReleasePreflight,
+  /resources\/verify-updater-provider\.mjs/,
+  "desktop preflight should require the updater provider rehearsal",
+);
+assert.match(
+  fullDesktopReleasePreflight,
+  /verify updater provider contract[\s\S]*?electron:verify-updater-provider/,
+  "the full desktop preflight should execute the real updater provider rehearsal",
+);
+assert.match(
+  electronUpdater,
+  /set! \(\.-allowPrerelease autoUpdater\) allow-prerelease\?/,
+  "the Electron runtime should override prerelease discovery for selfhost versions",
+);
+assert.match(
+  electronUpdaterConfig,
+  /-selfhost\(\?:\\\.\|\$\)/,
+  "the updater contract should identify only selfhost SemVer prereleases",
+);
+assert.match(
+  updaterProviderVerifier,
+  /ERR_UPDATER_NO_PUBLISHED_VERSIONS/,
+  "the updater rehearsal should preserve the original channel mismatch as a regression case",
+);
+assert.match(
+  updaterProviderVerifier,
+  /across six platform\/architecture contracts/,
+  "the updater rehearsal should cover all six desktop targets",
+);
+for (const needle of [
+  'path.join(resourcesDir, "app-update.yml")',
+  '["provider", /^provider:\\s*github\\s*$/m]',
+  '["owner", /^owner:\\s*cfenglv\\s*$/m]',
+  '["repo", /^repo:\\s*logseq\\s*$/m]',
+]) {
+  assertContains(
+    packagedDesktopVerifier,
+    needle,
+    "packaged desktop updater feed verification",
+  );
+}
+assert.match(
+  desktopSettings,
+  /openExternal fv\/releases-url/,
+  "selfhost updater errors should link to the fork release page",
 );
 assert.match(
   desktopReleaseAssetVerifier,
