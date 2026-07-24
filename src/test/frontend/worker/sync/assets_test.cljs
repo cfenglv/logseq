@@ -432,6 +432,51 @@
                 (reset! worker-state/*db-sync-config db-sync-config)
                 (done)))))))
 
+(deftest download-remote-asset-writes-array-buffer-as-uint8-test
+  (async done
+         (let [repo "asset-download-binary-repo"
+               graph-id "graph-download-binary"
+               asset-uuid (random-uuid)
+               original-fetch js/fetch
+               downloaded-bytes (js/Uint8Array. #js [0 127 128 255])
+               written-payload* (atom nil)]
+           (set! js/fetch
+                 (fn [& _]
+                   (p/resolved
+                    #js {:ok true
+                         :status 200
+                         :headers #js {:get (fn [_] "4")}
+                         :arrayBuffer
+                         (fn [] (p/resolved (.-buffer downloaded-bytes)))})))
+           (->
+            (p/with-redefs
+              [sync-auth/http-base-url
+               (fn [_] "https://sync.example.test")
+               sync-assets/graph-aes-key
+               (fn [& _] (p/resolved nil))
+               platform/current
+               (fn [] {})
+               platform/asset-write-bytes!
+               (fn [_platform _repo _file-name payload]
+                 (reset! written-payload* payload)
+                 (p/resolved nil))
+               shared-service/broadcast-to-clients!
+               (fn [& _] nil)]
+              (sync-assets/download-remote-asset!
+               repo graph-id asset-uuid "png"))
+            (p/then
+             (fn [_]
+               (is (instance? js/Uint8Array @written-payload*))
+               (is (= [0 127 128 255]
+                      (js->clj (js/Array.from @written-payload*))))))
+            (p/catch
+             (fn [error]
+               (is false (str "unexpected error: " error))))
+            (p/finally
+              (fn []
+                (set! js/fetch original-fetch)
+                (done)))))))
+
 (deftest download-remote-asset-aborts-after-timeout-test
   (async done
          (let [repo "asset-download-timeout-repo"

@@ -9,7 +9,12 @@
             [cmd]
             (if-let [port (:port cli-opts)]
               (str "-J-Dport=" port " " cmd)
-              cmd)))
+              cmd))
+          (defn rtc-test-command
+            [test-namespace]
+            (if-let [test-var (:var cli-opts)]
+              (str "-Srepro -M:test -v " test-var)
+              (str "-Srepro -M:test -n " test-namespace))))
 
   serve {:doc "Serve static assets"
          :requires ([babashka.http-server :as server])
@@ -36,18 +41,23 @@
                   (System/exit 0))}
 
   rtc-extra-test {:doc "run rtc-extra-test"
-                  :task (do (clojure (clojure-with-port "-Srepro -M:test -n logseq.e2e.rtc-extra-test"))
+                  :task (do (clojure (clojure-with-port
+                                      (rtc-test-command "logseq.e2e.rtc-extra-test")))
                             (System/exit 0))}
 
   rtc-extra-part2-test {:doc "run rtc-extra-part2-test"
-                        :task (do (clojure (clojure-with-port "-Srepro -M:test -n logseq.e2e.rtc-extra-part2-test"))
+                        :task (do (clojure (clojure-with-port
+                                            (rtc-test-command "logseq.e2e.rtc-extra-part2-test")))
                                   (System/exit 0))}
 
-  -run-rtc-extra-test {:depends [serve prn rtc-extra-test]}
-  run-rtc-extra-test {:task (run '-run-rtc-extra-test {:parallel true})}
+  ;; Allocate an isolated port and own the asset-server lifecycle explicitly.
+  ;; This keeps interrupted or repeated E2E runs from leaking a fixed-port
+  ;; server into the next local gate or CI job.
+  run-rtc-extra-test
+  {:task (shell "node" "../scripts/run-rtc-e2e.mjs" "rtc-extra-test")}
 
-  -run-rtc-extra-part2-test {:depends [serve prn rtc-extra-part2-test]}
-  run-rtc-extra-part2-test {:task (run '-run-rtc-extra-part2-test {:parallel true})}
+  run-rtc-extra-part2-test
+  {:task (shell "node" "../scripts/run-rtc-e2e.mjs" "rtc-extra-part2-test")}
 
   -dev {:depends [serve prn test]}
 

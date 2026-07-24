@@ -146,7 +146,8 @@
       :block/parent (get-block-uuid db value)
       :block/page (get-block-uuid db value)
       :block/title
-      (if (= :server-db-v2 mode)
+      (cond
+        (= :server-db-v2 mode)
         (if (and (large-title-object-v2? large-title-object)
                  (or (large-title? value)
                      (= "" value)))
@@ -154,6 +155,18 @@
            (:payload-digest-alg large-title-object)
            (:payload-digest large-title-object)]
           [:title/text value])
+
+        ;; The unversioned checksum remains the rolling-upgrade contract with
+        ;; older servers. Their DB stores an empty transport placeholder while
+        ;; a new client rehydrates the logical title locally. Normalize both
+        ;; forms to the old server representation once an offload marker is
+        ;; present.
+        (and (large-title-object? large-title-object)
+             (or (large-title? value)
+                 (= "" value)))
+        ""
+
+        :else
         value)
       :logseq.property.sync/large-title-object
       (if (= :server-db-v2 mode)

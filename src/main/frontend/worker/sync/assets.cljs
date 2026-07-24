@@ -505,7 +505,11 @@
                           (ldb/read-transit-str
                            (.decode (js/TextDecoder.) body))]
                       (crypt/<decrypt-uint8array aes-key asset-file-untransited)))
-                  _ (<write-asset-bytes! repo asset-id asset-type asset-file)]
+                  ;; Fetch returns an ArrayBuffer for unencrypted assets.
+                  ;; LightningFS accepts typed arrays but can create a zero-byte
+                  ;; file when handed the ArrayBuffer object directly.
+                  _ (<write-asset-bytes! repo asset-id asset-type
+                                         (->uint8 asset-file))]
             (notify-asset-progress! repo asset-id :download body-size total')
             nil)
           (p/catch

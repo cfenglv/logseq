@@ -110,6 +110,7 @@ for (const relativePath of [
   "resources/entitlements.local-signed.plist",
   "resources/verify-packaged-desktop.mjs",
   "scripts/verify-desktop-release-assets.mjs",
+  "scripts/run-rtc-e2e.mjs",
   "scripts/run-rtc-prepush.mjs",
   "deps/db-sync/pnpm-lock.yaml",
   "deps/db-sync/pnpm-workspace.yaml",

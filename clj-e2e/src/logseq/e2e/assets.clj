@@ -78,17 +78,29 @@
          (apply str))))
 
 (defn asset-sha256
-  "Return the SHA-256 of one LightningFS asset, or nil when it is absent."
+  "Return the SHA-256 of one LightningFS asset, or nil when it is absent.
+
+  Hash on the JVM rather than with `crypto.subtle` in the test page. The
+  browser API is restricted to secure contexts and previously made a
+  successfully restored, decodable asset look absent by collapsing that API
+  error to nil."
   [graph-name filename]
-  (let [path (str (assets-dir graph-name) "/" filename)]
-    (w/eval-js
-     (str
-      "(async () => {"
-      "  try {"
-      "    const bytes = await window.pfs.readFile(" (pr-str path) ");"
-      "    const start = bytes.byteOffset || 0;"
-      "    const end = start + bytes.byteLength;"
-      "    const digest = await crypto.subtle.digest('SHA-256', bytes.buffer.slice(start, end));"
-      "    return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');"
-      "  } catch (_) { return null; }"
-      "})()"))))
+  (let [path (str (assets-dir graph-name) "/" filename)
+        payload (w/eval-js
+                 (str
+                  "(async () => {"
+                  "  try {"
+                  "    const bytes = await window.pfs.readFile(" (pr-str path) ");"
+                  "    return Array.from(bytes);"
+                  "  } catch (_) { return null; }"
+                  "})()"))]
+    ;; Playwright deserializes a JavaScript Array as java.util.List, which is
+    ;; seqable but does not satisfy Clojure's `sequential?`.
+    (when (some? payload)
+      (let [digest (java.security.MessageDigest/getInstance "SHA-256")]
+        (->> payload
+             (map #(unchecked-byte (long %)))
+             byte-array
+             (.digest digest)
+             (map #(format "%02x" (bit-and % 0xff)))
+             (apply str))))))

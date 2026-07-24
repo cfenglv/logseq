@@ -9,6 +9,7 @@ Compared with upstream Logseq, this fork adds or fixes:
 - Heartbeats and automatic reconnection after sleep, standby, and network changes. Offline edits remain local and resume syncing when connectivity returns.
 - Recovery from individual rejected transactions, plus a fix for missing `created-by-ref` user entities that could make a shared graph uneditable.
 - Backward-compatible, atomic snapshot upload/download with v2 negotiation and automatic fallback to unchanged v1 endpoints during rolling upgrades.
+- Byte-for-byte attachment restoration in browser-backed graphs, including protection against zero-byte LightningFS writes.
 - Strict checksum and transaction-cursor validation, bounded-memory retry during continuous editing, and local database restoration if snapshot activation fails.
 - Hardened graph access, member revocation, WebSocket error handling, payload limits, and Node server lifecycle cleanup.
 - GitHub Actions builds for macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64.

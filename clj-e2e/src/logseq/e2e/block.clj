@@ -5,8 +5,7 @@
             [logseq.e2e.keyboard :as k]
             [logseq.e2e.locator :as loc]
             [logseq.e2e.util :as util]
-            [wally.main :as w]
-            [wally.repl :as repl]))
+            [wally.main :as w]))
 
 (defn open-last-block
   "Open the last existing block or pressing add button to create a new block"
@@ -50,14 +49,21 @@
         (assert/assert-editor-mode)
         (save-block title)
         (catch Throwable e
-          (if in-retry?
-            (throw (ex-info
-                    "new-block exception"
-                    {:current-id (.getAttribute (w/-query ".editor-wrapper textarea") "id")
-                     :last-id last-id}
-                    e))
-            (do (prn :retry-new-block title)
-                (new-block title true))))))))
+          ;; A remote render can replace the transient editor after the input
+          ;; event has already committed the uniquely titled block. Treat the
+          ;; committed UI state as success instead of creating a duplicate.
+          (if (and (not (string/blank? title))
+                   (some #(= title %)
+                         (util/get-page-blocks-contents)))
+            true
+            (if in-retry?
+              (throw (ex-info
+                      "new-block exception"
+                      {:current-id (.getAttribute (w/-query ".editor-wrapper textarea") "id")
+                       :last-id last-id}
+                      e))
+              (do (prn :retry-new-block title)
+                  (new-block title true)))))))))
 
 ;; TODO: support tree
 (defn new-blocks

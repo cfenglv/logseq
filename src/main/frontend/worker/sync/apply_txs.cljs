@@ -22,6 +22,7 @@
    [logseq.common.util :as common-util]
    [logseq.common.version :as build-version]
    [logseq.db :as ldb]
+   [logseq.db-sync.checksum :as sync-checksum]
    [logseq.db-sync.order :as sync-order]
    [logseq.db-sync.tx-sanitize :as tx-sanitize]
    [logseq.db.common.normalize :as db-normalize]
@@ -1073,7 +1074,18 @@
                            marker-txs
                            {:rtc-tx? true
                             :persist-op? false
-                            :op :large-title-marker}))
+                            :op :large-title-marker})
+                          ;; Marker persistence changes the unversioned
+                          ;; checksum from the logical large title to the old
+                          ;; server's empty transport placeholder. Cache both
+                          ;; representations before accepting an ack from
+                          ;; either an old or a versioned server.
+                          (client-op/update-local-checksum
+                           repo
+                           (sync-checksum/recompute-checksum @conn))
+                          (client-op/update-local-server-checksum
+                           repo
+                           (sync-checksum/recompute-server-checksum @conn)))
                         (reset! (:inflight client) tx-ids)
                         (p/do!
                          (send! ws (:message capped))

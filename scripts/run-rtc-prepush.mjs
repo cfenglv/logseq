@@ -95,15 +95,15 @@ run(
 );
 run(
   "RTC browser E2E part 1",
-  "bb",
-  ["run-rtc-extra-test"],
-  { cwd: e2eDir, timeout: 30 * 60 * 1000 },
+  process.execPath,
+  ["scripts/run-rtc-e2e.mjs", "rtc-extra-test"],
+  { timeout: 30 * 60 * 1000 },
 );
 run(
   "RTC browser E2E part 2",
-  "bb",
-  ["run-rtc-extra-part2-test"],
-  { cwd: e2eDir, timeout: 30 * 60 * 1000 },
+  process.execPath,
+  ["scripts/run-rtc-e2e.mjs", "rtc-extra-part2-test"],
+  { timeout: 30 * 60 * 1000 },
 );
 
 const finalSha = capture("git", ["rev-parse", "HEAD"]);

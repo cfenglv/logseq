@@ -1,7 +1,7 @@
 (ns logseq.e2e.rtc-extra-part2-test
   (:require [clojure.java.io :as io]
             [clojure.string :as string]
-            [clojure.test :refer [deftest testing is use-fixtures run-test]]
+            [clojure.test :refer [deftest testing is use-fixtures]]
             [jsonista.core :as json]
             [logseq.e2e.api :refer [ls-api-call!]]
             [logseq.e2e.assets :as e2e-assets]
@@ -14,8 +14,7 @@
             [logseq.e2e.page :as page]
             [logseq.e2e.rtc :as rtc]
             [logseq.e2e.util :as util]
-            [wally.main :as w]
-            [wally.repl :as repl]))
+            [wally.main :as w]))
 
 (use-fixtures :once
   fixtures/open-2-pages
@@ -121,6 +120,10 @@
                      d)
       :else d)))
 
+(defn- page-has-block-title?
+  [title]
+  (boolean (some #(= title %) (util/get-page-blocks-contents))))
+
 (defn- new-block-safe!
   [title]
   (loop [attempt 4]
@@ -132,17 +135,49 @@
               false))]
       (if created?
         true
-        (if (zero? attempt)
-          (throw (ex-info "new-block-safe failed" {:title title}))
-          (do
-            (util/exit-edit)
-            (util/wait-timeout 80)
-            (try
-              (b/open-last-block)
-              (catch Throwable _
-                nil))
-            (util/wait-timeout 80)
-            (recur (dec attempt))))))))
+        ;; `b/new-block` verifies transient editor DOM after committing the
+        ;; block. A concurrent remote render can replace that DOM even though
+        ;; the uniquely named block was committed; do not create a duplicate
+        ;; in that case.
+        (if (page-has-block-title? title)
+          true
+          (if (zero? attempt)
+            (throw (ex-info "new-block-safe failed" {:title title}))
+            (do
+              (util/exit-edit)
+              (util/wait-timeout 80)
+              (try
+                (b/open-last-block)
+                (catch Throwable _
+                  nil))
+              (util/wait-timeout 80)
+              (recur (dec attempt)))))))))
+
+(defn- save-block-safe!
+  [original-title updated-title]
+  (loop [attempt 4]
+    (let [saved?
+          (try
+            (b/save-block updated-title)
+            true
+            (catch Throwable _
+              (page-has-block-title? updated-title)))]
+      (cond
+        saved?
+        true
+
+        (zero? attempt)
+        (throw (ex-info "save-block-safe failed"
+                        {:original-title original-title
+                         :updated-title updated-title}))
+
+        :else
+        (do
+          (util/exit-edit)
+          (if (page-has-block-title? original-title)
+            (b/jump-to-block original-title)
+            (new-block-safe! original-title))
+          (recur (dec attempt)))))))
 
 (defn- sync-by-trigger!
   ([tag]
@@ -171,25 +206,25 @@
 (defn- seed-long-nested-page!
   [seed]
   (let [seed-blocks (max 20 (env-int "DB_SYNC_E2E_STRESS_SEED_BLOCKS" stress-default-seed-blocks))
-        rng (java.util.Random. (long (+ seed 97)))]
-    (let [titles
-          (w/with-page @*page1
-            (util/exit-edit)
-            (loop [i 0
-                   depth 0
-                   titles #{}]
-              (if (< i seed-blocks)
-                (let [title (format "seed-r%s-%03d" seed i)
-                      target-depth (.nextInt rng (inc stress-max-seed-depth))]
-                  (new-block-safe! title)
-                  (recur (inc i)
-                         (align-depth! depth target-depth)
-                         (conj titles title)))
-                (do
-                  (util/exit-edit)
-                  titles))))]
-      (sync-by-trigger! (str "seed-" seed))
-      titles)))
+        rng (java.util.Random. (long (+ seed 97)))
+        titles
+        (w/with-page @*page1
+          (util/exit-edit)
+          (loop [i 0
+                 depth 0
+                 titles #{}]
+            (if (< i seed-blocks)
+              (let [title (format "seed-r%s-%03d" seed i)
+                    target-depth (.nextInt rng (inc stress-max-seed-depth))]
+                (new-block-safe! title)
+                (recur (inc i)
+                       (align-depth! depth target-depth)
+                       (conj titles title)))
+              (do
+                (util/exit-edit)
+                titles))))]
+    (sync-by-trigger! (str "seed-" seed))
+    titles))
 
 (defn- next-action
   [rng]
@@ -231,7 +266,7 @@
       :save
       (let [save-title (str base "-save-updated")]
         (new-block-safe! (str base "-save"))
-        (b/save-block save-title)
+        (save-block-safe! (str base "-save") save-title)
         (swap! known-titles conj save-title)
         2)
 
@@ -452,6 +487,8 @@ wait for 5-10 seconds, will found that \"aaa/bbb\" became \"aaa/<encrypted-strin
       (w/with-page @*page1
         (let [p (w/get-page)
               before (e2e-assets/list-assets *graph-name*)
+              _ (when-not (util/get-editor)
+                  (b/open-last-block))
               chooser (.waitForFileChooser
                        p
                        (reify Runnable

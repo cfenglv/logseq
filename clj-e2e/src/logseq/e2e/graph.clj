@@ -25,6 +25,7 @@
 (def ^:private rtc-graph-e2ee-toggle "button#rtc-graph-e2ee")
 (def ^:private e2ee-password-poll-ms 250)
 (def ^:private e2ee-password-prompt-grace-ms 2000)
+(def ^:private cloud-ready-timeout-ms 60000)
 
 (defn- input-e2ee-password
   []
@@ -83,7 +84,7 @@
 
   (when enable-sync?
     (maybe-input-e2ee-password)
-    (w/wait-for cloud-ready-indicator {:timeout 20000}))
+    (w/wait-for cloud-ready-indicator {:timeout cloud-ready-timeout-ms}))
 
   ;; new graph can blocks the ui because the db need to be created and restored,
   ;; I have no idea why `search-and-click` failed to auto-wait sometimes.
@@ -126,7 +127,7 @@
   (w/click (.last (w/-query (format "div[data-testid='logseq_db_%1$s'] span:has-text('%1$s')" to-graph-name))))
   (when wait-sync?
     (when need-input-password? (maybe-input-e2ee-password))
-    (w/wait-for cloud-ready-indicator {:timeout 20000}))
+    (w/wait-for cloud-ready-indicator {:timeout cloud-ready-timeout-ms}))
   (assert/assert-graph-loaded?))
 
 (defn validate-graph

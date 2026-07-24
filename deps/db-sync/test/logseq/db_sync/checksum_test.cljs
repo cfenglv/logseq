@@ -93,10 +93,36 @@
                                [:db/add 4
                                 :logseq.property.sync/large-title-object
                                 object]]))]
-    (is (not= (checksum/recompute-checksum logical-db)
-              (checksum/recompute-checksum server-db)))
+    (is (= (checksum/recompute-checksum logical-db)
+           (checksum/recompute-checksum server-db))
+        "the unversioned checksum must emulate the old server transport DB")
     (is (= (checksum/recompute-server-checksum logical-db)
            (checksum/recompute-server-checksum server-db)))))
+
+(deftest adding-large-title-marker-advances-legacy-checksum-to-server-view-test
+  (let [db (sample-db)
+        large-title (apply str (repeat 5000 "a"))
+        object (v2-large-title-object "large-title-marker" "a")
+        logical-db (:db-after
+                    (d/with db [[:db/add 4 :block/title large-title]]))
+        checksum-before (checksum/recompute-checksum logical-db)
+        marker-report
+        (d/with logical-db
+                [[:db/add 4
+                  :logseq.property.sync/large-title-object
+                  object]])
+        logical-with-marker (:db-after marker-report)
+        server-db (:db-after
+                   (d/with db [[:db/add 4 :block/title ""]
+                               [:db/add 4
+                                :logseq.property.sync/large-title-object
+                                object]]))]
+    (is (not= checksum-before
+              (checksum/recompute-checksum logical-with-marker)))
+    (is (= (checksum/recompute-checksum logical-with-marker)
+           (checksum/recompute-checksum server-db)))
+    (is (= (checksum/recompute-checksum logical-with-marker)
+           (checksum/update-checksum checksum-before marker-report)))))
 
 (deftest incremental-server-checksum-matches-recompute-test
   (let [db-before (sample-db)
@@ -122,7 +148,7 @@
                 (checksum/recompute-server-checksum
                  (:db-after short-title-report)))))))
 
-(deftest versioned-server-checksum-covers-mixed-legacy-snapshot-history-test
+(deftest checksums-cover-mixed-snapshot-and-incremental-large-title-history-test
   (let [db (sample-db)
         title-a (apply str (repeat 5000 "a"))
         title-b (apply str (repeat 5000 "b"))
@@ -158,13 +184,11 @@
                    :logseq.property.sync/large-title-object object-b}]))
         mixed-legacy-checksum
         (checksum/update-checksum
-         ;; Snapshot uploads historically persisted the logical checksum while
-         ;; the server DB stored the offloaded placeholder.
          (checksum/recompute-checksum logical-a)
          server-report)]
-    (is (not= mixed-legacy-checksum
-              (checksum/recompute-checksum logical-after))
-        "the historical checksum can encode a mixed logical/placeholder history")
+    (is (= mixed-legacy-checksum
+           (checksum/recompute-checksum logical-after))
+        "the legacy checksum remains compatible with the server transport DB")
     (is (= (checksum/recompute-server-checksum
             (:db-after server-report))
            (checksum/recompute-server-checksum logical-after))

@@ -2535,8 +2535,8 @@
    :payload-digest-alg "sha256-v1"
    :payload-digest (apply str (repeat 64 digest-char))})
 
-(deftest hello-accepts-only-matching-versioned-server-checksum-test
-  (testing "a versioned server checksum bridges large-title transport shape without weakening legacy validation"
+(deftest hello-accepts-old-and-versioned-server-checksums-for-large-title-test
+  (testing "rehydrated large titles keep both old and versioned server checksum contracts"
     (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
           latest-prev @db-sync/*repo->latest-remote-tx
           latest-checksum-prev @db-sync/*repo->latest-remote-checksum
@@ -2544,7 +2544,6 @@
           large-title (apply str (repeat 5000 "a"))
           object (v2-large-title-object "versioned-title-1" "a")
           parent-id (:db/id parent)
-          captured* (atom nil)
           flush-count* (atom 0)
           success-count* (atom 0)
           client {:repo test-repo
@@ -2572,31 +2571,31 @@
                 legacy-checksum (sync-checksum/recompute-checksum server-db)
                 server-checksum
                 (sync-checksum/recompute-server-checksum server-db)
-                raw-message (js/JSON.stringify
-                             (clj->js {:type "hello"
-                                       :t 0
-                                       :checksum legacy-checksum
-                                       :checksum-version
-                                       sync-checksum/server-checksum-version
-                                       :server-checksum server-checksum}))]
+                raw-messages
+                [(js/JSON.stringify
+                  (clj->js {:type "hello"
+                            :t 0
+                            :checksum legacy-checksum}))
+                 (js/JSON.stringify
+                  (clj->js {:type "hello"
+                            :t 0
+                            :checksum legacy-checksum
+                            :checksum-version
+                            sync-checksum/server-checksum-version
+                            :server-checksum server-checksum}))]]
             (is (string? legacy-checksum))
-            (is (not= local-checksum legacy-checksum))
+            (is (= local-checksum legacy-checksum))
             (client-op/update-local-checksum test-repo local-checksum)
             (with-redefs [sync-apply/enqueue-flush-pending!
                           (fn [& _] (swap! flush-count* inc))
-                          sync-log-state/rtc-log
-                          (fn [type payload]
-                            (when (= :rtc.log/checksum-mismatch type)
-                              (reset! captured* {:type type :payload payload})))
                           sync-assets/enqueue-asset-sync! (fn [& _] nil)]
               (try
-                (is (nil? (sync-handle-message/handle-message!
-                           test-repo client raw-message)))
+                (doseq [raw-message raw-messages]
+                  (is (nil? (sync-handle-message/handle-message!
+                             test-repo client raw-message))))
                 (is (= :open @(:ws-state client)))
-                (is (= 1 @success-count*))
-                (is (= 1 @flush-count*))
-                (is (= :versioned-server-checksum
-                       (get-in @captured* [:payload :compatibility])))
+                (is (= 2 @success-count*))
+                (is (= 2 @flush-count*))
                 (finally
                   (reset! db-sync/*repo->latest-remote-tx latest-prev)
                   (reset! db-sync/*repo->latest-remote-checksum
@@ -7915,7 +7914,7 @@
                             (is false (str e))))
                  (p/finally done))))))
 
-(deftest versioned-server-checksum-normalization-is-narrow-test
+(deftest server-checksum-normalization-is-narrow-test
   (let [large-title (apply str (repeat 5000 "a"))
         conn (db-test/create-conn-with-blocks
               {:pages-and-blocks
@@ -7932,15 +7931,17 @@
                              :db-after)]
       (is (= (sync-checksum/recompute-server-checksum placeholder-db)
              (sync-checksum/recompute-server-checksum @conn)))
-      (is (not= (sync-checksum/recompute-checksum placeholder-db)
-                (sync-checksum/recompute-checksum @conn))))
+      (is (= (sync-checksum/recompute-checksum placeholder-db)
+             (sync-checksum/recompute-checksum @conn))))
     (d/transact! conn [[:db/add block-id :block/title "short"]])
     (let [placeholder-db (-> (d/with @conn
                                      [[:db/add block-id :block/title ""]])
                              :db-after)]
       (is (not= (sync-checksum/recompute-server-checksum placeholder-db)
                 (sync-checksum/recompute-server-checksum @conn))
-          "a stale object marker on a short title must not suppress divergence"))))
+          "a stale object marker on a short title must not suppress divergence")
+      (is (not= (sync-checksum/recompute-checksum placeholder-db)
+                (sync-checksum/recompute-checksum @conn))))))
 
 (deftest offload-small-title-test
   (testing "small titles are not offloaded"
@@ -8222,6 +8223,7 @@
                  tx-data [[:db/add block-id :block/title ""]
                           [:db/add block-id :logseq.property.sync/large-title-object
                            {:asset-uuid "title-1" :asset-type "txt"}]]
+                 transport-checksum* (atom nil)
                  download-calls (atom [])
                  download-fn (fn [_repo _graph-id obj _aes-key]
                                (swap! download-calls conj obj)
@@ -8229,9 +8231,11 @@
              (with-datascript-conns conn nil
                (fn []
                  (d/transact! conn tx-data)
+                 (reset! transport-checksum*
+                         (sync-checksum/recompute-checksum @conn))
                  (is (not= logical-checksum
-                           (sync-checksum/recompute-checksum @conn))
-                     "the transformed transport rows are not the logical graph")
+                           @transport-checksum*)
+                     "adding an offload marker advances the legacy checksum to the transport view")
                  (is (some? (worker-state/get-datascript-conn test-repo)))
                  (let [obj-datoms (filter #(= :logseq.property.sync/large-title-object (:a %))
                                           (d/datoms @conn :eavt))
@@ -8263,8 +8267,11 @@
                              block (d/entity @conn block-id)]
                        (is (= [{:asset-uuid "title-1" :asset-type "txt"}] @download-calls))
                        (is (= large-title (:block/title block)))
-                       (is (= logical-checksum
-                              (sync-checksum/recompute-checksum @conn))))
+                       (is (= @transport-checksum*
+                              (sync-checksum/recompute-checksum @conn))
+                           "rehydration must retain the old server checksum")
+                       (is (not= logical-checksum
+                                 (sync-checksum/recompute-checksum @conn))))
                      (p/finally done))))))))
 
 (deftest rehydrate-large-title-tempid-test
