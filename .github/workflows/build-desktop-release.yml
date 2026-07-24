@@ -725,7 +725,7 @@ jobs:
           version: 10.33.0
 
       - name: Install Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -850,7 +850,7 @@ jobs:
             ${{ runner.os }}-arm64-pnpm-
 
       - name: Install Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 

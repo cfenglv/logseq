@@ -353,6 +353,11 @@ assert.match(
   /compile-cljs:[\s\S]*?needs: \[ rtc-release-gate, rtc-browser-e2e \]/,
   "desktop compilation should wait for both RTC release and browser E2E gates",
 );
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /actions\/setup-python@v[1-4]\b/,
+  "desktop release workflow should not use an unsupported setup-python runtime",
+);
 assert.match(
   desktopReleaseWorkflow,
   /rtc-release-gate:[\s\S]*?persist-credentials: false/,
