@@ -73,7 +73,12 @@ pnpm("db-sync frozen install", [
   "install",
   "--frozen-lockfile",
 ]);
-pnpm("compile client tests", ["cljs:test"]);
+run("compile client tests", "clojure", [
+  "-Srepro",
+  "-M:test",
+  "compile",
+  "test",
+]);
 
 const staticDir = path.join(repoRoot, "static");
 fs.mkdirSync(staticDir, { recursive: true });
@@ -120,6 +125,7 @@ pnpm("db-sync 128 MB memory test", [
   "test:large-op-128m",
 ]);
 run("compile client backup memory test", "clojure", [
+  "-Srepro",
   "-M:test",
   "release",
   "db-sync-backup-memory-test",

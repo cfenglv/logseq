@@ -56,10 +56,9 @@
                 (ws/send! ws {:type "error" :message "invalid request"})
                 (case (:type message)
         "hello"
-        (let [checksum (sync-handler/current-checksum self)]
-          (ws/send! ws (cond-> {:type "hello"
-                                :t (sync-handler/t-now self)}
-                         (string? checksum) (assoc :checksum checksum))))
+        (ws/send! ws (merge {:type "hello"
+                             :t (sync-handler/t-now self)}
+                            (sync-handler/checksum-response-fields self)))
 
         "ping"
         (ws/send! ws {:type "pong"})

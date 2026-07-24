@@ -727,6 +727,11 @@
                            :close (fn [] nil)}
                client {:repo repo
                        :graph-id graph-id
+                       :resolve-ws-token-f
+                       (fn []
+                         (if (= 1 (swap! token-calls* inc))
+                           (p/resolved nil)
+                           (p/resolved "token")))
                        :ws old-ws
                        :ws-state (atom :closed)
                        :last-ws-message-ts (atom 0)
@@ -748,12 +753,8 @@
              :crypto {}
              :timers {}
              :sqlite {}})
-           (-> (p/with-redefs [sync/<resolve-ws-token
-                               (fn []
-                                 (if (= 1 (swap! token-calls* inc))
-                                   (p/resolved nil)
-                                   (p/resolved "token")))
-                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+           (-> (p/with-redefs [shared-service/broadcast-to-clients!
+                               (fn [& _] nil)]
                  (#'sync/schedule-reconnect! repo client url :test)
                  (p/let [_ ((:f (first @callbacks*)))
                          _ (is (= 2 (count @callbacks*)))
@@ -795,6 +796,7 @@
                                    :close (fn [] nil)}
                client {:repo repo
                        :graph-id graph-id
+                       :resolve-ws-token-f (fn [] (p/resolved "token"))
                        :ws #js {:readyState 3 :close (fn [] nil)}
                        :ws-state (atom :closed)
                        :last-ws-message-ts (atom 0)
@@ -820,9 +822,8 @@
              :crypto {}
              :timers {}
              :sqlite {}})
-           (-> (p/with-redefs [sync/<resolve-ws-token
-                               (fn [] (p/resolved "token"))
-                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+           (-> (p/with-redefs [shared-service/broadcast-to-clients!
+                               (fn [& _] nil)]
                  (#'sync/schedule-reconnect! repo client url :test)
                  (p/let [_ ((:f (first @callbacks*)))
                          _ (is (= 2 (count @callbacks*))
@@ -861,19 +862,24 @@
                replacement-ws #js {:readyState 0
                                    :send (fn [& _] nil)
                                    :close (fn [] nil)}
+               first-token-promise
+               (js/Promise.
+                (fn [resolve _reject]
+                  (reset! first-token-resolve* resolve)))
                client {:repo repo
                        :graph-id graph-id
+                       :resolve-ws-token-f
+                       (fn []
+                         (if (= 1 (swap! token-calls* inc))
+                           first-token-promise
+                           (p/resolved "fresh-token")))
                        :ws old-ws
                        :ws-state (atom :closed)
                        :last-ws-message-ts (atom 0)
                        :inflight (atom [])
                        :online-users (atom [])
                        :reconnect (atom {:attempt 0 :timer nil})
-                       :stale-kill-timer (atom nil)}
-               first-token-promise
-               (js/Promise.
-                (fn [resolve _reject]
-                  (reset! first-token-resolve* resolve)))]
+                       :stale-kill-timer (atom nil)}]
            (set! js/setTimeout
                  (fn [f delay]
                    (swap! callbacks* conj {:f f :delay delay})
@@ -893,12 +899,8 @@
              :crypto {}
              :timers {}
              :sqlite {}})
-           (-> (p/with-redefs [sync/<resolve-ws-token
-                               (fn []
-                                 (if (= 1 (swap! token-calls* inc))
-                                   first-token-promise
-                                   (p/resolved "fresh-token")))
-                               sync-util/get-graph-id (fn [_repo] graph-id)
+           (-> (p/with-redefs [sync-util/get-graph-id
+                               (fn [_repo] graph-id)
                                shared-service/broadcast-to-clients! (fn [& _] nil)]
                  (#'sync/schedule-reconnect! repo client url :system-resume)
                  (let [old-attempt ((:f (first @callbacks*)))]

@@ -10,6 +10,7 @@
    [frontend.worker.sync.client-op :as client-op]
    [frontend.worker.sync.crypt :as sync-crypt]
    [frontend.worker.sync.large-title :as sync-large-title]
+   [frontend.worker.sync.util :as sync-util]
    [lambdaisland.glogi :as log]
    [logseq.common.config :as common-config]
    [logseq.common.util :as common-util]
@@ -17,12 +18,111 @@
    [promesa.core :as p]))
 
 (def max-asset-size (* 100 1024 1024))
+(def remote-asset-download-timeout-ms (* 10 60 1000))
 
 (defonce *repo->missing-asset-upload-files
   (atom {}))
+(defonce ^:private *repo->preconnect-asset-queue (atom {}))
+(defonce ^:private *repo+asset->inflight-download (atom {}))
+(defonce ^:private *repo->asset-download-controllers (atom {}))
+(defonce ^:private *repo->asset-download-generation (atom {}))
 
 (def ^:private remote-asset-download-parallelism 2)
 (def ^:private text-encoder (js/TextEncoder.))
+
+(defn- asset-download-generation
+  [repo]
+  (get @*repo->asset-download-generation repo 0))
+
+(defn- current-asset-download-generation?
+  [repo generation]
+  (= generation (asset-download-generation repo)))
+
+(defn enqueue-asset-task!
+  "Runs `task` after the client's prior asset task. The returned promise keeps
+  the current task's success or failure, while the stored queue tail recovers
+  from that failure so one transient asset error cannot poison later work."
+  [client task]
+  (if-let [queue (:asset-queue client)]
+    (let [current-task* (atom nil)]
+      (swap! queue
+             (fn [previous]
+               (let [current-task
+                     (-> (or previous (p/resolved nil))
+                         (p/catch (fn [_] nil))
+                         (p/then (fn [_] (task))))]
+                 (reset! current-task* current-task)
+                 (p/catch current-task (fn [_] nil)))))
+      @current-task*)
+    (task)))
+
+(defn- preconnect-asset-queue
+  [repo]
+  (or (get @*repo->preconnect-asset-queue repo)
+      (let [queue (atom (p/resolved nil))]
+        (get (swap! *repo->preconnect-asset-queue
+                    #(if (contains? % repo) % (assoc % repo queue)))
+             repo))))
+
+(defn- enqueue-preconnect-asset-download!
+  [repo asset-id task]
+  (let [download-key [repo (str asset-id)]]
+    (if-let [existing (get @*repo+asset->inflight-download download-key)]
+      (:promise existing)
+      (let [token (js-obj)
+            current (enqueue-asset-task!
+                     {:asset-queue (preconnect-asset-queue repo)}
+                     task)
+            wrapped
+            (p/finally
+              current
+              (fn []
+                (swap! *repo+asset->inflight-download
+                       (fn [inflight]
+                         (if (identical? token
+                                        (:token (get inflight download-key)))
+                           (dissoc inflight download-key)
+                           inflight)))))]
+        (swap! *repo+asset->inflight-download
+               assoc download-key {:token token :promise wrapped})
+        wrapped))))
+
+(defn- register-download-controller!
+  [repo controller]
+  (swap! *repo->asset-download-controllers update repo (fnil conj #{}) controller))
+
+(defn- unregister-download-controller!
+  [repo controller]
+  (swap! *repo->asset-download-controllers
+         (fn [repo->controllers]
+           (let [controllers (disj (get repo->controllers repo #{})
+                                   controller)]
+             (if (seq controllers)
+               (assoc repo->controllers repo controllers)
+               (dissoc repo->controllers repo)))))
+  nil)
+
+(defn cancel-remote-asset-downloads!
+  "Aborts active HTTP downloads and forgets pre-connect queue state for `repo`.
+  Used when a sync client is explicitly stopped; a later start creates fresh
+  queue state and may retry missing assets."
+  [repo]
+  ;; Invalidate tasks that are still waiting in either promise queue before
+  ;; aborting the requests that have already created a controller.
+  (swap! *repo->asset-download-generation update repo (fnil inc 0))
+  (doseq [controller (get @*repo->asset-download-controllers repo)]
+    (try
+      (.abort controller)
+      (catch :default _ nil)))
+  (swap! *repo->asset-download-controllers dissoc repo)
+  (swap! *repo->preconnect-asset-queue dissoc repo)
+  (swap! *repo+asset->inflight-download
+         (fn [inflight]
+           (into {}
+                 (remove (fn [[[repo' _asset-id] _]]
+                           (= repo repo')))
+                 inflight)))
+  nil)
 
 (defn graph-aes-key
   [repo graph-id fail-fast-f]
@@ -369,16 +469,22 @@
 
 (defn download-remote-asset!
   [repo graph-id asset-uuid asset-type]
-  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)
+        asset-id (str asset-uuid)
+        abort-controller (js/AbortController.)
+        timeout-id (js/setTimeout
+                    #(.abort abort-controller)
+                    remote-asset-download-timeout-ms)]
+    (register-download-controller! repo abort-controller)
     (if (and (seq base) (seq graph-id) (seq asset-type))
       (-> (p/let [aes-key (graph-aes-key
                            repo graph-id
                            (fn [tag data]
                              (throw (ex-info (name tag) data))))
-                  asset-id (str asset-uuid)
                   get-url (sync-large-title/asset-url base graph-id asset-id asset-type)
                   headers (sync-auth/auth-headers (worker-state/get-id-token))
-                  request-opts (cond-> {:method "GET"}
+                  request-opts (cond-> {:method "GET"
+                                        :signal (.-signal abort-controller)}
                                  (seq headers) (assoc :headers headers))
                   ^js resp (js/fetch get-url
                                      (clj->js request-opts))
@@ -392,26 +498,39 @@
                   body (.arrayBuffer resp)
                   body-size (.-byteLength body)
                   total' (if (pos? total) total body-size)
-                  _ (notify-asset-progress! repo asset-id :download body-size total')
                   asset-file
                   (if (not aes-key)
                     body
-                    (let [asset-file-untransited (ldb/read-transit-str (.decode (js/TextDecoder.) body))]
-                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))]
-            (<write-asset-bytes! repo asset-id asset-type asset-file))
+                    (let [asset-file-untransited
+                          (ldb/read-transit-str
+                           (.decode (js/TextDecoder.) body))]
+                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))
+                  _ (<write-asset-bytes! repo asset-id asset-type asset-file)]
+            (notify-asset-progress! repo asset-id :download body-size total')
+            nil)
           (p/catch
            (fn [e]
+             ;; A failed body must not leave loaded=0,total>0, which the UI
+             ;; interprets as an active transfer and therefore never retries.
+             (notify-asset-progress! repo asset-id :download 0 0)
              (if (= :rtc.exception/download-asset-failed (:type (ex-data e)))
                (p/rejected e)
                (p/rejected (ex-info "download asset failed"
                                     {:type :rtc.exception/download-asset-failed}
-                                    e))))))
-      (p/rejected (ex-info "missing asset download info"
-                           {:repo repo
-                            :asset-uuid asset-uuid
-                            :asset-type asset-type
-                            :base base
-                            :graph-id graph-id})))))
+                                    e)))))
+          (p/finally
+            (fn []
+              (js/clearTimeout timeout-id)
+              (unregister-download-controller! repo abort-controller))))
+      (do
+        (js/clearTimeout timeout-id)
+        (unregister-download-controller! repo abort-controller)
+        (p/rejected (ex-info "missing asset download info"
+                             {:repo repo
+                              :asset-uuid asset-uuid
+                              :asset-type asset-type
+                              :base base
+                              :graph-id graph-id}))))))
 
 (defn log-request-asset-download-failed!
   [repo asset-uuid error]
@@ -423,33 +542,74 @@
                               (:code (ex-data error))
                               :download-failed)}))
 
+(defn <download-remote-asset-if-missing!
+  "Downloads a remote asset when the DB references it but the local file is absent.
+
+  Returns `true` when a download ran and `false` when the asset already exists."
+  [repo {:keys [graph-id asset-uuid asset-type expected-generation]}]
+  (let [graph-id (or graph-id (sync-util/get-graph-id repo))
+        asset-id (some-> asset-uuid str)
+        asset-type (some-> asset-type str)]
+    (if (and (seq graph-id) (seq asset-id) (seq asset-type))
+      (p/let [meta (platform/asset-stat (platform/current)
+                                        repo
+                                        (asset-file-name asset-id asset-type))]
+        (if (and (some? expected-generation)
+                 (not (current-asset-download-generation?
+                       repo expected-generation)))
+          false
+          (if meta
+          false
+          (p/let [_ (download-remote-asset! repo graph-id asset-id asset-type)]
+            true))))
+      (p/rejected (ex-info "missing asset download info"
+                           {:repo repo
+                            :asset-uuid asset-uuid
+                            :asset-type asset-type
+                            :graph-id graph-id})))))
+
 (defn request-asset-download!
   [repo asset-uuid {:keys [current-client-f enqueue-asset-task-f broadcast-rtc-state!-f]}]
-  (when-let [client (current-client-f repo)]
-    (when-let [graph-id (:graph-id client)]
-      (enqueue-asset-task-f
-       client
-       #(when-let [conn (worker-state/get-datascript-conn repo)]
-          (when-let [ent (d/entity @conn [:block/uuid asset-uuid])]
-            (let [asset-type (:logseq.property.asset/type ent)
-                  asset-id (str asset-uuid)
-                  should-download? (and (seq asset-type)
-                                        (:logseq.property.asset/remote-metadata ent))]
-              (-> (p/let [meta (when should-download?
-                                 (platform/asset-stat (platform/current)
-                                                      repo
-                                                      (asset-file-name asset-id asset-type)))
-                          missing-local? (and should-download? (nil? meta))
-                          _ (when missing-local?
-                              (download-remote-asset! repo graph-id asset-uuid asset-type))
-                          _ (when missing-local?
-                              (client-op/remove-asset-op repo asset-uuid))
-                          _ (when missing-local?
-                              (broadcast-rtc-state!-f client))]
-                    nil)
-                  (p/catch (fn [e]
-                             (log-request-asset-download-failed! repo asset-uuid e)
-                             (p/rejected e)))))))))))
+  ;; Asset downloads are pure HTTP, so they must also work before the WS sync
+  ;; loop is connected, for example immediately after restoring a snapshot.
+  (let [client (current-client-f repo)
+        graph-id (or (:graph-id client)
+                     (sync-util/get-graph-id repo))
+        generation (asset-download-generation repo)
+        runner (fn []
+                 (if-not (current-asset-download-generation? repo generation)
+                   (p/resolved false)
+                   (when-let [conn (worker-state/get-datascript-conn repo)]
+                     (when-let [ent (d/entity @conn [:block/uuid asset-uuid])]
+                       (let [asset-type (:logseq.property.asset/type ent)
+                             external-url (:logseq.property.asset/external-url ent)
+                             should-download? (and (seq asset-type)
+                                                   (:logseq.property.asset/remote-metadata ent)
+                                                   (not (seq (some-> external-url str))))]
+                         (-> (p/let [downloaded?
+                                    (when should-download?
+                                      (<download-remote-asset-if-missing!
+                                       repo
+                                       {:graph-id graph-id
+                                        :asset-uuid asset-uuid
+                                        :asset-type asset-type
+                                        :expected-generation generation}))
+                                    _ (when downloaded?
+                                        (client-op/remove-asset-op repo asset-uuid))
+                                    _ (when downloaded?
+                                        (when-let [current-client
+                                                   (current-client-f repo)]
+                                          (broadcast-rtc-state!-f
+                                           current-client)))]
+                               (boolean downloaded?))
+                             (p/catch (fn [e]
+                                        (log-request-asset-download-failed!
+                                         repo asset-uuid e)
+                                        (p/rejected e)))))))))]
+    (if client
+      (enqueue-asset-task-f client runner)
+      (enqueue-preconnect-asset-download!
+       repo asset-uuid #(or (runner) (p/resolved false))))))
 
 (defn- remote-asset-download-candidates
   [db]
@@ -476,6 +636,7 @@
                         distinct
                         (sort-by (juxt (comp str :asset-uuid) :asset-type)))
         current-platform (platform/current)
+        generation (asset-download-generation repo)
         queue (atom (vec candidates))
         result (atom {:total (count candidates)
                       :downloaded 0
@@ -491,16 +652,27 @@
                                   q)))
                        @selected))
         worker (fn worker []
-                 (if-let [{:keys [asset-uuid asset-type]} (pop-queue!)]
+                 (if-let [{:keys [asset-uuid asset-type]}
+                          (when (current-asset-download-generation?
+                                 repo generation)
+                            (pop-queue!))]
                    (let [asset-id (str asset-uuid)]
                      (p/let [meta (platform/asset-stat current-platform
                                                        repo
                                                        (asset-file-name asset-id asset-type))
-                             _ (if meta
+                             _ (cond
+                                 (not (current-asset-download-generation?
+                                       repo generation))
+                                 nil
+
+                                 meta
                                  (do
                                    (swap! result update :skipped-existing inc)
                                    nil)
-                                 (p/let [_ (download-remote-asset! repo graph-id asset-uuid asset-type)]
+
+                                 :else
+                                 (p/let [_ (download-remote-asset!
+                                            repo graph-id asset-uuid asset-type)]
                                    (swap! result update :downloaded inc)))]
                        (worker)))
                    (p/resolved nil)))]

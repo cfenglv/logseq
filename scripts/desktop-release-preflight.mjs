@@ -110,11 +110,38 @@ for (const relativePath of [
   "resources/entitlements.local-signed.plist",
   "resources/verify-packaged-desktop.mjs",
   "scripts/verify-desktop-release-assets.mjs",
+  "scripts/run-rtc-prepush.mjs",
   "deps/db-sync/pnpm-lock.yaml",
   "deps/db-sync/pnpm-workspace.yaml",
   ".github/workflows/build-desktop-release.yml",
 ]) {
   assertFile(relativePath);
+}
+
+if (
+  rootPackage.scripts?.["rtc:prepush"] !==
+  "node ./scripts/run-rtc-prepush.mjs"
+) {
+  fail("package.json must expose the exact rtc:prepush gate");
+}
+
+const repositoryGuidelines = readText("AGENTS.md");
+assertContains(
+  repositoryGuidelines,
+  "pnpm rtc:prepush",
+  "repository push safety gate",
+);
+
+const rtcE2eWorkflow = readText(".github/workflows/clj-rtc-e2e.yml");
+for (const needle of [
+  "workflow_call:",
+  "source-ref:",
+  "ref: ${{ inputs.source-ref || github.sha }}",
+  "Fetch E2E Clojure deps",
+  "clojure -Srepro -P -M:test",
+  "clojure-e2e-deps-v2-",
+]) {
+  assertContains(rtcE2eWorkflow, needle, "RTC E2E workflow");
 }
 
 const requiredDesktopBuildDependencies = [
@@ -146,6 +173,11 @@ if (desktopPackage.devDependencies?.["@electron/asar"] !== "3.4.1") {
 }
 
 const workflow = readText(".github/workflows/build-desktop-release.yml");
+const workflowVersion = (name) =>
+  workflow.match(new RegExp(`^  ${name}: ['"]?([^'"\\n]+)`, "m"))?.[1];
+const expectedJavaMajor = Number(workflowVersion("JAVA_VERSION"));
+const expectedClojure = workflowVersion("CLOJURE_VERSION");
+const expectedBabashka = workflowVersion("BABASHKA_VERSION");
 for (const needle of [
   "push:",
   "source-preflight:",
@@ -164,6 +196,9 @@ for (const needle of [
   "electron:make-unsigned --mac dmg zip --x64",
   "electron:make-unsigned --mac dmg zip --arm64",
   "codesign --verify --deep --strict",
+  "uses: ./.github/workflows/clj-rtc-e2e.yml",
+  "source-ref: ${{ github.event.inputs.git-ref || github.sha }}",
+  "needs: [ rtc-release-gate, rtc-browser-e2e ]",
 ]) {
   assertContains(workflow, needle, "desktop release workflow");
 }
@@ -209,13 +244,23 @@ if (actualPnpm && actualPnpm !== expectedPnpm) {
 const javaVersion = commandOutput("java", ["-version"]);
 const javaMajorMatch = javaVersion.match(/version "(?:1\.)?(\d+)/);
 const javaMajor = Number(javaMajorMatch?.[1]);
-if (!javaMajor || javaMajor < 21) {
-  fail(`Java 21 or newer is required; detected ${javaVersion || "nothing"}`);
+if (!javaMajor || javaMajor !== expectedJavaMajor) {
+  const message = `Java ${javaMajor || "unknown"} does not match CI major ${expectedJavaMajor}`;
+  strict ? fail(message) : warn(message);
 }
 
-const clojureDescription = commandOutput("clojure", ["-Sdescribe"]);
-if (!clojureDescription.includes(":version")) {
-  fail("Clojure CLI is unavailable or did not return -Sdescribe metadata");
+const clojureVersionOutput = commandOutput("clojure", ["--version"]);
+const actualClojure = clojureVersionOutput.match(/(\d+\.\d+\.\d+\.\d+)/)?.[1];
+if (!actualClojure || actualClojure !== expectedClojure) {
+  const message = `Clojure CLI ${actualClojure || "unknown"} does not match CI ${expectedClojure}`;
+  strict ? fail(message) : warn(message);
+}
+
+const babashkaVersionOutput = commandOutput("bb", ["--version"]);
+const actualBabashka = babashkaVersionOutput.match(/(\d+\.\d+\.\d+)/)?.[1];
+if (!actualBabashka || actualBabashka !== expectedBabashka) {
+  const message = `Babashka ${actualBabashka || "unknown"} does not match CI ${expectedBabashka}`;
+  strict ? fail(message) : warn(message);
 }
 
 const trackedChanges = commandOutput("git", [

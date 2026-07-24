@@ -33,6 +33,14 @@
                      :block/parent 3
                      :block/page 1}]))))
 
+(defn- v2-large-title-object
+  [asset-uuid digest-char]
+  {:asset-uuid asset-uuid
+   :asset-type "txt"
+   :payload-format "utf8-plain-v1"
+   :payload-digest-alg "sha256-v1"
+   :payload-digest (apply str (repeat 64 digest-char))})
+
 (defn- assert-incremental=full!
   [db-before checksum-before tx-data]
   (let [tx-report (d/with db-before tx-data)
@@ -70,6 +78,130 @@
              (checksum/recompute-checksum (:db-after tx-report))))
       (is (= checksum-before
              (checksum/update-checksum checksum-before tx-report))))))
+
+(deftest server-checksum-normalizes-large-title-transport-representation-test
+  (let [db (sample-db)
+        large-title (apply str (repeat 5000 "a"))
+        object (v2-large-title-object "large-title-1" "a")
+        logical-db (:db-after
+                    (d/with db [[:db/add 4 :block/title large-title]
+                                [:db/add 4
+                                 :logseq.property.sync/large-title-object
+                                 object]]))
+        server-db (:db-after
+                   (d/with db [[:db/add 4 :block/title ""]
+                               [:db/add 4
+                                :logseq.property.sync/large-title-object
+                                object]]))]
+    (is (not= (checksum/recompute-checksum logical-db)
+              (checksum/recompute-checksum server-db)))
+    (is (= (checksum/recompute-server-checksum logical-db)
+           (checksum/recompute-server-checksum server-db)))))
+
+(deftest incremental-server-checksum-matches-recompute-test
+  (let [db-before (sample-db)
+        large-title (apply str (repeat 5000 "b"))
+        object (v2-large-title-object "large-title-2" "b")
+        tx-report (d/with db-before
+                          [[:db/add 4 :block/title large-title]
+                           [:db/add 4
+                            :logseq.property.sync/large-title-object
+                            object]])
+        checksum-before (checksum/recompute-server-checksum db-before)]
+    (is (= (checksum/recompute-server-checksum (:db-after tx-report))
+           (checksum/update-server-checksum checksum-before tx-report)))
+    (let [short-title-report
+          (d/with (:db-after tx-report)
+                  [[:db/add 4 :block/title "short title"]])]
+      (is (= (checksum/recompute-server-checksum
+              (:db-after short-title-report))
+             (checksum/update-server-checksum
+              (checksum/recompute-server-checksum (:db-after tx-report))
+              short-title-report)))
+      (is (not= (checksum/recompute-server-checksum (:db-after tx-report))
+                (checksum/recompute-server-checksum
+                 (:db-after short-title-report)))))))
+
+(deftest versioned-server-checksum-covers-mixed-legacy-snapshot-history-test
+  (let [db (sample-db)
+        title-a (apply str (repeat 5000 "a"))
+        title-b (apply str (repeat 5000 "b"))
+        object-a (v2-large-title-object "snapshot-title-a" "a")
+        object-b (v2-large-title-object "later-title-b" "b")
+        block-b-uuid (random-uuid)
+        logical-a (:db-after
+                   (d/with db [[:db/add 4 :block/title title-a]
+                               [:db/add 4
+                                :logseq.property.sync/large-title-object
+                                object-a]]))
+        server-a (:db-after
+                  (d/with db [[:db/add 4 :block/title ""]
+                              [:db/add 4
+                               :logseq.property.sync/large-title-object
+                               object-a]]))
+        server-report
+        (d/with server-a
+                [{:db/id -1
+                  :block/uuid block-b-uuid
+                  :block/title ""
+                  :block/parent 1
+                  :block/page 1
+                  :logseq.property.sync/large-title-object object-b}])
+        logical-after
+        (:db-after
+         (d/with logical-a
+                 [{:db/id -1
+                   :block/uuid block-b-uuid
+                   :block/title title-b
+                   :block/parent 1
+                   :block/page 1
+                   :logseq.property.sync/large-title-object object-b}]))
+        mixed-legacy-checksum
+        (checksum/update-checksum
+         ;; Snapshot uploads historically persisted the logical checksum while
+         ;; the server DB stored the offloaded placeholder.
+         (checksum/recompute-checksum logical-a)
+         server-report)]
+    (is (not= mixed-legacy-checksum
+              (checksum/recompute-checksum logical-after))
+        "the historical checksum can encode a mixed logical/placeholder history")
+    (is (= (checksum/recompute-server-checksum
+            (:db-after server-report))
+           (checksum/recompute-server-checksum logical-after))
+        "the versioned representation is independent of snapshot history")))
+
+(deftest server-db-v2-rejects-legacy-markers-and-distinguishes-content-test
+  (let [db (sample-db)
+        title-a (apply str (repeat 5000 "a"))
+        title-b (apply str (repeat 5000 "b"))
+        marker-a (v2-large-title-object "object-a" "a")
+        marker-b (v2-large-title-object "object-b" "b")
+        legacy-marker {:asset-uuid "legacy" :asset-type "txt"}
+        with-title
+        (fn [title marker]
+          (:db-after
+           (d/with db
+                   (cond-> [[:db/add 4 :block/title title]]
+                     marker
+                     (conj [:db/add 4
+                            :logseq.property.sync/large-title-object
+                            marker])))))]
+    (is (nil? (checksum/recompute-server-checksum
+               (with-title title-a legacy-marker)))
+        "legacy markers have no content proof and cannot advertise v2")
+    (is (not= (checksum/recompute-server-checksum
+               (with-title title-a marker-a))
+              (checksum/recompute-server-checksum
+               (with-title title-b marker-b)))
+        "different payload digests must not collapse")
+    (is (not=
+         (checksum/recompute-server-checksum
+          (with-title
+           "::logseq-sync-large-title::"
+           nil))
+         (checksum/recompute-server-checksum
+          (with-title title-a marker-a)))
+        "a user-entered former sentinel is typed as ordinary text")))
 
 (deftest incremental-checksum-matches-recompute-on-rebased-retract-entity-log-repro-test
   (testing "incremental checksum should equal full recompute on rebased retract-entity replay payload"

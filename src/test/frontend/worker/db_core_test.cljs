@@ -2326,6 +2326,12 @@
                      client-op/update-local-checksum (fn [input-repo checksum]
                                                        (swap! calls conj [:update-local-checksum input-repo checksum])
                                                        nil)
+                     client-op/update-local-server-checksum
+                     (fn [input-repo checksum]
+                       (swap! calls conj
+                              [:update-local-server-checksum
+                               input-repo checksum])
+                       nil)
                      db-view/get-view-data (fn [db view-id option]
                                              (swap! calls conj [:get-view-data db view-id option])
                                              {:view-id view-id})
@@ -2347,7 +2353,11 @@
          (is (= [:value-1] ((get-thread-api :thread-api/get-property-values) repo property-option)))
          (is (= [:p-link] ((get-thread-api :thread-api/get-bidirectional-properties) repo {:target-id "b1"})))
          (is (= {:nodes 1} ((get-thread-api :thread-api/build-graph) repo {:depth 1})))
-         (is (some #(= [:update-local-checksum repo "new-checksum"] %) @calls)))))))
+         (is (some #(= [:update-local-checksum repo "new-checksum"] %) @calls))
+         (is (some #(and (= :update-local-server-checksum (first %))
+                         (= repo (second %))
+                         (string? (nth % 2)))
+                   @calls)))))))
 
 ;; When source and dest built-in eids differ, a :graph (datom) import would trip
 ;; the pipeline's revert-disallowed-changes, which sees the moved :db/ident as a

@@ -264,6 +264,12 @@
                     " on conflict(key) do update set value = excluded.value")
                [(name k) (str v)]))
 
+(defn- sqlite-delete-meta!
+  [db k]
+  (sqlite-run! db
+               "delete from sync_meta where key = ?"
+               [(name k)]))
+
 (defn update-graph-uuid
   [repo graph-uuid]
   {:pre [(some? graph-uuid)]}
@@ -292,14 +298,31 @@
                       {:repo repo
                        :prev-t prev-t
                        :new-t t})))
-    (sqlite-set-meta! store :local-tx t)))
+    (sqlite-set-meta! store :local-tx t)
+    ;; A normal acknowledgement changes only the cursor, so the versioned
+    ;; checksum remains valid. An old-client local edit changes the maintained
+    ;; legacy checksum; in that case do not bless the stale versioned value.
+    (when (and
+           (string? (sqlite-get-meta store :db-sync/server-checksum-v2))
+           (= (sqlite-get-meta
+               store
+               :db-sync/server-checksum-v2-legacy-checksum)
+              (sqlite-get-meta store :db-sync/checksum)))
+      (sqlite-set-meta! store :db-sync/server-checksum-v2-t t))))
 
 (defn reset-local-tx
   "Should be used only when uploading a graph"
   [repo]
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
-    (sqlite-set-meta! store :local-tx 0)))
+    (sqlite-set-meta! store :local-tx 0)
+    (when (and
+           (string? (sqlite-get-meta store :db-sync/server-checksum-v2))
+           (= (sqlite-get-meta
+               store
+               :db-sync/server-checksum-v2-legacy-checksum)
+              (sqlite-get-meta store :db-sync/checksum)))
+      (sqlite-set-meta! store :db-sync/server-checksum-v2-t 0))))
 
 (defn update-local-checksum
   [repo checksum]
@@ -307,6 +330,25 @@
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
     (sqlite-set-meta! store :db-sync/checksum checksum)))
+
+(defn update-local-server-checksum
+  [repo checksum]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (if (string? checksum)
+      (do
+        (sqlite-set-meta! store :db-sync/server-checksum-v2 checksum)
+        (sqlite-set-meta! store
+                          :db-sync/server-checksum-v2-t
+                          (or (get-local-tx repo) 0))
+        (sqlite-set-meta! store
+                          :db-sync/server-checksum-v2-legacy-checksum
+                          (sqlite-get-meta store :db-sync/checksum)))
+      (do
+        (sqlite-delete-meta! store :db-sync/server-checksum-v2)
+        (sqlite-delete-meta! store :db-sync/server-checksum-v2-t)
+        (sqlite-delete-meta!
+         store :db-sync/server-checksum-v2-legacy-checksum)))))
 
 (defn get-pending-local-tx-count
   [repo]
@@ -335,6 +377,26 @@
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
     (sqlite-get-meta store :db-sync/checksum)))
+
+(defn get-local-server-checksum
+  [repo]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (let [checksum (sqlite-get-meta store :db-sync/server-checksum-v2)
+          checksum-t (some-> (sqlite-get-meta
+                              store
+                              :db-sync/server-checksum-v2-t)
+                             (js/parseInt 10))
+          checksum-legacy
+          (sqlite-get-meta store
+                           :db-sync/server-checksum-v2-legacy-checksum)
+          local-t (get-local-tx repo)]
+      ;; Missing/stale watermarks are expected after a client downgrade. The
+      ;; caller recomputes from the current local DB instead of trusting them.
+      (when (and (string? checksum)
+                 (= checksum-t local-t)
+                 (= checksum-legacy (get-local-checksum repo)))
+        checksum))))
 
 (defn rtc-db-graph?
   "Is RTC enabled"

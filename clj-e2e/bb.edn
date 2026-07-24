@@ -17,7 +17,10 @@
                                     :dir "../static/"}
                                    cli-opts))}
 
-  prn {:task (clojure "-X clojure.core/prn" cli-opts)}
+  ;; Keep argument diagnostics in-process. Starting a second Clojure CLI in
+  ;; parallel with the test task races git dependency checkouts in ~/.gitlibs
+  ;; on clean machines and CI runners.
+  prn {:task (clojure.core/prn cli-opts)}
 
   test {:doc "run tests (ns'es ending in '-basic-test'); use -n <ns> to run a single namespace, -v <ns/fn> to run a single test fn, -i <tag> to filter by metadata"
         :task (do (let [ns      (:namespace cli-opts)
@@ -27,17 +30,17 @@
                         inc-arg (when include (str " -i " include))
                         var-arg (when var (str " -v " var))
                         base    (if ns
-                                  (str "-M:test" ns-arg " -e fix-me")
-                                  "-M:test -r \".*\\-basic\\-test$\" -e fix-me")]
+                                  (str "-Srepro -M:test" ns-arg " -e fix-me")
+                                  "-Srepro -M:test -r \".*\\-basic\\-test$\" -e fix-me")]
                     (clojure (clojure-with-port (str base inc-arg var-arg))))
                   (System/exit 0))}
 
   rtc-extra-test {:doc "run rtc-extra-test"
-                  :task (do (clojure (clojure-with-port "-M:test -n logseq.e2e.rtc-extra-test"))
+                  :task (do (clojure (clojure-with-port "-Srepro -M:test -n logseq.e2e.rtc-extra-test"))
                             (System/exit 0))}
 
   rtc-extra-part2-test {:doc "run rtc-extra-part2-test"
-                        :task (do (clojure (clojure-with-port "-M:test -n logseq.e2e.rtc-extra-part2-test"))
+                        :task (do (clojure (clojure-with-port "-Srepro -M:test -n logseq.e2e.rtc-extra-part2-test"))
                                   (System/exit 0))}
 
   -run-rtc-extra-test {:depends [serve prn rtc-extra-test]}

@@ -37,6 +37,7 @@
 
 (defonce *repo->latest-remote-tx (atom {}))
 (defonce *repo->latest-remote-checksum (atom {}))
+(defonce *repo->latest-remote-checksum-version (atom {}))
 ;; Debug-only gate to reproduce one-way sync:
 ;; still pull/rebase remote txs, but skip local tx batch uploads.
 (defonce *repo->upload-stopped? (atom {}))
@@ -57,6 +58,19 @@
 (defn upload-stopped?
   [repo]
   (true? (get @*repo->upload-stopped? repo)))
+
+(defn- versioned-large-title-marker-txs
+  [tx-entries]
+  (->> tx-entries
+       (mapcat :tx-data)
+       (filterv
+        (fn [item]
+          (and (vector? item)
+               (= :db/add (nth item 0 nil))
+               (= sync-large-title/large-title-object-attr
+                  (nth item 2 nil))
+               (sync-large-title/large-title-object-v2?
+                (nth item 3 nil)))))))
 
 (declare enqueue-asset-task!
          apply-remote-txs!
@@ -85,9 +99,11 @@
     :get-missing-asset-upload-files sync-assets/get-missing-asset-upload-files
     :get-local-tx client-op/get-local-tx
     :get-local-checksum client-op/get-local-checksum
+    :get-local-server-checksum client-op/get-local-server-checksum
     :get-graph-uuid client-op/get-graph-uuid
     :latest-remote-tx @*repo->latest-remote-tx
-    :latest-remote-checksum @*repo->latest-remote-checksum}
+    :latest-remote-checksum @*repo->latest-remote-checksum
+    :latest-remote-checksum-version @*repo->latest-remote-checksum-version}
    repo))
 
 (defn- broadcast-rtc-state! [client]
@@ -307,7 +323,9 @@
                                :http-base (sync-auth/http-base-url @worker-state/*db-sync-config)
                                :auth-headers (auth-headers)
                                :fail-fast-f fail-fast
-                               :decrypt-text-value-f sync-crypt/<decrypt-text-value})))
+                               :decrypt-text-value-f sync-crypt/<decrypt-text-value
+                               :strict-decrypt-text-value-f
+                               sync-crypt/<decrypt-text-value-strict})))
           :get-conn-f worker-state/get-datascript-conn
           :graph-e2ee?-f sync-crypt/graph-e2ee?
           :ensure-graph-aes-key-f sync-crypt/<ensure-graph-aes-key
@@ -326,8 +344,7 @@
     :broadcast-rtc-state!-f broadcast-rtc-state!}))
 
 (defn- enqueue-asset-task! [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue (fn [prev] (p/then prev (fn [_] (task)))))))
+  (sync-assets/enqueue-asset-task! client task))
 
 (defn- derive-history-outliner-ops
   [db-before db-after tx-data tx-meta]
@@ -1041,8 +1058,22 @@
                                           :t-before local-tx}
                             capped (cap-upload-request-bytes message-base tx-entries* payload)
                             tx-entries-to-send (:tx-entries capped)
+                            marker-txs
+                            (versioned-large-title-marker-txs
+                             tx-entries-to-send)
                             tx-ids (into [] (keep :tx-id) tx-entries-to-send)]
                       (when (seq tx-entries-to-send)
+                        (when (seq marker-txs)
+                          ;; Persist only markers for the prefix that will
+                          ;; actually be sent. Persisting markers from the
+                          ;; capped tail could advance the local checksum
+                          ;; before the corresponding tx reaches the server.
+                          (ldb/transact!
+                           conn
+                           marker-txs
+                           {:rtc-tx? true
+                            :persist-op? false
+                            :op :large-title-marker}))
                         (reset! (:inflight client) tx-ids)
                         (p/do!
                          (send! ws (:message capped))

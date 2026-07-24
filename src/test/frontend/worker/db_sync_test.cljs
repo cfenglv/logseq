@@ -58,6 +58,20 @@
   {:repo test-repo
    :graph-id "graph-1"})
 
+(deftest stop-cancels-preconnect-asset-downloads-without-client-test
+  (let [original-client @worker-state/*db-sync-client
+        cancelled-repos (atom [])]
+    (try
+      (reset! worker-state/*db-sync-client nil)
+      (with-redefs [worker-state/get-current-repo (constantly test-repo)
+                    sync-assets/cancel-remote-asset-downloads!
+                    (fn [repo]
+                      (swap! cancelled-repos conj repo))]
+        (db-sync/stop!)
+        (is (= [test-repo] @cancelled-repos)))
+      (finally
+        (reset! worker-state/*db-sync-client original-client)))))
+
 (def ^:private recycle-built-in-props
   #{:logseq.property.recycle/original-parent
     :logseq.property.recycle/original-page
@@ -692,6 +706,37 @@
           (is (= (subvec payload 0 2) (:payload result)))
           (is (= "tx/batch" (get-in result [:message :type])))
           (is (= (subvec payload 0 2) (get-in result [:message :txs]))))))))
+
+(deftest versioned-large-title-markers-follow-capped-upload-prefix-test
+  (let [v2-object (fn [asset-uuid digest-char]
+                    {:asset-uuid asset-uuid
+                     :asset-type "txt"
+                     :payload-format "utf8-plain-v1"
+                     :payload-digest-alg "sha256-v1"
+                     :payload-digest (apply str (repeat 64 digest-char))})
+        sent-object (v2-object "sent-object" "a")
+        deferred-object (v2-object "deferred-object" "b")
+        sent-entry {:tx-id "sent"
+                    :tx-data [[:db/add 1
+                               :logseq.property.sync/large-title-object
+                               sent-object]]}
+        deferred-entry {:tx-id "deferred"
+                        :tx-data [[:db/add 2
+                                   :logseq.property.sync/large-title-object
+                                   deferred-object]]}]
+    (is (= [[:db/add 1
+             :logseq.property.sync/large-title-object
+             sent-object]]
+           (#'sync-apply/versioned-large-title-marker-txs
+            [sent-entry])))
+    (is (not-any?
+         #(= deferred-object (nth % 3 nil))
+         (#'sync-apply/versioned-large-title-marker-txs
+          [sent-entry])))
+    (is (= 2
+           (count
+            (#'sync-apply/versioned-large-title-marker-txs
+             [sent-entry deferred-entry]))))))
 
 (deftest reject-oversized-atomic-upload-before-websocket-send-test
   (testing "an oversized atomic tx is retained locally and its contents are not copied into error data"
@@ -1635,6 +1680,31 @@
                     test-repo)]
         (is (= cached-checksum (:local-checksum counts)))))))
 
+(deftest sync-counts-selects-versioned-local-checksum-only-for-known-version-test
+  (let [base {:get-datascript-conn (constantly :conn)
+              :get-pending-local-tx-count (constantly 0)
+              :get-unpushed-asset-ops-count (constantly 0)
+              :get-local-tx (constantly 42)
+              :get-local-checksum (constantly "legacy-local")
+              :get-local-server-checksum (constantly "versioned-local")
+              :get-graph-uuid (constantly "graph-1")
+              :latest-remote-tx {test-repo 42}
+              :latest-remote-checksum {test-repo "remote"}}]
+    (is (= "versioned-local"
+           (:local-checksum
+            (sync-presence/sync-counts
+             (assoc base
+                    :latest-remote-checksum-version
+                    {test-repo sync-checksum/server-checksum-version})
+             test-repo))))
+    (is (= "legacy-local"
+           (:local-checksum
+            (sync-presence/sync-counts
+             (assoc base
+                    :latest-remote-checksum-version
+                    {test-repo "unknown-version"})
+             test-repo))))))
+
 (deftest rtc-state-payload-surfaces-graph-and-repair-diagnostic-test
   (let [last-error {:code :checksum-mismatch
                     :data {:type :db-sync/checksum-mismatch}}
@@ -2456,6 +2526,122 @@
                        (:type (ex-data error)))))
               (finally
                 (reset! db-sync/*repo->latest-remote-tx latest-prev)))))))))
+
+(defn- v2-large-title-object
+  [asset-uuid digest-char]
+  {:asset-uuid asset-uuid
+   :asset-type "txt"
+   :payload-format "utf8-plain-v1"
+   :payload-digest-alg "sha256-v1"
+   :payload-digest (apply str (repeat 64 digest-char))})
+
+(deftest hello-accepts-only-matching-versioned-server-checksum-test
+  (testing "a versioned server checksum bridges large-title transport shape without weakening legacy validation"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          latest-prev @db-sync/*repo->latest-remote-tx
+          latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+          latest-version-prev @db-sync/*repo->latest-remote-checksum-version
+          large-title (apply str (repeat 5000 "a"))
+          object (v2-large-title-object "versioned-title-1" "a")
+          parent-id (:db/id parent)
+          captured* (atom nil)
+          flush-count* (atom 0)
+          success-count* (atom 0)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)
+                  :sync-succeeded-f (fn [] (swap! success-count* inc))}]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (reset! db-sync/*repo->latest-remote-tx {})
+          (reset! db-sync/*repo->latest-remote-checksum {})
+          (reset! db-sync/*repo->latest-remote-checksum-version {})
+          (ldb/transact! conn
+                         [[:db/add parent-id :block/title large-title]
+                          [:db/add parent-id
+                           :logseq.property.sync/large-title-object
+                           object]]
+                         {:rtc-tx? true
+                          :persist-op? false})
+          (let [local-checksum (sync-checksum/recompute-checksum @conn)
+                server-db (:db-after
+                           (d/with @conn
+                                   [[:db/add parent-id :block/title ""]]))
+                legacy-checksum (sync-checksum/recompute-checksum server-db)
+                server-checksum
+                (sync-checksum/recompute-server-checksum server-db)
+                raw-message (js/JSON.stringify
+                             (clj->js {:type "hello"
+                                       :t 0
+                                       :checksum legacy-checksum
+                                       :checksum-version
+                                       sync-checksum/server-checksum-version
+                                       :server-checksum server-checksum}))]
+            (is (string? legacy-checksum))
+            (is (not= local-checksum legacy-checksum))
+            (client-op/update-local-checksum test-repo local-checksum)
+            (with-redefs [sync-apply/enqueue-flush-pending!
+                          (fn [& _] (swap! flush-count* inc))
+                          sync-log-state/rtc-log
+                          (fn [type payload]
+                            (when (= :rtc.log/checksum-mismatch type)
+                              (reset! captured* {:type type :payload payload})))
+                          sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+              (try
+                (is (nil? (sync-handle-message/handle-message!
+                           test-repo client raw-message)))
+                (is (= :open @(:ws-state client)))
+                (is (= 1 @success-count*))
+                (is (= 1 @flush-count*))
+                (is (= :versioned-server-checksum
+                       (get-in @captured* [:payload :compatibility])))
+                (finally
+                  (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                  (reset! db-sync/*repo->latest-remote-checksum
+                          latest-checksum-prev)
+                  (reset! db-sync/*repo->latest-remote-checksum-version
+                          latest-version-prev))))))))))
+
+(deftest hello-rejects-versioned-mismatch-even-when-legacy-matches-test
+  (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+        latest-prev @db-sync/*repo->latest-remote-tx
+        local-checksum (sync-checksum/recompute-checksum @conn)
+        local-server-checksum
+        (sync-checksum/recompute-server-checksum @conn)
+        client {:repo test-repo
+                :graph-id "graph-1"
+                :inflight (atom [])
+                :online-users (atom [])
+                :ws-state (atom :open)}
+        raw-message
+        (js/JSON.stringify
+         (clj->js {:type "hello"
+                   :t 0
+                   :checksum local-checksum
+                   :checksum-version sync-checksum/server-checksum-version
+                   :server-checksum
+                   (if (= local-server-checksum "0000000000000000")
+                     "ffffffffffffffff"
+                     "0000000000000000")}))]
+    (with-datascript-conns conn client-ops-conn
+      (fn []
+        (reset! db-sync/*repo->latest-remote-tx {})
+        ;; Leave both cached checksums absent. The verifier must recompute
+        ;; rather than skip an authoritative versioned mismatch.
+        (with-redefs [sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+          (try
+            (let [error (try
+                          (sync-handle-message/handle-message!
+                           test-repo client raw-message)
+                          nil
+                          (catch :default error
+                            error))]
+              (is (= :db-sync/checksum-mismatch
+                     (:type (ex-data error)))))
+            (finally
+              (reset! db-sync/*repo->latest-remote-tx latest-prev))))))))
 
 (deftest hello-server-cursor-regression-never-uploads-test
   (testing "server rollback is an explicit repair condition"
@@ -5616,6 +5802,46 @@
             (is (empty? (#'sync-apply/pending-txs test-repo)))
             (is (= 1 (client-op/get-local-tx test-repo)))))))))
 
+(deftest tx-batch-ok-advances-current-versioned-watermark-without-recompute-test
+  (testing "a normal acknowledgement does not scan the full graph"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (worker-page/create! conn "Ack Fast Path" :uuid (random-uuid))
+          (let [pending-before (#'sync-apply/pending-txs test-repo)
+                tx-ids (mapv :tx-id pending-before)
+                legacy-checksum (sync-checksum/recompute-checksum @conn)
+                server-checksum
+                (sync-checksum/recompute-server-checksum @conn)
+                raw-message
+                (js/JSON.stringify
+                 (clj->js {:type "tx/batch/ok"
+                           :t 1
+                           :checksum legacy-checksum
+                           :checksum-version
+                           sync-checksum/server-checksum-version
+                           :server-checksum server-checksum}))]
+            (client-op/update-local-checksum test-repo legacy-checksum)
+            (client-op/update-local-server-checksum
+             test-repo server-checksum)
+            (reset! (:inflight client) tx-ids)
+            (with-redefs
+              [sync-checksum/recompute-server-checksum
+               (fn [_]
+                 (throw
+                  (ex-info "ack fast path must not recompute"
+                           {:type :test/unexpected-full-recompute})))]
+              (sync-handle-message/handle-message!
+               test-repo client raw-message))
+            (is (= 1 (client-op/get-local-tx test-repo)))
+            (is (= server-checksum
+                   (client-op/get-local-server-checksum test-repo)))))))))
+
 (deftest tx-batch-ok-removes-only-inflight-acked-pending-txs-test
   (testing "tx/batch/ok should only clear pending txs tracked in inflight"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)
@@ -7689,6 +7915,33 @@
                             (is false (str e))))
                  (p/finally done))))))
 
+(deftest versioned-server-checksum-normalization-is-narrow-test
+  (let [large-title (apply str (repeat 5000 "a"))
+        conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "legacy-checksum-page"}
+                 :blocks [{:block/title large-title}]}]})
+        block (db-test/find-block-by-content @conn large-title)
+        block-id (:db/id block)
+        object (v2-large-title-object "versioned-title-2" "a")]
+    (d/transact! conn [[:db/add block-id
+                        :logseq.property.sync/large-title-object
+                        object]])
+    (let [placeholder-db (-> (d/with @conn
+                                     [[:db/add block-id :block/title ""]])
+                             :db-after)]
+      (is (= (sync-checksum/recompute-server-checksum placeholder-db)
+             (sync-checksum/recompute-server-checksum @conn)))
+      (is (not= (sync-checksum/recompute-checksum placeholder-db)
+                (sync-checksum/recompute-checksum @conn))))
+    (d/transact! conn [[:db/add block-id :block/title "short"]])
+    (let [placeholder-db (-> (d/with @conn
+                                     [[:db/add block-id :block/title ""]])
+                             :db-after)]
+      (is (not= (sync-checksum/recompute-server-checksum placeholder-db)
+                (sync-checksum/recompute-server-checksum @conn))
+          "a stale object marker on a short title must not suppress divergence"))))
+
 (deftest offload-small-title-test
   (testing "small titles are not offloaded"
     (async done
@@ -7857,17 +8110,23 @@
                      (js/Promise.resolve #js {:ok true})))
              (reset! worker-state/*db-sync-config {:http-base "https://example.com"})
              (-> (p/let [aes-key (crypt/<generate-aes-key)
-                         _ (sync-large-title/upload-large-title!
-                            {:repo test-repo
-                             :graph-id "graph-1"
-                             :title title
-                             :aes-key aes-key
-                             :http-base "https://example.com"
-                             :auth-headers nil
-                             :fail-fast-f db-sync/fail-fast
-                             :encrypt-text-value-f sync-crypt/<encrypt-text-value})
+                         obj (sync-large-title/upload-large-title!
+                              {:repo test-repo
+                               :graph-id "graph-1"
+                               :title title
+                               :aes-key aes-key
+                               :http-base "https://example.com"
+                               :auth-headers nil
+                               :fail-fast-f db-sync/fail-fast
+                               :encrypt-text-value-f
+                               sync-crypt/<encrypt-text-value})
                          body @captured-body]
                    (is (instance? js/Uint8Array body))
+                   (is (sync-large-title/large-title-object-v2? obj))
+                   (is (= sync-large-title/large-title-encrypted-payload-format
+                          (:payload-format obj)))
+                   (p/let [digest (sync-large-title/<sha256-hex body)]
+                     (is (= digest (:payload-digest obj))))
                    (let [payload-str (.decode (js/TextDecoder.) body)]
                      (p/let [title' (sync-crypt/<decrypt-text-value aes-key payload-str)]
                        (is (= title title')))))
@@ -7876,6 +8135,45 @@
                      (set! js/fetch fetch-prev)
                      (reset! worker-state/*db-sync-config config-prev)
                      (done))))))))
+
+(deftest download-large-title-rejects-payload-digest-mismatch-test
+  (async done
+         (let [fetch-prev js/fetch
+               payload (.encode (js/TextEncoder.) "corrupted title")
+               obj {:asset-uuid "corrupt-title"
+                    :asset-type "txt"
+                    :payload-format "utf8-plain-v1"
+                    :payload-digest-alg "sha256-v1"
+                    :payload-digest (apply str (repeat 64 "0"))}]
+           (set! js/fetch
+                 (fn [& _]
+                   (p/resolved
+                    #js {:ok true
+                         :status 200
+                         :arrayBuffer
+                         (fn [] (p/resolved (.-buffer payload)))})))
+           (->
+            (sync-large-title/download-large-title!
+             {:repo test-repo
+              :graph-id "graph-1"
+              :obj obj
+              :aes-key nil
+              :http-base "https://example.com"
+              :auth-headers nil
+              :fail-fast-f db-sync/fail-fast
+              :decrypt-text-value-f sync-crypt/<decrypt-text-value
+              :strict-decrypt-text-value-f
+              sync-crypt/<decrypt-text-value-strict})
+            (p/then (fn [_]
+                      (is false "corrupted payload must not rehydrate")))
+            (p/catch
+             (fn [error]
+               (is (= :db-sync/large-title-integrity-failed
+                      (:type (ex-data error))))))
+            (p/finally
+             (fn []
+               (set! js/fetch fetch-prev)
+               (done)))))))
 
 (deftest ^:fix-me download-large-title-decrypts-transit-payload-test
   (testing "encrypted large title downloads transit-encoded payload"

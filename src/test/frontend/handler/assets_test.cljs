@@ -131,3 +131,71 @@
     (let [url "assets:///C/logseq__colon/Users/charlie/graph/assets/test.mp3"]
       (is (= url
              (assets/asset-protocol-url->media-url url))))))
+
+(deftest remote-asset-download-latch-recovers-after-failure-test
+  (async done
+    (let [requested? (atom false)
+          calls (atom 0)
+          asset {:block/uuid (random-uuid)
+                 :logseq.property.asset/type "png"
+                 :logseq.property.asset/remote-metadata
+                 {:checksum "sha-256-value" :type "png"}}]
+      (-> (p/with-redefs
+            [assets/maybe-request-remote-asset-download!
+             (fn [_repo _asset file-ready?]
+               (when-not file-ready?
+                 (if (= 1 (swap! calls inc))
+                   (p/rejected (js/Error. "temporary network failure"))
+                   (p/resolved true))))]
+            (p/let [first-result
+                    (assets/request-remote-asset-download-once!
+                     "repo" asset false requested?)]
+              (is (false? first-result))
+              (is (false? @requested?)
+                  "a rejected request must release the mounted-component latch")
+              (p/let [second-result
+                      (assets/request-remote-asset-download-once!
+                       "repo" asset false requested?)]
+                (is (true? second-result))
+                (is (true? @requested?))
+                (is (= 2 @calls))
+                (assets/request-remote-asset-download-once!
+                 "repo" asset true requested?)
+                (is (false? @requested?)
+                    "file arrival releases the latch without another request")
+                (is (= 2 @calls)))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest remote-asset-download-retry-scheduler-enters-low-frequency-recovery-test
+  (let [timer* (atom nil)
+        attempt* (atom 0)
+        calls* (atom 0)
+        callbacks* (atom [])
+        delays* (atom [])
+        fake-set-timeout
+        (fn [callback delay]
+          (swap! callbacks* conj callback)
+          (swap! delays* conj delay)
+          (str "timer-" (count @callbacks*)))]
+    (dotimes [_ (count assets/remote-asset-download-retry-delays-ms)]
+      (is (true?
+           (assets/schedule-remote-asset-download-retry!
+            timer* attempt* #(swap! calls* inc) fake-set-timeout)))
+      (is (false?
+           (assets/schedule-remote-asset-download-retry!
+            timer* attempt* #(swap! calls* inc) fake-set-timeout))
+          "an existing timer deduplicates retry scheduling")
+      ((last @callbacks*)))
+    (is (= (count assets/remote-asset-download-retry-delays-ms)
+           @calls*))
+    (is (true?
+         (assets/schedule-remote-asset-download-retry!
+          timer* attempt* #(swap! calls* inc) fake-set-timeout)))
+    (is (= assets/remote-asset-download-steady-retry-ms
+           (last @delays*))
+        "recovery continues at low frequency after the fast budget")
+    ((last @callbacks*))
+    (is (= (inc (count assets/remote-asset-download-retry-delays-ms))
+           @calls*))))

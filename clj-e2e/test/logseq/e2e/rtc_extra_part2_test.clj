@@ -3,6 +3,8 @@
             [clojure.string :as string]
             [clojure.test :refer [deftest testing is use-fixtures run-test]]
             [jsonista.core :as json]
+            [logseq.e2e.api :refer [ls-api-call!]]
+            [logseq.e2e.assets :as e2e-assets]
             [logseq.e2e.block :as b]
             [logseq.e2e.const :refer [*page1 *page2 *graph-name*]]
             [logseq.e2e.custom-report :as custom-report]
@@ -371,11 +373,17 @@ wait for 5-10 seconds, will found that \"aaa/bbb\" became \"aaa/<encrypted-strin
       (w/with-page @*page2
         (rtc/wait-tx-update-to remote-tx)))
 
-;; check 'aaa/bbb' still exists
-    (w/with-page @*page1
-      (page/goto-page "aaa/bbb"))
-    (w/with-page @*page2
-      (page/goto-page "aaa/bbb"))
+    ;; The command palette no longer exposes the computed "aaa/bbb" title as
+    ;; a stable test id. Inspect the synced tag relation through the public API;
+    ;; #651 replaced the parent title with a transit/encryption payload.
+    (doseq [p [@*page1 @*page2]]
+      (w/with-page p
+        (let [child (first (ls-api-call! :editor.getTagsByName "bbb"))
+              parent-ids (get child ":logseq.property.class/extends")
+              parent (ls-api-call! :editor.getTag (first parent-ids))]
+          (is (= "bbb" (get child "title")))
+          (is (= 1 (count parent-ids)))
+          (is (= "aaa" (get parent "title"))))))
 
     (rtc/validate-graphs-in-2-pw-pages)))
 
@@ -433,16 +441,38 @@ wait for 5-10 seconds, will found that \"aaa/bbb\" became \"aaa/<encrypted-strin
 - remove local graph in client2
 - re-download the remote graph in client2
 - compare asset-blocks data in both clients"
-    (let [asset-file "../assets/icon.png"
-          page-title (w/with-page @*page1 (page/get-page-name))]
+    (let [asset-path (.toAbsolutePath
+                      (java.nio.file.Paths/get
+                       "../assets/icon.png"
+                       (into-array String [])))
+          page-title (w/with-page @*page1 (page/get-page-name))
+          expected-asset-sha256 (e2e-assets/file-sha256 asset-path)
+          asset-filename* (atom nil)
+          asset-block-uuid* (atom nil)]
       (w/with-page @*page1
-        (let [p (w/get-page)]
-          (.onFileChooser p (reify java.util.function.Consumer
-                              (accept [_ fc]
-                                (.setFiles fc (into-array java.nio.file.Path [(java.nio.file.Paths/get asset-file (into-array String []))])))))
-          (b/new-block "asset block")
-          (util/input-command "Upload an asset")
-          (w/wait-for ".ls-block img")))
+        (let [p (w/get-page)
+              before (e2e-assets/list-assets *graph-name*)
+              chooser (.waitForFileChooser
+                       p
+                       (reify Runnable
+                         (run [_]
+                           (util/input-command "Upload an asset"))))]
+          (.setFiles chooser (into-array java.nio.file.Path [asset-path]))
+          (let [filename (e2e-assets/wait-for-new-asset!
+                          *graph-name* before 60000)
+                asset-block-uuid (some-> filename
+                                         (string/replace #"\.[^.]+$" ""))]
+            (reset! asset-filename* filename)
+            (reset! asset-block-uuid* asset-block-uuid)
+            (is (string? filename)
+                (pr-str {:graph *graph-name*
+                         :assets-before before
+                         :assets (e2e-assets/list-assets *graph-name*)}))
+            (is (true? (e2e-assets/wait-for-asset!
+                        *graph-name* filename 60000))))
+          ;; A database transaction cursor does not imply that attachment
+          ;; upload has completed. Wait for both queues to drain.
+          (w/wait-for "button.cloud.on.idle" {:timeout 120000})))
 
       (let [{:keys [remote-tx]}
             (w/with-page @*page1
@@ -452,12 +482,39 @@ wait for 5-10 seconds, will found that \"aaa/bbb\" became \"aaa/<encrypted-strin
           (rtc/wait-tx-update-to remote-tx)))
 
       (w/with-page @*page2
-        (graph/remove-local-graph *graph-name*)
-        (graph/wait-for-remote-graph *graph-name*)
-        (graph/switch-graph *graph-name* true false)
-        (page/goto-page page-title)
-        (w/wait-for ".ls-block img")
-        (is (some? (.getAttribute (w/-query ".ls-block img") "src"))))
+        (let [asset-filename @asset-filename*
+              asset-block-uuid @asset-block-uuid*
+              asset-block-locator (format ".ls-block[blockid='%s']"
+                                          asset-block-uuid)]
+          (is (string? asset-filename))
+          (is (string? asset-block-uuid))
+          (page/goto-page-via-api page-title)
+          (w/wait-for asset-block-locator {:timeout 60000})
+
+          (graph/remove-local-graph *graph-name*)
+          (is (true? (e2e-assets/clear-assets-dir! *graph-name*)))
+          (is (not (some #(= asset-filename %)
+                         (e2e-assets/list-assets *graph-name*))))
+
+          (graph/wait-for-remote-graph *graph-name*)
+          (graph/switch-graph *graph-name* true false)
+          (page/goto-page-via-api page-title)
+
+          ;; Browser E2E exercises the lazy download path. Electron and CLI
+          ;; additionally prefetch these files during graph download.
+          (is (true? (e2e-assets/wait-for-asset!
+                      *graph-name* asset-filename 60000))
+              (pr-str {:graph *graph-name*
+                       :asset-filename asset-filename
+                       :assets (e2e-assets/list-assets *graph-name*)}))
+          (w/wait-for ".asset-container img" {:timeout 60000})
+          (is (= expected-asset-sha256
+                 (e2e-assets/asset-sha256 *graph-name* asset-filename))
+              "the restored bytes must match the uploaded file")
+          (is (pos? (w/eval-js
+                     "document.querySelector('.asset-container img')?.naturalWidth || 0"))
+              "the restored image must decode successfully")
+          (w/wait-for asset-block-locator {:timeout 60000})))
 
       (rtc/validate-graphs-in-2-pw-pages))))
 

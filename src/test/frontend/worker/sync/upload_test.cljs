@@ -1,10 +1,47 @@
 (ns frontend.worker.sync.upload-test
   (:require [cljs.test :refer [async deftest is]]
+            [datascript.core :as d]
             [frontend.worker.sync.crypt :as sync-crypt]
+            [frontend.worker.sync.large-title :as sync-large-title]
             [frontend.worker.sync.util :as sync-util]
             [frontend.worker.sync.upload :as sync-upload]
             [promesa.core :as p]
             [clojure.string :as string]))
+
+(deftest snapshot-large-title-markers-use-stable-block-uuid-test
+  (let [schema {:block/uuid {:db/unique :db.unique/identity}}
+        source-conn (d/create-conn schema)
+        snapshot-conn (d/create-conn schema)
+        block-uuid (random-uuid)
+        object {:asset-uuid "snapshot-title"
+                :asset-type "txt"
+                :payload-format "utf8-plain-v1"
+                :payload-digest-alg "sha256-v1"
+                :payload-digest (apply str (repeat 64 "a"))}]
+    (d/transact! source-conn
+                 [{:db/id 1
+                   :block/uuid block-uuid
+                   :block/title "logical title"}])
+    (d/transact! snapshot-conn
+                 [{:db/id 100
+                   :block/uuid block-uuid
+                   :block/title ""
+                   sync-large-title/large-title-object-attr object}])
+    (let [marker-txs
+          (#'sync-upload/snapshot-large-title-marker-txs
+           "test-repo"
+           @snapshot-conn)]
+      (is (= [[:db/add
+               [:block/uuid block-uuid]
+               sync-large-title/large-title-object-attr
+               object]]
+             marker-txs))
+      (d/transact! source-conn marker-txs)
+      (is (= object
+             (get
+              (d/entity @source-conn [:block/uuid block-uuid])
+              sync-large-title/large-title-object-attr)))
+      (is (nil? (d/entity @source-conn 100))))))
 
 (deftest split-snapshot-rows-by-max-bytes-splits-rows-into-byte-capped-batches-test
   (let [sizes {:a 4
