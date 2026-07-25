@@ -24,6 +24,7 @@ const dbSyncPackage = readJson("deps/db-sync/package.json");
 const dbSyncWorkspace = readText("deps/db-sync/pnpm-workspace.yaml");
 const desktopPackagingGulpfile = readText("gulpfile.js");
 const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const prLabelerWorkflow = readText(".github/workflows/pr-labeler.yml");
 const desktopBuilderConfig = readText("resources/electron-builder.yml");
 const unsignedDesktopBuilder = readText("resources/electron-builder-unsigned.mjs");
 const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
@@ -52,6 +53,29 @@ const electronUpdaterConfig = readText(
 );
 const desktopSettings = readText(
   "src/main/frontend/components/settings.cljs",
+);
+const e2eSettings = readText("clj-e2e/src/logseq/e2e/settings.clj");
+const e2eGraph = readText("clj-e2e/src/logseq/e2e/graph.clj");
+
+assert.match(
+  prLabelerWorkflow,
+  /permissions:\s+contents: read\s+pull-requests: write/,
+  "PR labeler should receive only the repository permissions it needs",
+);
+assert.match(
+  prLabelerWorkflow,
+  /TimonVS\/pr-labeler-action@bd0b592a410983316a454e3d48444608f028ec8e/,
+  "write-capable PR labeler action should be pinned to an immutable commit",
+);
+assert.match(
+  e2eSettings,
+  /\(w\/wait-for "#search-button"\)\s+\(assert\/assert-in-normal-mode\?\)/,
+  "E2E setup should wait for the application shell before asserting normal mode",
+);
+assert.match(
+  e2eGraph,
+  /rtc-graph-control-timeout-ms 15000[\s\S]*?rtc-sync-toggle \{:timeout rtc-graph-control-timeout-ms\}[\s\S]*?rtc-graph-e2ee-toggle \{:timeout rtc-graph-control-timeout-ms\}/,
+  "RTC graph setup should use a bounded cold-runner timeout for both controls",
 );
 
 const zvecOptionalRuntimeDependencies = [

@@ -104,15 +104,52 @@
 (def undo #(k/press "ControlOrMeta+z" {:delay 100}))
 (def redo #(k/press "ControlOrMeta+y" {:delay 100}))
 
+(def ^:private editor-layout-timeout-ms 10000)
+(def ^:private editor-layout-poll-ms 50)
+
+(defn- current-editor-x
+  []
+  (when-let [editor (util/get-editor)]
+    (when-let [box (.boundingBox editor)]
+      (.-x box))))
+
+(defn- wait-for-editor-x
+  [moved? context]
+  (let [deadline (+ (System/nanoTime)
+                    (* editor-layout-timeout-ms 1000000))]
+    (loop [last-x nil]
+      (let [x (current-editor-x)]
+        (cond
+          (and (some? x) (moved? x))
+          x
+
+          (< (System/nanoTime) deadline)
+          (do
+            (util/wait-timeout editor-layout-poll-ms)
+            (recur (or x last-x)))
+
+          :else
+          (throw
+           (ex-info
+            "editor layout did not reach the expected position"
+            (merge {:timeout-ms editor-layout-timeout-ms
+                    :last-x (or x last-x)}
+                   context))))))))
+
 (defn- indent-outdent
   [indent?]
-  (let [editor (util/get-editor)
-        [x1 _] (util/bounding-xy editor)
+  (let [x1 (wait-for-editor-x (constantly true)
+                              {:operation (if indent? :indent :outdent)
+                               :stage :before-key})
         _ (if indent? (k/tab) (k/shift+tab))
-        [x2 _] (util/bounding-xy editor)]
-    (if indent?
-      (is (< x1 x2))
-      (is (> x1 x2)))))
+        moved? (if indent?
+                 #(< x1 %)
+                 #(> x1 %))
+        x2 (wait-for-editor-x moved?
+                              {:operation (if indent? :indent :outdent)
+                               :stage :after-key
+                               :before-x x1})]
+    (is (moved? x2))))
 
 (defn indent
   []

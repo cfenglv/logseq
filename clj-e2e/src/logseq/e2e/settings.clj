@@ -48,4 +48,8 @@
 (defn developer-mode
   []
   (w/eval-js e2e-init-script)
+  ;; Navigation can complete before the application shell is interactive on
+  ;; a cold CI runner. Keep the readiness check explicit and bounded instead
+  ;; of racing the normal-mode assertions below.
+  (w/wait-for "#search-button")
   (assert/assert-in-normal-mode?))
