@@ -130,8 +130,12 @@
   (testing "Delete blocks case 1"
     (b/new-blocks ["b1" "b2" "b3" "b4"])
     (b/delete-blocks)                        ; delete b4
-    (util/repeat-keyboard 2 "Shift+ArrowUp") ; select b3 and b2
+    (b/select-blocks 2)                      ; select b3 and b2
     (b/delete-blocks)
+    (util/wait-editor-visible)
+    (assert/assert-have-count
+     ".ls-page-blocks .page-blocks-inner .ls-block"
+     1)
     (is (= "b1" (util/get-edit-content)))
     (is (= 1 (util/page-blocks-count)))))
 

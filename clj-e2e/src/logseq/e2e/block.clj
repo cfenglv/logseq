@@ -174,4 +174,11 @@
 
 (defn select-blocks
   [n]
-  (util/repeat-keyboard n "Shift+ArrowUp"))
+  ;; A remote render can briefly replace the editor/selection DOM. Sending all
+  ;; key events back-to-back lets a slow runner swallow an intermediate event,
+  ;; so wait for each selection step before sending the next one.
+  (dotimes [i n]
+    (k/press "Shift+ArrowUp" {:delay 20})
+    (assert/assert-have-count
+     ".ls-page-blocks .page-blocks-inner .ls-block.selected"
+     (inc i))))
