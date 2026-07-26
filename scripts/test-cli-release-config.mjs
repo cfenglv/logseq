@@ -5,6 +5,7 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveSelfhostUpdaterVersions } from "../resources/selfhost-updater-version.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -13,6 +14,41 @@ const readText = (relativePath) =>
 
 const readJson = (relativePath) =>
   JSON.parse(readText(relativePath));
+
+assert.deepEqual(
+  resolveSelfhostUpdaterVersions("2.0.1-selfhost.4"),
+  {
+    currentRevision: 4,
+    currentVersion: "2.0.1-selfhost.4",
+    isNightlyRehearsal: false,
+    nextVersion: "2.0.1-selfhost.5",
+  },
+  "stable selfhost updater versions should advance one numbered revision",
+);
+assert.deepEqual(
+  resolveSelfhostUpdaterVersions(
+    "2.0.1-selfhost.4-alpha.nightly.20260726",
+  ),
+  {
+    currentRevision: 4,
+    currentVersion: "2.0.1-selfhost.4",
+    isNightlyRehearsal: true,
+    nextVersion: "2.0.1-selfhost.5",
+  },
+  "push rehearsals should normalize only the dated nightly suffix",
+);
+for (const invalidVersion of [
+  "2.0.1-selfhost.3",
+  "2.0.1-selfhost.4-alpha.nightly.20260230",
+  "2.0.1-selfhost.4-alpha.other.20260726",
+  "2.0.1",
+]) {
+  assert.throws(
+    () => resolveSelfhostUpdaterVersions(invalidVersion),
+    undefined,
+    `invalid updater rehearsal version should be rejected: ${invalidVersion}`,
+  );
+}
 
 const assertContains = (text, needle, label) => {
   assert.ok(text.includes(needle), `${label} should contain ${needle}`);

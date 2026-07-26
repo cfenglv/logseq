@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { resolveSelfhostUpdaterVersions } from "./selfhost-updater-version.mjs";
 
 const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(path.join(packageRoot, "package.json"));
@@ -13,21 +14,11 @@ const { GitHubProvider } = require(
 const semver = require("semver");
 const packageJson = require(path.join(packageRoot, "package.json"));
 
-const match = packageJson.version.match(
-  /^(\d+\.\d+\.\d+-selfhost\.)(\d+)$/,
-);
-assert.ok(
-  match,
-  `selfhost updater rehearsal requires a numbered selfhost version, got ${packageJson.version}`,
-);
-
-const currentVersion = packageJson.version;
-const currentRevision = Number(match[2]);
-assert.ok(
-  currentRevision >= 4,
-  `automatic updater bootstrap starts at selfhost.4, got ${currentVersion}`,
-);
-const nextVersion = `${match[1]}${currentRevision + 1}`;
+const {
+  currentVersion,
+  isNightlyRehearsal,
+  nextVersion,
+} = resolveSelfhostUpdaterVersions(packageJson.version);
 
 const releaseEntry = (version) => `
   <entry>
@@ -171,5 +162,5 @@ await assert.rejects(
 );
 
 console.log(
-  `[updater-provider] OK ${currentVersion} -> ${nextVersion} across six platform/architecture contracts`,
+  `[updater-provider] OK ${currentVersion} -> ${nextVersion} across six platform/architecture contracts${isNightlyRehearsal ? ` (normalized from ${packageJson.version})` : ""}`,
 );
