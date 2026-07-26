@@ -72,17 +72,79 @@
     (is (= x2 x4))
     (is (< x3 x2))))
 
-(defn move-up-down []
-  (b/new-blocks ["b1" "b2" "b3" "b4"])
-  (util/repeat-keyboard 2 "Shift+ArrowUp")
-  (let [contents (util/get-page-blocks-contents)]
-    (is (= contents ["b1" "b2" "b3" "b4"])))
-  (util/repeat-keyboard 2 (str (if util/mac? "Meta" "Alt") "+Shift+ArrowUp"))
-  (let [contents (util/get-page-blocks-contents)]
-    (is (= contents ["b3" "b4" "b1" "b2"])))
-  (util/repeat-keyboard 2 (str (if util/mac? "Meta" "Alt") "+Shift+ArrowDown"))
-  (let [contents (util/get-page-blocks-contents)]
-    (is (= contents ["b1" "b2" "b3" "b4"]))))
+(def ^:private block-order-timeout-ms 10000)
+(def ^:private block-order-poll-ms 50)
+
+(defn- wait-page-blocks-contents
+  [expected]
+  (let [deadline (+ (System/nanoTime)
+                    (* block-order-timeout-ms 1000000))]
+    (loop [actual (util/get-page-blocks-contents)]
+      (cond
+        (= expected actual)
+        actual
+
+        (< (System/nanoTime) deadline)
+        (do
+          (util/wait-timeout block-order-poll-ms)
+          (recur (util/get-page-blocks-contents)))
+
+        :else
+        (throw
+         (ex-info
+          "page blocks did not reach the expected order"
+          {:timeout-ms block-order-timeout-ms
+           :expected expected
+           :actual actual}))))))
+
+(defn- select-b3-and-b4
+  []
+  ;; RTC can replace the editor DOM after the final block is created or after
+  ;; an acknowledged move. Re-enter the intended block and wait for the exact
+  ;; two-block selection before issuing a move shortcut.
+  (w/click (util/get-by-text "b4" true))
+  (b/wait-editor-text "b4")
+  (b/select-blocks-to-count 2)
+  (assert/assert-selected-block-text "b3")
+  (assert/assert-selected-block-text "b4"))
+
+(defn- move-selected-blocks
+  [shortcut expected-orders]
+  ;; Observe each move before issuing the next shortcut. This prevents a remote
+  ;; render from swallowing a back-to-back keyboard event without replaying a
+  ;; data-changing operation.
+  (doseq [expected expected-orders]
+    (k/press shortcut {:delay 20})
+    (wait-page-blocks-contents expected)))
+
+(defn move-up-down
+  ([]
+   (move-up-down (fn [] nil)))
+  ([settle!]
+   (b/new-blocks ["b1" "b2" "b3" "b4"])
+   ;; Commit the final editor value before an already-visible RTC idle state can
+   ;; satisfy settle! and allow a remote render to replace the editor.
+   (util/exit-edit)
+   (wait-page-blocks-contents ["b1" "b2" "b3" "b4"])
+   (settle!)
+   (is (= ["b1" "b2" "b3" "b4"]
+          (wait-page-blocks-contents ["b1" "b2" "b3" "b4"])))
+   (select-b3-and-b4)
+   (move-selected-blocks
+    (str (if util/mac? "Meta" "Alt") "+Shift+ArrowUp")
+    [["b1" "b3" "b4" "b2"]
+     ["b3" "b4" "b1" "b2"]])
+   (settle!)
+   (is (= ["b3" "b4" "b1" "b2"]
+          (wait-page-blocks-contents ["b3" "b4" "b1" "b2"])))
+   (select-b3-and-b4)
+   (move-selected-blocks
+    (str (if util/mac? "Meta" "Alt") "+Shift+ArrowDown")
+    [["b1" "b3" "b4" "b2"]
+     ["b1" "b2" "b3" "b4"]])
+   (settle!)
+   (is (= ["b1" "b2" "b3" "b4"]
+          (wait-page-blocks-contents ["b1" "b2" "b3" "b4"])))))
 
 (defn- zoom-in-shortcut []
   (k/press (if util/mac? "Meta+Shift+." "Alt+ArrowRight")))
