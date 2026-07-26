@@ -130,7 +130,7 @@
   (testing "Delete blocks case 1"
     (b/new-blocks ["b1" "b2" "b3" "b4"])
     (b/delete-blocks)                        ; delete b4
-    (b/select-blocks 2)                      ; select b3 and b2
+    (b/select-blocks-to-count 2)             ; select b3 and b2
     (b/delete-blocks)
     (util/wait-editor-visible)
     (assert/assert-have-count

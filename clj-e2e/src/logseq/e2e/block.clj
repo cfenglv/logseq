@@ -106,6 +106,10 @@
 
 (def ^:private editor-layout-timeout-ms 10000)
 (def ^:private editor-layout-poll-ms 50)
+(def ^:private block-selection-timeout-ms 10000)
+(def ^:private block-selection-poll-ms 50)
+(def ^:private selected-blocks-q
+  ".ls-page-blocks .page-blocks-inner .ls-block.selected")
 
 (defn- current-editor-x
   []
@@ -172,13 +176,54 @@
   (w/wait-for (format "#ac-0.menu-link:has-text('%s')" property-value))
   (k/enter))
 
-(defn select-blocks
-  [n]
+(defn select-blocks-to-count
+  [target-count]
   ;; A remote render can briefly replace the editor/selection DOM. Sending all
   ;; key events back-to-back lets a slow runner swallow an intermediate event,
-  ;; so wait for each selection step before sending the next one.
-  (dotimes [i n]
-    (k/press "Shift+ArrowUp" {:delay 20})
-    (assert/assert-have-count
-     ".ls-page-blocks .page-blocks-inner .ls-block.selected"
-     (inc i))))
+  ;; so wait for each visible selection change before sending the next one.
+  ;; The first key can select either one block or the editor block plus its
+  ;; predecessor, depending on the current mode; stop at the requested count
+  ;; instead of assuming every key changes the count by exactly one.
+  (letfn [(selected-count []
+            (util/count-elements selected-blocks-q))
+          (wait-for-count-change [previous-count]
+            (let [deadline (+ (System/nanoTime)
+                              (* block-selection-timeout-ms 1000000))]
+              (loop []
+                (let [current-count (selected-count)]
+                  (cond
+                    (not= previous-count current-count)
+                    current-count
+
+                    (< (System/nanoTime) deadline)
+                    (do
+                      (util/wait-timeout block-selection-poll-ms)
+                      (recur))
+
+                    :else
+                    (throw
+                     (ex-info
+                      "block selection count did not change"
+                      {:timeout-ms block-selection-timeout-ms
+                       :selected-count current-count
+                       :target-count target-count})))))))]
+    (loop [current-count (selected-count)]
+      (cond
+        (= target-count current-count)
+        true
+
+        (> current-count target-count)
+        (throw
+         (ex-info
+          "block selection exceeded requested count"
+          {:selected-count current-count
+           :target-count target-count}))
+
+        :else
+        (do
+          (k/press "Shift+ArrowUp" {:delay 20})
+          (recur (wait-for-count-change current-count)))))))
+
+(defn select-blocks
+  [n]
+  (util/repeat-keyboard n "Shift+ArrowUp"))
