@@ -64,6 +64,9 @@ const e2eOutliner = readText(
 const e2eRtcExtra = readText(
   "clj-e2e/test/logseq/e2e/rtc_extra_test.clj",
 );
+const e2eRtcExtraPart2 = readText(
+  "clj-e2e/test/logseq/e2e/rtc_extra_part2_test.clj",
+);
 
 assert.match(
   prLabelerWorkflow,
@@ -119,6 +122,16 @@ assert.match(
   e2eRtcExtra,
   /outliner-basic-test\/move-up-down rtc\/wait-current-tx-synced/,
   "RTC outliner tests should settle synchronized move stages",
+);
+assert.match(
+  e2eRtcExtra,
+  /rtc-outliner-conflict-update-test[\s\S]*?focus-exact-block! \(str title-prefix "-" 3\)[\s\S]*?k\/meta\+shift\+arrow-down[\s\S]*?k\/enter[\s\S]*?focus-exact-block! \(str title-prefix "-" 3\)[\s\S]*?\(b\/indent\)/,
+  "RTC conflict moves should re-establish the exact editor target before indentation",
+);
+assert.match(
+  e2eRtcExtraPart2,
+  /current-editor-layout[\s\S]*?when-let \[box \(\.boundingBox editor\)\][\s\S]*?:editor-id[\s\S]*?try-indent![\s\S]*?\(= editor-id editor-id'\)[\s\S]*?try-outdent![\s\S]*?\(= editor-id editor-id'\)/,
+  "parallel RTC stress indentation should tolerate detached editor layouts without changing targets",
 );
 
 const zvecOptionalRuntimeDependencies = [
