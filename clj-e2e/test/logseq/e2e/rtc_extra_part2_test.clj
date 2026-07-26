@@ -86,25 +86,36 @@
     (is (= (:local-tx tx2) (:remote-tx tx2))
         (str "page2 rtc-tx not converged: " (pr-str tx2)))))
 
+(defn- current-editor-layout
+  []
+  ;; A concurrent remote render can detach the editor between get-editor and
+  ;; boundingBox. Playwright reports that as a nil box; it is an expected
+  ;; "operation unavailable" result for these optional stress actions.
+  (when-let [editor (util/get-editor)]
+    (when-let [box (.boundingBox editor)]
+      (when-let [editor-id (.getAttribute editor "id")]
+        {:editor-id editor-id
+         :x (.-x box)}))))
+
 (defn- try-indent!
   []
-  (if-let [editor (util/get-editor)]
-    (let [[x1 _] (util/bounding-xy editor)]
+  (if-let [{editor-id :editor-id x1 :x} (current-editor-layout)]
+    (do
       (k/tab)
-      (if-let [editor' (util/get-editor)]
-        (let [[x2 _] (util/bounding-xy editor')]
-          (> x2 x1))
+      (if-let [{editor-id' :editor-id x2 :x} (current-editor-layout)]
+        (and (= editor-id editor-id')
+             (> x2 x1))
         false))
     false))
 
 (defn- try-outdent!
   []
-  (if-let [editor (util/get-editor)]
-    (let [[x1 _] (util/bounding-xy editor)]
+  (if-let [{editor-id :editor-id x1 :x} (current-editor-layout)]
+    (do
       (k/shift+tab)
-      (if-let [editor' (util/get-editor)]
-        (let [[x2 _] (util/bounding-xy editor')]
-          (> x1 x2))
+      (if-let [{editor-id' :editor-id x2 :x} (current-editor-layout)]
+        (and (= editor-id editor-id')
+             (> x1 x2))
         false))
     false))
 
