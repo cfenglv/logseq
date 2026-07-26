@@ -126,18 +126,31 @@
         (is (= before-hash (current-location-hash)))
         (is (= before-block-contents (util/get-page-blocks-contents)))))))
 
-(defn delete []
-  (testing "Delete blocks case 1"
-    (b/new-blocks ["b1" "b2" "b3" "b4"])
-    (b/delete-blocks)                        ; delete b4
-    (b/select-blocks-to-count 2)             ; select b3 and b2
-    (b/delete-blocks)
-    (util/wait-editor-visible)
-    (assert/assert-have-count
-     ".ls-page-blocks .page-blocks-inner .ls-block"
-     1)
-    (is (= "b1" (util/get-edit-content)))
-    (is (= 1 (util/page-blocks-count)))))
+(defn delete
+  ([]
+   (delete (fn [] nil)))
+  ([settle!]
+   (testing "Delete blocks case 1"
+     (b/new-blocks ["b1" "b2" "b3" "b4"])
+     (settle!)
+     ;; Establish observable selection state before each destructive key. In an
+     ;; RTC graph, a remote render can otherwise land between Escape and
+     ;; Backspace and leave an unselected empty block behind.
+     (w/click (util/get-by-text "b4" true))
+     (b/wait-editor-text "b4")
+     (b/delete-blocks)                       ; delete b4
+     (settle!)
+     (w/click (util/get-by-text "b3" true))
+     (b/wait-editor-text "b3")
+     (b/select-blocks-to-count 2)            ; select b3 and b2
+     (b/delete-blocks)
+     (settle!)
+     (util/wait-editor-visible)
+     (assert/assert-have-count
+      ".ls-page-blocks .page-blocks-inner .ls-block"
+      1)
+     (is (= "b1" (util/get-edit-content)))
+     (is (= 1 (util/page-blocks-count))))))
 
 (defn delete-end []
   (testing "Delete at end"

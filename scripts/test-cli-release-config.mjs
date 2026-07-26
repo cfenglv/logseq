@@ -56,6 +56,14 @@ const desktopSettings = readText(
 );
 const e2eSettings = readText("clj-e2e/src/logseq/e2e/settings.clj");
 const e2eGraph = readText("clj-e2e/src/logseq/e2e/graph.clj");
+const e2eRtc = readText("clj-e2e/src/logseq/e2e/rtc.clj");
+const e2eUtil = readText("clj-e2e/src/logseq/e2e/util.clj");
+const e2eOutliner = readText(
+  "clj-e2e/test/logseq/e2e/outliner_basic_test.clj",
+);
+const e2eRtcExtra = readText(
+  "clj-e2e/test/logseq/e2e/rtc_extra_test.clj",
+);
 
 assert.match(
   prLabelerWorkflow,
@@ -76,6 +84,31 @@ assert.match(
   e2eGraph,
   /rtc-graph-control-timeout-ms 15000[\s\S]*?rtc-sync-toggle \{:timeout rtc-graph-control-timeout-ms\}[\s\S]*?rtc-graph-e2ee-toggle \{:timeout rtc-graph-control-timeout-ms\}/,
   "RTC graph setup should use a bounded cold-runner timeout for both controls",
+);
+assert.match(
+  e2eUtil,
+  /rtc-entitlement-ready-script[\s\S]*?rtc_2025_07_10/,
+  "RTC E2E entitlement gate should accept both supported account groups",
+);
+assert.match(
+  e2eUtil,
+  /w\/wait-for-not-visible "\.cp__user-login"[\s\S]*?\(wait-rtc-entitlement-ready!\)/,
+  "RTC E2E login should await the asynchronous account entitlement before opening graph controls",
+);
+assert.match(
+  e2eRtc,
+  /wait-current-tx-synced[\s\S]*?button\.cloud\.on\.idle[\s\S]*?\(= local-tx remote-tx\)[\s\S]*?\(= previous current\)/,
+  "RTC destructive UI tests should require two consecutive synced transaction observations",
+);
+assert.match(
+  e2eOutliner,
+  /\(settle!\)[\s\S]*?get-by-text "b4" true[\s\S]*?\(b\/delete-blocks\)[\s\S]*?\(settle!\)[\s\S]*?get-by-text "b3" true[\s\S]*?select-blocks-to-count 2/,
+  "outliner deletion should settle RTC before re-establishing each destructive selection context",
+);
+assert.match(
+  e2eRtcExtra,
+  /outliner-basic-test\/delete rtc\/wait-current-tx-synced/,
+  "RTC outliner tests should enable the transaction-settling deletion path",
 );
 
 const zvecOptionalRuntimeDependencies = [
