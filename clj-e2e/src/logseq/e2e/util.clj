@@ -154,6 +154,32 @@
 
 (def mac? (= "Mac OS X" (System/getProperty "os.name")))
 
+(def ^:private rtc-login-dismiss-timeout-ms 30000)
+(def ^:private rtc-login-dismiss-poll-ms 250)
+
+(defn- wait-login-dismissed!
+  []
+  ;; A cold CI runner can take longer than Wally's default 10 seconds to
+  ;; complete both concurrent test-account logins. Wait longer, but remain
+  ;; bounded and never resubmit the login request.
+  (let [deadline (+ (System/nanoTime)
+                    (* rtc-login-dismiss-timeout-ms 1000000))]
+    (loop []
+      (cond
+        (not (w/visible? ".cp__user-login"))
+        true
+
+        (< (System/nanoTime) deadline)
+        (do
+          (wait-timeout rtc-login-dismiss-poll-ms)
+          (recur))
+
+        :else
+        (throw
+         (ex-info
+          "RTC login modal was not dismissed"
+          {:timeout-ms rtc-login-dismiss-timeout-ms}))))))
+
 (def ^:private rtc-entitlement-ready-script
   "(() => {
      try {
@@ -189,7 +215,7 @@
   (k/tab)
   (input password)
   (w/click ".cp__user-login button[type=\"submit\"]")
-  (w/wait-for-not-visible ".cp__user-login")
+  (wait-login-dismissed!)
   ;; Closing the login modal precedes the asynchronous user-info response.
   ;; Opening the new-graph dialog before the RTC group reaches app state
   ;; permanently renders that dialog without its sync controls.

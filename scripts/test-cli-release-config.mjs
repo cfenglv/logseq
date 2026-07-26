@@ -95,8 +95,13 @@ assert.match(
 );
 assert.match(
   e2eUtil,
-  /w\/wait-for-not-visible "\.cp__user-login"[\s\S]*?\(wait-rtc-entitlement-ready!\)/,
-  "RTC E2E login should await the asynchronous account entitlement before opening graph controls",
+  /rtc-login-dismiss-timeout-ms 30000[\s\S]*?wait-login-dismissed![\s\S]*?w\/visible\? "\.cp__user-login"[\s\S]*?System\/nanoTime[\s\S]*?RTC login modal was not dismissed/,
+  "RTC E2E login should use a bounded cold-runner allowance without resubmitting credentials",
+);
+assert.match(
+  e2eUtil,
+  /w\/click "\.cp__user-login button\[type=\\"submit\\"\]"[\s\S]*?\(wait-login-dismissed!\)[\s\S]*?\(wait-rtc-entitlement-ready!\)/,
+  "RTC E2E login should await dismissal and asynchronous account entitlement before opening graph controls",
 );
 assert.match(
   e2eRtc,
