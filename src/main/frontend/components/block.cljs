@@ -1077,16 +1077,16 @@
         title-or-path])]))
 
 (defn- maybe-request-asset-download!
-  [file-exists? requested? block]
-  (let [repo (state/get-current-repo)
-        asset-file-write-finish @(get @state/state :assets/asset-file-write-finish)
-        asset-file-write-finished? (get-in asset-file-write-finish [repo (str (:block/uuid block))])
-        file-ready? (or file-exists? asset-file-write-finished?)]
-    (when (and (true? @requested?) file-ready?)
-      (reset! requested? false))
-    (when (and (not @requested?)
-               (assets-handler/maybe-request-remote-asset-download! repo block file-ready?))
-      (reset! requested? true))))
+  [file-exists? requested? block on-retry]
+  (let [repo (state/get-current-repo)]
+    (when-let [request
+               (assets-handler/request-remote-asset-download-once!
+                repo block (true? file-exists?) requested?)]
+      (p/then request
+              (fn [downloaded?]
+                (when-not downloaded?
+                  (on-retry))
+                downloaded?)))))
 
 (defn- retry-missing-asset-upload!
   [repo block file-exists?*]
@@ -1115,11 +1115,20 @@
         file (block-asset/asset-file-name block)
         file-exists?* (hooks/use-memo #(atom nil) [(:block/uuid block) asset-type])
         requested?* (hooks/use-memo #(atom false) [(:block/uuid block)])
+        retry-attempt* (hooks/use-memo #(atom 0) [(:block/uuid block)])
+        retry-timer* (hooks/use-memo #(atom nil) [(:block/uuid block)])
+        connectivity* (hooks/use-memo #(atom nil) [(:block/uuid block)])
+        [retry-tick set-retry-tick!] (hooks/use-state 0)
         [file-exists?] (hooks/use-atom file-exists?*)
         repo (state/get-current-repo)
+        online? (state/use-sub :network/online?)
+        rtc-ws-state (state/use-sub :rtc/state
+                                    :path-in-sub-atom [:rtc-state :ws-state])
         asset-file-write-finished? (state/use-sub :assets/asset-file-write-finish
                                                   :path-in-sub-atom [repo (str (:block/uuid block))])
-        file-ready? (or file-exists? asset-file-write-finished?)
+        ;; The write-finish timestamp is an invalidation signal, not proof that
+        ;; the file still exists. It can outlive graph removal and restoration.
+        file-ready? (true? file-exists?)
         progress-entry (state/use-sub :rtc/asset-upload-download-progress
                                       :path-in-sub-atom [repo (str (:block/uuid block))])
         {:keys [direction loaded total]} progress-entry
@@ -1167,9 +1176,36 @@
                                 true
                                 (fs/file-exists? (config/get-repo-dir (state/get-current-repo)) path))]
                  (reset! file-exists?* result))))
-           [file])
+           [file asset-file-write-finished?])
         _ (hooks/use-effect!
-           #(maybe-request-asset-download! file-exists? requested?* block))
+           (fn []
+             (let [connectivity [online? rtc-ws-state]
+                   connectivity-changed? (not= connectivity @connectivity*)]
+               (when connectivity-changed?
+                 (reset! connectivity* connectivity)
+                 (reset! retry-attempt* 0)
+                 (assets-handler/cancel-remote-asset-download-retry!
+                  retry-timer*))
+               (if file-ready?
+                 (do
+                   (reset! retry-attempt* 0)
+                   (assets-handler/cancel-remote-asset-download-retry!
+                    retry-timer*))
+                 (when online?
+                   (maybe-request-asset-download!
+                    file-exists?
+                    requested?*
+                    block
+                    #(assets-handler/schedule-remote-asset-download-retry!
+                      retry-timer*
+                      retry-attempt*
+                      (fn [] (set-retry-tick! (inc retry-tick)))))))))
+           [file-exists? online? rtc-ws-state retry-tick])
+        _ (hooks/use-effect!
+           (fn []
+             #(assets-handler/cancel-remote-asset-download-retry!
+               retry-timer*))
+           [])
         content (cond
                   (or file-ready? gallery-image?)
                   (asset-link (cond-> (assoc config :asset-block block)

@@ -1,6 +1,7 @@
 (ns frontend.worker.sync.presence
   "Presence and rtc state helpers for db sync."
   (:require [logseq.common.util :as common-util]
+            [logseq.db-sync.checksum :as sync-checksum]
             [frontend.worker.state :as worker-state]))
 
 (defn current-client
@@ -20,9 +21,11 @@
            get-missing-asset-upload-files
            get-local-tx
            get-local-checksum
+           get-local-server-checksum
            get-graph-uuid
            latest-remote-tx
-           latest-remote-checksum]}
+           latest-remote-checksum
+           latest-remote-checksum-version]}
    repo]
   (when (get-datascript-conn repo)
     (let [pending-local (if get-pending-local-tx-count
@@ -34,8 +37,14 @@
                                        [])
           local-tx (get-local-tx repo)
           remote-tx (get latest-remote-tx repo)
-          local-checksum (when get-local-checksum
-                           (get-local-checksum repo))
+          remote-checksum-version (get latest-remote-checksum-version repo)
+          local-checksum
+          (if (and (= sync-checksum/server-checksum-version
+                      remote-checksum-version)
+                   get-local-server-checksum)
+            (get-local-server-checksum repo)
+            (when get-local-checksum
+              (get-local-checksum repo)))
           remote-checksum (get latest-remote-checksum repo)
           pending-server (when (and (number? local-tx) (number? remote-tx))
                            (max 0 (- remote-tx local-tx)))

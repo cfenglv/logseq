@@ -32,6 +32,7 @@
    [frontend.worker.undo-redo :as worker-undo-redo]
    [goog.functions :as gfun]
    [lambdaisland.glogi :as log]
+   [logseq.db-sync.checksum :as sync-checksum]
    [logseq.api.db-based.tools :as api-tools]
    [logseq.cli.common.db-worker :as cli-db-worker]
    [logseq.common.graph-dir :as graph-dir]
@@ -1832,7 +1833,10 @@
           recomputed-checksum (:recomputed-checksum result)]
       (when (and (some? recomputed-checksum)
                  (worker-state/get-client-ops-conn repo))
-        (client-op/update-local-checksum repo recomputed-checksum))
+        (client-op/update-local-checksum repo recomputed-checksum)
+        (client-op/update-local-server-checksum
+         repo
+         (sync-checksum/recompute-server-checksum @conn)))
       (cond-> result
         (some? recomputed-checksum)
         (assoc :local-checksum recomputed-checksum)))))

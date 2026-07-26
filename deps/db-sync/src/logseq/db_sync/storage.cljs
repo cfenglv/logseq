@@ -82,11 +82,32 @@
                    (name k)
                    (str v)))
 
+(defn delete-meta! [sql k]
+  (common/sql-exec sql
+                   "delete from sync_meta where key = ?"
+                   (name k)))
+
 (defn get-checksum [sql]
   (get-meta sql :checksum))
 
 (defn set-checksum! [sql checksum]
   (set-meta! sql :checksum checksum))
+
+(defn get-server-checksum [sql]
+  (get-meta sql :server-checksum-v2))
+
+(defn get-server-checksum-t [sql]
+  (when-let [value (get-meta sql :server-checksum-v2-t)]
+    (js/parseInt value 10)))
+
+(defn set-server-checksum! [sql checksum t]
+  (if (string? checksum)
+    (do
+      (set-meta! sql :server-checksum-v2 checksum)
+      (set-meta! sql :server-checksum-v2-t t))
+    (do
+      (delete-meta! sql :server-checksum-v2)
+      (delete-meta! sql :server-checksum-v2-t))))
 
 (defn get-t [sql]
   (let [value (get-meta sql :t)]
@@ -224,15 +245,31 @@
       (with-sql-transaction!
         sql
         (fn []
-          (let [new-t (inc (get-t sql))]
+          (let [prev-t (get-t sql)
+                new-t (inc prev-t)]
             (append-tx! sql new-t tx-str created-at (:outliner-op tx-meta))
             (set-t! sql new-t)
             (when-not (:db-sync/skip-checksum-update? tx-meta)
               (let [prev-checksum (get-checksum sql)
                     checksum (sync-checksum/update-checksum
                               prev-checksum
-                              (assoc tx-report :tx-data normalized-data))]
-                (set-checksum! sql checksum)))))))))
+                              (assoc tx-report :tx-data normalized-data))
+                    prev-server-checksum (get-server-checksum sql)
+                    prev-server-checksum-t (get-server-checksum-t sql)]
+                ;; Keep the historical checksum untouched for older clients.
+                ;; A rollback through an older server can advance `t` without
+                ;; maintaining the additive versioned metadata. Never extend a
+                ;; stale checksum and then stamp it with the new cursor.
+                (set-checksum! sql checksum)
+                (when (string? prev-server-checksum)
+                  (set-server-checksum!
+                   sql
+                   (if (= prev-t prev-server-checksum-t)
+                     (sync-checksum/update-server-checksum
+                      prev-server-checksum
+                      (assoc tx-report :tx-data normalized-data))
+                     (sync-checksum/recompute-server-checksum db-after))
+                   new-t))))))))))
 
 (defn- listen-db-updates!
   [sql conn]

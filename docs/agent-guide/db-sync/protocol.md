@@ -30,14 +30,28 @@
   - Cloudflare Durable Objects reply through `setWebSocketAutoResponse` without waking a hibernating object.
 
 ## Server -> Client
-- `{"type":"hello","t":<t>,"checksum":"<hex>"}`
+- `{"type":"hello","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}`
   - Server hello with current t and entity checksum.
+  - `checksum` retains the historical v1 value and meaning for old clients.
+    Current servers additionally emit the optional, paired
+    `checksum-version` and `server-checksum` fields. A client may compare the
+    latter only when it implements the exact advertised version; unknown or
+    missing versions fall back to the strict v1 comparison.
+  - `server-db-v2` uses a typed large-title token containing the exact uploaded
+    payload's SHA-256 digest. The logical title and the server placeholder
+    therefore compare equal only when they reference the same authenticated
+    payload; ordinary user text cannot collide with the token representation.
+    New markers contain `payload-format`, `payload-digest-alg`, and
+    `payload-digest`. Graphs that still contain a legacy marker without these
+    fields omit the v2 pair and retain strict v1 comparison until migrated.
+  - The server stores and updates v2 independently without changing the
+    historical `checksum`, so older clients continue to work.
 - `{"type":"online-users","online-users":[{"user-id":"...","email":"...","username":"...","name":"..."}...]}`
   - Presence update
   - Optional `editing-block-uuid` indicates the block the user is editing.
-- `{"type":"pull/ok","t":<t>,"checksum":"<hex>","txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`
+- `{"type":"pull/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?,"txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`
   - Pull response with txs and post-apply entity checksum.
-- `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>"}`
+- `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}`
   - Batch accepted; `t` and `checksum` describe the resulting server state.
     `t` remains unchanged when every entry is an idempotent no-op.
 - `{"type":"changed","t":<t>}`
@@ -100,12 +114,12 @@
 - `GET /sync/:graph-id/health`
   - Health check. Response: `{"ok":true}`.
 - `GET /sync/:graph-id/pull?since=<t>`
-  - Same as WS pull. Response: `{"type":"pull/ok","t":<t>,"checksum":"<hex>","txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`.
+  - Same as WS pull. Response: `{"type":"pull/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?,"txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`.
   - Error response (400): `{"error":"invalid since"}`.
   - Error response (409): `{"error":"graph not ready"}` when bootstrap upload/import has not finished.
 - `POST /sync/:graph-id/tx/batch`
   - Same as WS tx/batch. Body: `{"t-before":<t>,"txs":[{"tx":"<tx-transit>","tx-id":"<uuid?>","outliner-op":"<keyword?>"}, ...]}`.
-  - Response: `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>"}` or `{"type":"tx/reject","reason":...}`.
+  - Response: `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}` or `{"type":"tx/reject","reason":...}`.
   - Error response (400): `{"error":"missing body"|"invalid tx"}`.
   - Error response (409): `{"error":"graph not ready"}` when bootstrap upload/import has not finished.
 - `GET /sync/:graph-id/snapshot/download`

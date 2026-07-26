@@ -74,6 +74,61 @@
   (p/let [text (.text response)]
     (js->clj (js/JSON.parse text) :keywordize-keys true)))
 
+(deftest current-server-checksum-recomputes-after-old-server-cursor-advance-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            page-uuid (random-uuid)]
+        (d/transact! conn
+                     [{:block/uuid page-uuid
+                       :block/name "before-downgrade"
+                       :block/title "Before downgrade"}])
+        (let [checksum-before (sync-handler/current-server-checksum self)
+              checksum-t-before (storage/get-server-checksum-t sql)]
+          ;; Model an old server: DB and cursor advance while the new metadata
+          ;; keys are left untouched.
+          (d/transact! conn
+                       [[:db/add [:block/uuid page-uuid]
+                         :block/title
+                         "Changed by old server"]]
+                       {:db-sync/skip-checksum-update? true})
+          (is (> (storage/get-t sql) checksum-t-before))
+          (is (= checksum-before (storage/get-server-checksum sql)))
+          (let [checksum-after (sync-handler/current-server-checksum self)]
+            (is (not= checksum-before checksum-after))
+            (is (= (sync-checksum/recompute-server-checksum @conn)
+                   checksum-after))
+            (is (= (storage/get-t sql)
+                   (storage/get-server-checksum-t sql)))))))))
+
+(deftest legacy-large-title-marker-omits-v2-but-keeps-old-client-checksum-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            block-uuid (random-uuid)
+            self #js {:sql sql :conn conn :schema-ready true}]
+        (d/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "legacy-large-title-page"
+           :block/title "Legacy large title page"}
+          {:block/uuid block-uuid
+           :block/title ""
+           :block/page [:block/uuid page-uuid]
+           :block/parent [:block/uuid page-uuid]
+           :logseq.property.sync/large-title-object
+           {:asset-uuid "legacy-title"
+            :asset-type "txt"}}])
+        (let [fields (sync-handler/checksum-response-fields self)]
+          (is (string? (:checksum fields))
+              "the historical field remains available to old clients")
+          (is (nil? (:checksum-version fields)))
+          (is (nil? (:server-checksum fields))))))))
+
 (deftest semantic-create-page-delegates-to-outliner-and-broadcasts-test
   (async done
          (with-memory-sql-async
@@ -1184,11 +1239,18 @@
   [sql conn prev-t prev-checksum response label]
   (let [stored-checksum (storage/get-checksum sql)
         recomputed-checksum (sync-checksum/recompute-checksum @conn)
+        stored-server-checksum (storage/get-server-checksum sql)
+        recomputed-server-checksum
+        (sync-checksum/recompute-server-checksum @conn)
         new-t (storage/get-t sql)
         accepted? (= "tx/batch/ok" (:type response))
         advanced? (> new-t prev-t)]
     (is (= new-t (:t response))
         (str label " response.t should match storage t"))
+    (is (= recomputed-server-checksum stored-server-checksum)
+        (str label " versioned checksum should equal full recompute"))
+    (is (= new-t (storage/get-server-checksum-t sql))
+        (str label " versioned checksum watermark should match t"))
     (if accepted?
       (if advanced?
         (do
@@ -1901,7 +1963,9 @@
                                                  #js [])
                                storage/fetch-tx-since (fn [_ _] [])
                                storage/get-t (fn [_] 7)
-                               sync-handler/current-checksum (fn [_] "checksum-ok")]
+                               sync-handler/current-checksum (fn [_] "checksum-ok")
+                               sync-handler/current-server-checksum
+                               (fn [_] "server-checksum-ok")]
                  (p/let [resp (sync-handler/handle {:self self
                                                     :request request
                                                     :url url
@@ -1912,6 +1976,9 @@
                    (is (= 200 (.-status resp)))
                    (is (= 7 (:t body)))
                    (is (= "checksum-ok" (:checksum body)))
+                   (is (= sync-checksum/server-checksum-version
+                          (:checksum-version body)))
+                   (is (= "server-checksum-ok" (:server-checksum body)))
                    (is (contains? probe-set "select 1 from kvs limit 1"))
                    (is (contains? probe-set "select 1 from snapshot_kvs_staging limit 1"))
                    (is (contains? probe-set "select 1 from snapshot_downloads limit 1"))
@@ -2542,6 +2609,44 @@
           (is (= 1 (count @checksum-updates)))
           (is (= (sync-checksum/recompute-checksum @conn)
                  (storage/get-checksum sql))))))))
+
+(deftest large-entry-recomputes-versioned-checksum-after-rollback-write-test
+  (testing "a mutation-first upgrade cannot bless stale versioned metadata"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              page-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid page-uuid
+                                    :block/name "large-rollback-page"
+                                    :block/title "Before rollback"}])
+              _ (storage/set-server-checksum!
+                 sql
+                 (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-t sql))
+              _ (d/transact!
+                 conn
+                 [[:db/add [:block/uuid page-uuid]
+                   :block/title
+                   "Changed by old server"]]
+                 {:db-sync/skip-checksum-update? true})
+              t-before (storage/get-t sql)
+              tx-entry {:tx (protocol/tx->transit
+                             (large-block-insert-tx page-uuid 1200))
+                        :tx-id (random-uuid)
+                        :outliner-op :insert-blocks}
+              self #js {:sql sql
+                        :conn conn
+                        :schema-ready true}
+              response
+              (with-redefs [ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 self nil [tx-entry] t-before))]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql)))
+          (is (= (storage/get-t sql)
+                 (storage/get-server-checksum-t sql))))))))
 
 (defn- concat-bytes
   [^js a ^js b]
@@ -3499,6 +3604,7 @@
                                   :block/parent [:block/uuid page-uuid]
                                   :block/page [:block/uuid page-uuid]}])
             rng (seeded-rng seed)]
+        (sync-handler/current-server-checksum self)
         (loop [step 0
                prev-t (storage/get-t sql)
                prev-checksum (storage/get-checksum sql)]
@@ -3508,11 +3614,20 @@
                              (sync-handler/handle-tx-batch! self nil [entry] prev-t))
                   new-t (:t response)
                   stored-checksum (storage/get-checksum sql)
-                  recomputed-checksum (sync-checksum/recompute-checksum @conn)]
+                  recomputed-checksum (sync-checksum/recompute-checksum @conn)
+                  stored-server-checksum (storage/get-server-checksum sql)
+                  recomputed-server-checksum
+                  (sync-checksum/recompute-server-checksum @conn)]
               (is (= "tx/batch/ok" (:type response))
                   (str "expected tx/batch/ok at seed " seed " step " step))
               (is (= new-t (storage/get-t sql))
                   (str "t mismatch at seed " seed " step " step))
+              (is (= recomputed-server-checksum stored-server-checksum)
+                  (str "versioned checksum mismatch at seed " seed
+                       " step " step))
+              (is (= new-t (storage/get-server-checksum-t sql))
+                  (str "versioned checksum watermark mismatch at seed "
+                       seed " step " step))
               (if (> new-t prev-t)
                 (do
                   (is (string? stored-checksum)

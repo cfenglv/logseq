@@ -272,6 +272,27 @@
     {:graph-id graph-id
      :graph-e2ee? graph-e2ee?}))
 
+(defn- snapshot-large-title-marker-txs
+  [repo db]
+  (->> (d/datoms db :eavt)
+       (keep
+        (fn [{:keys [e a v]}]
+          (when (and
+                 (= sync-large-title/large-title-object-attr a)
+                 (sync-large-title/large-title-object-v2? v))
+            (if-let [block-uuid (:block/uuid (d/entity db e))]
+              [:db/add
+               [:block/uuid block-uuid]
+               sync-large-title/large-title-object-attr
+               v]
+              (fail-fast
+               :db-sync/missing-field
+               {:repo repo
+                :field :block/uuid
+                :phase :snapshot-large-title-marker
+                :entity-id e})))))
+       vec))
+
 (defn- <create-remote-graph-aux!
   [repo {:keys [graph-e2ee? graph-ready-for-use?]}]
   (let [base (http-base-url)
@@ -490,31 +511,59 @@
                             (sync-crypt/<ensure-graph-aes-key repo graph-id))
                   _ (when (and graph-e2ee? (nil? aes-key))
                       (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))]
-            (let [snapshot-checksum (sync-checksum/recompute-checksum @source-conn)]
-              (client-op/update-local-checksum repo snapshot-checksum)
-              (p/let [_ (update-progress {:sub-type :upload-progress
-                                          :message (if graph-e2ee? "Encrypting..." "Preparing...")})
-                      {:keys [db] :as temp} (<prepare-upload-temp-sqlite!
-                                             repo graph-id source-conn aes-key update-progress)
-                      total-rows (count-kvs-rows db)]
-                (-> (<upload-temp-snapshot-with-fallback!
-                     db
-                     {:base base
-                      :graph-id graph-id
-                      :snapshot-checksum snapshot-checksum
-                      :upload-id upload-id
-                      :total-rows total-rows
-                      :update-progress update-progress})
-                    (p/then
-                     (fn [_]
-                       (sync-apply/clear-pending-txs! repo)
-                       (client-op/reset-local-tx repo)
-                       (client-op/add-all-exists-asset-as-ops repo)
-                       (update-progress {:sub-type :upload-completed
-                                         :message "Graph upload finished!"})
-                       {:graph-id graph-id}))
-                    (p/finally
-                      (fn []
-                        (sync-temp-sqlite/cleanup-temp-sqlite! temp))))))))
+            (p/let [_ (update-progress {:sub-type :upload-progress
+                                        :message (if graph-e2ee? "Encrypting..." "Preparing...")})
+                    {:keys [db conn] :as temp}
+                    (<prepare-upload-temp-sqlite!
+                     repo graph-id source-conn aes-key update-progress)
+                    marker-txs
+                    (snapshot-large-title-marker-txs repo @conn)
+                    _ (when (seq marker-txs)
+                        (ldb/transact!
+                         source-conn
+                         marker-txs
+                         {:rtc-tx? true
+                          :persist-op? false
+                          :op :large-title-marker}))
+                    snapshot-checksum
+                    (sync-checksum/recompute-checksum @source-conn)
+                    _ (client-op/update-local-checksum
+                       repo snapshot-checksum)
+                    local-server-checksum
+                    (sync-checksum/recompute-server-checksum @source-conn)
+                    snapshot-server-checksum
+                    (sync-checksum/recompute-server-checksum @conn)
+                    _ (when-not (= local-server-checksum
+                                   snapshot-server-checksum)
+                        (fail-fast
+                         :db-sync/checksum-mismatch
+                         {:repo repo
+                          :phase :snapshot-large-title-marker
+                          :local-server-checksum
+                          local-server-checksum
+                          :snapshot-server-checksum
+                          snapshot-server-checksum}))
+                    _ (client-op/update-local-server-checksum
+                       repo local-server-checksum)
+                    total-rows (count-kvs-rows db)]
+              (-> (<upload-temp-snapshot-with-fallback!
+                   db
+                   {:base base
+                    :graph-id graph-id
+                    :snapshot-checksum snapshot-checksum
+                    :upload-id upload-id
+                    :total-rows total-rows
+                    :update-progress update-progress})
+                  (p/then
+                   (fn [_]
+                     (sync-apply/clear-pending-txs! repo)
+                     (client-op/reset-local-tx repo)
+                     (client-op/add-all-exists-asset-as-ops repo)
+                     (update-progress {:sub-type :upload-completed
+                                       :message "Graph upload finished!"})
+                     {:graph-id graph-id}))
+                  (p/finally
+                    (fn []
+                      (sync-temp-sqlite/cleanup-temp-sqlite! temp)))))))
         (p/rejected (ex-info "db-sync missing datascript conn"
                              {:repo repo}))))))

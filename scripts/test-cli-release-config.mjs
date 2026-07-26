@@ -14,12 +14,18 @@ const readText = (relativePath) =>
 const readJson = (relativePath) =>
   JSON.parse(readText(relativePath));
 
+const assertContains = (text, needle, label) => {
+  assert.ok(text.includes(needle), `${label} should contain ${needle}`);
+};
+
 const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
 const dbSyncPackage = readJson("deps/db-sync/package.json");
 const dbSyncWorkspace = readText("deps/db-sync/pnpm-workspace.yaml");
 const desktopPackagingGulpfile = readText("gulpfile.js");
 const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const prLabelerWorkflow = readText(".github/workflows/pr-labeler.yml");
+const desktopBuilderConfig = readText("resources/electron-builder.yml");
 const unsignedDesktopBuilder = readText("resources/electron-builder-unsigned.mjs");
 const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
 const adhocAfterSign = readText("resources/electron-builder-adhoc-after-sign.cjs");
@@ -29,11 +35,80 @@ const verifyDesktopRuntimeRevisionsScript = readText(
 const desktopReleasePreflight = readText(
   "scripts/desktop-release-preflight.mjs",
 );
+const fullDesktopReleasePreflight = readText(
+  "scripts/run-desktop-release-preflight.mjs",
+);
 const desktopReleaseAssetVerifier = readText(
   "scripts/verify-desktop-release-assets.mjs",
 );
 const packagedDesktopVerifier = readText(
   "resources/verify-packaged-desktop.mjs",
+);
+const updaterProviderVerifier = readText(
+  "resources/verify-updater-provider.mjs",
+);
+const electronUpdater = readText("src/electron/electron/updater.cljs");
+const electronUpdaterConfig = readText(
+  "src/electron/electron/updater_config.cljs",
+);
+const desktopSettings = readText(
+  "src/main/frontend/components/settings.cljs",
+);
+const e2eSettings = readText("clj-e2e/src/logseq/e2e/settings.clj");
+const e2eGraph = readText("clj-e2e/src/logseq/e2e/graph.clj");
+const e2eRtc = readText("clj-e2e/src/logseq/e2e/rtc.clj");
+const e2eUtil = readText("clj-e2e/src/logseq/e2e/util.clj");
+const e2eOutliner = readText(
+  "clj-e2e/test/logseq/e2e/outliner_basic_test.clj",
+);
+const e2eRtcExtra = readText(
+  "clj-e2e/test/logseq/e2e/rtc_extra_test.clj",
+);
+
+assert.match(
+  prLabelerWorkflow,
+  /permissions:\s+contents: read\s+pull-requests: write/,
+  "PR labeler should receive only the repository permissions it needs",
+);
+assert.match(
+  prLabelerWorkflow,
+  /TimonVS\/pr-labeler-action@bd0b592a410983316a454e3d48444608f028ec8e/,
+  "write-capable PR labeler action should be pinned to an immutable commit",
+);
+assert.match(
+  e2eSettings,
+  /\(w\/wait-for "#search-button"\)\s+\(assert\/assert-in-normal-mode\?\)/,
+  "E2E setup should wait for the application shell before asserting normal mode",
+);
+assert.match(
+  e2eGraph,
+  /rtc-graph-control-timeout-ms 15000[\s\S]*?rtc-sync-toggle \{:timeout rtc-graph-control-timeout-ms\}[\s\S]*?rtc-graph-e2ee-toggle \{:timeout rtc-graph-control-timeout-ms\}/,
+  "RTC graph setup should use a bounded cold-runner timeout for both controls",
+);
+assert.match(
+  e2eUtil,
+  /rtc-entitlement-ready-script[\s\S]*?rtc_2025_07_10/,
+  "RTC E2E entitlement gate should accept both supported account groups",
+);
+assert.match(
+  e2eUtil,
+  /w\/wait-for-not-visible "\.cp__user-login"[\s\S]*?\(wait-rtc-entitlement-ready!\)/,
+  "RTC E2E login should await the asynchronous account entitlement before opening graph controls",
+);
+assert.match(
+  e2eRtc,
+  /wait-current-tx-synced[\s\S]*?button\.cloud\.on\.idle[\s\S]*?\(= local-tx remote-tx\)[\s\S]*?\(= previous current\)/,
+  "RTC destructive UI tests should require two consecutive synced transaction observations",
+);
+assert.match(
+  e2eOutliner,
+  /\(settle!\)[\s\S]*?get-by-text "b4" true[\s\S]*?\(b\/delete-blocks\)[\s\S]*?\(settle!\)[\s\S]*?get-by-text "b3" true[\s\S]*?select-blocks-to-count 2/,
+  "outliner deletion should settle RTC before re-establishing each destructive selection context",
+);
+assert.match(
+  e2eRtcExtra,
+  /outliner-basic-test\/delete rtc\/wait-current-tx-synced/,
+  "RTC outliner tests should enable the transaction-settling deletion path",
 );
 
 const zvecOptionalRuntimeDependencies = [
@@ -78,6 +153,11 @@ assert.equal(
   "the standalone desktop artifact should expose package verification",
 );
 assert.equal(
+  desktopPackage.scripts["electron:verify-updater-provider"],
+  "node ./verify-updater-provider.mjs",
+  "the standalone desktop artifact should expose updater provider verification",
+);
+assert.equal(
   desktopPackage.devDependencies["@electron/asar"],
   "3.4.1",
   "package verification must not rely on a transitive asar dependency",
@@ -86,6 +166,11 @@ assert.match(
   desktopPackagingGulpfile,
   /resourceFilePath = path\.join\(resourcesPath, '\*\*'\)/,
   "desktop resource sync should include the bundled signing scripts",
+);
+assert.match(
+  desktopBuilderConfig,
+  /publish:\s+- provider: github\s+owner: cfenglv\s+repo: logseq/,
+  "packaged selfhost clients should read updates from the fork release feed",
 );
 
 assert.match(
@@ -293,6 +378,17 @@ assert.match(
   /node scripts\/verify-desktop-release-assets\.mjs[\s\S]*?--write-checksums/,
   "desktop release workflow should validate the complete asset set before publishing",
 );
+assert.equal(
+  desktopReleaseWorkflow.match(/pnpm electron:verify-updater-provider/g)
+    ?.length,
+  6,
+  "all six desktop builders should rehearse the updater provider contract",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /prerelease: \$\{\{ !contains\(steps\.ref\.outputs\.version, '-selfhost\.'\) && github\.event\.inputs\.is-pre-release \}\}/,
+  "selfhost versions must be GitHub production releases so /releases/latest can discover them",
+);
 assertNotContains(
   desktopReleaseWorkflow,
   "sha256sum *.apk",
@@ -350,8 +446,13 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
-  /compile-cljs:[\s\S]*?needs: \[ rtc-release-gate \]/,
-  "desktop compilation should wait for the RTC release gate",
+  /compile-cljs:[\s\S]*?needs: \[ rtc-release-gate, rtc-browser-e2e \]/,
+  "desktop compilation should wait for both RTC release and browser E2E gates",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /actions\/setup-python@v[1-4]\b/,
+  "desktop release workflow should not use an unsupported setup-python runtime",
 );
 assert.match(
   desktopReleaseWorkflow,
@@ -417,6 +518,53 @@ assert.match(
   desktopReleasePreflight,
   /tracked worktree changes must be committed before release/,
   "desktop preflight should reject dirty tracked release inputs in strict mode",
+);
+assert.match(
+  desktopReleasePreflight,
+  /resources\/verify-updater-provider\.mjs/,
+  "desktop preflight should require the updater provider rehearsal",
+);
+assert.match(
+  fullDesktopReleasePreflight,
+  /verify updater provider contract[\s\S]*?electron:verify-updater-provider/,
+  "the full desktop preflight should execute the real updater provider rehearsal",
+);
+assert.match(
+  electronUpdater,
+  /set! \(\.-allowPrerelease autoUpdater\) allow-prerelease\?/,
+  "the Electron runtime should override prerelease discovery for selfhost versions",
+);
+assert.match(
+  electronUpdaterConfig,
+  /-selfhost\(\?:\\\.\|\$\)/,
+  "the updater contract should identify only selfhost SemVer prereleases",
+);
+assert.match(
+  updaterProviderVerifier,
+  /ERR_UPDATER_NO_PUBLISHED_VERSIONS/,
+  "the updater rehearsal should preserve the original channel mismatch as a regression case",
+);
+assert.match(
+  updaterProviderVerifier,
+  /across six platform\/architecture contracts/,
+  "the updater rehearsal should cover all six desktop targets",
+);
+for (const needle of [
+  'path.join(resourcesDir, "app-update.yml")',
+  '["provider", /^provider:\\s*github\\s*$/m]',
+  '["owner", /^owner:\\s*cfenglv\\s*$/m]',
+  '["repo", /^repo:\\s*logseq\\s*$/m]',
+]) {
+  assertContains(
+    packagedDesktopVerifier,
+    needle,
+    "packaged desktop updater feed verification",
+  );
+}
+assert.match(
+  desktopSettings,
+  /openExternal fv\/releases-url/,
+  "selfhost updater errors should link to the fork release page",
 );
 assert.match(
   desktopReleaseAssetVerifier,

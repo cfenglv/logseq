@@ -111,6 +111,7 @@
     "desktop:verify-runtime-revisions": "node ./scripts/verify-desktop-runtime-revisions.mjs",
     "desktop:release-preflight:quick": "node ./scripts/desktop-release-preflight.mjs",
     "desktop:release-preflight": "node ./scripts/run-desktop-release-preflight.mjs",
+    "rtc:prepush": "node ./scripts/run-rtc-prepush.mjs",
     "cli:e2e": "bb dev:cli-e2e",
     "cli:e2e:skip-build": "bb dev:cli-e2e --skip-build",
     "cljs:dev-release-app": "clojure -M:cljs release app db-worker db-worker-node --config-merge \"{:closure-defines {frontend.config/DEV-RELEASE true}}\"",

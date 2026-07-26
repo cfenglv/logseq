@@ -602,7 +602,10 @@
                           :expected-checksum expected-checksum
                           :actual-checksum local-checksum})))
                      (client-op/update-local-checksum
-                      repo local-checksum)))))
+                      repo local-checksum)
+                     (client-op/update-local-server-checksum
+                      repo
+                      (sync-checksum/recompute-server-checksum @conn))))))
               commit-backup-f
               (when (:local-backup state)
                 (require-thread-api-f!

@@ -154,6 +154,30 @@
 
 (def mac? (= "Mac OS X" (System/getProperty "os.name")))
 
+(def ^:private rtc-entitlement-ready-script
+  "(() => {
+     try {
+       const groups = JSON.parse(localStorage.getItem('user-groups') || '[]');
+       return groups.some((group) => group === 'team' || group === 'rtc_2025_07_10');
+     } catch (_) {
+       return false;
+     }
+   })()")
+
+(defn- wait-rtc-entitlement-ready!
+  []
+  (loop [remaining 60]
+    (if (w/eval-js rtc-entitlement-ready-script)
+      true
+      (if (zero? remaining)
+        (throw
+         (ex-info
+          "RTC entitlement was not ready after login"
+          {:timeout-ms 15000}))
+        (do
+          (wait-timeout 250)
+          (recur (dec remaining)))))))
+
 (defn login-test-account
   [& {:keys [username password]
       :or {username "e2etest"
@@ -165,7 +189,11 @@
   (k/tab)
   (input password)
   (w/click ".cp__user-login button[type=\"submit\"]")
-  (w/wait-for-not-visible ".cp__user-login"))
+  (w/wait-for-not-visible ".cp__user-login")
+  ;; Closing the login modal precedes the asynchronous user-info response.
+  ;; Opening the new-graph dialog before the RTC group reaches app state
+  ;; permanently renders that dialog without its sync controls.
+  (wait-rtc-entitlement-ready!))
 
 (defn goto-journals
   []

@@ -257,6 +257,25 @@ forwarding, v2-to-v1 fallback, and optional asset headers. Even so, make a
 backup and test one non-critical shared graph before a team-wide client
 upgrade.
 
+### Desktop application updates
+
+Clients on `2.0.1-selfhost.3` or earlier must install
+`2.0.1-selfhost.4` manually. Their updater cannot discover selfhost releases
+because its architecture channel conflicts with the SemVer prerelease
+identifier.
+
+Starting with `.4`, **Settings → General → Check for updates** discovers the
+latest non-draft, non-prerelease GitHub Release and selects the current
+platform and architecture metadata. Future selfhost releases must therefore
+remain GitHub production releases even though their SemVer contains
+`-selfhost.N`; the release workflow enforces this contract.
+
+Use the NSIS installer on Windows and the AppImage on Linux when in-application
+installation is required. On macOS, both versions must use a consistent valid
+signing identity. Apple Developer ID signing and notarization provide the
+team-wide distribution path; the fallback ad-hoc packages remain manual
+downloads and are not claimed as a release-gated automatic replacement path.
+
 ## 10. Reproducibility and release checks
 
 Before publishing a server/client revision:
@@ -265,7 +284,7 @@ Before publishing a server/client revision:
 pnpm cljs:test
 
 LOGSEQ_STABLE_IDENTS=1 node static/tests.js \
-  -r '^(electron\.(db-worker-manager|power-monitor|proxy)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
+  -r '^(electron\.(db-worker-manager|power-monitor|proxy|updater-config)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
   -e fix-me
 
 pnpm --dir deps/db-sync test

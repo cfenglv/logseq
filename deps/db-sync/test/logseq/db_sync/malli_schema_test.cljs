@@ -68,6 +68,17 @@
                      :client-revision "test-revision")]
     (is (= body' (coerce-request :sync/tx-batch body')))))
 
+(deftest versioned-server-checksum-fields-are-additive-test
+  (doseq [message [{:type "hello" :t 0}
+                   {:type "pull/ok" :t 0 :txs []}
+                   {:type "tx/batch/ok" :t 0}]]
+    (let [message' (assoc message
+                          :checksum "legacy"
+                          :checksum-version "server-db-v2"
+                          :server-checksum "versioned")]
+      (is (= message'
+             (db-sync-schema/ws-server-message-coercer message'))))))
+
 (deftest ws-tx-batch-client-revision-accepts-string-test
   (let [body {:type "tx/batch"
               :t-before 0

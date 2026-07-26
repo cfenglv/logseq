@@ -79,6 +79,30 @@
   (ensure-conn! self)
   (storage/get-checksum (.-sql self)))
 
+(defn current-server-checksum [^js self]
+  (ensure-conn! self)
+  (let [sql (.-sql self)
+        current-t (storage/get-t sql)
+        stored-checksum (storage/get-server-checksum sql)
+        stored-t (storage/get-server-checksum-t sql)]
+    (if (and (string? stored-checksum)
+             (= current-t stored-t))
+      stored-checksum
+      (let [checksum (sync-checksum/recompute-server-checksum @(.-conn self))]
+        ;; The cursor prevents a new -> old -> new rolling deployment from
+        ;; trusting metadata that the old server could not maintain.
+        (storage/set-server-checksum! sql checksum current-t)
+        checksum))))
+
+(defn checksum-response-fields [^js self]
+  (let [legacy-checksum (current-checksum self)
+        server-checksum (current-server-checksum self)]
+    (cond-> {}
+      (string? legacy-checksum) (assoc :checksum legacy-checksum)
+      (string? server-checksum)
+      (assoc :checksum-version sync-checksum/server-checksum-version
+             :server-checksum server-checksum))))
+
 (defn snapshot-upload-finished? [^js self]
   (ensure-schema! self)
   (not= "true" (storage/get-meta (.-sql self) snapshot-uploading-meta-key)))
@@ -474,12 +498,11 @@
 
 (defn pull-response [^js self since]
   (let [sql (.-sql self)
-        txs (storage/fetch-tx-since sql since)
-        checksum (current-checksum self)]
-    (cond-> {:type "pull/ok"
-             :t (t-now self)
-             :txs txs}
-      (string? checksum) (assoc :checksum checksum))))
+        txs (storage/fetch-tx-since sql since)]
+    (merge {:type "pull/ok"
+            :t (t-now self)
+            :txs txs}
+           (checksum-response-fields self))))
 
 (defn- block-uuid-lookup-ref
   [entity-id]
@@ -749,7 +772,10 @@
   (let [db-before @conn
         tx-meta (apply-client-tx-meta request-context outliner-op)
         sql (when self (.-sql ^js self))
+        prev-t (when sql (storage/get-t sql))
         prev-checksum (when sql (storage/get-checksum sql))
+        prev-server-checksum (when sql (storage/get-server-checksum sql))
+        prev-server-checksum-t (when sql (storage/get-server-checksum-t sql))
         logical-tx-data (volatile! [])
         chunk-count (volatile! 0)]
     (log/info :db-sync/apply-large-tx-entry-start
@@ -787,7 +813,18 @@
                prev-checksum
                {:db-before db-before
                 :db-after @conn
-                :tx-data @logical-tx-data})))
+                :tx-data @logical-tx-data}))
+             (when (string? prev-server-checksum)
+               (storage/set-server-checksum!
+                sql
+                (if (= prev-t prev-server-checksum-t)
+                  (sync-checksum/update-server-checksum
+                   prev-server-checksum
+                   {:db-before db-before
+                    :db-after @conn
+                    :tx-data @logical-tx-data})
+                  (sync-checksum/recompute-server-checksum @conn))
+                (storage/get-t sql))))
            (finally
              (when sql
                (d/unlisten! conn ::large-logical-tx-checksum))))))
@@ -915,17 +952,15 @@
        :else
        (if (seq txs)
          (try
-           (let [{:keys [t applied?]} (apply-tx! self txs request-context)
-                 checksum (current-checksum self)]
+           (let [{:keys [t applied?]} (apply-tx! self txs request-context)]
              (when applied?
                ;; Broadcast once per processed batch after tx-log/checksum settle.
                (ws/broadcast! self sender {:type "changed" :t t}))
-             (cond-> {:type "tx/batch/ok"
-                      :t t}
-               (string? checksum) (assoc :checksum checksum)))
+             (merge {:type "tx/batch/ok"
+                     :t t}
+                    (checksum-response-fields self)))
            (catch :default e
              (let [new-t (t-now self)
-                   checksum (current-checksum self)
                    error-data (or (ex-data e) {})
                    {:keys [successful-tx-ids failed-tx-id missing-block-uuids]}
                    error-data
@@ -938,14 +973,15 @@
                (when (> new-t current-t)
                  ;; Broadcast once when partial batch writes advanced the graph.
                  (ws/broadcast! self sender {:type "changed" :t new-t}))
-               (cond-> {:type "tx/reject"
-                        :reason "db transact failed"
-                        :error-detail error-detail
-                        :t new-t}
-                 (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
-                 failed-tx-id (assoc :failed-tx-id failed-tx-id)
-                 (seq missing-block-uuids) (assoc :missing-block-uuids missing-block-uuids)
-                 (string? checksum) (assoc :checksum checksum)))))
+               (merge
+                (cond-> {:type "tx/reject"
+                         :reason "db transact failed"
+                         :error-detail error-detail
+                         :t new-t}
+                  (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
+                  failed-tx-id (assoc :failed-tx-id failed-tx-id)
+                  (seq missing-block-uuids) (assoc :missing-block-uuids missing-block-uuids))
+                (checksum-response-fields self)))))
          {:type "tx/reject"
           :reason "empty tx data"})))))
 

@@ -154,7 +154,7 @@
   (doseq [test-fn [outliner-basic-test/create-test-page-and-insert-blocks
                    outliner-basic-test/indent-and-outdent
                    outliner-basic-test/move-up-down
-                   outliner-basic-test/delete
+                   #(outliner-basic-test/delete rtc/wait-current-tx-synced)
                    outliner-basic-test/delete-test-with-children]]
     (let [test-fn-in-page2 (fn [*latest-remote-tx]
                              (w/with-page @*page2

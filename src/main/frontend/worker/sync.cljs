@@ -33,6 +33,8 @@
 
 (defonce *repo->latest-remote-tx sync-apply/*repo->latest-remote-tx)
 (defonce *repo->latest-remote-checksum sync-apply/*repo->latest-remote-checksum)
+(defonce *repo->latest-remote-checksum-version
+  sync-apply/*repo->latest-remote-checksum-version)
 (defonce *start-inflight (atom nil))
 
 (defn- current-client
@@ -49,26 +51,39 @@
     :get-missing-asset-upload-files sync-assets/get-missing-asset-upload-files
     :get-local-tx client-op/get-local-tx
     :get-local-checksum client-op/get-local-checksum
+    :get-local-server-checksum client-op/get-local-server-checksum
     :get-graph-uuid client-op/get-graph-uuid
     :latest-remote-tx @*repo->latest-remote-tx
-    :latest-remote-checksum @*repo->latest-remote-checksum}
+    :latest-remote-checksum @*repo->latest-remote-checksum
+    :latest-remote-checksum-version @*repo->latest-remote-checksum-version}
    repo))
 
 (defn update-local-sync-checksum!
   [repo tx-report]
   (when (worker-state/get-client-ops-conn repo)
     (let [current-checksum (client-op/get-local-checksum repo)
-          new-checksum (sync-checksum/update-checksum current-checksum tx-report)]
+          current-server-checksum
+          (or (client-op/get-local-server-checksum repo)
+              (sync-checksum/recompute-server-checksum (:db-before tx-report)))
+          new-checksum (sync-checksum/update-checksum current-checksum tx-report)
+          new-server-checksum
+          (sync-checksum/update-server-checksum current-server-checksum tx-report)]
       (when (and (exists? js/process)
                  (= "1" (aget (.-env js/process) "LOGSEQ_CHECKSUM_ASSERT")))
-        (let [recomputed-checksum (sync-checksum/recompute-checksum (:db-after tx-report))]
-          (when-not (= new-checksum recomputed-checksum)
+        (let [recomputed-checksum (sync-checksum/recompute-checksum (:db-after tx-report))
+              recomputed-server-checksum
+              (sync-checksum/recompute-server-checksum (:db-after tx-report))]
+          (when-not (and (= new-checksum recomputed-checksum)
+                         (= new-server-checksum recomputed-server-checksum))
             (let [{:keys [tx-meta tx-data]} tx-report]
               (log/error :db-sync/checksum-incremental-drift
                          {:repo repo
                           :current-checksum current-checksum
                           :incremental-checksum new-checksum
                           :recomputed-checksum recomputed-checksum
+                          :current-server-checksum current-server-checksum
+                          :incremental-server-checksum new-server-checksum
+                          :recomputed-server-checksum recomputed-server-checksum
                           :tx-meta tx-meta
                           :tx-count (count tx-data)
                           :tx-sample (take 30 tx-data)})
@@ -77,9 +92,13 @@
                                :current-checksum current-checksum
                                :incremental-checksum new-checksum
                                :recomputed-checksum recomputed-checksum
+                               :current-server-checksum current-server-checksum
+                               :incremental-server-checksum new-server-checksum
+                               :recomputed-server-checksum recomputed-server-checksum
                                :tx-meta tx-meta
                                :tx-count (count tx-data)}))))))
-      (client-op/update-local-checksum repo new-checksum))))
+      (client-op/update-local-checksum repo new-checksum)
+      (client-op/update-local-server-checksum repo new-server-checksum))))
 
 (defn- broadcast-rtc-state!
   [client]
@@ -216,10 +235,7 @@
 
 (defn- enqueue-asset-task!
   [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue
-           (fn [prev]
-             (p/then prev (fn [_] (task)))))))
+  (sync-assets/enqueue-asset-task! client task))
 
 (defn- ensure-client-state!
   [repo]
@@ -272,7 +288,8 @@
                                 :db-sync-client-exists?
                                 (some? @worker-state/*db-sync-client)})
                      (->
-                      (p/let [token (<resolve-ws-token)]
+                      (p/let [token ((or (:resolve-ws-token-f client)
+                                        <resolve-ws-token))]
                         ;; Resolving auth can outlive a suspend/resume or another
                         ;; network transition. Never let an obsolete attempt
                         ;; install a second WebSocket over the current client.
@@ -578,9 +595,16 @@
 
 (defn stop!
   []
-  (when-let [client @worker-state/*db-sync-client]
-    (stop-client! client)
-    (reset! worker-state/*db-sync-client nil))
+  (let [client @worker-state/*db-sync-client
+        repo (or (:repo client) (worker-state/get-current-repo))]
+    ;; Lazy asset restoration may start before the WS client exists. Stopping
+    ;; or switching the current graph must still abort those pre-connect HTTP
+    ;; requests and discard their queue state.
+    (when repo
+      (sync-assets/cancel-remote-asset-downloads! repo))
+    (when client
+      (stop-client! client)
+      (reset! worker-state/*db-sync-client nil)))
   (p/resolved nil))
 
 (declare list-remote-graphs!)

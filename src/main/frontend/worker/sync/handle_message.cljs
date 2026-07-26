@@ -12,6 +12,7 @@
             [frontend.worker.sync.transport :as sync-transport]
             [frontend.worker.sync.util :as sync-util]
             [lambdaisland.glogi :as log]
+            [logseq.db-sync.checksum :as sync-checksum]
             [promesa.core :as p]))
 
 (defn- fail-fast
@@ -29,9 +30,12 @@
     :get-missing-asset-upload-files sync-assets/get-missing-asset-upload-files
     :get-local-tx client-op/get-local-tx
     :get-local-checksum client-op/get-local-checksum
+    :get-local-server-checksum client-op/get-local-server-checksum
     :get-graph-uuid client-op/get-graph-uuid
     :latest-remote-tx @sync-apply/*repo->latest-remote-tx
-    :latest-remote-checksum @sync-apply/*repo->latest-remote-checksum}
+    :latest-remote-checksum @sync-apply/*repo->latest-remote-checksum
+    :latest-remote-checksum-version
+    @sync-apply/*repo->latest-remote-checksum-version}
    repo))
 
 (defn- broadcast-rtc-state!
@@ -63,10 +67,7 @@
 
 (defn- enqueue-asset-task!
   [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue
-           (fn [prev]
-             (p/then prev (fn [_] (task)))))))
+  (sync-assets/enqueue-asset-task! client task))
 
 (defn- enqueue-send-task!
   [client task]
@@ -176,25 +177,72 @@
 
 (defn- checksum-compare-ready?
   [repo client local-t remote-t]
-  (and (synced-checksum-ready? repo client local-t remote-t)
-       (string? (client-op/get-local-checksum repo))))
+  (synced-checksum-ready? repo client local-t remote-t))
 
 (defn- verify-sync-checksum!
-  [repo client local-tx remote-tx remote-checksum context]
-  (when (and (string? remote-checksum)
-             (checksum-compare-ready? repo client local-tx remote-tx))
-    (let [local-checksum (client-op/get-local-checksum repo)]
-      (when-not (= local-checksum remote-checksum)
-        (let [mismatch-data (merge context
-                                   {:type :db-sync/checksum-mismatch
-                                    :repo repo
-                                    :message-type (:type context)
-                                    :local-tx local-tx
-                                    :remote-tx remote-tx
-                                    :local-checksum local-checksum
-                                    :remote-checksum remote-checksum})]
+  [repo client local-tx remote-tx
+   {:keys [checksum server-checksum checksum-version]}
+   context]
+  (when (checksum-compare-ready? repo client local-tx remote-tx)
+    (let [conn (worker-state/get-datascript-conn repo)
+          local-checksum
+          (or (client-op/get-local-checksum repo)
+              (when conn
+                (let [computed (sync-checksum/recompute-checksum @conn)]
+                  (client-op/update-local-checksum repo computed)
+                  computed)))
+          versioned-checksum?
+          (and (= sync-checksum/server-checksum-version checksum-version)
+               (string? server-checksum))
+          local-server-checksum
+          (when versioned-checksum?
+            (or (client-op/get-local-server-checksum repo)
+                (when conn
+                  (let [computed
+                        (sync-checksum/recompute-server-checksum @conn)]
+                    (client-op/update-local-server-checksum repo computed)
+                    computed))))
+          legacy-match? (or (not (string? checksum))
+                            (= local-checksum checksum))
+          versioned-match? (and versioned-checksum?
+                                (= local-server-checksum server-checksum))
+          mismatch-data
+          (cond-> (merge context
+                         {:type :db-sync/checksum-mismatch
+                          :repo repo
+                          :message-type (:type context)
+                          :local-tx local-tx
+                          :remote-tx remote-tx
+                          :local-checksum local-checksum
+                          :remote-checksum checksum})
+            versioned-checksum?
+            (assoc :checksum-version checksum-version
+                   :local-server-checksum local-server-checksum
+                   :remote-server-checksum server-checksum))]
+      (cond
+        ;; A recognized advertised checksum is authoritative. A matching
+        ;; historical value must not hide a stale/corrupt server checksum.
+        (and versioned-checksum? (not versioned-match?))
+        (do
           (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
-          (fail-fast :db-sync/checksum-mismatch mismatch-data))))))
+          (fail-fast :db-sync/checksum-mismatch mismatch-data))
+
+        ;; The versioned representation intentionally bridges logical large
+        ;; titles and their server transport placeholders.
+        (and versioned-match? (not legacy-match?))
+        (let [compatibility-data
+              (assoc mismatch-data
+                     :compatibility :versioned-server-checksum)]
+          (sync-log-state/rtc-log
+           :rtc.log/checksum-mismatch compatibility-data)
+          (log/warn :db-sync/versioned-server-checksum compatibility-data))
+
+        ;; Old/unknown servers retain the strict historical comparison.
+        (not legacy-match?)
+        (do
+          (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
+          (fail-fast :db-sync/checksum-mismatch mismatch-data)))))
+  nil)
 
 (defn- handle-tx-reject!
   [repo client message local-tx]
@@ -289,7 +337,7 @@
                    rejected-data)))))
 
 (defn- handle-hello!
-  [repo client local-tx remote-tx remote-checksum]
+  [repo client local-tx remote-tx checksum-fields]
   (require-non-negative remote-tx {:repo repo :type "hello"})
   (when (< remote-tx local-tx)
     (fail-fast :db-sync/server-cursor-regressed
@@ -298,7 +346,7 @@
                 :message-type "hello"
                 :local-tx local-tx
                 :remote-tx remote-tx}))
-  (verify-sync-checksum! repo client local-tx remote-tx remote-checksum {:type "hello"})
+  (verify-sync-checksum! repo client local-tx remote-tx checksum-fields {:type "hello"})
   (broadcast-rtc-state! client)
   (if (> remote-tx local-tx)
     ;; Reconnects after a lost upload acknowledgement commonly see the server
@@ -336,7 +384,7 @@
       (update-user-presence! client user-id editing-block-uuid))))
 
 (defn- handle-tx-batch-ok!
-  [repo client remote-tx remote-checksum]
+  [repo client remote-tx checksum-fields]
   (require-non-negative remote-tx {:repo repo :type "tx/batch/ok"})
   (sync-apply/ack-upload-response! repo client)
   (let [current-local-tx (client-op/get-local-tx repo)
@@ -346,7 +394,7 @@
     (broadcast-rtc-state! client)
     (sync-apply/mark-pending-txs-false! repo @(:inflight client))
     (reset! (:inflight client) [])
-    (verify-sync-checksum! repo client next-local-tx remote-tx remote-checksum {:type "tx/batch/ok"})
+    (verify-sync-checksum! repo client next-local-tx remote-tx checksum-fields {:type "tx/batch/ok"})
     (mark-sync-succeeded! client)
     (sync-apply/enqueue-flush-pending! repo client)))
 
@@ -354,8 +402,16 @@
   [repo message]
   (let [message-type (:type message)
         remote-tx (:t message)
-        remote-checksum (:checksum message)
-        has-checksum? (contains? message :checksum)
+        checksum-version (:checksum-version message)
+        versioned-checksum?
+        (and (= sync-checksum/server-checksum-version checksum-version)
+             (string? (:server-checksum message)))
+        remote-checksum (if versioned-checksum?
+                          (:server-checksum message)
+                          (:checksum message))
+        has-checksum? (if versioned-checksum?
+                        (contains? message :server-checksum)
+                        (contains? message :checksum))
         latest-remote-tx (get @sync-apply/*repo->latest-remote-tx repo)
         authoritative? (contains? #{"hello" "changed"} message-type)
         stale-remote-tx? (and (number? remote-tx)
@@ -372,7 +428,10 @@
                    (max prev remote-tx)
                    remote-tx)))))
     (when (and has-checksum? (not stale-remote-tx?))
-      (swap! sync-apply/*repo->latest-remote-checksum assoc repo remote-checksum))
+      (swap! sync-apply/*repo->latest-remote-checksum assoc repo remote-checksum)
+      (swap! sync-apply/*repo->latest-remote-checksum-version
+             assoc repo
+             (when versioned-checksum? checksum-version)))
     {:stale-remote-tx? stale-remote-tx?
      :latest-remote-tx-before latest-remote-tx}))
 
@@ -428,15 +487,18 @@
                     0)}))
     (let [local-tx (client-op/get-local-tx repo)
           remote-tx (:t message)
-          remote-checksum (:checksum message)]
+          checksum-fields (select-keys message
+                                       [:checksum
+                                        :checksum-version
+                                        :server-checksum])]
       (validate-local-tx! repo message local-tx)
       (update-latest-remote-state! repo message)
       (case (:type message)
-        "hello" (handle-hello! repo client local-tx remote-tx remote-checksum)
+        "hello" (handle-hello! repo client local-tx remote-tx checksum-fields)
         "online-users" (handle-online-users! repo client message)
         "presence" (handle-presence! client message)
-        "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx remote-checksum)
-        "pull/ok" (handle-pull-ok! repo client local-tx remote-tx remote-checksum message)
+        "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx checksum-fields)
+        "pull/ok" (handle-pull-ok! repo client local-tx remote-tx checksum-fields message)
         "changed" (handle-changed! repo client local-tx remote-tx)
         "tx/reject" (handle-tx-reject! repo client message local-tx)
         "error" (fail-fast :db-sync/server-error
@@ -457,7 +519,7 @@
   (p/rejected error))
 
 (defn- handle-pull-ok!
-  [repo client local-tx remote-tx remote-checksum message]
+  [repo client local-tx remote-tx checksum-fields message]
   (try
     (cond
       (< remote-tx local-tx)
@@ -497,7 +559,7 @@
              (client-op/update-local-tx repo remote-tx)
              (clear-pending-pull! client)
              (broadcast-rtc-state! client)
-             (verify-sync-checksum! repo client remote-tx remote-tx remote-checksum {:type "pull/ok"})
+             (verify-sync-checksum! repo client remote-tx remote-tx checksum-fields {:type "pull/ok"})
              (mark-sync-succeeded! client)
              (sync-apply/enqueue-flush-pending! repo client))
            (p/then (fn [_]

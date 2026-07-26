@@ -4,6 +4,7 @@
             [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
             [logseq.db :as ldb]
+            [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-sync.common :as common]
             [logseq.db-sync.storage :as storage]
             [logseq.db.common.normalize :as db-normalize]
@@ -60,6 +61,81 @@
   [rng coll]
   (when (seq coll)
     (nth coll (rand-int* rng (count coll)))))
+
+(deftest versioned-server-checksum-listener-updates-independently-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            block-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "server-checksum-page"
+           :block/title "Server checksum page"}
+          {:block/uuid block-uuid
+           :block/title "short"
+           :block/parent [:block/uuid page-uuid]
+           :block/page [:block/uuid page-uuid]}])
+        (storage/set-server-checksum!
+         sql
+         (sync-checksum/recompute-server-checksum @conn)
+         (storage/get-t sql))
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid block-uuid]
+           :block/title
+           (apply str (repeat 5000 "x"))]
+          [:db/add [:block/uuid block-uuid]
+           :logseq.property.sync/large-title-object
+           {:asset-uuid "listener-large-title"
+            :asset-type "txt"
+            :payload-format "utf8-plain-v1"
+            :payload-digest-alg "sha256-v1"
+            :payload-digest (apply str (repeat 64 "a"))}]])
+        (is (= (sync-checksum/recompute-server-checksum @conn)
+               (storage/get-server-checksum sql)))
+        (is (= (storage/get-t sql)
+               (storage/get-server-checksum-t sql)))))))
+
+(deftest versioned-server-checksum-recomputes-when-first-upgrade-action-is-write-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "checksum-rollback-page"
+           :block/title "Before rollback"}])
+        (storage/set-server-checksum!
+         sql
+         (sync-checksum/recompute-server-checksum @conn)
+         (storage/get-t sql))
+
+        ;; Model an old server write: DB and cursor advance, while the additive
+        ;; versioned checksum metadata remains at the prior cursor.
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "Written during rollback"]]
+         {:db-sync/skip-checksum-update? true})
+        (is (not= (storage/get-t sql)
+                  (storage/get-server-checksum-t sql)))
+
+        ;; The first action after upgrading is another write, not a hello/pull
+        ;; that would otherwise repair metadata. It must recompute instead of
+        ;; extending and blessing the stale checksum.
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "First write after upgrade"]])
+        (is (= (sync-checksum/recompute-server-checksum @conn)
+               (storage/get-server-checksum sql)))
+        (is (= (storage/get-t sql)
+               (storage/get-server-checksum-t sql)))))))
 
 (defn- normal-block-uuids
   [db]

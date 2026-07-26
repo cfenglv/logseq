@@ -82,10 +82,24 @@ const keytar = path.join(
   "Release",
   "keytar.node",
 );
+const appUpdateConfig = path.join(resourcesDir, "app-update.yml");
 
-for (const filePath of [mainExecutable, keytar]) {
+for (const filePath of [mainExecutable, keytar, appUpdateConfig]) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`missing packaged native runtime: ${filePath}`);
+  }
+}
+
+const appUpdateText = fs.readFileSync(appUpdateConfig, "utf8");
+for (const [label, pattern] of [
+  ["provider", /^provider:\s*github\s*$/m],
+  ["owner", /^owner:\s*cfenglv\s*$/m],
+  ["repo", /^repo:\s*logseq\s*$/m],
+]) {
+  if (!pattern.test(appUpdateText)) {
+    throw new Error(
+      `packaged updater ${label} does not target cfenglv/logseq: ${appUpdateConfig}`,
+    );
   }
 }
 
