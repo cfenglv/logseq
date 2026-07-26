@@ -110,6 +110,16 @@ assert.match(
   /outliner-basic-test\/delete rtc\/wait-current-tx-synced/,
   "RTC outliner tests should enable the transaction-settling deletion path",
 );
+assert.match(
+  e2eOutliner,
+  /defn move-up-down[\s\S]*?\(util\/exit-edit\)[\s\S]*?\(settle!\)[\s\S]*?select-b3-and-b4[\s\S]*?move-selected-blocks[\s\S]*?\(settle!\)[\s\S]*?select-b3-and-b4[\s\S]*?move-selected-blocks[\s\S]*?\(settle!\)/,
+  "outliner moves should establish exact selection and observe each ordered stage",
+);
+assert.match(
+  e2eRtcExtra,
+  /outliner-basic-test\/move-up-down rtc\/wait-current-tx-synced/,
+  "RTC outliner tests should settle synchronized move stages",
+);
 
 const zvecOptionalRuntimeDependencies = [
   "@zvec/bindings-darwin-arm64",
