@@ -20,9 +20,10 @@
 (defn- <observe-call!
   [f on-error]
   (try
-    (-> (f)
-        p/resolved
-        (p/catch on-error))
+    (let [result (f)]
+      (if (p/promise? result)
+        (p/catch result on-error)
+        (p/resolved result)))
     (catch :default error
       (p/resolved (on-error error)))))
 
@@ -54,7 +55,9 @@
            (fn [error]
              (let [current-data @*last-popup-data
                    retry-data (or @*pending-popup-data
-                                  (when (not= data current-data)
+                                  (when (and
+                                         (not @*native-sheet-dismissing?)
+                                         (not= data current-data))
                                     current-data))]
                (log/error :native-bottom-sheet-present-failed error)
                (reset! *last-popup? false)
@@ -101,7 +104,9 @@
        (.requestAnimationFrame
         js/window
         (fn []
-          (.contentReady plugin #js {})))))))
+          (<observe-call!
+           #(.contentReady plugin #js {})
+           #(log/error :native-bottom-sheet-content-ready-failed %))))))))
 
 (defn- handle-native-sheet-state!
   [^js data]
