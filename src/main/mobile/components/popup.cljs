@@ -3,6 +3,7 @@
   (:require [frontend.mobile.util :as mobile-util]
             [frontend.state :as state]
             [frontend.ui :as ui]
+            [lambdaisland.glogi :as log]
             [logseq.shui.popup.core :as shui-popup]
             [logseq.shui.ui :as shui]
             [mobile.state :as mobile-state]
@@ -13,6 +14,17 @@
 (defonce *last-popup-data (atom nil))
 (defonce *native-sheet-dismissing? (atom false))
 (defonce *pending-popup-data (atom nil))
+
+(declare activate-native-popup!)
+
+(defn- <observe-call!
+  [f on-error]
+  (try
+    (-> (f)
+        p/resolved
+        (p/catch on-error))
+    (catch :default error
+      (p/resolved (on-error error)))))
 
 (defn- popup-min-height
   [default-height]
@@ -29,21 +41,35 @@
           sheet-presented? (some? @*last-popup-data)]
       (reset! *last-popup-data data)
       (when-not sheet-presented?
-        (.present
-         plugin
-         (clj->js
-          (let [height (popup-min-height (:default-height opts))
-                height' (if (contains? #{:ls-icon-picker} id)
-                          760
-                          height)]
-            (cond-> {:allowFullHeight (not= (:type opts) :action-sheet)}
-              (int? height') (assoc :defaultHeight height')))))))))
+        (let [present-opts
+              (clj->js
+               (let [height (popup-min-height (:default-height opts))
+                     height' (if (contains? #{:ls-icon-picker} id)
+                               760
+                               height)]
+                 (cond-> {:allowFullHeight (not= (:type opts) :action-sheet)}
+                   (int? height') (assoc :defaultHeight height'))))]
+          (<observe-call!
+           #(.present plugin present-opts)
+           (fn [error]
+             (let [current-data @*last-popup-data
+                   retry-data (or @*pending-popup-data
+                                  (when (not= data current-data)
+                                    current-data))]
+               (log/error :native-bottom-sheet-present-failed error)
+               (reset! *last-popup? false)
+               (reset! *last-popup-data nil)
+               (reset! *native-sheet-dismissing? false)
+               (reset! *pending-popup-data nil)
+               (mobile-state/set-popup! nil)
+               (when retry-data
+                 (activate-native-popup! retry-data))))))))))
 
 (defn- activate-native-popup!
   [data]
   (reset! *last-popup? true)
-  (present-native-sheet! data)
-  (mobile-state/set-popup! data))
+  (mobile-state/set-popup! data)
+  (present-native-sheet! data))
 
 (defn- request-native-popup!
   [data]
@@ -55,7 +81,16 @@
   []
   (when-let [^js plugin mobile-util/native-bottom-sheet]
     (reset! *native-sheet-dismissing? true)
-    (.dismiss plugin #js {})))
+    (<observe-call!
+     #(.dismiss plugin #js {})
+     (fn [error]
+       (log/error :native-bottom-sheet-dismiss-failed error)
+       (when (and @*native-sheet-dismissing?
+                  (some? @*last-popup-data))
+         (reset! *native-sheet-dismissing? false)
+         (when-let [data @*pending-popup-data]
+           (reset! *pending-popup-data nil)
+           (activate-native-popup! data)))))))
 
 (defn- notify-native-sheet-content-ready!
   []
@@ -73,16 +108,21 @@
   (let [dismissing? (.-dismissing data)]
     (cond
       (true? dismissing?)
-      (p/do!
-       (reset! *native-sheet-dismissing? true)
-       (when (some? @mobile-state/*popup-data)
-         (state/pub-event! [:mobile/clear-edit])
-         (mobile-state/set-popup! nil)
-         (when-let [plugin ^js mobile-util/native-editor-toolbar]
-           (.dismiss plugin)))
-       (reset! *last-popup? false)
-       (reset! *last-popup-data nil)
-       (notify-native-sheet-content-ready!))
+      (let [popup-open? (some? @mobile-state/*popup-data)]
+        (reset! *native-sheet-dismissing? true)
+        (when popup-open?
+          (<observe-call!
+           #(state/pub-event! [:mobile/clear-edit])
+           #(log/error :mobile-clear-edit-failed %))
+          (mobile-state/set-popup! nil))
+        (reset! *last-popup? false)
+        (reset! *last-popup-data nil)
+        (notify-native-sheet-content-ready!)
+        (when popup-open?
+          (when-let [plugin ^js mobile-util/native-editor-toolbar]
+            (<observe-call!
+             #(.dismiss plugin)
+             #(log/error :native-editor-toolbar-dismiss-failed %)))))
 
       (false? dismissing?)
       (do
@@ -143,16 +183,24 @@
   [& args]
   (let [id (first args)
         current-id (get-in @*last-popup-data [:opts :id])
-        current-popup? (or (nil? id) (= id current-id))]
+        current-popup? (or (nil? id) (= id current-id))
+        pending-id (get-in @*pending-popup-data [:opts :id])
+        pending-popup? (and (some? @*pending-popup-data)
+                            (or (nil? id) (= id pending-id)))]
+    (when pending-popup?
+      (reset! *pending-popup-data nil))
     (cond
       (= :download-rtc-graph id)
       (do
-        (when (and @*last-popup? current-popup?)
+        (when (and @*last-popup?
+                   current-popup?
+                   (not @*native-sheet-dismissing?))
           (dismiss-native-sheet!))
         (mobile-state/set-tab! "home"))
 
       (and @*last-popup? (not (= id :editor.commands/commands)))
-      (when current-popup?
+      (when (and current-popup?
+                 (not @*native-sheet-dismissing?))
         (dismiss-native-sheet!))
 
       :else

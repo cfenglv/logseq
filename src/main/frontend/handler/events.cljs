@@ -381,17 +381,17 @@
            :remote-graph graph-schema-version})
   (->
    (p/do!
-    (when (util/mobile?)
+    (when (state/mobile?)
       (download-progress/show! graph-name))
     (rtc-handler/<rtc-download-graph! graph-name graph-uuid graph-e2ee?)
     (rtc-handler/<get-remote-graphs)
     (state/pub-event! [:graph/switch (str config/db-version-prefix graph-name) {:rtc-download? true}])
-    (when (util/mobile?)
+    (when (state/mobile?)
       (download-progress/hide!)))
    (p/catch (fn [e]
               (println "RTC download graph failed, error:")
               (log/error :rtc-download-graph-failed e)
-              (when (util/mobile?)
+              (when (state/mobile?)
                 (download-progress/hide!))
               (when (rtc-error/download-decrypt-failed? e)
                 (notification/show! (t :encryption/wrong-password) :error false))))))
