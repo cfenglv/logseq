@@ -1,5 +1,7 @@
 (ns frontend.components.repo-test
-  (:require [cljs.test :refer [deftest is async]]
+  (:require ["react" :as react]
+            ["react-dom/server" :as react-dom-server]
+            [cljs.test :refer [deftest is async]]
             [frontend.components.repo :as repo]
             [frontend.components.rtc.indicator :as rtc-indicator]
             [frontend.db :as db]
@@ -8,11 +10,98 @@
             [frontend.handler.repo :as repo-handler]
             [frontend.handler.user :as user-handler]
             [frontend.state :as state]
+            [frontend.ui :as ui]
             [frontend.mobile.util :as mobile-util]
             [frontend.util :as util]
+            [goog.object :as gobj]
             [logseq.db :as ldb]
             [logseq.shui.ui :as shui]
             [promesa.core :as p]))
+
+(def remote-download-graph
+  {:url "logseq_db_cloud-graph"
+   :remote? true
+   :rtc-graph? true
+   :graph-e2ee? false
+   :graph-ready-for-use? true
+   :GraphName "cloud-graph"
+   :GraphUUID "graph-uuid"
+   :GraphSchemaVersion "65.2"})
+
+(deftest mobile-remote-graph-click-publishes-download-without-false-sentinel-test
+  (let [events (atom [])
+        links (#'repo/repos-dropdown-links
+               [remote-download-graph]
+               nil
+               nil
+               {:on-click (fn [_])})
+        on-click (get-in (first links) [:options :on-click])
+        result
+        (with-redefs [util/mobile? (constantly true)
+                      state/pub-event! (fn [event]
+                                         (swap! events conj event))]
+          (on-click #js {:shiftKey false}))]
+    (is (= [[:rtc/download-remote-graph
+             "cloud-graph"
+             "graph-uuid"
+             "65.2"
+             false]]
+           @events))
+    (is (not (false? result))
+        "download dispatch must not use false as control flow for popup cleanup")))
+
+(deftest mobile-remote-graph-popup-closes-after-not-during-click-test
+  (async done
+         (let [captured-menu-props (atom nil)
+               popup-hides (atom [])
+               previous-react (gobj/get js/globalThis "React")]
+           (gobj/set js/globalThis "React" react)
+           (try
+             (with-redefs [util/mobile? (constantly true)
+                           state/use-sub
+                           (fn [key]
+                             (case key
+                               :git/current-repo nil
+                               :auth/id-token "token"
+                               [:me :repos] []
+                               :rtc/graphs [remote-download-graph]
+                               :rtc/downloading-graph-uuid nil
+                               :rtc/loading-graphs? false
+                               nil))
+                           graph-handler/get-metadata-local (constantly nil)
+                           repo-handler/combine-local-&-remote-graphs
+                           (fn [locals remotes] (concat locals remotes))
+                           ui/menu-link
+                           (fn [props & _children]
+                             (reset! captured-menu-props props)
+                             (.createElement react "div" nil))
+                           shui/popup-hide!
+                           (fn [& args]
+                             (swap! popup-hides conj args))
+                           state/pub-event! (fn [_event] nil)]
+               (.renderToStaticMarkup
+                react-dom-server
+                (repo/repos-dropdown-content
+                 :contentid :graph-switcher
+                 :footer? false))
+               ((:on-click @captured-menu-props)
+                #js {:shiftKey false})
+               (is (empty? @popup-hides)
+                   "the graph-list popup must remain mounted for the entire click handler")
+               (-> (p/delay 1)
+                   (p/then
+                    (fn []
+                      (is (= [[:graph-switcher]] @popup-hides)
+                          "popup cleanup should still run after dispatch completes")
+                      (done)))
+                   (p/catch
+                    (fn [error]
+                      (is false (str error))
+                      (done)))))
+             (finally
+               (if (some? previous-react)
+                 (gobj/set js/globalThis "React" previous-react)
+                 (js-delete js/globalThis "React")))))))
 
 (defn- ensure-rsa-key-fn
   []
