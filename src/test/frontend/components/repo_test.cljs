@@ -48,13 +48,11 @@
       (recur))))
 
 (defn- run-repo-sheet-scenario!
-  [graph {:keys [initial-sheet mobile? native? progress-order]}]
+  [graph {:keys [initial-sheet mobile? native? event-render-order]}]
   (let [captured-menu-props (atom nil)
         sheet (atom initial-sheet)
         events (atom [])
         hides (atom [])
-        dismiss-acks (atom 0)
-        dismiss-ack-callbacks (atom [])
         progress-callbacks (atom [])
         timer-callbacks (atom [])
         previous-react (gobj/get js/globalThis "React")
@@ -67,11 +65,7 @@
         (fn [& args]
           (swap! hides conj {:args args
                              :sheet @sheet})
-          (reset! sheet nil)
-          (swap! dismiss-ack-callbacks
-                 conj
-                 (fn []
-                   (swap! dismiss-acks inc))))]
+          (reset! sheet nil))]
     (gobj/set js/globalThis "React" react)
     (gobj/set js/console "error" (fn [& _args]))
     (gobj/set js/globalThis "setTimeout"
@@ -108,7 +102,7 @@
                       (swap! events conj event)
                       (when (and native?
                                  (= :rtc/download-remote-graph (first event)))
-                        (if (= :before-dismiss-ack progress-order)
+                        (if (= :immediate event-render-order)
                           (present-progress!)
                           (swap! progress-callbacks conj present-progress!)))
                       nil)]
@@ -123,23 +117,11 @@
                          :hides (vec @hides)
                          :timer-count (count @timer-callbacks)}]
           (drain-callbacks! timer-callbacks)
-          (case progress-order
-            :before-dismiss-ack
-            (do
-              (drain-callbacks! progress-callbacks)
-              (drain-callbacks! dismiss-ack-callbacks))
-
-            :after-dismiss-ack
-            (do
-              (drain-callbacks! dismiss-ack-callbacks)
-              (drain-callbacks! progress-callbacks))
-
-            nil)
+          (drain-callbacks! progress-callbacks)
           {:immediate immediate
            :final-sheet @sheet
            :events (vec @events)
-           :hides (vec @hides)
-           :dismiss-acks @dismiss-acks}))
+           :hides (vec @hides)}))
       (finally
         (gobj/set js/globalThis "setTimeout" previous-set-timeout)
         (gobj/set js/console "error" previous-console-error)
@@ -159,28 +141,28 @@
       "native remote download is a single-sheet content transition, not a hide/show pair")
   (is (= expected-immediate-sheet
          (get-in result [:immediate :sheet]))
-      "the controlled scheduler must expose the expected pre-ack transition state")
+      "the controlled scheduler must expose the expected immediate event-render state")
   (is (= :download-progress (:final-sheet result))
       "the download progress sheet must remain visible after either scheduling order"))
 
-(deftest native-mobile-remote-download-survives-progress-before-dismiss-ack-test
+(deftest native-mobile-remote-content-transition-with-immediate-event-render-test
   (assert-safe-native-remote-download!
    (run-repo-sheet-scenario!
     remote-download-graph
     {:initial-sheet :repo-menu
      :mobile? true
      :native? true
-     :progress-order :before-dismiss-ack})
+     :event-render-order :immediate})
    :download-progress))
 
-(deftest native-mobile-remote-download-survives-dismiss-ack-before-progress-test
+(deftest native-mobile-remote-content-transition-with-deferred-event-render-test
   (assert-safe-native-remote-download!
    (run-repo-sheet-scenario!
     remote-download-graph
     {:initial-sheet :repo-menu
      :mobile? true
      :native? true
-     :progress-order :after-dismiss-ack})
+     :event-render-order :deferred})
    :repo-menu))
 
 (deftest ordinary-mobile-and-desktop-repo-actions-close-the-menu-once-test
