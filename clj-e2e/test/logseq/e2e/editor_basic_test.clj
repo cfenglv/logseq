@@ -50,20 +50,52 @@
    ".ls-page-blocks .ls-block:not(.block-add-button)"
    (count expected-contents))
   (let [actual-contents (util/get-page-blocks-contents)]
-    (is (= (set expected-contents) (set actual-contents))
+    (is (= expected-contents actual-contents)
         {:page page-name
          :expected-blocks expected-contents
          :actual-blocks actual-contents})))
 
+(defn- expected-block-subsequence
+  [actual-contents expected-contents]
+  (let [expected? (set expected-contents)]
+    (filterv expected? actual-contents)))
+
 (defn- assert-page-contains-once!
   [page-name expected-contents]
   (p/goto-page-via-api page-name)
-  (let [actual-frequencies (frequencies (util/get-page-blocks-contents))]
+  (let [actual-contents (util/get-page-blocks-contents)
+        actual-frequencies (frequencies actual-contents)
+        actual-subsequence
+        (expected-block-subsequence actual-contents expected-contents)]
     (is (= (zipmap expected-contents (repeat 1))
            (select-keys actual-frequencies expected-contents))
         {:page page-name
          :expected-once expected-contents
-         :actual-frequencies actual-frequencies})))
+         :actual-frequencies actual-frequencies})
+    (is (= expected-contents actual-subsequence)
+        {:page page-name
+         :expected-relative-order expected-contents
+         :actual-relative-order actual-subsequence
+         :actual-blocks actual-contents})))
+
+(deftest move-block-order-contract-rejects-permutations
+  (testing "exact page order rejects a permutation accepted by set equality"
+    (let [expected ["anchor" "b1" "b2" "b3"]
+          permuted ["anchor" "b2" "b1" "b3"]]
+      (is (= (set expected) (set permuted))
+          "The former set contract accepts the permutation")
+      (is (not= expected permuted)
+          "The vector contract rejects the permutation")))
+  (testing "Library relative order rejects a permutation accepted by counts"
+    (let [expected ["b1" "b2" "b3"]
+          permuted-with-other-blocks ["other 1" "b2" "b1" "other 2" "b3"]
+          actual-frequencies (frequencies permuted-with-other-blocks)]
+      (is (= (zipmap expected (repeat 1))
+             (select-keys actual-frequencies expected))
+          "The former frequency contract accepts the permutation")
+      (is (not= expected
+                (expected-block-subsequence permuted-with-other-blocks expected))
+          "The filtered-subsequence contract rejects the permutation"))))
 
 (defn- drag-and-drop-file!
   [file-name file-type]
