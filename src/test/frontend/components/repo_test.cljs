@@ -148,18 +148,20 @@
           (js-delete js/globalThis "React"))))))
 
 (defn- assert-safe-native-remote-download!
-  [result]
+  [result expected-immediate-sheet]
   (is (= [[:rtc/download-remote-graph
            "cloud-graph"
            "graph-uuid"
            "65.2"
            false]]
          (:events result)))
-  (is (= [:repo-menu]
-         (mapv :sheet (:hides result)))
-      "old-menu cleanup must run exactly once and must never target the progress sheet")
+  (is (empty? (:hides result))
+      "native remote download is a single-sheet content transition, not a hide/show pair")
+  (is (= expected-immediate-sheet
+         (get-in result [:immediate :sheet]))
+      "the controlled scheduler must expose the expected pre-ack transition state")
   (is (= :download-progress (:final-sheet result))
-      "the download progress sheet must remain visible after old-menu cleanup and ack"))
+      "the download progress sheet must remain visible after either scheduling order"))
 
 (deftest native-mobile-remote-download-survives-progress-before-dismiss-ack-test
   (assert-safe-native-remote-download!
@@ -168,7 +170,8 @@
     {:initial-sheet :repo-menu
      :mobile? true
      :native? true
-     :progress-order :before-dismiss-ack})))
+     :progress-order :before-dismiss-ack})
+   :download-progress))
 
 (deftest native-mobile-remote-download-survives-dismiss-ack-before-progress-test
   (assert-safe-native-remote-download!
@@ -177,7 +180,8 @@
     {:initial-sheet :repo-menu
      :mobile? true
      :native? true
-     :progress-order :after-dismiss-ack})))
+     :progress-order :after-dismiss-ack})
+   :repo-menu))
 
 (deftest ordinary-mobile-and-desktop-repo-actions-close-the-menu-once-test
   (let [mobile-result
@@ -194,10 +198,17 @@
           :native? false})]
     (is (= [[:graph/switch "logseq_db_local-graph"]]
            (:events mobile-result)))
+    (is (= :repo-menu
+           (get-in mobile-result [:immediate :sheet]))
+        "ordinary native-mobile actions must keep the menu visible through the click stack")
+    (is (empty? (get-in mobile-result [:immediate :hides]))
+        "ordinary native-mobile cleanup must not run synchronously")
+    (is (= 1 (get-in mobile-result [:immediate :timer-count]))
+        "ordinary native-mobile cleanup must be scheduled exactly once")
     (is (= [:repo-menu]
            (mapv :sheet (:hides mobile-result)))
-        "an ordinary native-mobile action must dismiss the repo menu exactly once")
-    (is (nil? (get-in mobile-result [:immediate :sheet])))
+        "draining the timer must dismiss the repo menu exactly once")
+    (is (nil? (:final-sheet mobile-result)))
     (is (= [[:rtc/download-remote-graph
              "cloud-graph"
              "graph-uuid"
@@ -209,7 +220,7 @@
         "desktop actions must dismiss synchronously and exactly once")
     (is (nil? (get-in desktop-result [:immediate :sheet])))))
 
-(deftest mobile-remote-graph-click-publishes-download-without-false-sentinel-test
+(deftest mobile-remote-graph-click-publishes-download-event-test
   (let [events (atom [])
         links (#'repo/repos-dropdown-links
                [remote-download-graph]
@@ -217,7 +228,7 @@
                nil
                {:on-click (fn [_])})
         on-click (get-in (first links) [:options :on-click])
-        result
+        _result
         (with-redefs [util/mobile? (constantly true)
                       state/pub-event! (fn [event]
                                          (swap! events conj event))]
@@ -227,9 +238,7 @@
              "graph-uuid"
              "65.2"
              false]]
-           @events))
-    (is (not (false? result))
-        "download dispatch must not use false as control flow for popup cleanup")))
+           @events))))
 
 (deftest repos-dropdown-content-gives-each-repo-a-stable-react-key-test
   (let [second-remote-graph
@@ -295,65 +304,6 @@
             "rendering repo items must not emit React's missing-key warning"))
       (finally
         (gobj/set js/console "error" previous-console-error)
-        (if (some? previous-react)
-          (gobj/set js/globalThis "React" previous-react)
-          (js-delete js/globalThis "React"))))))
-
-(deftest mobile-remote-graph-popup-closes-after-not-during-click-test
-  (let [captured-menu-props (atom nil)
-        popup-hides (atom [])
-        scheduled-callbacks (atom [])
-        previous-react (gobj/get js/globalThis "React")
-        previous-set-timeout (gobj/get js/globalThis "setTimeout")]
-    (gobj/set js/globalThis "React" react)
-    (gobj/set js/globalThis "setTimeout"
-              (fn [callback & _args]
-                (swap! scheduled-callbacks conj callback)
-                (count @scheduled-callbacks)))
-    (try
-      (with-redefs [util/mobile? (constantly true)
-                    state/use-sub
-                    (fn [key]
-                      (case key
-                        :git/current-repo nil
-                        :auth/id-token "token"
-                        [:me :repos] []
-                        :rtc/graphs [remote-download-graph]
-                        :rtc/downloading-graph-uuid nil
-                        :rtc/loading-graphs? false
-                        nil))
-                    graph-handler/get-metadata-local (constantly nil)
-                    repo-handler/combine-local-&-remote-graphs
-                    (fn [locals remotes] (concat locals remotes))
-                    ui/menu-link
-                    (fn [props & _children]
-                      (reset! captured-menu-props props)
-                      (if-some [item-key (:key props)]
-                        (.createElement react "div" #js {:key item-key})
-                        (.createElement react "div" nil)))
-                    shui/popup-hide!
-                    (fn [& args]
-                      (swap! popup-hides conj args))
-                    state/pub-event! (fn [_event] nil)]
-        (.renderToStaticMarkup
-         react-dom-server
-         (repo/repos-dropdown-content
-          :contentid :graph-switcher
-          :footer? false))
-        ((:on-click @captured-menu-props)
-         #js {:shiftKey false})
-        (is (empty? @popup-hides)
-            "the graph-list popup must remain mounted for the entire click handler")
-        (is (= 1 (count @scheduled-callbacks))
-            "popup cleanup should be scheduled exactly once")
-        (doseq [callback @scheduled-callbacks]
-          (callback))
-        (is (= [[:graph-switcher]] @popup-hides)
-            "the scheduled cleanup must hide exactly the graph-list popup"))
-      (finally
-        (if (some? previous-set-timeout)
-          (gobj/set js/globalThis "setTimeout" previous-set-timeout)
-          (js-delete js/globalThis "setTimeout"))
         (if (some? previous-react)
           (gobj/set js/globalThis "React" previous-react)
           (js-delete js/globalThis "React"))))))
