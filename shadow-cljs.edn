@@ -169,9 +169,15 @@
 
   :test {:target :node-test
          :output-to "static/tests.js"
+         :prepend-js "global.React = require('react');"
          :build-hooks [(shadow.hooks/build-metadata-hook
                         {:build-time "test-build-time"
                          :revision "test-revision"})]
+         :build-options {:ns-aliases
+                         {electron.logger
+                          frontend.test.electron-logger-stub
+                          frontend.components.lazy-editor
+                          frontend.test.lazy-editor-stub}}
          :closure-defines {frontend.util/NODETEST true
                            frontend.worker-common.util/NODETEST true
                            logseq.shui.util/NODETEST true}

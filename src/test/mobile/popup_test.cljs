@@ -159,6 +159,89 @@
                     (is (true? @support/native-visible?))))
                 done))))))
 
+(deftest pending-native-sheet-hidden-by-id-stays-cancelled-after-dismissal-ack-test
+  (async done
+         (let [listener (support/state-listener)]
+           (is (fn? listener)
+               "the popup namespace must subscribe to native sheet state")
+           (if-not listener
+             (done)
+             (do
+               (show! :active-a)
+               (popup/popup-hide! :active-a)
+               (show! :pending-b)
+               (popup/popup-hide! :pending-b)
+
+               (finish-async!
+                (p/let [_ (listener #js {:dismissing true})
+                        _ (p/delay 0)]
+                  (is (= 1 (support/call-count :present))
+                      "the dismissing acknowledgement must not present cancelled B")
+                  (is (nil? (popup-id)))
+                  (is (false? @support/native-visible?))
+                  (p/let [_ (listener #js {:dismissing false})
+                          _ (p/delay 0)]
+                    (is (= 1 (support/call-count :present))
+                        "the dismissed acknowledgement must not revive cancelled B")
+                    (is (nil? (popup-id)))
+                    (is (false? @support/native-visible?))))
+                done))))))
+
+(deftest pending-native-sheet-hidden-globally-stays-cancelled-after-dismissal-ack-test
+  (async done
+         (let [listener (support/state-listener)]
+           (is (fn? listener)
+               "the popup namespace must subscribe to native sheet state")
+           (if-not listener
+             (done)
+             (do
+               (show! :active-a)
+               (popup/popup-hide! :active-a)
+               (show! :pending-b)
+               (popup/popup-hide!)
+
+               (finish-async!
+                (p/let [_ (listener #js {:dismissing true})
+                        _ (p/delay 0)]
+                  (is (= 1 (support/call-count :present))
+                      "the dismissing acknowledgement must not present globally cancelled B")
+                  (is (nil? (popup-id)))
+                  (is (false? @support/native-visible?))
+                  (p/let [_ (listener #js {:dismissing false})
+                          _ (p/delay 0)]
+                    (is (= 1 (support/call-count :present))
+                        "the dismissed acknowledgement must not revive globally cancelled B")
+                    (is (nil? (popup-id)))
+                    (is (false? @support/native-visible?))))
+                done))))))
+
+(deftest hide-for-unrelated-id-does-not-cancel-pending-native-sheet-test
+  (async done
+         (let [listener (support/state-listener)]
+           (is (fn? listener)
+               "the popup namespace must subscribe to native sheet state")
+           (if-not listener
+             (done)
+             (do
+               (show! :active-a)
+               (popup/popup-hide! :active-a)
+               (show! :pending-b)
+               (popup/popup-hide! :unrelated-popup)
+
+               (finish-async!
+                (p/let [_ (listener #js {:dismissing true})
+                        _ (p/delay 0)]
+                  (is (= 1 (support/call-count :present)))
+                  (is (nil? (popup-id)))
+                  (is (false? @support/native-visible?))
+                  (p/let [_ (listener #js {:dismissing false})
+                          _ (p/delay 0)]
+                    (is (= 2 (support/call-count :present))
+                        "an unrelated hide request must leave B queued")
+                    (is (= :pending-b (popup-id)))
+                    (is (true? @support/native-visible?))))
+                done))))))
+
 (deftest ordinary-native-show-and-hide-still-call-plugin-once-test
   (show! :ordinary-popup)
   (is (= 1 (support/call-count :present)))
