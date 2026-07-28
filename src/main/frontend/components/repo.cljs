@@ -387,17 +387,8 @@
                                              (state/pub-event! [:graph/switch url])
 
                                              (and rtc-graph? remote?)
-                                             (let [event [:rtc/download-remote-graph
-                                                          GraphName
-                                                          GraphUUID
-                                                          GraphSchemaVersion
-                                                          graph-e2ee?]]
-                                               (state/pub-event! event)
-                                               (when (util/mobile?)
-                                                 (js/setTimeout
-                                                  #(shui/popup-hide! (:contentid opts))
-                                                  0)
-                                                 false))
+                                             (state/pub-event!
+                                              [:rtc/download-remote-graph GraphName GraphUUID GraphSchemaVersion graph-e2ee?])
 
                                              :else
                                              nil))))}})))
@@ -490,7 +481,9 @@
                     :on-click (fn [^js e]
                                 (when on-click'
                                   (when-not (false? (on-click' e))
-                                    (shui/popup-hide! contentid)))))
+                                    (if (util/mobile?)
+                                      (js/setTimeout #(shui/popup-hide! contentid) 0)
+                                      (shui/popup-hide! contentid))))))
              (or item
                  (if href'
                    [:a.flex.items-center.w-full
