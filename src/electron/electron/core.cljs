@@ -380,6 +380,32 @@
       :log-info! logger/info
       :log-warn! logger/warn})))
 
+(defn- handle-main-window-close!
+  [^js win ^js e]
+  (when @*quit-dirty? ;; when not updating
+    (.preventDefault e)
+    (let [windows (win/get-all-windows)
+          window @*win
+          multiple-windows? (> (count windows) 1)]
+      (cond
+        (or multiple-windows? (not mac?) @win/*quitting?)
+        (when window
+          (win/close-handler win e)
+          (reset! *win nil))
+
+        (and mac? (not multiple-windows?))
+        ;; Just hiding - don't do any actual closing operation
+        (do
+          (.preventDefault ^js/Event e)
+          (if (.isFullScreen win)
+            (do
+              (.once win "leave-full-screen" #(.hide win))
+              (.setFullScreen win false))
+            (.hide win)))
+
+        :else
+        nil))))
+
 (defn- on-app-ready!
   [^js app']
   (.on app' "ready"
@@ -457,28 +483,7 @@
                   (@*setup-fn)
 
                   ;; main window events
-                  (.on win "close" (fn [e]
-                                     (when @*quit-dirty? ;; when not updating
-                                       (.preventDefault e)
-
-                                       (let [windows (win/get-all-windows)
-                                             window @*win
-                                             multiple-windows? (> (count windows) 1)]
-                                         (cond
-                                           (or multiple-windows? (not mac?) @win/*quitting?)
-                                           (when window
-                                             (win/close-handler win e)
-                                             (reset! *win nil))
-
-                                           (and mac? (not multiple-windows?))
-                                               ;; Just hiding - don't do any actual closing operation
-                                           (do (.preventDefault ^js/Event e)
-                                               (if (and mac? (.isFullScreen win))
-                                                 (do (.once win "leave-full-screen" #(.hide win))
-                                                     (.setFullScreen win false))
-                                                 (.hide win)))
-                                           :else
-                                           nil)))))
+                  (.on win "close" #(handle-main-window-close! win %))
                   (.on app' "before-quit" (fn [_e]
                                             (reset! win/*quitting? true)
                                             (-> (handler/stop-all-db-workers!)

@@ -1315,6 +1315,20 @@
       [:a.opacity-70.hover:opacity-100 {:on-click #(set-reset! true)}
        (t :encryption/reset-password)])))
 
+(defn- reset-encryption-account-state!
+  ;; The settings component remains mounted across account changes.
+  [user-uuid set-encryption-user-uuid! set-rsa-key-pair! set-init-key-err!
+   set-get-key-err! set-current-password! set-new-password!
+   set-reset-password-status! set-forgot!]
+  (set-encryption-user-uuid! user-uuid)
+  (set-rsa-key-pair! :not-inited)
+  (set-init-key-err! nil)
+  (set-get-key-err! nil)
+  (set-current-password! nil)
+  (set-new-password! nil)
+  (set-reset-password-status! nil)
+  (set-forgot! false))
+
 (hsx/defc encryption
   []
   (let [user-uuid (user-handler/user-uuid)
@@ -1331,16 +1345,10 @@
     [:div.panel-wrap.is-encryption.mb-8
      (hooks/use-effect!
       (fn []
-        ;; This component remains mounted across account changes. Reset all
-        ;; account-scoped plaintext and key state before rendering the new user.
-        (set-encryption-user-uuid! user-uuid)
-        (set-rsa-key-pair! :not-inited)
-        (set-init-key-err! nil)
-        (set-get-key-err! nil)
-        (set-current-password! nil)
-        (set-new-password! nil)
-        (set-reset-password-status! nil)
-        (set-forgot! false))
+        (reset-encryption-account-state!
+         user-uuid set-encryption-user-uuid! set-rsa-key-pair! set-init-key-err!
+         set-get-key-err! set-current-password! set-new-password!
+         set-reset-password-status! set-forgot!))
       [user-uuid])
      (hooks/use-effect!
       (fn []

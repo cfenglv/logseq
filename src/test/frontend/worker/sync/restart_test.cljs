@@ -714,6 +714,7 @@
                url "wss://sync.example.test/sync/graph-1"
                original-set-timeout js/setTimeout
                prev-client @worker-state/*db-sync-client
+               prev-state @worker-state/*state
                prev-platform (try
                                (platform/current)
                                (catch :default _ nil))
@@ -743,6 +744,7 @@
                  (fn [f delay]
                    (swap! callbacks* conj {:f f :delay delay})
                    (keyword (str "timeout-" (count @callbacks*)))))
+           (swap! worker-state/*state assoc :auth/id-token nil)
            (reset! worker-state/*db-sync-client client)
            (platform/set-platform!
             {:env {:runtime :node}
@@ -774,6 +776,7 @@
                           (is false (str "unexpected error: " error))))
                (p/finally (fn []
                             (reset! worker-state/*db-sync-client prev-client)
+                            (reset! worker-state/*state prev-state)
                             (when prev-platform
                               (platform/set-platform! prev-platform))
                             (set! js/setTimeout original-set-timeout)

@@ -335,13 +335,6 @@
                              (assoc (ex-data error) :url for-url)
                              error))))))
 
-(defn <get-system-proxy
-  "Get system proxy for url, requires proxy to be set to system"
-  ([] (<get-system-proxy "https://www.google.com"))
-  ([for-url]
-   (when-let [sess (current-session)]
-     (<resolve-session-proxy sess for-url))))
-
 (defn- <resolve-temporary-system-proxy
   [for-url]
   (let [session-partition (str "logseq-system-proxy-" (random-uuid))

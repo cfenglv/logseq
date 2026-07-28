@@ -1109,6 +1109,37 @@
       (ui/icon "refresh" {:size 14})
       (t :asset/reload-file))]))
 
+(defn- asset-transfer-progress
+  [direction loaded total]
+  (when (and (number? loaded) (number? total) (pos? total) (not= loaded total))
+    (let [percent (int (* 100 (/ loaded total)))
+          label (case direction
+                  :upload (t :asset/uploading)
+                  :download (t :asset/downloading)
+                  (t :asset/syncing))]
+      {:label label
+       :view [:div.asset-transfer-progress
+              [:div.asset-transfer-progress-label (str label " " percent "%")]
+              [:div.asset-transfer-progress-bar
+               [:span {:style {:width (str percent "%")}}]]]})))
+
+(defn- asset-image-render-data
+  [block image?]
+  (when image?
+    (let [resize-width (get-in block [:logseq.property.asset/resize-metadata :width])
+          asset-width (:logseq.property.asset/width block)
+          asset-height (:logseq.property.asset/height block)
+          width (or resize-width 250 asset-width)
+          aspect-ratio (when (and asset-width asset-height)
+                         (/ asset-width asset-height))
+          metadata (merge
+                    (when width {:width width})
+                    (when (and width aspect-ratio)
+                      {:height (/ width aspect-ratio)}))]
+      {:metadata metadata
+       :placeholder [:div.img-placeholder.asset-container
+                     {:style metadata}]})))
+
 (hsx/defc asset-cp
   [config block]
   (let [asset-type (:logseq.property.asset/type block)
@@ -1132,35 +1163,12 @@
         progress-entry (state/use-sub :rtc/asset-upload-download-progress
                                       :path-in-sub-atom [repo (str (:block/uuid block))])
         {:keys [direction loaded total]} progress-entry
-        in-progress? (and (number? loaded) (number? total) (pos? total) (not= loaded total))
-        percent (when in-progress?
-                  (int (* 100 (/ loaded total))))
-        label (case direction
-                :upload (t :asset/uploading)
-                :download (t :asset/downloading)
-                (t :asset/syncing))
-        progress-view (when in-progress?
-                        [:div.asset-transfer-progress
-                         [:div.asset-transfer-progress-label (str label " " percent "%")]
-                         [:div.asset-transfer-progress-bar
-                          [:span {:style {:width (str percent "%")}}]]])
+        {progress-label :label progress-view :view}
+        (asset-transfer-progress direction loaded total)
         image? (contains? (common-config/img-formats) (keyword asset-type))
         gallery-image? (and (:gallery-view? config) image?)
-        width (get-in block [:logseq.property.asset/resize-metadata :width])
-        asset-width (:logseq.property.asset/width block)
-        asset-height (:logseq.property.asset/height block)
-        img-metadata (when image?
-                       (let [width (or width 250 asset-width)
-                             aspect-ratio (when (and asset-width asset-height)
-                                            (/ asset-width asset-height))]
-                         (merge
-                          (when width
-                            {:width width})
-                          (when (and width aspect-ratio)
-                            {:height (/ width aspect-ratio)}))))
-        img-placeholder (when image?
-                          [:div.img-placeholder.asset-container
-                           {:style img-metadata}])
+        {img-metadata :metadata img-placeholder :placeholder}
+        (asset-image-render-data block image?)
         ;; When external-url is set, use it as the render path so
         ;; plugin-sandboxed assets (./assets/storages/<plugin-id>/...)
         ;; resolve correctly; <make-asset-url handles both remote URLs
@@ -1225,7 +1233,7 @@
     (if progress-view
       [:div.asset-transfer-shell
        (or content
-           [:div.asset-transfer-placeholder (t :asset/transfer-placeholder label)])
+           [:div.asset-transfer-placeholder (t :asset/transfer-placeholder progress-label)])
        progress-view]
       content)))
 

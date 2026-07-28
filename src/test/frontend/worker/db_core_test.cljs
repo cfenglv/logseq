@@ -1043,6 +1043,22 @@
                (.close rows-db)))
            (reset! *import-state import-state-prev)))))))
 
+(defn- assert-sync-recovery-sidecars-removed!
+  [repo-dir]
+  (is (not
+       (fs/existsSync
+        (node-path/join
+         repo-dir "db-sync-backup.sqlite"))))
+  (is (not
+       (fs/existsSync
+        (node-path/join
+         repo-dir
+         "db-sync-client-ops-backup.sqlite"))))
+  (is (not
+       (fs/existsSync
+        (node-path/join
+         repo-dir "db-sync-recovery.sqlite")))))
+
 (deftest interrupted-snapshot-activation-restores-durable-sidecar-test
   (async done
          (->
@@ -1132,19 +1148,7 @@
                         (mapv vec (js->clj rows))))
                  (is (= [["original-op"]]
                         (mapv vec (js->clj client-ops-rows))))
-                 (is (not
-                      (fs/existsSync
-                       (node-path/join
-                        repo-dir "db-sync-backup.sqlite"))))
-                 (is (not
-                      (fs/existsSync
-                       (node-path/join
-                        repo-dir
-                        "db-sync-client-ops-backup.sqlite"))))
-                 (is (not
-                      (fs/existsSync
-                       (node-path/join
-                        repo-dir "db-sync-recovery.sqlite"))))))))
+                 (assert-sync-recovery-sidecars-removed! repo-dir)))))
           (p/catch (fn [error]
                      (is false (str error))))
           (p/finally done))))

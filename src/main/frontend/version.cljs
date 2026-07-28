@@ -1,7 +1,7 @@
 (ns ^:no-doc frontend.version
   (:require [clojure.string :as string]))
 
-(defonce version "2.0.1-selfhost.4")
+(defonce version "2.0.1-selfhost.5")
 
 (def selfhost-build?
   (string/includes? version "-selfhost."))

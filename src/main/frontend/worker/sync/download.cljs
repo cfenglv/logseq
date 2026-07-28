@@ -730,6 +730,38 @@
        :else
        (assoc snapshot-info :resp resp)))))
 
+(defn- <handle-download-graph-failure!
+  [base repo graph-id graph-e2ee? stage snapshot-info import-id log-f error]
+  (p/let [_ (<cancel-snapshot-download! base graph-id snapshot-info)]
+    (when import-id
+      (clear-import-state! import-id))
+    (log-f {:sub-type :download-completed
+            :graph-uuid graph-id
+            :message "Graph snapshot download failed"})
+    (log/error :db-sync/download-graph-by-id-failed
+               {:repo repo
+                :graph-id graph-id
+                :graph-e2ee? graph-e2ee?
+                :stage stage
+                :diagnostic
+                (dissoc
+                 (sync-util/error->diagnostic error)
+                 :at)})
+    (throw
+     (ex-info
+      "db-sync download failed"
+      {:repo repo
+       :graph-id graph-id
+       :graph-e2ee? graph-e2ee?
+       :stage stage
+       :error-message (or (ex-message error)
+                          (when (instance? js/Error error)
+                            (.-message error)))
+       :error-cause (when (instance? js/Error error)
+                      (some-> (.-cause error)
+                              (.-message)))}
+      error))))
+
 (defn download-graph-by-id!
   [repo graph-id graph-e2ee?]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
@@ -812,36 +844,9 @@
                  :graph-e2ee? graph-e2ee?}))
             (p/catch
              (fn [error]
-               (p/let [_ (<cancel-snapshot-download!
-                          base graph-id @snapshot-info*)]
-                 (when-let [import-id @import-id*]
-                   (clear-import-state! import-id))
-                 (log-f {:sub-type :download-completed
-                         :graph-uuid graph-id
-                         :message "Graph snapshot download failed"})
-                 (log/error :db-sync/download-graph-by-id-failed
-                            {:repo repo
-                             :graph-id graph-id
-                             :graph-e2ee? graph-e2ee?
-                             :stage @stage*
-                             :diagnostic
-                             (dissoc
-                              (sync-util/error->diagnostic error)
-                              :at)})
-                 (throw
-                  (ex-info
-                   "db-sync download failed"
-                   {:repo repo
-                    :graph-id graph-id
-                    :graph-e2ee? graph-e2ee?
-                    :stage @stage*
-                    :error-message (or (ex-message error)
-                                       (when (instance? js/Error error)
-                                         (.-message error)))
-                   :error-cause (when (instance? js/Error error)
-                                   (some-> (.-cause error)
-                                           (.-message)))}
-                   error)))))))
+               (<handle-download-graph-failure!
+                base repo graph-id graph-e2ee? @stage* @snapshot-info*
+                @import-id* log-f error)))))
       (p/rejected (ex-info "db-sync missing graph download info"
                            {:repo repo
                             :graph-id graph-id
