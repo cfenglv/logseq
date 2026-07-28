@@ -1,5 +1,5 @@
 (ns frontend.extensions.pdf.assets-test
-  (:require [cljs.test :as test :refer [are deftest is testing]]
+  (:require [cljs.test :refer [are deftest is testing]]
             [frontend.db :as db]
             [frontend.db.model :as db-model]
             [frontend.extensions.pdf.assets :as pdf-assets]
@@ -24,10 +24,10 @@
 (deftest inflate-asset-normalizes-local-assets-url-on-windows
   (with-redefs [util/electron? (constantly true)
                 util/win32? true]
-    (test/is (= "assets:///C/logseq__colon/Users/charlie/sicp.pdf"
-                (:url (pdf-assets/inflate-asset
-                       "C:/Users/charlie/sicp.pdf"
-                       {:href "assets:///C:/Users/charlie/sicp.pdf"}))))))
+    (is (= "assets:///C/logseq__colon/Users/charlie/sicp.pdf"
+           (:url (pdf-assets/inflate-asset
+                  "C:/Users/charlie/sicp.pdf"
+                  {:href "assets:///C:/Users/charlie/sicp.pdf"}))))))
 
 (deftest creating-pdf-annotation-without-text-inserts-empty-title-test
   (let [pdf-id #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"

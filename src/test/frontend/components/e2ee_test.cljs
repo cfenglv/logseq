@@ -5,7 +5,6 @@
             [frontend.common.crypt :as crypt]
             [frontend.components.e2ee :as e2ee]
             [frontend.state :as state]
-            [frontend.util :as util]
             [goog.object :as gobj]
             [logseq.shui.hooks :as hooks]
             [logseq.shui.ui :as shui]

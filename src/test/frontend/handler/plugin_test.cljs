@@ -2,19 +2,19 @@
   (:require [cljs.test :refer [async deftest is testing]]
             [frontend.common.idb :as idb]
             [frontend.fs :as fs]
-            [frontend.handler.plugin :as plugin]
+            [frontend.handler.plugin :as plugin-handler]
             [frontend.state :as state]
             [frontend.util :as util]
             [promesa.core :as p]))
 
 (defn- load-settings
   []
-  ((plugin/make-fn-to-load-dotdir-json "settings" #js {}) :sample-plugin))
+  ((plugin-handler/make-fn-to-load-dotdir-json "settings" #js {}) :sample-plugin))
 
 (deftest electron-plugin-settings-empty-files-use-default-test
   (async done
          (let [read-values (atom ["" " \n\t "])]
-           (reset! plugin/*ls-dotdir-root "/tmp/logseq-test")
+           (reset! plugin-handler/*ls-dotdir-root "/tmp/logseq-test")
            (-> (p/with-redefs [util/electron? (constantly true)
                                state/get-current-repo (constantly "repo")
                                fs/create-if-not-exists (fn [& _] (p/resolved nil))
@@ -37,7 +37,7 @@
 
 (deftest electron-plugin-settings-valid-json-is-preserved-test
   (async done
-         (reset! plugin/*ls-dotdir-root "/tmp/logseq-test")
+         (reset! plugin-handler/*ls-dotdir-root "/tmp/logseq-test")
          (-> (p/with-redefs [util/electron? (constantly true)
                              state/get-current-repo (constantly "repo")
                              fs/create-if-not-exists (fn [& _] (p/resolved nil))
@@ -57,7 +57,7 @@
   (async done
          (let [reads (atom [])
                stored #js {:theme "dark"}]
-           (reset! plugin/*ls-dotdir-root "LSPUserDotRoot/")
+           (reset! plugin-handler/*ls-dotdir-root "LSPUserDotRoot/")
            (-> (p/with-redefs [util/electron? (constantly false)
                                idb/get-item (fn [path]
                                               (swap! reads conj path)
