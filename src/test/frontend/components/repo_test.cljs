@@ -51,57 +51,61 @@
         "download dispatch must not use false as control flow for popup cleanup")))
 
 (deftest mobile-remote-graph-popup-closes-after-not-during-click-test
-  (async done
-         (let [captured-menu-props (atom nil)
-               popup-hides (atom [])
-               previous-react (gobj/get js/globalThis "React")]
-           (gobj/set js/globalThis "React" react)
-           (try
-             (with-redefs [util/mobile? (constantly true)
-                           state/use-sub
-                           (fn [key]
-                             (case key
-                               :git/current-repo nil
-                               :auth/id-token "token"
-                               [:me :repos] []
-                               :rtc/graphs [remote-download-graph]
-                               :rtc/downloading-graph-uuid nil
-                               :rtc/loading-graphs? false
-                               nil))
-                           graph-handler/get-metadata-local (constantly nil)
-                           repo-handler/combine-local-&-remote-graphs
-                           (fn [locals remotes] (concat locals remotes))
-                           ui/menu-link
-                           (fn [props & _children]
-                             (reset! captured-menu-props props)
-                             (.createElement react "div" nil))
-                           shui/popup-hide!
-                           (fn [& args]
-                             (swap! popup-hides conj args))
-                           state/pub-event! (fn [_event] nil)]
-               (.renderToStaticMarkup
-                react-dom-server
-                (repo/repos-dropdown-content
-                 :contentid :graph-switcher
-                 :footer? false))
-               ((:on-click @captured-menu-props)
-                #js {:shiftKey false})
-               (is (empty? @popup-hides)
-                   "the graph-list popup must remain mounted for the entire click handler")
-               (-> (p/delay 1)
-                   (p/then
-                    (fn []
-                      (is (= [[:graph-switcher]] @popup-hides)
-                          "popup cleanup should still run after dispatch completes")
-                      (done)))
-                   (p/catch
-                    (fn [error]
-                      (is false (str error))
-                      (done)))))
-             (finally
-               (if (some? previous-react)
-                 (gobj/set js/globalThis "React" previous-react)
-                 (js-delete js/globalThis "React")))))))
+  (let [captured-menu-props (atom nil)
+        popup-hides (atom [])
+        scheduled-callbacks (atom [])
+        previous-react (gobj/get js/globalThis "React")
+        previous-set-timeout (gobj/get js/globalThis "setTimeout")]
+    (gobj/set js/globalThis "React" react)
+    (gobj/set js/globalThis "setTimeout"
+              (fn [callback & _args]
+                (swap! scheduled-callbacks conj callback)
+                (count @scheduled-callbacks)))
+    (try
+      (with-redefs [util/mobile? (constantly true)
+                    state/use-sub
+                    (fn [key]
+                      (case key
+                        :git/current-repo nil
+                        :auth/id-token "token"
+                        [:me :repos] []
+                        :rtc/graphs [remote-download-graph]
+                        :rtc/downloading-graph-uuid nil
+                        :rtc/loading-graphs? false
+                        nil))
+                    graph-handler/get-metadata-local (constantly nil)
+                    repo-handler/combine-local-&-remote-graphs
+                    (fn [locals remotes] (concat locals remotes))
+                    ui/menu-link
+                    (fn [props & _children]
+                      (reset! captured-menu-props props)
+                      (.createElement react "div" nil))
+                    shui/popup-hide!
+                    (fn [& args]
+                      (swap! popup-hides conj args))
+                    state/pub-event! (fn [_event] nil)]
+        (.renderToStaticMarkup
+         react-dom-server
+         (repo/repos-dropdown-content
+          :contentid :graph-switcher
+          :footer? false))
+        ((:on-click @captured-menu-props)
+         #js {:shiftKey false})
+        (is (empty? @popup-hides)
+            "the graph-list popup must remain mounted for the entire click handler")
+        (is (= 1 (count @scheduled-callbacks))
+            "popup cleanup should be scheduled exactly once")
+        (doseq [callback @scheduled-callbacks]
+          (callback))
+        (is (= [[:graph-switcher]] @popup-hides)
+            "the scheduled cleanup must hide exactly the graph-list popup"))
+      (finally
+        (if (some? previous-set-timeout)
+          (gobj/set js/globalThis "setTimeout" previous-set-timeout)
+          (js-delete js/globalThis "setTimeout"))
+        (if (some? previous-react)
+          (gobj/set js/globalThis "React" previous-react)
+          (js-delete js/globalThis "React"))))))
 
 (defn- ensure-rsa-key-fn
   []
