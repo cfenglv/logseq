@@ -387,8 +387,17 @@
                                              (state/pub-event! [:graph/switch url])
 
                                              (and rtc-graph? remote?)
-                                             (state/pub-event!
-                                              [:rtc/download-remote-graph GraphName GraphUUID GraphSchemaVersion graph-e2ee?])
+                                             (let [event [:rtc/download-remote-graph
+                                                          GraphName
+                                                          GraphUUID
+                                                          GraphSchemaVersion
+                                                          graph-e2ee?]]
+                                               (state/pub-event! event)
+                                               (when (util/mobile?)
+                                                 (js/setTimeout
+                                                  #(shui/popup-hide! (:contentid opts))
+                                                  0)
+                                                 false))
 
                                              :else
                                              nil))))}})))
