@@ -31,17 +31,24 @@
                             state-atom (or (nth states index nil)
                                            (atom initial))]
                         [@state-atom #(reset! state-atom %)]))
+                    hooks/use-ref
+                    (fn [initial]
+                      #js {:current initial})
                     shui/toggle-password
                     (fn [props]
-                      (swap! inputs conj props)
-                      (.createElement react "input" nil))
+                      (let [input #js {:value (or (:value props) "")}]
+                        (attach-input-ref! props input)
+                        (swap! inputs conj {:props props
+                                           :node input})
+                        (.createElement react "input" nil)))
                     shui/button
                     (fn [props & _children]
                       (swap! buttons conj props)
                       (.createElement react "button" nil))
                     shui/dialog-close! (fn [])]
         (.renderToStaticMarkup react-dom-server (component))
-        {:input (first @inputs)
+        {:input (:props (first @inputs))
+         :input-node (:node (first @inputs))
          :button (first @buttons)})
       (finally
         (if (some? previous-react)
@@ -58,10 +65,10 @@
                enter-render (render-password-component!
                              #(e2ee/e2ee-request-password enter-promise)
                              [(atom "")])
-               button-input #js {:value "autofilled-button-password"}
-               enter-input #js {:value "autofilled-enter-password"}]
-           (attach-input-ref! (:input button-render) button-input)
-           (attach-input-ref! (:input enter-render) enter-input)
+               button-input (:input-node button-render)
+               enter-input (:input-node enter-render)]
+           (set! (.-value button-input) "autofilled-button-password")
+           (set! (.-value enter-input) "autofilled-enter-password")
            (testing "a password-manager-filled field must leave the submit button usable"
              (is (not (true? (:disabled (:button button-render))))))
            ((:on-click (:button button-render))
@@ -92,8 +99,8 @@
                   :encrypted-private-key
                   private-key-promise)
                 [(atom "") (atom false)])
-               input #js {:value "autofilled-decrypt-password"}]
-           (attach-input-ref! (:input rendered) input)
+               input (:input-node rendered)]
+           (set! (.-value input) "autofilled-decrypt-password")
            (is (not (true? (:disabled (:button rendered)))))
            (p/with-redefs [crypt/<decrypt-private-key
                            (fn [password encrypted-private-key]
