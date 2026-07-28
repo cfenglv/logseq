@@ -11,6 +11,8 @@
 
 (defonce *last-popup? (atom nil))
 (defonce *last-popup-data (atom nil))
+(defonce *native-sheet-dismissing? (atom false))
+(defonce *pending-popup-data (atom nil))
 
 (defn- popup-min-height
   [default-height]
@@ -24,9 +26,9 @@
   (when-let [^js plugin mobile-util/native-bottom-sheet]
     (let [{:keys [opts]} data
           id (:id opts)
-          popup-exists? (and id (= id (get-in @*last-popup-data [:opts :id])))]
-      (when-not popup-exists?
-        (reset! *last-popup-data data)
+          sheet-presented? (some? @*last-popup-data)]
+      (reset! *last-popup-data data)
+      (when-not sheet-presented?
         (.present
          plugin
          (clj->js
@@ -37,9 +39,22 @@
             (cond-> {:allowFullHeight (not= (:type opts) :action-sheet)}
               (int? height') (assoc :defaultHeight height')))))))))
 
+(defn- activate-native-popup!
+  [data]
+  (reset! *last-popup? true)
+  (present-native-sheet! data)
+  (mobile-state/set-popup! data))
+
+(defn- request-native-popup!
+  [data]
+  (if @*native-sheet-dismissing?
+    (reset! *pending-popup-data data)
+    (activate-native-popup! data)))
+
 (defn- dismiss-native-sheet!
   []
   (when-let [^js plugin mobile-util/native-bottom-sheet]
+    (reset! *native-sheet-dismissing? true)
     (.dismiss plugin #js {})))
 
 (defn- notify-native-sheet-content-ready!
@@ -57,8 +72,9 @@
   [^js data]
   (let [dismissing? (.-dismissing data)]
     (cond
-      dismissing?
+      (true? dismissing?)
       (p/do!
+       (reset! *native-sheet-dismissing? true)
        (when (some? @mobile-state/*popup-data)
          (state/pub-event! [:mobile/clear-edit])
          (mobile-state/set-popup! nil)
@@ -67,6 +83,13 @@
        (reset! *last-popup? false)
        (reset! *last-popup-data nil)
        (notify-native-sheet-content-ready!))
+
+      (false? dismissing?)
+      (do
+        (reset! *native-sheet-dismissing? false)
+        (when-let [data @*pending-popup-data]
+          (reset! *pending-popup-data nil)
+          (activate-native-popup! data)))
 
       :else
       nil)))
@@ -110,25 +133,29 @@
 
     :else
     (when content-fn
-      (reset! *last-popup? true)
       (when-let [_plugin ^js mobile-util/native-bottom-sheet]
         (let [data {:open? true
                     :content-fn content-fn
                     :opts opts}]
-          (present-native-sheet! data)
-          (mobile-state/set-popup! data))))))
+          (request-native-popup! data))))))
 
 (defn popup-hide!
   [& args]
-  (cond
-    (= :download-rtc-graph (first args))
-    (do
-      (dismiss-native-sheet!)
-      (mobile-state/set-tab! "home"))
+  (let [id (first args)
+        current-id (get-in @*last-popup-data [:opts :id])
+        current-popup? (or (nil? id) (= id current-id))]
+    (cond
+      (= :download-rtc-graph id)
+      (do
+        (when (and @*last-popup? current-popup?)
+          (dismiss-native-sheet!))
+        (mobile-state/set-tab! "home"))
 
-    :else
-    (if (and @*last-popup? (not (= (first args) :editor.commands/commands)))
-      (dismiss-native-sheet!)
+      (and @*last-popup? (not (= id :editor.commands/commands)))
+      (when current-popup?
+        (dismiss-native-sheet!))
+
+      :else
       (apply shui-popup/hide! args))))
 
 (set! shui/popup-show! popup-show!)
