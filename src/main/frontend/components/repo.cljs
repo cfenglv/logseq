@@ -357,9 +357,13 @@
                             short-repo-name (text-util/get-graph-name-from-path repo-url)
                             downloading? (and downloading-graph-id (= GraphUUID downloading-graph-id))
                             ready-for-use? (not= false graph-ready-for-use?)
-                            title (str "<" GraphName "> #" GraphUUID)]
+                            title (str "<" GraphName "> #" GraphUUID)
+                            item-key (if GraphUUID
+                                       (str "remote-graph:" GraphUUID)
+                                       (str "local-graph:" repo-url))]
                         (when short-repo-name
-                          {:title [:span.flex.items-center.title-wrap short-repo-name
+                          {:key item-key
+                           :title [:span.flex.items-center.title-wrap short-repo-name
                                    (when remote? [:span.pl-1.flex.items-center
                                                   {:title title}
                                                   (ui/icon (if graph-e2ee? "lock" "cloud") {:size 18})
@@ -469,14 +473,17 @@
      {:class (when (<= (count repos) 1) "no-repos")}
      (header-fn)
      [:div.cp__repos-list-wrap
-      (for [{:keys [hr item hover-detail title options icon]} (items-fn)]
+      (for [{:keys [key hr item hover-detail title options icon]} (items-fn)]
         (let [on-click' (:on-click options)
               href' (:href options)
               menu-item (if (util/mobile?) ui/menu-link shui/dropdown-menu-item)]
           (if hr
-            (if (util/mobile?) [:hr.py-2] (shui/dropdown-menu-separator))
+            (if (util/mobile?)
+              [:hr.py-2 {:key key}]
+              (shui/dropdown-menu-separator {:key key}))
             (menu-item
              (assoc options
+                    :key key
                     :title hover-detail
                     :on-click (fn [^js e]
                                 (when on-click'
