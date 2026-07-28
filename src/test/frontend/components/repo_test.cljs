@@ -29,6 +29,186 @@
    :GraphUUID "graph-uuid"
    :GraphSchemaVersion "65.2"})
 
+(def local-switch-graph
+  {:url "logseq_db_local-graph"
+   :root "/graphs/local-graph"
+   :remote? false
+   :rtc-graph? false
+   :graph-ready-for-use? true
+   :GraphName "local-graph"
+   :GraphUUID "local-graph-uuid"
+   :GraphSchemaVersion "65.2"})
+
+(defn- drain-callbacks!
+  [callbacks]
+  (loop []
+    (when-let [callback (first @callbacks)]
+      (swap! callbacks subvec 1)
+      (callback)
+      (recur))))
+
+(defn- run-repo-sheet-scenario!
+  [graph {:keys [initial-sheet mobile? native? progress-order]}]
+  (let [captured-menu-props (atom nil)
+        sheet (atom initial-sheet)
+        events (atom [])
+        hides (atom [])
+        dismiss-acks (atom 0)
+        dismiss-ack-callbacks (atom [])
+        progress-callbacks (atom [])
+        timer-callbacks (atom [])
+        previous-react (gobj/get js/globalThis "React")
+        previous-console-error (gobj/get js/console "error")
+        previous-set-timeout (gobj/get js/globalThis "setTimeout")
+        present-progress!
+        (fn []
+          (reset! sheet :download-progress))
+        hide-current-sheet!
+        (fn [& args]
+          (swap! hides conj {:args args
+                             :sheet @sheet})
+          (reset! sheet nil)
+          (swap! dismiss-ack-callbacks
+                 conj
+                 (fn []
+                   (swap! dismiss-acks inc))))]
+    (gobj/set js/globalThis "React" react)
+    (gobj/set js/console "error" (fn [& _args]))
+    (gobj/set js/globalThis "setTimeout"
+              (fn [callback & _args]
+                (swap! timer-callbacks conj callback)
+                (count @timer-callbacks)))
+    (try
+      (with-redefs [util/mobile? (constantly mobile?)
+                    mobile-util/native-platform? (constantly native?)
+                    state/use-sub
+                    (fn [key]
+                      (case key
+                        :git/current-repo nil
+                        :auth/id-token "token"
+                        [:me :repos] [graph]
+                        :rtc/graphs []
+                        :rtc/downloading-graph-uuid nil
+                        :rtc/loading-graphs? false
+                        nil))
+                    graph-handler/get-metadata-local (constantly nil)
+                    repo-handler/combine-local-&-remote-graphs
+                    (fn [locals remotes] (concat locals remotes))
+                    ui/menu-link
+                    (fn [props & _children]
+                      (reset! captured-menu-props props)
+                      (.createElement react "div" #js {:key "repo-action-under-test"}))
+                    shui/dropdown-menu-item
+                    (fn [props & _children]
+                      (reset! captured-menu-props props)
+                      (.createElement react "div" #js {:key "repo-action-under-test"}))
+                    shui/popup-hide! hide-current-sheet!
+                    state/pub-event!
+                    (fn [event]
+                      (swap! events conj event)
+                      (when (and native?
+                                 (= :rtc/download-remote-graph (first event)))
+                        (if (= :before-dismiss-ack progress-order)
+                          (present-progress!)
+                          (swap! progress-callbacks conj present-progress!)))
+                      nil)]
+        (.renderToStaticMarkup
+         react-dom-server
+         (repo/repos-dropdown-content
+          :contentid :graph-switcher
+          :footer? false))
+        ((:on-click @captured-menu-props)
+         #js {:shiftKey false})
+        (let [immediate {:sheet @sheet
+                         :hides (vec @hides)
+                         :timer-count (count @timer-callbacks)}]
+          (drain-callbacks! timer-callbacks)
+          (case progress-order
+            :before-dismiss-ack
+            (do
+              (drain-callbacks! progress-callbacks)
+              (drain-callbacks! dismiss-ack-callbacks))
+
+            :after-dismiss-ack
+            (do
+              (drain-callbacks! dismiss-ack-callbacks)
+              (drain-callbacks! progress-callbacks))
+
+            nil)
+          {:immediate immediate
+           :final-sheet @sheet
+           :events (vec @events)
+           :hides (vec @hides)
+           :dismiss-acks @dismiss-acks}))
+      (finally
+        (gobj/set js/globalThis "setTimeout" previous-set-timeout)
+        (gobj/set js/console "error" previous-console-error)
+        (if (some? previous-react)
+          (gobj/set js/globalThis "React" previous-react)
+          (js-delete js/globalThis "React"))))))
+
+(defn- assert-safe-native-remote-download!
+  [result]
+  (is (= [[:rtc/download-remote-graph
+           "cloud-graph"
+           "graph-uuid"
+           "65.2"
+           false]]
+         (:events result)))
+  (is (= [:repo-menu]
+         (mapv :sheet (:hides result)))
+      "old-menu cleanup must run exactly once and must never target the progress sheet")
+  (is (= :download-progress (:final-sheet result))
+      "the download progress sheet must remain visible after old-menu cleanup and ack"))
+
+(deftest native-mobile-remote-download-survives-progress-before-dismiss-ack-test
+  (assert-safe-native-remote-download!
+   (run-repo-sheet-scenario!
+    remote-download-graph
+    {:initial-sheet :repo-menu
+     :mobile? true
+     :native? true
+     :progress-order :before-dismiss-ack})))
+
+(deftest native-mobile-remote-download-survives-dismiss-ack-before-progress-test
+  (assert-safe-native-remote-download!
+   (run-repo-sheet-scenario!
+    remote-download-graph
+    {:initial-sheet :repo-menu
+     :mobile? true
+     :native? true
+     :progress-order :after-dismiss-ack})))
+
+(deftest ordinary-mobile-and-desktop-repo-actions-close-the-menu-once-test
+  (let [mobile-result
+        (run-repo-sheet-scenario!
+         local-switch-graph
+         {:initial-sheet :repo-menu
+          :mobile? true
+          :native? true})
+        desktop-result
+        (run-repo-sheet-scenario!
+         remote-download-graph
+         {:initial-sheet :desktop-menu
+          :mobile? false
+          :native? false})]
+    (is (= [[:graph/switch "logseq_db_local-graph"]]
+           (:events mobile-result)))
+    (is (= [:repo-menu]
+           (mapv :sheet (:hides mobile-result)))
+        "an ordinary native-mobile action must dismiss the repo menu exactly once")
+    (is (nil? (get-in mobile-result [:immediate :sheet])))
+    (is (= [[:rtc/download-remote-graph
+             "cloud-graph"
+             "graph-uuid"
+             "65.2"
+             false]]
+           (:events desktop-result)))
+    (is (= [:desktop-menu]
+           (mapv :sheet (get-in desktop-result [:immediate :hides])))
+        "desktop actions must dismiss synchronously and exactly once")
+    (is (nil? (get-in desktop-result [:immediate :sheet])))))
+
 (deftest mobile-remote-graph-click-publishes-download-without-false-sentinel-test
   (let [events (atom [])
         links (#'repo/repos-dropdown-links
