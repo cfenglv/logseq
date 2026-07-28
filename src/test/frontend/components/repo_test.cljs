@@ -1,6 +1,7 @@
 (ns frontend.components.repo-test
   (:require ["react" :as react]
             ["react-dom/server" :as react-dom-server]
+            [clojure.string :as string]
             [cljs.test :refer [deftest is async]]
             [frontend.components.repo :as repo]
             [frontend.components.rtc.indicator :as rtc-indicator]
@@ -50,6 +51,74 @@
     (is (not (false? result))
         "download dispatch must not use false as control flow for popup cleanup")))
 
+(deftest repos-dropdown-content-gives-each-repo-a-stable-react-key-test
+  (let [second-remote-graph
+        (assoc remote-download-graph
+               :url "logseq_db_second-cloud-graph"
+               :GraphName "second-cloud-graph"
+               :GraphUUID "graph-uuid-2")
+        captured-menu-props (atom [])
+        console-errors (atom [])
+        previous-react (gobj/get js/globalThis "React")
+        previous-console-error (gobj/get js/console "error")
+        missing-key-warning
+        "Each child in a list should have a unique \"key\" prop."]
+    (gobj/set js/globalThis "React" react)
+    (gobj/set js/console "error"
+              (fn [& args]
+                (swap! console-errors conj args)))
+    (try
+      (with-redefs [util/mobile? (constantly true)
+                    state/use-sub
+                    (fn [key]
+                      (case key
+                        :git/current-repo nil
+                        :auth/id-token "token"
+                        [:me :repos] []
+                        :rtc/graphs [remote-download-graph second-remote-graph]
+                        :rtc/downloading-graph-uuid nil
+                        :rtc/loading-graphs? false
+                        nil))
+                    graph-handler/get-metadata-local (constantly nil)
+                    repo-handler/combine-local-&-remote-graphs
+                    (fn [locals remotes] (concat locals remotes))
+                    shui/button
+                    (fn [_props & _children]
+                      (.createElement react "button" nil))
+                    ui/menu-link
+                    (fn [props & _children]
+                      (swap! captured-menu-props conj props)
+                      (if-some [item-key (:key props)]
+                        (.createElement react "div" #js {:key item-key})
+                        (.createElement react "div" nil)))]
+        (.renderToStaticMarkup
+         react-dom-server
+         (repo/repos-dropdown-content
+          :contentid :graph-switcher
+          :footer? false)))
+      (let [repo-titles (set (map :title @captured-menu-props))
+            repo-keys (set (keep :key @captured-menu-props))
+            missing-key-errors
+            (filter
+             (fn [args]
+               (some #(and (string? %)
+                           (string/includes? % missing-key-warning))
+                     args))
+             @console-errors)]
+        (is (= #{"logseq_db_cloud-graph"
+                 "logseq_db_second-cloud-graph"}
+               repo-titles)
+            "the render must exercise two repos with different stable identities")
+        (is (= 2 (count repo-keys))
+            "both repo identities must be forwarded as distinct React keys")
+        (is (empty? missing-key-errors)
+            "rendering repo items must not emit React's missing-key warning"))
+      (finally
+        (gobj/set js/console "error" previous-console-error)
+        (if (some? previous-react)
+          (gobj/set js/globalThis "React" previous-react)
+          (js-delete js/globalThis "React"))))))
+
 (deftest mobile-remote-graph-popup-closes-after-not-during-click-test
   (let [captured-menu-props (atom nil)
         popup-hides (atom [])
@@ -79,7 +148,9 @@
                     ui/menu-link
                     (fn [props & _children]
                       (reset! captured-menu-props props)
-                      (.createElement react "div" nil))
+                      (if-some [item-key (:key props)]
+                        (.createElement react "div" #js {:key item-key})
+                        (.createElement react "div" nil)))
                     shui/popup-hide!
                     (fn [& args]
                       (swap! popup-hides conj args))
