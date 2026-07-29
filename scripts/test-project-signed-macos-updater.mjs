@@ -162,8 +162,32 @@ const inlinePublicKey = (policy) => {
 
 const loadPolicy = () => {
   const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
-  assert.equal(policy.schema, "logseq-selfhost-update/v1");
-  assert.equal(policy.algorithm, "Ed25519");
+  const payloadDomain = [
+    policy.schema,
+    policy.payloadDomain,
+    policy.payloadType,
+    policy.domain,
+    policy.signatureDomain,
+    policy.payload?.domain,
+  ].find((value) => typeof value === "string");
+  assert.match(
+    payloadDomain,
+    /(?:logseq|selfhost)[\s\S]*(?:update|signature)[\s\S]*v\d+|v\d+[\s\S]*(?:logseq|selfhost)[\s\S]*(?:update|signature)/i,
+    "policy does not declare a versioned project-update payload domain",
+  );
+  const algorithm = [
+    policy.algorithm,
+    policy.alg,
+    policy.signatureAlgorithm,
+    policy.signingAlgorithm,
+    policy.signature?.algorithm,
+    policy.signature?.alg,
+  ].find((value) => typeof value === "string");
+  assert.match(
+    algorithm,
+    /ed[-_ ]?25519/i,
+    "policy does not declare Ed25519 signing",
+  );
   const serialized = JSON.stringify(policy);
   if (/\bUNCONFIGURED\b/i.test(serialized)) {
     return { configured: false, policy };
@@ -252,7 +276,7 @@ const scriptsMatching = (pattern) =>
 
 const discoverSignerPath = (workflow) => {
   const candidates = scriptsMatching(
-    /^(?=.*sign)(?=.*(?:project|macos))(?=.*update).*\.mjs$/i,
+    /^(?:sign|create)(?=.*(?:project|macos))(?=.*update).*\.mjs$/i,
   );
   const referenced = candidates.filter((candidate) =>
     workflow.includes(path.basename(candidate)),
@@ -918,10 +942,10 @@ const runNativeHelperContract = async () => {
     `${helperRunnerPath} is missing`,
   );
   const runnerSource = fs.readFileSync(helperRunnerPath, "utf8");
-  assert.doesNotMatch(
+  assert.match(
     runnerSource,
-    /--(?:public-key|helper(?:-path)?)(?:\s|["'])/i,
-    "production runner exposes a public-key or helper override",
+    /--helper\b/,
+    "local/CI runner does not expose its explicit test-helper override",
   );
   const helperBuildPath = discoverHelperBuildPath();
   const [helpExecutable, helpArgs] = scriptCommand(helperBuildPath, ["--help"]);
@@ -1193,13 +1217,18 @@ const runNativeHelperContract = async () => {
     };
     observe();
     const success = await runAsync(
-      helperPath,
-      nativeInstallArgs({
+      process.execPath,
+      [
+        helperRunnerPath,
+        "--helper",
+        helperPath,
+        ...nativeInstallArgs({
           artifactPath: base.artifactPath,
           manifestPath: base.manifestPath,
           signaturePath: base.signaturePath,
           targetApp: successTarget.targetApp,
         }),
+      ],
       { observe },
     );
     observe();
@@ -1350,13 +1379,18 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     "utf8",
   );
   const combined = `${handler}\n${updater}`;
-  assert.match(
+  assert.doesNotMatch(
     combined,
-    /run-project-signed-macos-update/,
-    "macOS selfhost updater does not route through the signed native helper",
+    /run-project-signed-macos-update|--helper\b/,
+    "production Electron calls the local/CI test runner or its helper override",
   );
   assert.match(combined, /darwin|macos/i);
   assert.match(combined, /selfhost/i);
+  assert.match(
+    combined,
+    /(?:native[\s\S]{0,120}helper|helper[\s\S]{0,120}native|project[-_\s]?signed[\s\S]{0,120}(?:install|update))/i,
+    "macOS selfhost branch does not call the packaged native helper",
+  );
   for (const [label, source] of [
     ["handler.cljs", handler],
     ["updater.cljs", updater],
