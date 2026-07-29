@@ -362,7 +362,6 @@ const canonicalNativePayload = ({
     `zip-size=${size}`,
     `zip-sha512=${sha512}`,
     "",
-    "",
   ].join("\n");
 
 const electronFixture = () => {
@@ -1115,6 +1114,36 @@ const runNativeHelperContract = async () => {
     const base = makeFixture({
       root: path.join(tempRoot, "valid-base"),
     });
+    const basePayload = canonicalNativePayload({
+      arch: base.arch,
+      bundleId,
+      payloadDomain,
+      sha512: base.sha512,
+      size: base.size,
+      version: base.version,
+    });
+    assert.match(base.sha512, /^[a-f0-9]{128}$/);
+    assert.equal(basePayload.endsWith("\n"), true);
+    assert.equal(basePayload.endsWith("\n\n"), false);
+    for (const [label, payload] of [
+      [
+        "canonical payload missing terminal newline",
+        basePayload.slice(0, -1),
+      ],
+      ["canonical payload has double terminal newline", `${basePayload}\n`],
+    ]) {
+      expectNoDamage({
+        fixture: {
+          ...base,
+          signature: cryptoSign(
+            null,
+            Buffer.from(payload),
+            privateKeyPem,
+          ).toString("base64"),
+        },
+        label,
+      });
+    }
 
     const wrongKey = makeFixture({
       privateKeyPem: wrongPrivateKeyPem,
