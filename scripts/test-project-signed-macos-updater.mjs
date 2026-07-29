@@ -1124,6 +1124,7 @@ const nativeInstallArgs = ({
   signature,
   size,
   targetApp,
+  testExitAfterSwap = false,
   verifyOnly = false,
   version,
 }) => [
@@ -1145,6 +1146,7 @@ const nativeInstallArgs = ({
   String(relaunch),
   "--signature",
   signature,
+  ...(testExitAfterSwap ? ["--test-exit-after-swap"] : []),
   ...(verifyOnly ? ["--verify-only"] : []),
 ];
 
@@ -1276,6 +1278,30 @@ const runNativeHelperContract = async () => {
       command("file", [helperPath]).output,
       /Mach-O/,
       "helper build did not produce a native Mach-O executable",
+    );
+    const flagSearch = command(
+      "git",
+      ["grep", "-l", "--", "--test-exit-after-swap"],
+      { allowFailure: true },
+    );
+    const productionSourcesWithGuard = flagSearch.status === 0
+      ? flagSearch.output
+          .split("\n")
+          .filter(
+            (file) =>
+              file &&
+              file !== "scripts/test-project-signed-macos-updater.mjs",
+          )
+          .filter((file) => {
+            const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
+            return /PROJECT_UPDATER_TESTING[\s\S]{0,1600}test-exit-after-swap|test-exit-after-swap[\s\S]{0,1600}PROJECT_UPDATER_TESTING/.test(
+              source,
+            );
+          })
+      : [];
+    assert.ok(
+      productionSourcesWithGuard.length > 0,
+      "--test-exit-after-swap is not compile-guarded by PROJECT_UPDATER_TESTING",
     );
 
     const makeFixture = (options) =>
@@ -1542,19 +1568,108 @@ const runNativeHelperContract = async () => {
       mutateTargetParent: (parent) => fs.chmodSync(parent, 0o555),
     });
 
-    const rollbackRoot = path.join(tempRoot, "mid-install-failure");
-    const rollbackTarget = makeOldTarget(rollbackRoot, bundleId, helperArch);
-    const rollbackBefore = treeDigest(rollbackTarget.targetApp);
-    const rollback = invokeNative(base, {
-      env: {
-        LOGSEQ_PROJECT_UPDATE_TEST_FAULT: "after-old-app-move",
-      },
-      targetApp: rollbackTarget.targetApp,
-    });
-    assert.notEqual(rollback.status, 0, "injected mid-install failure succeeded");
-    assert.equal(treeDigest(rollbackTarget.targetApp), rollbackBefore);
-    assert.deepEqual(fs.readdirSync(rollbackTarget.parent), ["Logseq.app"]);
-    console.log("[project-updater] PASS native rollback after mid-install failure");
+    const swapExitRoot = path.join(tempRoot, "exit-after-atomic-swap");
+    const swapExitTarget = makeOldTarget(
+      swapExitRoot,
+      bundleId,
+      helperArch,
+    );
+    const oldAppDigest = treeDigest(swapExitTarget.targetApp);
+    const swapStatePath = path.join(
+      swapExitTarget.targetApp,
+      "Contents",
+      "Resources",
+      "update-state.txt",
+    );
+    const observedSwapStates = new Set();
+    const observeSwap = () => {
+      try {
+        observedSwapStates.add(fs.readFileSync(swapStatePath, "utf8"));
+      } catch (error) {
+        if (error?.code === "ENOENT") observedSwapStates.add("<missing>");
+        else throw error;
+      }
+    };
+    observeSwap();
+    const swapExit = await runAsync(
+      helperPath,
+      nativeInstallArgs({
+        ...base,
+        targetApp: swapExitTarget.targetApp,
+        testExitAfterSwap: true,
+      }),
+      { observe: observeSwap },
+    );
+    observeSwap();
+    assert.equal(
+      swapExit.status,
+      86,
+      `test-only helper did not exit at the post-swap fault point:\n${swapExit.output}`,
+    );
+    assert.equal(observedSwapStates.has("<missing>"), false);
+    for (const state of observedSwapStates) {
+      assert.ok(
+        state === "2.0.1-selfhost.5" || state === "2.0.1-selfhost.6",
+        `post-swap observer saw partial state ${JSON.stringify(state)}`,
+      );
+    }
+    assert.equal(fs.readFileSync(swapStatePath, "utf8"), "2.0.1-selfhost.6");
+    assert.equal(
+      command("plutil", [
+        "-extract",
+        "CFBundleShortVersionString",
+        "raw",
+        path.join(swapExitTarget.targetApp, "Contents", "Info.plist"),
+      ]).output,
+      "2.0.1-selfhost.6",
+    );
+    command("codesign", [
+      "--verify",
+      "--deep",
+      "--strict",
+      "--all-architectures",
+      swapExitTarget.targetApp,
+    ]);
+    assert.ok(
+      command("lipo", [
+        "-archs",
+        path.join(
+          swapExitTarget.targetApp,
+          "Contents",
+          "MacOS",
+          "Logseq",
+        ),
+      ]).output
+        .split(/\s+/)
+        .includes(lipoArchitecture(helperArch)),
+    );
+    const stagedApps = [];
+    const collectStagedApps = (entry, depth = 0) => {
+      if (depth > 2 || !fs.existsSync(entry)) return;
+      if (
+        fs.statSync(entry).isDirectory() &&
+        fs.existsSync(path.join(entry, "Contents", "Info.plist"))
+      ) {
+        stagedApps.push(entry);
+        return;
+      }
+      if (!fs.statSync(entry).isDirectory()) return;
+      for (const child of fs.readdirSync(entry)) {
+        collectStagedApps(path.join(entry, child), depth + 1);
+      }
+    };
+    for (const entry of fs.readdirSync(swapExitTarget.parent)) {
+      if (entry.startsWith(".")) {
+        collectStagedApps(path.join(swapExitTarget.parent, entry));
+      }
+    }
+    assert.ok(
+      stagedApps.some((stagedApp) => treeDigest(stagedApp) === oldAppDigest),
+      "atomic swap did not retain the complete old App in hidden staging",
+    );
+    console.log(
+      "[project-updater] PASS native test exit after atomic swap preserves recoverable old App",
+    );
 
     const successRoot = path.join(tempRoot, "success");
     const successTarget = makeOldTarget(successRoot, bundleId, helperArch);
