@@ -1,9 +1,11 @@
 (ns electron.updater-test
-  (:require ["events" :refer [EventEmitter]]
+  (:require ["node:child_process" :refer [spawnSync]]
+            ["events" :refer [EventEmitter]]
             ["electron-updater/out/AppUpdater" :as app-updater-module]
             [clojure.string :as string]
             [cljs.test :refer [async deftest is testing]]
             [electron.updater :as updater]
+            [goog.object :as gobj]
             [promesa.core :as p]))
 
 (defn- updater-error
@@ -47,32 +49,35 @@
       (reset! candidate nil))))
 
 (defn- configure-production-policy!
-  [version]
+  []
   (let [auto-updater
         (aget js/globalThis "__LOGSEQ_TEST_AUTO_UPDATER__")]
     (reset-production-policy-caches!)
     (.resetContractState auto-updater)
-    (let [dispose!
-          (with-redefs [updater/electron-version version]
-            (updater/init-updater {:win nil}))
+    (let [dispose! (updater/init-updater {:win nil})
           raw-policy (.-isUpdateSupported auto-updater)]
       {:auto-updater auto-updater
        :dispose! dispose!
-       :policy (fn [info]
-                 ;; The production predicate performs asynchronous native
-                 ;; verification before it reads the running version. Keep the
-                 ;; fixture override alive until that Promise settles.
-                 (let [original-version updater/electron-version]
-                   (set! updater/electron-version version)
-                   (try
-                     (-> (raw-policy info)
-                         (p/finally
-                          (fn []
-                            (set! updater/electron-version
-                                  original-version))))
-                     (catch :default error
-                       (set! updater/electron-version original-version)
-                       (throw error)))))})))
+       :policy raw-policy})))
+
+(defn- run-nightly-policy-subprocess
+  [nightly-version]
+  (let [env (js/Object.assign #js {} (.-env js/process))
+        _ (gobj/set env "LOGSEQ_TEST_COMPILED_VERSION" nightly-version)
+        result
+        (spawnSync
+         (.-execPath js/process)
+         #js ["--require"
+              "./scripts/fixtures/electron-test-preload.cjs"
+              "static/tests.js"
+              "-v"
+              (str (namespace ::nightly-policy)
+                   "/nightly-production-update-policy-controls-real-app-updater-downloads")]
+         #js {:cwd (.cwd js/process)
+              :encoding "utf8"
+              :env env})]
+    {:status (.-status result)
+     :output (str (.-stdout result) (.-stderr result))}))
 
 (defn- run-app-updater-flow!
   [current info production-policy]
@@ -196,7 +201,7 @@
           nightly-current "2.0.1-selfhost.6.nightly.20260728"
           nightly-next "2.0.1-selfhost.6.nightly.20260729"
           disposers (atom [])
-          stable-config (configure-production-policy! stable-current)
+          stable-config (configure-production-policy!)
           _ (swap! disposers conj (:dispose! stable-config))
           stable-policy (:policy stable-config)
           stable-asset (target-asset platform arch stable-next)
@@ -258,63 +263,79 @@
                        (.-defaultSupportCalls
                         (:auto-updater stable-config))))
                 "production wrapper preserves the original minimumSystemVersion callback")
-            (let [nightly-config
-                  (configure-production-policy! nightly-current)
-                  _ (swap! disposers conj (:dispose! nightly-config))
-                  nightly-policy (:policy nightly-config)
-                  nightly-asset
-                  (target-asset platform arch nightly-next)
-                  feed-calls
-                  (array-seq
-                   (.-feedURLCalls (:auto-updater nightly-config)))
-                  feed-text
-                  (string/lower-case
-                   (str (or (some-> feed-calls last (aget "url"))
-                            (some-> feed-calls last)
-                            "")))]
-              (is (= 1 (count feed-calls))
-                  "nightly production path configures exactly one Generic feed")
-              (is (string/includes? feed-text "nightly")
-                  "nightly production feed is an isolated rolling URL")
-              (is (not (string/includes? feed-text "/releases/latest"))
-                  "nightly production path never points at stable latest")
-              (is (true?
-                   (.-allowPrerelease (:auto-updater nightly-config)))
-                  "nightly production path enables prerelease metadata")
-              (p/let [rolling-tag
+            (let [{:keys [status output]}
+                  (run-nightly-policy-subprocess nightly-current)]
+              (is (= 0 status)
+                  (str "nightly production policy subprocess failed:\n"
+                       output))))
+          (p/catch
+           (fn [error]
+             (is false
+                 (str "production updater policy contract failed: " error))))
+          (p/finally
+           (fn []
+             (doseq [dispose! @disposers]
+               (dispose!))
+             (done)))))))
+
+(deftest nightly-production-update-policy-controls-real-app-updater-downloads
+  (async done
+    (let [nightly-current "2.0.1-selfhost.6.nightly.20260728"
+          configured-version
+          (gobj/get (.-env js/process) "LOGSEQ_TEST_COMPILED_VERSION")]
+      (if-not (= nightly-current configured-version)
+        (do
+          ;; The stable parent test launches this test in a fresh Node process
+          ;; whose preload seeds frontend.version before the CLJS bundle loads.
+          (is true)
+          (done))
+        (let [platform (.-platform js/process)
+              arch (.-arch js/process)
+              stable-next "2.0.1-selfhost.6"
+              nightly-next "2.0.1-selfhost.6.nightly.20260729"
+              nightly-config (configure-production-policy!)
+              nightly-policy (:policy nightly-config)
+              nightly-asset (target-asset platform arch nightly-next)
+              stable-asset (target-asset platform arch stable-next)
+              feed-calls
+              (array-seq (.-feedURLCalls (:auto-updater nightly-config)))
+              feed-text
+              (string/lower-case
+               (str (or (some-> feed-calls last (aget "url"))
+                        (some-> feed-calls last)
+                        "")))]
+          (is (= 1 (count feed-calls))
+              "nightly production path configures exactly one Generic feed")
+          (is (string/includes? feed-text "nightly")
+              "nightly production feed is an isolated rolling URL")
+          (is (not (string/includes? feed-text "/releases/latest"))
+              "nightly production path never points at stable latest")
+          (is (true? (.-allowPrerelease (:auto-updater nightly-config)))
+              "nightly production path enables prerelease metadata")
+          (-> (p/let [rolling-tag
                       (run-app-updater-flow!
                        nightly-current
-                       (update-info nightly-next
-                                    "nightly"
-                                    nightly-asset)
+                       (update-info nightly-next "nightly" nightly-asset)
                        nightly-policy)
                       absent-tag
                       (run-app-updater-flow!
                        nightly-current
-                       (update-info nightly-next
-                                    ::absent
-                                    nightly-asset)
+                       (update-info nightly-next ::absent nightly-asset)
                        nightly-policy)
                       null-tag
                       (run-app-updater-flow!
                        nightly-current
-                       (update-info nightly-next
-                                    ::null
-                                    nightly-asset)
+                       (update-info nightly-next ::null nightly-asset)
                        nightly-policy)
                       dated-tag
                       (run-app-updater-flow!
                        nightly-current
-                       (update-info nightly-next
-                                    nightly-next
-                                    nightly-asset)
+                       (update-info nightly-next nightly-next nightly-asset)
                        nightly-policy)
                       manual-exit
                       (run-app-updater-flow!
                        nightly-current
-                       (update-info stable-next
-                                    stable-next
-                                    stable-asset)
+                       (update-info stable-next stable-next stable-asset)
                        nightly-policy)]
                 (doseq [[label result]
                         [["rolling tag" rolling-tag]
@@ -325,16 +346,16 @@
                 (is (= {:available? false :downloads 0} dated-tag)
                     "rolling Generic metadata rejects a dated release tag")
                 (is (= {:available? false :downloads 0} manual-exit)
-                    "nightly requires manual exit to stable"))))
-          (p/catch
-           (fn [error]
-             (is false
-                 (str "production updater policy contract failed: " error))))
-          (p/finally
-           (fn []
-             (doseq [dispose! @disposers]
-               (dispose!))
-             (done)))))))
+                    "nightly requires manual exit to stable"))
+              (p/catch
+               (fn [error]
+                 (is false
+                     (str "nightly production policy contract failed: "
+                          error))))
+              (p/finally
+               (fn []
+                 ((:dispose! nightly-config))
+                 (done)))))))))
 
 (deftest install-failures-keep-dirty-protection-and-report-to-updater-ui
   (async done

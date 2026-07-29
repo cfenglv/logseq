@@ -2824,9 +2824,17 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     /(?:>=\s+(?:[^\n()]+\s+)?5|<=\s+5(?:\s+[^\n()]*)?|at-least\??[^\n()]*5)/i,
     "signed-macOS predicate does not require selfhost revision >= 5",
   );
-  const validateProjectUpdateInfo = updater.match(
-    /\(defn-?\s+<validate-project-update-info[\s\S]*?(?=\n\(defn|\s*$)/,
-  )?.[0];
+  const updaterFunction = (name) => {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return updater.match(
+      new RegExp(
+        `\\(defn-?\\s+${escaped}[\\s\\S]*?(?=\\n\\(defn|\\s*$)`,
+      ),
+    )?.[0];
+  };
+  const validateProjectUpdateInfo = updaterFunction(
+    "<validate-project-update-info",
+  );
   assert.ok(
     validateProjectUpdateInfo,
     "Electron does not validate signed update metadata before installation",
@@ -2836,10 +2844,60 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     /:arch\s+\(\.-arch\s+js\/process\)/,
     "validated update metadata does not bind its architecture to process.arch",
   );
+  const rememberProjectUpdate = updaterFunction("remember-project-update!");
+  assert.ok(
+    rememberProjectUpdate,
+    "Electron does not persist validated project update metadata",
+  );
   assert.match(
-    updater,
-    /(?:["']--arch["']|:arch)\s+(?:\(:arch\s+(?:validated-)?manifest\)|\(get\s+(?:validated-)?manifest\s+:arch\))/,
-    "Electron does not pass the validated manifest architecture to the native helper",
+    rememberProjectUpdate,
+    /:arch\s+\(\.-arch\s+manifest\)/,
+    "remembered update architecture does not come from the validated manifest",
+  );
+  assert.match(
+    rememberProjectUpdate,
+    /\*project-update/,
+    "validated manifest architecture is not persisted in project update state",
+  );
+  assert.doesNotMatch(
+    rememberProjectUpdate,
+    /\.-arch\s+js\/process/,
+    "remembered update architecture bypasses the validated manifest",
+  );
+  const projectSignedInstall = updaterFunction("<project-signed-install!");
+  assert.ok(
+    projectSignedInstall,
+    "Electron does not expose the guarded project-signed install path",
+  );
+  assert.match(
+    projectSignedInstall,
+    /\{:keys\s+\[[^\]]*\barch\b[^\]]*\][^}]*\}\s+@?\*project-update/,
+    "project-signed install does not read architecture from remembered validated state",
+  );
+  assert.match(
+    projectSignedInstall,
+    /project-helper-arguments[\s\S]{0,500}\barch\b/,
+    "project-signed install does not pass remembered architecture to helper arguments",
+  );
+  assert.doesNotMatch(
+    projectSignedInstall,
+    /\.-arch\s+js\/process/,
+    "project-signed install replaces the validated architecture with process input",
+  );
+  const projectHelperArguments = updaterFunction("project-helper-arguments");
+  assert.ok(
+    projectHelperArguments,
+    "Electron does not construct native project helper arguments",
+  );
+  assert.match(
+    projectHelperArguments,
+    /["']--arch["']\s+arch\b/,
+    "native helper arguments do not emit the remembered validated architecture",
+  );
+  assert.doesNotMatch(
+    projectHelperArguments,
+    /\.-arch\s+js\/process/,
+    "native helper arguments bypass remembered validated architecture",
   );
   assert.match(
     combined,

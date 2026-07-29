@@ -27,6 +27,15 @@ const updaterNamespaceFilter = (source) => {
   return electronGroup?.split("|").includes("updater") ?? false;
 };
 
+const workflowJob = (workflow, jobName) => {
+  const marker = `  ${jobName}:`;
+  const start = workflow.indexOf(marker);
+  assert.notEqual(start, -1, `workflow job ${jobName} must exist`);
+  const tail = workflow.slice(start + marker.length);
+  const nextJobOffset = tail.search(/^  [a-zA-Z0-9_-]+:/m);
+  return nextJobOffset === -1 ? tail : tail.slice(0, nextJobOffset);
+};
+
 assert.deepEqual(
   resolveSelfhostUpdaterVersions("2.0.1-selfhost.4"),
   {
@@ -602,23 +611,14 @@ for (const sourceContract of [
     `source-preflight should execute ${sourceContract}`,
   );
 }
-assert.equal(
-  desktopReleaseWorkflow.match(/project-update:test-helper/g)?.length,
-  2,
-  "both macOS runners should build the explicit native updater test helper",
-);
-assert.equal(
-  desktopReleaseWorkflow.match(/test:project-signed-macos-updater/g)?.length,
-  2,
-  "both macOS runners should execute the native updater E2E",
-);
-assert.equal(
-  desktopReleaseWorkflow.match(
-    /test-selfhost-macos-updater-release-contract\.mjs/g,
-  )?.length,
-  2,
-  "both macOS runners should execute the real provider and SemVer contract",
-);
+for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
+  const job = workflowJob(desktopReleaseWorkflow, jobName);
+  assert.match(
+    job,
+    /project-update:test-helper[\s\S]*?test:project-signed-macos-updater[\s\S]*?test-selfhost-macos-updater-release-contract\.mjs/,
+    `${jobName} must build the native helper before its updater E2E and then run the real provider/SemVer contract`,
+  );
+}
 assert.match(
   desktopReleaseWorkflow,
   /push:[\s\S]*?selfhost\/cloudflare-rtc/,

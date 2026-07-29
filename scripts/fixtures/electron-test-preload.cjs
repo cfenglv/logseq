@@ -10,6 +10,16 @@ Object.defineProperty(process, "resourcesPath", {
   value: path.resolve(__dirname, "..", "..", "static"),
 });
 
+// frontend.version/version is a defonce. Seed it before the compiled CLJS
+// bundle loads so each subprocess exercises production policy with one fixed
+// running version, without mutating a namespace export after module load.
+const compiledTestVersion = process.env.LOGSEQ_TEST_COMPILED_VERSION;
+if (compiledTestVersion) {
+  globalThis.frontend ??= {};
+  globalThis.frontend.version ??= {};
+  globalThis.frontend.version.version = compiledTestVersion;
+}
+
 const noop = (() => {
   const target = function () {};
   const proxy = new Proxy(target, {
@@ -31,7 +41,7 @@ const app = Object.assign(new EventEmitter(), {
   getName: () => "Logseq Test",
   getPath: (name) =>
     path.join(os.tmpdir(), "logseq-electron-test", String(name)),
-  getVersion: () => "2.0.1-selfhost.5",
+  getVersion: () => compiledTestVersion ?? "2.0.1-selfhost.5",
   isReady: () => true,
   quit() {},
   whenReady: async () => {},

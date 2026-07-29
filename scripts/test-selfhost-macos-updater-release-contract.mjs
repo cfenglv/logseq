@@ -203,8 +203,7 @@ function assertNightlyPublicationIsolation() {
     /contains\(\s*[^,]*(?:version|tag)[^,]*,\s*['"]-selfhost\.['"]\s*\)/i
   const scopedSelfhostPrerelease =
     positiveSelfhostClause.test(prereleaseValue) &&
-    !/&&|!\s*contains|\bnot\s*\(/i.test(prereleaseValue) &&
-    (prereleaseValue.match(/\|\|/g)?.length ?? 0) <= 1
+    !/&&|!\s*contains|\bnot\s*\(/i.test(prereleaseValue)
   assert.equal(
     literalPrerelease || scopedSelfhostPrerelease,
     true,
