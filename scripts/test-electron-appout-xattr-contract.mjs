@@ -325,7 +325,7 @@ assert.notEqual(
 );
 assert.match(
   blockedOutput,
-  /(?:project signing policy|project-signing-policy)[\s\S]{0,300}(?:RELEASE BLOCKED|UNCONFIGURED|fail-closed)/i,
+  /(?:project (?:signing policy|update public key)|project-signing-policy)[\s\S]{0,300}(?:RELEASE BLOCKED|UNCONFIGURED|fail-closed)/i,
   "UNCONFIGURED release did not explain its fail-closed policy error",
 );
 assert.doesNotMatch(
