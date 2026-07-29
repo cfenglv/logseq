@@ -754,6 +754,26 @@ const thinMachOExecutable = (arch) => {
   return executable;
 };
 
+const universalMachOExecutable = () => {
+  if (thinMachOCache.has("universal")) {
+    return thinMachOCache.get("universal");
+  }
+  const executable = path.join(thinMachORoot, "Logseq-universal");
+  command("lipo", [
+    "-create",
+    thinMachOExecutable("arm64"),
+    thinMachOExecutable("x64"),
+    "-output",
+    executable,
+  ]);
+  assert.deepEqual(
+    command("lipo", ["-archs", executable]).output.split(/\s+/).sort(),
+    ["arm64", "x86_64"],
+  );
+  thinMachOCache.set("universal", executable);
+  return executable;
+};
+
 const makeNativeHelperApp = ({
   adHocSigned = true,
   applicationId = "com.logseq.logseq",
@@ -762,6 +782,7 @@ const makeNativeHelperApp = ({
   escapeSymlink,
   marker,
   quarantine,
+  universal = false,
   version,
 }) => {
   const contents = path.join(destination, "Contents");
@@ -774,11 +795,17 @@ const makeNativeHelperApp = ({
     appInfoPlist({ applicationId, version }),
   );
   const executable = path.join(macOS, "Logseq");
-  fs.copyFileSync(thinMachOExecutable(arch), executable);
+  fs.copyFileSync(
+    universal ? universalMachOExecutable() : thinMachOExecutable(arch),
+    executable,
+  );
   fs.chmodSync(executable, 0o755);
-  assert.equal(
-    command("lipo", ["-archs", executable]).output,
-    lipoArchitecture(arch),
+  const executableArchs = command("lipo", ["-archs", executable]).output
+    .split(/\s+/)
+    .sort();
+  assert.deepEqual(
+    executableArchs,
+    universal ? ["arm64", "x86_64"] : [lipoArchitecture(arch)],
   );
   fs.writeFileSync(path.join(resources, "update-state.txt"), marker);
   if (quarantine) {
@@ -928,6 +955,7 @@ const signedNativeArchive = ({
 const makeSignedNativeUpdate = ({
   adHocSigned = true,
   applicationId,
+  appArch,
   arch = "arm64",
   bundleId,
   damageCodeSignature = false,
@@ -935,17 +963,20 @@ const makeSignedNativeUpdate = ({
   payloadDomain,
   privateKeyPem,
   root,
+  universalApp = false,
   version = "2.0.1-selfhost.6",
 }) => {
+  const packagedAppArch = appArch ?? arch;
   fs.mkdirSync(root, { recursive: true });
   const app = makeNativeHelperApp({
     adHocSigned,
     applicationId: applicationId ?? bundleId,
-    arch,
+    arch: packagedAppArch,
     destination: path.join(root, "payload", "Logseq.app"),
     escapeSymlink,
     marker: version,
     quarantine: "0081;5f000000;Logseq project update;test-origin",
+    universal: universalApp,
     version,
   });
   if (damageCodeSignature) {
@@ -978,12 +1009,16 @@ const makeSignedNativeUpdate = ({
   ]);
   const archivedApp = path.join(probeRoot, "Logseq.app");
   const archivedQuarantine = quarantineValue(archivedApp);
-  assert.equal(
+  assert.deepEqual(
     command("lipo", [
       "-archs",
       path.join(archivedApp, "Contents", "MacOS", "Logseq"),
-    ]).output,
-    lipoArchitecture(arch),
+    ]).output
+      .split(/\s+/)
+      .sort(),
+    universalApp
+      ? ["arm64", "x86_64"]
+      : [lipoArchitecture(packagedAppArch)],
     "7-Zip archive changed the fixture executable architecture",
   );
   const archivedSignature = command(
@@ -1339,6 +1374,26 @@ const runNativeHelperContract = async () => {
         label,
       });
     }
+    const universalFixture = makeFixture({
+      root: path.join(tempRoot, "safe-universal-app"),
+      universalApp: true,
+    });
+    const universalTarget = makeOldTarget(
+      path.join(tempRoot, "safe-universal-target"),
+      bundleId,
+      helperArch,
+    );
+    const universalBefore = treeDigest(universalTarget.targetApp);
+    const universalVerification = invokeNative(universalFixture, {
+      fields: { verifyOnly: true },
+      targetApp: universalTarget.targetApp,
+    });
+    assert.equal(universalVerification.status, 0, universalVerification.output);
+    assert.equal(treeDigest(universalTarget.targetApp), universalBefore);
+    assert.deepEqual(fs.readdirSync(universalTarget.parent), ["Logseq.app"]);
+    console.log(
+      "[project-updater] PASS native verification: safe universal App includes declared arch",
+    );
 
     const wrongKey = makeFixture({
       privateKeyPem: wrongPrivateKeyPem,
@@ -1404,9 +1459,10 @@ const runNativeHelperContract = async () => {
 
     const oppositeArch = helperArch === "arm64" ? "x64" : "arm64";
     const wrongArchitecture = makeFixture({
-      arch: oppositeArch,
+      appArch: oppositeArch,
       root: path.join(tempRoot, "wrong-architecture"),
     });
+    assert.equal(wrongArchitecture.arch, helperArch);
     assert.equal(
       command("lipo", [
         "-archs",
@@ -1755,6 +1811,27 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     predicateDefinition,
     /(?:>=\s+(?:[^\n()]+\s+)?5|<=\s+5(?:\s+[^\n()]*)?|at-least\??[^\n()]*5)/i,
     "signed-macOS predicate does not require selfhost revision >= 5",
+  );
+  const processArchBinding = updater.match(
+    /\b([a-zA-Z][\w!?-]*)\s+\(\.-arch js\/process\)/,
+  );
+  assert.ok(
+    processArchBinding,
+    "Electron updater does not bind its helper architecture from process.arch",
+  );
+  const processArchSymbol = processArchBinding[1];
+  const signedRouteStart = updater.indexOf("project-signed-macos-updater?");
+  assert.notEqual(signedRouteStart, -1);
+  const signedRoute = updater.slice(
+    signedRouteStart,
+    signedRouteStart + 4000,
+  );
+  assert.match(
+    signedRoute,
+    new RegExp(
+      `(?:--arch|:arch)\\s+${processArchSymbol}\\b|${processArchSymbol}\\s+(?:--arch|:arch)`,
+    ),
+    "Electron does not bind signed update metadata/helper arch to process.arch",
   );
   assert.match(
     combined,
