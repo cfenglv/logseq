@@ -8729,6 +8729,20 @@
     (catch :default error
       {:error error})))
 
+(defn- pending-forward-semantics
+  [pending-txs]
+  (mapv (fn [{:keys [tx-id tx]}]
+          {:tx-id tx-id
+           :tx (mapv (fn [item]
+                       ;; DataScript allocates a fresh transaction id whenever
+                       ;; the same e/a/v is replayed during rebase. It is not
+                       ;; part of the pending user operation's semantics.
+                       (if (and (vector? item) (= 5 (count item)))
+                         (subvec item 0 4)
+                         item))
+                     tx)})
+        pending-txs))
+
 (deftest legacy-built-in-property-values-validate-without-stored-property-type-test
   (testing "known legacy built-ins derive their validation contract without mutating the property entity"
     (doseq [[label property-ident value]
@@ -8798,7 +8812,8 @@
                              "child 2 pending"]])
             (let [pending-before (#'sync-apply/pending-txs test-repo)
                   tx-ids-before (mapv :tx-id pending-before)
-                  forward-txs-before (mapv :tx pending-before)]
+                  forward-semantics-before
+                  (pending-forward-semantics pending-before)]
               (is (= 2 (count pending-before)) label)
               (is (= 2 (count (distinct tx-ids-before))) label)
 
@@ -8836,8 +8851,9 @@
                     "a compatible legacy value must not require sync repair")
                 (is (= tx-ids-before (mapv :tx-id pending-after))
                     "pending local transaction order/identity must be stable")
-                (is (= forward-txs-before (mapv :tx pending-after))
-                    "pending local transaction forward content must not be lost")
+                (is (= forward-semantics-before
+                       (pending-forward-semantics pending-after))
+                    "pending local transaction e/a/v content must not be lost")
                 (is (= "child 1 pending"
                        (:block/title
                         (d/entity @conn [:block/uuid (:block/uuid child1)]))))
