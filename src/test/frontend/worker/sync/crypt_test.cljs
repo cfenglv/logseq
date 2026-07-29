@@ -2,6 +2,7 @@
   (:require [cljs.test :refer [deftest is async]]
             [clojure.string :as string]
             [frontend.common.crypt :as crypt]
+            [frontend.common.thread-api :as thread-api]
             [frontend.worker-common.util :as worker-util]
             [frontend.worker.platform :as platform]
             [frontend.worker.state :as worker-state]
@@ -196,7 +197,7 @@
                             (reset! worker-state/*state state-prev)
                             (done)))))))
 
-(deftest save-e2ee-password-uses-secret-storage-in-node-runtime-test
+(deftest save-e2ee-password-uses-default-auth-file-in-cli-node-runtime-test
   (async done
          (let [platform-map {:env {:runtime :node
                                    :owner-source :cli}}
@@ -235,6 +236,62 @@
                (p/catch (fn [e]
                           (is false (str e))))
                (p/finally done)))))
+
+(deftest save-and-read-e2ee-password-round-trips-cli-runtime-refresh-token-test
+  (async done
+         (let [platform-map {:env {:runtime :node
+                                   :owner-source :cli}}
+               state-prev @worker-state/*state
+               auth-read-calls (atom [])
+               secret-text (atom nil)
+               encrypt-calls (atom [])
+               decrypt-calls (atom [])
+               runtime-refresh-token "refresh-from-custom-auth-file"
+               save-e2ee-password (get @thread-api/*thread-apis
+                                       :thread-api/save-e2ee-password)
+               get-e2ee-password (get @thread-api/*thread-apis
+                                      :thread-api/get-e2ee-password)]
+           (is (fn? save-e2ee-password))
+           (is (fn? get-e2ee-password))
+           (reset! worker-state/*state
+                   (assoc state-prev :auth/refresh-token runtime-refresh-token))
+           (-> (p/with-redefs [platform/current (fn [] platform-map)
+                               platform/read-text! (fn [platform' path]
+                                                     (swap! auth-read-calls conj {:platform platform'
+                                                                                  :path path})
+                                                     (p/resolved "{\"refresh-token\":\"refresh-from-default-auth-file\"}"))
+                               platform/save-secret-text! (fn [_platform' _key text]
+                                                            (reset! secret-text text)
+                                                            (p/resolved nil))
+                               platform/read-secret-text (fn [_platform' _key]
+                                                           (p/resolved @secret-text))
+                               crypt/<encrypt-text-by-text-password (fn [refresh-token password]
+                                                                      (swap! encrypt-calls conj [refresh-token password])
+                                                                      {:refresh-token refresh-token
+                                                                       :password password})
+                               crypt/<decrypt-text-by-text-password (fn [refresh-token data]
+                                                                      (swap! decrypt-calls conj [refresh-token data])
+                                                                      (if (= refresh-token (:refresh-token data))
+                                                                        (p/resolved (:password data))
+                                                                        (p/rejected
+                                                                         (ex-info "decrypt-text-by-text-password"
+                                                                                  {:expected refresh-token
+                                                                                   :actual (:refresh-token data)}))))]
+                 (p/let [_ (save-e2ee-password "custom-path-password")
+                         {:keys [password]} (get-e2ee-password runtime-refresh-token)]
+                   password))
+               (p/then (fn [password]
+                         (is (= "custom-path-password" password))
+                         (is (empty? @auth-read-calls))
+                         (is (= [[runtime-refresh-token "custom-path-password"]]
+                                @encrypt-calls))
+                         (is (= runtime-refresh-token
+                                (ffirst @decrypt-calls)))))
+               (p/catch (fn [e]
+                          (is false (str e))))
+               (p/finally (fn []
+                            (reset! worker-state/*state state-prev)
+                            (done)))))))
 
 (deftest save-e2ee-password-uses-secret-storage-in-electron-runtime-test
   (async done
