@@ -78,8 +78,6 @@ const probeBuild = [
   "-M:test",
   "release",
   "electron-project-signature-loader-contract",
-  "--config-merge",
-  '{:builds {:electron-project-signature-loader-contract {:target :node-script :output-to "static/electron-project-signature-loader-contract.js" :main electron.project-signature-loader-contract/main :compiler-options {:infer-externs :auto}}}}',
 ];
 run("production-mode signature loader probe", "clojure", probeBuild);
 
@@ -110,7 +108,7 @@ const success = parseResult(runProbe("success"), "success");
 assert.deepEqual(success, {
   scenario: "success",
   algorithm: "ed25519-sha512-manifest-v1",
-  samePromise: true,
+  "same-promise": true,
 });
 
 const missingResources = fs.mkdtempSync(
@@ -123,7 +121,7 @@ const failure = parseResult(
   "failure",
 );
 assert.equal(failure.scenario, "failure");
-assert.equal(failure.samePromise, true);
+assert.equal(failure["same-promise"], true);
 assert.equal(failure.rejected, true);
 assert.match(
   failure.code ?? "ERR_MODULE_NOT_FOUND",

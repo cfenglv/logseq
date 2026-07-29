@@ -203,6 +203,13 @@
                    :compiler-options {:static-fns false}
                    :main frontend.test.frontend-node-test-runner/main}
 
+  :electron-project-signature-loader-contract
+  {:target :node-script
+   :output-to "static/electron-project-signature-loader-contract.js"
+   :main electron.project-signature-loader-contract/main
+   :compiler-options {:infer-externs :auto}
+   :devtools {:enabled false}}
+
   :db-sync-backup-memory-test
   {:target :node-script
    :output-to "static/db-sync-backup-memory-test.js"

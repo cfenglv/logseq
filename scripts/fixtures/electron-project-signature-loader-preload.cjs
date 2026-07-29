@@ -84,5 +84,9 @@ Module._load = function loadWithElectronContractDoubles(
 ) {
   if (request === "electron") return electron;
   if (request === "electron-updater") return { autoUpdater };
+  if (request === "electron-log") return noop;
+  if (request === "extract-zip") return noop;
+  if (request === "socks-proxy-agent") return { SocksProxyAgent: noop };
+  if (request === "socks") return { SocksClient: noop };
   return originalLoad.call(this, request, parent, isMain);
 };
