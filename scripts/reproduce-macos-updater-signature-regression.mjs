@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   loadBaseline,
   runGate,
+  UpdaterSignatureGateError,
 } from "./verify-macos-updater-signature.mjs";
 
 const repoRoot = path.resolve(
@@ -163,10 +164,20 @@ const main = async () => {
 try {
   await main();
 } catch (error) {
-  console.error(
-    `[macos-updater-regression] EXPECTED RED: ${
-      error instanceof Error ? error.message : error
-    }`,
-  );
-  process.exitCode = 1;
+  const message = error instanceof Error ? error.message : String(error);
+  const expectedSignatureFailure =
+    error instanceof UpdaterSignatureGateError &&
+    error.kind === "signature-incompatible" &&
+    /code failed to satisfy specified code requirement\(s\)|SQRLCodeSignatureErrorDomain|Code=-67050/.test(
+      message,
+    );
+  if (expectedSignatureFailure) {
+    console.error(`[macos-updater-regression] EXPECTED SIGNATURE RED: ${message}`);
+    process.exitCode = 1;
+  } else {
+    console.error(
+      `[macos-updater-regression] FIXTURE OR HARNESS ERROR: ${message}`,
+    );
+    process.exitCode = 2;
+  }
 }

@@ -4,6 +4,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  classifyShipItOutcome,
+  UpdaterSignatureGateError,
+} from "./verify-macos-updater-signature.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -66,6 +70,10 @@ const cases = [
       assert.match(verifier, /"candidate metadata"/);
       assert.match(verifier, /"candidate download payload"/);
       assert.match(verifier, /"candidate generic signature"/);
+      assert.match(
+        verifier,
+        /"Squirrel designated requirement authorization"/,
+      );
       assert.match(verifier, /"Squirrel physical install"/);
     },
   ],
@@ -74,14 +82,46 @@ const cases = [
     () => {
       assert.match(
         verifier,
-        /result\.status !== 0 \|\| after !== newVersion/,
+        /ShipIt exit=0 target-before=\$\{before\} target-after=\$\{after\}/,
       );
       assert.match(
         verifier,
-        /ShipIt exit=0 target-before=\$\{before\} target-after=\$\{after\}/,
+        /ShipIt request fixture was unreadable or invalid; this is not an updater signature regression/,
       );
       assert.doesNotMatch(verifier, /Signature=adhoc.*throw/s);
     },
+  ],
+  [
+    "ShipIt request read errors are fixture failures, never signature failures",
+    () =>
+      assert.throws(
+        () =>
+          classifyShipItOutcome({
+            status: 1,
+            log: "SQRLShipItRequestErrorDomain Code=2 Could not read update request",
+            before: "2.0.1-selfhost.4",
+            after: "2.0.1-selfhost.4",
+            newVersion: "2.0.1-selfhost.5",
+          }),
+        (error) =>
+          error instanceof UpdaterSignatureGateError &&
+          error.kind === "fixture-error" &&
+          /not an updater signature regression/.test(error.message),
+      ),
+  ],
+  [
+    "a compatible ShipIt replacement is green",
+    () =>
+      assert.equal(
+        classifyShipItOutcome({
+          status: 0,
+          log: "Installation completed successfully",
+          before: "2.0.1-selfhost.5",
+          after: "2.0.1-selfhost.6",
+          newVersion: "2.0.1-selfhost.6",
+        }),
+        "ShipIt exit=0 target-before=2.0.1-selfhost.5 target-after=2.0.1-selfhost.6",
+      ),
   ],
 ];
 

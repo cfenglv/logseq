@@ -612,6 +612,7 @@ for (const requiredVerifierContract of [
   "LOGSEQ_UPDATER_BASELINE_METADATA",
   "published baseline metadata",
   "candidate download payload",
+  "Squirrel designated requirement authorization",
   "Squirrel.framework",
   "Squirrel physical install",
   "target-after=",

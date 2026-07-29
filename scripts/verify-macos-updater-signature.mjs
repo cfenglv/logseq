@@ -20,6 +20,14 @@ const defaultManifestPath = path.join(
   "macos-updater-baseline.json",
 );
 
+export class UpdaterSignatureGateError extends Error {
+  constructor(kind, message, options) {
+    super(message, options);
+    this.name = "UpdaterSignatureGateError";
+    this.kind = kind;
+  }
+}
+
 const quoteTrim = (value) =>
   value.trim().replace(/^(['"])(.*)\1$/, "$2");
 
@@ -230,6 +238,68 @@ const assertApp = ({ app, arch, version }) => {
   return command("codesign", ["-dvvv", "-r-", app]);
 };
 
+const verifyCandidateAgainstOldRequirement = (oldSignatureDetails, newApp) => {
+  const requirement = oldSignatureDetails.match(
+    /^(?:# )?designated => (.+)$/m,
+  )?.[1];
+  if (!requirement) {
+    throw new UpdaterSignatureGateError(
+      "fixture-error",
+      "published baseline codesign output did not contain a designated requirement",
+    );
+  }
+
+  const result = spawnSync(
+    "codesign",
+    [
+      "--verify",
+      "--deep",
+      "--strict",
+      "--all-architectures",
+      `-R=${requirement}`,
+      newApp,
+    ],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.error) {
+    throw new UpdaterSignatureGateError(
+      "fixture-error",
+      `could not execute codesign requirement check: ${result.error.message}`,
+      { cause: result.error },
+    );
+  }
+  const output = `${result.stdout || ""}${result.stderr || ""}`.trim();
+  if (result.status === 0) {
+    return `candidate satisfies old DR: ${requirement}`;
+  }
+  if (
+    output.includes("code failed to satisfy specified code requirement(s)") ||
+    output.includes("CSSMERR_TP_NOT_TRUSTED")
+  ) {
+    throw new UpdaterSignatureGateError(
+      "signature-incompatible",
+      [
+        `candidate does not satisfy published App designated requirement: ${requirement}`,
+        output,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+  throw new UpdaterSignatureGateError(
+    "fixture-error",
+    [
+      `codesign could not evaluate published App designated requirement (exit ${result.status})`,
+      output,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+  );
+};
+
 class Reporter {
   passed = 0;
   failed = 0;
@@ -259,6 +329,65 @@ class Reporter {
     );
   }
 }
+
+export const classifyShipItOutcome = ({
+  spawnError,
+  status,
+  log,
+  before,
+  after,
+  newVersion,
+}) => {
+  if (spawnError) {
+    throw new UpdaterSignatureGateError(
+      "fixture-error",
+      `could not execute ShipIt: ${spawnError.message}`,
+      { cause: spawnError },
+    );
+  }
+  if (
+    log.includes("SQRLShipItRequestErrorDomain") ||
+    log.includes("Could not read update request")
+  ) {
+    throw new UpdaterSignatureGateError(
+      "fixture-error",
+      [
+        "ShipIt request fixture was unreadable or invalid; this is not an updater signature regression",
+        `ShipIt exit=${status} target-before=${before} target-after=${after}`,
+        log,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+  if (
+    log.includes("SQRLCodeSignatureErrorDomain") ||
+    log.includes("code failed to satisfy specified code requirement(s)") ||
+    log.includes("Code=-67050")
+  ) {
+    throw new UpdaterSignatureGateError(
+      "signature-incompatible",
+      [
+        `ShipIt exit=${status ?? "spawn-error"} target-before=${before} target-after=${after}`,
+        log,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+  if (status !== 0 || after !== newVersion) {
+    throw new UpdaterSignatureGateError(
+      "install-failure",
+      [
+        `ShipIt did not replace the target (exit=${status} target-before=${before} target-after=${after})`,
+        log,
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+  return `ShipIt exit=0 target-before=${before} target-after=${after}`;
+};
 
 const runShipItInstall = ({
   oldApp,
@@ -327,17 +456,14 @@ const runShipItInstall = ({
   const after = fs.existsSync(targetApp)
     ? plistValue(targetApp, "CFBundleShortVersionString")
     : "<missing>";
-  if (result.error || result.status !== 0 || after !== newVersion) {
-    throw new Error(
-      [
-        `ShipIt exit=${result.status ?? "spawn-error"} target-before=${before} target-after=${after}`,
-        log,
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    );
-  }
-  return `ShipIt exit=0 target-before=${before} target-after=${after}`;
+  return classifyShipItOutcome({
+    spawnError: result.error,
+    status: result.status,
+    log,
+    before,
+    after,
+    newVersion,
+  });
 };
 
 export const loadBaseline = async (options, tempRoot) => {
@@ -422,13 +548,14 @@ export const runGate = async (options) => {
     const oldApp = findSingleApp(oldExtract);
     const newApp = findSingleApp(newExtract);
 
+    let oldSignatureDetails;
     await reporter.step("published baseline generic signature", async () => {
-      const details = assertApp({
+      oldSignatureDetails = assertApp({
         app: oldApp,
         arch: options.arch,
         version: baseline.manifest.version,
       });
-      return details
+      return oldSignatureDetails
         .split("\n")
         .filter((line) =>
           /^(Signature|TeamIdentifier|# designated|designated)/.test(line),
@@ -448,6 +575,12 @@ export const runGate = async (options) => {
         )
         .join("; ");
     });
+
+    await reporter.step(
+      "Squirrel designated requirement authorization",
+      async () =>
+        verifyCandidateAgainstOldRequirement(oldSignatureDetails, newApp),
+    );
 
     await reporter.step("Squirrel physical install", async () =>
       runShipItInstall({
