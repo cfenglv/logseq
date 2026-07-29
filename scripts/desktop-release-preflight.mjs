@@ -118,6 +118,7 @@ for (const relativePath of [
   "resources/entitlements.local-signed.plist",
   "resources/selfhost-updater-version.mjs",
   "resources/project-updater-signature.mjs",
+  "resources/packaged-resource-contract.mjs",
   "resources/updater/project-signing-policy.json",
   "resources/updater/legacy-macos/latest-arm64-mac.yml",
   "resources/updater/legacy-macos/latest-x64-mac.yml",
@@ -136,6 +137,7 @@ for (const relativePath of [
   "scripts/test-selfhost-macos-user-guidance.mjs",
   "scripts/test-macos-updater-signature-config.mjs",
   "scripts/test-selfhost-nightly-semver-contract.mjs",
+  "scripts/test-packaged-project-signature-runtime.mjs",
   "scripts/require-project-signing-policy.mjs",
   "scripts/verify-macos-updater-signature.mjs",
   "scripts/verify-desktop-release-assets.mjs",
@@ -157,7 +159,7 @@ if (
 }
 if (
   rootPackage.scripts?.["desktop:test-release-contracts"] !==
-  "node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs"
+  "node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
 ) {
   fail("package.json must expose the exact desktop release contract gate");
 }
@@ -304,6 +306,7 @@ for (const needle of ['"sidecar", "embedding_server.py"', '"static"', '"sidecar"
   assertContains(desktopRuntimePreparation, needle, "desktop sidecar staging");
 }
 const packagedDesktopVerifier = readText("resources/verify-packaged-desktop.mjs");
+const packagedResourceContract = readText("resources/packaged-resource-contract.mjs");
 for (const needle of [
   "embedding_server.py",
   "logseq-project-updater",
@@ -311,6 +314,17 @@ for (const needle of [
   "project-signing-policy.json",
 ]) {
   assertContains(packagedDesktopVerifier, needle, "packaged desktop verifier");
+}
+for (const needle of [
+  "project-updater-signature.mjs",
+  "assertRegularFile",
+  "does not match the staged release resource",
+]) {
+  assertContains(
+    packagedResourceContract,
+    needle,
+    "cross-platform packaged project signature runtime contract",
+  );
 }
 const fullDesktopPreflight = readText("scripts/run-desktop-release-preflight.mjs");
 for (const needle of [

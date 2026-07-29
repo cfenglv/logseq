@@ -120,6 +120,7 @@ jobs:
           node scripts/test-updater-install-entry-contract.mjs
           node scripts/test-selfhost-macos-user-guidance.mjs
           node scripts/test-macos-updater-signature-config.mjs
+          node scripts/test-packaged-project-signature-runtime.mjs
 
   release-rehearsal-gate:
     needs: [ source-preflight ]

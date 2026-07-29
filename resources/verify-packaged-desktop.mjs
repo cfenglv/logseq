@@ -6,6 +6,11 @@ import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  assertMatchesStagedResource,
+  assertRegularFile,
+  verifyProjectSignatureRuntime,
+} from "./packaged-resource-contract.mjs";
 
 const require = createRequire(import.meta.url);
 const asar = require("@electron/asar");
@@ -94,34 +99,17 @@ for (const filePath of [mainExecutable, keytar, appUpdateConfig]) {
   }
 }
 
-const assertRegularFile = (filePath, label) => {
-  let stats;
-  try {
-    stats = fs.lstatSync(filePath);
-  } catch {
-    throw new Error(`missing packaged ${label}: ${filePath}`);
-  }
-  if (stats.isSymbolicLink() || !stats.isFile()) {
-    throw new Error(`packaged ${label} is not a regular file: ${filePath}`);
-  }
-  return stats;
-};
-
-const assertMatchesStagedResource = (packagedPath, stagedPath, label) => {
-  assertRegularFile(packagedPath, label);
-  assertRegularFile(stagedPath, `staged ${label}`);
-  if (!fs.readFileSync(packagedPath).equals(fs.readFileSync(stagedPath))) {
-    throw new Error(
-      `packaged ${label} does not match the staged release resource: ${packagedPath}`,
-    );
-  }
-};
-
 assertMatchesStagedResource(
   embeddingServer,
   path.join(stagedResourcesDir, "sidecar", "embedding_server.py"),
   "embedding sidecar",
 );
+verifyProjectSignatureRuntime({
+  arch: expectedArch,
+  platform: expectedPlatform,
+  resourcesDir,
+  stagedResourcesDir,
+});
 
 const appUpdateText = fs.readFileSync(appUpdateConfig, "utf8");
 for (const [label, pattern] of [
@@ -198,13 +186,7 @@ if (expectedPlatform === "darwin") {
     );
   }
 
-  const projectSignatureRuntime = path.join(resourcesDir, "project-updater-signature.mjs");
   const projectSigningPolicy = path.join(resourcesDir, "updater", "project-signing-policy.json");
-  assertMatchesStagedResource(
-    projectSignatureRuntime,
-    path.join(stagedResourcesDir, "project-updater-signature.mjs"),
-    "project updater signature runtime",
-  );
   assertMatchesStagedResource(
     projectSigningPolicy,
     path.join(stagedResourcesDir, "updater", "project-signing-policy.json"),

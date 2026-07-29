@@ -168,6 +168,12 @@ const macosUpdaterBaseline = readJson(
 const packagedDesktopVerifier = readText(
   "resources/verify-packaged-desktop.mjs",
 );
+const packagedResourceContract = readText(
+  "resources/packaged-resource-contract.mjs",
+);
+const packagedProjectSignatureRuntimeTest = readText(
+  "scripts/test-packaged-project-signature-runtime.mjs",
+);
 const updaterProviderVerifier = readText(
   "resources/verify-updater-provider.mjs",
 );
@@ -553,10 +559,10 @@ for (const job of ["nightly-release", "release"]) {
     `${job} should publish only after the aggregate asset preflight`,
   );
 }
-assert.match(
-  desktopReleaseWorkflow,
-  /Verify packaged desktop/g,
-  "desktop release workflow should verify packaged applications",
+assert.equal(
+  desktopReleaseWorkflow.match(/- name: Verify packaged desktop/g)?.length,
+  6,
+  "desktop release workflow should verify all six packaged applications",
 );
 assert.match(
   desktopReleaseWorkflow,
@@ -871,6 +877,36 @@ for (const needle of [
     packagedDesktopVerifier,
     needle,
     "packaged desktop updater feed verification",
+  );
+}
+assert.ok(
+  packagedDesktopVerifier.indexOf("verifyProjectSignatureRuntime({") <
+    packagedDesktopVerifier.indexOf('if (expectedPlatform === "darwin")'),
+  "the packaged signature runtime gate must run before macOS-only helper and policy checks",
+);
+for (const needle of [
+  "assertRegularFile",
+  "does not match the staged release resource",
+  "project-updater-signature.mjs",
+]) {
+  assertContains(
+    packagedResourceContract,
+    needle,
+    "cross-platform packaged signature runtime contract",
+  );
+}
+for (const target of [
+  '["darwin", "x64"]',
+  '["darwin", "arm64"]',
+  '["win32", "x64"]',
+  '["win32", "arm64"]',
+  '["linux", "x64"]',
+  '["linux", "arm64"]',
+]) {
+  assertContains(
+    packagedProjectSignatureRuntimeTest,
+    target,
+    "packaged signature runtime six-target tests",
   );
 }
 assert.match(

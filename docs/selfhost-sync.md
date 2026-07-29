@@ -332,10 +332,12 @@ signature:
   clears or removes quarantine attributes.
 - The project Ed25519 signature authenticates `.6+` in-app updates, but does
   not make an unnotarized build trusted by Gatekeeper.
-- This repository exposes no local-certificate setup or local-signed build
-  command. Fork macOS packages remain purely ad-hoc signed; project tooling
-  does not import certificates, add trust roots, or alter the user Keychain
-  search list.
+- The updater and local pnpm/gulp/Electron build paths expose no
+  local-certificate setup or local-signed command. They remain purely ad-hoc
+  signed and do not import certificates, add trust roots, or alter the user
+  Keychain search list. The optional Developer ID workflow is separate: when
+  Apple signing secrets are configured, it may import the certificate only
+  into its ephemeral CI runner.
 - Denying Keychain access can make Safe Storage, login cookies, or tokens
   unavailable and is not recommended as a routine workaround.
 - Removing team-wide Gatekeeper warnings requires an Apple Developer ID
