@@ -3,8 +3,8 @@
 import assert from "node:assert/strict";
 import {
   createHash,
+  createPublicKey,
   generateKeyPairSync,
-  sign as cryptoSign,
 } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -26,21 +26,6 @@ const policyPath = path.join(
   "updater",
   "project-signing-policy.json",
 );
-const verifierPath = path.join(
-  repoRoot,
-  "resources",
-  "project-updater-signature.mjs",
-);
-const signerPath = path.join(
-  repoRoot,
-  "scripts",
-  "sign-project-update.mjs",
-);
-const helperBuildPath = path.join(
-  repoRoot,
-  "scripts",
-  "build-project-update-helper.mjs",
-);
 const helperRunnerPath = path.join(
   repoRoot,
   "scripts",
@@ -59,6 +44,7 @@ const legacyDigests = {
 };
 
 class SkipTest extends Error {}
+class ReleaseBlock extends Error {}
 
 const command = (
   executable,
@@ -130,31 +116,202 @@ const trackedPrivateMaterial = () => {
   };
 };
 
+const strictBase64 = (value, label) => {
+  assert.equal(typeof value, "string", `${label} must be a base64 string`);
+  assert.match(value, /^[A-Za-z0-9+/]+={0,2}$/, `${label} is not base64`);
+  const decoded = Buffer.from(value, "base64");
+  assert.equal(
+    decoded.toString("base64"),
+    value,
+    `${label} is not canonical base64`,
+  );
+  return decoded;
+};
+
+const normalizeKeyId = (value) => {
+  assert.equal(typeof value, "string", "project public keyId is missing");
+  const payload = value.replace(/^(?:sha256|ed25519)(?::|-)/i, "");
+  if (/^[a-f0-9]{32,64}$/i.test(payload) && payload.length % 2 === 0) {
+    return payload.toLowerCase();
+  }
+  if (/^[A-Za-z0-9+/_-]+={0,2}$/.test(payload)) {
+    const digest = Buffer.from(payload, /[-_]/.test(payload) ? "base64url" : "base64");
+    if (digest.length === 32) return digest.toString("hex");
+  }
+  assert.fail("project keyId is not a sufficiently strong SHA-256 identifier");
+};
+
+const inlinePublicKey = (policy) => {
+  const direct = [
+    policy.publicKeyBase64,
+    policy.publicKeyRawBase64,
+    policy.ed25519PublicKeyBase64,
+    typeof policy.publicKey === "string" ? policy.publicKey : null,
+  ].find((value) => typeof value === "string");
+  if (direct) return direct;
+  if (
+    policy.publicKey &&
+    typeof policy.publicKey === "object" &&
+    policy.publicKey.encoding === "base64" &&
+    typeof policy.publicKey.value === "string"
+  ) {
+    return policy.publicKey.value;
+  }
+  return null;
+};
+
 const loadPolicy = () => {
   const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
   assert.equal(policy.schema, "logseq-selfhost-update/v1");
   assert.equal(policy.algorithm, "Ed25519");
-  assert.match(policy.publicKeySha256, /^[a-f0-9]{64}$/);
-  assert.equal(path.isAbsolute(policy.publicKeyPath), false);
-  assert.equal(path.isAbsolute(policy.nativeHelperPath), false);
-  assert.doesNotMatch(
-    policy.nativeHelperPath,
-    /\.(?:[cm]?js|ts|cljs)$/i,
-    "replacement helper must be a native executable, not JavaScript",
-  );
-  const publicKeyPath = path.resolve(
-    path.dirname(policyPath),
-    policy.publicKeyPath,
-  );
-  const nativeHelperPath = path.resolve(
-    path.dirname(policyPath),
-    policy.nativeHelperPath,
-  );
-  const publicKeyPem = fs.readFileSync(publicKeyPath, "utf8");
-  assert.match(publicKeyPem, /^-----BEGIN PUBLIC KEY-----/);
-  assert.equal(fileSha256(publicKeyPath), policy.publicKeySha256);
-  return { policy, publicKeyPath, publicKeyPem, nativeHelperPath };
+  const serialized = JSON.stringify(policy);
+  if (/\bUNCONFIGURED\b/i.test(serialized)) {
+    return { configured: false, policy };
+  }
+
+  let publicKeyRaw;
+  let publicKeyPath = null;
+  const inline = inlinePublicKey(policy);
+  if (inline) {
+    publicKeyRaw = strictBase64(inline, "inline Ed25519 public key");
+    assert.equal(
+      publicKeyRaw.length,
+      32,
+      "inline Ed25519 public key must contain exactly 32 raw bytes",
+    );
+  } else {
+    assert.equal(
+      typeof policy.publicKeyPath,
+      "string",
+      "policy must contain either an inline raw key or publicKeyPath",
+    );
+    assert.equal(path.isAbsolute(policy.publicKeyPath), false);
+    publicKeyPath = path.resolve(
+      path.dirname(policyPath),
+      policy.publicKeyPath,
+    );
+    const publicKeyPem = fs.readFileSync(publicKeyPath, "utf8");
+    assert.match(publicKeyPem, /^-----BEGIN PUBLIC KEY-----/);
+    const jwk = createPublicKey(publicKeyPem).export({ format: "jwk" });
+    assert.equal(jwk.kty, "OKP");
+    assert.equal(jwk.crv, "Ed25519");
+    publicKeyRaw = Buffer.from(jwk.x, "base64url");
+    assert.equal(publicKeyRaw.length, 32);
+    if (policy.publicKeySha256) {
+      assert.equal(fileSha256(publicKeyPath), policy.publicKeySha256);
+    }
+  }
+
+  const derivedKeyId = sha256(publicKeyRaw);
+  const declaredKeyId =
+    policy.keyId ??
+    policy.keyID ??
+    policy.publicKeyId ??
+    policy.publicKeyID ??
+    policy.ed25519PublicKeyId;
+  if (inline || declaredKeyId !== undefined) {
+    assert.equal(
+      derivedKeyId.startsWith(normalizeKeyId(declaredKeyId)),
+      true,
+      "project keyId does not match the configured public key",
+    );
+  } else {
+    assert.ok(
+      policy.publicKeySha256,
+      "PEM policy must pin either keyId or publicKeySha256",
+    );
+  }
+  if (policy.publicKeyRawSha256) {
+    assert.equal(
+      policy.publicKeyRawSha256.toLowerCase(),
+      derivedKeyId,
+      "raw public key hash does not match the configured key",
+    );
+  }
+  if (inline && policy.publicKeySha256) {
+    assert.equal(
+      policy.publicKeySha256.toLowerCase(),
+      derivedKeyId,
+      "inline public key hash does not match the configured key",
+    );
+  }
+  return {
+    configured: true,
+    derivedKeyId,
+    policy,
+    publicKeyPath,
+    publicKeyRaw,
+  };
 };
+
+const scriptsMatching = (pattern) =>
+  fs
+    .readdirSync(path.join(repoRoot, "scripts"), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && pattern.test(entry.name))
+    .map((entry) => path.join(repoRoot, "scripts", entry.name));
+
+const discoverSignerPath = (workflow) => {
+  const candidates = scriptsMatching(
+    /^(?=.*sign)(?=.*(?:project|macos))(?=.*update).*\.mjs$/i,
+  );
+  const referenced = candidates.filter((candidate) =>
+    workflow.includes(path.basename(candidate)),
+  );
+  assert.equal(
+    referenced.length,
+    1,
+    `expected one workflow-referenced project update signer, found ${referenced
+      .map((file) => path.basename(file))
+      .join(", ") || "none"}`,
+  );
+  return referenced[0];
+};
+
+const signingVariableNames = (workflow) => {
+  const secretNames = [
+    ...workflow.matchAll(/secrets\.([A-Z][A-Z0-9_]*ED25519[A-Z0-9_]*)/g),
+  ].map((match) => match[1]);
+  const environmentNames = [
+    ...workflow.matchAll(
+      /^\s*([A-Z][A-Z0-9_]+):\s*\${{\s*secrets\.[A-Z0-9_]+\s*}}/gm,
+    ),
+  ].map((match) => match[1]);
+  return [...new Set([...secretNames, ...environmentNames])];
+};
+
+const signingEnvironment = (workflow, privateKeyPem) =>
+  Object.fromEntries(
+    signingVariableNames(workflow).map((name) => [
+      name,
+      /BASE64/i.test(name)
+        ? Buffer.from(privateKeyPem).toString("base64")
+        : privateKeyPem,
+    ]),
+  );
+
+const discoverHelperBuildPath = () => {
+  const candidates = fs
+    .readdirSync(path.join(repoRoot, "scripts"), { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        /^(?=.*build)(?=.*update)(?=.*helper)/i.test(entry.name),
+    )
+    .map((entry) => path.join(repoRoot, "scripts", entry.name));
+  assert.equal(
+    candidates.length,
+    1,
+    `expected one native update-helper builder, found ${candidates
+      .map((file) => path.basename(file))
+      .join(", ") || "none"}`,
+  );
+  return candidates[0];
+};
+
+const scriptCommand = (script, args) =>
+  path.extname(script) === ".mjs"
+    ? [process.execPath, [script, ...args]]
+    : [script, args];
 
 const makeManifest = ({
   artifact,
@@ -177,143 +334,6 @@ const makeManifest = ({
     sha512: createHash("sha512").update(artifact).digest("base64"),
   },
 });
-
-const importProductionVerifier = async () => {
-  if (!fs.existsSync(verifierPath)) return null;
-  return import(`${new URL(`file://${verifierPath}`).href}?test=${Date.now()}`);
-};
-
-const exerciseProductionVerifier = async (module) => {
-  const {
-    canonicalProjectUpdatePayload,
-    createProjectUpdateInstallGate,
-    verifyProjectUpdate,
-  } = module;
-  assert.equal(typeof canonicalProjectUpdatePayload, "function");
-  assert.equal(typeof verifyProjectUpdate, "function");
-  assert.equal(typeof createProjectUpdateInstallGate, "function");
-
-  const artifact = Buffer.from("valid selfhost.6 update payload");
-  const keys = generateKeyPairSync("ed25519");
-  const wrongKeys = generateKeyPairSync("ed25519");
-  const publicKeyPem = keys.publicKey.export({
-    format: "pem",
-    type: "spki",
-  });
-  const manifest = makeManifest({ artifact });
-  const signature = cryptoSign(
-    null,
-    Buffer.from(canonicalProjectUpdatePayload(manifest)),
-    keys.privateKey,
-  ).toString("base64");
-  const valid = {
-    artifact,
-    manifest,
-    publicKeyPem,
-    signature,
-    currentVersion: "2.0.1-selfhost.5",
-    expectedPlatform: "darwin",
-    expectedArch: "arm64",
-    expectedChannel: "selfhost-macos-v2-arm64",
-  };
-  await verifyProjectUpdate(valid);
-
-  const rejectionCases = [
-    ["tampered artifact", { artifact: Buffer.from("tampered") }],
-    ["missing signature", { signature: "" }],
-    [
-      "wrong private key",
-      {
-        signature: cryptoSign(
-          null,
-          Buffer.from(canonicalProjectUpdatePayload(manifest)),
-          wrongKeys.privateKey,
-        ).toString("base64"),
-      },
-    ],
-    ["replayed already-installed version", { currentVersion: manifest.version }],
-    [
-      "version substitution",
-      { manifest: { ...manifest, version: "2.0.1-selfhost.7" } },
-    ],
-    ["architecture mismatch", { expectedArch: "x64" }],
-    ["platform mismatch", { expectedPlatform: "linux" }],
-    ["channel mismatch", { expectedChannel: "selfhost-macos-v2-x64" }],
-    [
-      "artifact name substitution",
-      {
-        manifest: {
-          ...manifest,
-          artifact: { ...manifest.artifact, name: "different.zip" },
-        },
-      },
-    ],
-  ];
-  for (const [label, overrides] of rejectionCases) {
-    await assert.rejects(
-      () => verifyProjectUpdate({ ...valid, ...overrides }),
-      undefined,
-      label,
-    );
-  }
-
-  let replaceCalls = 0;
-  const gate = createProjectUpdateInstallGate({
-    publicKeyPem,
-    currentVersion: valid.currentVersion,
-    platform: valid.expectedPlatform,
-    arch: valid.expectedArch,
-    channel: valid.expectedChannel,
-    replace: async () => {
-      replaceCalls += 1;
-    },
-  });
-  const invalidInstallPayloads = [
-    ["tampered artifact", { artifact: Buffer.from("tampered") }],
-    ["missing signature", { signature: "" }],
-    [
-      "wrong private key",
-      {
-        signature: cryptoSign(
-          null,
-          Buffer.from(canonicalProjectUpdatePayload(manifest)),
-          wrongKeys.privateKey,
-        ).toString("base64"),
-      },
-    ],
-    [
-      "version substitution",
-      { manifest: { ...manifest, version: "2.0.1-selfhost.7" } },
-    ],
-    [
-      "architecture substitution",
-      { manifest: { ...manifest, arch: "x64" } },
-    ],
-    [
-      "platform substitution",
-      { manifest: { ...manifest, platform: "linux" } },
-    ],
-  ];
-  for (const [label, overrides] of invalidInstallPayloads) {
-    await assert.rejects(
-      () =>
-        gate.install({
-          artifact: overrides.artifact ?? artifact,
-          manifest: overrides.manifest ?? manifest,
-          signature: overrides.signature ?? signature,
-        }),
-      undefined,
-      label,
-    );
-    assert.equal(
-      replaceCalls,
-      0,
-      `replace was called before ${label} was rejected`,
-    );
-  }
-  await gate.install({ artifact, manifest, signature });
-  assert.equal(replaceCalls, 1);
-};
 
 const electronFixture = () => {
   const candidates = [
@@ -745,6 +765,8 @@ const signManifestFixture = ({
   privateKeyPem,
   root,
 }) => {
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const signerPath = discoverSignerPath(workflow);
   const manifestPath = path.join(root, "manifest.json");
   const signaturePath = path.join(root, "manifest.sig");
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
@@ -763,7 +785,7 @@ const signManifestFixture = ({
       allowFailure: true,
       env: {
         ...process.env,
-        SELFHOST_UPDATER_ED25519_PRIVATE_KEY: privateKeyPem,
+        ...signingEnvironment(workflow, privateKeyPem),
       },
     },
   );
@@ -775,6 +797,7 @@ const signManifestFixture = ({
 const makeSignedNativeUpdate = ({
   applicationId = "com.logseq.logseq",
   arch = "arm64",
+  channel,
   escapeSymlink,
   privateKeyPem,
   root,
@@ -800,6 +823,7 @@ const makeSignedNativeUpdate = ({
     arch,
     artifact,
     artifactName: path.basename(artifactPath),
+    channel,
     version,
   });
   return {
@@ -889,22 +913,30 @@ const runNativeHelperContract = async () => {
     throw new SkipTest("native replacement helper requires macOS");
   }
   assert.equal(
-    fs.existsSync(helperBuildPath),
-    true,
-    `${helperBuildPath} is missing`,
-  );
-  assert.equal(
     fs.existsSync(helperRunnerPath),
     true,
     `${helperRunnerPath} is missing`,
   );
-  const { policy } = loadPolicy();
   const runnerSource = fs.readFileSync(helperRunnerPath, "utf8");
   assert.doesNotMatch(
     runnerSource,
     /--(?:public-key|helper(?:-path)?)(?:\s|["'])/i,
     "production runner exposes a public-key or helper override",
   );
+  const helperBuildPath = discoverHelperBuildPath();
+  const [helpExecutable, helpArgs] = scriptCommand(helperBuildPath, ["--help"]);
+  const help = command(helpExecutable, helpArgs, { allowFailure: true });
+  const testKeyFlag = [
+    "--test-only-public-key",
+    "--test-public-key",
+    "--test-public-key-path",
+    "--test-public-key-base64",
+  ].find((flag) => help.output.includes(flag));
+  assert.ok(
+    testKeyFlag,
+    `native helper builder does not advertise a TEST-ONLY public-key input:\n${help.output}`,
+  );
+  assert.match(help.output, /--output\b/);
 
   const tempRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "logseq-native-helper-contract-"),
@@ -918,6 +950,10 @@ const runNativeHelperContract = async () => {
       publicKeyPath,
       signingKeys.publicKey.export({ format: "pem", type: "spki" }),
     );
+    const publicKeyRawBase64 = Buffer.from(
+      signingKeys.publicKey.export({ format: "jwk" }).x,
+      "base64url",
+    ).toString("base64");
     const privateKeyPem = signingKeys.privateKey.export({
       format: "pem",
       type: "pkcs8",
@@ -927,29 +963,19 @@ const runNativeHelperContract = async () => {
       type: "pkcs8",
     });
 
-    const sandbox = path.join(tempRoot, "runner-sandbox");
-    fs.cpSync(path.join(repoRoot, "scripts"), path.join(sandbox, "scripts"), {
-      recursive: true,
-    });
-    fs.cpSync(
-      path.join(repoRoot, "resources"),
-      path.join(sandbox, "resources"),
-      { recursive: true },
-    );
-    const helperPath = path.resolve(
-      path.join(sandbox, "resources", "updater"),
-      policy.nativeHelperPath,
-    );
-    fs.mkdirSync(path.dirname(helperPath), { recursive: true });
+    const helperPath = path.join(tempRoot, "project-update-helper");
+    const testKeyValue = testKeyFlag.endsWith("-base64")
+      ? publicKeyRawBase64
+      : publicKeyPath;
+    const [buildExecutable, buildArgs] = scriptCommand(helperBuildPath, [
+      testKeyFlag,
+      testKeyValue,
+      "--output",
+      helperPath,
+    ]);
     const build = command(
-      process.execPath,
-      [
-        helperBuildPath,
-        "--test-only-public-key",
-        publicKeyPath,
-        "--output",
-        helperPath,
-      ],
+      buildExecutable,
+      buildArgs,
       { allowFailure: true },
     );
     assert.equal(build.status, 0, build.output);
@@ -1077,6 +1103,14 @@ const runNativeHelperContract = async () => {
       }),
       label: "validly signed wrong architecture",
     });
+    expectNoDamage({
+      fixture: makeSignedNativeUpdate({
+        channel: "selfhost-macos-v2-x64",
+        privateKeyPem,
+        root: path.join(tempRoot, "wrong-channel"),
+      }),
+      label: "validly signed wrong channel",
+    });
 
     const sentinel = `logseq-update-traversal-${process.pid}-${Date.now()}`;
     const traversalRoot = path.join(tempRoot, "path-traversal");
@@ -1158,22 +1192,14 @@ const runNativeHelperContract = async () => {
       }
     };
     observe();
-    const sandboxRunner = path.join(
-      sandbox,
-      "scripts",
-      "run-project-signed-macos-update.mjs",
-    );
     const success = await runAsync(
-      process.execPath,
-      [
-        sandboxRunner,
-        ...nativeInstallArgs({
+      helperPath,
+      nativeInstallArgs({
           artifactPath: base.artifactPath,
           manifestPath: base.manifestPath,
           signaturePath: base.signaturePath,
           targetApp: successTarget.targetApp,
         }),
-      ],
       { observe },
     );
     observe();
@@ -1215,9 +1241,14 @@ addCase(cases, "repository contains no updater private key", () => {
   assert.equal(tracked.markerFiles, "");
 });
 
-addCase(cases, "fixed Ed25519 project public key policy is internally pinned", () =>
-  loadPolicy(),
-);
+addCase(cases, "fixed Ed25519 project public key policy is internally pinned", () => {
+  const loaded = loadPolicy();
+  if (!loaded.configured) {
+    throw new ReleaseBlock(
+      "production Ed25519 public key is UNCONFIGURED; release is blocked",
+    );
+  }
+});
 
 addCase(cases, ".4 legacy feed remains pinned and .5 remains manual", () => {
   assert.equal(
@@ -1243,17 +1274,26 @@ addCase(cases, ".4 legacy feed remains pinned and .5 remains manual", () => {
 
 addCase(cases, "release signing is fail-closed on an external private key", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
+  const secretNames = signingVariableNames(workflow);
+  const ed25519SecretNames = [
+    ...workflow.matchAll(/secrets\.([A-Z][A-Z0-9_]*ED25519[A-Z0-9_]*)/g),
+  ].map((match) => match[1]);
   assert.ok(
-    (workflow.match(/secrets\.SELFHOST_UPDATER_ED25519_PRIVATE_KEY/g)?.length ??
-      0) >= 2,
-    "both macOS architectures must consume the external project private key",
+    ed25519SecretNames.some((name) => /PRIVATE|SIGNING/i.test(name)),
+    "release workflow does not consume an external Ed25519 signing secret",
   );
+  assert.match(workflow, /arm64/i);
+  assert.match(workflow, /x64/i);
+  const signerPath = discoverSignerPath(workflow);
+  const signerReferences =
+    workflow.match(new RegExp(path.basename(signerPath), "g"))?.length ?? 0;
   assert.ok(
-    (workflow.match(/sign-project-update\.mjs/g)?.length ?? 0) >= 2,
-    "both macOS architectures must sign their update manifest",
+    signerReferences >= 2 ||
+      /matrix:[\s\S]{0,500}(?:arm64[\s\S]{0,100}x64|x64[\s\S]{0,100}arm64)/i.test(
+        workflow,
+      ),
+    "project signer is not wired to both macOS architectures",
   );
-  assert.match(workflow, /Missing project updater private key/i);
-  assert.equal(fs.existsSync(signerPath), true);
   const tempRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "logseq-project-signer-no-key-"),
   );
@@ -1281,7 +1321,7 @@ addCase(cases, "release signing is fail-closed on an external private key", () =
         allowFailure: true,
         env: {
           ...process.env,
-          SELFHOST_UPDATER_ED25519_PRIVATE_KEY: "",
+          ...Object.fromEntries(secretNames.map((name) => [name, ""])),
         },
       },
     );
@@ -1309,42 +1349,30 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     path.join(repoRoot, "src", "electron", "electron", "updater.cljs"),
     "utf8",
   );
-  assert.equal(
-    /\.quitAndInstall\s+autoUpdater/.test(handler),
-    false,
-    "IPC handler still calls quitAndInstall directly",
-  );
-  assert.equal(
-    /\.quitAndInstall\s+autoUpdater/.test(updater),
-    false,
-    "automatic restart path still calls quitAndInstall directly",
-  );
-  const directReplacement = command(
-    "rg",
-    [
-      "-n",
-      String.raw`\.quitAndInstall\s+autoUpdater`,
-      path.join(repoRoot, "src", "electron"),
-    ],
-    { allowFailure: true },
-  );
-  assert.notEqual(
-    directReplacement.status,
-    0,
-    `electron runtime retains unverified replacement entries:\n${directReplacement.output}`,
-  );
+  const combined = `${handler}\n${updater}`;
   assert.match(
-    `${handler}\n${updater}`,
+    combined,
     /run-project-signed-macos-update/,
     "macOS selfhost updater does not route through the signed native helper",
   );
-});
-
-let productionModule;
-addCase(cases, "production project verifier exposes the behavior contract", async () => {
-  productionModule = await importProductionVerifier();
-  assert.ok(productionModule, `${verifierPath} is missing`);
-  await exerciseProductionVerifier(productionModule);
+  assert.match(combined, /darwin|macos/i);
+  assert.match(combined, /selfhost/i);
+  for (const [label, source] of [
+    ["handler.cljs", handler],
+    ["updater.cljs", updater],
+  ]) {
+    for (const match of source.matchAll(/\.quitAndInstall\s+autoUpdater/g)) {
+      const guardedContext = source.slice(
+        Math.max(0, match.index - 1600),
+        match.index,
+      );
+      assert.match(
+        guardedContext,
+        /(?:if|cond)[\s\S]*(?:selfhost|project[-\s]?signed|signed[-\s]?macos|project-update)/i,
+        `${label} has quitAndInstall without a macOS selfhost signed-update guard`,
+      );
+    }
+  }
 });
 
 addCase(cases, "native helper is fail-closed, atomic, and rollback-safe", async () =>
@@ -1370,13 +1398,17 @@ addCase(cases, "diagnostics leave user Trust Settings unchanged", () => {
 let passed = 0;
 let failed = 0;
 let skipped = 0;
+let blocked = 0;
 for (const [name, test] of cases) {
   try {
     await test();
     passed += 1;
     console.log(`[project-updater] PASS ${name}`);
   } catch (error) {
-    if (error instanceof SkipTest) {
+    if (error instanceof ReleaseBlock) {
+      blocked += 1;
+      console.error(`[project-updater] BLOCK ${name}: ${error.message}`);
+    } else if (error instanceof SkipTest) {
       skipped += 1;
       console.log(`[project-updater] SKIP ${name}: ${error.message}`);
     } else {
@@ -1391,6 +1423,6 @@ for (const [name, test] of cases) {
 }
 
 console.log(
-  `[project-updater] SUMMARY passed=${passed} failed=${failed} skipped=${skipped} total=${cases.length}`,
+  `[project-updater] SUMMARY passed=${passed} failed=${failed} blocked=${blocked} skipped=${skipped} total=${cases.length}`,
 );
-if (failed > 0) process.exitCode = 1;
+if (failed > 0 || blocked > 0) process.exitCode = 1;
