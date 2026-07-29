@@ -4,10 +4,31 @@ const { EventEmitter } = require("node:events");
 const Module = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
+const vm = require("node:vm");
+
+const originalRunInThisContext = vm.runInThisContext;
+const mainContextDefaultLoader =
+  vm.constants?.USE_MAIN_CONTEXT_DEFAULT_LOADER;
+if (!mainContextDefaultLoader) {
+  throw new Error(
+    "Electron test preload requires vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER",
+  );
+}
+vm.runInThisContext = function runInThisContextWithDynamicImport(
+  code,
+  options,
+) {
+  const normalizedOptions =
+    typeof options === "string" ? { filename: options } : { ...options };
+  return originalRunInThisContext.call(vm, code, {
+    ...normalizedOptions,
+    importModuleDynamically: mainContextDefaultLoader,
+  });
+};
 
 Object.defineProperty(process, "resourcesPath", {
   configurable: true,
-  value: path.resolve(__dirname, "..", "..", "static"),
+  value: path.resolve(__dirname, "..", "..", "resources"),
 });
 
 // Seed the test build's version seam before the compiled CLJS bundle loads so

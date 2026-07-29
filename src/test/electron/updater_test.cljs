@@ -5,6 +5,7 @@
             [clojure.string :as string]
             [cljs.test :refer [async deftest is testing]]
             [electron.updater :as updater]
+            [frontend.test.electron-logger-stub :as logger-stub]
             [goog.object :as gobj]
             [promesa.core :as p]))
 
@@ -229,7 +230,11 @@
                        stable-next
                        stable-asset
                        "999.0.0")]
-      (-> (p/let [good (run-app-updater-flow!
+      (logger-stub/reset-calls!)
+      (is (= stable-current updater/electron-version)
+          "stable test process must load production policy with the stable version")
+      (-> (p/let [raw-good (stable-policy stable-good)
+                  good (run-app-updater-flow!
                         stable-current stable-good stable-policy)
                   wrong-tag (run-app-updater-flow!
                              stable-current stable-wrong-tag stable-policy)
@@ -247,6 +252,9 @@
                   unsupported-system
                   (run-app-updater-flow!
                    stable-current stable-minimum-system stable-policy)]
+            (is (true? raw-good)
+                (str "production-installed stable support policy accepts the valid fixture directly; logs="
+                     (pr-str (logger-stub/calls))))
             (is (= {:available? true :downloads 1} good)
                 "production stable policy accepts a valid later stable")
             (doseq [[label result]
@@ -304,6 +312,9 @@
                (str (or (some-> feed-calls last (aget "url"))
                         (some-> feed-calls last)
                         "")))]
+          (logger-stub/reset-calls!)
+          (is (= nightly-current updater/electron-version)
+              "nightly subprocess must load production policy with the nightly version")
           (is (= 1 (count feed-calls))
               "nightly production path configures exactly one Generic feed")
           (is (string/includes? feed-text "nightly")
@@ -312,7 +323,10 @@
               "nightly production path never points at stable latest")
           (is (true? (.-allowPrerelease (:auto-updater nightly-config)))
               "nightly production path enables prerelease metadata")
-          (-> (p/let [rolling-tag
+          (-> (p/let [raw-rolling
+                      (nightly-policy
+                       (update-info nightly-next "nightly" nightly-asset))
+                      rolling-tag
                       (run-app-updater-flow!
                        nightly-current
                        (update-info nightly-next "nightly" nightly-asset)
@@ -337,6 +351,9 @@
                        nightly-current
                        (update-info stable-next stable-next stable-asset)
                        nightly-policy)]
+                (is (true? raw-rolling)
+                    (str "production-installed nightly support policy accepts the valid fixture directly; logs="
+                         (pr-str (logger-stub/calls))))
                 (doseq [[label result]
                         [["rolling tag" rolling-tag]
                          ["absent tag" absent-tag]

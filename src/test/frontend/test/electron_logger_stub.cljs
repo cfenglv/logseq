@@ -1,13 +1,31 @@
 (ns frontend.test.electron-logger-stub)
 
+(defonce *calls (atom []))
+
+(defn reset-calls!
+  []
+  (reset! *calls []))
+
+(defn calls
+  []
+  @*calls)
+
+(defn- record!
+  [level args]
+  (swap! *calls conj [level args]))
+
 (defn debug
-  [& _args])
+  [& args]
+  (record! :debug args))
 
 (defn info
-  [& _args])
+  [& args]
+  (record! :info args))
 
 (defn warn
-  [& _args])
+  [& args]
+  (record! :warn args))
 
 (defn error
-  [& _args])
+  [& args]
+  (record! :error args))
