@@ -28,10 +28,13 @@ const assertMacosGuidance = (label, source) => {
     /2\.0\.1-selfhost\.5[\s\S]{0,360}(?:2\.0\.1-selfhost\.6|\.6\+|later|subsequent|future|后续|以后)/i.test(
       text,
     ) &&
-      /(?:in[- ]app|inside the app|application UI|应用内)[\s\S]{0,180}(?:automatic(?:ally)?\s+install|install(?:ed|ation)?\s+automatically|默认自动安装|自动安装)|(?:automatic(?:ally)?\s+install|install(?:ed|ation)?\s+automatically|默认自动安装|自动安装)[\s\S]{0,180}(?:in[- ]app|inside the app|application UI|应用内)/i.test(
+      /(?:automatic(?:ally)?|默认|自动)[\s\S]{0,180}(?:check|检查)[\s\S]{0,180}(?:download|下载)|(?:check|检查)[\s\S]{0,180}(?:download|下载)[\s\S]{0,180}(?:automatic(?:ally)?|默认|自动)/i.test(
+        text,
+      ) &&
+      /(?:click|select|choose|点击|选择)[\s\S]{0,100}(?:Restart and install|重启并安装)|(?:Restart and install|重启并安装)[\s\S]{0,100}(?:click|select|choose|点击|选择)/i.test(
         text,
       ),
-    `${label} must say that .5 -> .6+ defaults to in-application automatic installation`,
+    `${label} must say that .5 -> .6+ checks/downloads automatically and the user clicks Restart and install`,
   );
   check(
     /(?:each|every|每个|每次)[\s\S]{0,120}(?:new|subsequent|新|后续)[\s\S]{0,120}ad[ -]?hoc|ad[ -]?hoc[\s\S]{0,120}(?:each|every|每个|每次)[\s\S]{0,120}(?:new|subsequent|新|后续)/i.test(
@@ -39,13 +42,16 @@ const assertMacosGuidance = (label, source) => {
     ) &&
       /(?:first launch|first open|首次启动|首次打开)/i.test(text) &&
       /Open Anyway/i.test(text) &&
+      /(?:macOS|Mac)[\s\S]{0,220}Open Anyway|Open Anyway[\s\S]{0,220}(?:macOS|Mac)/i.test(
+        text,
+      ) &&
       /(?:may|might|can|可能|也许)[\s\S]{0,160}Open Anyway|Open Anyway[\s\S]{0,160}(?:may|might|can|可能|也许)/i.test(
         text,
       ),
     `${label} must warn that every new ad-hoc version may need Open Anyway on first launch`,
   );
   check(
-    /(?:does not|will not|never|不(?:会|要)?)[\s\S]{0,100}(?:change|modify|write|add|alter|更改|修改)[\s\S]{0,100}Trust Settings|Trust Settings[\s\S]{0,100}(?:remain|unchanged|不变)/i.test(
+    /(?:does not|will not|never|不(?:会|要)?)[\s\S]{0,100}(?:change|modify|write|add|alter|touch|更改|修改|写入)[\s\S]{0,100}Trust Settings|Trust Settings[\s\S]{0,100}(?:remain|unchanged|untouched|不变)/i.test(
       text,
     ),
     `${label} must state that the updater does not change Trust Settings`,
@@ -70,6 +76,40 @@ const assertMacosGuidance = (label, source) => {
         sentence,
       ),
       `${label} must not promise that Open Anyway is needed only once or only for .5: ${sentence.trim()}`,
+    );
+  }
+
+  check(
+    !/\bxattr\b[\s\S]{0,100}com\.apple\.quarantine|com\.apple\.quarantine[\s\S]{0,100}\bxattr\b/i.test(
+      source,
+    ),
+    `${label} must not instruct users to remove quarantine with xattr`,
+  );
+  const certificateSentences = source
+    .split(/(?<=[.!?。！？])\s+|\n+/)
+    .filter(
+      (sentence) =>
+        /certificate|证书/i.test(sentence) &&
+        /import|install|add|trust|导入|安装|添加|信任/i.test(sentence),
+    );
+  for (const sentence of certificateSentences) {
+    check(
+      /(?:does not|will not|never|no need|do not|must not|不(?:会|要|需要)?)/i.test(
+        sentence,
+      ) &&
+        !/security\s+add-trusted-cert/i.test(sentence),
+      `${label} must not direct users to import or trust a certificate: ${sentence.trim()}`,
+    );
+  }
+  const trustSettingsSentences = source
+    .split(/(?<=[.!?。！？])\s+|\n+/)
+    .filter((sentence) => /Trust Settings/i.test(sentence));
+  for (const sentence of trustSettingsSentences) {
+    check(
+      /(?:does not|will not|never|no need|do not|不(?:会|要|需要)?)/i.test(
+        sentence,
+      ),
+      `${label} must not direct users to modify Trust Settings: ${sentence.trim()}`,
     );
   }
 };
@@ -99,6 +139,6 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    "[selfhost-macos-guidance] PASS migration, automatic install, recurring Gatekeeper, Trust Settings, and quarantine guidance",
+    "[selfhost-macos-guidance] PASS migration, automatic check/download, user restart install, recurring Gatekeeper, Trust Settings, certificate, and quarantine guidance",
   );
 }

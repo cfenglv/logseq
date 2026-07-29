@@ -583,32 +583,94 @@ test("darwin verifier rejects missing project update runtime", () =>
     },
   ));
 
-test("full local preflight builds a test-only host helper and guarantees cleanup", () => {
+test("full local preflight invokes the explicit macOS test-helper gate", () => {
   const source = fs.readFileSync(preflightPath, "utf8");
   assert.match(
     source,
-    /build[\w./-]*update[\w./-]*helper/i,
-    "full preflight never invokes the native helper builder",
-  );
-  assert.match(
-    source,
-    /--test-only\b/,
-    "full preflight does not explicitly request a test-only helper",
-  );
-  assert.match(
-    source,
-    /--public-key-base64\b|--test-only-public-key\b|--test-public-key(?:-path|-base64)?\b/,
-    "full preflight does not provide an isolated test public key",
+    /project-update:test-helper/,
+    "full preflight never invokes the explicit native test-helper target",
   );
   assert.match(
     source,
     /process\.arch/,
     "full preflight does not build the helper for the host architecture",
   );
+});
+
+test("formal preflight and CI execute updater source, native, and provider contracts", () => {
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const sourcePreflight = workflowJob(workflow, "source-preflight");
+  for (const script of [
+    "test-desktop-sidecar-release-contract.mjs",
+    "test-updater-install-entry-contract.mjs",
+    "test-selfhost-macos-user-guidance.mjs",
+  ]) {
+    assert.match(
+      sourcePreflight,
+      new RegExp(script.replaceAll(".", "\\.")),
+      `source-preflight does not execute ${script}`,
+    );
+  }
+
+  for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
+    const job = workflowJob(workflow, jobName);
+    assert.match(
+      job,
+      /project-update:test-helper/,
+      `${jobName} does not build the explicit test-only native helper`,
+    );
+    assert.match(
+      job,
+      /test:project-signed-macos-updater/,
+      `${jobName} does not execute the native project-signed updater E2E`,
+    );
+    assert.match(
+      job,
+      /test-selfhost-macos-updater-release-contract\.mjs/,
+      `${jobName} does not execute the real electron-updater provider contract`,
+    );
+    assert.match(
+      job,
+      /LOGSEQ_UPDATER_TEST_PACKAGE_ROOT:[^\n]*static/,
+      `${jobName} provider contract does not use the downloaded static dependencies`,
+    );
+  }
+
+  const packageJson = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"),
+  );
+  assert.equal(
+    typeof packageJson.scripts?.["project-update:test-helper"],
+    "string",
+    "package.json does not expose the explicit native updater test-helper target",
+  );
   assert.match(
-    source,
-    /finally\s*\{[\s\S]{0,1800}(?:rmSync|unlinkSync)/,
-    "full preflight does not guarantee helper cleanup after failures",
+    packageJson.scripts?.["test:selfhost-updater-source-contracts"] ?? "",
+    /test-desktop-sidecar-release-contract\.mjs[\s\S]*test-updater-install-entry-contract\.mjs[\s\S]*test-selfhost-macos-user-guidance\.mjs/,
+    "package.json does not expose the complete updater source-contract gate",
+  );
+  assert.match(
+    packageJson.scripts?.["test:selfhost-updater-provider-contract"] ?? "",
+    /test-selfhost-macos-updater-release-contract\.mjs/,
+    "package.json does not expose the real updater provider contract",
+  );
+
+  const fullPreflight = fs.readFileSync(preflightPath, "utf8");
+  for (const commandName of [
+    "test:selfhost-updater-source-contracts",
+    "test:selfhost-updater-provider-contract",
+    "test:project-signed-macos-updater",
+  ]) {
+    assert.match(
+      fullPreflight,
+      new RegExp(commandName.replaceAll(":", "\\:")),
+      `full desktop preflight does not execute ${commandName}`,
+    );
+  }
+  assert.match(
+    fullPreflight,
+    /process\.platform === "darwin"[\s\S]{0,300}project-update:test-helper/,
+    "full desktop preflight does not require the native test helper on macOS",
   );
 });
 

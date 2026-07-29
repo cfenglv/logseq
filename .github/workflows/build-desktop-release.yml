@@ -122,6 +122,12 @@ jobs:
           node scripts/test-macos-updater-signature-config.mjs
           node scripts/test-packaged-project-signature-runtime.mjs
 
+      - name: Test self-host updater source contracts
+        run: |
+          node scripts/test-desktop-sidecar-release-contract.mjs
+          node scripts/test-updater-install-entry-contract.mjs
+          node scripts/test-selfhost-macos-user-guidance.mjs
+
   release-rehearsal-gate:
     needs: [ source-preflight ]
     runs-on: ubuntu-22.04
@@ -819,6 +825,14 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
+      - name: Run project-signed updater native and provider contracts
+        run: |
+          pnpm --dir release-gate-source project-update:test-helper
+          pnpm --dir release-gate-source test:project-signed-macos-updater
+          node release-gate-source/scripts/test-selfhost-macos-updater-release-contract.mjs
+        env:
+          LOGSEQ_UPDATER_TEST_PACKAGE_ROOT: ${{ github.workspace }}/static
+
       - name: Verify packaged desktop
         run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch x64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
@@ -963,6 +977,14 @@ jobs:
       - name: Verify arm64 updater provider contract
         run: pnpm electron:verify-updater-provider
         working-directory: ./static
+
+      - name: Run project-signed updater native and provider contracts
+        run: |
+          pnpm --dir release-gate-source project-update:test-helper
+          pnpm --dir release-gate-source test:project-signed-macos-updater
+          node release-gate-source/scripts/test-selfhost-macos-updater-release-contract.mjs
+        env:
+          LOGSEQ_UPDATER_TEST_PACKAGE_ROOT: ${{ github.workspace }}/static
 
       - name: Build/Release Electron App for arm64
         run: |

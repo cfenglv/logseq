@@ -1548,9 +1548,17 @@ const runNativeHelperContract = async () => {
       signerSecrets.length > 0,
       "workflow does not expose the release signer private-key environment",
     );
-    const privateKeyPkcs8Base64 = signingKeys.privateKey
-      .export({ format: "der", type: "pkcs8" })
-      .toString("base64");
+    const privateKeyPkcs8Der = signingKeys.privateKey.export({
+      format: "der",
+      type: "pkcs8",
+    });
+    assert.equal(Buffer.isBuffer(privateKeyPkcs8Der), true);
+    assert.doesNotMatch(
+      privateKeyPkcs8Der.toString("utf8"),
+      /-----BEGIN PRIVATE KEY-----/,
+      "release signer fixture encoded PEM text instead of PKCS#8 DER bytes",
+    );
+    const privateKeyPkcs8Base64 = privateKeyPkcs8Der.toString("base64");
     const signerEnv = {
       ...process.env,
       ...Object.fromEntries(
@@ -1649,7 +1657,7 @@ const runNativeHelperContract = async () => {
         `${label} signature does not cover the exact canonical payload`,
       );
       const stableAlias = fixture.version.replace(
-        /-alpha\.nightly\.\d{8}$/,
+        /\.nightly\.\d{8}$/,
         "",
       );
       if (stableAlias !== fixture.version) {
@@ -1810,9 +1818,9 @@ const runNativeHelperContract = async () => {
     };
 
     const nightlyEarly =
-      "2.0.1-selfhost.6-alpha.nightly.20260728";
+      "2.0.1-selfhost.6.nightly.20260728";
     const nightlyLate =
-      "2.0.1-selfhost.6-alpha.nightly.20260729";
+      "2.0.1-selfhost.6.nightly.20260729";
     const releaseSignedNightly = signWithReleaseCli(
       makeFixture({
         root: path.join(tempRoot, "release-signed-nightly"),
@@ -1829,13 +1837,13 @@ const runNativeHelperContract = async () => {
     });
     for (const transition of [
       {
-        accepted: true,
+        accepted: false,
         candidateVersion: "2.0.1-selfhost.6",
         currentVersion: nightlyLate,
         label: "same revision nightly to stable",
       },
       {
-        accepted: false,
+        accepted: true,
         candidateVersion: nightlyLate,
         currentVersion: "2.0.1-selfhost.6",
         label: "same revision stable to nightly",
@@ -1855,9 +1863,15 @@ const runNativeHelperContract = async () => {
       {
         accepted: true,
         candidateVersion:
-          "2.0.1-selfhost.7-alpha.nightly.20260730",
+          "2.0.1-selfhost.7.nightly.20260730",
         currentVersion: "2.0.1-selfhost.6",
         label: "higher revision nightly",
+      },
+      {
+        accepted: true,
+        candidateVersion: "2.0.1-selfhost.7",
+        currentVersion: nightlyLate,
+        label: "lower revision nightly to higher stable",
       },
       {
         accepted: true,
@@ -1869,9 +1883,10 @@ const runNativeHelperContract = async () => {
       expectVersionTransition(transition);
     }
     for (const invalidVersion of [
-      "2.0.1-selfhost.6-alpha.nightly.20260230",
-      "2.0.1-selfhost.6-alpha.nightly",
-      "2.0.1-selfhost.6-alpha.nightly.20260729.extra",
+      "2.0.1-selfhost.6-alpha.nightly.20260729",
+      "2.0.1-selfhost.6.nightly.20260230",
+      "2.0.1-selfhost.6.nightly",
+      "2.0.1-selfhost.6.nightly.20260729.extra",
     ]) {
       expectSignerRejectsVersion(invalidVersion);
       expectVersionTransition({
@@ -2201,6 +2216,9 @@ const runNativeHelperContract = async () => {
 };
 
 const cases = [];
+const releaseBlockSelfTest = process.argv.includes(
+  "--release-block-self-test",
+);
 
 addCase(cases, "repository contains no updater private key", () => {
   const tracked = trackedPrivateMaterial();
@@ -2500,6 +2518,37 @@ addCase(cases, "diagnostics leave user Trust Settings unchanged", () => {
   }
   assert.equal(userTrustSettingsDigest(), initialUserTrustSettingsDigest);
 });
+
+if (releaseBlockSelfTest) {
+  cases.splice(0, cases.length);
+  addCase(cases, "UNCONFIGURED production signing policy", () => {
+    throw new ReleaseBlock(
+      "production Ed25519 public key is UNCONFIGURED; release is blocked",
+    );
+  });
+} else {
+  addCase(
+    cases,
+    "UNCONFIGURED policy is a release block rather than a failure",
+    () => {
+      const result = command(
+        process.execPath,
+        [fileURLToPath(import.meta.url), "--release-block-self-test"],
+        { allowFailure: true },
+      );
+      assert.notEqual(
+        result.status,
+        0,
+        "UNCONFIGURED release-block probe exited successfully",
+      );
+      assert.match(
+        result.output,
+        /\[project-updater\] SUMMARY passed=0 failed=0 blocked=1 skipped=0 total=1/,
+        `UNCONFIGURED probe did not report the exact release-block summary:\n${result.output}`,
+      );
+    },
+  );
+}
 
 let passed = 0;
 let failed = 0;

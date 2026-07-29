@@ -64,6 +64,8 @@
     "release-electron": "run-s gulp:build && gulp electronMaker",
     "release-electron:unsigned": "run-s gulp:build && gulp electronMakerUnsigned",
     "test:project-signed-macos-updater": "node ./scripts/test-project-signed-macos-updater.mjs",
+    "test:selfhost-updater-source-contracts": "node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs",
+    "test:selfhost-updater-provider-contract": "node ./scripts/test-selfhost-macos-updater-release-contract.mjs",
     "debug-electron": "cd static/ && pnpm electron:debug",
     "webpack-watch": "webpack --watch",
     "webpack-app-watch": "pnpm exec webpack --watch --config-name app",

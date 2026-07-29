@@ -42,12 +42,16 @@ const dependencyRequire = createRequire(path.join(packageRoot, 'package.json'))
 const { GitHubProvider } = dependencyRequire(
   'electron-updater/out/providers/GitHubProvider'
 )
+const { AppUpdater } = dependencyRequire('electron-updater/out/AppUpdater')
 const { HttpError } = dependencyRequire('builder-util-runtime')
 const semver = dependencyRequire('semver')
 
 const currentLegacyVersion = '2.0.1-selfhost.4'
 const firstV2Version = '2.0.1-selfhost.5'
 const nextV2Version = '2.0.1-selfhost.6'
+const sameRevisionStable = '2.0.1-selfhost.6'
+const nightlyEarly = '2.0.1-selfhost.6.nightly.20260728'
+const nightlyLate = '2.0.1-selfhost.6.nightly.20260729'
 const owner = 'logseq'
 const repository = 'logseq'
 // Byte-for-byte digests of the metadata published in release 2.0.1-selfhost.4.
@@ -487,6 +491,73 @@ async function assertV2ChannelCanEvolve(arch) {
   assert.equal(semver.gt(info.version, firstV2Version), true)
 }
 
+async function assertProviderVersionOrdering({
+  arch,
+  candidateVersion,
+  currentVersion,
+  expectedUpdate,
+  label,
+}) {
+  const metadataName = expectedV2MetadataName(arch)
+  const metadataByName = new Map([
+    [
+      metadataName,
+      updaterMetadata(
+        candidateVersion,
+        `Logseq-darwin-${arch}-${candidateVersion}.zip`
+      ),
+    ],
+  ])
+  const { provider, requestedMetadataNames } = createProvider({
+    currentVersion,
+    latestVersion: candidateVersion,
+    arch,
+    metadataByName,
+  })
+  const info = await provider.getLatestVersion()
+
+  assert.deepEqual(
+    requestedMetadataNames,
+    [metadataName],
+    `${label}: GitHubProvider did not read the signed v2 metadata channel`
+  )
+  assert.equal(
+    info.version,
+    candidateVersion,
+    `${label}: GitHubProvider changed the candidate version`
+  )
+  assert.equal(
+    semver.gt(info.version, currentVersion),
+    expectedUpdate,
+    `${label}: semver made the wrong update decision`
+  )
+  const appUpdater = new AppUpdater(null, { version: currentVersion })
+  appUpdater.allowDowngrade = false
+  appUpdater.isUpdateSupported = () => true
+  appUpdater.isUserWithinRollout = () => true
+  assert.equal(
+    await appUpdater.isUpdateAvailable(info),
+    expectedUpdate,
+    `${label}: electron-updater AppUpdater made the wrong update decision`
+  )
+}
+
+function assertUpdaterHelperRejectsVersion(version, arch) {
+  const result = spawnSync(
+    process.execPath,
+    [updaterHelperPath, 'macos-metadata-name', version, arch],
+    {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+    }
+  )
+  assert.notEqual(
+    result.status,
+    0,
+    `updater helper accepted forbidden nightly version ${version}`
+  )
+}
+
 const cases = []
 
 function test(name, run) {
@@ -513,6 +584,23 @@ test('release asset verifier enforces both pinned legacy channel files', () => {
   assertReleaseAssetVerifierContract()
 })
 
+test('obsolete and malformed nightly versions fail closed before provider routing', () => {
+  for (const invalidVersion of [
+    '2.0.1-selfhost.6-alpha.nightly.20260729',
+    '2.0.1-selfhost.6.nightly.20260230',
+    '2.0.1-selfhost.6.nightly',
+    '2.0.1-selfhost.6.nightly.20260729.extra',
+  ]) {
+    assert.ok(
+      semver.valid(invalidVersion),
+      `${invalidVersion} should demonstrate why generic SemVer validation is insufficient`
+    )
+    for (const arch of ['x64', 'arm64']) {
+      assertUpdaterHelperRejectsVersion(invalidVersion, arch)
+    }
+  }
+})
+
 for (const arch of ['x64', 'arm64']) {
   test(`${arch}: checked-in helper emits the exact .5 metadata filename`, () => {
     assert.equal(
@@ -536,6 +624,43 @@ for (const arch of ['x64', 'arm64']) {
   test(`${arch}: actual GitHubProvider lets the .5 v2 channel evolve`, async () => {
     await assertV2ChannelCanEvolve(arch)
   })
+
+  for (const transition of [
+    {
+      currentVersion: '2.0.1-selfhost.5.nightly.20260729',
+      candidateVersion: sameRevisionStable,
+      expectedUpdate: true,
+      label: 'lower-revision nightly is older than higher stable',
+    },
+    {
+      currentVersion: sameRevisionStable,
+      candidateVersion: nightlyEarly,
+      expectedUpdate: true,
+      label: 'same-revision stable is older than nightly',
+    },
+    {
+      currentVersion: nightlyEarly,
+      candidateVersion: nightlyLate,
+      expectedUpdate: true,
+      label: 'nightly date increases',
+    },
+    {
+      currentVersion: nightlyLate,
+      candidateVersion: nightlyEarly,
+      expectedUpdate: false,
+      label: 'nightly date cannot move backwards',
+    },
+    {
+      currentVersion: nightlyLate,
+      candidateVersion: sameRevisionStable,
+      expectedUpdate: false,
+      label: 'same-revision stable cannot replace a newer nightly',
+    },
+  ]) {
+    test(`${arch}: ${transition.label} through GitHubProvider and AppUpdater`, async () => {
+      await assertProviderVersionOrdering({ arch, ...transition })
+    })
+  }
 }
 
 const failures = []

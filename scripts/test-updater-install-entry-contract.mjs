@@ -25,6 +25,14 @@ const electronUpdater = fs.readFileSync(
   path.join(repoRoot, "src", "electron", "electron", "updater.cljs"),
   "utf8",
 );
+const fullPreflight = fs.readFileSync(
+  path.join(repoRoot, "scripts", "run-desktop-release-preflight.mjs"),
+  "utf8",
+);
+const releaseWorkflow = fs.readFileSync(
+  path.join(repoRoot, ".github", "workflows", "build-desktop-release.yml"),
+  "utf8",
+);
 
 const headerEntry = frontendHandler.match(
   /\(defn\s+quit-and-install-new-version![\s\S]*?(?=\n\(defn|\n\(defmethod|\s*$)/,
@@ -79,6 +87,17 @@ assert.match(
   "downloaded-update installer bypasses the mocked project-signed timing seam",
 );
 
+assert.match(
+  fullPreflight,
+  /electron\\\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
+  "full desktop preflight does not execute the updater mock-timing behavior test",
+);
+assert.match(
+  releaseWorkflow,
+  /rtc-release-gate:[\s\S]*?node static\/tests\.js[\s\S]*?electron\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
+  "desktop release CI does not execute the updater mock-timing behavior test",
+);
+
 console.log(
-  "[updater-install-entry-contract] PASS header and settings share guarded main install flow",
+  "[updater-install-entry-contract] PASS shared guarded install flow and formal mock-timing gates",
 );

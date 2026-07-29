@@ -43,9 +43,12 @@ assert.deepEqual(
 );
 for (const invalidVersion of [
   "2.0.1-selfhost.3",
-  "2.0.1-selfhost.4.nightly.20260230",
   "2.0.1-selfhost.4-alpha.nightly.20260726",
   "2.0.1-selfhost.4-alpha.other.20260726",
+  "2.0.1-selfhost.4.nightly.20260230",
+  "2.0.1-selfhost.4.nightly",
+  "2.0.1-selfhost.4.nightly.20260726.extra",
+  "2.0.1-selfhost.4.other.20260726",
   "2.0.1",
 ]) {
   assert.throws(
@@ -54,6 +57,22 @@ for (const invalidVersion of [
     `invalid updater rehearsal version should be rejected: ${invalidVersion}`,
   );
 }
+
+const nightlyVersion = execFileSync(
+  process.execPath,
+  [path.join(repoRoot, "scripts", "get-pkg-version.js"), "nightly"],
+  { encoding: "utf8" },
+).trim();
+assert.match(
+  nightlyVersion,
+  /^\d+\.\d+\.\d+-selfhost\.[1-9]\d*\.nightly\.\d{8}$/,
+  "nightly version generation must use X.Y.Z-selfhost.N.nightly.YYYYMMDD",
+);
+assert.doesNotMatch(
+  nightlyVersion,
+  /-alpha\.nightly\./,
+  "nightly version generation must reject the obsolete -alpha.nightly form",
+);
 assert.equal(
   macosUpdaterChannel("2.0.1-selfhost.4", "arm64"),
   "latest-arm64",
@@ -196,6 +215,32 @@ const e2eRtcExtra = readText(
 );
 const e2eRtcExtraPart2 = readText(
   "clj-e2e/test/logseq/e2e/rtc_extra_part2_test.clj",
+);
+
+assert.match(
+  rootPackage.scripts?.["test:selfhost-updater-source-contracts"] ?? "",
+  /test-desktop-sidecar-release-contract\.mjs[\s\S]*test-updater-install-entry-contract\.mjs[\s\S]*test-selfhost-macos-user-guidance\.mjs/,
+  "package.json should expose all updater source contracts",
+);
+assert.match(
+  rootPackage.scripts?.["test:selfhost-updater-provider-contract"] ?? "",
+  /test-selfhost-macos-updater-release-contract\.mjs/,
+  "package.json should expose the real provider and SemVer contract",
+);
+assert.equal(
+  typeof rootPackage.scripts?.["project-update:test-helper"],
+  "string",
+  "package.json should expose the explicit native updater test-helper target",
+);
+assert.doesNotMatch(
+  desktopReleaseAssetVerifier,
+  /-alpha\.nightly/,
+  "release asset verifier guidance must not advertise the obsolete nightly format",
+);
+assert.match(
+  desktopReleaseAssetVerifier,
+  /selfhost[\s\S]{0,80}nightly[\s\S]{0,80}YYYYMMDD/i,
+  "release asset verifier guidance should advertise X.Y.Z-selfhost.N.nightly.YYYYMMDD",
 );
 
 assert.match(
@@ -531,6 +576,41 @@ assert.match(
   desktopReleaseWorkflow,
   /rtc-release-gate:[\s\S]*?pnpm cljs:test[\s\S]*?pnpm --dir deps\/db-sync test[\s\S]*?pnpm --dir deps\/db-sync test:large-op-128m/,
   "desktop release workflow should gate packaging on client and server RTC tests",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?node static\/tests\.js[\s\S]*?electron\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
+  "desktop release workflow should execute the updater mock-timing behavior test",
+);
+for (const sourceContract of [
+  "test-desktop-sidecar-release-contract.mjs",
+  "test-updater-install-entry-contract.mjs",
+  "test-selfhost-macos-user-guidance.mjs",
+]) {
+  assert.match(
+    desktopReleaseWorkflow,
+    new RegExp(
+      `source-preflight:[\\s\\S]*?${sourceContract.replaceAll(".", "\\.")}`,
+    ),
+    `source-preflight should execute ${sourceContract}`,
+  );
+}
+assert.equal(
+  desktopReleaseWorkflow.match(/project-update:test-helper/g)?.length,
+  2,
+  "both macOS runners should build the explicit native updater test helper",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(/test:project-signed-macos-updater/g)?.length,
+  2,
+  "both macOS runners should execute the native updater E2E",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /test-selfhost-macos-updater-release-contract\.mjs/g,
+  )?.length,
+  2,
+  "both macOS runners should execute the real provider and SemVer contract",
 );
 assert.match(
   desktopReleaseWorkflow,

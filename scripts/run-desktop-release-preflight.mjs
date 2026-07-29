@@ -187,6 +187,17 @@ run(
   process.execPath,
   ["scripts/test-cli-release-config.mjs"],
 );
+pnpm("self-host updater source contracts", [
+  "test:selfhost-updater-source-contracts",
+]);
+if (process.platform === "darwin") {
+  pnpm("build project updater test helper", [
+    "project-update:test-helper",
+  ]);
+}
+pnpm("project-signed updater contract", [
+  "test:project-signed-macos-updater",
+]);
 
 pnpm("isolated packaging install", [
   "--dir",
@@ -194,6 +205,9 @@ pnpm("isolated packaging install", [
   "install",
   "--frozen-lockfile",
   "--ignore-workspace",
+]);
+pnpm("self-host updater provider and SemVer contract", [
+  "test:selfhost-updater-provider-contract",
 ]);
 pnpm("rebuild desktop native modules", ["--dir", "static", "rebuild:all"]);
 
