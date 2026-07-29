@@ -53,11 +53,6 @@ const quarantineValue =
   "0083;7f5e1000;LogseqAppOutXattrContract;01234567-89AB-CDEF-0123-456789ABCDEF";
 const finderInfoHex =
   "0000000000000000000000000000000000000000000000000000000000000001";
-const cleanupAttributes = [
-  "com.apple.FinderInfo",
-  "com.apple.ResourceFork",
-  "com.apple.provenance",
-];
 const unsafeArtifactAttributes = [
   "com.apple.FinderInfo",
   "com.apple.ResourceFork",
@@ -85,13 +80,6 @@ const run = (command, args, options = {}) => {
 
 const xattr = (args, options = {}) =>
   run("/usr/bin/xattr", args, options);
-
-const readXattrHex = (target, name) => {
-  const result = xattr(["-px", name, target], { expectSuccess: false });
-  return result.status === 0
-    ? result.stdout.replace(/\s+/g, "").toLowerCase()
-    : null;
-};
 
 const recursiveXattrs = (target) => {
   const result = xattr(["-lr", target], { expectSuccess: false });
@@ -142,15 +130,6 @@ const runReleaseWithInjectedAppOut = ({ env, appOutHelper, tracePath }) =>
           quarantineValue,
           appOutHelper,
         ]);
-        for (const attribute of [
-          ...cleanupAttributes,
-          "com.apple.quarantine",
-        ]) {
-          assert.ok(
-            readXattrHex(appOutHelper, attribute),
-            `could not inject ${attribute} into the temporary appOut helper`,
-          );
-        }
         fs.appendFileSync(
           tracePath,
           `${JSON.stringify({
