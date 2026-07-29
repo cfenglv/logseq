@@ -717,6 +717,7 @@ const quarantineValue = (target) => {
 };
 
 const makeNativeHelperApp = ({
+  adHocSigned = true,
   applicationId = "com.logseq.logseq",
   destination,
   escapeSymlink,
@@ -734,14 +735,9 @@ const makeNativeHelperApp = ({
     appInfoPlist({ applicationId, version }),
   );
   const executable = path.join(macOS, "Logseq");
-  fs.writeFileSync(executable, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  fs.copyFileSync("/usr/bin/true", executable);
+  fs.chmodSync(executable, 0o755);
   fs.writeFileSync(path.join(resources, "update-state.txt"), marker);
-  if (escapeSymlink) {
-    fs.symlinkSync(
-      escapeSymlink,
-      path.join(resources, "escape-link"),
-    );
-  }
   if (quarantine) {
     command("xattr", [
       "-w",
@@ -749,6 +745,41 @@ const makeNativeHelperApp = ({
       quarantine,
       destination,
     ]);
+  }
+  if (adHocSigned) {
+    command("xattr", ["-dr", "com.apple.FinderInfo", destination]);
+    command("xattr", ["-dr", "com.apple.ResourceFork", destination]);
+    command("codesign", [
+      "--force",
+      "--deep",
+      "--timestamp=none",
+      "--sign",
+      "-",
+      destination,
+    ]);
+    command("codesign", [
+      "--verify",
+      "--deep",
+      "--strict",
+      "--all-architectures",
+      destination,
+    ]);
+  } else {
+    assert.notEqual(
+      command(
+        "codesign",
+        ["--verify", "--deep", "--strict", destination],
+        { allowFailure: true },
+      ).status,
+      0,
+      "unsigned App fixture unexpectedly has a valid code signature",
+    );
+  }
+  if (escapeSymlink) {
+    fs.symlinkSync(
+      escapeSymlink,
+      path.join(resources, "escape-link"),
+    );
   }
   return destination;
 };
@@ -852,9 +883,11 @@ const signedNativeArchive = ({
 };
 
 const makeSignedNativeUpdate = ({
+  adHocSigned = true,
   applicationId,
   arch = "arm64",
   bundleId,
+  damageCodeSignature = false,
   escapeSymlink,
   payloadDomain,
   privateKeyPem,
@@ -863,6 +896,7 @@ const makeSignedNativeUpdate = ({
 }) => {
   fs.mkdirSync(root, { recursive: true });
   const app = makeNativeHelperApp({
+    adHocSigned,
     applicationId: applicationId ?? bundleId,
     destination: path.join(root, "payload", "Logseq.app"),
     escapeSymlink,
@@ -870,6 +904,21 @@ const makeSignedNativeUpdate = ({
     quarantine: "0081;5f000000;Logseq project update;test-origin",
     version,
   });
+  if (damageCodeSignature) {
+    fs.appendFileSync(
+      path.join(app, "Contents", "Resources", "update-state.txt"),
+      "\ndamaged after codesign",
+    );
+    assert.notEqual(
+      command(
+        "codesign",
+        ["--verify", "--deep", "--strict", app],
+        { allowFailure: true },
+      ).status,
+      0,
+      "damaged App fixture unexpectedly retained a valid code signature",
+    );
+  }
   const artifactPath = path.join(
     root,
     `Logseq-darwin-${arch}-${version}.zip`,
@@ -883,8 +932,17 @@ const makeSignedNativeUpdate = ({
     `-o${probeRoot}`,
     artifactPath,
   ]);
-  const archivedQuarantine = quarantineValue(
-    path.join(probeRoot, "Logseq.app"),
+  const archivedApp = path.join(probeRoot, "Logseq.app");
+  const archivedQuarantine = quarantineValue(archivedApp);
+  const archivedSignature = command(
+    "codesign",
+    ["--verify", "--deep", "--strict", "--all-architectures", archivedApp],
+    { allowFailure: true },
+  );
+  assert.equal(
+    archivedSignature.status === 0,
+    adHocSigned && !damageCodeSignature && !escapeSymlink,
+    `archive round-trip produced an unexpected code-signature state:\n${archivedSignature.output}`,
   );
   fs.rmSync(probeRoot, { recursive: true, force: true });
   return {
@@ -1226,6 +1284,21 @@ const runNativeHelperContract = async () => {
       root: path.join(tempRoot, "wrong-key"),
     });
     expectNoDamage({ fixture: wrongKey, label: "wrong signing key" });
+
+    expectNoDamage({
+      fixture: makeFixture({
+        adHocSigned: false,
+        root: path.join(tempRoot, "unsigned-app"),
+      }),
+      label: "validly project-signed but unsigned App",
+    });
+    expectNoDamage({
+      fixture: makeFixture({
+        damageCodeSignature: true,
+        root: path.join(tempRoot, "damaged-code-signature"),
+      }),
+      label: "validly project-signed but damaged App code signature",
+    });
 
     const tampered = makeFixture({
       root: path.join(tempRoot, "tampered"),
