@@ -1250,6 +1250,7 @@ const runNativeHelperContract = async () => {
         helperRunnerPath,
         "--helper",
         helperPath,
+        "--",
         ...nativeInstallArgs({
           ...base,
           targetApp: successTarget.targetApp,
