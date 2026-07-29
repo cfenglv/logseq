@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const selfhostVersionPattern =
-  /^(\d+\.\d+\.\d+-selfhost\.)([1-9]\d*)(?:-alpha\.nightly\.(\d{8}))?$/;
+  /^(\d+\.\d+\.\d+-selfhost\.)([1-9]\d*)(?:\.nightly\.(\d{8}))?$/;
 const supportedMacosArchitectures = new Set(["x64", "arm64"]);
 // selfhost.4 was ad-hoc signed, so its designated requirement is its exact
 // cdhash. Keep that legacy channel frozen and start a new signed trust chain

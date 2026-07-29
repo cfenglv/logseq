@@ -31,7 +31,7 @@ assert.deepEqual(
 );
 assert.deepEqual(
   resolveSelfhostUpdaterVersions(
-    "2.0.1-selfhost.4-alpha.nightly.20260726",
+    "2.0.1-selfhost.4.nightly.20260726",
   ),
   {
     currentRevision: 4,
@@ -43,7 +43,8 @@ assert.deepEqual(
 );
 for (const invalidVersion of [
   "2.0.1-selfhost.3",
-  "2.0.1-selfhost.4-alpha.nightly.20260230",
+  "2.0.1-selfhost.4.nightly.20260230",
+  "2.0.1-selfhost.4-alpha.nightly.20260726",
   "2.0.1-selfhost.4-alpha.other.20260726",
   "2.0.1",
 ]) {

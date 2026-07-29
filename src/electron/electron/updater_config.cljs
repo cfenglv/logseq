@@ -4,13 +4,17 @@
   [version]
   (boolean (re-find #"-selfhost(?:\.|$)" (or version ""))))
 
+(defn- selfhost-updater-revision
+  [version]
+  (some-> (re-matches #"\d+\.\d+\.\d+-selfhost\.([1-9]\d*)(?:\.nightly\.\d{8})?"
+                      (or version ""))
+          second
+          js/parseInt))
+
 (defn project-signed-macos-updater?
   [version platform]
   (and (= "darwin" platform)
-       (let [revision (some-> (re-find #"-selfhost\.([1-9]\d*)(?:-|$)"
-                                       (or version ""))
-                              second
-                              js/parseInt)]
+       (let [revision (selfhost-updater-revision version)]
          (and revision (>= revision 5)))))
 
 (defn- signed-macos-updater-channel?
@@ -25,10 +29,13 @@
     "win32" (when (#{"x64" "arm64"} arch)
               (str "latest-" arch))
     "darwin" (when (#{"x64" "arm64"} arch)
-               (str (if (signed-macos-updater-channel? version)
-                      "selfhost-macos-v2-"
-                      "latest-")
-                    arch))
+               (if (selfhost-version? version)
+                 (when (selfhost-updater-revision version)
+                   (str (if (signed-macos-updater-channel? version)
+                          "selfhost-macos-v2-"
+                          "latest-")
+                        arch))
+                 (str "latest-" arch)))
     nil))
 
 (defn updater-options

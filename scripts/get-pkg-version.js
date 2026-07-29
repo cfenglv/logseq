@@ -20,8 +20,11 @@ if (match) {
 
 if (process.argv[2] === 'nightly' || process.argv[2] === '') {
   const today = new Date()
+  const date = today.toISOString().split('T')[0].replaceAll('-', '')
   console.log(
-    ver + '-alpha.nightly.' + today.toISOString().split('T')[0].replaceAll('-', '')
+    /^\d+\.\d+\.\d+-selfhost\.[1-9]\d*$/.test(ver)
+      ? ver + '.nightly.' + date
+      : ver + '-alpha.nightly.' + date
   )
 } else {
   console.log(ver)

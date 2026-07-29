@@ -6,11 +6,13 @@
 
 Moving from `2.0.1-selfhost.4` to `2.0.1-selfhost.5` requires manually
 replacing the application to bootstrap the fixed project Ed25519 public key.
-After `.5`, the app still checks for and downloads `.6+` releases; choosing
-**Restart and install** verifies and installs them automatically. Candidates
+After `.5`, the default in-app update flow automatically checks for and
+downloads `.6+` releases; after the user clicks **Restart and install**, it
+verifies and installs them automatically. Candidates
 after `.5` are gated by their project-signed metadata and exact ZIP bytes; they
 do not require a Developer ID or notarized `.5` baseline. Without those Apple
-credentials, Gatekeeper may require **Open Anyway** on the first launch of
-`.5` and may ask again after later updates. The updater never changes Trust
-Settings or removes quarantine attributes. Keep the `.4` fixtures above only
+credentials, every new ad-hoc application bundle may require
+**Open Anyway** again the first time it is opened. The updater never changes
+certificate Trust Settings and never clears or removes quarantine attributes.
+Keep the `.4` fixtures above only
 for the historical Squirrel signature regression reproducer.

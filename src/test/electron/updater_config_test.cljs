@@ -29,9 +29,13 @@
             "2.0.1-selfhost.5" "darwin" "x64")))
     (is (= "selfhost-macos-v2-arm64"
            (updater-config/updater-channel
-            "2.0.1-selfhost.5-alpha.nightly.20260729"
+            "2.0.1-selfhost.5.nightly.20260729"
             "darwin"
-            "arm64"))))
+            "arm64")))
+    (is (nil? (updater-config/updater-channel
+               "2.0.1-selfhost.5-alpha.nightly.20260729"
+               "darwin"
+               "arm64"))))
   (testing "upstream macOS versions keep their existing channels"
     (is (= "latest-arm64"
            (updater-config/updater-channel
@@ -52,6 +56,10 @@
        "2.0.1-selfhost.5" "darwin"))
   (is (updater-config/project-signed-macos-updater?
        "2.0.1-selfhost.6" "darwin"))
+  (is (updater-config/project-signed-macos-updater?
+       "2.0.1-selfhost.6.nightly.20260729" "darwin"))
+  (is (not (updater-config/project-signed-macos-updater?
+            "2.0.1-selfhost.6-alpha.nightly.20260729" "darwin")))
   (is (not (updater-config/project-signed-macos-updater?
             "2.0.1-selfhost.4" "darwin")))
   (is (not (updater-config/project-signed-macos-updater?

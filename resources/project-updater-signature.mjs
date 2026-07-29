@@ -57,7 +57,7 @@ const validNightlyDate = (value) => {
 
 export const parseSelfhostProjectVersion = (version) => {
   const match =
-    /^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)(?:-alpha\.nightly\.([0-9]{8}))?$/.exec(
+    /^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)(?:\.nightly\.([0-9]{8}))?$/.exec(
       version || "",
     );
   if (!match || !validNightlyDate(match[5])) {
@@ -82,8 +82,11 @@ export const compareSelfhostProjectVersions = (leftVersion, rightVersion) => {
     }
   }
   if (left.nightlyDate === right.nightlyDate) return 0;
-  if (left.nightlyDate === undefined) return 1;
-  if (right.nightlyDate === undefined) return -1;
+  // This mirrors SemVer precedence for
+  // `...-selfhost.N[.nightly.YYYYMMDD]`: a longer prerelease identifier set
+  // sorts after its otherwise-identical prefix.
+  if (left.nightlyDate === undefined) return -1;
+  if (right.nightlyDate === undefined) return 1;
   return left.nightlyDate - right.nightlyDate;
 };
 

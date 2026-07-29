@@ -114,8 +114,12 @@ jobs:
       - name: Run deterministic release preflight
         run: pnpm desktop:release-preflight:quick -- --strict
 
-      - name: Test macOS updater release policy
-        run: node scripts/test-macos-updater-signature-config.mjs
+      - name: Test static desktop release contracts
+        run: |
+          node scripts/test-desktop-sidecar-release-contract.mjs
+          node scripts/test-updater-install-entry-contract.mjs
+          node scripts/test-selfhost-macos-user-guidance.mjs
+          node scripts/test-macos-updater-signature-config.mjs
 
   release-rehearsal-gate:
     needs: [ source-preflight ]
@@ -203,10 +207,13 @@ jobs:
           cp resources/package.json resources/pnpm-lock.yaml static/
           pnpm --dir static install --frozen-lockfile --ignore-workspace
 
+      - name: Run complete desktop release contracts
+        run: pnpm desktop:test-release-contracts
+
       - name: Run RTC client and Electron tests
         run: |
           LOGSEQ_STABLE_IDENTS=1 node static/tests.js \
-            -r '^(electron\.(db-worker-manager|power-monitor|proxy|updater-config)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
+            -r '^(electron\.(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
             -e fix-me
 
       - name: Run db-sync server tests
@@ -261,6 +268,9 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
+
+      - name: Require configured project signing policy for selfhost release
+        run: pnpm project-update:require-signing-policy
 
       - name: Get pnpm store directory path
         id: pnpm-store-dir-path
@@ -743,6 +753,10 @@ jobs:
         with:
           version: 10.33.0
 
+      - name: Run x64 native project updater helper E2E
+        run: pnpm project-update:test-helper
+        working-directory: ./release-gate-source
+
       - name: Install Python
         uses: actions/setup-python@v6
         with:
@@ -781,11 +795,18 @@ jobs:
       #       **/node_modules
       #     key: ${{ runner.os }}-node-modules
 
-      - name: Build/Release Electron App for x64
+      - name: Prepare x64 desktop dependencies
         run: |
           pnpm install --frozen-lockfile --ignore-workspace
           pnpm rebuild:all
-          pnpm electron:verify-updater-provider
+        working-directory: ./static
+
+      - name: Verify x64 updater provider contract
+        run: pnpm electron:verify-updater-provider
+        working-directory: ./static
+
+      - name: Build/Release Electron App for x64
+        run: |
           if [ "${HAS_APPLE_SIGNING}" = "true" ]; then
             pnpm electron:make
           else
@@ -892,6 +913,10 @@ jobs:
         with:
           version: 10.33.0
 
+      - name: Run arm64 native project updater helper E2E
+        run: pnpm project-update:test-helper
+        working-directory: ./release-gate-source
+
       - name: Get pnpm store directory path
         id: pnpm-store-dir-path
         run: echo "dir=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
@@ -931,7 +956,11 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Fetch deps
-        run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all && pnpm electron:verify-updater-provider
+        run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
+        working-directory: ./static
+
+      - name: Verify arm64 updater provider contract
+        run: pnpm electron:verify-updater-provider
         working-directory: ./static
 
       - name: Build/Release Electron App for arm64
@@ -1024,6 +1053,8 @@ jobs:
     needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
+    outputs:
+      version: ${{ steps.assets.outputs.version }}
     steps:
       - name: Check out release verifier
         uses: actions/checkout@v4
@@ -1044,8 +1075,10 @@ jobs:
           merge-multiple: true
 
       - name: Verify complete desktop release asset set
+        id: assets
         run: |
           version="$(cat "${RUNNER_TEMP}/desktop-release-assets/VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
           node scripts/verify-desktop-release-assets.mjs \
             --dir "${RUNNER_TEMP}/desktop-release-assets" \
             --version "$version" \
@@ -1119,7 +1152,8 @@ jobs:
       - name: List files
         run: ls -rl
 
-      - name: Update Nightly Release
+      - name: Update upstream rolling Nightly Release
+        if: ${{ !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
         uses: andelf/nightly-release@5834076edc55cc05975561c9722043f072ac5c26 # main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1127,10 +1161,34 @@ jobs:
           tag_name: nightly
           name: 'Desktop app Nightly Release $$'
           draft: false
-          prerelease: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.is-pre-release) || (github.event_name == 'schedule')}}
+          prerelease: ${{ github.event_name == 'schedule' || github.event.inputs.is-pre-release }}
           body: |
             This is a nightly release of the Logseq desktop app.
             It's unstable compared to the official releases, **use it with caution**!
+          files: |
+            ./SHA256SUMS.txt
+            ./*.zip
+            ./*.dmg
+            ./*.exe
+            ./*.yml
+            ./*.blockmap
+            ./*.AppImage
+            ./*.apk
+
+      - name: Publish selfhost dated Nightly Release
+        if: ${{ contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.release-assets-preflight.outputs.version }}
+          name: Desktop APP ${{ needs.release-assets-preflight.outputs.version }} (Nightly)
+          draft: false
+          prerelease: false
+          body: |
+            This is a dated nightly release of the selfhost Logseq desktop app.
+            It is published as a production GitHub Release so existing selfhost
+            clients can discover its signed architecture-specific metadata.
           files: |
             ./SHA256SUMS.txt
             ./*.zip

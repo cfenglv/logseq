@@ -439,7 +439,7 @@ private struct SelfhostVersion: Comparable {
     let nightlyDate: Int?
 
     init(_ version: String) throws {
-        let pattern = #"^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)(?:-alpha\.nightly\.([0-9]{8}))?$"#
+        let pattern = #"^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)(?:\.nightly\.([0-9]{8}))?$"#
         let regex = try NSRegularExpression(pattern: pattern)
         let range = NSRange(version.startIndex..., in: version)
         guard let match = regex.firstMatch(in: version, range: range) else {
@@ -485,9 +485,9 @@ private struct SelfhostVersion: Comparable {
         case let (.some(left), .some(right)):
             return left < right
         case (.some, .none):
-            return true
-        case (.none, .some):
             return false
+        case (.none, .some):
+            return true
         case (.none, .none):
             return false
         }

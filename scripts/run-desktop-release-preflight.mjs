@@ -97,6 +97,7 @@ pnpm("isolated desktop test install", [
   "--frozen-lockfile",
   "--ignore-workspace",
 ]);
+pnpm("desktop release contract tests", ["desktop:test-release-contracts"]);
 run(
   "RTC client and Electron tests",
   process.execPath,

@@ -36,7 +36,7 @@ if (!version) {
 }
 if (version.includes("+")) {
   throw new Error(
-    `release version ${version} contains SemVer build metadata; electron-builder strips build metadata from updater filenames, so use a prerelease version such as -alpha.nightly.YYYYMMDD`,
+    `release version ${version} contains SemVer build metadata; electron-builder strips build metadata from updater filenames, so use a prerelease version such as -alpha.nightly.YYYYMMDD (upstream) or -selfhost.N.nightly.YYYYMMDD (selfhost)`,
   );
 }
 

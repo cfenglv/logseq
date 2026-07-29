@@ -248,81 +248,155 @@
                      (.-message error)))))
           (resolve true)))))))
 
-(defn- <launch-project-update!
-  [helper arguments]
-  (js/Promise.
-   (fn [resolve reject]
-     (let [child (.spawn child-process
-                         helper
-                         (bean/->js arguments)
-                         #js {:detached true
-                              :stdio "ignore"})]
-       (.once child "error" reject)
-       (.once child "spawn"
-              (fn []
-                (try
-                  (.unref child)
-                  (if-let [set-quit-dirty-state! @*set-quit-dirty-state!]
-                    (set-quit-dirty-state! false)
-                    (throw (js/Error. "updater quit-state callback is unavailable")))
-                  (.quit app)
-                  (resolve true)
-                  (catch :default error
-                    (when-let [set-quit-dirty-state! @*set-quit-dirty-state!]
-                      (set-quit-dirty-state! true))
-                    (reject error)))))))))
+(defn run-project-signed-install!
+  "Runs the project-signed install handoff through one injectable production
+  sequence. Verification must finish before the detached child is created.
+  The dirty guard is disabled only after the child emits `spawn`, immediately
+  before quitting. Every failure restores the guard and is surfaced exactly
+  once through `emit-error!`."
+  ([{:keys [verify! spawn-child! spawn! set-dirty!
+            set-quit-dirty-state! quit! emit-error!]}]
+   (let [spawn-child! (or spawn-child! spawn!)
+         set-dirty! (or set-dirty! set-quit-dirty-state!)
+         required! (fn [label f]
+                     (when-not (fn? f)
+                       (throw (js/Error. (str "missing updater injection " label))))
+                     f)
+         verify! (required! "verify!" verify!)
+         spawn-child! (required! "spawn-child!" spawn-child!)
+         set-dirty! (required! "set-dirty!" set-dirty!)
+         quit! (required! "quit!" quit!)
+         emit-error! (required! "emit-error!" emit-error!)]
+     (-> (js/Promise.resolve)
+         (.then (fn [] (verify!)))
+         (.then
+          (fn [verified]
+            (if-not verified
+              (throw (js/Error. "project updater preflight did not verify"))
+              (js/Promise.
+               (fn [resolve reject]
+                 (try
+                   (let [child (spawn-child! verified)
+                         settled? (atom false)]
+                     (.once child "error"
+                            (fn [error]
+                              (when (compare-and-set! settled? false true)
+                                (reject error))))
+                     (.once child "spawn"
+                            (fn []
+                              (when (compare-and-set! settled? false true)
+                                (try
+                                  (.unref child)
+                                  (set-dirty! false)
+                                  (quit!)
+                                  (resolve true)
+                                  (catch :default error
+                                    (reject error)))))))
+                   (catch :default error
+                     (reject error))))))))
+         (.catch
+          (fn [error]
+            ;; This function is also the terminal IPC handler. Consume the
+            ;; rejection after restoring state and notifying the renderer so a
+            ;; child-process `error` event cannot become an unhandled Promise.
+            (try
+              (set-dirty! true)
+              (catch :default restore-error
+                (logger/warn "[updater/install] failed to restore quit guard"
+                             restore-error)))
+            (try
+              (emit-error! error)
+              (catch :default emit-error
+                (logger/warn "[updater/install] failed to emit install error"
+                             emit-error)))
+            false)))))
+  ([verify! spawn-child! set-dirty! quit! emit-error!]
+   (run-project-signed-install!
+    {:verify! verify!
+     :spawn-child! spawn-child!
+     :set-dirty! set-dirty!
+     :quit! quit!
+     :emit-error! emit-error!})))
 
-(defn- <install-downloaded-update!
+(defn- emit-install-error!
+  [error]
+  (logger/warn "[updater/install]" error)
+  (when-let [win @*win]
+    (emit-update! win "error" (normalize-error error))
+    (emit-completed! win)))
+
+(defn- <project-signed-install!
   []
-  (if-not (project-signed-macos-updater?)
-    (if-let [set-quit-dirty-state! @*set-quit-dirty-state!]
-      (try
-        (set-quit-dirty-state! false)
-        (.quitAndInstall autoUpdater false true)
-        (catch :default error
-          (set-quit-dirty-state! true)
-          (throw error)))
-      (throw (js/Error. "updater quit-state callback is unavailable")))
-    (if-let [{:keys [archive arch sha512 signature size version]} @*project-update]
-      (let [helper (node-path/join (.-resourcesPath js/process)
-                                   "sidecar"
-                                   "logseq-project-updater")
-            target (node-path/resolve
-                    (node-path/dirname (.-execPath js/process))
-                    "../..")
-            helper-stat (fs/lstatSync helper)]
-        (when (or (.isSymbolicLink helper-stat)
-                  (not (.isFile helper-stat))
-                  (zero? (bit-and (.-mode helper-stat) 73)))
-          (throw (js/Error. "project updater helper is not a real executable file")))
-        (let [arguments (project-helper-arguments
-                         {:archive archive
-                          :arch arch
-                          :sha512 sha512
-                          :signature signature
-                          :size size
-                          :version version}
-                         target)]
-          ;; Keep the App running until the production helper has completed
-          ;; signature, archive, bundle, architecture, and upgrade validation.
-          ;; The detached install repeats all checks after quit to close TOCTOU.
-          (-> (<verify-project-update! helper arguments)
-              (.then #(<launch-project-update! helper arguments)))))
-      (throw (js/Error. "no verified project-signed update is downloaded")))))
+  (run-project-signed-install!
+   {:verify!
+    (fn []
+      (if-let [{:keys [archive arch sha512 signature size version]} @*project-update]
+        (let [helper (node-path/join (.-resourcesPath js/process)
+                                     "sidecar"
+                                     "logseq-project-updater")
+              target (node-path/resolve
+                      (node-path/dirname (.-execPath js/process))
+                      "../..")
+              helper-stat (fs/lstatSync helper)]
+          (when (or (.isSymbolicLink helper-stat)
+                    (not (.isFile helper-stat))
+                    (zero? (bit-and (.-mode helper-stat) 73)))
+            (throw (js/Error. "project updater helper is not a real executable file")))
+          (let [arguments (project-helper-arguments
+                           {:archive archive
+                            :arch arch
+                            :sha512 sha512
+                            :signature signature
+                            :size size
+                            :version version}
+                           target)]
+            ;; Keep the App running until the production helper has completed
+            ;; signature, archive, bundle, architecture, and upgrade validation.
+            ;; The detached install repeats all checks after quit to close TOCTOU.
+            (-> (<verify-project-update! helper arguments)
+                (.then (fn []
+                         {:helper helper
+                          :arguments arguments})))))
+        (throw (js/Error. "no verified project-signed update is downloaded"))))
+    :spawn-child!
+    (fn [{:keys [helper arguments]}]
+      (.spawn child-process
+              helper
+              (bean/->js arguments)
+              #js {:detached true
+                   :stdio "ignore"}))
+    :set-dirty!
+    (or @*set-quit-dirty-state!
+        (fn [_]
+          (throw (js/Error. "updater quit-state callback is unavailable"))))
+    :quit! #(.quit app)
+    :emit-error! emit-install-error!}))
 
-(defn install-downloaded-update!
+(defn- <legacy-install!
   []
   (-> (js/Promise.resolve)
-      (.then (fn [] (<install-downloaded-update!)))
+      (.then
+       (fn []
+         (if-let [set-quit-dirty-state! @*set-quit-dirty-state!]
+           (try
+             (set-quit-dirty-state! false)
+             (.quitAndInstall autoUpdater false true)
+             (catch :default error
+               (set-quit-dirty-state! true)
+               (throw error)))
+           (throw (js/Error. "updater quit-state callback is unavailable")))))
       (.catch
        (fn [error]
          (when-let [set-quit-dirty-state! @*set-quit-dirty-state!]
            (set-quit-dirty-state! true))
-         (logger/warn "[updater/install]" error)
-         (when-let [win @*win]
-           (emit-update! win "error" (normalize-error error))
-           (emit-completed! win))
+         (emit-install-error! error)
          (throw error)))))
+
+(defn install-downloaded-update!
+  []
+  (if (project-signed-macos-updater?)
+    (<project-signed-install!)
+    (<legacy-install!)))
 
 (defn init-updater
   [{:keys [^js win set-quit-dirty-state!] :as _opts}]

@@ -135,7 +135,7 @@ const cases = [
       );
       assert.equal(runHelper("selfhost-revision", "2.0.1-selfhost.5"), "5");
       assert.equal(
-        runHelper("macos-metadata-name", "2.0.1-selfhost.5-alpha.nightly.20260729", "arm64"),
+        runHelper("macos-metadata-name", "2.0.1-selfhost.5.nightly.20260729", "arm64"),
         "selfhost-macos-v2-arm64-mac.yml",
       );
       assert.equal(
@@ -149,32 +149,33 @@ const cases = [
   [
     "project updater version ordering supports strict dated nightlies",
     () => {
-      const earlier = "2.0.1-selfhost.5-alpha.nightly.20260728";
-      const later = "2.0.1-selfhost.5-alpha.nightly.20260729";
+      const earlier = "2.0.1-selfhost.5.nightly.20260728";
+      const later = "2.0.1-selfhost.5.nightly.20260729";
       const stable = "2.0.1-selfhost.5";
       assert.ok(compareSelfhostProjectVersions(earlier, later) < 0);
-      assert.ok(compareSelfhostProjectVersions(later, stable) < 0);
+      assert.ok(compareSelfhostProjectVersions(stable, later) < 0);
       assert.ok(
-        compareSelfhostProjectVersions(stable, "2.0.1-selfhost.6-alpha.nightly.20260701") < 0,
+        compareSelfhostProjectVersions(later, "2.0.1-selfhost.6") < 0,
       );
       assert.equal(compareSelfhostProjectVersions(stable, stable), 0);
       for (const invalid of [
-        "2.0.1-selfhost.5-alpha.nightly.20260229",
-        "2.0.1-selfhost.5-alpha.nightly.20261301",
-        "2.0.1-selfhost.5-alpha.nightly.2026072",
+        "2.0.1-selfhost.5.nightly.20260229",
+        "2.0.1-selfhost.5.nightly.20261301",
+        "2.0.1-selfhost.5.nightly.2026072",
         "2.0.1-selfhost.5-nightly.20260729",
+        "2.0.1-selfhost.5-alpha.nightly.20260729",
       ]) {
         assert.throws(() => parseSelfhostProjectVersion(invalid), /unsupported selfhost version/);
       }
       assert.doesNotThrow(() =>
-        parseSelfhostProjectVersion("2.0.1-selfhost.5-alpha.nightly.20240229"),
+        parseSelfhostProjectVersion("2.0.1-selfhost.5.nightly.20240229"),
       );
     },
   ],
   [
     "production signer and verifier accept only valid nightly versions",
     () => {
-      const valid = "2.0.1-selfhost.5-alpha.nightly.20260729";
+      const valid = "2.0.1-selfhost.5.nightly.20260729";
       const signer = runProjectUpdateScript("sign-macos-project-update.mjs", valid);
       assert.notEqual(signer.status, 0);
       assert.match(signer.stderr, /missing LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY/);
@@ -186,7 +187,7 @@ const cases = [
         "sign-macos-project-update.mjs",
         "verify-project-signed-macos-update.mjs",
       ]) {
-        const invalid = runProjectUpdateScript(script, "2.0.1-selfhost.5-alpha.nightly.20260229");
+        const invalid = runProjectUpdateScript(script, "2.0.1-selfhost.5.nightly.20260229");
         assert.notEqual(invalid.status, 0);
         assert.match(invalid.stderr, /unsupported selfhost version/);
       }
@@ -250,20 +251,29 @@ const cases = [
       assert.match(electronUpdater, /"--verify-only"/);
       assert.match(
         electronUpdater,
-        /<verify-project-update! helper arguments\)[\s\S]*?\.then #\(<launch-project-update! helper arguments\)/,
+        /defn run-project-signed-install!/,
       );
       assert.match(
         electronUpdater,
-        /<launch-project-update![\s\S]*?\.once child "spawn"[\s\S]*?\.quit app/,
+        /run-project-signed-install![\s\S]*?\.then \(fn \[\] \(verify!\)\)[\s\S]*?spawn-child! verified/,
       );
       assert.match(
         electronUpdater,
-        /\.once child "spawn"[\s\S]*?set-quit-dirty-state! false[\s\S]*?\.quit app/,
+        /\.once child "error"[\s\S]*?\.once child "spawn"[\s\S]*?set-dirty! false[\s\S]*?\(quit!\)/,
       );
       assert.match(
         electronUpdater,
-        /\.catch[\s\S]*?"\[updater\/install\]"[\s\S]*?emit-update! win "error"/,
+        /\.catch[\s\S]*?set-dirty! true[\s\S]*?emit-error! error[\s\S]*?false/,
       );
+      assert.match(
+        electronUpdater,
+        /defn- <project-signed-install![\s\S]*?run-project-signed-install![\s\S]*?<verify-project-update![\s\S]*?:spawn-child![\s\S]*?\.spawn child-process/,
+      );
+      assert.match(
+        electronUpdater,
+        /defn- emit-install-error![\s\S]*?"\[updater\/install\]"[\s\S]*?emit-update! win "error"/,
+      );
+      assert.doesNotMatch(electronUpdater, /<launch-project-update!/);
       assert.match(
         electronCore,
         /:set-quit-dirty-state! #\(vreset! \*quit-dirty\? %\)/,

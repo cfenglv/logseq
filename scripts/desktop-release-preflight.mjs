@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveSelfhostUpdaterVersions } from "../resources/selfhost-updater-version.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -73,13 +74,10 @@ if (!version) {
   fail(`invalid SemVer release version: ${version}`);
 }
 if (version?.includes("-selfhost.")) {
-  const selfhostRevision = Number(
-    version.match(/^\d+\.\d+\.\d+-selfhost\.(\d+)$/)?.[1],
-  );
-  if (!selfhostRevision || selfhostRevision < 4) {
-    fail(
-      `automatic updater bootstrap requires a numbered selfhost revision >= 4, got ${version}`,
-    );
+  try {
+    resolveSelfhostUpdaterVersions(version);
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
   }
 }
 
@@ -133,7 +131,12 @@ for (const relativePath of [
   "scripts/sign-macos-project-update.mjs",
   "scripts/test-project-update-helper-e2e.mjs",
   "scripts/verify-project-signed-macos-update.mjs",
+  "scripts/test-desktop-sidecar-release-contract.mjs",
+  "scripts/test-updater-install-entry-contract.mjs",
+  "scripts/test-selfhost-macos-user-guidance.mjs",
   "scripts/test-macos-updater-signature-config.mjs",
+  "scripts/test-selfhost-nightly-semver-contract.mjs",
+  "scripts/require-project-signing-policy.mjs",
   "scripts/verify-macos-updater-signature.mjs",
   "scripts/verify-desktop-release-assets.mjs",
   "scripts/run-rtc-e2e.mjs",
@@ -151,6 +154,18 @@ if (
   "node ./scripts/run-rtc-prepush.mjs"
 ) {
   fail("package.json must expose the exact rtc:prepush gate");
+}
+if (
+  rootPackage.scripts?.["desktop:test-release-contracts"] !==
+  "node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs"
+) {
+  fail("package.json must expose the exact desktop release contract gate");
+}
+if (
+  rootPackage.scripts?.["project-update:require-signing-policy"] !==
+  "node ./scripts/require-project-signing-policy.mjs"
+) {
+  fail("package.json must expose the explicit signing-policy release block");
 }
 
 const repositoryGuidelines = readText("AGENTS.md");
@@ -220,6 +235,9 @@ for (const needle of [
   "release-rehearsal-gate:",
   "release-assets-preflight:",
   "pnpm desktop:release-preflight:quick -- --strict",
+  "pnpm desktop:test-release-contracts",
+  "pnpm project-update:require-signing-policy",
+  "pnpm project-update:test-helper",
   "Verify successful push rehearsal",
   "Verify packaged desktop",
   "Verify complete desktop release asset set",
@@ -262,6 +280,14 @@ if (
 ) {
   fail(
     "the compile gate and both macOS jobs must require the staged embedding sidecar before packaging",
+  );
+}
+if (
+  workflow.match(/Run (?:x64|arm64) native project updater helper E2E/g)?.length !== 2 ||
+  workflow.match(/Verify (?:x64|arm64) updater provider contract/g)?.length !== 2
+) {
+  fail(
+    "both real macOS architecture jobs must run the native helper E2E and updater provider contract",
   );
 }
 assertNotContains(

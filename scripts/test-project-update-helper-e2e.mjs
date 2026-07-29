@@ -336,8 +336,8 @@ try {
     /does not contain signed architecture/,
   );
 
-  const nightlyEarlier = "2.0.1-selfhost.5-alpha.nightly.20260728";
-  const nightlyLater = "2.0.1-selfhost.5-alpha.nightly.20260729";
+  const nightlyEarlier = "2.0.1-selfhost.5.nightly.20260728";
+  const nightlyLater = "2.0.1-selfhost.5.nightly.20260729";
   const nightlyTargetParent = path.join(temporaryRoot, "nightly-target");
   const nightlyCandidateParent = path.join(temporaryRoot, "nightly-candidate");
   fs.mkdirSync(nightlyTargetParent);
@@ -366,34 +366,34 @@ try {
   const stableCandidate = createApp(stableCandidateParent, "2.0.1-selfhost.5", "candidate-stable");
   const stableArchive = path.join(temporaryRoot, "stable-candidate.zip");
   zipApp(stableCandidate, stableArchive);
-  expectPass(
-    "stable release supersedes a nightly in the same revision",
+  expectFail(
+    "stable cannot replace a nightly in the same revision",
     signedArguments({
       archive: stableArchive,
       candidateVersion: "2.0.1-selfhost.5",
       privateKey,
       target: nightlyTarget,
     }),
-    /VERIFIED .*20260728 -> 2\.0\.1-selfhost\.5/,
+    /refuses downgrade or same-version/,
   );
 
   const stableTargetParent = path.join(temporaryRoot, "stable-target");
   fs.mkdirSync(stableTargetParent);
   const stableTarget = createApp(stableTargetParent, "2.0.1-selfhost.5", "installed-stable");
-  expectFail(
-    "nightly cannot replace stable in the same revision",
+  expectPass(
+    "nightly supersedes stable in the same revision",
     signedArguments({
       archive: nightlyArchive,
       candidateVersion: nightlyLater,
       privateKey,
       target: stableTarget,
     }),
-    /refuses downgrade or same-version/,
+    /VERIFIED 2\.0\.1-selfhost\.5 -> .*20260729/,
   );
 
   const nextNightlyParent = path.join(temporaryRoot, "next-nightly");
   fs.mkdirSync(nextNightlyParent);
-  const nextNightlyVersion = "2.0.1-selfhost.6-alpha.nightly.20260701";
+  const nextNightlyVersion = "2.0.1-selfhost.6.nightly.20260701";
   const nextNightly = createApp(
     nextNightlyParent,
     nextNightlyVersion,
@@ -409,13 +409,13 @@ try {
       privateKey,
       target: stableTarget,
     }),
-    /VERIFIED 2\.0\.1-selfhost\.5 -> .*selfhost\.6-alpha\.nightly\.20260701/,
+    /VERIFIED 2\.0\.1-selfhost\.5 -> .*selfhost\.6\.nightly\.20260701/,
   );
   expectFail(
     "invalid nightly calendar date fails closed",
     signedArguments({
       archive: nightlyArchive,
-      candidateVersion: "2.0.1-selfhost.5-alpha.nightly.20260229",
+      candidateVersion: "2.0.1-selfhost.5.nightly.20260229",
       privateKey,
       target,
     }),

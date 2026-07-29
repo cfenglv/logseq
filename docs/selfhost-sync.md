@@ -272,15 +272,17 @@ remain GitHub production releases even though their SemVer contains
 
 Use the NSIS installer on Windows and the AppImage on Linux when in-application
 installation is required. On macOS, moving from `.4` to `.5` requires manually
-replacing the application. Starting with `.5`, the app checks for and downloads
-later releases; choosing **Restart and install** uses a fixed project Ed25519
-public key and native replacement helper to verify and install `.6+` updater
-ZIPs independently of the App's ad-hoc code-signing identity. The release
+replacing the application. Starting with `.5`, the default in-app update flow
+automatically checks for and downloads later releases; after the user clicks
+**Restart and install**, a fixed project Ed25519 public key and native
+replacement helper verify and install `.6+` updater ZIPs automatically,
+independently of the App's ad-hoc code-signing identity. The release
 private key is external to the repository; missing key material fails the
 macOS release closed. Without an Apple Developer ID and notarization, macOS may
-require **Open Anyway** on the first launch of `.5` and may ask again after
-later updates. Never change certificate Trust Settings or remove quarantine
-attributes.
+require **Open Anyway** on the first launch of `.5`. Every new ad-hoc
+application bundle may require **Open Anyway** again the first time it is
+opened. The updater never changes certificate Trust Settings and never clears
+or removes quarantine attributes.
 
 ## 10. Reproducibility and release checks
 
@@ -290,7 +292,7 @@ Before publishing a server/client revision:
 pnpm cljs:test
 
 LOGSEQ_STABLE_IDENTS=1 node static/tests.js \
-  -r '^(electron\.(db-worker-manager|power-monitor|proxy|updater-config)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
+  -r '^(electron\.(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
   -e fix-me
 
 pnpm --dir deps/db-sync test
@@ -315,8 +317,10 @@ signature:
 
 - A GitHub package without Apple Developer ID notarization may be blocked by
   Gatekeeper the first time each newly installed application bundle is opened.
-- Use **Open Anyway** for `.5` and again after a later update if macOS requires
-  it. Do not change certificate Trust Settings or remove quarantine attributes.
+- Use **Open Anyway** for `.5` if macOS requires it. Every new ad-hoc
+  application bundle may require **Open Anyway** again the first time it is
+  opened. The updater never changes certificate Trust Settings and never
+  clears or removes quarantine attributes.
 - The project Ed25519 signature authenticates `.6+` in-app updates, but does
   not make an unnotarized build trusted by Gatekeeper.
 - Denying Keychain access can make Safe Storage, login cookies, or tokens
