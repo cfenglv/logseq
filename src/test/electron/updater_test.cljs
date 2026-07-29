@@ -1,5 +1,7 @@
 (ns electron.updater-test
   (:require ["events" :refer [EventEmitter]]
+            ["electron-updater/out/AppUpdater" :as app-updater-module]
+            [clojure.string :as string]
             [cljs.test :refer [async deftest is testing]]
             [electron.updater :as updater]
             [promesa.core :as p]))
@@ -8,6 +10,85 @@
   [message code]
   (doto (js/Error. message)
     (aset "code" code)))
+
+(defn- target-asset
+  [platform arch version]
+  (case platform
+    "darwin" (str "Logseq-darwin-" arch "-" version ".zip")
+    "win32" (str "Logseq-win-" arch "-" version "-nsis.exe")
+    "linux" (str "Logseq-linux-"
+                 (if (= arch "x64") "x86_64" arch)
+                 "-"
+                 version
+                 ".AppImage")))
+
+(defn- update-info
+  [version tag asset & [minimum-system-version]]
+  (let [info #js {:version version
+                  :files #js [#js {:url asset}]}]
+    (when-not (= tag ::absent)
+      (aset info "tag" (when-not (= tag ::null) tag)))
+    (when minimum-system-version
+      (aset info "minimumSystemVersion" minimum-system-version))
+    info))
+
+(defn- reset-production-policy-caches!
+  []
+  (when-let [namespace-object
+             (.getObjectByName js/goog "electron.updater")]
+    (doseq [key (array-seq (js/Object.keys namespace-object))
+            :when (re-find #"(?:policy|signature|support)"
+                           (string/lower-case key))
+            :let [candidate (aget namespace-object key)]
+            :when (some? candidate)
+            :when (some?
+                   (aget candidate
+                         "cljs$core$IReset$_reset_BANG_$arity$2"))]
+      (reset! candidate nil))))
+
+(defn- configure-production-policy!
+  [version]
+  (let [auto-updater
+        (aget js/globalThis "__LOGSEQ_TEST_AUTO_UPDATER__")]
+    (reset-production-policy-caches!)
+    (.resetContractState auto-updater)
+    (let [dispose!
+          (with-redefs [updater/electron-version version]
+            (updater/init-updater {:win nil}))
+          raw-policy (.-isUpdateSupported auto-updater)]
+      {:auto-updater auto-updater
+       :dispose! dispose!
+       :policy (fn [info]
+                 (with-redefs [updater/electron-version version]
+                   (raw-policy info)))})))
+
+(defn- run-app-updater-flow!
+  [current info production-policy]
+  (let [app-updater
+        (new (.-AppUpdater app-updater-module)
+             nil
+             #js {:version current})
+        downloads (atom 0)]
+    (set! (.-logger app-updater)
+          #js {:debug (fn [])
+               :error (fn [])
+               :info (fn [])
+               :warn (fn [])})
+    (set! (.-allowDowngrade app-updater) false)
+    (set! (.-autoDownload app-updater) true)
+    (set! (.-isUpdateSupported app-updater) production-policy)
+    (set! (.-isUserWithinRollout app-updater) (fn [_] true))
+    (set! (.-getUpdateInfoAndProvider app-updater)
+          (fn []
+            (p/resolved #js {:info info :provider #js {}})))
+    (set! (.-downloadUpdate app-updater)
+          (fn [& _]
+            (swap! downloads inc)
+            (p/resolved #js ["controlled-download-fixture"])))
+    (p/let [result (.doCheckForUpdates app-updater)
+            _ (or (.-downloadPromise result) (p/resolved nil))]
+      {:available? (true? (.-isUpdateAvailable result))
+       :downloads @downloads})))
 
 (defn- run-install-scenario!
   [{:keys [failure]}]
@@ -86,6 +167,157 @@
         (p/finally
          (fn []
            (.off js/process "unhandledRejection" unhandled-handler))))))
+
+(deftest production-update-policy-controls-real-app-updater-downloads
+  (async done
+    (let [platform (.-platform js/process)
+          arch (.-arch js/process)
+          other-arch (if (= arch "x64") "arm64" "x64")
+          other-platform (if (= platform "darwin") "win32" "darwin")
+          stable-current "2.0.1-selfhost.5"
+          stable-next "2.0.1-selfhost.6"
+          nightly-current "2.0.1-selfhost.6.nightly.20260728"
+          nightly-next "2.0.1-selfhost.6.nightly.20260729"
+          disposers (atom [])
+          stable-config (configure-production-policy! stable-current)
+          _ (swap! disposers conj (:dispose! stable-config))
+          stable-policy (:policy stable-config)
+          stable-asset (target-asset platform arch stable-next)
+          stable-good (update-info stable-next stable-next stable-asset)
+          stable-wrong-tag
+          (update-info stable-next "2.0.1-selfhost.999" stable-asset)
+          stable-wrong-arch
+          (update-info stable-next
+                       stable-next
+                       (target-asset platform other-arch stable-next))
+          stable-wrong-platform
+          (update-info stable-next
+                       stable-next
+                       (target-asset other-platform arch stable-next))
+          stable-wrong-version
+          (update-info stable-next
+                       stable-next
+                       (target-asset platform arch "2.0.1-selfhost.7"))
+          stable-cross-track
+          (update-info nightly-next
+                       "nightly"
+                       (target-asset platform arch nightly-next))
+          stable-minimum-system
+          (update-info stable-next
+                       stable-next
+                       stable-asset
+                       "999.0.0")]
+      (-> (p/let [good (run-app-updater-flow!
+                        stable-current stable-good stable-policy)
+                  wrong-tag (run-app-updater-flow!
+                             stable-current stable-wrong-tag stable-policy)
+                  wrong-arch (run-app-updater-flow!
+                              stable-current stable-wrong-arch stable-policy)
+                  wrong-platform
+                  (run-app-updater-flow!
+                   stable-current stable-wrong-platform stable-policy)
+                  wrong-version
+                  (run-app-updater-flow!
+                   stable-current stable-wrong-version stable-policy)
+                  cross-track
+                  (run-app-updater-flow!
+                   stable-current stable-cross-track stable-policy)
+                  unsupported-system
+                  (run-app-updater-flow!
+                   stable-current stable-minimum-system stable-policy)]
+            (is (= {:available? true :downloads 1} good)
+                "production stable policy accepts a valid later stable")
+            (doseq [[label result]
+                    [["wrong tag" wrong-tag]
+                     ["wrong architecture" wrong-arch]
+                     ["wrong platform" wrong-platform]
+                     ["asset/version mismatch" wrong-version]
+                     ["stable to nightly" cross-track]
+                     ["minimum system version" unsupported-system]]]
+              (is (= {:available? false :downloads 0} result)
+                  (str "production policy rejects " label)))
+            (is (some #(identical? stable-minimum-system %)
+                      (array-seq
+                       (.-defaultSupportCalls
+                        (:auto-updater stable-config))))
+                "production wrapper preserves the original minimumSystemVersion callback")
+            (let [nightly-config
+                  (configure-production-policy! nightly-current)
+                  _ (swap! disposers conj (:dispose! nightly-config))
+                  nightly-policy (:policy nightly-config)
+                  nightly-asset
+                  (target-asset platform arch nightly-next)
+                  feed-calls
+                  (array-seq
+                   (.-feedURLCalls (:auto-updater nightly-config)))
+                  feed-text
+                  (string/lower-case
+                   (str (or (some-> feed-calls last (aget "url"))
+                            (some-> feed-calls last)
+                            "")))]
+              (is (= 1 (count feed-calls))
+                  "nightly production path configures exactly one Generic feed")
+              (is (string/includes? feed-text "nightly")
+                  "nightly production feed is an isolated rolling URL")
+              (is (not (string/includes? feed-text "/releases/latest"))
+                  "nightly production path never points at stable latest")
+              (is (true?
+                   (.-allowPrerelease (:auto-updater nightly-config)))
+                  "nightly production path enables prerelease metadata")
+              (p/let [rolling-tag
+                      (run-app-updater-flow!
+                       nightly-current
+                       (update-info nightly-next
+                                    "nightly"
+                                    nightly-asset)
+                       nightly-policy)
+                      absent-tag
+                      (run-app-updater-flow!
+                       nightly-current
+                       (update-info nightly-next
+                                    ::absent
+                                    nightly-asset)
+                       nightly-policy)
+                      null-tag
+                      (run-app-updater-flow!
+                       nightly-current
+                       (update-info nightly-next
+                                    ::null
+                                    nightly-asset)
+                       nightly-policy)
+                      dated-tag
+                      (run-app-updater-flow!
+                       nightly-current
+                       (update-info nightly-next
+                                    nightly-next
+                                    nightly-asset)
+                       nightly-policy)
+                      manual-exit
+                      (run-app-updater-flow!
+                       nightly-current
+                       (update-info stable-next
+                                    stable-next
+                                    stable-asset)
+                       nightly-policy)]
+                (doseq [[label result]
+                        [["rolling tag" rolling-tag]
+                         ["absent tag" absent-tag]
+                         ["null tag" null-tag]]]
+                  (is (= {:available? true :downloads 1} result)
+                      (str "production nightly policy accepts " label)))
+                (is (= {:available? false :downloads 0} dated-tag)
+                    "rolling Generic metadata rejects a dated release tag")
+                (is (= {:available? false :downloads 0} manual-exit)
+                    "nightly requires manual exit to stable"))))
+          (p/catch
+           (fn [error]
+             (is false
+                 (str "production updater policy contract failed: " error))))
+          (p/finally
+           (fn []
+             (doseq [dispose! @disposers]
+               (dispose!))
+             (done)))))))
 
 (deftest install-failures-keep-dirty-protection-and-report-to-updater-ui
   (async done

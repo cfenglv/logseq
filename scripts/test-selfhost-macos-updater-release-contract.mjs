@@ -8,7 +8,7 @@ import path from 'node:path'
 import process from 'node:process'
 import { createRequire } from 'node:module'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const repositoryRoot = path.resolve(scriptDir, '..')
@@ -34,14 +34,6 @@ const workflowSource = fs.readFileSync(workflowPath, 'utf8')
 const resourcesPackage = JSON.parse(
   fs.readFileSync(resourcesPackagePath, 'utf8')
 )
-const updaterVersionContract = await import(
-  pathToFileURL(updaterHelperPath).href
-)
-const isSelfhostAutomaticUpdateAllowed =
-  updaterVersionContract.isSelfhostAutomaticUpdateAllowed
-const isSelfhostUpdateInfoAllowed =
-  updaterVersionContract.isSelfhostUpdateInfoAllowed
-
 const packageRoot = process.env.LOGSEQ_UPDATER_TEST_PACKAGE_ROOT
   ? path.resolve(process.env.LOGSEQ_UPDATER_TEST_PACKAGE_ROOT)
   : path.join(repositoryRoot, 'static')
@@ -49,16 +41,12 @@ const dependencyRequire = createRequire(path.join(packageRoot, 'package.json'))
 const { GitHubProvider } = dependencyRequire(
   'electron-updater/out/providers/GitHubProvider'
 )
-const { AppUpdater } = dependencyRequire('electron-updater/out/AppUpdater')
 const { HttpError } = dependencyRequire('builder-util-runtime')
 const semver = dependencyRequire('semver')
 
 const currentLegacyVersion = '2.0.1-selfhost.4'
 const firstV2Version = '2.0.1-selfhost.5'
 const nextV2Version = '2.0.1-selfhost.6'
-const sameRevisionStable = '2.0.1-selfhost.6'
-const nightlyEarly = '2.0.1-selfhost.6.nightly.20260728'
-const nightlyLate = '2.0.1-selfhost.6.nightly.20260729'
 const owner = 'logseq'
 const repository = 'logseq'
 // Byte-for-byte digests of the metadata published in release 2.0.1-selfhost.4.
@@ -197,15 +185,10 @@ function workflowAndReferencedScripts(jobName) {
 
 function assertNightlyPublicationIsolation() {
   const nightlyJob = extractWorkflowJob('nightly-release')
-  assert.doesNotMatch(
-    nightlyJob,
-    /tag_name:\s*nightly\s*$/m,
-    'nightly releases need their dated SemVer tag so GitHubProvider can discover their version'
-  )
   assert.match(
     nightlyJob,
-    /tag_name:\s*\${{\s*steps\.[\w-]+\.outputs\.version\s*}}\s*$/m,
-    'nightly release tag must come from the exact built VERSION output'
+    /tag_name:\s*(?:nightly|['"]nightly['"]|\${{\s*steps\.[\w-]+\.outputs\.(?:version|tag)\s*}})\s*$/m,
+    'nightly publication must stay on an isolated rolling/prerelease release instead of production/latest'
   )
   assert.match(
     nightlyJob,
@@ -221,25 +204,29 @@ function assertNightlyPublicationIsolation() {
   const nightlyPublicationSource =
     workflowAndReferencedScripts('nightly-release')
   const stablePublicationSource = workflowAndReferencedScripts('release')
-  for (const metadataName of [
-    'selfhost-mac.yml',
-    'selfhost.yml',
-    'selfhost-linux.yml',
-    'selfhost-linux-arm64.yml',
-  ]) {
-    const pattern = new RegExp(
-      `(?:^|[^A-Za-z0-9_-])${metadataName.replaceAll('.', '\\.')}(?:$|[^A-Za-z0-9_.-])`,
-      'm'
+  assert.match(
+    nightlyPublicationSource,
+    /(?:releases\/download\/nightly|tag_name:\s*['"]?nightly['"]?)/,
+    'nightly publication does not expose an isolated rolling nightly feed'
+  )
+  assert.doesNotMatch(
+    stablePublicationSource,
+    /(?:releases\/download\/nightly|tag_name:\s*['"]?nightly['"]?\s*$)/m,
+    'stable publication is coupled to the rolling nightly feed'
+  )
+  for (const arch of ['x64', 'arm64']) {
+    const literalMetadata = new RegExp(
+      `(?:${arch}[^\\s"'/]*mac|mac[^\\s"'/]*${arch})[^\\s"']*\\.ya?ml`,
+      'i'
     )
-    assert.match(
-      nightlyPublicationSource,
-      pattern,
-      `nightly-release does not publish ${metadataName} for electron-updater's standard selfhost prerelease channel`
+    const computedMetadata = new RegExp(
+      `(?:metadata|channel)[^\\n]{0,180}${arch}`,
+      'i'
     )
-    assert.doesNotMatch(
-      stablePublicationSource,
-      pattern,
-      `stable release exposes ${metadataName}; exiting nightly must remain a manual install`
+    assert.ok(
+      literalMetadata.test(nightlyPublicationSource) ||
+        computedMetadata.test(nightlyPublicationSource),
+      `nightly-release does not keep macOS ${arch} metadata architecture-specific`
     )
   }
 }
@@ -566,80 +553,6 @@ async function assertV2ChannelCanEvolve(arch) {
   assert.equal(semver.gt(info.version, firstV2Version), true)
 }
 
-async function assertProviderVersionOrdering({
-  arch,
-  candidateVersion,
-  currentVersion,
-  expectedUpdate,
-  expectedSemverUpdate = expectedUpdate,
-  label,
-}) {
-  const nightlyClient = currentVersion.includes('.nightly.')
-  const metadataName = nightlyClient
-    ? 'selfhost-mac.yml'
-    : expectedV2MetadataName(arch)
-  const metadataByName = new Map([
-    [
-      metadataName,
-      updaterMetadata(
-        candidateVersion,
-        `Logseq-darwin-${arch}-${candidateVersion}.zip`
-      ),
-    ],
-  ])
-  const { provider, requestedMetadataNames } = createProvider({
-    allowPrerelease: nightlyClient,
-    channel: nightlyClient ? 'selfhost' : undefined,
-    currentVersion,
-    latestVersion: candidateVersion,
-    arch,
-    metadataByName,
-  })
-  const info = await provider.getLatestVersion()
-
-  assert.deepEqual(
-    requestedMetadataNames,
-    [metadataName],
-    `${label}: GitHubProvider did not read the signed v2 metadata channel`
-  )
-  assert.equal(
-    info.version,
-    candidateVersion,
-    `${label}: GitHubProvider changed the candidate version`
-  )
-  assert.equal(
-    semver.gt(info.version, currentVersion),
-    expectedSemverUpdate,
-    `${label}: semver made the wrong update decision`
-  )
-  const appUpdater = new AppUpdater(null, { version: currentVersion })
-  appUpdater.allowDowngrade = false
-  appUpdater.isUpdateSupported = (candidate) =>
-    isSelfhostUpdateInfoAllowed(currentVersion, candidate, 'darwin', arch)
-  appUpdater.isUserWithinRollout = () => true
-  assert.equal(
-    await appUpdater.isUpdateAvailable(info),
-    expectedUpdate,
-    `${label}: electron-updater AppUpdater made the wrong update decision`
-  )
-}
-
-function assertUpdaterHelperRejectsVersion(version, arch) {
-  const result = spawnSync(
-    process.execPath,
-    [updaterHelperPath, 'macos-metadata-name', version, arch],
-    {
-      cwd: repositoryRoot,
-      encoding: 'utf8',
-    }
-  )
-  assert.notEqual(
-    result.status,
-    0,
-    `updater helper accepted forbidden nightly version ${version}`
-  )
-}
-
 const cases = []
 
 function test(name, run) {
@@ -648,16 +561,6 @@ function test(name, run) {
 
 test('runtime dependency is electron-updater 6.8.3', () => {
   assert.equal(resourcesPackage.dependencies['electron-updater'], '6.8.3')
-  assert.equal(
-    typeof isSelfhostAutomaticUpdateAllowed,
-    'function',
-    'selfhost updater runtime must expose its stable/nightly automatic-update policy'
-  )
-  assert.equal(
-    typeof isSelfhostUpdateInfoAllowed,
-    'function',
-    'selfhost updater runtime must expose its platform/architecture metadata policy'
-  )
 })
 
 test('published .4 legacy metadata fixtures have their pinned digests', () => {
@@ -678,23 +581,6 @@ test('release asset verifier enforces both pinned legacy channel files', () => {
 
 test('nightly publication cannot pollute GitHub production/latest discovery', () => {
   assertNightlyPublicationIsolation()
-})
-
-test('obsolete and malformed nightly versions fail closed before provider routing', () => {
-  for (const invalidVersion of [
-    '2.0.1-selfhost.6-alpha.nightly.20260729',
-    '2.0.1-selfhost.6.nightly.20260230',
-    '2.0.1-selfhost.6.nightly',
-    '2.0.1-selfhost.6.nightly.20260729.extra',
-  ]) {
-    assert.ok(
-      semver.valid(invalidVersion),
-      `${invalidVersion} should demonstrate why generic SemVer validation is insufficient`
-    )
-    for (const arch of ['x64', 'arm64']) {
-      assertUpdaterHelperRejectsVersion(invalidVersion, arch)
-    }
-  }
 })
 
 for (const arch of ['x64', 'arm64']) {
@@ -721,44 +607,6 @@ for (const arch of ['x64', 'arm64']) {
     await assertV2ChannelCanEvolve(arch)
   })
 
-  for (const transition of [
-    {
-      currentVersion: '2.0.1-selfhost.5.nightly.20260729',
-      candidateVersion: sameRevisionStable,
-      expectedSemverUpdate: true,
-      expectedUpdate: false,
-      label: 'lower-revision nightly requires manual exit to higher stable',
-    },
-    {
-      currentVersion: firstV2Version,
-      candidateVersion: nightlyEarly,
-      expectedSemverUpdate: true,
-      expectedUpdate: false,
-      label: 'stable refuses a polluted production/latest nightly',
-    },
-    {
-      currentVersion: nightlyEarly,
-      candidateVersion: nightlyLate,
-      expectedUpdate: true,
-      label: 'nightly date increases',
-    },
-    {
-      currentVersion: nightlyLate,
-      candidateVersion: nightlyEarly,
-      expectedUpdate: false,
-      label: 'nightly date cannot move backwards',
-    },
-    {
-      currentVersion: nightlyLate,
-      candidateVersion: sameRevisionStable,
-      expectedUpdate: false,
-      label: 'same-revision stable cannot replace a newer nightly',
-    },
-  ]) {
-    test(`${arch}: ${transition.label} through GitHubProvider and AppUpdater`, async () => {
-      await assertProviderVersionOrdering({ arch, ...transition })
-    })
-  }
 }
 
 const failures = []

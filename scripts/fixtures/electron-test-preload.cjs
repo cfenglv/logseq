@@ -5,6 +5,11 @@ const Module = require("node:module");
 const os = require("node:os");
 const path = require("node:path");
 
+Object.defineProperty(process, "resourcesPath", {
+  configurable: true,
+  value: path.resolve(__dirname, "..", "..", "static"),
+});
+
 const noop = (() => {
   const target = function () {};
   const proxy = new Proxy(target, {
@@ -35,6 +40,11 @@ const ipcMain = Object.assign(new EventEmitter(), {
   handle() {},
   removeHandler() {},
 });
+const defaultSupportCalls = [];
+const defaultIsUpdateSupported = (info) => {
+  defaultSupportCalls.push(info);
+  return info?.minimumSystemVersion !== "999.0.0";
+};
 const autoUpdater = Object.assign(new EventEmitter(), {
   allowDowngrade: false,
   allowPrerelease: false,
@@ -43,8 +53,26 @@ const autoUpdater = Object.assign(new EventEmitter(), {
   checkForUpdates: async () => ({
     isUpdateAvailable: false,
   }),
+  defaultSupportCalls,
   downloadUpdate: async () => [],
+  feedURLCalls: [],
+  isUpdateSupported: defaultIsUpdateSupported,
   quitAndInstall() {},
+  setFeedURL(options) {
+    this.feedURLCalls.push(options);
+    this.feedURL = options;
+  },
+  resetContractState() {
+    this.allowDowngrade = false;
+    this.allowPrerelease = false;
+    this.autoDownload = false;
+    this.autoInstallOnAppQuit = false;
+    this.channel = undefined;
+    this.defaultSupportCalls.length = 0;
+    this.feedURLCalls.length = 0;
+    this.feedURL = undefined;
+    this.isUpdateSupported = defaultIsUpdateSupported;
+  },
 });
 const electron = new Proxy(
   {
@@ -78,3 +106,5 @@ Module._load = function loadWithElectronTestDoubles(
   if (request === "electron-updater") return { autoUpdater };
   return originalLoad.call(this, request, parent, isMain);
 };
+
+globalThis.__LOGSEQ_TEST_AUTO_UPDATER__ = autoUpdater;

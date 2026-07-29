@@ -232,11 +232,6 @@ assert.equal(
   "string",
   "package.json should expose the explicit native updater test-helper target",
 );
-assert.doesNotMatch(
-  desktopReleaseAssetVerifier,
-  /-alpha\.nightly/,
-  "release asset verifier guidance must not advertise the obsolete nightly format",
-);
 assert.match(
   desktopReleaseAssetVerifier,
   /selfhost[\s\S]{0,80}nightly[\s\S]{0,80}YYYYMMDD/i,

@@ -181,6 +181,33 @@ const resourceVariants = (tokens, predicate) =>
     }),
   );
 
+const collectRelativeModuleClosure = (
+  relativePath,
+  seen = new Set(),
+) => {
+  const normalized = path.normalize(relativePath);
+  if (seen.has(normalized)) return seen;
+  seen.add(normalized);
+  const sourcePath = path.join(repoRoot, "resources", normalized);
+  if (!fs.existsSync(sourcePath)) return seen;
+  const source = fs.readFileSync(sourcePath, "utf8");
+  for (const match of source.matchAll(
+    /(?:from\s+|import\s*\(\s*)["'](\.[^"']+\.(?:c?js|mjs))["']/g,
+  )) {
+    const dependency = path.normalize(
+      path.join(path.dirname(normalized), match[1]),
+    );
+    collectRelativeModuleClosure(dependency, seen);
+  }
+  return seen;
+};
+const verifierDependencyRelativePaths = unique([
+  "packaged-resource-contract.mjs",
+  ...collectRelativeModuleClosure("verify-packaged-desktop.mjs"),
+]).filter(
+  (relativePath) => relativePath !== "verify-packaged-desktop.mjs",
+);
+
 const helperNames = unique([
   "project-update-helper",
   "project-signed-update-helper",
@@ -210,6 +237,7 @@ const policyRelativePaths = unique([
   ),
 ]);
 const runtimeRelativePaths = unique([
+  ...verifierDependencyRelativePaths,
   path.join("sidecar", "run-project-signed-macos-update.mjs"),
   path.join("updater", "run-project-signed-macos-update.mjs"),
   path.join("scripts", "run-project-signed-macos-update.mjs"),

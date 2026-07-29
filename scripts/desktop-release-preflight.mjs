@@ -116,6 +116,7 @@ for (const relativePath of [
   "resources/electron-builder-unsigned.mjs",
   "resources/electron-builder-adhoc-after-sign.cjs",
   "resources/entitlements.local-signed.plist",
+  "resources/packaged-resource-contract.mjs",
   "resources/selfhost-updater-version.mjs",
   "resources/project-updater-signature.mjs",
   "resources/packaged-resource-contract.mjs",
@@ -153,6 +154,31 @@ for (const relativePath of [
 ]) {
   assertFile(relativePath);
 }
+
+const relativeModuleClosure = (entryPath, seen = new Set()) => {
+  if (seen.has(entryPath)) return seen;
+  seen.add(entryPath);
+  const source = readText(entryPath);
+  for (const match of source.matchAll(
+    /(?:from\s+|import\s*\(\s*)["'](\.[^"']+\.(?:c?js|mjs))["']/g,
+  )) {
+    const dependency = path
+      .normalize(path.join(path.dirname(entryPath), match[1]))
+      .replaceAll(path.sep, "/");
+    relativeModuleClosure(dependency, seen);
+  }
+  return seen;
+};
+const packagedVerifierClosure = [
+  ...relativeModuleClosure("resources/verify-packaged-desktop.mjs"),
+]
+  .map((relativePath) => readText(relativePath))
+  .join("\n");
+assertContains(
+  packagedVerifierClosure,
+  "project-updater-signature.mjs",
+  "packaged desktop verifier import closure",
+);
 
 if (
   rootPackage.scripts?.["rtc:prepush"] !==

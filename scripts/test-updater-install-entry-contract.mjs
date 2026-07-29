@@ -81,9 +81,24 @@ assert.ok(
   installDownloadedUpdate,
   "main downloaded-update installer is missing",
 );
-assert.match(
-  installDownloadedUpdate,
-  /run-project-signed-install!/,
+const directlyUsesTimingSeam =
+  /run-project-signed-install!/.test(installDownloadedUpdate);
+const oneLayerDelegateNames = [
+  ...installDownloadedUpdate.matchAll(
+    /\(([\w<>!?*-]*project-signed[\w<>!?*-]*)\b/g,
+  ),
+].map((match) => match[1]);
+const delegatedToTimingSeam = oneLayerDelegateNames.some((delegateName) => {
+  const escaped = delegateName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const definition = electronUpdater.match(
+    new RegExp(
+      `\\(defn-?\\s+${escaped}[\\s\\S]*?(?=\\n\\(defn|\\s*$)`,
+    ),
+  )?.[0];
+  return definition && /run-project-signed-install!/.test(definition);
+});
+assert.ok(
+  directlyUsesTimingSeam || delegatedToTimingSeam,
   "downloaded-update installer bypasses the mocked project-signed timing seam",
 );
 
@@ -98,8 +113,13 @@ assert.match(
 );
 assert.match(
   configureAutoUpdater,
-  /updater-config\/update-info-allowed\?/,
-  "auto-updater runtime does not delegate candidate filtering to the tested track and metadata policy",
+  /updater-config\/updater-options/,
+  "auto-updater runtime does not consume the black-box provider options",
+);
+assert.match(
+  configureAutoUpdater,
+  /setFeedURL/,
+  "auto-updater runtime does not apply the isolated rolling Generic feed returned for nightly clients",
 );
 
 assert.match(

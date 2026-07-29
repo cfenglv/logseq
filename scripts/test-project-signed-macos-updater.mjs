@@ -110,9 +110,20 @@ const trackedPrivateMaterial = () => {
     ),
   );
   const marker = ["BEGIN", "PRIVATE", "KEY"].join(" ");
-  const markerSearch = command("git", ["grep", "-l", marker], {
-    allowFailure: true,
-  });
+  const markerSearch = command(
+    "git",
+    [
+      "grep",
+      "-l",
+      marker,
+      "--",
+      ".",
+      ":(exclude)scripts/test-project-signed-macos-updater.mjs",
+    ],
+    {
+      allowFailure: true,
+    },
+  );
   return {
     forbiddenNames,
     markerFiles: markerSearch.status === 0 ? markerSearch.output : "",
@@ -1527,8 +1538,11 @@ const runNativeHelperContract = async () => {
   );
   const {
     bundleId,
+    configured: productionPolicyConfigured,
+    derivedKeyId: productionDerivedKeyId,
     payloadDomain,
     policy: productionPolicy,
+    publicKeyRaw: productionPublicKeyRaw,
   } = loadPolicy();
   const helperBuildPath = discoverHelperBuildPath();
   const [helpExecutable, helpArgs] = scriptCommand(helperBuildPath, ["--help"]);
@@ -1868,14 +1882,39 @@ const runNativeHelperContract = async () => {
     });
 
     const workflow = fs.readFileSync(workflowPath, "utf8");
+    const signerSecrets = signingVariableNames(workflow);
+    const managedSignerAvailable =
+      productionPolicyConfigured &&
+      signerSecrets.length > 0 &&
+      signerSecrets.some((name) => Boolean(process.env[name]));
+    const productionCompositeBlockReason = !productionPolicyConfigured
+      ? "production Ed25519 policy is UNCONFIGURED; managed signer/native composite is blocked"
+      : !managedSignerAvailable
+        ? "managed production Ed25519 private key is unavailable; signer/native composite is blocked"
+        : null;
+    let signWithReleaseCli = null;
+    let expectSignerRejectsVersion = null;
+    if (managedSignerAvailable) {
     const productionSignerPath = discoverSignerPath(workflow);
+    const productionPublicKeyRawBase64 =
+      productionPublicKeyRaw.toString("base64");
+    const productionFullKeyId =
+      `ed25519:${productionDerivedKeyId}`;
+    const productionPublicKey = createPublicKey({
+      format: "jwk",
+      key: {
+        crv: "Ed25519",
+        kty: "OKP",
+        x: productionPublicKeyRaw.toString("base64url"),
+      },
+    });
     const isolatedSigner = createIsolatedSignerTree({
       bundleId,
       destinationRoot: path.join(tempRoot, "isolated-release-signer"),
-      fullKeyId,
+      fullKeyId: productionFullKeyId,
       payloadDomain,
       policyTemplate: productionPolicy,
-      publicKeyRawBase64,
+      publicKeyRawBase64: productionPublicKeyRawBase64,
       signerPath: productionSignerPath,
       sourceRoot: repoRoot,
     });
@@ -1890,29 +1929,12 @@ const runNativeHelperContract = async () => {
       true,
       "native release test signer is not isolated under its fixture root",
     );
-    const signerSecrets = signingVariableNames(workflow);
     assert.ok(
       signerSecrets.length > 0,
       "workflow does not expose the release signer private-key environment",
     );
-    const privateKeyPkcs8Der = signingKeys.privateKey.export({
-      format: "der",
-      type: "pkcs8",
-    });
-    assert.equal(Buffer.isBuffer(privateKeyPkcs8Der), true);
-    assert.doesNotMatch(
-      privateKeyPkcs8Der.toString("utf8"),
-      /-----BEGIN PRIVATE KEY-----/,
-      "release signer fixture encoded PEM text instead of PKCS#8 DER bytes",
-    );
-    const privateKeyPkcs8Base64 = privateKeyPkcs8Der.toString("base64");
-    const signerEnv = {
-      ...process.env,
-      ...Object.fromEntries(
-        signerSecrets.map((name) => [name, privateKeyPkcs8Base64]),
-      ),
-    };
-    const signWithReleaseCli = (fixture, label) => {
+    const signerEnv = { ...process.env };
+    signWithReleaseCli = (fixture, label) => {
       const metadata = path.join(
         path.dirname(fixture.artifactPath),
         `${label.replaceAll(" ", "-")}-latest-mac.yml`,
@@ -1977,7 +1999,9 @@ const runNativeHelperContract = async () => {
       );
       assert.match(
         metadataText,
-        new RegExp(fullKeyId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        new RegExp(
+          productionFullKeyId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        ),
         `${label} metadata does not contain the complete Ed25519 keyId`,
       );
       assert.match(
@@ -1997,7 +2021,7 @@ const runNativeHelperContract = async () => {
         cryptoVerify(
           null,
           Buffer.from(exactPayload),
-          signingKeys.publicKey,
+          productionPublicKey,
           Buffer.from(signature, "base64"),
         ),
         true,
@@ -2021,7 +2045,7 @@ const runNativeHelperContract = async () => {
                 version: stableAlias,
               }),
             ),
-            signingKeys.publicKey,
+            productionPublicKey,
             Buffer.from(signature, "base64"),
           ),
           false,
@@ -2030,7 +2054,7 @@ const runNativeHelperContract = async () => {
       }
       return { ...fixture, signature };
     };
-    const expectSignerRejectsVersion = (candidateVersion) => {
+    expectSignerRejectsVersion = (candidateVersion) => {
       const fixture = makeFixture({
         root: path.join(
           tempRoot,
@@ -2093,6 +2117,7 @@ const runNativeHelperContract = async () => {
         `release signer modified metadata for invalid ${candidateVersion}`,
       );
     };
+    }
     const invokeViaJsRuntime = (fixture, targetApp) =>
       command(
         process.execPath,
@@ -2168,19 +2193,21 @@ const runNativeHelperContract = async () => {
       "2.0.1-selfhost.6.nightly.20260728";
     const nightlyLate =
       "2.0.1-selfhost.6.nightly.20260729";
-    const releaseSignedNightly = signWithReleaseCli(
-      makeFixture({
-        root: path.join(tempRoot, "release-signed-nightly"),
-        version: nightlyLate,
-      }),
-      "release signed nightly",
-    );
+    const nightlyFixture = makeFixture({
+      root: path.join(tempRoot, "release-signed-nightly"),
+      version: nightlyLate,
+    });
+    const releaseSignedNightly = signWithReleaseCli
+      ? signWithReleaseCli(nightlyFixture, "release signed nightly")
+      : nightlyFixture;
     expectVersionTransition({
       accepted: true,
       candidateVersion: nightlyLate,
       currentVersion: nightlyEarly,
       fixture: releaseSignedNightly,
-      label: "release signer metadata JS runtime native helper nightly chain",
+      label: signWithReleaseCli
+        ? "managed release signer metadata JS runtime native helper nightly chain"
+        : "TEST-ONLY helper JS runtime native nightly chain",
     });
     for (const transition of [
       {
@@ -2235,7 +2262,7 @@ const runNativeHelperContract = async () => {
       "2.0.1-selfhost.6.nightly",
       "2.0.1-selfhost.6.nightly.20260729.extra",
     ]) {
-      expectSignerRejectsVersion(invalidVersion);
+      expectSignerRejectsVersion?.(invalidVersion);
       expectVersionTransition({
         accepted: false,
         candidateVersion: invalidVersion,
@@ -2557,6 +2584,9 @@ const runNativeHelperContract = async () => {
     );
     assert.deepEqual(fs.readdirSync(successTarget.parent), ["Logseq.app"]);
     assert.equal(userTrustSettingsDigest(), initialTrust);
+    if (productionCompositeBlockReason) {
+      throw new ReleaseBlock(productionCompositeBlockReason);
+    }
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
@@ -2797,21 +2827,20 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
   const processArchBinding = updater.match(
     /\b([a-zA-Z][\w!?-]*)\s+\(\.-arch js\/process\)/,
   );
-  assert.ok(
-    processArchBinding,
-    "Electron updater does not bind its helper architecture from process.arch",
-  );
-  const processArchSymbol = processArchBinding[1];
   const signedRouteStart = updater.indexOf("project-signed-macos-updater?");
   assert.notEqual(signedRouteStart, -1);
   const signedRoute = updater.slice(
     signedRouteStart,
     signedRouteStart + 4000,
   );
+  const directProcessArch = String.raw`\(\.-arch\s+js\/process\)`;
+  const processArchArgument = processArchBinding
+    ? `${processArchBinding[1]}\\b`
+    : directProcessArch;
   assert.match(
     signedRoute,
     new RegExp(
-      `(?:--arch|:arch)\\s+${processArchSymbol}\\b|${processArchSymbol}\\s+(?:--arch|:arch)`,
+      `(?:--arch|:arch)\\s+${processArchArgument}|${processArchArgument}\\s+(?:--arch|:arch)`,
     ),
     "Electron does not bind signed update metadata/helper arch to process.arch",
   );

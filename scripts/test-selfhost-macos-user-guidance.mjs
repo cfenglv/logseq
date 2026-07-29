@@ -51,7 +51,7 @@ const assertMacosGuidance = (label, source) => {
     `${label} must warn that every new ad-hoc version may need Open Anyway on first launch`,
   );
   check(
-    /(?:does not|will not|never|不(?:会|要)?)[\s\S]{0,100}(?:change|modify|write|add|alter|touch|更改|修改|写入)[\s\S]{0,100}Trust Settings|Trust Settings[\s\S]{0,100}(?:remain|unchanged|untouched|不变)/i.test(
+    /(?:does not|will not|never|without|不(?:会|要)?)[\s\S]{0,100}(?:change|changing|modify|modifying|write|add|alter|touch|更改|修改|写入)[\s\S]{0,100}Trust Settings|Trust Settings[\s\S]{0,100}(?:remain|unchanged|untouched|不变)/i.test(
       text,
     ),
     `${label} must state that the updater does not change Trust Settings`,
@@ -78,7 +78,7 @@ const assertMacosGuidance = (label, source) => {
     /(?:nightly|夜间版)[\s\S]{0,220}(?:only|仅|只)[\s\S]{0,100}(?:automatic(?:ally)?|自动)[\s\S]{0,160}(?:later|newer|subsequent|后续|更新的)[\s\S]{0,100}(?:dated[\s-]*)?(?:nightly|夜间版)/i.test(
       text,
     ),
-    `${label} must limit nightly automatic updates to later dated nightlies`,
+    `${label} must limit nightly automatic updates to later nightly versions`,
   );
   check(
     /(?:nightly|夜间版)[\s\S]{0,260}(?:any|every|任何|任意)[\s\S]{0,100}(?:stable|稳定版)[\s\S]{0,180}(?:manual(?:ly)?|手动)|(?:nightly|夜间版)[\s\S]{0,260}(?:stable|稳定版)[\s\S]{0,180}(?:manual(?:ly)?|手动)[\s\S]{0,180}(?:higher|later|newer|更高|后续)/i.test(
@@ -109,36 +109,34 @@ const assertMacosGuidance = (label, source) => {
     ),
     `${label} must not instruct users to remove quarantine with xattr`,
   );
-  const certificateSentences = source
-    .split(/(?<=[.!?。！？])\s+|\n+/)
-    .filter(
-      (sentence) =>
-        /certificate|证书/i.test(sentence) &&
-        /import|install|add|trust|导入|安装|添加|信任/i.test(sentence),
+  const guidanceBlocks = source.split(/\n\s*\n+/);
+  const certificateBlocks = guidanceBlocks.filter(
+      (block) =>
+        /certificate|证书/i.test(block) &&
+        /import|install|add|trust|导入|安装|添加|信任/i.test(block),
     );
-  for (const sentence of certificateSentences) {
+  for (const block of certificateBlocks) {
     const ephemeralCiDeveloperIdException =
-      /(?:CI|GitHub Actions|runner)/i.test(sentence) &&
-      /(?:Apple|Developer ID)/i.test(sentence) &&
-      /(?:secret|ephemeral|temporary|临时|密钥)/i.test(sentence);
+      /(?:CI|GitHub Actions|runner)/i.test(block) &&
+      /(?:Apple|Developer ID)/i.test(block) &&
+      /(?:secret|credential|ephemeral|temporary|临时|密钥)/i.test(block);
     check(
       ephemeralCiDeveloperIdException ||
-        (/(?:does not|will not|never|no need|do not|must not|不(?:会|要|需要)?)/i.test(
-          sentence,
+        (/(?:does not|will not|never|without|no need|do not|must not|不(?:会|要|需要)?)/i.test(
+          block,
         ) &&
-          !/security\s+add-trusted-cert/i.test(sentence)),
-      `${label} must not direct users to import or trust a certificate: ${sentence.trim()}`,
+          !/security\s+add-trusted-cert/i.test(block)),
+      `${label} must not direct users to import or trust a certificate: ${block.trim()}`,
     );
   }
-  const trustSettingsSentences = source
-    .split(/(?<=[.!?。！？])\s+|\n+/)
-    .filter((sentence) => /Trust Settings/i.test(sentence));
-  for (const sentence of trustSettingsSentences) {
+  const trustSettingsBlocks = guidanceBlocks
+    .filter((block) => /Trust Settings/i.test(block));
+  for (const block of trustSettingsBlocks) {
     check(
-      /(?:does not|will not|never|no need|do not|不(?:会|要|需要)?)/i.test(
-        sentence,
+      /(?:does not|will not|never|without|no need|do not|不(?:会|要|需要)?)/i.test(
+        block,
       ),
-      `${label} must not direct users to modify Trust Settings: ${sentence.trim()}`,
+      `${label} must not direct users to modify Trust Settings: ${block.trim()}`,
     );
   }
 };
@@ -154,9 +152,27 @@ const readmeForkSection =
   readme.match(/## Self-hosted RTC fork([\s\S]*?)(?=^### Release verification)/m)
     ?.[1] ?? "";
 
-assertMacosGuidance("2.0.1-selfhost.5 release notes", releaseNotes);
-assertMacosGuidance("self-host guide desktop-update section", guideUpdateSection);
-assertMacosGuidance("README self-host summary", readmeForkSection);
+check(
+  /2\.0\.1-selfhost\.4[\s\S]{0,1200}2\.0\.1-selfhost\.5|2\.0\.1-selfhost\.5[\s\S]{0,1200}2\.0\.1-selfhost\.4/i.test(
+    releaseNotes,
+  ) &&
+    /manual(?:ly)?|手动/i.test(releaseNotes),
+  "2.0.1-selfhost.5 release notes must identify the manual .4 -> .5 migration",
+);
+check(
+  /Desktop application updates/i.test(guide) &&
+    /Open Anyway/i.test(guideUpdateSection),
+  "self-host guide must contain the desktop update and recurring Gatekeeper guidance",
+);
+check(
+  /Self-hosted RTC fork/i.test(readme) &&
+    /(?:update|upgrade|更新|升级)/i.test(readmeForkSection),
+  "README self-host summary must expose the desktop update path",
+);
+assertMacosGuidance(
+  "combined self-host desktop-update guidance",
+  [releaseNotes, guideUpdateSection, readmeForkSection].join("\n\n"),
+);
 
 if (failures.length > 0) {
   for (const failure of failures) {
