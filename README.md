@@ -13,14 +13,14 @@ Compared with upstream Logseq, this fork adds or fixes:
 - Strict checksum and transaction-cursor validation, bounded-memory retry during continuous editing, and local database restoration if snapshot activation fails.
 - Hardened graph access, member revocation, WebSocket error handling, payload limits, and Node server lifecycle cleanup.
 - GitHub Actions builds for macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64.
-- In-application update discovery with architecture-specific metadata and a six-target provider rehearsal. Because the published `2.0.1-selfhost.4` macOS app was ad-hoc signed, macOS requires a one-time manual install of `2.0.1-selfhost.5`; `.5` embeds the fixed project Ed25519 public key so later project-signed updates use a separate verified update channel.
+- In-application update discovery with architecture-specific metadata and a six-target provider rehearsal. Because the published `2.0.1-selfhost.4` macOS app was ad-hoc signed, moving from `.4` to `2.0.1-selfhost.5` requires manually replacing the application. After `.5` is installed, the app continues to check for and download `.6+` releases; choosing **Restart and install** verifies and installs them automatically through the project-signed update channel.
 - Electron 42.4.1, including upstream Safe Storage initialization fixes that reduce unnecessary macOS Keychain prompts.
 
 To configure a client, open **Settings → Advanced → Sync Server URL**, enter the Worker base URL (for example, `https://team-logseq-sync.example.workers.dev`), and save it. Do not append `/health`, `/sync/%s`, or another path. Every collaborator must use the same server URL.
 
 See the [self-hosted Logseq DB Sync / RTC guide](docs/selfhost-sync.md) for the full setup process and the [2.0.1-selfhost.5 release notes](docs/releases/2.0.1-selfhost.5.md) for this release. Installers are available from [this fork's Releases](https://github.com/cfenglv/logseq/releases).
 
-> Data compatibility: this fork intentionally keeps the `Logseq` product name and `com.logseq.logseq` application ID so it can continue using existing Logseq user data, settings, authentication state, and local graphs. Do not run official Logseq and this fork at the same time. Quit Logseq and back up your graphs before installing or switching builds. Without an Apple Developer ID, macOS may require **Open Anyway** for the one-time `.5` installation; the project update signature secures later in-app replacements but does not suppress Gatekeeper.
+> Data compatibility: this fork intentionally keeps the `Logseq` product name and `com.logseq.logseq` application ID so it can continue using existing Logseq user data, settings, authentication state, and local graphs. Do not run official Logseq and this fork at the same time. Quit Logseq and back up your graphs before installing or switching builds. Without an Apple Developer ID and notarization, macOS may require **Open Anyway** the first time you launch `.5` and may ask again after a later update installs a new application bundle. Project signatures authenticate `.6+` in-app replacements but do not suppress Gatekeeper. Never change certificate Trust Settings or remove quarantine attributes.
 
 ### Release verification
 

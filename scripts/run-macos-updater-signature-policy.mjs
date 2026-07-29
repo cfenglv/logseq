@@ -11,7 +11,7 @@ export const updaterSignatureGatePlan = (candidateVersion) => {
     return {
       mode: "manual-migration",
       message:
-        "2.0.1-selfhost.5 manually bootstraps the fixed project Ed25519 key; the pinned .4 signature rejection is a reproducer, not a release gate",
+        "2.0.1-selfhost.4 users must manually replace the App with 2.0.1-selfhost.5 to bootstrap the fixed project Ed25519 key; the pinned .4 signature rejection is a reproducer, not a release gate",
     };
   }
   if (revision > 5) {

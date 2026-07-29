@@ -271,11 +271,16 @@ remain GitHub production releases even though their SemVer contains
 `-selfhost.N`; the release workflow enforces this contract.
 
 Use the NSIS installer on Windows and the AppImage on Linux when in-application
-installation is required. On macOS, `.4` to `.5` is a one-time manual
-migration. Starting with `.5`, a fixed project Ed25519 public key and native
-replacement helper verify later updater ZIPs independently of the App's ad-hoc
-code-signing identity. The release private key is external to the repository;
-missing key material fails the macOS release closed.
+installation is required. On macOS, moving from `.4` to `.5` requires manually
+replacing the application. Starting with `.5`, the app checks for and downloads
+later releases; choosing **Restart and install** uses a fixed project Ed25519
+public key and native replacement helper to verify and install `.6+` updater
+ZIPs independently of the App's ad-hoc code-signing identity. The release
+private key is external to the repository; missing key material fails the
+macOS release closed. Without an Apple Developer ID and notarization, macOS may
+require **Open Anyway** on the first launch of `.5` and may ask again after
+later updates. Never change certificate Trust Settings or remove quarantine
+attributes.
 
 ## 10. Reproducibility and release checks
 
@@ -309,11 +314,11 @@ signature cannot inherit Apple's Keychain access trust from the official
 signature:
 
 - A GitHub package without Apple Developer ID notarization may be blocked by
-  Gatekeeper on first launch.
-- Use **Open Anyway** for the one-time `.5` bootstrap if necessary. Do not
-  change certificate Trust Settings and do not strip quarantine attributes.
-- The project Ed25519 signature authenticates `.5` to later in-app updates, but
-  does not make an unnotarized build trusted by Gatekeeper.
+  Gatekeeper the first time each newly installed application bundle is opened.
+- Use **Open Anyway** for `.5` and again after a later update if macOS requires
+  it. Do not change certificate Trust Settings or remove quarantine attributes.
+- The project Ed25519 signature authenticates `.6+` in-app updates, but does
+  not make an unnotarized build trusted by Gatekeeper.
 - Denying Keychain access can make Safe Storage, login cookies, or tokens
   unavailable and is not recommended as a routine workaround.
 - A stable local signing identity can reduce repeated prompts on one Mac, but
