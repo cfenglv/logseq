@@ -8700,3 +8700,154 @@
               (is (not= template-3-uuid redone-ref-uuid)))
             (finally
               (reset! undo-redo/*apply-history-action! prev-apply-action))))))))
+
+(defn- install-legacy-built-in-value-without-type!
+  [conn block property-ident value]
+  (let [property (d/entity @conn property-ident)
+        property-type (:logseq.property/type property)]
+    (is (= property-ident (:db/ident property)))
+    (is (some? property-type)
+        (str property-ident " must start as a complete built-in fixture"))
+    ;; Reproduce an on-disk graph written by an older client: the built-in
+    ;; attribute and value exist, but the built-in property entity is missing
+    ;; its newer schema/type datom.
+    (d/transact! conn [[:db/retract property-ident :logseq.property/type property-type]
+                       [:db/add (:db/id block) property-ident value]])
+    (is (nil? (:logseq.property/type (d/entity @conn property-ident))))
+    (is (= value (get (d/entity @conn (:db/id block)) property-ident)))))
+
+(defn- changed-block-validation
+  [conn block]
+  (try
+    (let [tx-report (d/with @conn
+                            [[:db/add (:db/id block)
+                              :block/updated-at
+                              1770000000000]])
+          [valid? errors] (db-validate/validate-tx-report tx-report nil)]
+      {:valid? valid?
+       :errors errors})
+    (catch :default error
+      {:error error})))
+
+(deftest legacy-built-in-property-values-validate-without-stored-property-type-test
+  (testing "known legacy built-ins derive their validation contract without mutating the property entity"
+    (doseq [[label property-ident value]
+            [["heading" :logseq.property/heading 3]
+             ["math display" :logseq.property.node/display-type :math]]]
+      (let [{:keys [conn child1]} (setup-parent-child)]
+        (install-legacy-built-in-value-without-type!
+         conn child1 property-ident value)
+        (let [{:keys [valid? errors error]} (changed-block-validation conn child1)]
+          (is (nil? error)
+              (str label " raised instead of validating: "
+                   (some-> error ex-message)
+                   " "
+                   (some-> error ex-data)))
+          (is valid? (str label " was rejected: " errors))
+          (is (nil? (:logseq.property/type
+                     (d/entity @conn property-ident)))
+              "validation must not silently rewrite legacy graph state"))))))
+
+(deftest legacy-built-in-property-compatibility-keeps-strict-value-validation-test
+  (testing "a missing stored type does not make an invalid known built-in value valid"
+    (let [{:keys [conn child1]} (setup-parent-child)]
+      (install-legacy-built-in-value-without-type!
+       conn child1 :logseq.property.node/display-type "math")
+      (let [{:keys [valid? error]} (changed-block-validation conn child1)]
+        (is (or error (false? valid?))
+            "display-type must remain keyword-only"))))
+
+  (testing "an unknown incomplete property is not accepted by a broad nil-type fallback"
+    (let [{:keys [conn child1]} (setup-parent-child)
+          property-ident :logseq.property/not-a-built-in]
+      (d/transact! conn [{:db/id -100
+                          :db/ident property-ident}
+                         [:db/add (:db/id child1)
+                          property-ident
+                          "unexpected"]])
+      (let [{:keys [valid? error]} (changed-block-validation conn child1)]
+        (is (or error (false? valid?))
+            "only recognized legacy built-ins may use compatibility validation")))))
+
+(deftest legacy-built-in-properties-survive-remote-rebase-with-pending-local-txs-test
+  (testing "ordinary remote apply preserves pending local order/content for valid legacy built-in values"
+    (doseq [[label property-ident value]
+            [["heading" :logseq.property/heading 3]
+             ["math display" :logseq.property.node/display-type :math]]]
+      (let [{:keys [conn client-ops-conn parent child1 child2]}
+            (setup-parent-child)
+            client {:repo test-repo
+                    :inflight (atom [])
+                    :last-sync-error (atom nil)
+                    :online-users (atom [])
+                    :pending-pull-since (atom nil)
+                    :ws-state (atom :open)}]
+        (with-datascript-conns
+          conn
+          client-ops-conn
+          (fn []
+            ;; Produce the durable pending queue through the same listener used
+            ;; by normal local writes while the built-in metadata is complete.
+            (ldb/transact! conn
+                           [[:db/add (:db/id child1)
+                             :block/title
+                             "child 1 pending"]])
+            (ldb/transact! conn
+                           [[:db/add (:db/id child2)
+                             :block/title
+                             "child 2 pending"]])
+            (let [pending-before (#'sync-apply/pending-txs test-repo)
+                  tx-ids-before (mapv :tx-id pending-before)
+                  forward-txs-before (mapv :tx pending-before)]
+              (is (= 2 (count pending-before)) label)
+              (is (= 2 (count (distinct tx-ids-before))) label)
+
+              ;; Model legacy persisted metadata without recording the fixture
+              ;; preparation itself as a third local user transaction.
+              (d/unlisten! conn ::listen-db)
+              (install-legacy-built-in-value-without-type!
+               conn child1 property-ident value)
+
+              (let [apply-error
+                    (try
+                      (sync-apply/apply-remote-txs!
+                       test-repo
+                       client
+                       [{:t 1
+                         :tx-data [[:db/add (:db/id parent)
+                                    :block/updated-at
+                                    1770000000100]]}])
+                      nil
+                      (catch :default error
+                        error))
+                    pending-after (#'sync-apply/pending-txs test-repo)]
+                (when apply-error
+                  (with-redefs [shared-service/broadcast-to-clients!
+                                (fn [& _] nil)]
+                    (#'db-sync/handle-runtime-sync-failure!
+                     test-repo client nil nil apply-error :receive)))
+                (is (nil? apply-error)
+                    (str label
+                         " entered the remote-apply failure path: "
+                         (some-> apply-error ex-message)
+                         " "
+                         (some-> apply-error ex-data)))
+                (is (= :open @(:ws-state client))
+                    "a compatible legacy value must not require sync repair")
+                (is (= tx-ids-before (mapv :tx-id pending-after))
+                    "pending local transaction order/identity must be stable")
+                (is (= forward-txs-before (mapv :tx pending-after))
+                    "pending local transaction forward content must not be lost")
+                (is (= "child 1 pending"
+                       (:block/title
+                        (d/entity @conn [:block/uuid (:block/uuid child1)]))))
+                (is (= "child 2 pending"
+                       (:block/title
+                        (d/entity @conn [:block/uuid (:block/uuid child2)]))))
+                (is (= value
+                       (get (d/entity @conn
+                                      [:block/uuid (:block/uuid child1)])
+                            property-ident)))
+                (is (= 1770000000100
+                       (:block/updated-at
+                        (d/entity @conn [:block/uuid (:block/uuid parent)]))))))))))))
