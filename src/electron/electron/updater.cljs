@@ -21,6 +21,11 @@
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
 
+(def ^:private <native-import
+  ;; Keep import() out of Closure's AST: the Electron main process must load
+  ;; the packaged ESM at runtime, while Closure cannot transpile dynamic imports.
+  (js/Function. "moduleUrl" "return import(moduleUrl);"))
+
 (declare normalize-payload emit-update! emit-update-downloaded! emit-completed!)
 
 (defn- project-signed-macos-updater?
@@ -36,7 +41,7 @@
                                            "project-updater-signature.mjs")
                            pathToFileURL
                            (.-href))
-            module-promise (js* "import(~{})" module-url)]
+            module-promise (<native-import module-url)]
         (reset! *project-signature-module module-promise)
         module-promise)))
 
