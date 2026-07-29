@@ -33,6 +33,14 @@ if (["security", "spctl", "sudo"].includes(command)) {
   process.exit(97);
 }
 
+if (
+  command === "xcrun" &&
+  args.includes("-DPROJECT_UPDATER_TESTING")
+) {
+  console.error("production packaging must not build a --test-only updater helper");
+  process.exit(99);
+}
+
 if (command === "xattr") {
   const optionText = args
     .filter((arg) => arg.startsWith("-"))
@@ -86,6 +94,7 @@ if (command === "xattr") {
 const realCommands = {
   codesign: "/usr/bin/codesign",
   xattr: "/usr/bin/xattr",
+  xcrun: "/usr/bin/xcrun",
 };
 const realCommand = realCommands[command];
 if (!realCommand) {

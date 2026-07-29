@@ -42,6 +42,12 @@ const fixtureShim = path.join(
   "fixtures",
   "electron-appout-xattr-command-shim.mjs",
 );
+const policyPath = path.join(
+  repoRoot,
+  "resources",
+  "updater",
+  "project-signing-policy.json",
+);
 const expectedVersion = "2.0.1-selfhost.5";
 const quarantineValue =
   "0083;7f5e1000;LogseqAppOutXattrContract;01234567-89AB-CDEF-0123-456789ABCDEF";
@@ -197,6 +203,26 @@ const findNamed = (root, name) => {
   return found;
 };
 
+const collectDeliverables = (root) => {
+  if (!fs.existsSync(root)) return [];
+  const deliverables = [];
+  const visit = (current) => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const child = path.join(current, entry.name);
+      if (
+        entry.name.endsWith(".app") ||
+        entry.name.endsWith(".dmg") ||
+        entry.name.endsWith(".zip")
+      ) {
+        deliverables.push(child);
+      }
+      if (entry.isDirectory() && !entry.isSymbolicLink()) visit(child);
+    }
+  };
+  visit(root);
+  return deliverables;
+};
+
 const assertSafeBundleXattrs = (appPath, label) => {
   const output = recursiveXattrs(appPath);
   for (const attribute of unsafeArtifactAttributes) {
@@ -218,8 +244,12 @@ const frontendVersion = fs
 const resourcePackage = JSON.parse(
   fs.readFileSync(path.join(repoRoot, "resources", "package.json"), "utf8"),
 );
+const originalPolicyBytes = fs.readFileSync(policyPath);
+const originalPolicy = JSON.parse(originalPolicyBytes.toString("utf8"));
 assert.equal(frontendVersion, expectedVersion);
 assert.equal(resourcePackage.version, expectedVersion);
+assert.equal(originalPolicy.keyId, "UNCONFIGURED");
+assert.equal(originalPolicy.publicKeyBase64, "UNCONFIGURED");
 assert.equal(
   fs.lstatSync(sourceNodeModules).isSymbolicLink(),
   false,
@@ -261,7 +291,14 @@ const shimRoot = path.join(temporaryRoot, "bin");
 const tracePath = path.join(temporaryRoot, "commands.jsonl");
 fs.mkdirSync(shimRoot);
 fs.writeFileSync(tracePath, "");
-for (const command of ["codesign", "security", "spctl", "sudo", "xattr"]) {
+for (const command of [
+  "codesign",
+  "security",
+  "spctl",
+  "sudo",
+  "xattr",
+  "xcrun",
+]) {
   const target = path.join(shimRoot, command);
   fs.copyFileSync(fixtureShim, target);
   fs.chmodSync(target, 0o755);
@@ -276,6 +313,54 @@ const env = {
   LOGSEQ_APP_OUT_XATTR_OUTPUT_ROOT: outputRoot,
   LOGSEQ_APP_OUT_XATTR_SOURCE_NODE_MODULES: sourceNodeModules,
 };
+const blockedBuild = run("pnpm", ["release-electron:unsigned"], {
+  env,
+  expectSuccess: false,
+});
+const blockedOutput = `${blockedBuild.stdout}\n${blockedBuild.stderr}`;
+assert.notEqual(
+  blockedBuild.status,
+  0,
+  "UNCONFIGURED project signing policy silently produced a release",
+);
+assert.match(
+  blockedOutput,
+  /(?:project signing policy|project-signing-policy)[\s\S]{0,300}(?:RELEASE BLOCKED|UNCONFIGURED|fail-closed)/i,
+  "UNCONFIGURED release did not explain its fail-closed policy error",
+);
+assert.doesNotMatch(
+  blockedOutput,
+  /(?:electron-builder[\s\S]{0,300}\bpackaging\b|appOutDir=)/i,
+  "UNCONFIGURED release reached electron-builder packaging",
+);
+assert.doesNotMatch(
+  blockedOutput,
+  /build-project-update-helper[^\r\n]*--test-only/i,
+  "UNCONFIGURED production release silently selected a test-only helper",
+);
+assert.deepEqual(
+  collectDeliverables(outputRoot),
+  [],
+  "UNCONFIGURED release left a complete App/DMG/ZIP that could be misdelivered",
+);
+
+const { publicKey } = crypto.generateKeyPairSync("ed25519");
+const rawPublicKey = Buffer.from(
+  publicKey.export({ format: "jwk" }).x,
+  "base64url",
+);
+const configuredPolicy = {
+  ...originalPolicy,
+  keyId: `ed25519:${digest(rawPublicKey)}`,
+  publicKeyBase64: rawPublicKey.toString("base64"),
+};
+fs.writeFileSync(
+  policyPath,
+  `${JSON.stringify(configuredPolicy, null, 2)}\n`,
+  { mode: 0o600 },
+);
+fs.rmSync(outputRoot, { recursive: true, force: true });
+
 const architecture = process.arch === "arm64" ? "arm64" : "x64";
 const appOutHelper = path.join(
   outputRoot,
@@ -288,11 +373,20 @@ const appOutHelper = path.join(
   "MacOS",
   "Logseq Helper",
 );
-buildResult = await runReleaseWithInjectedAppOut({
-  env,
-  appOutHelper,
-  tracePath,
-});
+try {
+  buildResult = await runReleaseWithInjectedAppOut({
+    env,
+    appOutHelper,
+    tracePath,
+  });
+} finally {
+  fs.writeFileSync(policyPath, originalPolicyBytes);
+}
+assert.deepEqual(
+  fs.readFileSync(policyPath),
+  originalPolicyBytes,
+  "configured-path contract did not restore the production policy",
+);
 assert.ifError(buildResult.injectionError);
 assert.equal(
   buildResult.injected,
@@ -331,6 +425,15 @@ assert.equal(
   ),
   false,
   "unsigned packaging attempted to mutate local trust or installation state",
+);
+assert.equal(
+  trace.some(
+    (event) =>
+      event.command === "xcrun" &&
+      event.args.includes("-DPROJECT_UPDATER_TESTING"),
+  ),
+  false,
+  "configured production release compiled a --test-only updater helper",
 );
 for (const event of trace.filter((candidate) => candidate.command === "xattr")) {
   assert.equal(
@@ -408,6 +511,40 @@ const plistVersion = run(
   ],
 ).stdout.trim();
 assert.equal(plistVersion, expectedVersion);
+
+const packagedHelper = path.join(
+  appPath,
+  "Contents",
+  "Resources",
+  "sidecar",
+  "logseq-project-updater",
+);
+const packagedHelperStat = fs.lstatSync(packagedHelper);
+assert.equal(
+  packagedHelperStat.isFile() && !packagedHelperStat.isSymbolicLink(),
+  true,
+  "packaged project updater helper must be a regular file",
+);
+assert.notEqual(
+  packagedHelperStat.mode & 0o111,
+  0,
+  "packaged project updater helper must be executable",
+);
+run(
+  process.execPath,
+  [
+    path.join(staticRoot, "verify-packaged-desktop.mjs"),
+    "--search-root",
+    outputRoot,
+    "--platform",
+    "darwin",
+    "--arch",
+    architecture,
+    "--version",
+    expectedVersion,
+  ],
+  { cwd: staticRoot },
+);
 
 const dmgPath = path.join(
   outputRoot,
