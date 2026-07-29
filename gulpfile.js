@@ -106,6 +106,24 @@ const readReleaseVersion = () => {
   return version
 }
 
+const buildProjectUpdaterHelper = () => {
+  if (process.platform !== 'darwin') return
+  if (!['arm64', 'x64'].includes(process.arch)) {
+    throw new Error(`Unsupported macOS project updater architecture: ${process.arch}`)
+  }
+
+  cp.execFileSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'scripts/build-project-update-helper.mjs'),
+      '--arch',
+      process.arch,
+      '--output',
+      path.join(outputPath, 'sidecar', 'logseq-project-updater'),
+    ],
+    { stdio: 'inherit' })
+}
+
 const css = {
   watchCSS () {
     return cp.spawn(`pnpm css:watch`, {
@@ -378,6 +396,9 @@ exports.electron = () => {
 }
 
 const prepareElectronMaker = async () => {
+  const version = readReleaseVersion()
+  buildProjectUpdaterHelper()
+
   cp.execSync('pnpm cljs:release-electron', {
     stdio: 'inherit',
   })
@@ -399,7 +420,6 @@ const prepareElectronMaker = async () => {
 
   const pkgPath = path.join(outputPath, 'package.json')
   const pkg = require(pkgPath)
-  const version = readReleaseVersion()
 
   pkg.version = version
   fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2))
