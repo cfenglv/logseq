@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { createRequire } from 'node:module'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
@@ -18,6 +20,10 @@ const artifactVerifierPath = path.join(
   repositoryRoot,
   'scripts/verify-desktop-release-assets.mjs'
 )
+const fixtureRoot = path.join(
+  repositoryRoot,
+  'scripts/fixtures/selfhost-macos-updater'
+)
 const updaterHelperPath = path.join(
   repositoryRoot,
   'resources/selfhost-updater-version.mjs'
@@ -25,7 +31,6 @@ const updaterHelperPath = path.join(
 const resourcesPackagePath = path.join(repositoryRoot, 'resources/package.json')
 
 const workflowSource = fs.readFileSync(workflowPath, 'utf8')
-const artifactVerifierSource = fs.readFileSync(artifactVerifierPath, 'utf8')
 const resourcesPackage = JSON.parse(
   fs.readFileSync(resourcesPackagePath, 'utf8')
 )
@@ -45,6 +50,11 @@ const firstV2Version = '2.0.1-selfhost.5'
 const nextV2Version = '2.0.1-selfhost.6'
 const owner = 'logseq'
 const repository = 'logseq'
+// Byte-for-byte digests of the metadata published in release 2.0.1-selfhost.4.
+const pinnedLegacyMetadataSha256 = {
+  arm64: '2dd11f39538c801cf2356a40e753b8f6a9963641df6951e13ed3493b1c5ed705',
+  x64: '7b35999d6cd7edcd54b08944bca4112abb39e6fc2f12b7d2f602a2c35cdb8ec0',
+}
 const providerRuntimeOptions = {
   platform: 'darwin',
   executor: {
@@ -87,6 +97,17 @@ function expectedV2MetadataName(arch) {
 
 function legacyMetadataName(arch) {
   return `latest-${arch}-mac.yml`
+}
+
+function pinnedLegacyMetadata(arch) {
+  return fs.readFileSync(
+    path.join(fixtureRoot, legacyMetadataName(arch)),
+    'utf8'
+  )
+}
+
+function sha256(value) {
+  return crypto.createHash('sha256').update(value).digest('hex')
 }
 
 function assertWorkflowUsesTestedHelper(arch) {
@@ -148,37 +169,179 @@ function assertReleaseDoesNotRequireLegacyExactDrGate(arch) {
   )
 }
 
-function publishesFrozenLegacyMetadata(arch) {
-  const name = legacyMetadataName(arch)
-  const job = workflowJobForArch(arch)
-  return (
-    job.includes(name) && artifactVerifierSource.includes(JSON.stringify(name))
+function fixtureArtifactNames() {
+  return [
+    `Logseq-darwin-arm64-${firstV2Version}.dmg`,
+    `Logseq-darwin-arm64-${firstV2Version}.dmg.blockmap`,
+    `Logseq-darwin-arm64-${firstV2Version}.zip`,
+    `Logseq-darwin-arm64-${firstV2Version}.zip.blockmap`,
+    `Logseq-darwin-x64-${firstV2Version}.dmg`,
+    `Logseq-darwin-x64-${firstV2Version}.dmg.blockmap`,
+    `Logseq-darwin-x64-${firstV2Version}.zip`,
+    `Logseq-darwin-x64-${firstV2Version}.zip.blockmap`,
+    `Logseq-linux-arm64-${firstV2Version}.AppImage`,
+    `Logseq-linux-arm64-${firstV2Version}.zip`,
+    `Logseq-linux-x86_64-${firstV2Version}.AppImage`,
+    `Logseq-linux-x86_64-${firstV2Version}.zip`,
+    `Logseq-win-arm64-${firstV2Version}-nsis.exe`,
+    `Logseq-win-arm64-${firstV2Version}-nsis.exe.blockmap`,
+    `Logseq-win-arm64-${firstV2Version}.zip`,
+    `Logseq-win-x64-${firstV2Version}-nsis.exe`,
+    `Logseq-win-x64-${firstV2Version}-nsis.exe.blockmap`,
+    `Logseq-win-x64-${firstV2Version}.zip`,
+  ]
+}
+
+function sha512(filePath) {
+  return crypto
+    .createHash('sha512')
+    .update(fs.readFileSync(filePath))
+    .digest('base64')
+}
+
+function updaterMetadataForFiles(version, releaseDir, artifactNames) {
+  const entries = artifactNames.flatMap((name) => {
+    const filePath = path.join(releaseDir, name)
+    return [
+      `  - url: ${name}`,
+      `    sha512: ${sha512(filePath)}`,
+      `    size: ${fs.statSync(filePath).size}`,
+    ]
+  })
+  return [
+    `version: ${version}`,
+    'files:',
+    ...entries,
+    `path: ${artifactNames[0]}`,
+    `sha512: ${sha512(path.join(releaseDir, artifactNames[0]))}`,
+    `releaseDate: '2026-07-29T00:00:00.000Z'`,
+    '',
+  ].join('\n')
+}
+
+function createCompleteReleaseFixture() {
+  const releaseDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'logseq-selfhost5-release-contract-')
+  )
+  for (const name of fixtureArtifactNames()) {
+    fs.writeFileSync(path.join(releaseDir, name), `fixture:${name}\n`)
+  }
+
+  const metadataFiles = {
+    [expectedV2MetadataName('arm64')]: [
+      `Logseq-darwin-arm64-${firstV2Version}.zip`,
+      `Logseq-darwin-arm64-${firstV2Version}.dmg`,
+    ],
+    [expectedV2MetadataName('x64')]: [
+      `Logseq-darwin-x64-${firstV2Version}.zip`,
+      `Logseq-darwin-x64-${firstV2Version}.dmg`,
+    ],
+    'latest-arm64.yml': [
+      `Logseq-win-arm64-${firstV2Version}-nsis.exe`,
+      `Logseq-win-arm64-${firstV2Version}.zip`,
+    ],
+    'latest-linux-arm64.yml': [
+      `Logseq-linux-arm64-${firstV2Version}.AppImage`,
+      `Logseq-linux-arm64-${firstV2Version}.zip`,
+    ],
+    'latest-linux.yml': [
+      `Logseq-linux-x86_64-${firstV2Version}.AppImage`,
+      `Logseq-linux-x86_64-${firstV2Version}.zip`,
+    ],
+    'latest-x64.yml': [
+      `Logseq-win-x64-${firstV2Version}-nsis.exe`,
+      `Logseq-win-x64-${firstV2Version}.zip`,
+    ],
+  }
+  for (const [name, artifacts] of Object.entries(metadataFiles)) {
+    fs.writeFileSync(
+      path.join(releaseDir, name),
+      updaterMetadataForFiles(firstV2Version, releaseDir, artifacts)
+    )
+  }
+  for (const arch of ['x64', 'arm64']) {
+    fs.writeFileSync(
+      path.join(releaseDir, legacyMetadataName(arch)),
+      pinnedLegacyMetadata(arch)
+    )
+  }
+  fs.writeFileSync(path.join(releaseDir, 'VERSION'), `${firstV2Version}\n`)
+  return releaseDir
+}
+
+function runArtifactVerifier(releaseDir) {
+  return spawnSync(
+    process.execPath,
+    [artifactVerifierPath, '--dir', releaseDir, '--version', firstV2Version],
+    {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+    }
   )
 }
 
-function assertDualChannelMetadataIsPublished(arch) {
-  const legacyName = legacyMetadataName(arch)
-  const v2Name = expectedV2MetadataName(arch)
-  const job = workflowJobForArch(arch)
+function verifierOutput(result) {
+  return `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim()
+}
 
-  assert.ok(
-    job.includes(legacyName),
-    `${arch} .5 release must publish frozen ${legacyName} for .4 clients`
-  )
-  assert.ok(
-    artifactVerifierSource.includes(JSON.stringify(legacyName)),
-    `release asset verification must require ${legacyName}`
-  )
-  assert.match(
-    job,
-    /selfhost-updater-version\.mjs\s+macos-metadata-name/,
-    `${arch} .5 release must also publish its versioned-v2 channel metadata`
-  )
+function assertVerifierAccepts(releaseDir) {
+  const result = runArtifactVerifier(releaseDir)
   assert.equal(
-    runUpdaterHelper('macos-metadata-name', firstV2Version, arch),
-    v2Name,
-    `${arch} v2 metadata name must remain independently derivable`
+    result.status,
+    0,
+    `release asset verifier rejected the complete dual-channel fixture:\n${verifierOutput(
+      result
+    )}`
   )
+}
+
+function assertVerifierRejects(releaseDir, description) {
+  const result = runArtifactVerifier(releaseDir)
+  assert.notEqual(
+    result.status,
+    0,
+    `release asset verifier accepted ${description}`
+  )
+}
+
+function withReleaseFixture(run) {
+  const releaseDir = createCompleteReleaseFixture()
+  try {
+    return run(releaseDir)
+  } finally {
+    fs.rmSync(releaseDir, { recursive: true, force: true })
+  }
+}
+
+function assertReleaseAssetVerifierContract() {
+  withReleaseFixture((releaseDir) => {
+    assert.equal(
+      fs.readdirSync(releaseDir).length,
+      27,
+      'controlled .5 release fixture must contain its complete dual-channel asset set'
+    )
+    assertVerifierAccepts(releaseDir)
+  })
+
+  for (const arch of ['x64', 'arm64']) {
+    withReleaseFixture((releaseDir) => {
+      fs.rmSync(path.join(releaseDir, legacyMetadataName(arch)))
+      assertVerifierRejects(
+        releaseDir,
+        `a release missing ${legacyMetadataName(arch)}`
+      )
+    })
+    withReleaseFixture((releaseDir) => {
+      fs.appendFileSync(
+        path.join(releaseDir, legacyMetadataName(arch)),
+        '# tampered\n'
+      )
+      assertVerifierRejects(
+        releaseDir,
+        `a release with tampered ${legacyMetadataName(arch)}`
+      )
+    })
+  }
 }
 
 function releaseFeed(versions) {
@@ -271,16 +434,9 @@ function createProvider({
 }
 
 async function assertLegacyClientGetsNoErrorAndNoUpdate(arch) {
-  const metadataByName = new Map()
-  if (publishesFrozenLegacyMetadata(arch)) {
-    metadataByName.set(
-      legacyMetadataName(arch),
-      updaterMetadata(
-        currentLegacyVersion,
-        `Logseq-darwin-${arch}-${currentLegacyVersion}.zip`
-      )
-    )
-  }
+  const metadataByName = new Map([
+    [legacyMetadataName(arch), pinnedLegacyMetadata(arch)],
+  ])
 
   const { provider, requestedMetadataNames } = createProvider({
     currentVersion: currentLegacyVersion,
@@ -341,6 +497,22 @@ test('runtime dependency is electron-updater 6.8.3', () => {
   assert.equal(resourcesPackage.dependencies['electron-updater'], '6.8.3')
 })
 
+test('published .4 legacy metadata fixtures have their pinned digests', () => {
+  for (const arch of ['x64', 'arm64']) {
+    assert.equal(
+      sha256(pinnedLegacyMetadata(arch)),
+      pinnedLegacyMetadataSha256[arch],
+      `${legacyMetadataName(
+        arch
+      )} must remain byte-for-byte identical to the published .4 asset`
+    )
+  }
+})
+
+test('release asset verifier enforces both pinned legacy channel files', () => {
+  assertReleaseAssetVerifierContract()
+})
+
 for (const arch of ['x64', 'arm64']) {
   test(`${arch}: checked-in helper emits the exact .5 metadata filename`, () => {
     assert.equal(
@@ -355,10 +527,6 @@ for (const arch of ['x64', 'arm64']) {
 
   test(`${arch}: .5 release has no exact-DR gate against published .4`, () => {
     assertReleaseDoesNotRequireLegacyExactDrGate(arch)
-  })
-
-  test(`${arch}: .5 release publishes and verifies both channel files`, () => {
-    assertDualChannelMetadataIsPublished(arch)
   })
 
   test(`${arch}: actual GitHubProvider lets .4 query latest without error or update`, async () => {
