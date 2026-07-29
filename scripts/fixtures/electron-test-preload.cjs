@@ -1,0 +1,80 @@
+"use strict";
+
+const { EventEmitter } = require("node:events");
+const Module = require("node:module");
+const os = require("node:os");
+const path = require("node:path");
+
+const noop = (() => {
+  const target = function () {};
+  const proxy = new Proxy(target, {
+    apply() {
+      return proxy;
+    },
+    construct() {
+      return proxy;
+    },
+    get(_target, property) {
+      if (property === "then") return undefined;
+      return proxy;
+    },
+  });
+  return proxy;
+})();
+
+const app = Object.assign(new EventEmitter(), {
+  getName: () => "Logseq Test",
+  getPath: (name) =>
+    path.join(os.tmpdir(), "logseq-electron-test", String(name)),
+  getVersion: () => "2.0.1-selfhost.5",
+  isReady: () => true,
+  quit() {},
+  whenReady: async () => {},
+});
+const ipcMain = Object.assign(new EventEmitter(), {
+  handle() {},
+  removeHandler() {},
+});
+const autoUpdater = Object.assign(new EventEmitter(), {
+  allowDowngrade: false,
+  allowPrerelease: false,
+  autoDownload: false,
+  autoInstallOnAppQuit: false,
+  checkForUpdates: async () => ({
+    isUpdateAvailable: false,
+  }),
+  downloadUpdate: async () => [],
+  quitAndInstall() {},
+});
+const electron = new Proxy(
+  {
+    app,
+    BrowserWindow: noop,
+    clipboard: noop,
+    dialog: noop,
+    ipcMain,
+    Menu: noop,
+    nativeImage: noop,
+    powerMonitor: new EventEmitter(),
+    protocol: noop,
+    screen: noop,
+    session: { defaultSession: noop },
+    shell: noop,
+  },
+  {
+    get(target, property) {
+      return property in target ? target[property] : noop;
+    },
+  },
+);
+
+const originalLoad = Module._load;
+Module._load = function loadWithElectronTestDoubles(
+  request,
+  parent,
+  isMain,
+) {
+  if (request === "electron") return electron;
+  if (request === "electron-updater") return { autoUpdater };
+  return originalLoad.call(this, request, parent, isMain);
+};

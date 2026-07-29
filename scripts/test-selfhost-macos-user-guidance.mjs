@@ -57,10 +57,34 @@ const assertMacosGuidance = (label, source) => {
     `${label} must state that the updater does not change Trust Settings`,
   );
   check(
+    /(?:CI|GitHub Actions|runner)[\s\S]{0,240}(?:Developer ID|Apple)[\s\S]{0,180}(?:secret|ephemeral|temporary|临时|密钥)|(?:Developer ID|Apple)[\s\S]{0,240}(?:secret|ephemeral|temporary|临时|密钥)[\s\S]{0,180}(?:CI|GitHub Actions|runner)/i.test(
+      text,
+    ),
+    `${label} must distinguish ephemeral CI Developer ID secret import from the local/client no-trust-mutation rule`,
+  );
+  check(
     /(?:does not|will not|never|不(?:会|要)?)[\s\S]{0,100}(?:remove|clear|strip|delete|移除|清除|删除)[\s\S]{0,100}(?:quarantine|隔离)|(?:quarantine|隔离)[\s\S]{0,100}(?:preserved|retained|kept|保留)/i.test(
       text,
     ),
     `${label} must state that the updater does not remove quarantine`,
+  );
+  check(
+    /(?:stable|稳定版)[\s\S]{0,220}(?:never|does not|will not|不(?:会|能)?)[\s\S]{0,180}(?:automatic(?:ally)?|自动)[\s\S]{0,120}(?:enter|switch|update|upgrade|进入|切换|更新|升级)[\s\S]{0,100}(?:nightly|夜间版)|(?:stable|稳定版)[\s\S]{0,220}(?:nightly|夜间版)[\s\S]{0,180}(?:manual|手动)/i.test(
+      text,
+    ),
+    `${label} must state that stable clients never automatically enter the nightly track`,
+  );
+  check(
+    /(?:nightly|夜间版)[\s\S]{0,220}(?:only|仅|只)[\s\S]{0,100}(?:automatic(?:ally)?|自动)[\s\S]{0,160}(?:later|newer|subsequent|后续|更新的)[\s\S]{0,100}(?:dated[\s-]*)?(?:nightly|夜间版)/i.test(
+      text,
+    ),
+    `${label} must limit nightly automatic updates to later dated nightlies`,
+  );
+  check(
+    /(?:nightly|夜间版)[\s\S]{0,260}(?:any|every|任何|任意)[\s\S]{0,100}(?:stable|稳定版)[\s\S]{0,180}(?:manual(?:ly)?|手动)|(?:nightly|夜间版)[\s\S]{0,260}(?:stable|稳定版)[\s\S]{0,180}(?:manual(?:ly)?|手动)[\s\S]{0,180}(?:higher|later|newer|更高|后续)/i.test(
+      text,
+    ),
+    `${label} must require manual installation for nightly to any stable revision, including a higher revision`,
   );
 
   const openAnywaySentences = source
@@ -93,11 +117,16 @@ const assertMacosGuidance = (label, source) => {
         /import|install|add|trust|导入|安装|添加|信任/i.test(sentence),
     );
   for (const sentence of certificateSentences) {
+    const ephemeralCiDeveloperIdException =
+      /(?:CI|GitHub Actions|runner)/i.test(sentence) &&
+      /(?:Apple|Developer ID)/i.test(sentence) &&
+      /(?:secret|ephemeral|temporary|临时|密钥)/i.test(sentence);
     check(
-      /(?:does not|will not|never|no need|do not|must not|不(?:会|要|需要)?)/i.test(
-        sentence,
-      ) &&
-        !/security\s+add-trusted-cert/i.test(sentence),
+      ephemeralCiDeveloperIdException ||
+        (/(?:does not|will not|never|no need|do not|must not|不(?:会|要|需要)?)/i.test(
+          sentence,
+        ) &&
+          !/security\s+add-trusted-cert/i.test(sentence)),
       `${label} must not direct users to import or trust a certificate: ${sentence.trim()}`,
     );
   }
@@ -139,6 +168,6 @@ if (failures.length > 0) {
   process.exitCode = 1;
 } else {
   console.log(
-    "[selfhost-macos-guidance] PASS migration, automatic check/download, user restart install, recurring Gatekeeper, Trust Settings, certificate, and quarantine guidance",
+    "[selfhost-macos-guidance] PASS migration, stable/nightly manual-exit tracks, automatic check/download, user restart install, recurring Gatekeeper, Trust Settings, certificate, and quarantine guidance",
   );
 }

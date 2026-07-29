@@ -87,6 +87,21 @@ assert.match(
   "downloaded-update installer bypasses the mocked project-signed timing seam",
 );
 
+const configureAutoUpdater = electronUpdater.match(
+  /\(defn-?\s+configure-auto-updater![\s\S]*?(?=\n\(defn|\s*$)/,
+)?.[0];
+assert.ok(configureAutoUpdater, "auto-updater configuration is missing");
+assert.match(
+  configureAutoUpdater,
+  /isUpdateSupported/,
+  "auto-updater runtime does not install a stable/nightly track policy",
+);
+assert.match(
+  configureAutoUpdater,
+  /updater-config\/update-info-allowed\?/,
+  "auto-updater runtime does not delegate candidate filtering to the tested track and metadata policy",
+);
+
 assert.match(
   fullPreflight,
   /electron\\\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
@@ -94,7 +109,7 @@ assert.match(
 );
 assert.match(
   releaseWorkflow,
-  /rtc-release-gate:[\s\S]*?node static\/tests\.js[\s\S]*?electron\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
+  /rtc-release-gate:[\s\S]*?node[^\n]*static\/tests\.js[\s\S]*?electron\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
   "desktop release CI does not execute the updater mock-timing behavior test",
 );
 

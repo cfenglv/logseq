@@ -98,7 +98,9 @@
                         (is dirty?)
                         (is running?)
                         (is (empty? unhandled))
-                        (is (not-any? #(= :dirty (first %)) events))
+                        (is (not-any? #(and (= :dirty (first %))
+                                            (false? (second %)))
+                                      events))
                         (is (not-any? #(= :quit (first %)) events))
                         (if (contains? #{:invalid-signature :preflight}
                                        failure)

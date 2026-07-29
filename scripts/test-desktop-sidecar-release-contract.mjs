@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -32,6 +32,7 @@ const preflightPath = path.join(
 );
 const version = "2.0.1-selfhost.5";
 const electronVersion = "42.4.1";
+const verifierSource = fs.readFileSync(verifierPath, "utf8");
 
 const cases = [];
 const test = (name, callback) => cases.push([name, callback]);
@@ -83,8 +84,7 @@ const writeExecutable = (filePath, platform, arch) => {
 
 const writeMainExecutable = (filePath, platform, arch) => {
   if (
-    platform !== "darwin" ||
-    process.platform !== "darwin" ||
+    platform !== process.platform ||
     arch !== process.arch
   ) {
     writeExecutable(filePath, platform, arch);
@@ -97,16 +97,24 @@ const writeMainExecutable = (filePath, platform, arch) => {
     `#include <stdio.h>\nint main(void) { fputs("${electronVersion}", stdout); return 0; }\n`,
   );
   try {
-    const result = run("xcrun", [
-      "clang",
-      "-arch",
-      arch === "arm64" ? "arm64" : "x86_64",
-      "-Os",
-      source,
-      "-o",
-      filePath,
-    ]);
+    const [compiler, args] =
+      platform === "darwin"
+        ? [
+            "xcrun",
+            [
+              "clang",
+              "-arch",
+              arch === "arm64" ? "arm64" : "x86_64",
+              "-Os",
+              source,
+              "-o",
+              filePath,
+            ],
+          ]
+        : ["cc", ["-Os", source, "-o", filePath]];
+    const result = run(compiler, args);
     assert.equal(result.status, 0, result.output);
+    fs.chmodSync(filePath, 0o755);
   } finally {
     fs.rmSync(source, { force: true });
   }
@@ -132,21 +140,171 @@ const fixtureLayout = (root, platform, arch) => {
   };
 };
 
-const helperNames = [
+const sourceTokens = verifierSource.match(
+  /[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*/g,
+) ?? [];
+const repositoryResourcePaths = [];
+const collectResourcePaths = (directory, relative = "") => {
+  if (!fs.existsSync(directory)) return;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryRelativePath = path.join(relative, entry.name);
+    if (entry.isDirectory()) {
+      collectResourcePaths(path.join(directory, entry.name), entryRelativePath);
+    } else {
+      repositoryResourcePaths.push(entryRelativePath);
+    }
+  }
+};
+collectResourcePaths(path.join(repoRoot, "resources"));
+
+const unique = (values) => [...new Set(values)];
+const resourceVariants = (tokens, predicate) =>
+  unique(
+    tokens.flatMap((token) => {
+      const normalized = token.replaceAll("/", path.sep);
+      const basename = path.basename(normalized);
+      if (!predicate(basename)) return [];
+      if (
+        normalized.includes(path.sep) &&
+        ["scripts", "sidecar", "updater"].includes(
+          normalized.split(path.sep)[0],
+        )
+      ) {
+        return [normalized];
+      }
+      return [
+        basename,
+        ...["scripts", "sidecar", "updater"].map((directory) =>
+          path.join(directory, basename)
+        ),
+      ];
+    }),
+  );
+
+const helperNames = unique([
   "project-update-helper",
   "project-signed-update-helper",
   "project-signed-macos-update-helper",
   "logseq-project-update-helper",
-];
-const policyRelativePaths = [
+  ...[...sourceTokens, ...repositoryResourcePaths]
+    .map((token) => path.basename(token))
+    .filter(
+      (basename) =>
+        !path.extname(basename) &&
+        (
+          /(?:project|signed).*(?:update|helper|installer)/i.test(basename) ||
+          /(?:update|helper|installer).*(?:project|signed)/i.test(basename)
+        ),
+    ),
+]);
+const policyRelativePaths = unique([
   path.join("updater", "project-signing-policy.json"),
   path.join("sidecar", "project-signing-policy.json"),
-];
-const runtimeRelativePaths = [
+  ...resourceVariants(
+    [...sourceTokens, ...repositoryResourcePaths],
+    (basename) =>
+      basename.endsWith(".json") &&
+      /(?:project|update|sign).*(?:policy|key)|policy.*(?:project|update|sign)/i.test(
+        basename,
+      ),
+  ),
+]);
+const runtimeRelativePaths = unique([
   path.join("sidecar", "run-project-signed-macos-update.mjs"),
   path.join("updater", "run-project-signed-macos-update.mjs"),
   path.join("scripts", "run-project-signed-macos-update.mjs"),
-];
+  ...resourceVariants(
+    [...sourceTokens, ...repositoryResourcePaths],
+    (basename) =>
+      /\.(?:c?js|mjs)$/i.test(basename) &&
+      /(?:project.*update|update.*project|signed.*update|update.*signed|signature)/i.test(
+        basename,
+      ),
+  ),
+]);
+const trackRuntimeRelativePaths = unique(
+  runtimeRelativePaths.filter(
+    (relativePath) =>
+      path.basename(relativePath) === "project-updater-signature.mjs",
+  ),
+);
+for (const directory of ["", "scripts", "sidecar", "updater"]) {
+  const relativePath = path.join(
+    directory,
+    "project-updater-signature.mjs",
+  );
+  if (!runtimeRelativePaths.includes(relativePath)) {
+    runtimeRelativePaths.push(relativePath);
+  }
+  if (!trackRuntimeRelativePaths.includes(relativePath)) {
+    trackRuntimeRelativePaths.push(relativePath);
+  }
+}
+
+const productionPolicyPath = policyRelativePaths
+  .map((relativePath) => path.join(repoRoot, "resources", relativePath))
+  .find((candidate) => fs.existsSync(candidate));
+const policyTemplate = productionPolicyPath
+  ? JSON.parse(fs.readFileSync(productionPolicyPath, "utf8"))
+  : {
+      algorithm: "Ed25519",
+      bundleId: "com.logseq.logseq",
+      keyId: "UNCONFIGURED",
+      payloadDomain: "logseq-selfhost-project-update-signature-v1",
+      publicKeyBase64: "UNCONFIGURED",
+      schema: "logseq-selfhost-project-update-signature-v1",
+    };
+const inlinePolicyPublicKey = [
+  policyTemplate.publicKeyBase64,
+  policyTemplate.publicKeyRawBase64,
+  policyTemplate.ed25519PublicKeyBase64,
+  typeof policyTemplate.publicKey === "string"
+    ? policyTemplate.publicKey
+    : null,
+  policyTemplate.publicKey?.encoding === "base64"
+    ? policyTemplate.publicKey.value
+    : null,
+].find((value) => typeof value === "string" && !/UNCONFIGURED/i.test(value));
+const policyPublicKeyPath =
+  productionPolicyPath && typeof policyTemplate.publicKeyPath === "string"
+    ? path.resolve(
+        path.dirname(productionPolicyPath),
+        policyTemplate.publicKeyPath,
+      )
+    : null;
+const fixturePublicKey = inlinePolicyPublicKey
+  ? Buffer.from(inlinePolicyPublicKey, "base64")
+  : policyPublicKeyPath && fs.existsSync(policyPublicKeyPath)
+    ? Buffer.from(
+        createPublicKey(fs.readFileSync(policyPublicKeyPath))
+          .export({ format: "jwk" }).x,
+        "base64url",
+      )
+    : Buffer.alloc(32, 0x2a);
+assert.equal(
+  fixturePublicKey.length,
+  32,
+  "production project policy must resolve to a 32-byte Ed25519 public key",
+);
+const policyCompanionRelativePaths =
+  typeof policyTemplate.publicKeyPath === "string"
+    ? unique(
+        policyRelativePaths.map((relativePolicyPath) => {
+          const relativePath = path.normalize(
+            path.join(
+              path.dirname(relativePolicyPath),
+              policyTemplate.publicKeyPath,
+            ),
+          );
+          assert.doesNotMatch(
+            relativePath,
+            /^(?:\.\.(?:\/|\\|$))/,
+            "fixture policy public key escapes packaged resources",
+          );
+          return relativePath;
+        }),
+      )
+    : [];
 
 const createAsarShim = (root) => {
   const moduleDir = path.join(root, "node_modules", "@electron", "asar");
@@ -168,21 +326,123 @@ const createAsarShim = (root) => {
 
 const signingPolicy = ({
   keyId,
-  publicKey = Buffer.alloc(32, 0x2a),
+  publicKey = fixturePublicKey,
 } = {}) => {
   const digest = createHash("sha256").update(publicKey).digest("hex");
-  return JSON.stringify(
-    {
+  const publicKeyPem = createPublicKey({
+    format: "jwk",
+    key: {
+      crv: "Ed25519",
+      kty: "OKP",
+      x: publicKey.toString("base64url"),
+    },
+  }).export({ format: "pem", type: "spki" });
+  const policy = structuredClone(policyTemplate);
+  const normalizedKeyIdFields = new Set([
+    "ed25519publickeyid",
+    "keyid",
+    "publickeyid",
+  ]);
+  const normalizedPublicKeyFields = new Set([
+    "ed25519publickeybase64",
+    "publickeybase64",
+    "publickeyrawbase64",
+  ]);
+  let keyFields = 0;
+  let publicKeyFields = 0;
+  const configure = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    for (const [field, child] of Object.entries(value)) {
+      const normalized = field.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (normalizedKeyIdFields.has(normalized)) {
+        value[field] = keyId ?? `ed25519:${digest}`;
+        keyFields += 1;
+      } else if (normalizedPublicKeyFields.has(normalized)) {
+        value[field] = publicKey.toString("base64");
+        publicKeyFields += 1;
+      } else if (
+        normalized === "publickey" &&
+        typeof child === "string"
+      ) {
+        value[field] = publicKey.toString("base64");
+        publicKeyFields += 1;
+      } else if (
+        normalized === "publickey" &&
+        child &&
+        typeof child === "object" &&
+        child.encoding === "base64" &&
+        typeof child.value === "string"
+      ) {
+        child.value = publicKey.toString("base64");
+        publicKeyFields += 1;
+      }
+      configure(value[field]);
+    }
+  };
+  configure(policy);
+  const updateHashes = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    for (const [field, child] of Object.entries(value)) {
+      const normalized = field.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (normalized === "publickeyrawsha256") {
+        value[field] = digest;
+      } else if (normalized === "publickeysha256") {
+        value[field] = policyTemplate.publicKeyPath
+          ? createHash("sha256").update(publicKeyPem).digest("hex")
+          : digest;
+      }
+      updateHashes(value[field]);
+    }
+  };
+  updateHashes(policy);
+  if (keyFields === 0) {
+    policy.keyId = keyId ?? `ed25519:${digest}`;
+  }
+  if (publicKeyFields === 0 && !("publicKeyPath" in policy)) {
+    policy.publicKeyBase64 = publicKey.toString("base64");
+  }
+  if (/\bUNCONFIGURED\b/i.test(JSON.stringify(policy))) {
+    delete policy.status;
+    Object.assign(policy, {
       algorithm: "Ed25519",
       bundleId: "com.logseq.logseq",
       keyId: keyId ?? `ed25519:${digest}`,
       payloadDomain: "logseq-selfhost-project-update-signature-v1",
       publicKeyBase64: publicKey.toString("base64"),
       schema: "logseq-selfhost-project-update-signature-v1",
-    },
-    null,
-    2,
+    });
+  }
+  return JSON.stringify(policy, null, 2);
+};
+
+const writePolicyCompanion = (
+  resourcesDir,
+  relativePolicyPath,
+  publicKey = fixturePublicKey,
+) => {
+  if (typeof policyTemplate.publicKeyPath !== "string") return;
+  const policyDirectory = path.dirname(
+    path.join(resourcesDir, relativePolicyPath),
   );
+  const destination = path.resolve(
+    policyDirectory,
+    policyTemplate.publicKeyPath,
+  );
+  assert.equal(
+    destination.startsWith(`${resourcesDir}${path.sep}`),
+    true,
+    "fixture policy public key path escapes packaged resources",
+  );
+  const publicKeyPem = createPublicKey({
+    format: "jwk",
+    key: {
+      crv: "Ed25519",
+      kty: "OKP",
+      x: publicKey.toString("base64url"),
+    },
+  }).export({ format: "pem", type: "spki" });
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.writeFileSync(destination, publicKeyPem);
 };
 
 const createPackagedFixture = ({ arch, platform, root }) => {
@@ -224,11 +484,22 @@ const createPackagedFixture = ({ arch, platform, root }) => {
     const filePath = path.join(layout.resourcesDir, relativePath);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, signingPolicy());
+    writePolicyCompanion(layout.resourcesDir, relativePath);
   }
   for (const relativePath of runtimeRelativePaths) {
     const filePath = path.join(layout.resourcesDir, relativePath);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    fs.writeFileSync(filePath, "#!/usr/bin/env node\nprocess.exit(0);\n");
+    const repositoryRuntime = path.join(
+      repoRoot,
+      "resources",
+      relativePath,
+    );
+    fs.writeFileSync(
+      filePath,
+      fs.existsSync(repositoryRuntime)
+        ? fs.readFileSync(repositoryRuntime)
+        : "#!/usr/bin/env node\nprocess.exit(0);\n",
+    );
     fs.chmodSync(filePath, 0o755);
   }
   return layout;
@@ -249,6 +520,7 @@ const createStagedVerifier = (root, packagedResourcesDir) => {
     path.join("sidecar", "embedding_server.py"),
     ...helperNames.map((name) => path.join("sidecar", name)),
     ...policyRelativePaths,
+    ...policyCompanionRelativePaths,
     ...runtimeRelativePaths,
   ]) {
     const source = path.join(packagedResourcesDir, relativePath);
@@ -272,10 +544,15 @@ const removeAll = (root, relativePaths) => {
   }
 };
 
-const overwritePolicies = (resourceRoots, policy) => {
+const overwritePolicies = (
+  resourceRoots,
+  policy,
+  publicKey = fixturePublicKey,
+) => {
   for (const resourcesDir of resourceRoots) {
     for (const relativePath of policyRelativePaths) {
       fs.writeFileSync(path.join(resourcesDir, relativePath), policy);
+      writePolicyCompanion(resourcesDir, relativePath, publicKey);
     }
   }
 };
@@ -458,6 +735,48 @@ for (const platform of ["linux", "win32", "darwin"]) {
       );
     }),
     );
+    test(`${platform}/${arch} packaged verifier rejects missing shared track-policy runtime`, () =>
+    withPackagedFixture({ arch, platform }, (fixture) => {
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        removeAll(resourcesDir, trackRuntimeRelativePaths);
+      }
+      expectVerifierFailure(
+        fixture,
+        `${platform}/${arch} missing project-updater-signature.mjs`,
+      );
+    }),
+    );
+    test(`${platform}/${arch} packaged verifier rejects packaged track-policy tampering`, () =>
+    withPackagedFixture({ arch, platform }, (fixture) => {
+      for (const relativePath of trackRuntimeRelativePaths) {
+        fs.appendFileSync(
+          path.join(fixture.layout.resourcesDir, relativePath),
+          "\n// packaged tamper\n",
+        );
+      }
+      expectVerifierFailure(
+        fixture,
+        `${platform}/${arch} packaged track-policy tampering`,
+      );
+    }),
+    );
+    test(`${platform}/${arch} packaged verifier rejects staged track-policy tampering`, () =>
+    withPackagedFixture({ arch, platform }, (fixture) => {
+      for (const relativePath of trackRuntimeRelativePaths) {
+        fs.appendFileSync(
+          path.join(fixture.staticRoot, relativePath),
+          "\n// staged tamper\n",
+        );
+      }
+      expectVerifierFailure(
+        fixture,
+        `${platform}/${arch} staged track-policy tampering`,
+      );
+    }),
+    );
   }
 }
 
@@ -600,6 +919,7 @@ test("darwin verifier rejects an unrelated key claiming the accepted short prefi
           keyId: `ed25519:${acceptedDigest.slice(0, 16)}`,
           publicKey: Buffer.alloc(32, 0x7e),
         }),
+        Buffer.alloc(32, 0x7e),
       );
       expectVerifierFailure(
         fixture,
@@ -646,6 +966,7 @@ test("formal preflight and CI execute updater source, native, and provider contr
     "test-desktop-sidecar-release-contract.mjs",
     "test-updater-install-entry-contract.mjs",
     "test-selfhost-macos-user-guidance.mjs",
+    "test-no-local-trust-mutation-contract.mjs",
   ]) {
     assert.match(
       sourcePreflight,
@@ -677,6 +998,27 @@ test("formal preflight and CI execute updater source, native, and provider contr
       `${jobName} provider contract does not use the downloaded static dependencies`,
     );
   }
+  const rtcReleaseGate = workflowJob(workflow, "rtc-release-gate");
+  const compileTestsAt = rtcReleaseGate.indexOf("pnpm cljs:test");
+  const runCompiledTestsAt = rtcReleaseGate.indexOf("static/tests.js");
+  assert.ok(
+    compileTestsAt >= 0 &&
+      runCompiledTestsAt > compileTestsAt,
+    "RTC release gate must recompile CLJS tests before running static/tests.js",
+  );
+  assert.match(
+    rtcReleaseGate.slice(runCompiledTestsAt),
+    /electron\\\.\([^)]*\bupdater\b[^)]*\)-test|electron\\\.updater-test/,
+    "RTC release gate does not execute electron.updater-test from the freshly compiled bundle",
+  );
+  assert.match(
+    rtcReleaseGate.slice(
+      Math.max(0, runCompiledTestsAt - 180),
+      runCompiledTestsAt,
+    ),
+    /--require\s+\.\/scripts\/fixtures\/electron-test-preload\.cjs/,
+    "RTC release gate does not preload its Node-only Electron test doubles",
+  );
 
   const packageJson = JSON.parse(
     fs.readFileSync(path.join(repoRoot, "package.json"), "utf8"),
@@ -688,7 +1030,7 @@ test("formal preflight and CI execute updater source, native, and provider contr
   );
   assert.match(
     packageJson.scripts?.["test:selfhost-updater-source-contracts"] ?? "",
-    /test-desktop-sidecar-release-contract\.mjs[\s\S]*test-updater-install-entry-contract\.mjs[\s\S]*test-selfhost-macos-user-guidance\.mjs/,
+    /test-desktop-sidecar-release-contract\.mjs[\s\S]*test-updater-install-entry-contract\.mjs[\s\S]*test-selfhost-macos-user-guidance\.mjs[\s\S]*test-no-local-trust-mutation-contract\.mjs/,
     "package.json does not expose the complete updater source-contract gate",
   );
   assert.match(
@@ -698,6 +1040,22 @@ test("formal preflight and CI execute updater source, native, and provider contr
   );
 
   const fullPreflight = fs.readFileSync(preflightPath, "utf8");
+  const fullCompileAt = fullPreflight.indexOf('"compile client tests"');
+  const fullRunAt = fullPreflight.indexOf('"static/tests.js"');
+  assert.ok(
+    fullCompileAt >= 0 && fullRunAt > fullCompileAt,
+    "full preflight must recompile CLJS tests before running static/tests.js",
+  );
+  assert.match(
+    fullPreflight.slice(fullRunAt),
+    /electron\\\\\.\([^)]*\bupdater\b[^)]*\)-test|electron\\\\\.updater-test/,
+    "full preflight does not execute electron.updater-test from the freshly compiled bundle",
+  );
+  assert.match(
+    fullPreflight.slice(Math.max(0, fullRunAt - 300), fullRunAt),
+    /electron-test-preload\.cjs/,
+    "full preflight does not preload its Node-only Electron test doubles",
+  );
   for (const commandName of [
     "test:selfhost-updater-source-contracts",
     "test:selfhost-updater-provider-contract",

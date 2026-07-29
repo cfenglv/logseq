@@ -102,6 +102,8 @@ run(
   "RTC client and Electron tests",
   process.execPath,
   [
+    "--require",
+    "scripts/fixtures/electron-test-preload.cjs",
     "static/tests.js",
     "-r",
     "^(electron\\.(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|frontend\\.handler\\.db-based\\.(rtc-background-tasks|sync)-test|frontend\\.worker\\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\\.worker\\.sync\\..*-test|logseq\\.cli\\.command\\.sync-test|logseq\\.db-worker\\.daemon-test)$",

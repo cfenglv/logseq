@@ -303,6 +303,328 @@ const discoverSignerPath = (workflow) => {
   return referenced[0];
 };
 
+const createIsolatedSignerTree = ({
+  bundleId,
+  destinationRoot,
+  fullKeyId,
+  payloadDomain,
+  policyTemplate,
+  publicKeyRawBase64,
+  signerPath,
+  sourceRoot,
+}) => {
+  const relativeSignerPath = path.relative(sourceRoot, signerPath);
+  assert.equal(
+    path.isAbsolute(relativeSignerPath),
+    false,
+    "isolated signer path must remain relative to its source tree",
+  );
+  assert.doesNotMatch(
+    relativeSignerPath,
+    /^(?:\.\.(?:\/|\\|$))/,
+    "isolated signer path escapes its source tree",
+  );
+  for (const directoryName of ["scripts", "resources"]) {
+    const source = path.join(sourceRoot, directoryName);
+    if (fs.existsSync(source)) {
+      fs.cpSync(source, path.join(destinationRoot, directoryName), {
+        filter: (entry) => path.basename(entry) !== "node_modules",
+        recursive: true,
+      });
+    }
+  }
+  const sourcePackage = path.join(sourceRoot, "package.json");
+  if (fs.existsSync(sourcePackage)) {
+    fs.copyFileSync(sourcePackage, path.join(destinationRoot, "package.json"));
+  }
+
+  const publicKeyRaw = strictBase64(
+    publicKeyRawBase64,
+    "isolated signer raw Ed25519 public key",
+  );
+  assert.equal(publicKeyRaw.length, 32);
+  const derivedKeyId = `ed25519:${sha256(publicKeyRaw)}`;
+  assert.equal(
+    fullKeyId,
+    derivedKeyId,
+    "isolated signer policy keyId does not match its raw public key",
+  );
+  const policy = structuredClone(policyTemplate ?? {});
+  const normalizedKeys = {
+    algorithm: new Set([
+      "alg",
+      "algorithm",
+      "signaturealg",
+      "signaturealgorithm",
+      "signingalgorithm",
+    ]),
+    bundleId: new Set([
+      "applicationid",
+      "bundleid",
+      "bundleidentifier",
+    ]),
+    keyId: new Set([
+      "ed25519publickeyid",
+      "keyid",
+      "publickeyid",
+    ]),
+    payloadDomain: new Set([
+      "domain",
+      "payloaddomain",
+      "payloadtype",
+      "schema",
+      "signaturedomain",
+    ]),
+    publicKey: new Set([
+      "ed25519publickeybase64",
+      "publickeybase64",
+      "publickeyrawbase64",
+    ]),
+    publicKeyHash: new Set([
+      "publickeyrawsha256",
+      "publickeysha256",
+    ]),
+  };
+  const replacements = {
+    algorithm: 0,
+    bundleId: 0,
+    keyId: 0,
+    payloadDomain: 0,
+    publicKey: 0,
+    publicKeyPath: [],
+  };
+  const configurePolicy = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    for (const [key, child] of Object.entries(value)) {
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (normalizedKeys.algorithm.has(normalized)) {
+        value[key] = "Ed25519";
+        replacements.algorithm += 1;
+      } else if (normalizedKeys.bundleId.has(normalized)) {
+        value[key] = bundleId;
+        replacements.bundleId += 1;
+      } else if (normalizedKeys.keyId.has(normalized)) {
+        value[key] = fullKeyId;
+        replacements.keyId += 1;
+      } else if (normalizedKeys.payloadDomain.has(normalized)) {
+        value[key] = payloadDomain;
+        replacements.payloadDomain += 1;
+      } else if (normalizedKeys.publicKey.has(normalized)) {
+        value[key] = publicKeyRawBase64;
+        replacements.publicKey += 1;
+      } else if (
+        normalized === "publickey" &&
+        typeof child === "string"
+      ) {
+        value[key] = publicKeyRawBase64;
+        replacements.publicKey += 1;
+      } else if (
+        normalized === "publickey" &&
+        child &&
+        typeof child === "object" &&
+        child.encoding === "base64" &&
+        typeof child.value === "string"
+      ) {
+        child.value = publicKeyRawBase64;
+        replacements.publicKey += 1;
+      } else if (normalizedKeys.publicKeyHash.has(normalized)) {
+        value[key] = derivedKeyId.slice("ed25519:".length);
+      } else if (
+        normalized === "publickeypath" &&
+        typeof child === "string"
+      ) {
+        replacements.publicKeyPath.push(child);
+      }
+      configurePolicy(value[key]);
+    }
+  };
+  configurePolicy(policy);
+  if (
+    Object.values(replacements)
+      .filter((value) => typeof value === "number")
+      .every((value) => value === 0)
+  ) {
+    Object.assign(policy, {
+      algorithm: "Ed25519",
+      bundleId,
+      keyId: fullKeyId,
+      payloadDomain,
+      publicKeyBase64: publicKeyRawBase64,
+      publicKeyRawSha256: derivedKeyId.slice("ed25519:".length),
+      schema: payloadDomain,
+    });
+    delete policy.status;
+  }
+  const publicKeyPem = createPublicKey({
+    format: "jwk",
+    key: {
+      crv: "Ed25519",
+      kty: "OKP",
+      x: publicKeyRaw.toString("base64url"),
+    },
+  }).export({ format: "pem", type: "spki" });
+  const correctPolicyHashes = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    for (const [key, child] of Object.entries(value)) {
+      const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (normalized === "publickeyrawsha256") {
+        value[key] = derivedKeyId.slice("ed25519:".length);
+      } else if (normalized === "publickeysha256") {
+        value[key] = replacements.publicKeyPath.length > 0
+          ? sha256(publicKeyPem)
+          : derivedKeyId.slice("ed25519:".length);
+      }
+      correctPolicyHashes(value[key]);
+    }
+  };
+  correctPolicyHashes(policy);
+  const isolatedPolicyPath = path.join(
+    destinationRoot,
+    "resources",
+    "updater",
+    "project-signing-policy.json",
+  );
+  fs.mkdirSync(path.dirname(isolatedPolicyPath), { recursive: true });
+  fs.writeFileSync(
+    isolatedPolicyPath,
+    `${JSON.stringify(policy, null, 2)}\n`,
+  );
+  for (const relativePublicKeyPath of replacements.publicKeyPath) {
+    assert.equal(
+      path.isAbsolute(relativePublicKeyPath),
+      false,
+      "isolated signer public key path must be relative",
+    );
+    const destination = path.resolve(
+      path.dirname(isolatedPolicyPath),
+      relativePublicKeyPath,
+    );
+    assert.equal(
+      destination.startsWith(`${destinationRoot}${path.sep}`),
+      true,
+      "isolated signer public key path escapes the isolated tree",
+    );
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.writeFileSync(destination, publicKeyPem);
+  }
+
+  const isolatedSignerPath = path.join(
+    destinationRoot,
+    relativeSignerPath,
+  );
+  assert.equal(
+    fs.existsSync(isolatedSignerPath),
+    true,
+    `isolated signer copy is missing: ${isolatedSignerPath}`,
+  );
+  return {
+    policyPath: isolatedPolicyPath,
+    signerPath: isolatedSignerPath,
+  };
+};
+
+const runIsolatedSignerTreeSelfTest = () => {
+  const tempRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "logseq-isolated-signer-self-test-"),
+  );
+  try {
+    const sourceRoot = path.join(tempRoot, "source");
+    const sourceSignerPath = path.join(
+      sourceRoot,
+      "scripts",
+      "sign-project-update.mjs",
+    );
+    const sourcePolicyPath = path.join(
+      sourceRoot,
+      "resources",
+      "updater",
+      "project-signing-policy.json",
+    );
+    fs.mkdirSync(path.dirname(sourceSignerPath), { recursive: true });
+    fs.mkdirSync(path.dirname(sourcePolicyPath), { recursive: true });
+    fs.writeFileSync(
+      sourcePolicyPath,
+      '{"status":"UNCONFIGURED"}\n',
+    );
+    fs.writeFileSync(
+      sourceSignerPath,
+      [
+        'import fs from "node:fs";',
+        'import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto";',
+        'const policy = JSON.parse(fs.readFileSync(new URL("../resources/updater/project-signing-policy.json", import.meta.url), "utf8"));',
+        'const key = createPrivateKey({ key: Buffer.from(process.env.TEST_SIGNER_KEY_BASE64, "base64"), format: "der", type: "pkcs8" });',
+        'const raw = Buffer.from(createPublicKey(key).export({ format: "jwk" }).x, "base64url");',
+        'const keyId = `ed25519:${createHash("sha256").update(raw).digest("hex")}`;',
+        'if (policy.publicKeyBase64 !== raw.toString("base64") || policy.keyId !== keyId) throw new Error("isolated policy mismatch");',
+        'const outputIndex = process.argv.indexOf("--signature-output");',
+        'if (outputIndex < 0 || !process.argv[outputIndex + 1]) throw new Error("missing signature output");',
+        'fs.writeFileSync(process.argv[outputIndex + 1], sign(null, Buffer.from("isolated signer fixture"), key).toString("base64"));',
+        "",
+      ].join("\n"),
+    );
+
+    const signingKeys = generateKeyPairSync("ed25519");
+    const publicKeyRaw = Buffer.from(
+      signingKeys.publicKey.export({ format: "jwk" }).x,
+      "base64url",
+    );
+    const publicKeyRawBase64 = publicKeyRaw.toString("base64");
+    const fullKeyId = `ed25519:${sha256(publicKeyRaw)}`;
+    const privateKeyPkcs8Base64 = signingKeys.privateKey
+      .export({ format: "der", type: "pkcs8" })
+      .toString("base64");
+    const isolated = createIsolatedSignerTree({
+      bundleId: "com.logseq.logseq",
+      destinationRoot: path.join(tempRoot, "isolated"),
+      fullKeyId,
+      payloadDomain: "logseq-selfhost-project-update-signature-v1",
+      policyTemplate: JSON.parse(fs.readFileSync(sourcePolicyPath, "utf8")),
+      publicKeyRawBase64,
+      signerPath: sourceSignerPath,
+      sourceRoot,
+    });
+    const signatureOutput = path.join(tempRoot, "signature.txt");
+    const result = command(
+      process.execPath,
+      [
+        isolated.signerPath,
+        "--signature-output",
+        signatureOutput,
+      ],
+      {
+        allowFailure: true,
+        env: {
+          ...process.env,
+          TEST_SIGNER_KEY_BASE64: privateKeyPkcs8Base64,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.output);
+    const signature = fs.readFileSync(signatureOutput, "utf8");
+    assert.equal(
+      cryptoVerify(
+        null,
+        Buffer.from("isolated signer fixture"),
+        signingKeys.publicKey,
+        Buffer.from(signature, "base64"),
+      ),
+      true,
+      "isolated signer did not emit a valid signature",
+    );
+    assert.equal(
+      fs.readFileSync(sourcePolicyPath, "utf8"),
+      '{"status":"UNCONFIGURED"}\n',
+      "isolated signer setup modified its source policy",
+    );
+    assert.equal(
+      JSON.parse(fs.readFileSync(isolated.policyPath, "utf8")).keyId,
+      fullKeyId,
+    );
+  } finally {
+    fs.rmSync(tempRoot, { force: true, recursive: true });
+  }
+};
+
 const workflowJobSource = (workflow, jobName) => {
   const match = workflow.match(
     new RegExp(
@@ -1203,7 +1525,11 @@ const runNativeHelperContract = async () => {
     /--helper\b/,
     "local/CI runner does not expose its explicit test-helper override",
   );
-  const { bundleId, payloadDomain } = loadPolicy();
+  const {
+    bundleId,
+    payloadDomain,
+    policy: productionPolicy,
+  } = loadPolicy();
   const helperBuildPath = discoverHelperBuildPath();
   const [helpExecutable, helpArgs] = scriptCommand(helperBuildPath, ["--help"]);
   const help = command(helpExecutable, helpArgs, { allowFailure: true });
@@ -1542,7 +1868,28 @@ const runNativeHelperContract = async () => {
     });
 
     const workflow = fs.readFileSync(workflowPath, "utf8");
-    const signerPath = discoverSignerPath(workflow);
+    const productionSignerPath = discoverSignerPath(workflow);
+    const isolatedSigner = createIsolatedSignerTree({
+      bundleId,
+      destinationRoot: path.join(tempRoot, "isolated-release-signer"),
+      fullKeyId,
+      payloadDomain,
+      policyTemplate: productionPolicy,
+      publicKeyRawBase64,
+      signerPath: productionSignerPath,
+      sourceRoot: repoRoot,
+    });
+    const signerPath = isolatedSigner.signerPath;
+    assert.notEqual(
+      signerPath,
+      productionSignerPath,
+      "native release test must not execute the production-tree signer",
+    );
+    assert.equal(
+      signerPath.startsWith(`${tempRoot}${path.sep}`),
+      true,
+      "native release test signer is not isolated under its fixture root",
+    );
     const signerSecrets = signingVariableNames(workflow);
     assert.ok(
       signerSecrets.length > 0,
@@ -2499,8 +2846,14 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
   }
 });
 
-addCase(cases, "native helper is fail-closed, atomic, and rollback-safe", async () =>
-  runNativeHelperContract(),
+addCase(cases, "isolated signer fixture reaches verified output", () =>
+  runIsolatedSignerTreeSelfTest(),
+);
+
+addCase(
+  cases,
+  "native helper is fail-closed, atomic, and rollback-safe",
+  async () => runNativeHelperContract(),
 );
 
 addCase(cases, "weak identifier-only ad-hoc DR is forgeable", () =>
