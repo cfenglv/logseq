@@ -716,9 +716,48 @@ const quarantineValue = (target) => {
   return result.status === 0 ? result.output : null;
 };
 
+const thinMachORoot = fs.mkdtempSync(
+  path.join(os.tmpdir(), "logseq-thin-macho-fixtures-"),
+);
+const thinMachOCache = new Map();
+process.once("exit", () => {
+  fs.rmSync(thinMachORoot, { recursive: true, force: true });
+});
+
+const lipoArchitecture = (arch) => {
+  assert.ok(arch === "arm64" || arch === "x64");
+  return arch === "x64" ? "x86_64" : "arm64";
+};
+
+const thinMachOExecutable = (arch) => {
+  if (thinMachOCache.has(arch)) return thinMachOCache.get(arch);
+  const source = path.join(thinMachORoot, "main.c");
+  const executable = path.join(thinMachORoot, `Logseq-${arch}`);
+  if (!fs.existsSync(source)) {
+    fs.writeFileSync(source, "int main(void) { return 0; }\n");
+  }
+  command("xcrun", [
+    "clang",
+    "-arch",
+    lipoArchitecture(arch),
+    "-Os",
+    "-Wl,-no_uuid",
+    source,
+    "-o",
+    executable,
+  ]);
+  assert.equal(
+    command("lipo", ["-archs", executable]).output,
+    lipoArchitecture(arch),
+  );
+  thinMachOCache.set(arch, executable);
+  return executable;
+};
+
 const makeNativeHelperApp = ({
   adHocSigned = true,
   applicationId = "com.logseq.logseq",
+  arch = process.arch === "arm64" ? "arm64" : "x64",
   destination,
   escapeSymlink,
   marker,
@@ -735,8 +774,12 @@ const makeNativeHelperApp = ({
     appInfoPlist({ applicationId, version }),
   );
   const executable = path.join(macOS, "Logseq");
-  fs.copyFileSync("/usr/bin/true", executable);
+  fs.copyFileSync(thinMachOExecutable(arch), executable);
   fs.chmodSync(executable, 0o755);
+  assert.equal(
+    command("lipo", ["-archs", executable]).output,
+    lipoArchitecture(arch),
+  );
   fs.writeFileSync(path.join(resources, "update-state.txt"), marker);
   if (quarantine) {
     command("xattr", [
@@ -898,6 +941,7 @@ const makeSignedNativeUpdate = ({
   const app = makeNativeHelperApp({
     adHocSigned,
     applicationId: applicationId ?? bundleId,
+    arch,
     destination: path.join(root, "payload", "Logseq.app"),
     escapeSymlink,
     marker: version,
@@ -934,6 +978,14 @@ const makeSignedNativeUpdate = ({
   ]);
   const archivedApp = path.join(probeRoot, "Logseq.app");
   const archivedQuarantine = quarantineValue(archivedApp);
+  assert.equal(
+    command("lipo", [
+      "-archs",
+      path.join(archivedApp, "Contents", "MacOS", "Logseq"),
+    ]).output,
+    lipoArchitecture(arch),
+    "7-Zip archive changed the fixture executable architecture",
+  );
   const archivedSignature = command(
     "codesign",
     ["--verify", "--deep", "--strict", "--all-architectures", archivedApp],
@@ -1061,10 +1113,15 @@ const nativeInstallArgs = ({
   ...(verifyOnly ? ["--verify-only"] : []),
 ];
 
-const makeOldTarget = (root, bundleId = "com.logseq.logseq") => {
+const makeOldTarget = (
+  root,
+  bundleId = "com.logseq.logseq",
+  arch = process.arch === "arm64" ? "arm64" : "x64",
+) => {
   const parent = path.join(root, "installed");
   const targetApp = makeNativeHelperApp({
     applicationId: bundleId,
+    arch,
     destination: path.join(parent, "Logseq.app"),
     marker: "2.0.1-selfhost.5",
     quarantine: "0081;4f000000;Logseq legacy install;test-origin",
@@ -1216,7 +1273,11 @@ const runNativeHelperContract = async () => {
       invocationFields,
     }) => {
       const caseRoot = path.join(tempRoot, `reject-${label.replaceAll(" ", "-")}`);
-      const { parent, targetApp } = makeOldTarget(caseRoot, bundleId);
+      const { parent, targetApp } = makeOldTarget(
+        caseRoot,
+        bundleId,
+        helperArch,
+      );
       const before = treeDigest(targetApp);
       const oldQuarantine = quarantineValue(targetApp);
       try {
@@ -1341,11 +1402,25 @@ const runNativeHelperContract = async () => {
       });
     }
 
+    const oppositeArch = helperArch === "arm64" ? "x64" : "arm64";
+    const wrongArchitecture = makeFixture({
+      arch: oppositeArch,
+      root: path.join(tempRoot, "wrong-architecture"),
+    });
+    assert.equal(
+      command("lipo", [
+        "-archs",
+        path.join(
+          wrongArchitecture.app,
+          "Contents",
+          "MacOS",
+          "Logseq",
+        ),
+      ]).output,
+      lipoArchitecture(oppositeArch),
+    );
     expectNoDamage({
-      fixture: makeFixture({
-        arch: helperArch === "arm64" ? "x64" : "arm64",
-        root: path.join(tempRoot, "wrong-architecture"),
-      }),
+      fixture: wrongArchitecture,
       label: "validly signed wrong architecture",
     });
 
@@ -1412,7 +1487,7 @@ const runNativeHelperContract = async () => {
     });
 
     const rollbackRoot = path.join(tempRoot, "mid-install-failure");
-    const rollbackTarget = makeOldTarget(rollbackRoot, bundleId);
+    const rollbackTarget = makeOldTarget(rollbackRoot, bundleId, helperArch);
     const rollbackBefore = treeDigest(rollbackTarget.targetApp);
     const rollback = invokeNative(base, {
       env: {
@@ -1426,7 +1501,7 @@ const runNativeHelperContract = async () => {
     console.log("[project-updater] PASS native rollback after mid-install failure");
 
     const successRoot = path.join(tempRoot, "success");
-    const successTarget = makeOldTarget(successRoot, bundleId);
+    const successTarget = makeOldTarget(successRoot, bundleId, helperArch);
     const observedStates = new Set();
     const statePath = path.join(
       successTarget.targetApp,
