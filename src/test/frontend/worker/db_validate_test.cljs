@@ -1,5 +1,5 @@
 (ns frontend.worker.db-validate-test
-  (:require [cljs.test :refer [deftest is]]
+  (:require [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
             [frontend.worker.db.validate :as worker-db-validate]
             [frontend.worker.shared-service :as shared-service]
@@ -12,6 +12,60 @@
   (let [conn (d/create-conn db-schema/schema)]
     (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
     conn))
+
+(defn- validate-block-with-property-entities
+  [property-entities block-properties]
+  (let [conn (d/create-conn db-schema/schema)
+        _ (d/transact! conn property-entities)
+        tx-report
+        (d/with
+         @conn
+         [(merge
+           {:block/uuid (random-uuid)
+            :block/created-at 1
+            :block/updated-at 1
+            :block/title "Legacy built-in property"
+            :block/parent 1000
+            :block/page 1000
+            :block/order "a0"}
+           block-properties)])]
+    (db-validate/validate-tx-report tx-report nil)))
+
+(deftest validate-tx-report-supports-incomplete-legacy-built-in-properties
+  (let [[valid? errors]
+        (validate-block-with-property-entities
+         [{:db/ident :logseq.property/heading}
+          {:db/ident :logseq.property.node/display-type}]
+         {:logseq.property/heading 2
+          :logseq.property.node/display-type :code})]
+    (is valid?)
+    (is (nil? errors))))
+
+(deftest validate-tx-report-keeps-property-validation-strict
+  (testing "a recovered built-in definition still validates its value"
+    (let [[valid? errors]
+          (validate-block-with-property-entities
+           [{:db/ident :logseq.property.node/display-type}]
+           {:logseq.property.node/display-type "code"})]
+      (is (false? valid?))
+      (is (seq errors))))
+
+  (testing "unknown property definitions are not inferred"
+    (let [[valid? errors]
+          (validate-block-with-property-entities
+           [{:db/ident :logseq.property/unknown-legacy-property}]
+           {:logseq.property/unknown-legacy-property "value"})]
+      (is (false? valid?))
+      (is (seq errors))))
+
+  (testing "an explicit stored type is not replaced by the built-in definition"
+    (let [[valid? errors]
+          (validate-block-with-property-entities
+           [{:db/ident :logseq.property.node/display-type
+             :logseq.property/type :checkbox}]
+           {:logseq.property.node/display-type :code})]
+      (is (false? valid?))
+      (is (seq errors)))))
 
 (deftest validate-db-returns-count-fields-without-counts-wrapper
   (let [conn (create-db-graph-conn)]
