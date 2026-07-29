@@ -1378,14 +1378,41 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     path.join(repoRoot, "src", "electron", "electron", "updater.cljs"),
     "utf8",
   );
+  const updaterConfig = fs.readFileSync(
+    path.join(
+      repoRoot,
+      "src",
+      "electron",
+      "electron",
+      "updater_config.cljs",
+    ),
+    "utf8",
+  );
   const combined = `${handler}\n${updater}`;
   assert.doesNotMatch(
     combined,
     /run-project-signed-macos-update|--helper\b/,
     "production Electron calls the local/CI test runner or its helper override",
   );
-  assert.match(combined, /darwin|macos/i);
-  assert.match(combined, /selfhost/i);
+  assert.match(
+    combined,
+    /project-signed-macos-updater\?/,
+    "runtime does not use the shared signed-macOS routing predicate",
+  );
+  const predicateDefinition = updaterConfig.match(
+    /\(defn-?\s+project-signed-macos-updater\?[\s\S]*?(?=\n\(defn|\s*$)/,
+  )?.[0];
+  assert.ok(
+    predicateDefinition,
+    "updater config does not define project-signed-macos-updater?",
+  );
+  assert.match(predicateDefinition, /darwin/i);
+  assert.match(predicateDefinition, /selfhost/i);
+  assert.match(
+    predicateDefinition,
+    /(?:>=\s+(?:[^\n()]+\s+)?5|<=\s+5(?:\s+[^\n()]*)?|at-least\??[^\n()]*5)/i,
+    "signed-macOS predicate does not require selfhost revision >= 5",
+  );
   assert.match(
     combined,
     /(?:native[\s\S]{0,120}helper|helper[\s\S]{0,120}native|project[-_\s]?signed[\s\S]{0,120}(?:install|update))/i,
@@ -1397,13 +1424,21 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
   ]) {
     for (const match of source.matchAll(/\.quitAndInstall\s+autoUpdater/g)) {
       const guardedContext = source.slice(
-        Math.max(0, match.index - 1600),
+        Math.max(0, match.index - 2400),
         match.index,
       );
-      assert.match(
-        guardedContext,
-        /(?:if|cond)[\s\S]*(?:selfhost|project[-\s]?signed|signed[-\s]?macos|project-update)/i,
-        `${label} has quitAndInstall without a macOS selfhost signed-update guard`,
+      const explicitlyNegative =
+        /(?:if-not|when-not|not)\s+\(?[\s\S]{0,240}project-signed-macos-updater\?/i.test(
+          guardedContext,
+        );
+      const signedPositiveBranchBeforeFallback =
+        /(?:if|cond)\s+\(?[\s\S]{0,240}project-signed-macos-updater\?[\s\S]*(?:native[\s\S]{0,120}helper|project[-_\s]?signed[\s\S]{0,120}(?:install|update))/i.test(
+          guardedContext,
+        );
+      assert.equal(
+        explicitlyNegative || signedPositiveBranchBeforeFallback,
+        true,
+        `${label} has quitAndInstall outside the negative branch of project-signed-macos-updater?`,
       );
     }
   }
