@@ -988,6 +988,7 @@ const runNativeHelperContract = async () => {
     });
 
     const helperPath = path.join(tempRoot, "project-update-helper");
+    const helperArch = process.arch === "arm64" ? "arm64" : "x64";
     const testKeyArgs = splitTestOnlyKeyFlags
       ? ["--test-only", "--public-key-base64", publicKeyRawBase64]
       : [
@@ -998,6 +999,8 @@ const runNativeHelperContract = async () => {
         ];
     const [buildExecutable, buildArgs] = scriptCommand(helperBuildPath, [
       ...testKeyArgs,
+      "--arch",
+      helperArch,
       "--output",
       helperPath,
     ]);
@@ -1013,6 +1016,8 @@ const runNativeHelperContract = async () => {
       const [unsafeExecutable, unsafeArgs] = scriptCommand(helperBuildPath, [
         "--public-key-base64",
         publicKeyRawBase64,
+        "--arch",
+        helperArch,
         "--output",
         unsafeHelperPath,
       ]);
