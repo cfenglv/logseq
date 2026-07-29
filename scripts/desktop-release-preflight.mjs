@@ -313,14 +313,29 @@ const packagedResourceContract = readText("resources/packaged-resource-contract.
 for (const needle of [
   "embedding_server.py",
   "logseq-project-updater",
-  "project-updater-signature.mjs",
+  "./packaged-resource-contract.mjs",
+  "verifyProjectSignatureRuntime",
   "project-signing-policy.json",
 ]) {
   assertContains(packagedDesktopVerifier, needle, "packaged desktop verifier");
 }
+const projectSignatureRuntimeVerification =
+  packagedDesktopVerifier.indexOf("verifyProjectSignatureRuntime({");
+const darwinOnlyPackagedVerification =
+  packagedDesktopVerifier.indexOf('if (expectedPlatform === "darwin")');
+if (
+  projectSignatureRuntimeVerification === -1 ||
+  darwinOnlyPackagedVerification === -1 ||
+  projectSignatureRuntimeVerification > darwinOnlyPackagedVerification
+) {
+  fail(
+    "packaged desktop verifier must invoke the shared project signature runtime contract before macOS-only checks",
+  );
+}
 for (const needle of [
   "project-updater-signature.mjs",
   "assertRegularFile",
+  "assertMatchesStagedResource",
   "does not match the staged release resource",
 ]) {
   assertContains(
