@@ -360,6 +360,7 @@ jobs:
           test -f ./static/js/db-worker-node.js
           test -f ./static/js/logseq-cli.js
           test -f ./static/.agents/skills/logseq-cli/SKILL.md
+          test -f ./static/sidecar/embedding_server.py
           pnpm desktop:verify-runtime-revisions
 
       - name: Verify release configuration
@@ -768,8 +769,7 @@ jobs:
 
       - name: Build project-signed updater helper for x64
         run: |
-          mkdir -p static/sidecar
-          cp -R release-gate-source/sidecar/. static/sidecar/
+          test -f static/sidecar/embedding_server.py
           node release-gate-source/scripts/build-project-update-helper.mjs \
             --arch x64 \
             --output static/sidecar/logseq-project-updater
@@ -918,8 +918,7 @@ jobs:
 
       - name: Build project-signed updater helper for arm64
         run: |
-          mkdir -p static/sidecar
-          cp -R release-gate-source/sidecar/. static/sidecar/
+          test -f static/sidecar/embedding_server.py
           node release-gate-source/scripts/build-project-update-helper.mjs \
             --arch arm64 \
             --output static/sidecar/logseq-project-updater

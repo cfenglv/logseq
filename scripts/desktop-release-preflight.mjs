@@ -257,11 +257,18 @@ if (packagedVerificationSteps !== 6) {
   );
 }
 if (
-  workflow.match(/cp -R release-gate-source\/sidecar\/\. static\/sidecar\//g)?.length !== 2 ||
+  workflow.match(/test -f (?:\.\/)?static\/sidecar\/embedding_server\.py/g)?.length !== 3 ||
   workflow.match(/--output static\/sidecar\/logseq-project-updater/g)?.length !== 2
 ) {
-  fail("both macOS jobs must stage the complete sidecar before adding the project updater helper");
+  fail(
+    "the compile gate and both macOS jobs must require the staged embedding sidecar before packaging",
+  );
 }
+assertNotContains(
+  workflow,
+  "cp -R release-gate-source/sidecar/. static/sidecar/",
+  "desktop release workflow",
+);
 
 const desktopBuilder = readText("resources/electron-builder.yml");
 assertContains(desktopBuilder, "- from: sidecar\n    to: sidecar", "desktop sidecar packaging");
