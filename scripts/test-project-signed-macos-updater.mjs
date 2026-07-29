@@ -2904,30 +2904,46 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     /(?:native[\s\S]{0,120}helper|helper[\s\S]{0,120}native|project[-_\s]?signed[\s\S]{0,120}(?:install|update))/i,
     "macOS selfhost branch does not call the packaged native helper",
   );
-  for (const [label, source] of [
-    ["handler.cljs", handler],
-    ["updater.cljs", updater],
-  ]) {
-    for (const match of source.matchAll(/\.quitAndInstall\s+autoUpdater/g)) {
-      const guardedContext = source.slice(
-        Math.max(0, match.index - 2400),
-        match.index,
-      );
-      const explicitlyNegative =
-        /(?:if-not|when-not|not)\s+\(?[\s\S]{0,240}project-signed-macos-updater\?/i.test(
-          guardedContext,
-        );
-      const signedPositiveBranchBeforeFallback =
-        /(?:if|cond)\s+\(?[\s\S]{0,240}project-signed-macos-updater\?[\s\S]*(?:native[\s\S]{0,120}helper|project[-_\s]?signed[\s\S]{0,120}(?:install|update))/i.test(
-          guardedContext,
-        );
-      assert.equal(
-        explicitlyNegative || signedPositiveBranchBeforeFallback,
-        true,
-        `${label} has quitAndInstall outside the negative branch of project-signed-macos-updater?`,
-      );
-    }
-  }
+  const legacyInstall = updaterFunction("<legacy-install!");
+  assert.ok(
+    legacyInstall,
+    "Electron does not isolate the electron-updater fallback",
+  );
+  assert.match(
+    legacyInstall,
+    /\.quitAndInstall\s+autoUpdater\s+false\s+true/,
+    "legacy fallback does not contain the expected electron-updater install call",
+  );
+  const allQuitAndInstallCalls = `${handler}\n${updater}`.match(
+    /\.quitAndInstall\s+autoUpdater/g,
+  ) ?? [];
+  assert.equal(
+    allQuitAndInstallCalls.length,
+    1,
+    "quitAndInstall must exist only inside the isolated legacy fallback",
+  );
+  assert.doesNotMatch(
+    `${handler}\n${updater.replace(legacyInstall, "")}`,
+    /\.quitAndInstall\s+autoUpdater/,
+    "a direct quitAndInstall path bypasses the isolated legacy fallback",
+  );
+  const installDownloadedUpdate = updaterFunction(
+    "install-downloaded-update!",
+  );
+  assert.ok(
+    installDownloadedUpdate,
+    "Electron does not expose the shared downloaded-update install entry",
+  );
+  assert.match(
+    installDownloadedUpdate,
+    /\(if\s+\(project-signed-macos-updater\?\)[\s\S]{0,800}<project-signed-install![\s\S]{0,800}<legacy-install!/,
+    "legacy quitAndInstall is not confined to the explicit negative branch of the signed macOS predicate",
+  );
+  assert.equal(
+    (installDownloadedUpdate.match(/<legacy-install!/g) ?? []).length,
+    1,
+    "downloaded-update entry must have exactly one legacy fallback call",
+  );
 });
 
 addCase(cases, "isolated signer fixture reaches verified output", () =>
