@@ -234,7 +234,7 @@ const createPackagedFixture = ({ arch, platform, root }) => {
   return layout;
 };
 
-const createStagedVerifier = (root) => {
+const createStagedVerifier = (root, packagedResourcesDir) => {
   const staticRoot = path.join(root, "staged-static");
   fs.mkdirSync(staticRoot, { recursive: true });
   fs.copyFileSync(verifierPath, path.join(staticRoot, "verify-packaged-desktop.mjs"));
@@ -245,6 +245,18 @@ const createStagedVerifier = (root) => {
       type: "module",
     }),
   );
+  for (const relativePath of [
+    path.join("sidecar", "embedding_server.py"),
+    ...helperNames.map((name) => path.join("sidecar", name)),
+    ...policyRelativePaths,
+    ...runtimeRelativePaths,
+  ]) {
+    const source = path.join(packagedResourcesDir, relativePath);
+    const destination = path.join(staticRoot, relativePath);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(source, destination);
+    fs.chmodSync(destination, fs.statSync(source).mode & 0o777);
+  }
   return {
     staticRoot,
     verifierPath: path.join(staticRoot, "verify-packaged-desktop.mjs"),
@@ -260,9 +272,11 @@ const removeAll = (root, relativePaths) => {
   }
 };
 
-const overwritePolicies = (resourcesDir, policy) => {
-  for (const relativePath of policyRelativePaths) {
-    fs.writeFileSync(path.join(resourcesDir, relativePath), policy);
+const overwritePolicies = (resourceRoots, policy) => {
+  for (const resourcesDir of resourceRoots) {
+    for (const relativePath of policyRelativePaths) {
+      fs.writeFileSync(path.join(resourcesDir, relativePath), policy);
+    }
   }
 };
 
@@ -298,7 +312,7 @@ const withPackagedFixture = ({ arch, platform }, callback) => {
   try {
     const asarNodePath = createAsarShim(path.join(root, "asar-shim"));
     const layout = createPackagedFixture({ arch, platform, root });
-    const stagedVerifier = createStagedVerifier(root);
+    const stagedVerifier = createStagedVerifier(root, layout.resourcesDir);
     return callback({
       arch,
       asarNodePath,
@@ -430,13 +444,14 @@ for (const platform of ["linux", "win32", "darwin"]) {
     );
     test(`${platform}/${arch} packaged verifier rejects missing embedding_server.py`, () =>
     withPackagedFixture({ arch, platform }, (fixture) => {
-      fs.rmSync(
-        path.join(
-          fixture.layout.resourcesDir,
-          "sidecar",
-          "embedding_server.py",
-        ),
-      );
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        fs.rmSync(
+          path.join(resourcesDir, "sidecar", "embedding_server.py"),
+        );
+      }
       expectVerifierFailure(
         fixture,
         `${platform}/${arch} missing embedding_server.py`,
@@ -453,10 +468,12 @@ test("darwin verifier rejects a missing native helper", () =>
       platform: "darwin",
     },
     (fixture) => {
-      removeAll(
-        path.join(fixture.layout.resourcesDir, "sidecar"),
-        helperNames,
-      );
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        removeAll(path.join(resourcesDir, "sidecar"), helperNames);
+      }
       expectVerifierFailure(fixture, "darwin missing native helper");
     },
   ));
@@ -468,11 +485,16 @@ test("darwin verifier rejects a helper that is not a regular executable", () =>
       platform: "darwin",
     },
     (fixture) => {
-      const sidecarDir = path.join(fixture.layout.resourcesDir, "sidecar");
-      for (const helperName of helperNames) {
-        const helperPath = path.join(sidecarDir, helperName);
-        fs.rmSync(helperPath);
-        fs.mkdirSync(helperPath);
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        const sidecarDir = path.join(resourcesDir, "sidecar");
+        for (const helperName of helperNames) {
+          const helperPath = path.join(sidecarDir, helperName);
+          fs.rmSync(helperPath);
+          fs.mkdirSync(helperPath);
+        }
       }
       expectVerifierFailure(fixture, "darwin non-regular native helper");
     },
@@ -485,9 +507,14 @@ test("darwin verifier rejects a non-executable native helper", () =>
       platform: "darwin",
     },
     (fixture) => {
-      const sidecarDir = path.join(fixture.layout.resourcesDir, "sidecar");
-      for (const helperName of helperNames) {
-        fs.chmodSync(path.join(sidecarDir, helperName), 0o644);
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        const sidecarDir = path.join(resourcesDir, "sidecar");
+        for (const helperName of helperNames) {
+          fs.chmodSync(path.join(sidecarDir, helperName), 0o644);
+        }
       }
       expectVerifierFailure(fixture, "darwin non-executable native helper");
     },
@@ -501,13 +528,18 @@ test("darwin verifier rejects a native helper for the wrong Mach-O architecture"
     },
     (fixture) => {
       const wrongArch = fixture.arch === "arm64" ? "x64" : "arm64";
-      const sidecarDir = path.join(fixture.layout.resourcesDir, "sidecar");
-      for (const helperName of helperNames) {
-        writeExecutable(
-          path.join(sidecarDir, helperName),
-          "darwin",
-          wrongArch,
-        );
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        const sidecarDir = path.join(resourcesDir, "sidecar");
+        for (const helperName of helperNames) {
+          writeExecutable(
+            path.join(sidecarDir, helperName),
+            "darwin",
+            wrongArch,
+          );
+        }
       }
       expectVerifierFailure(fixture, "darwin wrong-architecture native helper");
     },
@@ -520,7 +552,12 @@ test("darwin verifier rejects missing project signing policy", () =>
       platform: "darwin",
     },
     (fixture) => {
-      removeAll(fixture.layout.resourcesDir, policyRelativePaths);
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        removeAll(resourcesDir, policyRelativePaths);
+      }
       expectVerifierFailure(fixture, "darwin missing project signing policy");
     },
   ));
@@ -538,7 +575,7 @@ for (const [label, keyId] of [
       },
       (fixture) => {
         overwritePolicies(
-          fixture.layout.resourcesDir,
+          [fixture.layout.resourcesDir, fixture.staticRoot],
           signingPolicy({ keyId }),
         );
         expectVerifierFailure(fixture, `darwin ${label}`);
@@ -558,7 +595,7 @@ test("darwin verifier rejects an unrelated key claiming the accepted short prefi
         .update(acceptedPublicKey)
         .digest("hex");
       overwritePolicies(
-        fixture.layout.resourcesDir,
+        [fixture.layout.resourcesDir, fixture.staticRoot],
         signingPolicy({
           keyId: `ed25519:${acceptedDigest.slice(0, 16)}`,
           publicKey: Buffer.alloc(32, 0x7e),
@@ -578,7 +615,12 @@ test("darwin verifier rejects missing project update runtime", () =>
       platform: "darwin",
     },
     (fixture) => {
-      removeAll(fixture.layout.resourcesDir, runtimeRelativePaths);
+      for (const resourcesDir of [
+        fixture.layout.resourcesDir,
+        fixture.staticRoot,
+      ]) {
+        removeAll(resourcesDir, runtimeRelativePaths);
+      }
       expectVerifierFailure(fixture, "darwin missing project update runtime");
     },
   ));
