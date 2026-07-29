@@ -799,7 +799,7 @@ const signedNativeArchive = ({
 }) => {
   const artifact = fs.readFileSync(artifactPath);
   const size = artifact.length;
-  const sha512 = createHash("sha512").update(artifact).digest("base64");
+  const sha512 = createHash("sha512").update(artifact).digest("hex");
   const payload = canonicalNativePayload({
     arch,
     bundleId,
