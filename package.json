@@ -65,6 +65,7 @@
     "release-electron:local-signed": "run-s gulp:build && gulp electronMakerLocalSigned",
     "release-electron:unsigned": "run-s gulp:build && gulp electronMakerUnsigned",
     "setup-macos-local-signing": "node ./scripts/setup-local-macos-codesign.mjs",
+    "test:project-signed-macos-updater": "node ./scripts/test-project-signed-macos-updater.mjs",
     "debug-electron": "cd static/ && pnpm electron:debug",
     "webpack-watch": "webpack --watch",
     "webpack-app-watch": "pnpm exec webpack --watch --config-name app",
