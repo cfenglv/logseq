@@ -77,6 +77,12 @@ const fullDesktopReleasePreflight = readText(
 const desktopReleaseAssetVerifier = readText(
   "scripts/verify-desktop-release-assets.mjs",
 );
+const macosUpdaterSignatureVerifier = readText(
+  "scripts/verify-macos-updater-signature.mjs",
+);
+const macosUpdaterBaseline = readJson(
+  "scripts/fixtures/macos-updater-baseline.json",
+);
 const packagedDesktopVerifier = readText(
   "resources/verify-packaged-desktop.mjs",
 );
@@ -535,6 +541,11 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
+  /build-macos-arm64:[\s\S]*?Check out macOS updater signature gate[\s\S]*?persist-credentials: false[\s\S]*?Verify macOS updater installation compatibility[\s\S]*?verify-macos-updater-signature\.mjs[\s\S]*?--arch arm64[\s\S]*?--candidate-metadata static\/dist\/latest-mac\.yml[\s\S]*?--candidate-zip/,
+  "macOS arm64 release should physically rehearse the published updater path",
+);
+assert.match(
+  desktopReleaseWorkflow,
   /electron:make-unsigned --mac dmg zip --x64/,
   "fork desktop release workflow should build an unsigned macOS x64 app",
 );
@@ -578,6 +589,39 @@ assert.match(
   /entitlements\.local-signed\.plist/,
   "the fork afterSign hook should disable library validation",
 );
+assert.deepEqual(
+  macosUpdaterBaseline,
+  {
+    repository: "cfenglv/logseq",
+    version: "2.0.1-selfhost.4",
+    architectures: {
+      arm64: {
+        metadata: "latest-arm64-mac.yml",
+        metadataSha256:
+          "2dd11f39538c801cf2356a40e753b8f6a9963641df6951e13ed3493b1c5ed705",
+        zip: "Logseq-darwin-arm64-2.0.1-selfhost.4.zip",
+        zipSha256:
+          "6668bc87712d849374b5de823cce6bac2c32aa93486dd88ea9fcad8c82c41643",
+      },
+    },
+  },
+  "macOS updater gate should pin the published arm64 baseline assets",
+);
+for (const requiredVerifierContract of [
+  "LOGSEQ_UPDATER_BASELINE_ZIP",
+  "LOGSEQ_UPDATER_BASELINE_METADATA",
+  "published baseline metadata",
+  "candidate download payload",
+  "Squirrel.framework",
+  "Squirrel physical install",
+  "target-after=",
+]) {
+  assertContains(
+    macosUpdaterSignatureVerifier,
+    requiredVerifierContract,
+    "macOS updater signature verifier",
+  );
+}
 assert.match(
   desktopReleasePreflight,
   /tracked worktree changes must be committed before release/,
