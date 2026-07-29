@@ -177,7 +177,9 @@
                          {electron.logger
                           frontend.test.electron-logger-stub
                           frontend.components.lazy-editor
-                          frontend.test.lazy-editor-stub}}
+                          frontend.test.lazy-editor-stub
+                          frontend.version
+                          frontend.test.version-stub}}
          :closure-defines {frontend.util/NODETEST true
                            frontend.worker-common.util/NODETEST true
                            frontend.worker.platform.node/TEST-SECRET-STORAGE true

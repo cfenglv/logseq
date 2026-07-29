@@ -10,14 +10,12 @@ Object.defineProperty(process, "resourcesPath", {
   value: path.resolve(__dirname, "..", "..", "static"),
 });
 
-// frontend.version/version is a defonce. Seed it before the compiled CLJS
-// bundle loads so each subprocess exercises production policy with one fixed
-// running version, without mutating a namespace export after module load.
+// Seed the test build's version seam before the compiled CLJS bundle loads so
+// each subprocess exercises production policy with one fixed running version,
+// without mutating a namespace export after module load.
 const compiledTestVersion = process.env.LOGSEQ_TEST_COMPILED_VERSION;
 if (compiledTestVersion) {
-  globalThis.frontend ??= {};
-  globalThis.frontend.version ??= {};
-  globalThis.frontend.version.version = compiledTestVersion;
+  globalThis.__LOGSEQ_TEST_COMPILED_VERSION__ = compiledTestVersion;
 }
 
 const noop = (() => {
