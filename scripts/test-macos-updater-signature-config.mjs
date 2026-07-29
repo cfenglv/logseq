@@ -24,6 +24,7 @@ const read = (relativePath) =>
 
 const workflow = read(".github/workflows/build-desktop-release.yml");
 const verifier = read("scripts/verify-macos-updater-signature.mjs");
+const electronUpdater = read("src/electron/electron/updater.cljs");
 const baseline = JSON.parse(
   read("scripts/fixtures/macos-updater-baseline.json"),
 );
@@ -144,6 +145,21 @@ const cases = [
       assert.equal(
         workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length,
         2,
+      );
+    },
+  ],
+  [
+    "Electron waits for native verify-only success before quitting to install",
+    () => {
+      assert.match(electronUpdater, /<verify-project-update!/);
+      assert.match(electronUpdater, /"--verify-only"/);
+      assert.match(
+        electronUpdater,
+        /<verify-project-update! helper arguments\)[\s\S]*?\.then #\(<launch-project-update! helper arguments\)/,
+      );
+      assert.match(
+        electronUpdater,
+        /<launch-project-update![\s\S]*?\.once child "spawn"[\s\S]*?\.quit app/,
       );
     },
   ],

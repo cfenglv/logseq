@@ -269,6 +269,17 @@ try {
     invalidSignature,
     /signature is invalid/,
   );
+  const markerAfterInvalidPreflight = fs.readFileSync(
+    path.join(target, "Contents", "Resources", "release-marker.txt"),
+    "utf8",
+  );
+  if (markerAfterInvalidPreflight !== "installed-selfhost.4\n") {
+    throw new Error("invalid preflight changed the installed App");
+  }
+  passed += 1;
+  console.log(
+    "[project-updater-test] PASS invalid preflight leaves the installed App unchanged",
+  );
 
   const hashMismatch = [...validArgs];
   hashMismatch[hashMismatch.indexOf("--sha512") + 1] = "0".repeat(128);

@@ -213,6 +213,54 @@
     (debug "init-auto-updater")
     (<check-for-updates! win true)))
 
+(defn- project-helper-arguments
+  [{:keys [archive arch sha512 signature size version]} target]
+  ["--archive" archive
+   "--target" target
+   "--arch" arch
+   "--version" version
+   "--sha512" sha512
+   "--size" size
+   "--parent-pid" (str (.-pid js/process))
+   "--relaunch" "true"
+   "--signature" signature])
+
+(defn- <verify-project-update!
+  [helper arguments]
+  (js/Promise.
+   (fn [resolve reject]
+     (.execFile
+      child-process
+      helper
+      (bean/->js (conj arguments "--verify-only"))
+      #js {:encoding "utf8"
+           :maxBuffer (* 1024 1024)}
+      (fn [error stdout stderr]
+        (if error
+          (reject
+           (js/Error.
+            (str "project updater preflight failed: "
+                 (or (not-empty stderr)
+                     (not-empty stdout)
+                     (.-message error)))))
+          (resolve true)))))))
+
+(defn- <launch-project-update!
+  [helper arguments]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [child (.spawn child-process
+                         helper
+                         (bean/->js arguments)
+                         #js {:detached true
+                              :stdio "ignore"})]
+       (.once child "error" reject)
+       (.once child "spawn"
+              (fn []
+                (.unref child)
+                (resolve true)
+                (.quit app)))))))
+
 (defn install-downloaded-update!
   []
   (if-not (project-signed-macos-updater?)
@@ -229,29 +277,19 @@
                   (not (.isFile helper-stat))
                   (zero? (bit-and (.-mode helper-stat) 73)))
           (throw (js/Error. "project updater helper is not a real executable file")))
-        (js/Promise.
-         (fn [resolve reject]
-           (let [child (.spawn
-                        child-process
-                        helper
-                        (bean/->js
-                         ["--archive" archive
-                          "--target" target
-                          "--arch" arch
-                          "--version" version
-                          "--sha512" sha512
-                          "--size" size
-                          "--parent-pid" (str (.-pid js/process))
-                          "--relaunch" "true"
-                          "--signature" signature])
-                        #js {:detached true
-                             :stdio "ignore"})]
-             (.once child "error" reject)
-             (.once child "spawn"
-                    (fn []
-                      (.unref child)
-                      (resolve true)
-                      (.quit app)))))))
+        (let [arguments (project-helper-arguments
+                         {:archive archive
+                          :arch arch
+                          :sha512 sha512
+                          :signature signature
+                          :size size
+                          :version version}
+                         target)]
+          ;; Keep the App running until the production helper has completed
+          ;; signature, archive, bundle, architecture, and upgrade validation.
+          ;; The detached install repeats all checks after quit to close TOCTOU.
+          (-> (<verify-project-update! helper arguments)
+              (.then #(<launch-project-update! helper arguments)))))
       (throw (js/Error. "no verified project-signed update is downloaded")))))
 
 (defn init-updater
