@@ -231,11 +231,38 @@ const assertApp = ({ app, arch, version }) => {
   const executableName = plistValue(app, "CFBundleExecutable");
   const executable = path.join(app, "Contents", "MacOS", executableName);
   const architectures = command("lipo", ["-archs", executable]).split(/\s+/);
-  if (!architectures.includes(arch)) {
-    throw new Error(`${app} executable architectures do not include ${arch}`);
+  const executableArch = arch === "x64" ? "x86_64" : arch;
+  if (!architectures.includes(executableArch)) {
+    throw new Error(
+      `${app} executable architectures do not include ${executableArch}`,
+    );
   }
   command("codesign", ["--verify", "--deep", "--strict", "--verbose=2", app]);
   return command("codesign", ["-dvvv", "-r-", app]);
+};
+
+const assertDeveloperIdBaseline = (signatureDetails) => {
+  const teamIdentifier = signatureDetails.match(
+    /^TeamIdentifier=(.+)$/m,
+  )?.[1];
+  const requirement = signatureDetails.match(
+    /^(?:# )?designated => (.+)$/m,
+  )?.[1];
+  const hasDeveloperIdAuthority =
+    /^Authority=Developer ID Application:/m.test(signatureDetails);
+  if (
+    !teamIdentifier ||
+    teamIdentifier === "not set" ||
+    !hasDeveloperIdAuthority ||
+    !requirement ||
+    /^cdhash\b/.test(requirement)
+  ) {
+    throw new UpdaterSignatureGateError(
+      "fixture-error",
+      "future updater baseline must be the published Developer ID Application signed 2.0.1-selfhost.5 App with a stable non-cdhash designated requirement",
+    );
+  }
+  return `TeamIdentifier=${teamIdentifier}; designated => ${requirement}`;
 };
 
 const verifyCandidateAgainstOldRequirement = (oldSignatureDetails, newApp) => {
@@ -562,6 +589,23 @@ export const runGate = async (options) => {
         )
         .join("; ");
     });
+    if (options.requireDeveloperIdBaseline) {
+      await reporter.step("published baseline Developer ID identity", async () =>
+        assertDeveloperIdBaseline(oldSignatureDetails),
+      );
+      await reporter.step("published baseline Gatekeeper acceptance", async () =>
+        command("spctl", [
+          "--assess",
+          "--type",
+          "execute",
+          "--verbose=4",
+          oldApp,
+        ]),
+      );
+      await reporter.step("published baseline stapled notarization", async () =>
+        command("xcrun", ["stapler", "validate", oldApp]),
+      );
+    }
     await reporter.step("candidate generic signature", async () => {
       const details = assertApp({
         app: newApp,

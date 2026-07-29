@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { macosUpdaterMetadataName } from "../resources/selfhost-updater-version.mjs";
 
 const parseArgs = (argv) => {
@@ -25,6 +26,10 @@ const parseArgs = (argv) => {
 const args = parseArgs(process.argv.slice(2));
 const releaseDir = path.resolve(args.dir || ".");
 const version = args.version?.trim();
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
 
 if (!version) {
   throw new Error("--version is required");
@@ -34,6 +39,12 @@ if (version.includes("+")) {
     `release version ${version} contains SemVer build metadata; electron-builder strips build metadata from updater filenames, so use a prerelease version such as -alpha.nightly.YYYYMMDD`,
   );
 }
+
+const macosMetadataNames = ["arm64", "x64"].flatMap((arch) => {
+  const current = macosUpdaterMetadataName(version, arch);
+  const legacy = `latest-${arch}-mac.yml`;
+  return current === legacy ? [current] : [current, legacy];
+});
 
 const desktopArtifactNames = [
   `Logseq-darwin-arm64-${version}.dmg`,
@@ -54,12 +65,11 @@ const desktopArtifactNames = [
   `Logseq-win-x64-${version}-nsis.exe`,
   `Logseq-win-x64-${version}-nsis.exe.blockmap`,
   `Logseq-win-x64-${version}.zip`,
-  macosUpdaterMetadataName(version, "arm64"),
   "latest-arm64.yml",
   "latest-linux-arm64.yml",
   "latest-linux.yml",
-  macosUpdaterMetadataName(version, "x64"),
   "latest-x64.yml",
+  ...macosMetadataNames,
   "VERSION",
 ];
 const androidArtifactNames = fs
@@ -103,6 +113,27 @@ const sha512 = (filePath) =>
 
 for (const yamlName of artifactNames.filter((name) => name.endsWith(".yml"))) {
   const yaml = fs.readFileSync(path.join(releaseDir, yamlName), "utf8");
+  const legacyArch = yamlName.match(/^latest-(arm64|x64)-mac\.yml$/)?.[1];
+  const isLegacySentinel =
+    legacyArch &&
+    macosUpdaterMetadataName(version, legacyArch) !== yamlName;
+  if (isLegacySentinel) {
+    const pinnedPath = path.join(
+      repoRoot,
+      "resources",
+      "updater",
+      "legacy-macos",
+      yamlName,
+    );
+    const pinned = fs.readFileSync(pinnedPath, "utf8");
+    if (yaml !== pinned) {
+      throw new Error(
+        `${yamlName} must exactly match the pinned 2.0.1-selfhost.4 sentinel`,
+      );
+    }
+    continue;
+  }
+
   const yamlVersion = yaml.match(/^version:\s*(.+)$/m)?.[1]?.trim();
   if (yamlVersion !== version) {
     throw new Error(`${yamlName} version ${yamlVersion} does not match ${version}`);

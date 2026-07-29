@@ -48,6 +48,16 @@ export const resolveSelfhostUpdaterVersions = (packageVersion) => {
   };
 };
 
+export const selfhostUpdaterRevision = (packageVersion) => {
+  const revision = Number(
+    packageVersion.match(selfhostRevisionPattern)?.[1],
+  );
+  if (!Number.isInteger(revision)) {
+    throw new Error(`invalid selfhost updater version: ${packageVersion}`);
+  }
+  return revision;
+};
+
 export const macosUpdaterChannel = (packageVersion, arch) => {
   if (!supportedMacosArchitectures.has(arch)) {
     throw new Error(`unsupported macOS updater architecture: ${arch}`);
@@ -71,10 +81,17 @@ const isEntrypoint =
 
 if (isEntrypoint) {
   const [command, packageVersion, arch] = process.argv.slice(2);
-  if (command !== "macos-metadata-name" || !packageVersion || !arch) {
+  if (command === "macos-metadata-name" && packageVersion && arch) {
+    console.log(macosUpdaterMetadataName(packageVersion, arch));
+  } else if (
+    command === "selfhost-revision" &&
+    packageVersion &&
+    arch === undefined
+  ) {
+    console.log(selfhostUpdaterRevision(packageVersion));
+  } else {
     throw new Error(
-      "usage: selfhost-updater-version.mjs macos-metadata-name <version> <x64|arm64>",
+      "usage: selfhost-updater-version.mjs <macos-metadata-name <version> <x64|arm64>|selfhost-revision <version>>",
     );
   }
-  console.log(macosUpdaterMetadataName(packageVersion, arch));
 }

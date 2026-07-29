@@ -114,6 +114,9 @@ jobs:
       - name: Run deterministic release preflight
         run: pnpm desktop:release-preflight:quick -- --strict
 
+      - name: Test macOS updater release policy
+        run: node scripts/test-macos-updater-signature-config.mjs
+
   release-rehearsal-gate:
     needs: [ source-preflight ]
     runs-on: ubuntu-22.04
@@ -713,6 +716,13 @@ jobs:
           name: static
           path: static
 
+      - name: Check out macOS release policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          path: release-gate-source
+          persist-credentials: false
+
       - name: Retrieve tag version
         id: ref
         run: |
@@ -808,6 +818,16 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app_path"
           xcrun stapler validate "$app_path"
 
+      - name: Route macOS updater signature policy
+        run: |
+          candidate_zip="$(find static/dist -maxdepth 1 -type f -name 'Logseq-darwin-x64-*.zip' -print -quit)"
+          test -n "$candidate_zip"
+          node release-gate-source/scripts/run-macos-updater-signature-policy.mjs \
+            --arch x64 \
+            --candidate-version "${{ steps.ref.outputs.version }}" \
+            --candidate-metadata static/dist/latest-mac.yml \
+            --candidate-zip "$candidate_zip"
+
       - name: Save x64 artifacts
         run: |
           mkdir -p builds
@@ -815,8 +835,11 @@ jobs:
           mv static/dist/*.dmg           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.dmg
           mv static/dist/*.zip           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.zip
           mv static/dist/*.blockmap      ./builds/
-          metadata_name="$(node static/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" x64)"
+          metadata_name="$(node release-gate-source/resources/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" x64)"
           mv static/dist/latest-mac.yml  "./builds/${metadata_name}"
+          if [ "$metadata_name" != "latest-x64-mac.yml" ]; then
+            cp release-gate-source/resources/updater/legacy-macos/latest-x64-mac.yml ./builds/latest-x64-mac.yml
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -837,7 +860,7 @@ jobs:
           name: static
           path: static
 
-      - name: Check out macOS updater signature gate
+      - name: Check out macOS release policy
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.git-ref || github.sha }}
@@ -918,16 +941,6 @@ jobs:
         run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch arm64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
-      - name: Verify macOS updater installation compatibility
-        run: |
-          candidate_zip="$(find static/dist -maxdepth 1 -type f -name 'Logseq-darwin-arm64-*.zip' -print -quit)"
-          test -n "$candidate_zip"
-          node release-gate-source/scripts/verify-macos-updater-signature.mjs \
-            --arch arm64 \
-            --candidate-version "${{ steps.ref.outputs.version }}" \
-            --candidate-metadata static/dist/latest-mac.yml \
-            --candidate-zip "$candidate_zip"
-
       - name: Verify fork macOS app can load Electron
         if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
         run: |
@@ -947,6 +960,16 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app_path"
           xcrun stapler validate "$app_path"
 
+      - name: Route macOS updater signature policy
+        run: |
+          candidate_zip="$(find static/dist -maxdepth 1 -type f -name 'Logseq-darwin-arm64-*.zip' -print -quit)"
+          test -n "$candidate_zip"
+          node release-gate-source/scripts/run-macos-updater-signature-policy.mjs \
+            --arch arm64 \
+            --candidate-version "${{ steps.ref.outputs.version }}" \
+            --candidate-metadata static/dist/latest-mac.yml \
+            --candidate-zip "$candidate_zip"
+
       - name: Save arm64 artifacts
         run: |
           mkdir -p builds
@@ -954,8 +977,11 @@ jobs:
           mv static/dist/*.dmg           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.dmg
           mv static/dist/*.zip           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.zip
           mv static/dist/*.blockmap      ./builds/
-          metadata_name="$(node static/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" arm64)"
+          metadata_name="$(node release-gate-source/resources/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" arm64)"
           mv static/dist/latest-mac.yml  "./builds/${metadata_name}"
+          if [ "$metadata_name" != "latest-arm64-mac.yml" ]; then
+            cp release-gate-source/resources/updater/legacy-macos/latest-arm64-mac.yml ./builds/latest-arm64-mac.yml
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

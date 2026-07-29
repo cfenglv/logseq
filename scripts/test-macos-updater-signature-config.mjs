@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  signedBaselineManifest,
+  updaterSignatureGatePlan,
+} from "./run-macos-updater-signature-policy.mjs";
 import {
   classifyShipItOutcome,
   UpdaterSignatureGateError,
@@ -21,10 +27,22 @@ const verifier = read("scripts/verify-macos-updater-signature.mjs");
 const baseline = JSON.parse(
   read("scripts/fixtures/macos-updater-baseline.json"),
 );
+const helperPath = path.join(
+  repoRoot,
+  "resources",
+  "selfhost-updater-version.mjs",
+);
+const runHelper = (...args) => {
+  const result = spawnSync(process.execPath, [helperPath, ...args], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+};
 
 const cases = [
   [
-    "published .4 arm64 inputs are SHA-256 pinned",
+    "published .4 arm64 and x64 inputs are SHA-256 pinned",
     () =>
       assert.deepEqual(baseline, {
         repository: "cfenglv/logseq",
@@ -38,16 +56,113 @@ const cases = [
             zipSha256:
               "6668bc87712d849374b5de823cce6bac2c32aa93486dd88ea9fcad8c82c41643",
           },
+          x64: {
+            metadata: "latest-x64-mac.yml",
+            metadataSha256:
+              "7b35999d6cd7edcd54b08944bca4112abb39e6fc2f12b7d2f602a2c35cdb8ec0",
+            zip: "Logseq-darwin-x64-2.0.1-selfhost.4.zip",
+            zipSha256:
+              "48aef39093d0395c692c78a75a4e4cbb00a9d728e118e11f04c86b1783f3ef90",
+          },
         },
       }),
   ],
   [
-    "release workflow runs the gate against the candidate ZIP",
-    () =>
-      assert.match(
+    ".4 to .5 signature rejection remains an independent pinned reproducer",
+    () => {
+      assert.ok(
+        fs.existsSync(
+          path.join(
+            repoRoot,
+            "scripts",
+            "reproduce-macos-updater-signature-regression.mjs",
+          ),
+        ),
+      );
+      assert.doesNotMatch(
         workflow,
-        /build-macos-arm64:[\s\S]*?Verify macOS updater installation compatibility[\s\S]*?verify-macos-updater-signature\.mjs[\s\S]*?--candidate-metadata static\/dist\/latest-mac\.yml[\s\S]*?--candidate-zip/,
-      ),
+        /Verify macOS updater installation compatibility/,
+      );
+      assert.doesNotMatch(
+        workflow,
+        /node release-gate-source\/scripts\/verify-macos-updater-signature\.mjs/,
+      );
+    },
+  ],
+  [
+    "workflow helper produces legacy and v2 metadata names when executed",
+    () => {
+      assert.equal(
+        runHelper("macos-metadata-name", "2.0.1-selfhost.4", "arm64"),
+        "latest-arm64-mac.yml",
+      );
+      assert.equal(
+        runHelper("macos-metadata-name", "2.0.1-selfhost.4", "x64"),
+        "latest-x64-mac.yml",
+      );
+      assert.equal(
+        runHelper("macos-metadata-name", "2.0.1-selfhost.5", "arm64"),
+        "selfhost-macos-v2-arm64-mac.yml",
+      );
+      assert.equal(
+        runHelper("macos-metadata-name", "2.0.1-selfhost.5", "x64"),
+        "selfhost-macos-v2-x64-mac.yml",
+      );
+      assert.equal(runHelper("selfhost-revision", "2.0.1-selfhost.5"), "5");
+      assert.equal(
+        workflow.match(
+          /release-gate-source\/resources\/selfhost-updater-version\.mjs macos-metadata-name/g,
+        )?.length,
+        2,
+      );
+    },
+  ],
+  [
+    ".5 is a manual trust-chain bootstrap and future releases fail closed",
+    () => {
+      assert.equal(
+        updaterSignatureGatePlan("2.0.1-selfhost.5", false).mode,
+        "manual-migration",
+      );
+      assert.throws(
+        () => updaterSignatureGatePlan("2.0.1-selfhost.6", false),
+        /published Developer ID signed and notarized 2\.0\.1-selfhost\.5/,
+      );
+      assert.deepEqual(
+        updaterSignatureGatePlan("2.0.1-selfhost.6", true),
+        { mode: "signed-baseline", manifest: signedBaselineManifest },
+      );
+      assert.equal(fs.existsSync(signedBaselineManifest), false);
+      assert.equal(
+        workflow.match(/run-macos-updater-signature-policy\.mjs/g)?.length,
+        2,
+      );
+    },
+  ],
+  [
+    "both legacy sentinels are exact published .4 metadata",
+    () => {
+      const expected = {
+        arm64:
+          "2dd11f39538c801cf2356a40e753b8f6a9963641df6951e13ed3493b1c5ed705",
+        x64: "7b35999d6cd7edcd54b08944bca4112abb39e6fc2f12b7d2f602a2c35cdb8ec0",
+      };
+      for (const [arch, digest] of Object.entries(expected)) {
+        const metadata = read(
+          `resources/updater/legacy-macos/latest-${arch}-mac.yml`,
+        );
+        assert.match(metadata, /^version: 2\.0\.1-selfhost\.4$/m);
+        assert.doesNotMatch(metadata, /2\.0\.1-selfhost\.5/);
+        assert.equal(
+          createHash("sha256").update(metadata).digest("hex"),
+          digest,
+        );
+      }
+      assert.equal(
+        workflow.match(/resources\/updater\/legacy-macos\/latest-/g)?.length,
+        2,
+      );
+    },
   ],
   [
     "local baseline overrides still flow through pinned hash checks",
@@ -75,6 +190,10 @@ const cases = [
         /"Squirrel designated requirement authorization"/,
       );
       assert.match(verifier, /"Squirrel physical install"/);
+      assert.match(verifier, /published baseline Developer ID identity/);
+      assert.match(verifier, /published baseline Gatekeeper acceptance/);
+      assert.match(verifier, /published baseline stapled notarization/);
+      assert.match(verifier, /arch === "x64" \? "x86_64" : arch/);
     },
   ],
   [

@@ -40,14 +40,15 @@ const hashFile = async (algorithm, file, encoding) => {
 };
 
 const parseOverrides = (argv) => {
-  const result = {};
+  const result = { arch: "arm64" };
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
     if (!key?.startsWith("--") || !value) {
       throw new Error(`invalid argument near ${key ?? "<end>"}`);
     }
-    if (key === "--baseline-zip") result.baselineZip = value;
+    if (key === "--arch") result.arch = value;
+    else if (key === "--baseline-zip") result.baselineZip = value;
     else if (key === "--baseline-metadata") result.baselineMetadata = value;
     else throw new Error(`unknown argument ${key}`);
   }
@@ -71,7 +72,7 @@ const main = async () => {
     );
     const baseline = await loadBaseline(
       {
-        arch: "arm64",
+        arch: overrides.arch,
         baselineManifest,
         baselineMetadata:
           overrides.baselineMetadata ||
@@ -118,7 +119,7 @@ const main = async () => {
 
     const candidateZip = path.join(
       scratch,
-      "Logseq-darwin-arm64-2.0.1-selfhost.5.zip",
+      `Logseq-darwin-${overrides.arch}-2.0.1-selfhost.5.zip`,
     );
     command("ditto", [
       "-c",
@@ -136,10 +137,10 @@ const main = async () => {
       [
         "version: 2.0.1-selfhost.5",
         "files:",
-        "  - url: Logseq-darwin-arm64-2.0.1-selfhost.5.zip",
+        `  - url: Logseq-darwin-${overrides.arch}-2.0.1-selfhost.5.zip`,
         `    sha512: ${sha512}`,
         `    size: ${size}`,
-        "path: Logseq-darwin-arm64-2.0.1-selfhost.5.zip",
+        `path: Logseq-darwin-${overrides.arch}-2.0.1-selfhost.5.zip`,
         `sha512: ${sha512}`,
         "releaseDate: '2026-07-29T00:00:00.000Z'",
         "",
@@ -148,7 +149,7 @@ const main = async () => {
     );
 
     await runGate({
-      arch: "arm64",
+      arch: overrides.arch,
       candidateMetadata,
       candidateVersion: "2.0.1-selfhost.5",
       candidateZip,

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -58,32 +59,41 @@ const releaseAssetName = (platform, arch) => {
   return `Logseq-linux-${arch === "x64" ? "x86_64" : arch}-${nextVersion}.AppImage`;
 };
 
-const channel = (platform, arch) =>
+const channel = (platform, arch, version = currentVersion) =>
   platform === "darwin"
-    ? macosUpdaterChannel(currentVersion, arch)
+    ? macosUpdaterChannel(version, arch)
     : platform === "win32"
       ? `latest-${arch}`
       : null;
 
-const makeProvider = ({ platform, arch, allowPrerelease }) => {
-  const expectedMetadata = metadataName(platform, arch);
+const makeProvider = ({
+  platform,
+  arch,
+  allowPrerelease,
+  clientVersion = currentVersion,
+  expectedMetadata = metadataName(platform, arch),
+  latestReleaseTag = nextVersion,
+  metadataOverride,
+}) => {
   const assetName = releaseAssetName(platform, arch);
   const requests = [];
-  const metadata = [
-    `version: ${nextVersion}`,
-    "files:",
-    `  - url: ${assetName}`,
-    "    sha512: YQ==",
-    "    size: 1",
-    `path: ${assetName}`,
-    "sha512: YQ==",
-    "releaseDate: '2026-07-25T00:00:00.000Z'",
-    "",
-  ].join("\n");
+  const metadata =
+    metadataOverride ||
+    [
+      `version: ${nextVersion}`,
+      "files:",
+      `  - url: ${assetName}`,
+      "    sha512: YQ==",
+      "    size: 1",
+      `path: ${assetName}`,
+      "sha512: YQ==",
+      "releaseDate: '2026-07-25T00:00:00.000Z'",
+      "",
+    ].join("\n");
   const updater = {
     allowPrerelease,
-    channel: channel(platform, arch),
-    currentVersion: semver.parse(currentVersion),
+    channel: channel(platform, arch, clientVersion),
+    currentVersion: semver.parse(clientVersion),
     fullChangelog: false,
   };
   const provider = new GitHubProvider(
@@ -112,7 +122,7 @@ const makeProvider = ({ platform, arch, allowPrerelease }) => {
     requests.push(url.pathname);
     if (url.pathname.endsWith(".atom")) return feed;
     if (url.pathname.endsWith("/releases/latest")) {
-      return JSON.stringify({ tag_name: nextVersion });
+      return JSON.stringify({ tag_name: latestReleaseTag });
     }
     throw new Error(`unexpected updater provider request: ${url}`);
   };
@@ -158,6 +168,35 @@ for (const [platform, arch] of [
   }
 }
 
+for (const arch of ["x64", "arm64"]) {
+  const expectedMetadata = `latest-${arch}-mac.yml`;
+  const pinnedLegacyMetadata = fs.readFileSync(
+    path.join(packageRoot, "updater", "legacy-macos", expectedMetadata),
+    "utf8",
+  );
+  const legacy = makeProvider({
+    platform: "darwin",
+    arch,
+    allowPrerelease: false,
+    clientVersion: "2.0.1-selfhost.4",
+    expectedMetadata,
+    latestReleaseTag: currentVersion,
+    metadataOverride: pinnedLegacyMetadata,
+  });
+  const info = await legacy.provider.getLatestVersion();
+  assert.equal(
+    info.version,
+    "2.0.1-selfhost.4",
+    `legacy ${arch} clients must not be offered the manually installed release`,
+  );
+  assert.ok(
+    legacy.requests.some((request) =>
+      request.endsWith(`/${expectedMetadata}`),
+    ),
+    `legacy ${arch} clients must receive pinned metadata instead of a 404`,
+  );
+}
+
 const broken = makeProvider({
   platform: "darwin",
   arch: "arm64",
@@ -170,5 +209,5 @@ await assert.rejects(
 );
 
 console.log(
-  `[updater-provider] OK ${currentVersion} -> ${nextVersion} across six platform/architecture contracts${isNightlyRehearsal ? ` (normalized from ${packageJson.version})` : ""}`,
+  `[updater-provider] OK ${currentVersion} -> ${nextVersion} across six platform/architecture contracts; legacy macOS .4 stays on pinned metadata${isNightlyRehearsal ? ` (normalized from ${packageJson.version})` : ""}`,
 );

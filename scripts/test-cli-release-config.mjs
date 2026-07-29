@@ -73,6 +73,31 @@ assert.throws(
   /unsupported macOS updater architecture/,
   "macOS metadata generation should reject unsupported architectures",
 );
+const updaterVersionCli = path.join(
+  repoRoot,
+  "resources",
+  "selfhost-updater-version.mjs",
+);
+for (const [version, arch, expected] of [
+  ["2.0.1-selfhost.4", "arm64", "latest-arm64-mac.yml"],
+  ["2.0.1-selfhost.4", "x64", "latest-x64-mac.yml"],
+  [
+    "2.0.1-selfhost.5",
+    "arm64",
+    "selfhost-macos-v2-arm64-mac.yml",
+  ],
+  ["2.0.1-selfhost.5", "x64", "selfhost-macos-v2-x64-mac.yml"],
+]) {
+  assert.equal(
+    execFileSync(
+      process.execPath,
+      [updaterVersionCli, "macos-metadata-name", version, arch],
+      { encoding: "utf8" },
+    ).trim(),
+    expected,
+    `workflow metadata helper should resolve ${version}/${arch}`,
+  );
+}
 
 const assertContains = (text, needle, label) => {
   assert.ok(text.includes(needle), `${label} should contain ${needle}`);
@@ -103,6 +128,9 @@ const desktopReleaseAssetVerifier = readText(
 );
 const macosUpdaterSignatureVerifier = readText(
   "scripts/verify-macos-updater-signature.mjs",
+);
+const macosUpdaterSignaturePolicy = readText(
+  "scripts/run-macos-updater-signature-policy.mjs",
 );
 const macosUpdaterBaseline = readJson(
   "scripts/fixtures/macos-updater-baseline.json",
@@ -577,15 +605,34 @@ assert.match(
 );
 assert.equal(
   desktopReleaseWorkflow.match(
-    /selfhost-updater-version\.mjs macos-metadata-name/g,
+    /release-gate-source\/resources\/selfhost-updater-version\.mjs macos-metadata-name/g,
   )?.length,
   2,
-  "both macOS builders should publish metadata on the versioned channel",
+  "both macOS builders should execute the checked-out metadata helper",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /run-macos-updater-signature-policy\.mjs/g,
+  )?.length,
+  2,
+  "both macOS builders should route through the migration-aware signature policy",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /node release-gate-source\/scripts\/verify-macos-updater-signature\.mjs/,
+  "the .5 workflow must not run the .4 designated requirement as a release gate",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /resources\/updater\/legacy-macos\/latest-(?:arm64|x64)-mac\.yml/g,
+  )?.length,
+  2,
+  "both macOS releases should carry pinned legacy metadata sentinels",
 );
 assert.match(
-  desktopReleaseWorkflow,
-  /build-macos-arm64:[\s\S]*?Check out macOS updater signature gate[\s\S]*?persist-credentials: false[\s\S]*?Verify macOS updater installation compatibility[\s\S]*?verify-macos-updater-signature\.mjs[\s\S]*?--arch arm64[\s\S]*?--candidate-metadata static\/dist\/latest-mac\.yml[\s\S]*?--candidate-zip/,
-  "macOS arm64 release should physically rehearse the published updater path",
+  macosUpdaterSignaturePolicy,
+  /manual-migration[\s\S]*revision > 5[\s\S]*macos-updater-signed-baseline\.json/,
+  "the signature policy should defer the physical gate until a signed .5 baseline exists",
 );
 assert.match(
   desktopReleaseWorkflow,
@@ -646,9 +693,22 @@ assert.deepEqual(
         zipSha256:
           "6668bc87712d849374b5de823cce6bac2c32aa93486dd88ea9fcad8c82c41643",
       },
+      x64: {
+        metadata: "latest-x64-mac.yml",
+        metadataSha256:
+          "7b35999d6cd7edcd54b08944bca4112abb39e6fc2f12b7d2f602a2c35cdb8ec0",
+        zip: "Logseq-darwin-x64-2.0.1-selfhost.4.zip",
+        zipSha256:
+          "48aef39093d0395c692c78a75a4e4cbb00a9d728e118e11f04c86b1783f3ef90",
+      },
     },
   },
-  "macOS updater gate should pin the published arm64 baseline assets",
+  "macOS updater regression reproducer should pin the published arm64 and x64 baseline assets",
+);
+assert.match(
+  macosUpdaterSignatureVerifier,
+  /published baseline Developer ID identity/,
+  "future physical updater gates should require a Developer ID baseline",
 );
 for (const requiredVerifierContract of [
   "LOGSEQ_UPDATER_BASELINE_ZIP",
