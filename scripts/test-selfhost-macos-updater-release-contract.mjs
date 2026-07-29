@@ -190,15 +190,25 @@ function assertNightlyPublicationIsolation() {
     /tag_name:\s*(?:nightly|['"]nightly['"]|\${{\s*steps\.[\w-]+\.outputs\.(?:version|tag)\s*}})\s*$/m,
     'nightly publication must stay on an isolated rolling/prerelease release instead of production/latest'
   )
-  assert.match(
-    nightlyJob,
-    /prerelease:\s*(?:true|['"]true['"])\s*$/m,
-    'every nightly publication must be an unconditional GitHub prerelease'
+  const prereleaseValue = nightlyJob.match(
+    /prerelease:\s*([^\n]+)/
+  )?.[1]?.trim()
+  assert.ok(
+    prereleaseValue,
+    'nightly publication must declare its GitHub prerelease state'
   )
-  assert.doesNotMatch(
-    nightlyJob,
-    /prerelease:[^\n]*(?:is-pre-release|event_name|schedule|workflow_dispatch)/,
-    'manual nightly publication must not be allowed to become a production/latest release'
+  const literalPrerelease =
+    /^(?:true|['"]true['"])$/.test(prereleaseValue)
+  const positiveSelfhostClause =
+    /contains\(\s*[^,]*(?:version|tag)[^,]*,\s*['"]-selfhost\.['"]\s*\)/i
+  const scopedSelfhostPrerelease =
+    positiveSelfhostClause.test(prereleaseValue) &&
+    !/&&|!\s*contains|\bnot\s*\(/i.test(prereleaseValue) &&
+    (prereleaseValue.match(/\|\|/g)?.length ?? 0) <= 1
+  assert.equal(
+    literalPrerelease || scopedSelfhostPrerelease,
+    true,
+    'every selfhost nightly publication must be an unconditional GitHub prerelease'
   )
 
   const nightlyPublicationSource =

@@ -59,8 +59,20 @@
       {:auto-updater auto-updater
        :dispose! dispose!
        :policy (fn [info]
-                 (with-redefs [updater/electron-version version]
-                   (raw-policy info)))})))
+                 ;; The production predicate performs asynchronous native
+                 ;; verification before it reads the running version. Keep the
+                 ;; fixture override alive until that Promise settles.
+                 (let [original-version updater/electron-version]
+                   (set! updater/electron-version version)
+                   (try
+                     (-> (raw-policy info)
+                         (p/finally
+                          (fn []
+                            (set! updater/electron-version
+                                  original-version))))
+                     (catch :default error
+                       (set! updater/electron-version original-version)
+                       (throw error)))))})))
 
 (defn- run-app-updater-flow!
   [current info production-policy]
@@ -125,6 +137,11 @@
 
             (:child-spawn-error :success)
             (let [child (EventEmitter.)]
+              (set! (.-unref child)
+                    (fn []
+                      (swap! events conj
+                             [:unref @dirty? @running?])
+                      child))
               (js/setTimeout
                (fn []
                  (if (= failure :child-spawn-error)
@@ -382,6 +399,7 @@
           (is (= [[:verify true true]
                   [:spawn-call true true]
                   [:child-spawn true true]
+                  [:unref true true]
                   [:dirty false true true]
                   [:quit false true]]
                  events)))

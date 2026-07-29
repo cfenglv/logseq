@@ -2217,7 +2217,7 @@ const runNativeHelperContract = async () => {
         label: "same revision nightly to stable",
       },
       {
-        accepted: true,
+        accepted: false,
         candidateVersion: nightlyLate,
         currentVersion: "2.0.1-selfhost.6",
         label: "same revision stable to nightly",
@@ -2235,14 +2235,14 @@ const runNativeHelperContract = async () => {
         label: "later nightly to earlier nightly",
       },
       {
-        accepted: true,
+        accepted: false,
         candidateVersion:
           "2.0.1-selfhost.7.nightly.20260730",
         currentVersion: "2.0.1-selfhost.6",
-        label: "higher revision nightly",
+        label: "stable to higher revision nightly",
       },
       {
-        accepted: true,
+        accepted: false,
         candidateVersion: "2.0.1-selfhost.7",
         currentVersion: nightlyLate,
         label: "lower revision nightly to higher stable",
@@ -2824,25 +2824,22 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
     /(?:>=\s+(?:[^\n()]+\s+)?5|<=\s+5(?:\s+[^\n()]*)?|at-least\??[^\n()]*5)/i,
     "signed-macOS predicate does not require selfhost revision >= 5",
   );
-  const processArchBinding = updater.match(
-    /\b([a-zA-Z][\w!?-]*)\s+\(\.-arch js\/process\)/,
+  const validateProjectUpdateInfo = updater.match(
+    /\(defn-?\s+<validate-project-update-info[\s\S]*?(?=\n\(defn|\s*$)/,
+  )?.[0];
+  assert.ok(
+    validateProjectUpdateInfo,
+    "Electron does not validate signed update metadata before installation",
   );
-  const signedRouteStart = updater.indexOf("project-signed-macos-updater?");
-  assert.notEqual(signedRouteStart, -1);
-  const signedRoute = updater.slice(
-    signedRouteStart,
-    signedRouteStart + 4000,
-  );
-  const directProcessArch = String.raw`\(\.-arch\s+js\/process\)`;
-  const processArchArgument = processArchBinding
-    ? `${processArchBinding[1]}\\b`
-    : directProcessArch;
   assert.match(
-    signedRoute,
-    new RegExp(
-      `(?:--arch|:arch)\\s+${processArchArgument}|${processArchArgument}\\s+(?:--arch|:arch)`,
-    ),
-    "Electron does not bind signed update metadata/helper arch to process.arch",
+    validateProjectUpdateInfo,
+    /:arch\s+\(\.-arch\s+js\/process\)/,
+    "validated update metadata does not bind its architecture to process.arch",
+  );
+  assert.match(
+    updater,
+    /(?:["']--arch["']|:arch)\s+(?:\(:arch\s+(?:validated-)?manifest\)|\(get\s+(?:validated-)?manifest\s+:arch\))/,
+    "Electron does not pass the validated manifest architecture to the native helper",
   );
   assert.match(
     combined,

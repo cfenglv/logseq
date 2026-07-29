@@ -33,6 +33,13 @@ const releaseWorkflow = fs.readFileSync(
   path.join(repoRoot, ".github", "workflows", "build-desktop-release.yml"),
   "utf8",
 );
+const updaterNamespaceFilter = (source) => {
+  const normalizedBackslashes = source.replaceAll("\\\\", "\\");
+  const electronGroup = normalizedBackslashes.match(
+    /electron\\\.\(([^)\n]+)\)-test/,
+  )?.[1];
+  return electronGroup?.split("|").includes("updater") ?? false;
+};
 
 const headerEntry = frontendHandler.match(
   /\(defn\s+quit-and-install-new-version![\s\S]*?(?=\n\(defn|\n\(defmethod|\s*$)/,
@@ -106,9 +113,23 @@ const configureAutoUpdater = electronUpdater.match(
   /\(defn-?\s+configure-auto-updater![\s\S]*?(?=\n\(defn|\s*$)/,
 )?.[0];
 assert.ok(configureAutoUpdater, "auto-updater configuration is missing");
-assert.match(
-  configureAutoUpdater,
-  /isUpdateSupported/,
+const directlyInstallsSupportPolicy =
+  /isUpdateSupported/.test(configureAutoUpdater);
+const oneLayerSupportPolicyDelegates = [
+  ...configureAutoUpdater.matchAll(/\(([\w<>!?*-]*support-policy[\w<>!?*-]*)\b/g),
+].map((match) => match[1]);
+const delegatesSupportPolicyInstallation =
+  oneLayerSupportPolicyDelegates.some((delegateName) => {
+    const escaped = delegateName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const definition = electronUpdater.match(
+      new RegExp(
+        `\\(defn-?\\s+${escaped}[\\s\\S]*?(?=\\n\\(defn|\\s*$)`,
+      ),
+    )?.[0];
+    return definition && /isUpdateSupported/.test(definition);
+  });
+assert.ok(
+  directlyInstallsSupportPolicy || delegatesSupportPolicyInstallation,
   "auto-updater runtime does not install a stable/nightly track policy",
 );
 assert.match(
@@ -124,13 +145,21 @@ assert.match(
 
 assert.match(
   fullPreflight,
-  /electron\\\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
-  "full desktop preflight does not execute the updater mock-timing behavior test",
+  /static\/tests\.js/,
+  "full desktop preflight does not execute compiled Electron tests",
+);
+assert.ok(
+  updaterNamespaceFilter(fullPreflight),
+  "full desktop preflight does not select the exact electron.updater-test namespace",
 );
 assert.match(
   releaseWorkflow,
-  /rtc-release-gate:[\s\S]*?node[^\n]*static\/tests\.js[\s\S]*?electron\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
-  "desktop release CI does not execute the updater mock-timing behavior test",
+  /rtc-release-gate:[\s\S]*?node[^\n]*static\/tests\.js/,
+  "desktop release CI does not execute compiled Electron tests with the required preload/flags",
+);
+assert.ok(
+  updaterNamespaceFilter(releaseWorkflow),
+  "desktop release CI does not select the exact electron.updater-test namespace",
 );
 
 console.log(

@@ -19,6 +19,14 @@ const readText = (relativePath) =>
 const readJson = (relativePath) =>
   JSON.parse(readText(relativePath));
 
+const updaterNamespaceFilter = (source) => {
+  const normalizedBackslashes = source.replaceAll("\\\\", "\\");
+  const electronGroup = normalizedBackslashes.match(
+    /electron\\\.\(([^)\n]+)\)-test/,
+  )?.[1];
+  return electronGroup?.split("|").includes("updater") ?? false;
+};
+
 assert.deepEqual(
   resolveSelfhostUpdaterVersions("2.0.1-selfhost.4"),
   {
@@ -574,8 +582,12 @@ assert.match(
 );
 assert.match(
   desktopReleaseWorkflow,
-  /rtc-release-gate:[\s\S]*?node static\/tests\.js[\s\S]*?electron\\\.\([^\n]*\bupdater\b[^\n]*\)-test/,
-  "desktop release workflow should execute the updater mock-timing behavior test",
+  /rtc-release-gate:[\s\S]*?node[^\n]*static\/tests\.js/,
+  "desktop release workflow should execute compiled Electron tests with the required preload/flags",
+);
+assert.ok(
+  updaterNamespaceFilter(desktopReleaseWorkflow),
+  "desktop release workflow should select the exact electron.updater-test namespace",
 );
 for (const sourceContract of [
   "test-desktop-sidecar-release-contract.mjs",

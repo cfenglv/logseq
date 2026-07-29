@@ -17,6 +17,10 @@ const normalized = (text) => text.replace(/\s+/g, " ").trim();
 
 const assertMacosGuidance = (label, source) => {
   const text = normalized(source);
+  const defaultsToAutomaticCheckAndDownload =
+    /(?:automatic(?:ally)?|默认|自动)[\s\S]{0,180}(?:check|检查)[\s\S]{0,180}(?:download|下载)|(?:check|检查)[\s\S]{0,180}(?:download|下载)[\s\S]{0,180}(?:automatic(?:ally)?|默认|自动)/i.test(
+      text,
+    );
   check(
     /2\.0\.1-selfhost\.4[\s\S]{0,900}2\.0\.1-selfhost\.5/i.test(text) &&
       /2\.0\.1-selfhost\.5[\s\S]{0,260}(?:manual(?:ly)?|手动)|(?:manual(?:ly)?|手动)[\s\S]{0,260}2\.0\.1-selfhost\.5/i.test(
@@ -28,9 +32,7 @@ const assertMacosGuidance = (label, source) => {
     /2\.0\.1-selfhost\.5[\s\S]{0,360}(?:2\.0\.1-selfhost\.6|\.6\+|later|subsequent|future|后续|以后)/i.test(
       text,
     ) &&
-      /(?:automatic(?:ally)?|默认|自动)[\s\S]{0,180}(?:check|检查)[\s\S]{0,180}(?:download|下载)|(?:check|检查)[\s\S]{0,180}(?:download|下载)[\s\S]{0,180}(?:automatic(?:ally)?|默认|自动)/i.test(
-        text,
-      ) &&
+      defaultsToAutomaticCheckAndDownload &&
       /(?:click|select|choose|点击|选择)[\s\S]{0,100}(?:Restart and install|重启并安装)|(?:Restart and install|重启并安装)[\s\S]{0,100}(?:click|select|choose|点击|选择)/i.test(
         text,
       ),
@@ -75,9 +77,13 @@ const assertMacosGuidance = (label, source) => {
     `${label} must state that stable clients never automatically enter the nightly track`,
   );
   check(
-    /(?:nightly|夜间版)[\s\S]{0,220}(?:only|仅|只)[\s\S]{0,100}(?:automatic(?:ally)?|自动)[\s\S]{0,160}(?:later|newer|subsequent|后续|更新的)[\s\S]{0,100}(?:dated[\s-]*)?(?:nightly|夜间版)/i.test(
-      text,
-    ),
+    defaultsToAutomaticCheckAndDownload &&
+      (/(?:nightly|夜间版)[\s\S]{0,220}(?:only|仅|只)[\s\S]{0,100}(?:automatic(?:ally)?|自动)[\s\S]{0,160}(?:later|newer|subsequent|后续|更新的)[\s\S]{0,100}(?:dated[\s-]*)?(?:nightly|夜间版)/i.test(
+        text,
+      ) ||
+        /(?:dated[\s-]*)?(?:nightly|夜间版)(?:\s+builds?)?[\s\S]{0,160}(?:update|upgrade|更新|升级)[\s\S]{0,80}(?:only|仅|只)[\s\S]{0,120}(?:later|newer|subsequent|后续|更新的)[\s\S]{0,80}(?:nightly|nightlies|夜间版)/i.test(
+          text,
+        )),
     `${label} must limit nightly automatic updates to later nightly versions`,
   );
   check(
