@@ -954,6 +954,7 @@ const signedNativeArchive = ({
 
 const makeSignedNativeUpdate = ({
   adHocSigned = true,
+  archiveQuarantine = null,
   applicationId,
   appArch,
   arch = "arm64",
@@ -999,6 +1000,19 @@ const makeSignedNativeUpdate = ({
     `Logseq-darwin-${arch}-${version}.zip`,
   );
   archiveApp({ app, archive: artifactPath });
+  if (archiveQuarantine !== null) {
+    command("xattr", [
+      "-w",
+      "com.apple.quarantine",
+      archiveQuarantine,
+      artifactPath,
+    ]);
+  }
+  assert.equal(
+    quarantineValue(artifactPath),
+    archiveQuarantine,
+    "source update ZIP quarantine fixture was not created as requested",
+  );
   const probeRoot = path.join(root, "archive-layout-probe");
   command(sevenZipExecutable(), [
     "x",
@@ -1035,6 +1049,7 @@ const makeSignedNativeUpdate = ({
   return {
     app,
     archivedQuarantine,
+    sourceArchiveQuarantine: quarantineValue(artifactPath),
     ...signedNativeArchive({
       arch,
       artifactPath,
@@ -1154,6 +1169,7 @@ const makeOldTarget = (
   root,
   bundleId = "com.logseq.logseq",
   arch = process.arch === "arm64" ? "arm64" : "x64",
+  quarantine = "0081;4f000000;Logseq legacy install;test-origin",
 ) => {
   const parent = path.join(root, "installed");
   const targetApp = makeNativeHelperApp({
@@ -1161,7 +1177,7 @@ const makeOldTarget = (
     arch,
     destination: path.join(parent, "Logseq.app"),
     marker: "2.0.1-selfhost.5",
-    quarantine: "0081;4f000000;Logseq legacy install;test-origin",
+    quarantine,
     version: "2.0.1-selfhost.5",
   });
   return { parent, targetApp };
@@ -1367,9 +1383,15 @@ const runNativeHelperContract = async () => {
       console.log(`[project-updater] PASS native rejection: ${label}`);
     };
 
+    const sourceQuarantine =
+      "0081;6f000000;Logseq signed update;source-origin";
+    const oldQuarantine =
+      "0081;4f000000;Logseq legacy install;old-origin";
     const base = makeFixture({
+      archiveQuarantine: sourceQuarantine,
       root: path.join(tempRoot, "valid-base"),
     });
+    assert.equal(base.sourceArchiveQuarantine, sourceQuarantine);
     const basePayload = canonicalNativePayload({
       arch: base.arch,
       bundleId,
@@ -1416,10 +1438,77 @@ const runNativeHelperContract = async () => {
     });
     assert.equal(universalVerification.status, 0, universalVerification.output);
     assert.equal(treeDigest(universalTarget.targetApp), universalBefore);
+    assert.equal(
+      quarantineValue(universalTarget.targetApp),
+      "0081;4f000000;Logseq legacy install;test-origin",
+      "verify-only changed the installed App quarantine metadata",
+    );
     assert.deepEqual(fs.readdirSync(universalTarget.parent), ["Logseq.app"]);
     console.log(
       "[project-updater] PASS native verification: safe universal App includes declared arch",
     );
+
+    const expectInstalledQuarantine = ({
+      expectedQuarantine,
+      fixture,
+      label,
+      targetQuarantine,
+    }) => {
+      const caseRoot = path.join(
+        tempRoot,
+        `quarantine-${label.replaceAll(" ", "-")}`,
+      );
+      const target = makeOldTarget(
+        caseRoot,
+        bundleId,
+        helperArch,
+        targetQuarantine,
+      );
+      assert.equal(
+        quarantineValue(target.targetApp),
+        targetQuarantine,
+        `${label} old target fixture has the wrong quarantine`,
+      );
+      const archiveQuarantineBefore = quarantineValue(fixture.artifactPath);
+      const result = invokeNative(fixture, { targetApp: target.targetApp });
+      assert.equal(result.status, 0, result.output);
+      assert.equal(
+        quarantineValue(target.targetApp),
+        expectedQuarantine,
+        `${label} installed the wrong quarantine metadata`,
+      );
+      assert.equal(
+        quarantineValue(fixture.artifactPath),
+        archiveQuarantineBefore,
+        `${label} modified the source ZIP quarantine metadata`,
+      );
+      assert.deepEqual(fs.readdirSync(target.parent), ["Logseq.app"]);
+      assert.equal(userTrustSettingsDigest(), initialTrust);
+      console.log(`[project-updater] PASS native quarantine: ${label}`);
+    };
+
+    expectInstalledQuarantine({
+      expectedQuarantine: sourceQuarantine,
+      fixture: base,
+      label: "source ZIP quarantine applies when old target has none",
+      targetQuarantine: null,
+    });
+    const noSourceQuarantine = makeFixture({
+      archiveQuarantine: null,
+      root: path.join(tempRoot, "no-source-quarantine"),
+    });
+    expectInstalledQuarantine({
+      expectedQuarantine: oldQuarantine,
+      fixture: noSourceQuarantine,
+      label: "old target quarantine survives when source ZIP has none",
+      targetQuarantine: oldQuarantine,
+    });
+    expectInstalledQuarantine({
+      expectedQuarantine: sourceQuarantine,
+      fixture: base,
+      label: "source ZIP quarantine wins over a different old target value",
+      targetQuarantine: oldQuarantine,
+    });
 
     const wrongKey = makeFixture({
       privateKeyPem: wrongPrivateKeyPem,
@@ -1615,6 +1704,11 @@ const runNativeHelperContract = async () => {
     }
     assert.equal(fs.readFileSync(swapStatePath, "utf8"), "2.0.1-selfhost.6");
     assert.equal(
+      quarantineValue(swapExitTarget.targetApp),
+      sourceQuarantine,
+      "post-swap crash changed or cleared the installed source quarantine",
+    );
+    assert.equal(
       command("plutil", [
         "-extract",
         "CFBundleShortVersionString",
@@ -1724,8 +1818,8 @@ const runNativeHelperContract = async () => {
     );
     assert.equal(
       quarantineValue(successTarget.targetApp),
-      base.archivedQuarantine,
-      "successful replacement changed candidate quarantine metadata",
+      sourceQuarantine,
+      "successful replacement did not apply the source ZIP quarantine",
     );
     assert.deepEqual(fs.readdirSync(successTarget.parent), ["Logseq.app"]);
     assert.equal(userTrustSettingsDigest(), initialTrust);
