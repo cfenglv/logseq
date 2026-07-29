@@ -953,8 +953,11 @@ const runNativeHelperContract = async () => {
     "--test-public-key-path",
     "--test-public-key-base64",
   ].find((flag) => help.output.includes(flag));
+  const splitTestOnlyKeyFlags =
+    help.output.includes("--test-only") &&
+    help.output.includes("--public-key-base64");
   assert.ok(
-    testKeyFlag,
+    testKeyFlag || splitTestOnlyKeyFlags,
     `native helper builder does not advertise a TEST-ONLY public-key input:\n${help.output}`,
   );
   assert.match(help.output, /--output\b/);
@@ -985,12 +988,16 @@ const runNativeHelperContract = async () => {
     });
 
     const helperPath = path.join(tempRoot, "project-update-helper");
-    const testKeyValue = testKeyFlag.endsWith("-base64")
-      ? publicKeyRawBase64
-      : publicKeyPath;
+    const testKeyArgs = splitTestOnlyKeyFlags
+      ? ["--test-only", "--public-key-base64", publicKeyRawBase64]
+      : [
+          testKeyFlag,
+          testKeyFlag.endsWith("-base64")
+            ? publicKeyRawBase64
+            : publicKeyPath,
+        ];
     const [buildExecutable, buildArgs] = scriptCommand(helperBuildPath, [
-      testKeyFlag,
-      testKeyValue,
+      ...testKeyArgs,
       "--output",
       helperPath,
     ]);
@@ -1001,6 +1008,28 @@ const runNativeHelperContract = async () => {
     );
     assert.equal(build.status, 0, build.output);
     assert.equal(fs.existsSync(helperPath), true);
+    if (splitTestOnlyKeyFlags) {
+      const unsafeHelperPath = path.join(tempRoot, "unsafe-key-override-helper");
+      const [unsafeExecutable, unsafeArgs] = scriptCommand(helperBuildPath, [
+        "--public-key-base64",
+        publicKeyRawBase64,
+        "--output",
+        unsafeHelperPath,
+      ]);
+      const unsafeBuild = command(unsafeExecutable, unsafeArgs, {
+        allowFailure: true,
+      });
+      assert.notEqual(
+        unsafeBuild.status,
+        0,
+        "builder accepted a public-key override without --test-only",
+      );
+      assert.equal(
+        fs.existsSync(unsafeHelperPath),
+        false,
+        "builder emitted a helper for a non-test public-key override",
+      );
+    }
     assert.match(
       command("file", [helperPath]).output,
       /Mach-O/,
@@ -1284,7 +1313,7 @@ addCase(cases, ".4 legacy feed remains pinned and .5 remains manual", () => {
   const futurePlan = updaterSignatureGatePlan("2.0.1-selfhost.6", false);
   assert.match(
     futurePlan.mode,
-    /project[\s_-]*signature|signature[\s_-]*project/i,
+    /project[\s_-]*(?:signature|signed)|signature[\s_-]*project/i,
     ".6+ updater policy is not the project-signature verifier",
   );
   assert.doesNotMatch(
