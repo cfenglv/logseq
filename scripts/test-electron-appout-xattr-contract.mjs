@@ -379,11 +379,16 @@ assert.equal(
   `expected one packaged Logseq.app, found ${appCandidates.join(", ")}`,
 );
 const appPath = appCandidates[0];
-const appXattrs = assertSafeBundleXattrs(appPath, "temporary appOut");
+assertSafeBundleXattrs(appPath, "temporary appOut");
+const packagedQuarantine = xattr([
+  "-p",
+  "com.apple.quarantine",
+  appOutHelper,
+]).stdout;
 assert.match(
-  appXattrs,
-  /com\.apple\.quarantine: 0083;7f5e1000;LogseqAppOutXattrContract;/,
-  "temporary appOut did not preserve the injected quarantine marker",
+  packagedQuarantine,
+  /01234567-89AB-CDEF-0123-456789ABCDEF/,
+  "temporary appOut deleted or replaced the injected quarantine identity",
 );
 
 run("/usr/bin/codesign", [
