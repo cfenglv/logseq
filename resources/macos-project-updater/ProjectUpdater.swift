@@ -519,7 +519,12 @@ private func currentVersion(_ target: URL) throws -> String {
 }
 
 private func requireUpgrade(from current: String, to candidate: String) throws {
-    guard try SelfhostVersion(candidate) > SelfhostVersion(current) else {
+    let currentVersion = try SelfhostVersion(current)
+    let candidateVersion = try SelfhostVersion(candidate)
+    guard (currentVersion.nightlyDate == nil) == (candidateVersion.nightlyDate == nil) else {
+        try fail("project updater refuses stable/nightly cross-channel replacement")
+    }
+    guard candidateVersion > currentVersion else {
         try fail("project updater refuses downgrade or same-version replacement")
     }
 }

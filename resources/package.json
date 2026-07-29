@@ -12,7 +12,6 @@
     "electron:dev": "electron .",
     "electron:debug": "electron --inspect=9229 .",
     "electron:make": "electron-builder --config electron-builder.yml --publish never",
-    "electron:make-local-signed": "node ../scripts/electron-builder-local-signed.mjs",
     "electron:make-unsigned": "node ./electron-builder-unsigned.mjs",
     "electron:verify-package": "node ./verify-packaged-desktop.mjs",
     "electron:verify-updater-provider": "node ./verify-updater-provider.mjs",

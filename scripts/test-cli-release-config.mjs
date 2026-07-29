@@ -69,6 +69,22 @@ assert.equal(
   "selfhost-macos-v2-x64-mac.yml",
   "published metadata should match the signed macOS channel",
 );
+assert.equal(
+  macosUpdaterChannel(
+    "2.0.1-selfhost.5.nightly.20260729",
+    "arm64",
+  ),
+  "selfhost-macos-v2-nightly-arm64",
+  "selfhost nightly metadata must use an isolated macOS channel",
+);
+assert.equal(
+  macosUpdaterMetadataName(
+    "2.0.1-selfhost.5.nightly.20260729",
+    "x64",
+  ),
+  "selfhost-macos-v2-nightly-x64-mac.yml",
+  "selfhost nightly metadata must not overwrite stable macOS metadata",
+);
 assert.throws(
   () => macosUpdaterChannel("2.0.1-selfhost.5", "ia32"),
   /unsupported macOS updater architecture/,
@@ -88,6 +104,16 @@ for (const [version, arch, expected] of [
     "selfhost-macos-v2-arm64-mac.yml",
   ],
   ["2.0.1-selfhost.5", "x64", "selfhost-macos-v2-x64-mac.yml"],
+  [
+    "2.0.1-selfhost.5.nightly.20260729",
+    "arm64",
+    "selfhost-macos-v2-nightly-arm64-mac.yml",
+  ],
+  [
+    "2.0.1-selfhost.5.nightly.20260729",
+    "x64",
+    "selfhost-macos-v2-nightly-x64-mac.yml",
+  ],
 ]) {
   assert.equal(
     execFileSync(
@@ -273,6 +299,39 @@ assert.equal(
   "node ./electron-builder-unsigned.mjs",
   "the standalone desktop artifact should run its bundled unsigned builder",
 );
+assert.equal(
+  rootPackage.scripts["release-electron:local-signed"],
+  undefined,
+  "the repository must not expose the removed local-certificate build path",
+);
+assert.equal(
+  rootPackage.scripts["setup-macos-local-signing"],
+  undefined,
+  "the repository must not expose a Keychain trust setup command",
+);
+assert.equal(
+  desktopPackage.scripts["electron:make-local-signed"],
+  undefined,
+  "the desktop package must expose only the ad-hoc fork build path",
+);
+assert.doesNotMatch(
+  desktopPackagingGulpfile,
+  /electronMakerLocalSigned|electron:make-local-signed/,
+  "gulp must not retain the removed local-certificate build entry",
+);
+for (const removedLocalSigningPath of [
+  "scripts/setup-local-macos-codesign.mjs",
+  "scripts/electron-builder-local-signed.mjs",
+  "scripts/electron-builder-local-signed-after-pack.cjs",
+  "scripts/electron-builder-local-signed-after-sign.cjs",
+  "resources/electron-builder.local-signed.yml",
+]) {
+  assert.equal(
+    fs.existsSync(path.join(repoRoot, removedLocalSigningPath)),
+    false,
+    `${removedLocalSigningPath} must stay removed`,
+  );
+}
 assert.equal(
   desktopPackage.scripts["electron:verify-package"],
   "node ./verify-packaged-desktop.mjs",
@@ -513,7 +572,17 @@ assert.equal(
 assert.match(
   desktopReleaseWorkflow,
   /prerelease: \$\{\{ !contains\(steps\.ref\.outputs\.version, '-selfhost\.'\) && github\.event\.inputs\.is-pre-release \}\}/,
-  "selfhost versions must be GitHub production releases so /releases/latest can discover them",
+  "stable selfhost releases must remain GitHub production releases so /releases/latest can discover them",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Update rolling Nightly Release[\s\S]*?tag_name: nightly[\s\S]*?prerelease: \$\{\{ contains\(needs\.release-assets-preflight\.outputs\.version, '-selfhost\.'\)/,
+  "selfhost nightlies must publish only to the isolated rolling prerelease",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /Publish selfhost dated Nightly Release|dated nightly release[\s\S]*?prerelease: false/i,
+  "selfhost nightlies must never become GitHub production latest",
 );
 assertNotContains(
   desktopReleaseWorkflow,
@@ -760,7 +829,17 @@ assert.match(
 assert.match(
   electronUpdater,
   /set! \(\.-allowPrerelease autoUpdater\) allow-prerelease\?/,
-  "the Electron runtime should override prerelease discovery for selfhost versions",
+  "the Electron runtime should configure prerelease discovery by selfhost track",
+);
+assert.match(
+  electronUpdater,
+  /\.setFeedURL autoUpdater[\s\S]*?:provider "generic"[\s\S]*?:url feed-url/,
+  "the Electron runtime should isolate nightly discovery on GenericProvider",
+);
+assert.match(
+  electronUpdater,
+  /install-selfhost-update-support-policy![\s\S]*?default-is-update-supported update-info[\s\S]*?selfhostProjectUpdateAllowed/,
+  "the Electron runtime should preserve default support checks before rejecting cross-track metadata",
 );
 assert.match(
   electronUpdaterConfig,
@@ -769,12 +848,12 @@ assert.match(
 );
 assert.match(
   updaterProviderVerifier,
-  /ERR_UPDATER_NO_PUBLISHED_VERSIONS/,
-  "the updater rehearsal should preserve the original channel mismatch as a regression case",
+  /GenericProvider[\s\S]*?releases\/download\/nightly/,
+  "the updater rehearsal should exercise the isolated rolling nightly feed",
 );
 assert.match(
   updaterProviderVerifier,
-  /across six platform\/architecture contracts/,
+  /stable[\s\S]*nightly[\s\S]*across six platform\/architecture contracts/,
   "the updater rehearsal should cover all six desktop targets",
 );
 assert.match(

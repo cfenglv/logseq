@@ -90,6 +90,21 @@ export const compareSelfhostProjectVersions = (leftVersion, rightVersion) => {
   return left.nightlyDate - right.nightlyDate;
 };
 
+export const selfhostProjectUpdateAllowed = (
+  currentVersion,
+  candidateVersion,
+) => {
+  const current = parseSelfhostProjectVersion(currentVersion);
+  const candidate = parseSelfhostProjectVersion(candidateVersion);
+  const sameReleaseTrack =
+    (current.nightlyDate === undefined) ===
+    (candidate.nightlyDate === undefined);
+  return (
+    sameReleaseTrack &&
+    compareSelfhostProjectVersions(candidateVersion, currentVersion) > 0
+  );
+};
+
 export const projectSignedMacosUpdater = (
   version,
   platform = process.platform,
@@ -110,11 +125,13 @@ export const validateProjectUpdateSignature = ({
   if (!projectSignedMacosUpdater(currentVersion, "darwin")) {
     throw new Error("current App is not in the project-signed updater chain");
   }
-  const policy = loadProjectSigningPolicy();
   const candidateVersion = updateInfo?.version;
-  if (compareSelfhostProjectVersions(candidateVersion, currentVersion) <= 0) {
-    throw new Error("project updater refuses downgrade or same-version update");
+  if (!selfhostProjectUpdateAllowed(currentVersion, candidateVersion)) {
+    throw new Error(
+      "project updater refuses downgrade, same-version, or stable/nightly cross-channel update",
+    );
   }
+  const policy = loadProjectSigningPolicy();
   const signature = updateInfo?.projectUpdateSignature;
   if (!signature || typeof signature !== "object") {
     throw new Error("update metadata has no projectUpdateSignature");

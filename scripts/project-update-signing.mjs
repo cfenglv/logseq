@@ -1,6 +1,7 @@
 export {
   compareSelfhostProjectVersions,
   parseSelfhostProjectVersion,
+  selfhostProjectUpdateAllowed,
   projectUpdateAlgorithm,
   projectUpdateBundleIdentifier,
   projectUpdateKeyId,

@@ -374,21 +374,21 @@ try {
       privateKey,
       target: nightlyTarget,
     }),
-    /refuses downgrade or same-version/,
+    /refuses stable\/nightly cross-channel/,
   );
 
   const stableTargetParent = path.join(temporaryRoot, "stable-target");
   fs.mkdirSync(stableTargetParent);
   const stableTarget = createApp(stableTargetParent, "2.0.1-selfhost.5", "installed-stable");
-  expectPass(
-    "nightly supersedes stable in the same revision",
+  expectFail(
+    "stable clients cannot enter the nightly track",
     signedArguments({
       archive: nightlyArchive,
       candidateVersion: nightlyLater,
       privateKey,
       target: stableTarget,
     }),
-    /VERIFIED 2\.0\.1-selfhost\.5 -> .*20260729/,
+    /refuses stable\/nightly cross-channel/,
   );
 
   const nextNightlyParent = path.join(temporaryRoot, "next-nightly");
@@ -401,15 +401,55 @@ try {
   );
   const nextNightlyArchive = path.join(temporaryRoot, "next-nightly.zip");
   zipApp(nextNightly, nextNightlyArchive);
-  expectPass(
-    "higher revision nightly supersedes lower stable revision",
+  expectFail(
+    "higher revision nightly still cannot replace a stable release",
     signedArguments({
       archive: nextNightlyArchive,
       candidateVersion: nextNightlyVersion,
       privateKey,
       target: stableTarget,
     }),
-    /VERIFIED 2\.0\.1-selfhost\.5 -> .*selfhost\.6\.nightly\.20260701/,
+    /refuses stable\/nightly cross-channel/,
+  );
+  expectPass(
+    "nightly clients can advance to a higher revision nightly",
+    signedArguments({
+      archive: nextNightlyArchive,
+      candidateVersion: nextNightlyVersion,
+      privateKey,
+      target: nightlyTarget,
+    }),
+    /VERIFIED .*selfhost\.5\.nightly\.20260728 -> .*selfhost\.6\.nightly\.20260701/,
+  );
+
+  const nextStableParent = path.join(temporaryRoot, "next-stable");
+  fs.mkdirSync(nextStableParent);
+  const nextStable = createApp(
+    nextStableParent,
+    "2.0.1-selfhost.6",
+    "candidate-next-stable",
+  );
+  const nextStableArchive = path.join(temporaryRoot, "next-stable.zip");
+  zipApp(nextStable, nextStableArchive);
+  expectPass(
+    "stable clients advance to the next stable revision",
+    signedArguments({
+      archive: nextStableArchive,
+      candidateVersion: "2.0.1-selfhost.6",
+      privateKey,
+      target: stableTarget,
+    }),
+    /VERIFIED 2\.0\.1-selfhost\.5 -> 2\.0\.1-selfhost\.6/,
+  );
+  expectFail(
+    "nightly clients require manual installation to return to stable",
+    signedArguments({
+      archive: nextStableArchive,
+      candidateVersion: "2.0.1-selfhost.6",
+      privateKey,
+      target: nightlyTarget,
+    }),
+    /refuses stable\/nightly cross-channel/,
   );
   expectFail(
     "invalid nightly calendar date fails closed",

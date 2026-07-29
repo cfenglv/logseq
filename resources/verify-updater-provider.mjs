@@ -16,6 +16,9 @@ const require = createRequire(path.join(packageRoot, "package.json"));
 const { GitHubProvider } = require(
   "electron-updater/out/providers/GitHubProvider",
 );
+const { GenericProvider } = require(
+  "electron-updater/out/providers/GenericProvider",
+);
 const semver = require("semver");
 const packageJson = require(path.join(packageRoot, "package.json"));
 
@@ -24,6 +27,8 @@ const {
   isNightlyRehearsal,
   nextVersion,
 } = resolveSelfhostUpdaterVersions(packageJson.version);
+const nightlyCurrent = "2.0.1-selfhost.5.nightly.20260728";
+const nightlyNext = "2.0.1-selfhost.5.nightly.20260729";
 
 const releaseEntry = (version) => `
   <entry>
@@ -34,6 +39,7 @@ const releaseEntry = (version) => `
 const feed = `<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
   <title>Release notes from logseq</title>
+  ${releaseEntry(nightlyNext)}
   ${releaseEntry(nextVersion)}
   ${releaseEntry(currentVersion)}
 </feed>`;
@@ -49,14 +55,14 @@ const metadataName = (platform, arch) => {
   throw new Error(`unsupported updater rehearsal platform: ${platform}`);
 };
 
-const releaseAssetName = (platform, arch) => {
+const releaseAssetName = (platform, arch, version = nextVersion) => {
   if (platform === "darwin") {
-    return `Logseq-darwin-${arch}-${nextVersion}.zip`;
+    return `Logseq-darwin-${arch}-${version}.zip`;
   }
   if (platform === "win32") {
-    return `Logseq-win-${arch}-${nextVersion}-nsis.exe`;
+    return `Logseq-win-${arch}-${version}-nsis.exe`;
   }
-  return `Logseq-linux-${arch === "x64" ? "x86_64" : arch}-${nextVersion}.AppImage`;
+  return `Logseq-linux-${arch === "x64" ? "x86_64" : arch}-${version}.AppImage`;
 };
 
 const channel = (platform, arch, version = currentVersion) =>
@@ -129,6 +135,53 @@ const makeProvider = ({
   return { provider, requests, expectedMetadata, assetName };
 };
 
+const makeNightlyProvider = ({ platform, arch }) => {
+  const channelName = channel(platform, arch, nightlyCurrent);
+  const expectedMetadata =
+    platform === "darwin"
+      ? macosUpdaterMetadataName(nightlyCurrent, arch)
+      : metadataName(platform, arch);
+  const assetName = releaseAssetName(platform, arch, nightlyNext);
+  const requests = [];
+  const updater = {
+    allowPrerelease: true,
+    channel: channelName,
+    currentVersion: semver.parse(nightlyCurrent),
+    fullChangelog: false,
+  };
+  const provider = new GenericProvider(
+    {
+      provider: "generic",
+      url: "https://github.com/cfenglv/logseq/releases/download/nightly",
+      channel: channelName,
+    },
+    updater,
+    {
+      executor: {},
+      platform,
+      isUseMultipleRangeRequest: false,
+    },
+  );
+  provider.httpRequest = async (url) => {
+    requests.push(url.pathname);
+    if (!url.pathname.endsWith(`/${expectedMetadata}`)) {
+      throw new Error(`unexpected nightly metadata request: ${url}`);
+    }
+    return [
+      `version: ${nightlyNext}`,
+      "files:",
+      `  - url: ${assetName}`,
+      "    sha512: YQ==",
+      "    size: 1",
+      `path: ${assetName}`,
+      "sha512: YQ==",
+      "releaseDate: '2026-07-29T00:00:00.000Z'",
+      "",
+    ].join("\n");
+  };
+  return { provider, requests, expectedMetadata, assetName };
+};
+
 for (const [platform, arch] of [
   ["darwin", "x64"],
   ["darwin", "arm64"],
@@ -158,7 +211,12 @@ for (const [platform, arch] of [
     );
     const resolved = provider.resolveFiles(info);
     assert.equal(resolved.length, 1);
-    assert.ok(resolved[0].url.pathname.endsWith(`/${assetName}`));
+    assert.ok(
+      resolved[0].url.pathname.endsWith(
+        `/releases/download/${nextVersion}/${assetName}`,
+      ),
+      `${platform}/${arch} stable must resolve only the production stable asset`,
+    );
   } finally {
     if (previousTestArch === undefined) {
       delete process.env.TEST_UPDATER_ARCH;
@@ -197,17 +255,45 @@ for (const arch of ["x64", "arm64"]) {
   );
 }
 
-const broken = makeProvider({
-  platform: "darwin",
-  arch: "arm64",
-  allowPrerelease: true,
-});
-await assert.rejects(
-  broken.provider.getLatestVersion(),
-  (error) => error?.code === "ERR_UPDATER_NO_PUBLISHED_VERSIONS",
-  "the rehearsal must preserve the prerelease/channel mismatch regression case",
-);
+for (const [platform, arch] of [
+  ["darwin", "x64"],
+  ["darwin", "arm64"],
+  ["win32", "x64"],
+  ["win32", "arm64"],
+  ["linux", "x64"],
+  ["linux", "arm64"],
+]) {
+  const previousTestArch = process.env.TEST_UPDATER_ARCH;
+  process.env.TEST_UPDATER_ARCH = arch;
+  try {
+    const { provider, requests, expectedMetadata, assetName } =
+      makeNightlyProvider({ platform, arch });
+    const info = await provider.getLatestVersion();
+    assert.equal(info.version, nightlyNext);
+    assert.ok(
+      requests.some((request) => request.endsWith(`/${expectedMetadata}`)),
+      `${platform}/${arch} nightly must request isolated ${expectedMetadata}`,
+    );
+    assert.ok(
+      requests.every((request) => !request.endsWith("/releases/latest")),
+      `${platform}/${arch} nightly must never read the stable production latest release`,
+    );
+    const resolved = provider.resolveFiles(info);
+    assert.equal(resolved.length, 1);
+    assert.ok(
+      resolved[0].url.pathname.endsWith(
+        `/releases/download/nightly/${assetName}`,
+      ),
+    );
+  } finally {
+    if (previousTestArch === undefined) {
+      delete process.env.TEST_UPDATER_ARCH;
+    } else {
+      process.env.TEST_UPDATER_ARCH = previousTestArch;
+    }
+  }
+}
 
 console.log(
-  `[updater-provider] OK ${currentVersion} -> ${nextVersion} across six platform/architecture contracts; legacy macOS .4 stays on pinned metadata${isNightlyRehearsal ? ` (normalized from ${packageJson.version})` : ""}`,
+  `[updater-provider] OK stable ${currentVersion} -> ${nextVersion} stays on GitHub production latest and nightly ${nightlyCurrent} -> ${nightlyNext} stays on the isolated rolling prerelease across six platform/architecture contracts; legacy macOS .4 stays on pinned metadata${isNightlyRehearsal ? ` (normalized from ${packageJson.version})` : ""}`,
 );

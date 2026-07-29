@@ -10,6 +10,7 @@ import semver from 'semver'
 import {
   compareSelfhostProjectVersions,
   parseSelfhostProjectVersion,
+  selfhostProjectUpdateAllowed,
 } from '../resources/project-updater-signature.mjs'
 
 const repoRoot = path.resolve(
@@ -38,7 +39,7 @@ for (const version of [
 }
 
 for (const [older, newer, label] of [
-  [stable, earlyNightly, 'stable to same-revision nightly'],
+  [stable, earlyNightly, 'raw same-revision nightly precedence'],
   [earlyNightly, lateNightly, 'earlier to later same-revision nightly'],
   [lateNightly, nextStable, 'lower-revision nightly to higher stable'],
   [nextStable, nextNightly, 'next stable to its nightly'],
@@ -51,6 +52,19 @@ for (const [older, newer, label] of [
   assert.ok(
     compareSelfhostProjectVersions(newer, older) > 0,
     `project runtime must reject the reverse of ${label}`
+  )
+}
+for (const [currentVersion, candidateVersion, expected, label] of [
+  [stable, earlyNightly, false, 'stable clients cannot enter nightly'],
+  [stable, nextStable, true, 'stable clients advance to stable'],
+  [earlyNightly, lateNightly, true, 'nightly clients advance by date'],
+  [lateNightly, nextNightly, true, 'nightly clients advance by revision'],
+  [lateNightly, nextStable, false, 'nightly to stable requires manual install'],
+]) {
+  assert.equal(
+    selfhostProjectUpdateAllowed(currentVersion, candidateVersion),
+    expected,
+    label
   )
 }
 
@@ -80,8 +94,13 @@ const workflow = fs.readFileSync(
 )
 assert.match(
   workflow,
-  /Publish selfhost dated Nightly Release[\s\S]*?tag_name: \$\{\{ needs\.release-assets-preflight\.outputs\.version \}\}[\s\S]*?prerelease: false/,
-  'selfhost nightlies must use their strict version tag and remain GitHub production releases so electron-updater can discover them'
+  /Update rolling Nightly Release[\s\S]*?tag_name: nightly[\s\S]*?prerelease: \$\{\{ contains\(needs\.release-assets-preflight\.outputs\.version, '-selfhost\.'\)/,
+  'selfhost nightlies must remain on the isolated rolling GitHub prerelease'
+)
+assert.doesNotMatch(
+  workflow,
+  /Publish selfhost dated Nightly Release|prerelease: false[\s\S]*?dated nightly/,
+  'selfhost nightlies must never become the production latest release'
 )
 const updaterConfig = fs.readFileSync(
   path.join(repoRoot, 'src', 'electron', 'electron', 'updater_config.cljs'),
@@ -89,16 +108,16 @@ const updaterConfig = fs.readFileSync(
 )
 assert.match(
   updaterConfig,
-  /:allow-prerelease\? \(when \(selfhost-version\? version\) false\)/,
-  "selfhost clients must use GitHub's production-release discovery path"
+  /selfhost-nightly-feed-url[\s\S]*?releases\/download\/nightly[\s\S]*?:feed-url/,
+  'nightly clients must use the isolated GenericProvider feed'
 )
 
 const requireFromDesktop = createRequire(
   path.join(repoRoot, 'static', 'package.json')
 )
 const { AppUpdater } = requireFromDesktop('electron-updater')
-const electronUpdaterAvailable = async (currentVersion, candidateVersion) => {
-  const updater = new AppUpdater(null, {
+const makeAppUpdater = (currentVersion) =>
+  new AppUpdater(null, {
     version: currentVersion,
     name: 'Logseq',
     isPackaged: true,
@@ -109,25 +128,80 @@ const electronUpdaterAvailable = async (currentVersion, candidateVersion) => {
     relaunch() {},
     onQuit() {},
   })
-  updater.allowPrerelease = false
+const installSelfhostTrackPolicy = (updater, currentVersion) => {
+  const defaultIsUpdateSupported =
+    updater.isUpdateSupported.bind(updater)
+  updater.isUpdateSupported = async (updateInfo) =>
+    (await defaultIsUpdateSupported(updateInfo)) &&
+    selfhostProjectUpdateAllowed(currentVersion, updateInfo.version)
+}
+const electronUpdaterAvailable = async (
+  currentVersion,
+  candidateVersion,
+  allowPrerelease
+) => {
+  const updater = makeAppUpdater(currentVersion)
+  updater.allowPrerelease = allowPrerelease
   updater.allowDowngrade = false
-  updater.isUpdateSupported = () => true
   updater.isUserWithinRollout = () => true
+  installSelfhostTrackPolicy(updater, currentVersion)
   return updater.isUpdateAvailable({ version: candidateVersion })
 }
-for (const [currentVersion, candidateVersion, expected] of [
-  [stable, earlyNightly, true],
-  [earlyNightly, lateNightly, true],
-  [lateNightly, stable, false],
-  [lateNightly, nextStable, true],
-  [nextStable, lateNightly, false],
+for (const [currentVersion, candidateVersion, expected, allowPrerelease] of [
+  [stable, nextStable, true, false],
+  [earlyNightly, lateNightly, true, true],
+  [nextStable, lateNightly, false, false],
 ]) {
   assert.equal(
-    await electronUpdaterAvailable(currentVersion, candidateVersion),
+    await electronUpdaterAvailable(
+      currentVersion,
+      candidateVersion,
+      allowPrerelease
+    ),
     expected,
     `electron-updater discovery compare ${currentVersion} -> ${candidateVersion}`
   )
 }
+
+const misconfiguredStableUpdater = makeAppUpdater(stable)
+misconfiguredStableUpdater.allowPrerelease = false
+misconfiguredStableUpdater.allowDowngrade = false
+misconfiguredStableUpdater.autoDownload = true
+misconfiguredStableUpdater.isUserWithinRollout = () => true
+installSelfhostTrackPolicy(misconfiguredStableUpdater, stable)
+misconfiguredStableUpdater.getUpdateInfoAndProvider = async () => ({
+  info: {
+    version: earlyNightly,
+    files: [{ url: 'nightly.zip', sha512: 'YQ==' }],
+  },
+  provider: {},
+})
+let misconfiguredDownloadCount = 0
+misconfiguredStableUpdater.downloadUpdate = () => {
+  misconfiguredDownloadCount += 1
+  return Promise.resolve([])
+}
+const misconfiguredResult =
+  await misconfiguredStableUpdater.doCheckForUpdates()
+assert.equal(misconfiguredResult.isUpdateAvailable, false)
+assert.equal(
+  misconfiguredDownloadCount,
+  0,
+  'cross-track metadata must never reach electron-updater downloadUpdate'
+)
+
+const minimumSystemUpdater = makeAppUpdater(stable)
+minimumSystemUpdater.allowDowngrade = false
+minimumSystemUpdater.isUserWithinRollout = () => true
+installSelfhostTrackPolicy(minimumSystemUpdater, stable)
+assert.equal(
+  await minimumSystemUpdater.isUpdateAvailable({
+    version: nextStable,
+    minimumSystemVersion: '9999.0.0',
+  }),
+  false,
+  'the selfhost track wrapper must preserve the default minimumSystemVersion rejection'
+)
 
 const generatedNightly = execFileSync(
   process.execPath,
@@ -141,5 +215,5 @@ assert.match(
 )
 
 console.log(
-  '[selfhost-nightly-semver-contract] PASS electron-updater semver discovery and project runtime ordering agree'
+  '[selfhost-nightly-semver-contract] PASS AppUpdater rejects cross-track download metadata, preserves minimumSystemVersion, and allows only isolated stable/nightly tracks'
 )

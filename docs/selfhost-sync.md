@@ -266,19 +266,28 @@ identifier.
 
 Starting with `.4`, **Settings → General → Check for updates** discovers the
 latest non-draft, non-prerelease GitHub Release and selects the current
-platform and architecture metadata. Future selfhost releases must therefore
-remain GitHub production releases even though their SemVer contains
-`-selfhost.N`; the release workflow enforces this contract.
+platform and architecture metadata. Stable selfhost revisions such as
+`2.0.1-selfhost.5` and `2.0.1-selfhost.6` are therefore GitHub production
+releases even though their SemVer contains `-selfhost.N`; the release workflow
+enforces this contract. Dated builds such as
+`2.0.1-selfhost.5.nightly.YYYYMMDD` are instead published only under the
+rolling `nightly` GitHub prerelease and use a separate GenericProvider feed.
+Stable clients never discover or download that feed. Nightly clients can
+advance to a later dated nightly, including a higher nightly revision, but
+returning from nightly to any stable release, including a higher stable
+revision, requires a manual installation.
 
 Use the NSIS installer on Windows and the AppImage on Linux when in-application
 installation is required. On macOS, moving from `.4` to `.5` requires manually
 replacing the application. Starting with `.5`, the default in-app update flow
-automatically checks for and downloads later releases; after the user clicks
-**Restart and install**, a fixed project Ed25519 public key and native
-replacement helper verify and install `.6+` updater ZIPs automatically,
-independently of the App's ad-hoc code-signing identity. The release
-private key is external to the repository; missing key material fails the
-macOS release closed. Without an Apple Developer ID and notarization, macOS may
+automatically checks for and downloads later releases on the same stable or
+nightly track. Stable `.5` advances to a higher stable revision such as `.6`;
+it is never offered a nightly. After the user clicks **Restart and install**,
+a fixed project Ed25519 public key and native replacement helper verify and
+install an eligible updater ZIP automatically, independently of the App's
+ad-hoc code-signing identity. The release private key is external to the
+repository; missing key material fails the macOS release closed. Without an
+Apple Developer ID and notarization, macOS may
 require **Open Anyway** on the first launch of `.5`. Every new ad-hoc
 application bundle may require **Open Anyway** again the first time it is
 opened. The updater never changes certificate Trust Settings and never clears
@@ -323,10 +332,12 @@ signature:
   clears or removes quarantine attributes.
 - The project Ed25519 signature authenticates `.6+` in-app updates, but does
   not make an unnotarized build trusted by Gatekeeper.
+- This repository exposes no local-certificate setup or local-signed build
+  command. Fork macOS packages remain purely ad-hoc signed; project tooling
+  does not import certificates, add trust roots, or alter the user Keychain
+  search list.
 - Denying Keychain access can make Safe Storage, login cookies, or tokens
   unavailable and is not recommended as a routine workaround.
-- A stable local signing identity can reduce repeated prompts on one Mac, but
-  it does not make other users trust the package automatically.
 - Removing team-wide Gatekeeper warnings requires an Apple Developer ID
   signature and notarization.
 

@@ -15,6 +15,7 @@ import {
   compareSelfhostProjectVersions,
   parseSelfhostProjectVersion,
   projectUpdateKeyId,
+  selfhostProjectUpdateAllowed,
 } from "../resources/project-updater-signature.mjs";
 
 const repoRoot = path.resolve(
@@ -136,7 +137,7 @@ const cases = [
       assert.equal(runHelper("selfhost-revision", "2.0.1-selfhost.5"), "5");
       assert.equal(
         runHelper("macos-metadata-name", "2.0.1-selfhost.5.nightly.20260729", "arm64"),
-        "selfhost-macos-v2-arm64-mac.yml",
+        "selfhost-macos-v2-nightly-arm64-mac.yml",
       );
       assert.equal(
         workflow.match(
@@ -158,6 +159,23 @@ const cases = [
         compareSelfhostProjectVersions(later, "2.0.1-selfhost.6") < 0,
       );
       assert.equal(compareSelfhostProjectVersions(stable, stable), 0);
+      assert.equal(selfhostProjectUpdateAllowed(stable, later), false);
+      assert.equal(
+        selfhostProjectUpdateAllowed(stable, "2.0.1-selfhost.6"),
+        true,
+      );
+      assert.equal(selfhostProjectUpdateAllowed(earlier, later), true);
+      assert.equal(
+        selfhostProjectUpdateAllowed(
+          later,
+          "2.0.1-selfhost.6.nightly.20260701",
+        ),
+        true,
+      );
+      assert.equal(
+        selfhostProjectUpdateAllowed(later, "2.0.1-selfhost.6"),
+        false,
+      );
       for (const invalid of [
         "2.0.1-selfhost.5.nightly.20260229",
         "2.0.1-selfhost.5.nightly.20261301",
@@ -259,6 +277,14 @@ const cases = [
       );
       assert.match(
         electronUpdater,
+        /spawn-install![\s\S]*?\(fn \[_verified\] \(spawn-install!\)\)/,
+      );
+      assert.match(
+        electronUpdater,
+        /set-quit-dirty![\s\S]*?quit-app!/,
+      );
+      assert.match(
+        electronUpdater,
         /\.once child "error"[\s\S]*?\.once child "spawn"[\s\S]*?set-dirty! false[\s\S]*?\(quit!\)/,
       );
       assert.match(
@@ -268,6 +294,10 @@ const cases = [
       assert.match(
         electronUpdater,
         /defn- <project-signed-install![\s\S]*?run-project-signed-install![\s\S]*?<verify-project-update![\s\S]*?:spawn-child![\s\S]*?\.spawn child-process/,
+      );
+      assert.match(
+        electronUpdater,
+        /install-selfhost-update-support-policy![\s\S]*?default-is-update-supported update-info[\s\S]*?<project-signature-module![\s\S]*?selfhostProjectUpdateAllowed/,
       );
       assert.match(
         electronUpdater,

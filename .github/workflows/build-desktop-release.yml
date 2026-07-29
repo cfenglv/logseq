@@ -1152,8 +1152,7 @@ jobs:
       - name: List files
         run: ls -rl
 
-      - name: Update upstream rolling Nightly Release
-        if: ${{ !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
+      - name: Update rolling Nightly Release
         uses: andelf/nightly-release@5834076edc55cc05975561c9722043f072ac5c26 # main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1161,34 +1160,10 @@ jobs:
           tag_name: nightly
           name: 'Desktop app Nightly Release $$'
           draft: false
-          prerelease: ${{ github.event_name == 'schedule' || github.event.inputs.is-pre-release }}
+          prerelease: ${{ contains(needs.release-assets-preflight.outputs.version, '-selfhost.') || github.event_name == 'schedule' || github.event.inputs.is-pre-release }}
           body: |
             This is a nightly release of the Logseq desktop app.
             It's unstable compared to the official releases, **use it with caution**!
-          files: |
-            ./SHA256SUMS.txt
-            ./*.zip
-            ./*.dmg
-            ./*.exe
-            ./*.yml
-            ./*.blockmap
-            ./*.AppImage
-            ./*.apk
-
-      - name: Publish selfhost dated Nightly Release
-        if: ${{ contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ needs.release-assets-preflight.outputs.version }}
-          name: Desktop APP ${{ needs.release-assets-preflight.outputs.version }} (Nightly)
-          draft: false
-          prerelease: false
-          body: |
-            This is a dated nightly release of the selfhost Logseq desktop app.
-            It is published as a production GitHub Release so existing selfhost
-            clients can discover its signed architecture-specific metadata.
           files: |
             ./SHA256SUMS.txt
             ./*.zip

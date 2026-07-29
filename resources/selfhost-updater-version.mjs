@@ -79,7 +79,9 @@ export const macosUpdaterChannel = (packageVersion, arch) => {
 
   const selfhostRevision = selfhostUpdaterRevision(packageVersion);
   if (selfhostRevision >= signedMacosUpdaterChannelRevision) {
-    return `selfhost-macos-v2-${arch}`;
+    return selfhostVersionPattern.exec(packageVersion)?.[3] === undefined
+      ? `selfhost-macos-v2-${arch}`
+      : `selfhost-macos-v2-nightly-${arch}`;
   }
   return `latest-${arch}`;
 };

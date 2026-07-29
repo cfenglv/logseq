@@ -17,6 +17,7 @@
 (def *project-update (atom nil))
 (def *project-signature-module (atom nil))
 (def *set-quit-dirty-state! (atom nil))
+(def *default-is-update-supported (atom nil))
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
 
@@ -112,18 +113,59 @@
   (when-let [web-contents (and @*win (. ^js @*win -webContents))]
     (.send web-contents "auto-updater-downloaded" (bean/->js payload))))
 
+(defn- install-selfhost-update-support-policy!
+  []
+  (when (updater-config/selfhost-version? electron-version)
+    (let [default-is-update-supported
+          (or @*default-is-update-supported
+              (let [support! (.bind (.-isUpdateSupported autoUpdater)
+                                    autoUpdater)]
+                (reset! *default-is-update-supported support!)
+                support!))]
+      (set!
+       (.-isUpdateSupported autoUpdater)
+       (fn [^js update-info]
+         ;; Preserve electron-updater's minimumSystemVersion check first, then
+         ;; fail closed if provider metadata crosses stable/nightly tracks.
+         (-> (js/Promise.resolve
+              (default-is-update-supported update-info))
+             (.then
+              (fn [default-supported?]
+                (if-not default-supported?
+                  false
+                  (-> (<project-signature-module!)
+                      (.then
+                       (fn [^js signature-module]
+                         (boolean
+                          (.selfhostProjectUpdateAllowed
+                           signature-module
+                           electron-version
+                           (.-version update-info)))))
+                      (.catch
+                       (fn [error]
+                         (logger/warn
+                          "[updater/support] refusing invalid selfhost update"
+                          error)
+                         false))))))))))))
+
 (defn- configure-auto-updater!
   []
   (let [platform (.-platform js/process)
         arch (.-arch js/process)
-        {:keys [channel allow-prerelease? allow-downgrade?] :as options}
+        {:keys [channel feed-url allow-prerelease? allow-downgrade?] :as options}
         (updater-config/updater-options electron-version platform arch)]
+    (when feed-url
+      (.setFeedURL autoUpdater
+                   (bean/->js {:provider "generic"
+                               :url feed-url
+                               :channel channel})))
     (when (some? allow-prerelease?)
       (set! (.-allowPrerelease autoUpdater) allow-prerelease?))
     (when channel
       (set! (.-channel autoUpdater) channel))
     ;; Keep the original downgrade policy even though setting channel flips it on.
     (set! (.-allowDowngrade autoUpdater) allow-downgrade?)
+    (install-selfhost-update-support-policy!)
     (debug "configure-auto-updater" (assoc options
                                            :platform platform
                                            :arch arch
@@ -254,10 +296,21 @@
   The dirty guard is disabled only after the child emits `spawn`, immediately
   before quitting. Every failure restores the guard and is surfaced exactly
   once through `emit-error!`."
-  ([{:keys [verify! spawn-child! spawn! set-dirty!
-            set-quit-dirty-state! quit! emit-error!]}]
-   (let [spawn-child! (or spawn-child! spawn!)
-         set-dirty! (or set-dirty! set-quit-dirty-state!)
+  ([{:keys [verify! spawn-child! spawn! spawn-install! set-dirty!
+            set-quit-dirty-state! set-quit-dirty! quit! quit-app!
+            emit-error!]}]
+   (let [;; `spawn-install!` is the public role-oriented test seam and is
+         ;; intentionally zero-arity. Production `spawn-child!` consumes the
+         ;; verified helper payload, so normalize both at this one boundary.
+         spawn-child! (cond
+                        (fn? spawn-child!) spawn-child!
+                        (fn? spawn!) spawn!
+                        (fn? spawn-install!) (fn [_verified] (spawn-install!))
+                        :else nil)
+         set-dirty! (or set-dirty!
+                        set-quit-dirty-state!
+                        set-quit-dirty!)
+         quit! (or quit! quit-app!)
          required! (fn [label f]
                      (when-not (fn? f)
                        (throw (js/Error. (str "missing updater injection " label))))

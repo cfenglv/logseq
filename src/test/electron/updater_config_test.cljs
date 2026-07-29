@@ -27,13 +27,17 @@
     (is (= "selfhost-macos-v2-x64"
            (updater-config/updater-channel
             "2.0.1-selfhost.5" "darwin" "x64")))
-    (is (= "selfhost-macos-v2-arm64"
+    (is (= "selfhost-macos-v2-nightly-arm64"
            (updater-config/updater-channel
             "2.0.1-selfhost.5.nightly.20260729"
             "darwin"
             "arm64")))
     (is (nil? (updater-config/updater-channel
                "2.0.1-selfhost.5-alpha.nightly.20260729"
+               "darwin"
+               "arm64")))
+    (is (nil? (updater-config/updater-channel
+               "2.0.1-selfhost.5.nightly.20260229"
                "darwin"
                "arm64"))))
   (testing "upstream macOS versions keep their existing channels"
@@ -73,6 +77,31 @@
            (updater-config/updater-options
             "2.0.1-selfhost.5"
             "darwin"
+            "arm64"))))
+  (testing "selfhost nightly builds use the isolated rolling prerelease feed"
+    (is (= {:channel "selfhost-macos-v2-nightly-arm64"
+            :allow-prerelease? true
+            :allow-downgrade? false
+            :feed-url updater-config/selfhost-nightly-feed-url}
+           (updater-config/updater-options
+            "2.0.1-selfhost.5.nightly.20260729"
+            "darwin"
+            "arm64")))
+    (is (= {:channel "latest-x64"
+            :allow-prerelease? true
+            :allow-downgrade? false
+            :feed-url updater-config/selfhost-nightly-feed-url}
+           (updater-config/updater-options
+            "2.0.1-selfhost.5.nightly.20260729"
+            "win32"
+            "x64")))
+    (is (= {:channel nil
+            :allow-prerelease? true
+            :allow-downgrade? false
+            :feed-url updater-config/selfhost-nightly-feed-url}
+           (updater-config/updater-options
+            "2.0.1-selfhost.5.nightly.20260729"
+            "linux"
             "arm64"))))
   (testing "upstream prerelease behavior remains owned by electron-updater"
     (is (= {:channel "latest-x64"
