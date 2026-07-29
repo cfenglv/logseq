@@ -271,10 +271,11 @@ remain GitHub production releases even though their SemVer contains
 `-selfhost.N`; the release workflow enforces this contract.
 
 Use the NSIS installer on Windows and the AppImage on Linux when in-application
-installation is required. On macOS, both versions must use a consistent valid
-signing identity. Apple Developer ID signing and notarization provide the
-team-wide distribution path; the fallback ad-hoc packages remain manual
-downloads and are not claimed as a release-gated automatic replacement path.
+installation is required. On macOS, `.4` to `.5` is a one-time manual
+migration. Starting with `.5`, a fixed project Ed25519 public key and native
+replacement helper verify later updater ZIPs independently of the App's ad-hoc
+code-signing identity. The release private key is external to the repository;
+missing key material fails the macOS release closed.
 
 ## 10. Reproducibility and release checks
 
@@ -309,6 +310,10 @@ signature:
 
 - A GitHub package without Apple Developer ID notarization may be blocked by
   Gatekeeper on first launch.
+- Use **Open Anyway** for the one-time `.5` bootstrap if necessary. Do not
+  change certificate Trust Settings and do not strip quarantine attributes.
+- The project Ed25519 signature authenticates `.5` to later in-app updates, but
+  does not make an unnotarized build trusted by Gatekeeper.
 - Denying Keychain access can make Safe Storage, login cookies, or tokens
   unavailable and is not recommended as a routine workaround.
 - A stable local signing identity can reduce repeated prompts on one Mac, but

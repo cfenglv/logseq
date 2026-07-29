@@ -4,15 +4,20 @@
   [version]
   (boolean (re-find #"-selfhost(?:\.|$)" (or version ""))))
 
+(defn project-signed-macos-updater?
+  [version platform]
+  (and (= "darwin" platform)
+       (let [revision (some-> (re-find #"-selfhost\.([1-9]\d*)(?:-|$)"
+                                       (or version ""))
+                              second
+                              js/parseInt)]
+         (and revision (>= revision 5)))))
+
 (defn- signed-macos-updater-channel?
   [version]
   ;; selfhost.4's ad-hoc signature pins Squirrel.Mac to that exact cdhash.
   ;; selfhost.5 is the manually installed start of a new signed trust chain.
-  (let [revision (some-> (re-find #"-selfhost\.([1-9]\d*)(?:-|$)"
-                                  (or version ""))
-                         second
-                         js/parseInt)]
-    (and revision (>= revision 5))))
+  (project-signed-macos-updater? version "darwin"))
 
 (defn updater-channel
   [version platform arch]

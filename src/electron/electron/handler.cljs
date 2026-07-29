@@ -5,7 +5,6 @@
             ["abort-controller" :as AbortController]
             ["buffer" :as buffer]
             ["electron" :refer [app dialog ipcMain shell]]
-            ["electron-updater" :refer [autoUpdater]]
             ["electron-window-state" :as windowStateKeeper]
             ["fs" :as fs]
             ["fs-extra" :as fs-extra]
@@ -28,6 +27,7 @@
             [electron.server :as server]
             [electron.shell :as shell]
             [electron.state :as state]
+            [electron.updater :as updater]
             [electron.utils :as utils]
             [electron.window :as win]
             [electron.graph-switch-flow :as graph-switch-flow]
@@ -518,8 +518,7 @@
 
 (defmethod handle :quitAndInstall []
   (logger/info ::quick-and-install)
-  ;; https://www.electron.build/electron-updater.class.appupdater#quitandinstall
-  (.quitAndInstall autoUpdater false true))
+  (updater/install-downloaded-update!))
 
 ;; The graphHas* events are not used but maybe useful later?
 (defmethod handle :graphHasOtherWindow [^js win [_ graph]]

@@ -118,7 +118,7 @@ const cases = [
     },
   ],
   [
-    ".5 is a manual trust-chain bootstrap and future releases fail closed",
+    ".5 remains manual while both future architecture jobs use project signatures",
     () => {
       assert.equal(
         updaterSignatureGatePlan("2.0.1-selfhost.5", false).mode,
@@ -134,7 +134,15 @@ const cases = [
       );
       assert.equal(fs.existsSync(signedBaselineManifest), false);
       assert.equal(
-        workflow.match(/run-macos-updater-signature-policy\.mjs/g)?.length,
+        workflow.match(/build-project-update-helper\.mjs/g)?.length,
+        2,
+      );
+      assert.equal(
+        workflow.match(/sign-macos-project-update\.mjs/g)?.length,
+        2,
+      );
+      assert.equal(
+        workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length,
         2,
       );
     },

@@ -47,6 +47,16 @@
     (is (nil? (updater-config/updater-channel
                "2.0.1-selfhost.5" "win32" "ia32")))))
 
+(deftest project-signed-macos-updater-test
+  (is (updater-config/project-signed-macos-updater?
+       "2.0.1-selfhost.5" "darwin"))
+  (is (updater-config/project-signed-macos-updater?
+       "2.0.1-selfhost.6" "darwin"))
+  (is (not (updater-config/project-signed-macos-updater?
+            "2.0.1-selfhost.4" "darwin")))
+  (is (not (updater-config/project-signed-macos-updater?
+            "2.0.1-selfhost.5" "win32"))))
+
 (deftest updater-options-test
   (testing "selfhost versions use the signed macOS production channel"
     (is (= {:channel "selfhost-macos-v2-arm64"

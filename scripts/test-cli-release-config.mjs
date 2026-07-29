@@ -593,15 +593,15 @@ assert.match(
 );
 assert.equal(
   desktopReleaseWorkflow.match(
-    /Require Developer ID for published macOS releases/g,
+    /build-project-update-helper\.mjs/g,
   )?.length,
   2,
-  "both macOS builders should reject published ad-hoc candidates",
+  "both macOS builders should embed the project updater helper",
 );
 assert.match(
   desktopReleaseWorkflow,
-  /Published macOS releases must be Developer ID signed and notarized/,
-  "the macOS release gate should explain the required trust boundary",
+  /LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64/,
+  "the macOS release gate should require the external project signing key",
 );
 assert.equal(
   desktopReleaseWorkflow.match(
@@ -612,10 +612,17 @@ assert.equal(
 );
 assert.equal(
   desktopReleaseWorkflow.match(
-    /run-macos-updater-signature-policy\.mjs/g,
+    /sign-macos-project-update\.mjs/g,
   )?.length,
   2,
-  "both macOS builders should route through the migration-aware signature policy",
+  "both macOS builders should sign the project update manifest",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /verify-project-signed-macos-update\.mjs/g,
+  )?.length,
+  2,
+  "both macOS builders should verify the signed manifest against the ZIP",
 );
 assert.doesNotMatch(
   desktopReleaseWorkflow,

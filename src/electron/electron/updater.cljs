@@ -5,13 +5,87 @@
             [electron.updater-config :as updater-config]
             [electron.utils :refer [*win prod?]]
             [frontend.version :refer [version]]
-            ["electron" :refer [ipcMain]]
+            ["child_process" :as child-process]
+            ["electron" :refer [app ipcMain]]
+            ["fs" :as fs]
+            ["path" :as node-path]
+            ["url" :refer [pathToFileURL]]
             ["electron-updater" :refer [autoUpdater]]))
 
 (def *update-pending (atom nil))
 (def *downloaded-update (atom nil))
+(def *project-update (atom nil))
+(def *project-signature-module (atom nil))
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
+
+(declare normalize-payload emit-update! emit-update-downloaded! emit-completed!)
+
+(defn- project-signed-macos-updater?
+  []
+  (updater-config/project-signed-macos-updater?
+   electron-version
+   (.-platform js/process)))
+
+(defn- <project-signature-module!
+  []
+  (or @*project-signature-module
+      (let [module-url (-> (node-path/join (.-resourcesPath js/process)
+                                           "project-updater-signature.mjs")
+                           pathToFileURL
+                           (.-href))
+            module-promise (js* "import(~{})" module-url)]
+        (reset! *project-signature-module module-promise)
+        module-promise)))
+
+(defn- <validate-project-update-info
+  [update-info]
+  (-> (<project-signature-module!)
+      (.then
+       (fn [^js signature-module]
+         (.validateProjectUpdateSignature
+          signature-module
+          #js {:arch (.-arch js/process)
+               :currentVersion electron-version
+               :updateInfo update-info})))))
+
+(defn- downloaded-zip
+  [paths]
+  (let [zip-paths (->> (array-seq paths)
+                       (filter #(and (string? %)
+                                     (.endsWith (.toLowerCase %) ".zip"))))]
+    (when-not (= 1 (count zip-paths))
+      (throw (js/Error. "project updater requires exactly one downloaded ZIP")))
+    (first zip-paths)))
+
+(defn- remember-project-update!
+  [^js win update-info ^js manifest paths]
+  (let [archive (downloaded-zip paths)
+        payload (normalize-payload update-info)]
+    (reset! *project-update
+            {:archive archive
+             :arch (.-arch manifest)
+             :sha512 (.-sha512 manifest)
+             :signature (.-signature manifest)
+             :size (.-size manifest)
+             :version (.-version manifest)})
+    (reset! *downloaded-update payload)
+    (logger/info "[project-update-downloaded]"
+                 {:archive archive
+                  :arch (.-arch manifest)
+                  :version (.-version manifest)})
+    (emit-update! win "update-downloaded" payload)
+    (emit-update-downloaded! payload)
+    (emit-completed! win)))
+
+(defn- <download-project-update!
+  [^js win update-info]
+  (-> (<validate-project-update-info update-info)
+      (.then
+       (fn [manifest]
+         (-> (.downloadUpdate autoUpdater)
+             (.then #(remember-project-update!
+                      win update-info manifest %)))))))
 
 (defn- emit-update!
   [^js win type payload]
@@ -77,12 +151,16 @@
 
         downloaded-handler
         (fn [info]
-          (let [payload (normalize-payload info)]
-            (reset! *downloaded-update payload)
-            (logger/info "[update-downloaded]" payload)
-            (emit-update! win "update-downloaded" payload)
-            (emit-update-downloaded! payload)
-            (emit-completed! win)))
+          ;; The project-signed macOS path only becomes installable after the
+          ;; download promise yields the exact ZIP path and the signed manifest
+          ;; has been bound to it. Squirrel's event cannot cross that boundary.
+          (when-not (project-signed-macos-updater?)
+            (let [payload (normalize-payload info)]
+              (reset! *downloaded-update payload)
+              (logger/info "[update-downloaded]" payload)
+              (emit-update! win "update-downloaded" payload)
+              (emit-update-downloaded! payload)
+              (emit-completed! win))))
 
         error-handler
         (fn [error]
@@ -106,29 +184,75 @@
 (defn- <check-for-updates!
   [^js win auto-download?]
   (debug "check-for-updates" {:auto-download? auto-download?})
-  (set! (.-autoDownload autoUpdater) auto-download?)
+  (let [project-signed? (project-signed-macos-updater?)]
+    ;; electron-updater may download the ZIP, but Squirrel must never install
+    ;; it for the project-signed chain.
+    (set! (.-autoDownload autoUpdater)
+          (and auto-download? (not project-signed?)))
   (-> (.checkForUpdates autoUpdater)
       (.then
-       (fn [_]
-         ;; Manual checks without auto download need an explicit terminal event.
-         (when-not auto-download?
+       (fn [^js result]
+         (cond
+           (and project-signed?
+                auto-download?
+                (true? (.-isUpdateAvailable result)))
+           (<download-project-update! win (.-updateInfo result))
+
+           ;; Manual checks without auto download need an explicit terminal event.
+           (not auto-download?)
            (emit-completed! win))))
       (.catch
        (fn [error]
          (logger/warn "[updater/check]" error)
          (emit-update! win "error" (normalize-error error))
-         (emit-completed! win)))))
+         (emit-completed! win))))))
 
 (defn- init-auto-updater!
   [^js win]
   (when (and prod? (not= false (cfgs/get-item :auto-update)))
     (debug "init-auto-updater")
-    (set! (.-autoDownload autoUpdater) true)
-    (-> (.checkForUpdates autoUpdater)
-        (.catch (fn [error]
-                  (logger/warn "[updater/auto-check]" error)
-                  (emit-update! win "error" (normalize-error error))
-                  (emit-completed! win))))))
+    (<check-for-updates! win true)))
+
+(defn install-downloaded-update!
+  []
+  (if-not (project-signed-macos-updater?)
+    (.quitAndInstall autoUpdater false true)
+    (if-let [{:keys [archive arch sha512 signature size version]} @*project-update]
+      (let [helper (node-path/join (.-resourcesPath js/process)
+                                   "sidecar"
+                                   "logseq-project-updater")
+            target (node-path/resolve
+                    (node-path/dirname (.-execPath js/process))
+                    "../..")
+            helper-stat (fs/lstatSync helper)]
+        (when (or (.isSymbolicLink helper-stat)
+                  (not (.isFile helper-stat))
+                  (zero? (bit-and (.-mode helper-stat) 73)))
+          (throw (js/Error. "project updater helper is not a real executable file")))
+        (js/Promise.
+         (fn [resolve reject]
+           (let [child (.spawn
+                        child-process
+                        helper
+                        (bean/->js
+                         ["--archive" archive
+                          "--target" target
+                          "--arch" arch
+                          "--version" version
+                          "--sha512" sha512
+                          "--size" size
+                          "--parent-pid" (str (.-pid js/process))
+                          "--relaunch" "true"
+                          "--signature" signature])
+                        #js {:detached true
+                             :stdio "ignore"})]
+             (.once child "error" reject)
+             (.once child "spawn"
+                    (fn []
+                      (.unref child)
+                      (resolve true)
+                      (.quit app)))))))
+      (throw (js/Error. "no verified project-signed update is downloaded")))))
 
 (defn init-updater
   [{:keys [^js win] :as _opts}]
@@ -144,7 +268,7 @@
                              (-> (<check-for-updates! win auto-download?)
                                  (.finally #(reset! *update-pending nil))))))
         install-listener (fn [_e _quit-app?]
-                           (.quitAndInstall autoUpdater false true))
+                           (install-downloaded-update!))
         get-downloaded-listener (fn [_e]
                                   (some-> @*downloaded-update bean/->js))]
     (init-auto-updater! win)
@@ -156,4 +280,5 @@
        (.removeHandler ipcMain install-channel)
        (.removeHandler ipcMain check-channel)
        (.removeHandler ipcMain get-downloaded-channel)
-       (reset! *update-pending nil))))
+       (reset! *update-pending nil)
+       (reset! *project-update nil))))

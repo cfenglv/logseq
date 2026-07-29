@@ -49,6 +49,10 @@ publish:
     repo: logseq
 
 extraResources:
+  - from: project-updater-signature.mjs
+    to: project-updater-signature.mjs
+  - from: updater/project-signing-policy.json
+    to: updater/project-signing-policy.json
   - from: .agents/skills/logseq-cli/SKILL.md
     to: .agents/skills/logseq-cli/SKILL.md
   - from: ../sidecar
