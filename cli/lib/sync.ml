@@ -270,18 +270,27 @@ let execute_config_unset mode config key =
         (Cli_result.error ~command:Command_id.Sync_config_unset mode err)
 
 let sync_config_value config =
-  Edn_util.map_t_vec
-    (Vec.of_array
-       [|
-         ( Edn_util.keyword "ws-url",
-           match config.Cli_config.ws_url with
-           | Some value -> Edn_util.string value
-           | None -> Edn_util.nil );
-         ( Edn_util.keyword "http-base",
-           match config.Cli_config.http_base with
-           | Some value -> Edn_util.string value
-           | None -> Edn_util.nil );
-       |])
+  let fields =
+    Vec.of_array
+      [|
+        ( Edn_util.keyword "ws-url",
+          match config.Cli_config.ws_url with
+          | Some value -> Edn_util.string value
+          | None -> Edn_util.nil );
+        ( Edn_util.keyword "http-base",
+          match config.Cli_config.http_base with
+          | Some value -> Edn_util.string value
+          | None -> Edn_util.nil );
+      |]
+  in
+  let fields =
+    match config.Cli_config.auth_path with
+    | Some value when String.trim value <> "" ->
+        Vec.push_back fields
+          (Edn_util.keyword "auth-path", Edn_util.string value)
+    | _ -> fields
+  in
+  Edn_util.map_t_vec fields
 
 let add_runtime_auth key value fields =
   match value with

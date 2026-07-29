@@ -2646,6 +2646,14 @@ let () =
                 && Js.String.includes ~search:"refresh-token-custom-path" body)
               !invoke_calls
           in
+          let custom_auth_path_forwarded =
+            Vec.exists
+              (fun body ->
+                Js.String.includes ~search:"thread-api/set-db-sync-config" body
+                && Js.String.includes ~search:"auth-path" body
+                && Js.String.includes ~search:auth_path body)
+              !invoke_calls
+          in
           let e2ee_call_uses_custom_refresh_token =
             Vec.exists
               (fun body ->
@@ -2656,6 +2664,8 @@ let () =
           in
           if not runtime_auth_resolved then
             fail_promise "missing custom auth sync-app-state payload"
+          else if not custom_auth_path_forwarded then
+            fail_promise "missing custom auth path in worker sync config"
           else if not e2ee_call_uses_custom_refresh_token then
             fail_promise "missing custom auth refresh token in e2ee call"
           else Js.Promise.resolve pass));

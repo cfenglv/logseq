@@ -475,8 +475,9 @@
 
 (defn- sync-config
   [config]
-  {:ws-url (:ws-url config)
-   :http-base (:http-base config)})
+  (cond-> {:ws-url (:ws-url config)
+           :http-base (:http-base config)}
+    (seq (:auth-path config)) (assoc :auth-path (:auth-path config))))
 
 (defn- runtime-auth-present?
   [config]

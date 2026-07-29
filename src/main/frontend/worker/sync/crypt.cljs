@@ -47,7 +47,8 @@
 
 (defn- auth-file-path
   []
-  node-default-auth-file)
+  (or (:auth-path @worker-state/*db-sync-config)
+      node-default-auth-file))
 
 (defn- interactive-runtime?
   []

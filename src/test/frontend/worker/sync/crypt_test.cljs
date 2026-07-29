@@ -197,14 +197,29 @@
                             (reset! worker-state/*state state-prev)
                             (done)))))))
 
-(deftest save-e2ee-password-uses-default-auth-file-in-cli-node-runtime-test
+(deftest auth-file-path-default-and-custom-test
+  (let [config-prev @worker-state/*db-sync-config]
+    (try
+      (reset! worker-state/*db-sync-config {})
+      (is (= "~/logseq/auth.json" (#'sync-crypt/auth-file-path)))
+      (reset! worker-state/*db-sync-config
+              {:auth-path "/tmp/custom-logseq/auth.json"})
+      (is (= "/tmp/custom-logseq/auth.json"
+             (#'sync-crypt/auth-file-path)))
+      (finally
+        (reset! worker-state/*db-sync-config config-prev)))))
+
+(deftest save-e2ee-password-uses-custom-auth-file-in-cli-node-runtime-test
   (async done
          (let [platform-map {:env {:runtime :node
                                    :owner-source :cli}}
+               config-prev @worker-state/*db-sync-config
+               custom-auth-path "/tmp/custom-logseq/auth.json"
                secret-calls (atom [])
                file-calls (atom [])
                auth-read-calls (atom [])
                encrypt-calls (atom [])]
+           (reset! worker-state/*db-sync-config {:auth-path custom-auth-path})
            (-> (p/with-redefs [crypt/<encrypt-text-by-text-password (fn [refresh-token password]
                                                                       (swap! encrypt-calls conj [refresh-token password])
                                                                       {:cipher "payload"})
@@ -226,7 +241,7 @@
                  (#'sync-crypt/<save-e2ee-password "password"))
                (p/then (fn [_]
                          (is (= 1 (count @auth-read-calls)))
-                         (is (= "~/logseq/auth.json" (:path (first @auth-read-calls))))
+                         (is (= custom-auth-path (:path (first @auth-read-calls))))
                          (is (= [["refresh-from-auth-file" "password"]] @encrypt-calls))
                          (is (= 1 (count @secret-calls)))
                          (is (= platform-map (:platform (first @secret-calls))))
@@ -235,17 +250,21 @@
                          (is (empty? @file-calls))))
                (p/catch (fn [e]
                           (is false (str e))))
-               (p/finally done)))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (done)))))))
 
-(deftest save-and-read-e2ee-password-round-trips-cli-runtime-refresh-token-test
+(deftest save-and-read-e2ee-password-round-trips-custom-cli-auth-path-test
   (async done
          (let [platform-map {:env {:runtime :node
                                    :owner-source :cli}}
+               config-prev @worker-state/*db-sync-config
                state-prev @worker-state/*state
                auth-read-calls (atom [])
                secret-text (atom nil)
                encrypt-calls (atom [])
                decrypt-calls (atom [])
+               custom-auth-path "/tmp/custom-logseq-round-trip/auth.json"
                runtime-refresh-token "refresh-from-custom-auth-file"
                save-e2ee-password (get @thread-api/*thread-apis
                                        :thread-api/save-e2ee-password)
@@ -253,13 +272,17 @@
                                       :thread-api/get-e2ee-password)]
            (is (fn? save-e2ee-password))
            (is (fn? get-e2ee-password))
+           (reset! worker-state/*db-sync-config {:auth-path custom-auth-path})
            (reset! worker-state/*state
                    (assoc state-prev :auth/refresh-token runtime-refresh-token))
            (-> (p/with-redefs [platform/current (fn [] platform-map)
                                platform/read-text! (fn [platform' path]
                                                      (swap! auth-read-calls conj {:platform platform'
                                                                                   :path path})
-                                                     (p/resolved "{\"refresh-token\":\"refresh-from-default-auth-file\"}"))
+                                                     (p/resolved
+                                                      (str "{\"refresh-token\":\""
+                                                           runtime-refresh-token
+                                                           "\"}")))
                                platform/save-secret-text! (fn [_platform' _key text]
                                                             (reset! secret-text text)
                                                             (p/resolved nil))
@@ -282,7 +305,8 @@
                    password))
                (p/then (fn [password]
                          (is (= "custom-path-password" password))
-                         (is (empty? @auth-read-calls))
+                         (is (= [custom-auth-path]
+                                (mapv :path @auth-read-calls)))
                          (is (= [[runtime-refresh-token "custom-path-password"]]
                                 @encrypt-calls))
                          (is (= runtime-refresh-token
@@ -290,6 +314,7 @@
                (p/catch (fn [e]
                           (is false (str e))))
                (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
                             (reset! worker-state/*state state-prev)
                             (done)))))))
 
