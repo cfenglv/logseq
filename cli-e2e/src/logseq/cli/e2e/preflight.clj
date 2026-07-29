@@ -5,7 +5,7 @@
 
 (def build-plan
   [{:cmd "pnpm cli:release"}
-   {:cmd "pnpm db-worker-node:compile:bundle"}
+   {:cmd "pnpm db-worker-node:e2e-compile:bundle"}
    {:cmd "pnpm --dir deps/db-sync build:node-adapter"}])
 
 (defn missing-artifacts

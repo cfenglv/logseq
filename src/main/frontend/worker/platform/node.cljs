@@ -15,6 +15,11 @@
             [promesa.core :as p]
             ["keytar" :as keytar]))
 
+(goog-define TEST-SECRET-STORAGE false)
+
+(def ^:private test-secret-storage-enabled?
+  TEST-SECRET-STORAGE)
+
 (defn- resolve-database-sync-ctor
   []
   (or (gobj/get node-sqlite "DatabaseSync")
@@ -723,85 +728,72 @@
   (transit/write kv-transit-writer state))
 
 (def ^:private keychain-service "Logseq E2EE")
+(def ^:private test-secret-storage-file "test-only-e2ee-secret-store.json")
 
-(defn- <save-secret-text!
-  [kv key text]
-  (-> (p/let [_ (.setPassword ^js keytar keychain-service key text)]
-        nil)
-      (p/catch (fn [e]
-                 (log/warn :db-worker/keychain-save-failed {:error e
-                                                            :key key})
-                 ((:set! kv) key text)))))
+(defn- keychain-secret-store
+  [kv keychain]
+  {:save-secret-text!
+   (fn [key text]
+     (-> (p/let [_ (.setPassword ^js keychain keychain-service key text)]
+           nil)
+         (p/catch (fn [e]
+                    (log/warn :db-worker/keychain-save-failed {:error e
+                                                               :key key})
+                    ((:set! kv) key text)))))
+   :read-secret-text
+   (fn [key]
+     (-> (p/let [secret (.getPassword ^js keychain keychain-service key)]
+           secret)
+         (p/catch (fn [e]
+                    (log/warn :db-worker/keychain-read-failed {:error e
+                                                               :key key})
+                    ((:get kv) key)))))
+   :delete-secret-text!
+   (fn [key]
+     (-> (p/let [_ (.deletePassword ^js keychain keychain-service key)]
+           nil)
+         (p/catch (fn [e]
+                    (log/warn :db-worker/keychain-delete-failed {:error e
+                                                                 :key key})
+                    ((:set! kv) key nil)))))})
 
-(defn- <read-secret-text
-  [kv key]
-  (-> (p/let [secret (.getPassword ^js keytar keychain-service key)]
-        secret)
-      (p/catch (fn [e]
-                 (log/warn :db-worker/keychain-read-failed {:error e
-                                                            :key key})
-                 ((:get kv) key)))))
+(defn- kv-secret-store
+  [kv]
+  {:save-secret-text! (fn [key text] ((:set! kv) key text))
+   :read-secret-text (fn [key] ((:get kv) key))
+   :delete-secret-text! (fn [key] ((:set! kv) key nil))})
 
-(defn- <delete-secret-text!
-  [kv key]
-  (-> (p/let [_ (.deletePassword ^js keytar keychain-service key)]
-        nil)
-      (p/catch (fn [e]
-                 (log/warn :db-worker/keychain-delete-failed {:error e
-                                                              :key key})
-                 ((:set! kv) key nil)))))
-
-(defn- truthy-env?
-  [value]
-  (contains? #{"1" "true" "yes" "on"}
-             (string/lower-case (string/trim (str (or value ""))))))
-
-(defn- use-keychain-for-owner?
-  [owner-source]
-  (not (and (= :cli owner-source)
-            (truthy-env? (gobj/get (.-env js/process) "CLI_E2E_TEST")))))
-
-(defn- <save-secret-text-by-owner!
-  [kv owner-source key text]
-  (if (use-keychain-for-owner? owner-source)
-    (<save-secret-text! kv key text)
-    ((:set! kv) key text)))
-
-(defn- <read-secret-text-by-owner
-  [kv owner-source key]
-  (if (use-keychain-for-owner? owner-source)
-    (<read-secret-text kv key)
-    ((:get kv) key)))
-
-(defn- <delete-secret-text-by-owner!
-  [kv owner-source key]
-  (if (use-keychain-for-owner? owner-source)
-    (<delete-secret-text! kv key)
-    ((:set! kv) key nil)))
+(defn- resolve-secret-store
+  [test-storage-enabled? production-kv test-kv]
+  (if test-storage-enabled?
+    (kv-secret-store test-kv)
+    (keychain-secret-store production-kv keytar)))
 
 (defn- kv-store
-  [data-dir]
-  (let [kv-path (node-path/join data-dir "kv-store.json")
-        state (atom nil)
-        <load! (fn []
-                 (if (some? @state)
-                   (p/resolved @state)
-                   (-> (fs/readFile kv-path "utf8")
-                       (p/then (fn [contents]
-                                 (let [data (parse-kv-state contents)]
-                                   (reset! state data)
-                                   @state)))
-                       (p/catch (fn [_]
-                                  (reset! state {})
-                                  @state)))))]
-    {:get (fn [k]
-            (p/let [_ (<load!)]
-              (get @state k)))
-     :set! (fn [k value]
-             (p/let [_ (<load!)
-                     _ (swap! state assoc k value)
-                     payload (serialize-kv-state @state)]
-               (fs/writeFile kv-path payload "utf8")))}))
+  ([data-dir]
+   (kv-store data-dir "kv-store.json"))
+  ([data-dir file-name]
+   (let [kv-path (node-path/join data-dir file-name)
+         state (atom nil)
+         <load! (fn []
+                  (if (some? @state)
+                    (p/resolved @state)
+                    (-> (fs/readFile kv-path "utf8")
+                        (p/then (fn [contents]
+                                  (let [data (parse-kv-state contents)]
+                                    (reset! state data)
+                                    @state)))
+                        (p/catch (fn [_]
+                                   (reset! state {})
+                                   @state)))))]
+     {:get (fn [k]
+             (p/let [_ (<load!)]
+               (get @state k)))
+      :set! (fn [k value]
+              (p/let [_ (<load!)
+                      _ (swap! state assoc k value)
+                      payload (serialize-kv-state @state)]
+                (fs/writeFile kv-path payload "utf8")))})))
 
 (defn node-platform
   [{:keys [root-dir event-fn write-guard-fn owner-source recreate-lock-fn
@@ -818,14 +810,20 @@
         embedding-dimension (when vector-embedding-enabled?
                               (resolve-embedding-dimension embedding-model-id))
         open-vector-index-fn (or open-vector-index-fn open-vector-index)
-        kv (kv-store root-dir)]
+        kv (kv-store root-dir)
+        test-kv (when test-secret-storage-enabled?
+                  (kv-store root-dir test-secret-storage-file))
+        secret-store (resolve-secret-store test-secret-storage-enabled? kv test-kv)]
     (p/do!
      (ensure-dir! root-dir)
      (ensure-dir! data-dir)
      (log/info :db-worker-node-platform {:root-dir root-dir
                                           :vector-embedding-enabled? vector-embedding-enabled?
                                           :embedding-endpoint embedding-endpoint
-                                          :embedding-model-id embedding-model-id})
+                                          :embedding-model-id embedding-model-id
+                                          :secret-storage (if test-secret-storage-enabled?
+                                                            :isolated-test
+                                                            :system-keychain)})
      (cond->
       {:env {:publishing? false
              :runtime :node
@@ -874,12 +872,7 @@
                 :transaction (fn [db f] (.transaction db f))
                 :backup-db (fn [^js db path]
                              (.backup db path))}
-       :crypto {:save-secret-text! (fn [key text]
-                                     (<save-secret-text-by-owner! kv owner-source key text))
-                :read-secret-text (fn [key]
-                                    (<read-secret-text-by-owner kv owner-source key))
-                :delete-secret-text! (fn [key]
-                                       (<delete-secret-text-by-owner! kv owner-source key))}
+       :crypto secret-store
        :timers {:set-interval! (fn [f ms] (js/setInterval f ms))}}
        vector-embedding-enabled?
        (assoc :embedding {:model-id embedding-model-id

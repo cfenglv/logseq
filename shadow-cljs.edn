@@ -180,6 +180,7 @@
                           frontend.test.lazy-editor-stub}}
          :closure-defines {frontend.util/NODETEST true
                            frontend.worker-common.util/NODETEST true
+                           frontend.worker.platform.node/TEST-SECRET-STORAGE true
                            logseq.shui.util/NODETEST true}
          :devtools {:enabled false}
          ;; disable :static-fns to allow for with-redefs and repl development
@@ -204,7 +205,8 @@
   {:target :node-script
    :output-to "static/db-sync-backup-memory-test.js"
    :main frontend.worker.db-sync-backup-memory-test-runner/main
-   :closure-defines {frontend.worker-common.util/NODETEST true}
+   :closure-defines {frontend.worker-common.util/NODETEST true
+                     frontend.worker.platform.node/TEST-SECRET-STORAGE true}
    :devtools {:enabled false}}
 
   :gen-malli-kondo-config {:target :node-script
