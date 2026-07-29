@@ -1,4 +1,5 @@
 extends: ./electron-builder.yml
+afterPack: ./electron-builder-clean-signing-xattrs-after-pack.cjs
 afterSign: ./electron-builder-adhoc-after-sign.cjs
 
 mac:
