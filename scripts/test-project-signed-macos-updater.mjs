@@ -11,10 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  signedBaselineManifest,
-  updaterSignatureGatePlan,
-} from "./run-macos-updater-signature-policy.mjs";
+import { updaterSignatureGatePlan } from "./run-macos-updater-signature-policy.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -1284,7 +1281,17 @@ addCase(cases, ".4 legacy feed remains pinned and .5 remains manual", () => {
     updaterSignatureGatePlan("2.0.1-selfhost.5", false).mode,
     "manual-migration",
   );
-  assert.equal(fs.existsSync(signedBaselineManifest), false);
+  const futurePlan = updaterSignatureGatePlan("2.0.1-selfhost.6", false);
+  assert.match(
+    futurePlan.mode,
+    /project[\s_-]*signature|signature[\s_-]*project/i,
+    ".6+ updater policy is not the project-signature verifier",
+  );
+  assert.doesNotMatch(
+    JSON.stringify(futurePlan),
+    /developer[\s_-]*id|notari[sz]|signed[\s_-]*baseline/i,
+    ".6+ updater policy still depends on the obsolete Developer ID baseline",
+  );
   for (const [arch, digest] of Object.entries(legacyDigests)) {
     assert.equal(
       fileSha256(
