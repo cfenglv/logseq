@@ -287,7 +287,8 @@ let sync_config_value config =
     match config.Cli_config.auth_path with
     | Some value when String.trim value <> "" ->
         Vec.push_back fields
-          (Edn_util.keyword "auth-path", Edn_util.string value)
+          (Edn_util.keyword "auth-path",
+           Edn_util.string (Auth_state.auth_path config))
     | _ -> fields
   in
   Edn_util.map_t_vec fields

@@ -36,7 +36,10 @@ let default_auth_path () =
     "auth.json"
 
 let auth_path config =
-  Option.value config.Cli_config.auth_path ~default:(default_auth_path ())
+  match config.Cli_config.auth_path with
+  | Some path when path <> "" -> Node.Path.resolve "." path
+  | Some path -> path
+  | None -> default_auth_path ()
 
 let rec mkdir_p path =
   if path = "" || path = Filename.dirname path || Cli_unix.file_exists path then

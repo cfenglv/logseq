@@ -1596,6 +1596,29 @@
                           (is false (str "unexpected error: " e))))
                (p/finally done)))))
 
+(deftest test-execute-sync-ensure-keys-forwards-resolved-relative-auth-path
+  (async done
+         (let [invoke-calls (atom [])
+               relative-auth-path (node-path/join "relative-auth" "auth.json")
+               expected-auth-path (node-path/resolve relative-auth-path)]
+           (-> (p/with-redefs [transport/invoke (fn [_ method args]
+                                                  (swap! invoke-calls conj [method args])
+                                                  (p/resolved {:ok true}))]
+                 (p/let [_ (sync-command/execute {:type :sync-ensure-keys}
+                                                 {:base-url "http://example"
+                                                  :root-dir "/tmp"
+                                                  :auth-path relative-auth-path
+                                                  :id-token "runtime-token"})]
+                   (is (some #(= [:thread-api/set-db-sync-config
+                                  [{:ws-url nil
+                                    :http-base nil
+                                    :auth-path expected-auth-path}]]
+                                 %)
+                             @invoke-calls))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally done)))))
+
 (deftest test-execute-sync-ensure-keys-verifies-and-persists-e2ee-password-when-provided
   (async done
          (let [invoke-calls (atom [])]

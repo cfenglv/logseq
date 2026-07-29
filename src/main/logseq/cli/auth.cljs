@@ -29,7 +29,10 @@
 
 (defn auth-path
   [{custom-auth-path :auth-path}]
-  (or custom-auth-path (default-auth-path)))
+  (cond
+    (seq custom-auth-path) (node-path/resolve custom-auth-path)
+    (some? custom-auth-path) custom-auth-path
+    :else (default-auth-path)))
 
 (defn- ensure-auth-dir!
   [path]

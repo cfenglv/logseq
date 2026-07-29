@@ -2619,6 +2619,9 @@ let () =
     (fun () ->
       let root = temp_dir "logseq-cli-sync-ensure-keys-auth-" in
       let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let relative_auth_path =
+        Node.Path.relative ~from:(Sys.getcwd ()) ~to_:auth_path ()
+      in
       let config_path = Node.Path.join [| root; "cli.edn" |] in
       let invoke_calls = ref Vec.empty in
       let server =
@@ -2629,7 +2632,8 @@ let () =
       with_server server (fun base_url ->
           write_file auth_path
             "{\"provider\":\"cognito\",\"id-token\":\"id-token-custom-path\",\"access-token\":\"access-token-custom-path\",\"refresh-token\":\"refresh-token-custom-path\",\"expires-at\":4102444800000}\n";
-          write_file config_path (Printf.sprintf "{:auth-path %S}\n" auth_path);
+          write_file config_path
+            (Printf.sprintf "{:auth-path %S}\n" relative_auth_path);
           let env = [| ("LOGSEQ_CLI_BASE_URL", base_url) |] in
           let* result =
             run_cli_p ~env

@@ -477,7 +477,7 @@
   [config]
   (cond-> {:ws-url (:ws-url config)
            :http-base (:http-base config)}
-    (seq (:auth-path config)) (assoc :auth-path (:auth-path config))))
+    (seq (:auth-path config)) (assoc :auth-path (cli-auth/auth-path config))))
 
 (defn- runtime-auth-present?
   [config]

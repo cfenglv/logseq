@@ -660,6 +660,12 @@ let () =
       expect_equal "default auth path" expected
         (Auth_state.default_auth_path ()));
 
+  test "CLI parity custom relative auth path resolves from cwd" (fun () ->
+      let relative_path = Node.Path.join [| "relative-auth"; "auth.json" |] in
+      expect_equal "relative auth path"
+        (Node.Path.resolve "." relative_path)
+        (Auth_state.auth_path (config ~auth_path:relative_path ())));
+
   test "CLI parity auth file write read and delete round-trips token data"
     (fun () ->
       let root = temp_dir "logseq-cli-parity-auth-" in
