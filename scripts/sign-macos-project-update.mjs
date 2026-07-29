@@ -14,6 +14,7 @@ import {
   projectUpdateBundleIdentifier,
   projectUpdateKeyId,
   projectUpdatePayload,
+  parseSelfhostProjectVersion,
 } from "./project-update-signing.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -37,9 +38,7 @@ const version = required("--version");
 const archive = path.resolve(required("--archive"));
 const metadata = path.resolve(required("--metadata"));
 if (!["arm64", "x64"].includes(arch)) throw new Error("unsupported architecture");
-if (!/^[0-9]+\.[0-9]+\.[0-9]+-selfhost\.[1-9][0-9]*$/.test(version)) {
-  throw new Error("project updater signs only stable numbered selfhost versions");
-}
+parseSelfhostProjectVersion(version);
 const privateKeyBase64 =
   process.env.LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64?.trim();
 if (!privateKeyBase64) {

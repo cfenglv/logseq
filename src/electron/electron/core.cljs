@@ -46,7 +46,8 @@
 (defn setup-updater! [^js win]
   ;; manual/auto updater
   (init-updater {:repo   "logseq/logseq"
-                 :win    win}))
+                 :win    win
+                 :set-quit-dirty-state! #(vreset! *quit-dirty? %)}))
 
 (defn open-url-handler
   "win - the main window instance (first renderer process)

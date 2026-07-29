@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
+import { generateKeyPairSync } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -199,86 +200,151 @@ const outputDir = fs.mkdtempSync(
   path.join(os.tmpdir(), "logseq-desktop-preflight-"),
 );
 const outputOverride = `-c.directories.output=${outputDir}`;
-if (process.platform === "darwin") {
-  pnpm("package host macOS application", [
-    "--dir",
-    "static",
-    "electron:make-unsigned",
-    "--mac",
-    "dmg",
-    "zip",
-    `--${process.arch}`,
-    outputOverride,
-  ]);
-} else if (process.platform === "win32") {
-  pnpm("package host Windows application", [
-    "--dir",
-    "static",
-    "exec",
-    "electron-builder",
-    "--win",
-    "nsis",
-    "zip",
-    `--${process.arch}`,
-    "--publish",
-    "never",
-    outputOverride,
-  ]);
-} else if (process.platform === "linux") {
-  pnpm("package host Linux application", [
-    "--dir",
-    "static",
-    "exec",
-    "electron-builder",
-    "--linux",
-    "AppImage",
-    "zip",
-    `--${process.arch}`,
-    "--publish",
-    "never",
-    outputOverride,
-  ]);
-} else {
-  throw new Error(`unsupported local packaging platform: ${process.platform}`);
-}
-
-run(
-  "verify host packaged application",
-  process.execPath,
-  [
-    "static/verify-packaged-desktop.mjs",
-    "--search-root",
-    outputDir,
-    "--platform",
-    process.platform,
-    "--arch",
-    process.arch,
-    "--version",
-    version,
-  ],
+const stagedProjectUpdater = path.join(
+  staticDir,
+  "sidecar",
+  "logseq-project-updater",
 );
+let previousProjectUpdater;
+if (fs.existsSync(stagedProjectUpdater)) {
+  const stats = fs.lstatSync(stagedProjectUpdater);
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error(
+      `refusing to replace non-regular staged helper: ${stagedProjectUpdater}`,
+    );
+  }
+  previousProjectUpdater = {
+    bytes: fs.readFileSync(stagedProjectUpdater),
+    mode: stats.mode,
+  };
+}
+let temporaryHelperRoot;
 
-if (process.platform === "darwin") {
-  const appPath = path.join(
-    outputDir,
-    process.arch === "arm64" ? "mac-arm64" : "mac",
-    "Logseq.app",
+try {
+  if (process.platform === "darwin") {
+    temporaryHelperRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "logseq-preflight-project-updater-"),
+    );
+    const temporaryHelper = path.join(
+      temporaryHelperRoot,
+      "logseq-project-updater",
+    );
+    const { publicKey } = generateKeyPairSync("ed25519");
+    const publicKeyBase64 = publicKey
+      .export({ format: "der", type: "spki" })
+      .subarray(-32)
+      .toString("base64");
+    run(
+      "build test-only project updater helper for packaging verification",
+      process.execPath,
+      [
+        "scripts/build-project-update-helper.mjs",
+        "--test-only",
+        "--public-key-base64",
+        publicKeyBase64,
+        "--arch",
+        process.arch,
+        "--output",
+        temporaryHelper,
+      ],
+    );
+    fs.mkdirSync(path.dirname(stagedProjectUpdater), { recursive: true });
+    fs.copyFileSync(temporaryHelper, stagedProjectUpdater);
+    fs.chmodSync(stagedProjectUpdater, 0o755);
+  }
+
+  if (process.platform === "darwin") {
+    pnpm("package host macOS application", [
+      "--dir",
+      "static",
+      "electron:make-unsigned",
+      "--mac",
+      "dmg",
+      "zip",
+      `--${process.arch}`,
+      outputOverride,
+    ]);
+  } else if (process.platform === "win32") {
+    pnpm("package host Windows application", [
+      "--dir",
+      "static",
+      "exec",
+      "electron-builder",
+      "--win",
+      "nsis",
+      "zip",
+      `--${process.arch}`,
+      "--publish",
+      "never",
+      outputOverride,
+    ]);
+  } else if (process.platform === "linux") {
+    pnpm("package host Linux application", [
+      "--dir",
+      "static",
+      "exec",
+      "electron-builder",
+      "--linux",
+      "AppImage",
+      "zip",
+      `--${process.arch}`,
+      "--publish",
+      "never",
+      outputOverride,
+    ]);
+  } else {
+    throw new Error(`unsupported local packaging platform: ${process.platform}`);
+  }
+
+  run(
+    "verify host packaged application",
+    process.execPath,
+    [
+      "static/verify-packaged-desktop.mjs",
+      "--search-root",
+      outputDir,
+      "--platform",
+      process.platform,
+      "--arch",
+      process.arch,
+      "--version",
+      version,
+    ],
   );
-  run("verify macOS bundle signature", "codesign", [
-    "--verify",
-    "--deep",
-    "--strict",
-    "--verbose=2",
-    appPath,
-  ]);
-  const dmg = fs
-    .readdirSync(outputDir)
-    .find((name) => name.endsWith(".dmg"));
-  if (!dmg) throw new Error(`missing DMG under ${outputDir}`);
-  run("verify macOS DMG", "hdiutil", [
-    "verify",
-    path.join(outputDir, dmg),
-  ]);
+
+  if (process.platform === "darwin") {
+    const appPath = path.join(
+      outputDir,
+      process.arch === "arm64" ? "mac-arm64" : "mac",
+      "Logseq.app",
+    );
+    run("verify macOS bundle signature", "codesign", [
+      "--verify",
+      "--deep",
+      "--strict",
+      "--verbose=2",
+      appPath,
+    ]);
+    const dmg = fs
+      .readdirSync(outputDir)
+      .find((name) => name.endsWith(".dmg"));
+    if (!dmg) throw new Error(`missing DMG under ${outputDir}`);
+    run("verify macOS DMG", "hdiutil", [
+      "verify",
+      path.join(outputDir, dmg),
+    ]);
+  }
+} finally {
+  if (previousProjectUpdater) {
+    fs.mkdirSync(path.dirname(stagedProjectUpdater), { recursive: true });
+    fs.writeFileSync(stagedProjectUpdater, previousProjectUpdater.bytes);
+    fs.chmodSync(stagedProjectUpdater, previousProjectUpdater.mode);
+  } else {
+    fs.rmSync(stagedProjectUpdater, { force: true });
+  }
+  if (temporaryHelperRoot) {
+    fs.rmSync(temporaryHelperRoot, { recursive: true, force: true });
+  }
 }
 
 console.log(

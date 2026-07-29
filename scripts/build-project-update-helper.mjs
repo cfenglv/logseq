@@ -82,8 +82,7 @@ if (
 }
 const expectedKeyId = `ed25519:${createHash("sha256")
   .update(publicKey)
-  .digest("hex")
-  .slice(0, 16)}`;
+  .digest("hex")}`;
 if (!testOnly && manifest.keyId !== expectedKeyId) {
   throw new Error(
     `project update keyId ${manifest.keyId} != derived ${expectedKeyId}`,

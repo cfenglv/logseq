@@ -303,19 +303,31 @@ private func hex<D: Sequence>(_ digest: D) -> String where D.Element == UInt8 {
     digest.map { String(format: "%02x", $0) }.joined()
 }
 
-private func preserveQuarantine(from source: String, to destination: String) throws {
+private func quarantineValue(at path: String) throws -> Data? {
     let name = "com.apple.quarantine"
-    let length = getxattr(source, name, nil, 0, 0, XATTR_NOFOLLOW)
+    let length = getxattr(path, name, nil, 0, 0, XATTR_NOFOLLOW)
     if length < 0 {
-        if errno == ENOATTR { return }
-        try fail("cannot read source quarantine attribute")
+        if errno == ENOATTR { return nil }
+        try fail("cannot read quarantine attribute from \(path)")
     }
+    if length == 0 { return Data() }
     var value = [UInt8](repeating: 0, count: length)
-    guard getxattr(source, name, &value, length, 0, XATTR_NOFOLLOW) == length else {
-        try fail("cannot copy source quarantine attribute")
+    guard getxattr(path, name, &value, length, 0, XATTR_NOFOLLOW) == length else {
+        try fail("cannot read quarantine attribute value from \(path)")
     }
-    guard setxattr(destination, name, value, length, 0, XATTR_NOFOLLOW) == 0 else {
-        try fail("cannot preserve source quarantine attribute")
+    return Data(value)
+}
+
+private func setQuarantine(_ value: Data, at path: String) throws {
+    let name = "com.apple.quarantine"
+    let result = value.withUnsafeBytes {
+        setxattr(path, name, $0.baseAddress, value.count, 0, XATTR_NOFOLLOW)
+    }
+    guard result == 0 else {
+        try fail("cannot preserve quarantine attribute on \(path)")
+    }
+    guard try quarantineValue(at: path) == value else {
+        try fail("quarantine attribute verification failed on \(path)")
     }
 }
 
@@ -355,7 +367,9 @@ private func copyAndHashArchive(_ source: URL, to destination: URL, expectedSize
     guard copied == expectedSize, fsync(destinationFD) == 0 else {
         try fail("private update archive is incomplete")
     }
-    try preserveQuarantine(from: source.path, to: destination.path)
+    if let quarantine = try quarantineValue(at: source.path) {
+        try setQuarantine(quarantine, at: destination.path)
+    }
     return hex(hasher.finalize())
 }
 
@@ -422,9 +436,10 @@ private func validateExtractedApp(_ app: URL, arguments: Arguments, extractionRo
 
 private struct SelfhostVersion: Comparable {
     let components: [Int]
+    let nightlyDate: Int?
 
     init(_ version: String) throws {
-        let pattern = #"^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)$"#
+        let pattern = #"^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)(?:-alpha\.nightly\.([0-9]{8}))?$"#
         let regex = try NSRegularExpression(pattern: pattern)
         let range = NSRange(version.startIndex..., in: version)
         guard let match = regex.firstMatch(in: version, range: range) else {
@@ -438,11 +453,44 @@ private struct SelfhostVersion: Comparable {
             }
             parsed.append(value)
         }
+        if match.range(at: 5).location != NSNotFound {
+            guard let capture = Range(match.range(at: 5), in: version),
+                  let date = Int(version[capture]) else {
+                try fail("unsupported selfhost version \(version)")
+            }
+            let year = date / 10_000
+            let month = (date / 100) % 100
+            let day = date % 100
+            let leap = year % 400 == 0 || (year % 4 == 0 && year % 100 != 0)
+            let days = [
+                0, 31, leap ? 29 : 28, 31, 30, 31, 30,
+                31, 31, 30, 31, 30, 31,
+            ]
+            guard year >= 1, month >= 1, month <= 12,
+                  day >= 1, day <= days[month] else {
+                try fail("unsupported selfhost version \(version)")
+            }
+            nightlyDate = date
+        } else {
+            nightlyDate = nil
+        }
         components = parsed
     }
 
     static func < (lhs: SelfhostVersion, rhs: SelfhostVersion) -> Bool {
-        lhs.components.lexicographicallyPrecedes(rhs.components)
+        if lhs.components != rhs.components {
+            return lhs.components.lexicographicallyPrecedes(rhs.components)
+        }
+        switch (lhs.nightlyDate, rhs.nightlyDate) {
+        case let (.some(left), .some(right)):
+            return left < right
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        case (.none, .none):
+            return false
+        }
     }
 }
 
@@ -552,6 +600,11 @@ private func execute(_ arguments: Arguments) throws {
     _ = try run("/usr/bin/ditto", ["-x", "-k", privateArchive.path, extractionRoot.path])
     let candidate = extractionRoot.appendingPathComponent("Logseq.app", isDirectory: true)
     try validateExtractedApp(candidate, arguments: arguments, extractionRoot: extractionRoot)
+    let quarantine = try quarantineValue(at: privateArchive.path)
+        ?? quarantineValue(at: arguments.target.path)
+    if let quarantine {
+        try setQuarantine(quarantine, at: candidate.path)
+    }
 
     if arguments.verifyOnly {
         print("[project-updater] VERIFIED \(installedVersion) -> \(arguments.version)")

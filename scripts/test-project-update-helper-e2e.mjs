@@ -74,6 +74,13 @@ const zipApp = (app, output) => {
   run("/usr/bin/ditto", ["-c", "-k", "--keepParent", app, output]);
 };
 
+const quarantineName = "com.apple.quarantine";
+const setQuarantine = (filePath, value) => {
+  run("/usr/bin/xattr", ["-w", quarantineName, value, filePath]);
+};
+const readQuarantine = (filePath) =>
+  run("/usr/bin/xattr", ["-p", quarantineName, filePath]).stdout.trim();
+
 const archiveFacts = (archive) => {
   const payload = fs.readFileSync(archive);
   return {
@@ -329,6 +336,92 @@ try {
     /does not contain signed architecture/,
   );
 
+  const nightlyEarlier = "2.0.1-selfhost.5-alpha.nightly.20260728";
+  const nightlyLater = "2.0.1-selfhost.5-alpha.nightly.20260729";
+  const nightlyTargetParent = path.join(temporaryRoot, "nightly-target");
+  const nightlyCandidateParent = path.join(temporaryRoot, "nightly-candidate");
+  fs.mkdirSync(nightlyTargetParent);
+  fs.mkdirSync(nightlyCandidateParent);
+  const nightlyTarget = createApp(nightlyTargetParent, nightlyEarlier, "installed-earlier-nightly");
+  const nightlyCandidate = createApp(
+    nightlyCandidateParent,
+    nightlyLater,
+    "candidate-later-nightly",
+  );
+  const nightlyArchive = path.join(temporaryRoot, "nightly-candidate.zip");
+  zipApp(nightlyCandidate, nightlyArchive);
+  expectPass(
+    "later nightly in the same revision verifies",
+    signedArguments({
+      archive: nightlyArchive,
+      candidateVersion: nightlyLater,
+      privateKey,
+      target: nightlyTarget,
+    }),
+    /VERIFIED .*20260728 -> .*20260729/,
+  );
+
+  const stableCandidateParent = path.join(temporaryRoot, "stable-candidate");
+  fs.mkdirSync(stableCandidateParent);
+  const stableCandidate = createApp(stableCandidateParent, "2.0.1-selfhost.5", "candidate-stable");
+  const stableArchive = path.join(temporaryRoot, "stable-candidate.zip");
+  zipApp(stableCandidate, stableArchive);
+  expectPass(
+    "stable release supersedes a nightly in the same revision",
+    signedArguments({
+      archive: stableArchive,
+      candidateVersion: "2.0.1-selfhost.5",
+      privateKey,
+      target: nightlyTarget,
+    }),
+    /VERIFIED .*20260728 -> 2\.0\.1-selfhost\.5/,
+  );
+
+  const stableTargetParent = path.join(temporaryRoot, "stable-target");
+  fs.mkdirSync(stableTargetParent);
+  const stableTarget = createApp(stableTargetParent, "2.0.1-selfhost.5", "installed-stable");
+  expectFail(
+    "nightly cannot replace stable in the same revision",
+    signedArguments({
+      archive: nightlyArchive,
+      candidateVersion: nightlyLater,
+      privateKey,
+      target: stableTarget,
+    }),
+    /refuses downgrade or same-version/,
+  );
+
+  const nextNightlyParent = path.join(temporaryRoot, "next-nightly");
+  fs.mkdirSync(nextNightlyParent);
+  const nextNightlyVersion = "2.0.1-selfhost.6-alpha.nightly.20260701";
+  const nextNightly = createApp(
+    nextNightlyParent,
+    nextNightlyVersion,
+    "candidate-next-revision-nightly",
+  );
+  const nextNightlyArchive = path.join(temporaryRoot, "next-nightly.zip");
+  zipApp(nextNightly, nextNightlyArchive);
+  expectPass(
+    "higher revision nightly supersedes lower stable revision",
+    signedArguments({
+      archive: nextNightlyArchive,
+      candidateVersion: nextNightlyVersion,
+      privateKey,
+      target: stableTarget,
+    }),
+    /VERIFIED 2\.0\.1-selfhost\.5 -> .*selfhost\.6-alpha\.nightly\.20260701/,
+  );
+  expectFail(
+    "invalid nightly calendar date fails closed",
+    signedArguments({
+      archive: nightlyArchive,
+      candidateVersion: "2.0.1-selfhost.5-alpha.nightly.20260229",
+      privateKey,
+      target,
+    }),
+    /unsupported selfhost version/,
+  );
+
   const downgradeParent = path.join(temporaryRoot, "downgrade");
   fs.mkdirSync(downgradeParent);
   const downgradeApp = createApp(
@@ -435,6 +528,38 @@ try {
     "[project-updater-test] PASS crash boundary keeps target present and old App recoverable",
   );
 
+  const fallbackTargetParent = path.join(temporaryRoot, "quarantine-fallback-target");
+  fs.mkdirSync(fallbackTargetParent);
+  const fallbackTarget = createApp(
+    fallbackTargetParent,
+    "2.0.1-selfhost.4",
+    "installed-quarantine-fallback",
+  );
+  const fallbackArchive = path.join(temporaryRoot, "candidate-without-quarantine.zip");
+  zipApp(candidate, fallbackArchive);
+  const installedQuarantine = "0081;fallback-installed-app;Logseq;";
+  setQuarantine(fallbackTarget, installedQuarantine);
+  expectPass(
+    "installed App quarantine is the fallback when download has none",
+    signedArguments({
+      archive: fallbackArchive,
+      candidateVersion: "2.0.1-selfhost.5",
+      privateKey,
+      target: fallbackTarget,
+      verifyOnly: false,
+    }),
+    /INSTALLED 2\.0\.1-selfhost\.4 -> 2\.0\.1-selfhost\.5/,
+  );
+  if (readQuarantine(fallbackTarget) !== installedQuarantine) {
+    throw new Error("replacement did not inherit the installed App quarantine");
+  }
+  passed += 1;
+  console.log("[project-updater-test] PASS installed App quarantine fallback survives replacement");
+
+  const targetQuarantine = "0081;older-installed-app;Logseq;";
+  const downloadQuarantine = "0083;downloaded-update;Logseq;";
+  setQuarantine(target, targetQuarantine);
+  setQuarantine(archive, downloadQuarantine);
   expectPass(
     "valid signed update atomically replaces the App",
     signedArguments({
@@ -456,9 +581,10 @@ try {
   );
   if (
     !installedInfo.includes("2.0.1-selfhost.5") ||
-    installedMarker !== "candidate-selfhost.5\n"
+    installedMarker !== "candidate-selfhost.5\n" ||
+    readQuarantine(target) !== downloadQuarantine
   ) {
-    throw new Error("replacement did not install the signed candidate");
+    throw new Error("replacement did not install the signed candidate with download quarantine");
   }
   passed += 1;
   console.log("[project-updater-test] PASS installed App identity and payload");

@@ -213,5 +213,4 @@
 
 (defn quit-and-install-new-version!
   []
-  (p/let [_ (ipc/invoke "set-quit-dirty-state" false)]
-    (ipc/ipc :quitAndInstall)))
+  (ipc/quit-and-install-new-version!))

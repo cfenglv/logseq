@@ -11,6 +11,11 @@ import {
   classifyShipItOutcome,
   UpdaterSignatureGateError,
 } from "./verify-macos-updater-signature.mjs";
+import {
+  compareSelfhostProjectVersions,
+  parseSelfhostProjectVersion,
+  projectUpdateKeyId,
+} from "../resources/project-updater-signature.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -22,17 +27,14 @@ const read = (relativePath) =>
 const workflow = read(".github/workflows/build-desktop-release.yml");
 const verifier = read("scripts/verify-macos-updater-signature.mjs");
 const electronUpdater = read("src/electron/electron/updater.cljs");
-const nativeHelper = read(
-  "resources/macos-project-updater/ProjectUpdater.swift",
-);
-const baseline = JSON.parse(
-  read("scripts/fixtures/macos-updater-baseline.json"),
-);
-const helperPath = path.join(
-  repoRoot,
-  "resources",
-  "selfhost-updater-version.mjs",
-);
+const electronCore = read("src/electron/electron/core.cljs");
+const rendererIpc = read("src/main/electron/ipc.cljs");
+const rendererHandler = read("src/main/frontend/handler.cljs");
+const header = read("src/main/frontend/components/header.cljs");
+const settings = read("src/main/frontend/components/settings.cljs");
+const nativeHelper = read("resources/macos-project-updater/ProjectUpdater.swift");
+const baseline = JSON.parse(read("scripts/fixtures/macos-updater-baseline.json"));
+const helperPath = path.join(repoRoot, "resources", "selfhost-updater-version.mjs");
 const runHelper = (...args) => {
   const result = spawnSync(process.execPath, [helperPath, ...args], {
     encoding: "utf8",
@@ -40,6 +42,28 @@ const runHelper = (...args) => {
   assert.equal(result.status, 0, result.stderr);
   return result.stdout.trim();
 };
+const runProjectUpdateScript = (script, version) =>
+  spawnSync(
+    process.execPath,
+    [
+      path.join(repoRoot, "scripts", script),
+      "--arch",
+      "arm64",
+      "--version",
+      version,
+      "--archive",
+      path.join(repoRoot, "does-not-exist.zip"),
+      "--metadata",
+      path.join(repoRoot, "does-not-exist.yml"),
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64: "",
+      },
+    },
+  );
 
 const cases = [
   [
@@ -111,6 +135,10 @@ const cases = [
       );
       assert.equal(runHelper("selfhost-revision", "2.0.1-selfhost.5"), "5");
       assert.equal(
+        runHelper("macos-metadata-name", "2.0.1-selfhost.5-alpha.nightly.20260729", "arm64"),
+        "selfhost-macos-v2-arm64-mac.yml",
+      );
+      assert.equal(
         workflow.match(
           /release-gate-source\/resources\/selfhost-updater-version\.mjs macos-metadata-name/g,
         )?.length,
@@ -119,28 +147,70 @@ const cases = [
     },
   ],
   [
+    "project updater version ordering supports strict dated nightlies",
+    () => {
+      const earlier = "2.0.1-selfhost.5-alpha.nightly.20260728";
+      const later = "2.0.1-selfhost.5-alpha.nightly.20260729";
+      const stable = "2.0.1-selfhost.5";
+      assert.ok(compareSelfhostProjectVersions(earlier, later) < 0);
+      assert.ok(compareSelfhostProjectVersions(later, stable) < 0);
+      assert.ok(
+        compareSelfhostProjectVersions(stable, "2.0.1-selfhost.6-alpha.nightly.20260701") < 0,
+      );
+      assert.equal(compareSelfhostProjectVersions(stable, stable), 0);
+      for (const invalid of [
+        "2.0.1-selfhost.5-alpha.nightly.20260229",
+        "2.0.1-selfhost.5-alpha.nightly.20261301",
+        "2.0.1-selfhost.5-alpha.nightly.2026072",
+        "2.0.1-selfhost.5-nightly.20260729",
+      ]) {
+        assert.throws(() => parseSelfhostProjectVersion(invalid), /unsupported selfhost version/);
+      }
+      assert.doesNotThrow(() =>
+        parseSelfhostProjectVersion("2.0.1-selfhost.5-alpha.nightly.20240229"),
+      );
+    },
+  ],
+  [
+    "production signer and verifier accept only valid nightly versions",
+    () => {
+      const valid = "2.0.1-selfhost.5-alpha.nightly.20260729";
+      const signer = runProjectUpdateScript("sign-macos-project-update.mjs", valid);
+      assert.notEqual(signer.status, 0);
+      assert.match(signer.stderr, /missing LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY/);
+      const verifier = runProjectUpdateScript("verify-project-signed-macos-update.mjs", valid);
+      assert.notEqual(verifier.status, 0);
+      assert.match(verifier.stderr, /ENOENT|no such file/i);
+
+      for (const script of [
+        "sign-macos-project-update.mjs",
+        "verify-project-signed-macos-update.mjs",
+      ]) {
+        const invalid = runProjectUpdateScript(script, "2.0.1-selfhost.5-alpha.nightly.20260229");
+        assert.notEqual(invalid.status, 0);
+        assert.match(invalid.stderr, /unsupported selfhost version/);
+      }
+    },
+  ],
+  [
+    "project updater key IDs retain the complete SHA-256 digest",
+    () => {
+      assert.match(projectUpdateKeyId(Buffer.alloc(32)), /^ed25519:[0-9a-f]{64}$/);
+      assert.throws(() => projectUpdateKeyId(Buffer.alloc(31)), /32 raw Ed25519 bytes/);
+      assert.doesNotMatch(read("scripts/build-project-update-helper.mjs"), /\.slice\(0,\s*16\)/);
+      assert.doesNotMatch(read("resources/verify-packaged-desktop.mjs"), /\.slice\(0,\s*16\)/);
+    },
+  ],
+  [
     ".5 remains manual and future releases route only through project signatures",
     () => {
-      assert.equal(
-        updaterSignatureGatePlan("2.0.1-selfhost.5").mode,
-        "manual-migration",
-      );
-      assert.deepEqual(
-        updaterSignatureGatePlan("2.0.1-selfhost.6"),
-        { mode: "project-signed" },
-      );
-      assert.equal(
-        workflow.match(/build-project-update-helper\.mjs/g)?.length,
-        2,
-      );
-      assert.equal(
-        workflow.match(/sign-macos-project-update\.mjs/g)?.length,
-        2,
-      );
-      assert.equal(
-        workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length,
-        2,
-      );
+      assert.equal(updaterSignatureGatePlan("2.0.1-selfhost.5").mode, "manual-migration");
+      assert.deepEqual(updaterSignatureGatePlan("2.0.1-selfhost.6"), {
+        mode: "project-signed",
+      });
+      assert.equal(workflow.match(/build-project-update-helper\.mjs/g)?.length, 2);
+      assert.equal(workflow.match(/sign-macos-project-update\.mjs/g)?.length, 2);
+      assert.equal(workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length, 2);
       const policy = read("scripts/run-macos-updater-signature-policy.mjs");
       assert.match(policy, /verifyProjectSignedMacosUpdate/);
       assert.doesNotMatch(policy, /requireDeveloperIdBaseline/);
@@ -160,6 +230,20 @@ const cases = [
     },
   ],
   [
+    "native replacement preserves quarantine before the atomic exchange",
+    () => {
+      assert.match(
+        nativeHelper,
+        /quarantineValue\(at: privateArchive\.path\)[\s\S]*\?\? quarantineValue\(at: arguments\.target\.path\)/,
+      );
+      assert.match(
+        nativeHelper,
+        /setQuarantine\(quarantine, at: candidate\.path\)[\s\S]*if arguments\.verifyOnly[\s\S]*atomicExchange/,
+      );
+      assert.doesNotMatch(nativeHelper, /removexattr|xattr -d|spctl --add/);
+    },
+  ],
+  [
     "Electron waits for native verify-only success before quitting to install",
     () => {
       assert.match(electronUpdater, /<verify-project-update!/);
@@ -172,6 +256,40 @@ const cases = [
         electronUpdater,
         /<launch-project-update![\s\S]*?\.once child "spawn"[\s\S]*?\.quit app/,
       );
+      assert.match(
+        electronUpdater,
+        /\.once child "spawn"[\s\S]*?set-quit-dirty-state! false[\s\S]*?\.quit app/,
+      );
+      assert.match(
+        electronUpdater,
+        /\.catch[\s\S]*?"\[updater\/install\]"[\s\S]*?emit-update! win "error"/,
+      );
+      assert.match(
+        electronCore,
+        /:set-quit-dirty-state! #\(vreset! \*quit-dirty\? %\)/,
+      );
+      assert.doesNotMatch(
+        rendererHandler,
+        /set-quit-dirty-state/,
+      );
+    },
+  ],
+  [
+    "both install buttons use one rejection-safe Promise handler",
+    () => {
+      assert.match(
+        rendererIpc,
+        /defn quit-and-install-new-version![\s\S]*?invoke "install-updates"[\s\S]*?p\/catch/,
+      );
+      assert.match(
+        header,
+        /:on-click #\(ipc\/quit-and-install-new-version!\)/,
+      );
+      assert.match(
+        settings,
+        /:on-click #\(ipc\/quit-and-install-new-version!\)/,
+      );
+      assert.doesNotMatch(settings, /ipc\/ipc :quitAndInstall/);
     },
   ],
   [

@@ -138,6 +138,7 @@ for (const relativePath of [
   "scripts/verify-desktop-release-assets.mjs",
   "scripts/run-rtc-e2e.mjs",
   "scripts/run-rtc-prepush.mjs",
+  "sidecar/embedding_server.py",
   "deps/db-sync/pnpm-lock.yaml",
   "deps/db-sync/pnpm-workspace.yaml",
   ".github/workflows/build-desktop-release.yml",
@@ -254,6 +255,38 @@ if (packagedVerificationSteps !== 6) {
   fail(
     `desktop release workflow must verify all six packaged desktops; found ${packagedVerificationSteps} verifier steps`,
   );
+}
+if (
+  workflow.match(/cp -R release-gate-source\/sidecar\/\. static\/sidecar\//g)?.length !== 2 ||
+  workflow.match(/--output static\/sidecar\/logseq-project-updater/g)?.length !== 2
+) {
+  fail("both macOS jobs must stage the complete sidecar before adding the project updater helper");
+}
+
+const desktopBuilder = readText("resources/electron-builder.yml");
+assertContains(desktopBuilder, "- from: sidecar\n    to: sidecar", "desktop sidecar packaging");
+assertNotContains(desktopBuilder, "- from: ../sidecar", "desktop sidecar packaging");
+const desktopRuntimePreparation = readText("scripts/prepare-desktop-runtime-js.mjs");
+for (const needle of ['"sidecar", "embedding_server.py"', '"static"', '"sidecar"']) {
+  assertContains(desktopRuntimePreparation, needle, "desktop sidecar staging");
+}
+const packagedDesktopVerifier = readText("resources/verify-packaged-desktop.mjs");
+for (const needle of [
+  "embedding_server.py",
+  "logseq-project-updater",
+  "project-updater-signature.mjs",
+  "project-signing-policy.json",
+]) {
+  assertContains(packagedDesktopVerifier, needle, "packaged desktop verifier");
+}
+const fullDesktopPreflight = readText("scripts/run-desktop-release-preflight.mjs");
+for (const needle of [
+  "--test-only",
+  "--public-key-base64",
+  '"sidecar",',
+  '"logseq-project-updater"',
+]) {
+  assertContains(fullDesktopPreflight, needle, "full desktop preflight");
 }
 
 for (const forbidden of [

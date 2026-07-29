@@ -40,6 +40,10 @@ const copyPairs = [
     from: path.join(skillSourceDir, "SKILL.md"),
     to: path.join(stagedSkillDir, "SKILL.md"),
   },
+  {
+    from: path.join(repoRoot, "sidecar", "embedding_server.py"),
+    to: path.join(staticDir, "sidecar", "embedding_server.py"),
+  },
 ];
 
 async function exists(filePath) {

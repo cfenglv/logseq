@@ -768,10 +768,11 @@ jobs:
 
       - name: Build project-signed updater helper for x64
         run: |
-          mkdir -p sidecar
+          mkdir -p static/sidecar
+          cp -R release-gate-source/sidecar/. static/sidecar/
           node release-gate-source/scripts/build-project-update-helper.mjs \
             --arch x64 \
-            --output sidecar/logseq-project-updater
+            --output static/sidecar/logseq-project-updater
 
       # - name: Cache Node Modules
       #   uses: actions/cache@v4
@@ -917,10 +918,11 @@ jobs:
 
       - name: Build project-signed updater helper for arm64
         run: |
-          mkdir -p sidecar
+          mkdir -p static/sidecar
+          cp -R release-gate-source/sidecar/. static/sidecar/
           node release-gate-source/scripts/build-project-update-helper.mjs \
             --arch arm64 \
-            --output sidecar/logseq-project-updater
+            --output static/sidecar/logseq-project-updater
 
       # - name: Cache Node Modules
       #   uses: actions/cache@v4

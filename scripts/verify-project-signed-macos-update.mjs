@@ -10,6 +10,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadProjectSigningPolicy,
+  parseSelfhostProjectVersion,
   projectUpdatePayload,
 } from "../resources/project-updater-signature.mjs";
 
@@ -45,6 +46,7 @@ export const verifyProjectSignedMacosUpdate = ({
   if (!["arm64", "x64"].includes(arch)) {
     throw new Error("unsupported architecture");
   }
+  parseSelfhostProjectVersion(version);
   const yaml = fs.readFileSync(metadata, "utf8");
   const field = (name) => {
     const value = yaml

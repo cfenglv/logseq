@@ -2,11 +2,14 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const asar = require("@electron/asar");
+const stagedResourcesDir = path.dirname(fileURLToPath(import.meta.url));
 
 const parseArgs = (argv) => {
   if (argv[0] === "--") argv = argv.slice(1);
@@ -83,12 +86,42 @@ const keytar = path.join(
   "keytar.node",
 );
 const appUpdateConfig = path.join(resourcesDir, "app-update.yml");
+const embeddingServer = path.join(resourcesDir, "sidecar", "embedding_server.py");
 
 for (const filePath of [mainExecutable, keytar, appUpdateConfig]) {
   if (!fs.existsSync(filePath)) {
     throw new Error(`missing packaged native runtime: ${filePath}`);
   }
 }
+
+const assertRegularFile = (filePath, label) => {
+  let stats;
+  try {
+    stats = fs.lstatSync(filePath);
+  } catch {
+    throw new Error(`missing packaged ${label}: ${filePath}`);
+  }
+  if (stats.isSymbolicLink() || !stats.isFile()) {
+    throw new Error(`packaged ${label} is not a regular file: ${filePath}`);
+  }
+  return stats;
+};
+
+const assertMatchesStagedResource = (packagedPath, stagedPath, label) => {
+  assertRegularFile(packagedPath, label);
+  assertRegularFile(stagedPath, `staged ${label}`);
+  if (!fs.readFileSync(packagedPath).equals(fs.readFileSync(stagedPath))) {
+    throw new Error(
+      `packaged ${label} does not match the staged release resource: ${packagedPath}`,
+    );
+  }
+};
+
+assertMatchesStagedResource(
+  embeddingServer,
+  path.join(stagedResourcesDir, "sidecar", "embedding_server.py"),
+  "embedding sidecar",
+);
 
 const appUpdateText = fs.readFileSync(appUpdateConfig, "utf8");
 for (const [label, pattern] of [
@@ -152,9 +185,55 @@ for (const filePath of [mainExecutable, keytar]) {
   }
 }
 
-const packageJson = JSON.parse(
-  asar.extractFile(appAsar, "package.json").toString(),
-);
+if (expectedPlatform === "darwin") {
+  const helper = path.join(resourcesDir, "sidecar", "logseq-project-updater");
+  const helperStats = assertRegularFile(helper, "project updater helper");
+  if ((helperStats.mode & 0o111) === 0) {
+    throw new Error(`packaged project updater helper is not executable: ${helper}`);
+  }
+  const helperArchitecture = detectArchitecture(helper);
+  if (helperArchitecture.platform !== "darwin" || helperArchitecture.arch !== expectedArch) {
+    throw new Error(
+      `${helper} is ${helperArchitecture.platform}/${helperArchitecture.arch}, expected darwin/${expectedArch}`,
+    );
+  }
+
+  const projectSignatureRuntime = path.join(resourcesDir, "project-updater-signature.mjs");
+  const projectSigningPolicy = path.join(resourcesDir, "updater", "project-signing-policy.json");
+  assertMatchesStagedResource(
+    projectSignatureRuntime,
+    path.join(stagedResourcesDir, "project-updater-signature.mjs"),
+    "project updater signature runtime",
+  );
+  assertMatchesStagedResource(
+    projectSigningPolicy,
+    path.join(stagedResourcesDir, "updater", "project-signing-policy.json"),
+    "project updater signing policy",
+  );
+
+  const policy = JSON.parse(fs.readFileSync(projectSigningPolicy, "utf8"));
+  const rawPublicKey = Buffer.from(policy.publicKeyBase64 || "", "base64");
+  const configuredKey =
+    rawPublicKey.length === 32 && rawPublicKey.toString("base64") === policy.publicKeyBase64;
+  const configuredKeyId = configuredKey
+    ? `ed25519:${createHash("sha256").update(rawPublicKey).digest("hex")}`
+    : undefined;
+  const explicitlyUnconfigured =
+    policy.publicKeyBase64 === "UNCONFIGURED" && policy.keyId === "UNCONFIGURED";
+  if (
+    policy.algorithm !== "ed25519-sha512-manifest-v1" ||
+    policy.bundleIdentifier !== "com.logseq.logseq" ||
+    policy.payloadDomain !== "logseq-selfhost-macos-update-v1" ||
+    policy.minimumBootstrapRevision !== 5 ||
+    (!explicitlyUnconfigured && configuredKeyId !== policy.keyId)
+  ) {
+    throw new Error(
+      `packaged project updater signing policy is malformed: ${projectSigningPolicy}`,
+    );
+  }
+}
+
+const packageJson = JSON.parse(asar.extractFile(appAsar, "package.json").toString());
 if (packageJson.version !== expectedVersion) {
   throw new Error(
     `packaged app version ${packageJson.version} does not match ${expectedVersion}`,

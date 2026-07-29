@@ -16,6 +16,7 @@
 (def *downloaded-update (atom nil))
 (def *project-update (atom nil))
 (def *project-signature-module (atom nil))
+(def *set-quit-dirty-state! (atom nil))
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
 
@@ -164,6 +165,8 @@
 
         error-handler
         (fn [error]
+          (when-let [set-quit-dirty-state! @*set-quit-dirty-state!]
+            (set-quit-dirty-state! true))
           (logger/warn "[updater/error]" error)
           (emit-update! win "error" (normalize-error error))
           (emit-completed! win))]
@@ -257,14 +260,29 @@
        (.once child "error" reject)
        (.once child "spawn"
               (fn []
-                (.unref child)
-                (resolve true)
-                (.quit app)))))))
+                (try
+                  (.unref child)
+                  (if-let [set-quit-dirty-state! @*set-quit-dirty-state!]
+                    (set-quit-dirty-state! false)
+                    (throw (js/Error. "updater quit-state callback is unavailable")))
+                  (.quit app)
+                  (resolve true)
+                  (catch :default error
+                    (when-let [set-quit-dirty-state! @*set-quit-dirty-state!]
+                      (set-quit-dirty-state! true))
+                    (reject error)))))))))
 
-(defn install-downloaded-update!
+(defn- <install-downloaded-update!
   []
   (if-not (project-signed-macos-updater?)
-    (.quitAndInstall autoUpdater false true)
+    (if-let [set-quit-dirty-state! @*set-quit-dirty-state!]
+      (try
+        (set-quit-dirty-state! false)
+        (.quitAndInstall autoUpdater false true)
+        (catch :default error
+          (set-quit-dirty-state! true)
+          (throw error)))
+      (throw (js/Error. "updater quit-state callback is unavailable")))
     (if-let [{:keys [archive arch sha512 signature size version]} @*project-update]
       (let [helper (node-path/join (.-resourcesPath js/process)
                                    "sidecar"
@@ -292,9 +310,24 @@
               (.then #(<launch-project-update! helper arguments)))))
       (throw (js/Error. "no verified project-signed update is downloaded")))))
 
+(defn install-downloaded-update!
+  []
+  (-> (js/Promise.resolve)
+      (.then (fn [] (<install-downloaded-update!)))
+      (.catch
+       (fn [error]
+         (when-let [set-quit-dirty-state! @*set-quit-dirty-state!]
+           (set-quit-dirty-state! true))
+         (logger/warn "[updater/install]" error)
+         (when-let [win @*win]
+           (emit-update! win "error" (normalize-error error))
+           (emit-completed! win))
+         (throw error)))))
+
 (defn init-updater
-  [{:keys [^js win] :as _opts}]
+  [{:keys [^js win set-quit-dirty-state!] :as _opts}]
   (configure-auto-updater!)
+  (reset! *set-quit-dirty-state! set-quit-dirty-state!)
   (let [dispose-listeners! (register-auto-updater-listeners! win)
         check-channel "check-for-updates"
         install-channel "install-updates"
@@ -319,4 +352,5 @@
        (.removeHandler ipcMain check-channel)
        (.removeHandler ipcMain get-downloaded-channel)
        (reset! *update-pending nil)
-       (reset! *project-update nil))))
+       (reset! *project-update nil)
+       (reset! *set-quit-dirty-state! nil))))

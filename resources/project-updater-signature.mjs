@@ -13,11 +13,12 @@ export const projectUpdatePayload = ({ arch, sha512, size, version }) =>
     `zip-sha512=${sha512}`,
     "",
   ].join("\n");
-export const projectUpdateKeyId = (rawPublicKey) =>
-  `ed25519:${createHash("sha256")
-    .update(rawPublicKey)
-    .digest("hex")
-    .slice(0, 16)}`;
+export const projectUpdateKeyId = (rawPublicKey) => {
+  if (!rawPublicKey || rawPublicKey.length !== 32) {
+    throw new Error("project update public key must be 32 raw Ed25519 bytes");
+  }
+  return `ed25519:${createHash("sha256").update(rawPublicKey).digest("hex")}`;
+};
 
 const policyPath = new URL(
   "./updater/project-signing-policy.json",
@@ -27,7 +28,7 @@ const policyPath = new URL(
 export const loadProjectSigningPolicy = () => {
   const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
   const publicKey = Buffer.from(policy.publicKeyBase64, "base64");
-  const derivedKeyId = projectUpdateKeyId(publicKey);
+  const derivedKeyId = publicKey.length === 32 ? projectUpdateKeyId(publicKey) : undefined;
   if (
     policy.algorithm !== projectUpdateAlgorithm ||
     policy.bundleIdentifier !== projectUpdateBundleIdentifier ||
@@ -44,20 +45,46 @@ export const loadProjectSigningPolicy = () => {
   return Object.freeze({ ...policy });
 };
 
-const parseSelfhostVersion = (version) => {
-  const match =
-    /^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)$/.exec(
-      version || "",
-    );
-  if (!match) throw new Error(`unsupported selfhost version ${version}`);
-  return match.slice(1).map(Number);
+const validNightlyDate = (value) => {
+  if (value === undefined) return true;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(4, 6));
+  const day = Number(value.slice(6, 8));
+  const leap = year % 400 === 0 || (year % 4 === 0 && year % 100 !== 0);
+  const days = [0, 31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= days[month];
 };
 
-const compareVersions = (left, right) => {
-  for (let index = 0; index < left.length; index += 1) {
-    if (left[index] !== right[index]) return left[index] - right[index];
+export const parseSelfhostProjectVersion = (version) => {
+  const match =
+    /^([0-9]+)\.([0-9]+)\.([0-9]+)-selfhost\.([1-9][0-9]*)(?:-alpha\.nightly\.([0-9]{8}))?$/.exec(
+      version || "",
+    );
+  if (!match || !validNightlyDate(match[5])) {
+    throw new Error(`unsupported selfhost version ${version}`);
   }
-  return 0;
+  const components = match.slice(1, 5).map(Number);
+  if (!components.every(Number.isSafeInteger)) {
+    throw new Error(`unsupported selfhost version ${version}`);
+  }
+  return Object.freeze({
+    components,
+    nightlyDate: match[5] === undefined ? undefined : Number(match[5]),
+  });
+};
+
+export const compareSelfhostProjectVersions = (leftVersion, rightVersion) => {
+  const left = parseSelfhostProjectVersion(leftVersion);
+  const right = parseSelfhostProjectVersion(rightVersion);
+  for (let index = 0; index < left.components.length; index += 1) {
+    if (left.components[index] !== right.components[index]) {
+      return left.components[index] - right.components[index];
+    }
+  }
+  if (left.nightlyDate === right.nightlyDate) return 0;
+  if (left.nightlyDate === undefined) return 1;
+  if (right.nightlyDate === undefined) return -1;
+  return left.nightlyDate - right.nightlyDate;
 };
 
 export const projectSignedMacosUpdater = (
@@ -65,8 +92,8 @@ export const projectSignedMacosUpdater = (
   platform = process.platform,
 ) => {
   if (platform !== "darwin") return false;
-  const parsed = parseSelfhostVersion(version);
-  return parsed[3] >= 5;
+  const parsed = parseSelfhostProjectVersion(version);
+  return parsed.components[3] >= 5;
 };
 
 export const validateProjectUpdateSignature = ({
@@ -82,12 +109,7 @@ export const validateProjectUpdateSignature = ({
   }
   const policy = loadProjectSigningPolicy();
   const candidateVersion = updateInfo?.version;
-  if (
-    compareVersions(
-      parseSelfhostVersion(candidateVersion),
-      parseSelfhostVersion(currentVersion),
-    ) <= 0
-  ) {
+  if (compareSelfhostProjectVersions(candidateVersion, currentVersion) <= 0) {
     throw new Error("project updater refuses downgrade or same-version update");
   }
   const signature = updateInfo?.projectUpdateSignature;
