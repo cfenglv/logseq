@@ -753,15 +753,53 @@ const makeNativeHelperApp = ({
   return destination;
 };
 
+const sevenZipExecutable = () => {
+  const candidates = [
+    process.env.LOGSEQ_7ZIP,
+    "7zz",
+    "7z",
+    "7za",
+  ].filter(Boolean);
+  const executable = candidates.find((candidate) => {
+    const probe = spawnSync(candidate, ["i"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return !probe.error && probe.status === 0;
+  });
+  assert.ok(executable, "electron-builder-compatible 7-Zip is unavailable");
+  return executable;
+};
+
 const archiveApp = ({ app, archive }) => {
-  command("ditto", [
-    "-c",
-    "-k",
-    "--sequesterRsrc",
-    "--keepParent",
-    app,
-    archive,
-  ]);
+  command(
+    sevenZipExecutable(),
+    [
+      "a",
+      "-bd",
+      "-bb0",
+      "-tzip",
+      "-mtc=off",
+      "-mta=off",
+      "-mtm=off",
+      archive,
+      path.basename(app),
+    ],
+    { cwd: path.dirname(app) },
+  );
+  const entries = command("zipinfo", ["-1", archive]).output
+    .split("\n")
+    .filter(Boolean);
+  assert.ok(entries.length > 0);
+  assert.equal(
+    entries.every(
+      (entry) =>
+        entry === "Logseq.app" || entry.startsWith("Logseq.app/"),
+    ),
+    true,
+    `legal update ZIP contains an App-external entry:\n${entries.join("\n")}`,
+  );
+  assert.equal(entries.some((entry) => entry.startsWith("__MACOSX/")), false);
   return archive;
 };
 
@@ -837,8 +875,21 @@ const makeSignedNativeUpdate = ({
     `Logseq-darwin-${arch}-${version}.zip`,
   );
   archiveApp({ app, archive: artifactPath });
+  const probeRoot = path.join(root, "archive-layout-probe");
+  command(sevenZipExecutable(), [
+    "x",
+    "-bd",
+    "-bb0",
+    `-o${probeRoot}`,
+    artifactPath,
+  ]);
+  const archivedQuarantine = quarantineValue(
+    path.join(probeRoot, "Logseq.app"),
+  );
+  fs.rmSync(probeRoot, { recursive: true, force: true });
   return {
     app,
+    archivedQuarantine,
     ...signedNativeArchive({
       arch,
       artifactPath,
@@ -893,6 +944,31 @@ const makeTraversalArchive = ({ archive, sentinel }) => {
     Buffer.concat([local, name, payload, central, name, end]),
   );
   assert.equal(command("zipinfo", ["-1", archive]).output, name.toString());
+};
+
+const addMacosxSidecarEntry = ({ archive, root }) => {
+  const sidecarRoot = path.join(root, "finder-sidecar");
+  const macosx = path.join(sidecarRoot, "__MACOSX");
+  fs.mkdirSync(macosx, { recursive: true });
+  fs.writeFileSync(path.join(macosx, "._Logseq"), "Finder metadata sidecar");
+  command(
+    sevenZipExecutable(),
+    [
+      "a",
+      "-bd",
+      "-bb0",
+      "-tzip",
+      "-mtc=off",
+      "-mta=off",
+      "-mtm=off",
+      archive,
+      "__MACOSX",
+    ],
+    { cwd: sidecarRoot },
+  );
+  const entries = command("zipinfo", ["-1", archive]).output.split("\n");
+  assert.ok(entries.some((entry) => entry.startsWith("__MACOSX/")));
+  fs.rmSync(sidecarRoot, { recursive: true, force: true });
 };
 
 const nativeInstallArgs = ({
@@ -1220,6 +1296,27 @@ const runNativeHelperContract = async () => {
       postcondition: () => assert.equal(fs.existsSync(escaped), false),
     });
 
+    const sidecarRoot = path.join(tempRoot, "finder-sidecar-entry");
+    const sidecarBase = makeFixture({ root: sidecarRoot });
+    addMacosxSidecarEntry({
+      archive: sidecarBase.artifactPath,
+      root: sidecarRoot,
+    });
+    expectNoDamage({
+      fixture: {
+        ...sidecarBase,
+        ...signedNativeArchive({
+          arch: helperArch,
+          artifactPath: sidecarBase.artifactPath,
+          bundleId,
+          payloadDomain,
+          privateKeyPem,
+          version: "2.0.1-selfhost.6",
+        }),
+      },
+      label: "validly signed App-external __MACOSX entry",
+    });
+
     const symlinkDestination = path.join(tempRoot, "outside-symlink-target");
     fs.writeFileSync(symlinkDestination, "must not be reachable");
     expectNoDamage({
@@ -1308,7 +1405,7 @@ const runNativeHelperContract = async () => {
     );
     assert.equal(
       quarantineValue(successTarget.targetApp),
-      "0081;5f000000;Logseq project update;test-origin",
+      base.archivedQuarantine,
       "successful replacement changed candidate quarantine metadata",
     );
     assert.deepEqual(fs.readdirSync(successTarget.parent), ["Logseq.app"]);
