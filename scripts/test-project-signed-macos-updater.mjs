@@ -5,6 +5,7 @@ import {
   createHash,
   createPublicKey,
   generateKeyPairSync,
+  sign as cryptoSign,
 } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -12,6 +13,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { updaterSignatureGatePlan } from "./run-macos-updater-signature-policy.mjs";
+import {
+  macosUpdaterChannel,
+  resolveSelfhostUpdaterVersions,
+} from "../resources/selfhost-updater-version.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -185,9 +190,24 @@ const loadPolicy = () => {
     /ed[-_ ]?25519/i,
     "policy does not declare Ed25519 signing",
   );
+  const bundleId =
+    policy.bundleId ??
+    policy.bundleIdentifier ??
+    policy.applicationId ??
+    policy.payload?.bundleId;
+  assert.match(
+    bundleId,
+    /^[a-z0-9]+(?:[.-][a-z0-9]+)+$/i,
+    "policy does not declare the signed bundle identifier",
+  );
   const serialized = JSON.stringify(policy);
   if (/\bUNCONFIGURED\b/i.test(serialized)) {
-    return { configured: false, policy };
+    return {
+      bundleId,
+      configured: false,
+      payloadDomain,
+      policy,
+    };
   }
 
   let publicKeyRaw;
@@ -259,6 +279,8 @@ const loadPolicy = () => {
   return {
     configured: true,
     derivedKeyId,
+    bundleId,
+    payloadDomain,
     policy,
     publicKeyPath,
     publicKeyRaw,
@@ -300,16 +322,6 @@ const signingVariableNames = (workflow) => {
   return [...new Set([...secretNames, ...environmentNames])];
 };
 
-const signingEnvironment = (workflow, privateKeyPem) =>
-  Object.fromEntries(
-    signingVariableNames(workflow).map((name) => [
-      name,
-      /BASE64/i.test(name)
-        ? Buffer.from(privateKeyPem).toString("base64")
-        : privateKeyPem,
-    ]),
-  );
-
 const discoverHelperBuildPath = () => {
   const candidates = fs
     .readdirSync(path.join(repoRoot, "scripts"), { withFileTypes: true })
@@ -334,27 +346,24 @@ const scriptCommand = (script, args) =>
     ? [process.execPath, [script, ...args]]
     : [script, args];
 
-const makeManifest = ({
-  artifact,
-  arch = "arm64",
-  applicationId = "com.logseq.logseq",
-  artifactName,
-  channel = `selfhost-macos-v2-${arch}`,
-  platform = "darwin",
-  version = "2.0.1-selfhost.6",
-} = {}) => ({
-  schema: "logseq-selfhost-update/v1",
-  applicationId,
-  channel,
-  version,
-  platform,
+const canonicalNativePayload = ({
   arch,
-  artifact: {
-    name: artifactName ?? `Logseq-darwin-${arch}-${version}.zip`,
-    size: artifact.length,
-    sha512: createHash("sha512").update(artifact).digest("base64"),
-  },
-});
+  bundleId,
+  payloadDomain,
+  sha512,
+  size,
+  version,
+}) =>
+  [
+    payloadDomain,
+    `bundle-id=${bundleId}`,
+    `version=${version}`,
+    `arch=${arch}`,
+    `zip-size=${size}`,
+    `zip-sha512=${sha512}`,
+    "",
+    "",
+  ].join("\n");
 
 const electronFixture = () => {
   const candidates = [
@@ -780,53 +789,44 @@ const treeDigest = (root) => {
   return sha256(JSON.stringify(entries));
 };
 
-const signManifestFixture = ({
+const signedNativeArchive = ({
+  arch,
   artifactPath,
-  manifest,
+  bundleId,
+  payloadDomain,
   privateKeyPem,
-  root,
+  version,
 }) => {
-  const workflow = fs.readFileSync(workflowPath, "utf8");
-  const signerPath = discoverSignerPath(workflow);
-  const manifestPath = path.join(root, "manifest.json");
-  const signaturePath = path.join(root, "manifest.sig");
-  fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  const result = command(
-    process.execPath,
-    [
-      signerPath,
-      "--manifest",
-      manifestPath,
-      "--artifact",
-      artifactPath,
-      "--signature-out",
-      signaturePath,
-    ],
-    {
-      allowFailure: true,
-      env: {
-        ...process.env,
-        ...signingEnvironment(workflow, privateKeyPem),
-      },
-    },
+  const artifact = fs.readFileSync(artifactPath);
+  const size = artifact.length;
+  const sha512 = createHash("sha512").update(artifact).digest("base64");
+  const payload = canonicalNativePayload({
+    arch,
+    bundleId,
+    payloadDomain,
+    sha512,
+    size,
+    version,
+  });
+  const signature = cryptoSign(null, Buffer.from(payload), privateKeyPem).toString(
+    "base64",
   );
-  assert.equal(result.status, 0, result.output);
-  assert.equal(fs.existsSync(signaturePath), true);
-  return { manifestPath, signaturePath };
+  return { arch, artifactPath, sha512, signature, size, version };
 };
 
 const makeSignedNativeUpdate = ({
-  applicationId = "com.logseq.logseq",
+  applicationId,
   arch = "arm64",
-  channel,
+  bundleId,
   escapeSymlink,
+  payloadDomain,
   privateKeyPem,
   root,
   version = "2.0.1-selfhost.6",
 }) => {
   fs.mkdirSync(root, { recursive: true });
   const app = makeNativeHelperApp({
-    applicationId,
+    applicationId: applicationId ?? bundleId,
     destination: path.join(root, "payload", "Logseq.app"),
     escapeSymlink,
     marker: version,
@@ -838,24 +838,15 @@ const makeSignedNativeUpdate = ({
     `Logseq-darwin-${arch}-${version}.zip`,
   );
   archiveApp({ app, archive: artifactPath });
-  const artifact = fs.readFileSync(artifactPath);
-  const manifest = makeManifest({
-    applicationId,
-    arch,
-    artifact,
-    artifactName: path.basename(artifactPath),
-    channel,
-    version,
-  });
   return {
     app,
-    artifactPath,
-    manifest,
-    ...signManifestFixture({
+    ...signedNativeArchive({
+      arch,
       artifactPath,
-      manifest,
+      bundleId,
+      payloadDomain,
       privateKeyPem,
-      root,
+      version,
     }),
   };
 };
@@ -893,34 +884,41 @@ const makeTraversalArchive = ({ archive, sentinel }) => {
 };
 
 const nativeInstallArgs = ({
+  arch,
   artifactPath,
-  manifestPath,
-  signaturePath,
+  relaunch = false,
+  sha512,
+  signature,
+  size,
   targetApp,
+  verifyOnly = false,
+  version,
 }) => [
-  "--artifact",
+  "--archive",
   artifactPath,
-  "--manifest",
-  manifestPath,
-  "--signature",
-  signaturePath,
-  "--target-app",
+  "--target",
   targetApp,
-  "--expected-current-version",
-  "2.0.1-selfhost.5",
-  "--expected-bundle-id",
-  "com.logseq.logseq",
-  "--expected-platform",
-  "darwin",
-  "--expected-arch",
-  "arm64",
-  "--expected-channel",
-  "selfhost-macos-v2-arm64",
+  "--arch",
+  arch,
+  "--version",
+  version,
+  "--sha512",
+  sha512,
+  "--size",
+  String(size),
+  "--parent-pid",
+  "2147483647",
+  "--relaunch",
+  String(relaunch),
+  "--signature",
+  signature,
+  ...(verifyOnly ? ["--verify-only"] : []),
 ];
 
-const makeOldTarget = (root) => {
+const makeOldTarget = (root, bundleId = "com.logseq.logseq") => {
   const parent = path.join(root, "installed");
   const targetApp = makeNativeHelperApp({
+    applicationId: bundleId,
     destination: path.join(parent, "Logseq.app"),
     marker: "2.0.1-selfhost.5",
     quarantine: "0081;4f000000;Logseq legacy install;test-origin",
@@ -944,6 +942,7 @@ const runNativeHelperContract = async () => {
     /--helper\b/,
     "local/CI runner does not expose its explicit test-helper override",
   );
+  const { bundleId, payloadDomain } = loadPolicy();
   const helperBuildPath = discoverHelperBuildPath();
   const [helpExecutable, helpArgs] = scriptCommand(helperBuildPath, ["--help"]);
   const help = command(helpExecutable, helpArgs, { allowFailure: true });
@@ -1041,13 +1040,20 @@ const runNativeHelperContract = async () => {
       "helper build did not produce a native Mach-O executable",
     );
 
+    const makeFixture = (options) =>
+      makeSignedNativeUpdate({
+        arch: helperArch,
+        bundleId,
+        payloadDomain,
+        privateKeyPem,
+        ...options,
+      });
     const invokeNative = (fixture, options = {}) =>
       command(
         helperPath,
         nativeInstallArgs({
-          artifactPath: fixture.artifactPath,
-          manifestPath: fixture.manifestPath,
-          signaturePath: fixture.signaturePath,
+          ...fixture,
+          ...(options.fields ?? {}),
           targetApp: options.targetApp,
         }),
         {
@@ -1061,14 +1067,18 @@ const runNativeHelperContract = async () => {
       label,
       mutateTargetParent,
       postcondition,
+      invocationFields,
     }) => {
       const caseRoot = path.join(tempRoot, `reject-${label.replaceAll(" ", "-")}`);
-      const { parent, targetApp } = makeOldTarget(caseRoot);
+      const { parent, targetApp } = makeOldTarget(caseRoot, bundleId);
       const before = treeDigest(targetApp);
       const oldQuarantine = quarantineValue(targetApp);
       try {
         mutateTargetParent?.(parent);
-        const result = invokeNative(fixture, { targetApp });
+        const result = invokeNative(fixture, {
+          fields: invocationFields,
+          targetApp,
+        });
         assert.notEqual(result.status, 0, `${label} was accepted`);
         assert.equal(fs.existsSync(targetApp), true, `${label} removed old App`);
         assert.equal(treeDigest(targetApp), before, `${label} changed old App`);
@@ -1089,51 +1099,42 @@ const runNativeHelperContract = async () => {
       console.log(`[project-updater] PASS native rejection: ${label}`);
     };
 
-    const base = makeSignedNativeUpdate({
-      privateKeyPem,
+    const base = makeFixture({
       root: path.join(tempRoot, "valid-base"),
     });
 
-    const wrongKey = makeSignedNativeUpdate({
+    const wrongKey = makeFixture({
       privateKeyPem: wrongPrivateKeyPem,
       root: path.join(tempRoot, "wrong-key"),
     });
     expectNoDamage({ fixture: wrongKey, label: "wrong signing key" });
 
-    const tampered = makeSignedNativeUpdate({
-      privateKeyPem,
+    const tampered = makeFixture({
       root: path.join(tempRoot, "tampered"),
     });
     fs.appendFileSync(tampered.artifactPath, "tampered after signing");
     expectNoDamage({ fixture: tampered, label: "tampered zip bytes" });
 
-    for (const [label, mutate] of [
-      ["signed bundle-id substitution", (manifest) => {
-        manifest.applicationId = "com.attacker.logseq";
-      }],
-      ["signed version substitution", (manifest) => {
-        manifest.version = "2.0.1-selfhost.7";
-      }],
-      ["signed architecture substitution", (manifest) => {
-        manifest.arch = "x64";
-      }],
-      ["signed zip-size substitution", (manifest) => {
-        manifest.artifact.size += 1;
-      }],
-      ["signed zip-hash substitution", (manifest) => {
-        manifest.artifact.sha512 = Buffer.alloc(64, 7).toString("base64");
-      }],
+    expectNoDamage({
+      fixture: makeFixture({
+        applicationId: "com.attacker.logseq",
+        root: path.join(tempRoot, "bundle-id-substitution"),
+      }),
+      label: "validly signed bundle-id substitution",
+    });
+    for (const [label, invocationFields] of [
+      ["signed version substitution", { version: "2.0.1-selfhost.7" }],
+      [
+        "signed architecture substitution",
+        { arch: helperArch === "arm64" ? "x64" : "arm64" },
+      ],
+      ["signed zip-size substitution", { size: base.size + 1 }],
+      [
+        "signed zip-hash substitution",
+        { sha512: Buffer.alloc(64, 7).toString("base64") },
+      ],
     ]) {
-      const changed = path.join(tempRoot, label.replaceAll(" ", "-"));
-      fs.mkdirSync(changed);
-      const manifest = structuredClone(base.manifest);
-      mutate(manifest);
-      const manifestPath = path.join(changed, "manifest.json");
-      fs.writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`);
-      expectNoDamage({
-        fixture: { ...base, manifestPath },
-        label,
-      });
+      expectNoDamage({ fixture: base, invocationFields, label });
     }
 
     for (const [label, version] of [
@@ -1141,8 +1142,7 @@ const runNativeHelperContract = async () => {
       ["signed downgrade", "2.0.1-selfhost.4"],
     ]) {
       expectNoDamage({
-        fixture: makeSignedNativeUpdate({
-          privateKeyPem,
+        fixture: makeFixture({
           root: path.join(tempRoot, label.replaceAll(" ", "-")),
           version,
         }),
@@ -1151,20 +1151,11 @@ const runNativeHelperContract = async () => {
     }
 
     expectNoDamage({
-      fixture: makeSignedNativeUpdate({
-        arch: "x64",
-        privateKeyPem,
+      fixture: makeFixture({
+        arch: helperArch === "arm64" ? "x64" : "arm64",
         root: path.join(tempRoot, "wrong-architecture"),
       }),
       label: "validly signed wrong architecture",
-    });
-    expectNoDamage({
-      fixture: makeSignedNativeUpdate({
-        channel: "selfhost-macos-v2-x64",
-        privateKeyPem,
-        root: path.join(tempRoot, "wrong-channel"),
-      }),
-      label: "validly signed wrong channel",
     });
 
     const sentinel = `logseq-update-traversal-${process.pid}-${Date.now()}`;
@@ -1172,20 +1163,14 @@ const runNativeHelperContract = async () => {
     fs.mkdirSync(traversalRoot);
     const traversalArchive = path.join(traversalRoot, "traversal.zip");
     makeTraversalArchive({ archive: traversalArchive, sentinel });
-    const traversalBytes = fs.readFileSync(traversalArchive);
-    const traversalManifest = makeManifest({
-      artifact: traversalBytes,
-      artifactName: path.basename(traversalArchive),
-    });
-    const traversalFixture = {
+    const traversalFixture = signedNativeArchive({
+      arch: helperArch,
       artifactPath: traversalArchive,
-      ...signManifestFixture({
-        artifactPath: traversalArchive,
-        manifest: traversalManifest,
-        privateKeyPem,
-        root: traversalRoot,
-      }),
-    };
+      bundleId,
+      payloadDomain,
+      privateKeyPem,
+      version: "2.0.1-selfhost.6",
+    });
     const escaped = path.join("/private/tmp", sentinel);
     expectNoDamage({
       fixture: traversalFixture,
@@ -1196,9 +1181,8 @@ const runNativeHelperContract = async () => {
     const symlinkDestination = path.join(tempRoot, "outside-symlink-target");
     fs.writeFileSync(symlinkDestination, "must not be reachable");
     expectNoDamage({
-      fixture: makeSignedNativeUpdate({
+      fixture: makeFixture({
         escapeSymlink: symlinkDestination,
-        privateKeyPem,
         root: path.join(tempRoot, "escaping-symlink"),
       }),
       label: "signed escaping symlink",
@@ -1216,7 +1200,7 @@ const runNativeHelperContract = async () => {
     });
 
     const rollbackRoot = path.join(tempRoot, "mid-install-failure");
-    const rollbackTarget = makeOldTarget(rollbackRoot);
+    const rollbackTarget = makeOldTarget(rollbackRoot, bundleId);
     const rollbackBefore = treeDigest(rollbackTarget.targetApp);
     const rollback = invokeNative(base, {
       env: {
@@ -1230,7 +1214,7 @@ const runNativeHelperContract = async () => {
     console.log("[project-updater] PASS native rollback after mid-install failure");
 
     const successRoot = path.join(tempRoot, "success");
-    const successTarget = makeOldTarget(successRoot);
+    const successTarget = makeOldTarget(successRoot, bundleId);
     const observedStates = new Set();
     const statePath = path.join(
       successTarget.targetApp,
@@ -1254,9 +1238,7 @@ const runNativeHelperContract = async () => {
         "--helper",
         helperPath,
         ...nativeInstallArgs({
-          artifactPath: base.artifactPath,
-          manifestPath: base.manifestPath,
-          signaturePath: base.signaturePath,
+          ...base,
           targetApp: successTarget.targetApp,
         }),
       ],
@@ -1326,6 +1308,15 @@ addCase(cases, ".4 legacy feed remains pinned and .5 remains manual", () => {
     /developer[\s_-]*id|notari[sz]|signed[\s_-]*baseline/i,
     ".6+ updater policy still depends on the obsolete Developer ID baseline",
   );
+  const stable = resolveSelfhostUpdaterVersions("2.0.1-selfhost.6");
+  assert.equal(stable.currentVersion, "2.0.1-selfhost.6");
+  assert.equal(stable.isNightlyRehearsal, false);
+  for (const arch of ["arm64", "x64"]) {
+    assert.equal(
+      macosUpdaterChannel(stable.currentVersion, arch),
+      `selfhost-macos-v2-${arch}`,
+    );
+  }
   for (const [arch, digest] of Object.entries(legacyDigests)) {
     assert.equal(
       fileSha256(
@@ -1368,24 +1359,42 @@ addCase(cases, "release signing is fail-closed on an external private key", () =
     path.join(os.tmpdir(), "logseq-project-signer-no-key-"),
   );
   try {
-    const artifact = path.join(tempRoot, "update.zip");
-    const manifest = path.join(tempRoot, "manifest.json");
-    const signature = path.join(tempRoot, "manifest.sig");
-    fs.writeFileSync(artifact, "release artifact");
+    const archive = path.join(tempRoot, "update.zip");
+    const metadata = path.join(tempRoot, "latest.yml");
+    const signatureOutput = path.join(tempRoot, "signature.txt");
+    fs.writeFileSync(archive, "release artifact");
+    const archiveBytes = fs.readFileSync(archive);
+    const archiveSha512 = createHash("sha512")
+      .update(archiveBytes)
+      .digest("base64");
     fs.writeFileSync(
-      manifest,
-      JSON.stringify(makeManifest({ artifact: fs.readFileSync(artifact) })),
+      metadata,
+      [
+        "version: 2.0.1-selfhost.6",
+        "files:",
+        "  - url: update.zip",
+        `    sha512: ${archiveSha512}`,
+        `    size: ${archiveBytes.length}`,
+        "path: update.zip",
+        `sha512: ${archiveSha512}`,
+        "",
+      ].join("\n"),
     );
+    const metadataBefore = fs.readFileSync(metadata, "utf8");
     const missingKey = command(
       process.execPath,
       [
         signerPath,
-        "--manifest",
-        manifest,
-        "--artifact",
-        artifact,
-        "--signature-out",
-        signature,
+        "--arch",
+        "arm64",
+        "--version",
+        "2.0.1-selfhost.6",
+        "--archive",
+        archive,
+        "--metadata",
+        metadata,
+        "--signature-output",
+        signatureOutput,
       ],
       {
         allowFailure: true,
@@ -1401,9 +1410,14 @@ addCase(cases, "release signing is fail-closed on an external private key", () =
       "release signer accepted a missing private key",
     );
     assert.equal(
-      fs.existsSync(signature),
+      fs.existsSync(signatureOutput),
       false,
       "release signer emitted a signature without the private key",
+    );
+    assert.equal(
+      fs.readFileSync(metadata, "utf8"),
+      metadataBefore,
+      "release signer modified updater metadata without the private key",
     );
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
