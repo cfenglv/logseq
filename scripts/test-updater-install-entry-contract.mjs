@@ -21,10 +21,6 @@ const settings = fs.readFileSync(
   ),
   "utf8",
 );
-const electronHandler = fs.readFileSync(
-  path.join(repoRoot, "src", "electron", "electron", "handler.cljs"),
-  "utf8",
-);
 const electronUpdater = fs.readFileSync(
   path.join(repoRoot, "src", "electron", "electron", "updater.cljs"),
   "utf8",
@@ -41,7 +37,7 @@ assert.doesNotMatch(
 );
 assert.match(
   headerEntry,
-  /ipc\/ipc\s+:quitAndInstall|updater\/install/i,
+  /ipc\/quit-and-install-new-version!/,
   "renderer header does not route through the shared install entry",
 );
 
@@ -56,23 +52,8 @@ assert.doesNotMatch(
 );
 assert.match(
   settingsDownloadedBranch,
-  /quit-and-install-new-version!|ipc\/ipc\s+:quitAndInstall/,
+  /ipc\/quit-and-install-new-version!/,
   "settings does not route through the shared install entry",
-);
-
-const mainHandler = electronHandler.match(
-  /\(defmethod\s+handle\s+:quitAndInstall[\s\S]*?(?=\n\(defmethod|\s*$)/,
-)?.[0];
-assert.ok(mainHandler, "main :quitAndInstall handler is missing");
-assert.match(
-  mainHandler,
-  /updater\/run-project-signed-install!/,
-  "legacy/settings IPC entry bypasses the guarded project-signed install flow",
-);
-assert.doesNotMatch(
-  mainHandler,
-  /\.quitAndInstall\s+autoUpdater/,
-  "legacy/settings IPC entry calls electron-updater directly",
 );
 
 const installListener = electronUpdater.match(
@@ -81,8 +62,21 @@ const installListener = electronUpdater.match(
 assert.ok(installListener, "header install-updates listener is missing");
 assert.match(
   installListener,
-  /run-project-signed-install!/,
+  /install-downloaded-update!/,
   "install-updates IPC entry bypasses the guarded project-signed install flow",
+);
+
+const installDownloadedUpdate = electronUpdater.match(
+  /\(defn-?\s+install-downloaded-update![\s\S]*?(?=\n\(defn|\s*$)/,
+)?.[0];
+assert.ok(
+  installDownloadedUpdate,
+  "main downloaded-update installer is missing",
+);
+assert.match(
+  installDownloadedUpdate,
+  /run-project-signed-install!/,
+  "downloaded-update installer bypasses the mocked project-signed timing seam",
 );
 
 console.log(

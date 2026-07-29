@@ -151,6 +151,11 @@ const inlinePublicKey = (policy) => {
 };
 
 const loadPolicy = () => {
+  if (!fs.existsSync(policyPath)) {
+    throw new ReleaseBlock(
+      "production Ed25519 signing policy is missing; release is blocked",
+    );
+  }
   const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
   const payloadDomain = [
     policy.schema,
@@ -1543,11 +1548,13 @@ const runNativeHelperContract = async () => {
       signerSecrets.length > 0,
       "workflow does not expose the release signer private-key environment",
     );
-    const privateKeyPemBase64 = Buffer.from(privateKeyPem).toString("base64");
+    const privateKeyPkcs8Base64 = signingKeys.privateKey
+      .export({ format: "der", type: "pkcs8" })
+      .toString("base64");
     const signerEnv = {
       ...process.env,
       ...Object.fromEntries(
-        signerSecrets.map((name) => [name, privateKeyPemBase64]),
+        signerSecrets.map((name) => [name, privateKeyPkcs8Base64]),
       ),
     };
     const signWithReleaseCli = (fixture, label) => {

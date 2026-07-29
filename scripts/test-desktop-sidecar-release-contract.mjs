@@ -20,6 +20,11 @@ const verifierPath = path.join(
   "resources",
   "verify-packaged-desktop.mjs",
 );
+const runtimePreparationPath = path.join(
+  repoRoot,
+  "scripts",
+  "prepare-desktop-runtime-js.mjs",
+);
 const preflightPath = path.join(
   repoRoot,
   "scripts",
@@ -229,6 +234,23 @@ const createPackagedFixture = ({ arch, platform, root }) => {
   return layout;
 };
 
+const createStagedVerifier = (root) => {
+  const staticRoot = path.join(root, "staged-static");
+  fs.mkdirSync(staticRoot, { recursive: true });
+  fs.copyFileSync(verifierPath, path.join(staticRoot, "verify-packaged-desktop.mjs"));
+  fs.writeFileSync(
+    path.join(staticRoot, "package.json"),
+    JSON.stringify({
+      devDependencies: { electron: electronVersion },
+      type: "module",
+    }),
+  );
+  return {
+    staticRoot,
+    verifierPath: path.join(staticRoot, "verify-packaged-desktop.mjs"),
+  };
+};
+
 const removeAll = (root, relativePaths) => {
   for (const relativePath of relativePaths) {
     fs.rmSync(path.join(root, relativePath), {
@@ -244,11 +266,17 @@ const overwritePolicies = (resourcesDir, policy) => {
   }
 };
 
-const verifierInvocation = ({ arch, asarNodePath, platform, searchRoot }) =>
+const verifierInvocation = ({
+  arch,
+  asarNodePath,
+  platform,
+  searchRoot,
+  verifierPath: stagedVerifierPath,
+}) =>
   run(
     process.execPath,
     [
-      verifierPath,
+      stagedVerifierPath,
       "--search-root",
       searchRoot,
       "--platform",
@@ -270,6 +298,7 @@ const withPackagedFixture = ({ arch, platform }, callback) => {
   try {
     const asarNodePath = createAsarShim(path.join(root, "asar-shim"));
     const layout = createPackagedFixture({ arch, platform, root });
+    const stagedVerifier = createStagedVerifier(root);
     return callback({
       arch,
       asarNodePath,
@@ -277,6 +306,7 @@ const withPackagedFixture = ({ arch, platform }, callback) => {
       platform,
       root,
       searchRoot: path.join(root, "dist"),
+      ...stagedVerifier,
     });
   } finally {
     fs.rmSync(root, { force: true, recursive: true });
@@ -303,26 +333,22 @@ const workflowJob = (workflow, jobName) => {
   return match[1];
 };
 
-test("resource preparation stages the repository sidecar inside static", () => {
-  const gulpfile = fs.readFileSync(path.join(repoRoot, "gulpfile.js"), "utf8");
+test("desktop runtime preparation stages the repository sidecar inside static", () => {
+  const runtimePreparation = fs.readFileSync(runtimePreparationPath, "utf8");
   assert.match(
-    gulpfile,
-    /(?:__dirname|repoRoot)[\s\S]{0,120}sidecar/,
-    "resource preparation does not declare the repository sidecar source",
+    runtimePreparation,
+    /(?:path\.(?:join|resolve)\([^)]*["']sidecar["'][^)]*\)|new URL\(\s*["'](?:\.\.\/)?sidecar\/?["'])/,
+    "desktop runtime preparation does not declare the repository sidecar source",
   );
   assert.match(
-    gulpfile,
-    /(?:outputPath|static)[\s\S]{0,120}sidecar/,
-    "resource preparation does not stage the sidecar under static/sidecar",
+    runtimePreparation,
+    /(?:path\.(?:join|resolve)\(\s*(?:staticDir|staticRoot|outputDir)\s*,[^)]*["']sidecar["'][^)]*\)|path\.(?:join|resolve)\([^)]*["']static["'][^)]*["']sidecar["'][^)]*\)|new URL\(\s*["'](?:\.\.\/)?static\/sidecar\/?["']|["']static\/sidecar\/?["'])/,
+    "desktop runtime preparation does not stage into static/sidecar",
   );
-  const buildDefinition = gulpfile.match(
-    /exports\.build\s*=\s*gulp\.series\(([\s\S]*?)\)\s*(?:\n|$)/,
-  )?.[1];
-  assert.ok(buildDefinition, "gulp build pipeline is missing");
   assert.match(
-    buildDefinition,
-    /sidecar/i,
-    "gulp build does not include the sidecar staging operation",
+    runtimePreparation,
+    /(?:\bcp(?:Sync)?\s*\(|\bcopy(?:File|Directory|Dir)(?:Sync)?\s*\()/,
+    "desktop runtime preparation does not copy the repository sidecar into static",
   );
 
   const builder = fs.readFileSync(
@@ -339,6 +365,19 @@ test("resource preparation stages the repository sidecar inside static", () => {
     /from:\s*\.\.\/sidecar\b/,
     "electron-builder still depends on a job-root sidecar absent from the compile artifact",
   );
+
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const compileJob = workflowJob(workflow, "compile-cljs");
+  assert.match(
+    compileJob,
+    /desktop:prepare-runtime-js/,
+    "compile artifact job does not run desktop runtime preparation",
+  );
+  assert.match(
+    compileJob,
+    /test\s+-f\s+(?:\.\/)?static\/sidecar\/embedding_server\.py/,
+    "compile artifact job does not prove static/sidecar/embedding_server.py was staged",
+  );
 });
 
 test("macOS x64 and arm64 jobs append the helper to static/sidecar", () => {
@@ -350,7 +389,7 @@ test("macOS x64 and arm64 jobs append the helper to static/sidecar", () => {
     const job = workflowJob(workflow, jobName);
     assert.match(
       job,
-      /static\/sidecar\/embedding_server\.py/,
+      /test\s+-f\s+["']?[^"'\n]*static\/sidecar\/embedding_server\.py["']?/,
       `${jobName} does not prove the downloaded compile artifact retained embedding_server.py`,
     );
     assert.match(
@@ -372,6 +411,11 @@ test("macOS x64 and arm64 jobs append the helper to static/sidecar", () => {
       job,
       /rm\s+-rf\s+(?:\.\/)?static\/sidecar\b/,
       `${jobName} deletes the compile artifact sidecar before adding the helper`,
+    );
+    assert.doesNotMatch(
+      job,
+      /(?:cp|ditto|rsync)[^\n]*(?:release-gate-source|checkout)[^\n]*sidecar|(?:cp|ditto|rsync)[^\n]*sidecar[^\n]*(?:release-gate-source|checkout)/i,
+      `${jobName} masks a missing compile artifact by copying sidecar from its checkout`,
     );
   }
 });
