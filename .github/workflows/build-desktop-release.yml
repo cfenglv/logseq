@@ -756,6 +756,12 @@ jobs:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
 
+      - name: Require Developer ID for published macOS releases
+        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build-target != 'non-release')) && env.HAS_APPLE_SIGNING != 'true' }}
+        run: |
+          echo "::error title=Missing Developer ID::Published macOS releases must be Developer ID signed and notarized. Ad-hoc builds are rehearsal artifacts only."
+          exit 1
+
       # - name: Cache Node Modules
       #   uses: actions/cache@v4
       #   with:
@@ -809,7 +815,8 @@ jobs:
           mv static/dist/*.dmg           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.dmg
           mv static/dist/*.zip           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.zip
           mv static/dist/*.blockmap      ./builds/
-          mv static/dist/latest-mac.yml  ./builds/latest-x64-mac.yml
+          metadata_name="$(node static/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" x64)"
+          mv static/dist/latest-mac.yml  "./builds/${metadata_name}"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -877,6 +884,12 @@ jobs:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
 
+      - name: Require Developer ID for published macOS releases
+        if: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.build-target != 'non-release')) && env.HAS_APPLE_SIGNING != 'true' }}
+        run: |
+          echo "::error title=Missing Developer ID::Published macOS releases must be Developer ID signed and notarized. Ad-hoc builds are rehearsal artifacts only."
+          exit 1
+
       # - name: Cache Node Modules
       #   uses: actions/cache@v4
       #   with:
@@ -941,7 +954,8 @@ jobs:
           mv static/dist/*.dmg           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.dmg
           mv static/dist/*.zip           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.zip
           mv static/dist/*.blockmap      ./builds/
-          mv static/dist/latest-mac.yml  ./builds/latest-arm64-mac.yml
+          metadata_name="$(node static/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" arm64)"
+          mv static/dist/latest-mac.yml  "./builds/${metadata_name}"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4

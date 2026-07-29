@@ -3,6 +3,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { macosUpdaterMetadataName } from "../resources/selfhost-updater-version.mjs";
 
 const parseArgs = (argv) => {
   const result = {};
@@ -53,11 +54,11 @@ const desktopArtifactNames = [
   `Logseq-win-x64-${version}-nsis.exe`,
   `Logseq-win-x64-${version}-nsis.exe.blockmap`,
   `Logseq-win-x64-${version}.zip`,
-  "latest-arm64-mac.yml",
+  macosUpdaterMetadataName(version, "arm64"),
   "latest-arm64.yml",
   "latest-linux-arm64.yml",
   "latest-linux.yml",
-  "latest-x64-mac.yml",
+  macosUpdaterMetadataName(version, "x64"),
   "latest-x64.yml",
   "VERSION",
 ];
@@ -70,7 +71,7 @@ const artifactNames = [
 ].sort();
 
 const releaseFilePattern =
-  /^(?:Logseq-(?:darwin|linux|win)-|latest(?:-|\.yml)|VERSION$)|\.apk$/;
+  /^(?:Logseq-(?:darwin|linux|win)-|latest(?:-|\.yml)|selfhost-macos-v2-(?:arm64|x64)-mac\.yml$|VERSION$)|\.apk$/;
 const actualArtifactNames = fs
   .readdirSync(releaseDir)
   .filter((name) => releaseFilePattern.test(name))

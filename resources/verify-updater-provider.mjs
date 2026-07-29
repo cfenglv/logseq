@@ -4,7 +4,11 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { resolveSelfhostUpdaterVersions } from "./selfhost-updater-version.mjs";
+import {
+  macosUpdaterChannel,
+  macosUpdaterMetadataName,
+  resolveSelfhostUpdaterVersions,
+} from "./selfhost-updater-version.mjs";
 
 const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(path.join(packageRoot, "package.json"));
@@ -34,7 +38,9 @@ const feed = `<?xml version="1.0" encoding="UTF-8"?>
 </feed>`;
 
 const metadataName = (platform, arch) => {
-  if (platform === "darwin") return `latest-${arch}-mac.yml`;
+  if (platform === "darwin") {
+    return macosUpdaterMetadataName(currentVersion, arch);
+  }
   if (platform === "win32") return `latest-${arch}.yml`;
   if (platform === "linux") {
     return arch === "x64" ? "latest-linux.yml" : `latest-linux-${arch}.yml`;
@@ -53,9 +59,11 @@ const releaseAssetName = (platform, arch) => {
 };
 
 const channel = (platform, arch) =>
-  platform === "darwin" || platform === "win32"
-    ? `latest-${arch}`
-    : null;
+  platform === "darwin"
+    ? macosUpdaterChannel(currentVersion, arch)
+    : platform === "win32"
+      ? `latest-${arch}`
+      : null;
 
 const makeProvider = ({ platform, arch, allowPrerelease }) => {
   const expectedMetadata = metadataName(platform, arch);

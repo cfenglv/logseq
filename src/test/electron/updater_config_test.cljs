@@ -9,29 +9,51 @@
   (is (not (updater-config/selfhost-version? nil))))
 
 (deftest updater-channel-test
-  (testing "Windows and macOS use architecture-specific metadata"
+  (testing "Windows keeps architecture-specific legacy metadata"
     (is (= "latest-x64"
-           (updater-config/updater-channel "win32" "x64")))
+           (updater-config/updater-channel
+            "2.0.1-selfhost.5" "win32" "x64")))
     (is (= "latest-arm64"
-           (updater-config/updater-channel "win32" "arm64")))
+           (updater-config/updater-channel
+            "2.0.1-selfhost.5" "win32" "arm64"))))
+  (testing "macOS selfhost.4 remains on its frozen legacy channel"
     (is (= "latest-x64"
-           (updater-config/updater-channel "darwin" "x64")))
+           (updater-config/updater-channel
+            "2.0.1-selfhost.4" "darwin" "x64")))
     (is (= "latest-arm64"
-           (updater-config/updater-channel "darwin" "arm64"))))
+           (updater-config/updater-channel
+            "2.0.1-selfhost.4" "darwin" "arm64"))))
+  (testing "macOS selfhost.5 starts a signed update channel"
+    (is (= "selfhost-macos-v2-x64"
+           (updater-config/updater-channel
+            "2.0.1-selfhost.5" "darwin" "x64")))
+    (is (= "selfhost-macos-v2-arm64"
+           (updater-config/updater-channel
+            "2.0.1-selfhost.5-alpha.nightly.20260729"
+            "darwin"
+            "arm64"))))
+  (testing "upstream macOS versions keep their existing channels"
+    (is (= "latest-arm64"
+           (updater-config/updater-channel
+            "2.0.1-alpha.1" "darwin" "arm64"))))
   (testing "Linux lets electron-updater select its native platform metadata"
-    (is (nil? (updater-config/updater-channel "linux" "x64")))
-    (is (nil? (updater-config/updater-channel "linux" "arm64"))))
+    (is (nil? (updater-config/updater-channel
+               "2.0.1-selfhost.5" "linux" "x64")))
+    (is (nil? (updater-config/updater-channel
+               "2.0.1-selfhost.5" "linux" "arm64"))))
   (testing "unsupported architectures do not reuse another architecture"
-    (is (nil? (updater-config/updater-channel "darwin" "ia32")))
-    (is (nil? (updater-config/updater-channel "win32" "ia32")))))
+    (is (nil? (updater-config/updater-channel
+               "2.0.1-selfhost.5" "darwin" "ia32")))
+    (is (nil? (updater-config/updater-channel
+               "2.0.1-selfhost.5" "win32" "ia32")))))
 
 (deftest updater-options-test
-  (testing "selfhost versions use the latest production GitHub release"
-    (is (= {:channel "latest-arm64"
+  (testing "selfhost versions use the signed macOS production channel"
+    (is (= {:channel "selfhost-macos-v2-arm64"
             :allow-prerelease? false
             :allow-downgrade? false}
            (updater-config/updater-options
-            "2.0.1-selfhost.4"
+            "2.0.1-selfhost.5"
             "darwin"
             "arm64"))))
   (testing "upstream prerelease behavior remains owned by electron-updater"

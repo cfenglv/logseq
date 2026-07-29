@@ -13,7 +13,7 @@ Compared with upstream Logseq, this fork adds or fixes:
 - Strict checksum and transaction-cursor validation, bounded-memory retry during continuous editing, and local database restoration if snapshot activation fails.
 - Hardened graph access, member revocation, WebSocket error handling, payload limits, and Node server lifecycle cleanup.
 - GitHub Actions builds for macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64.
-- In-application update discovery for production selfhost releases starting with `2.0.1-selfhost.4`, with architecture-specific metadata and a six-target provider rehearsal.
+- In-application update discovery with architecture-specific metadata and a six-target provider rehearsal. Because the published `2.0.1-selfhost.4` macOS app was ad-hoc signed, macOS requires a one-time manual install of `2.0.1-selfhost.5`; later signed/notarized macOS builds use a separate update channel.
 - Electron 42.4.1, including upstream Safe Storage initialization fixes that reduce unnecessary macOS Keychain prompts.
 
 To configure a client, open **Settings → Advanced → Sync Server URL**, enter the Worker base URL (for example, `https://team-logseq-sync.example.workers.dev`), and save it. Do not append `/health`, `/sync/%s`, or another path. Every collaborator must use the same server URL.

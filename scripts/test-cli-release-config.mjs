@@ -5,7 +5,11 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveSelfhostUpdaterVersions } from "../resources/selfhost-updater-version.mjs";
+import {
+  macosUpdaterChannel,
+  macosUpdaterMetadataName,
+  resolveSelfhostUpdaterVersions,
+} from "../resources/selfhost-updater-version.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -49,6 +53,26 @@ for (const invalidVersion of [
     `invalid updater rehearsal version should be rejected: ${invalidVersion}`,
   );
 }
+assert.equal(
+  macosUpdaterChannel("2.0.1-selfhost.4", "arm64"),
+  "latest-arm64",
+  "published selfhost.4 clients must remain on the frozen legacy channel",
+);
+assert.equal(
+  macosUpdaterChannel("2.0.1-selfhost.5", "arm64"),
+  "selfhost-macos-v2-arm64",
+  "manual migration clients should use the new signed macOS channel",
+);
+assert.equal(
+  macosUpdaterMetadataName("2.0.1-selfhost.5", "x64"),
+  "selfhost-macos-v2-x64-mac.yml",
+  "published metadata should match the signed macOS channel",
+);
+assert.throws(
+  () => macosUpdaterChannel("2.0.1-selfhost.5", "ia32"),
+  /unsupported macOS updater architecture/,
+  "macOS metadata generation should reject unsupported architectures",
+);
 
 const assertContains = (text, needle, label) => {
   assert.ok(text.includes(needle), `${label} should contain ${needle}`);
@@ -539,6 +563,25 @@ assert.match(
   /xcrun stapler validate/,
   "desktop release workflow should verify stapled notarization tickets",
 );
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /Require Developer ID for published macOS releases/g,
+  )?.length,
+  2,
+  "both macOS builders should reject published ad-hoc candidates",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Published macOS releases must be Developer ID signed and notarized/,
+  "the macOS release gate should explain the required trust boundary",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /selfhost-updater-version\.mjs macos-metadata-name/g,
+  )?.length,
+  2,
+  "both macOS builders should publish metadata on the versioned channel",
+);
 assert.match(
   desktopReleaseWorkflow,
   /build-macos-arm64:[\s\S]*?Check out macOS updater signature gate[\s\S]*?persist-credentials: false[\s\S]*?Verify macOS updater installation compatibility[\s\S]*?verify-macos-updater-signature\.mjs[\s\S]*?--arch arm64[\s\S]*?--candidate-metadata static\/dist\/latest-mac\.yml[\s\S]*?--candidate-zip/,
@@ -657,6 +700,11 @@ assert.match(
   updaterProviderVerifier,
   /across six platform\/architecture contracts/,
   "the updater rehearsal should cover all six desktop targets",
+);
+assert.match(
+  desktopReleaseAssetVerifier,
+  /macosUpdaterMetadataName/,
+  "release asset verification should require the versioned macOS metadata names",
 );
 for (const needle of [
   'path.join(resourcesDir, "app-update.yml")',
