@@ -437,7 +437,8 @@ const injectionIndex = trace.findIndex(
   (event) => event.command === "contract-inject-xattrs",
 );
 const strictVerifyIndex = trace.findIndex(
-  (event) =>
+  (event, index) =>
+    index > deepSignIndex &&
     event.command === "codesign" &&
     event.args.includes("--verify") &&
     event.args.includes("--deep") &&
