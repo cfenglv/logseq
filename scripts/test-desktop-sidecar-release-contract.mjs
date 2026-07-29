@@ -161,13 +161,16 @@ const createAsarShim = (root) => {
   return path.join(root, "node_modules");
 };
 
-const signingPolicy = () => {
-  const publicKey = Buffer.alloc(32, 0x2a);
+const signingPolicy = ({
+  keyId,
+  publicKey = Buffer.alloc(32, 0x2a),
+} = {}) => {
+  const digest = createHash("sha256").update(publicKey).digest("hex");
   return JSON.stringify(
     {
       algorithm: "Ed25519",
       bundleId: "com.logseq.logseq",
-      keyId: createHash("sha256").update(publicKey).digest("hex"),
+      keyId: keyId ?? `ed25519:${digest}`,
       payloadDomain: "logseq-selfhost-project-update-signature-v1",
       publicKeyBase64: publicKey.toString("base64"),
       schema: "logseq-selfhost-project-update-signature-v1",
@@ -232,6 +235,12 @@ const removeAll = (root, relativePaths) => {
       force: true,
       recursive: true,
     });
+  }
+};
+
+const overwritePolicies = (resourcesDir, policy) => {
+  for (const relativePath of policyRelativePaths) {
+    fs.writeFileSync(path.join(resourcesDir, relativePath), policy);
   }
 };
 
@@ -469,6 +478,52 @@ test("darwin verifier rejects missing project signing policy", () =>
     (fixture) => {
       removeAll(fixture.layout.resourcesDir, policyRelativePaths);
       expectVerifierFailure(fixture, "darwin missing project signing policy");
+    },
+  ));
+
+for (const [label, keyId] of [
+  ["16-hex truncated keyId", `ed25519:${"a".repeat(16)}`],
+  ["32-hex truncated keyId", `ed25519:${"a".repeat(32)}`],
+  ["wrong full keyId", `ed25519:${"b".repeat(64)}`],
+]) {
+  test(`darwin verifier rejects ${label}`, () =>
+    withPackagedFixture(
+      {
+        arch: process.arch === "arm64" ? "x64" : "arm64",
+        platform: "darwin",
+      },
+      (fixture) => {
+        overwritePolicies(
+          fixture.layout.resourcesDir,
+          signingPolicy({ keyId }),
+        );
+        expectVerifierFailure(fixture, `darwin ${label}`);
+      },
+    ));
+}
+
+test("darwin verifier rejects an unrelated key claiming the accepted short prefix", () =>
+  withPackagedFixture(
+    {
+      arch: process.arch === "arm64" ? "x64" : "arm64",
+      platform: "darwin",
+    },
+    (fixture) => {
+      const acceptedPublicKey = Buffer.alloc(32, 0x2a);
+      const acceptedDigest = createHash("sha256")
+        .update(acceptedPublicKey)
+        .digest("hex");
+      overwritePolicies(
+        fixture.layout.resourcesDir,
+        signingPolicy({
+          keyId: `ed25519:${acceptedDigest.slice(0, 16)}`,
+          publicKey: Buffer.alloc(32, 0x7e),
+        }),
+      );
+      expectVerifierFailure(
+        fixture,
+        "darwin unrelated key with claimed short prefix",
+      );
     },
   ));
 

@@ -6,6 +6,7 @@ import {
   createPublicKey,
   generateKeyPairSync,
   sign as cryptoSign,
+  verify as cryptoVerify,
 } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -130,19 +131,6 @@ const strictBase64 = (value, label) => {
   return decoded;
 };
 
-const normalizeKeyId = (value) => {
-  assert.equal(typeof value, "string", "project public keyId is missing");
-  const payload = value.replace(/^(?:sha256|ed25519)(?::|-)/i, "");
-  if (/^[a-f0-9]{32,64}$/i.test(payload) && payload.length % 2 === 0) {
-    return payload.toLowerCase();
-  }
-  if (/^[A-Za-z0-9+/_-]+={0,2}$/.test(payload)) {
-    const digest = Buffer.from(payload, /[-_]/.test(payload) ? "base64url" : "base64");
-    if (digest.length === 32) return digest.toString("hex");
-  }
-  assert.fail("project keyId is not a sufficiently strong SHA-256 identifier");
-};
-
 const inlinePublicKey = (policy) => {
   const direct = [
     policy.publicKeyBase64,
@@ -252,9 +240,9 @@ const loadPolicy = () => {
     policy.ed25519PublicKeyId;
   if (inline || declaredKeyId !== undefined) {
     assert.equal(
-      derivedKeyId.startsWith(normalizeKeyId(declaredKeyId)),
-      true,
-      "project keyId does not match the configured public key",
+      declaredKeyId,
+      `ed25519:${derivedKeyId}`,
+      "project keyId must be ed25519: followed by the complete lowercase SHA-256 of the raw public key",
     );
   } else {
     assert.ok(
@@ -308,6 +296,17 @@ const discoverSignerPath = (workflow) => {
       .join(", ") || "none"}`,
   );
   return referenced[0];
+};
+
+const workflowJobSource = (workflow, jobName) => {
+  const match = workflow.match(
+    new RegExp(
+      `^  ${jobName}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:\\n|(?![\\s\\S]))`,
+      "m",
+    ),
+  );
+  assert.ok(match, `workflow job ${jobName} is missing`);
+  return match[1];
 };
 
 const signingVariableNames = (workflow) => {
@@ -1170,15 +1169,16 @@ const makeOldTarget = (
   bundleId = "com.logseq.logseq",
   arch = process.arch === "arm64" ? "arm64" : "x64",
   quarantine = "0081;4f000000;Logseq legacy install;test-origin",
+  version = "2.0.1-selfhost.5",
 ) => {
   const parent = path.join(root, "installed");
   const targetApp = makeNativeHelperApp({
     applicationId: bundleId,
     arch,
     destination: path.join(parent, "Logseq.app"),
-    marker: "2.0.1-selfhost.5",
+    marker: version,
     quarantine,
-    version: "2.0.1-selfhost.5",
+    version,
   });
   return { parent, targetApp };
 };
@@ -1233,6 +1233,13 @@ const runNativeHelperContract = async () => {
       signingKeys.publicKey.export({ format: "jwk" }).x,
       "base64url",
     ).toString("base64");
+    const wrongPublicKeyRawBase64 = Buffer.from(
+      wrongKeys.publicKey.export({ format: "jwk" }).x,
+      "base64url",
+    ).toString("base64");
+    const fullKeyId = `ed25519:${sha256(
+      Buffer.from(publicKeyRawBase64, "base64"),
+    )}`;
     const privateKeyPem = signingKeys.privateKey.export({
       format: "pem",
       type: "pkcs8",
@@ -1266,6 +1273,11 @@ const runNativeHelperContract = async () => {
     );
     assert.equal(build.status, 0, build.output);
     assert.equal(fs.existsSync(helperPath), true);
+    assert.match(
+      build.output,
+      new RegExp(fullKeyId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      "native helper builder does not report the complete derived keyId",
+    );
     if (splitTestOnlyKeyFlags) {
       const unsafeHelperPath = path.join(tempRoot, "unsafe-key-override-helper");
       const [unsafeExecutable, unsafeArgs] = scriptCommand(helperBuildPath, [
@@ -1294,6 +1306,20 @@ const runNativeHelperContract = async () => {
       command("file", [helperPath]).output,
       /Mach-O/,
       "helper build did not produce a native Mach-O executable",
+    );
+    assert.match(
+      command("strings", [helperPath]).output,
+      new RegExp(
+        publicKeyRawBase64.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      ),
+      "built native helper does not embed the configured raw Ed25519 public key",
+    );
+    assert.doesNotMatch(
+      command("strings", [helperPath]).output,
+      new RegExp(
+        wrongPublicKeyRawBase64.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      ),
+      "built native helper embeds an unrelated Ed25519 public key",
     );
     const flagSearch = command(
       "git",
@@ -1509,6 +1535,345 @@ const runNativeHelperContract = async () => {
       label: "source ZIP quarantine wins over a different old target value",
       targetQuarantine: oldQuarantine,
     });
+
+    const workflow = fs.readFileSync(workflowPath, "utf8");
+    const signerPath = discoverSignerPath(workflow);
+    const signerSecrets = signingVariableNames(workflow);
+    assert.ok(
+      signerSecrets.length > 0,
+      "workflow does not expose the release signer private-key environment",
+    );
+    const privateKeyPemBase64 = Buffer.from(privateKeyPem).toString("base64");
+    const signerEnv = {
+      ...process.env,
+      ...Object.fromEntries(
+        signerSecrets.map((name) => [name, privateKeyPemBase64]),
+      ),
+    };
+    const signWithReleaseCli = (fixture, label) => {
+      const metadata = path.join(
+        path.dirname(fixture.artifactPath),
+        `${label.replaceAll(" ", "-")}-latest-mac.yml`,
+      );
+      const signatureOutput = path.join(
+        path.dirname(fixture.artifactPath),
+        `${label.replaceAll(" ", "-")}-signature.txt`,
+      );
+      const archiveBytes = fs.readFileSync(fixture.artifactPath);
+      const updaterSha512 = createHash("sha512")
+        .update(archiveBytes)
+        .digest("base64");
+      fs.writeFileSync(
+        metadata,
+        [
+          `version: ${fixture.version}`,
+          "files:",
+          `  - url: ${path.basename(fixture.artifactPath)}`,
+          `    sha512: ${updaterSha512}`,
+          `    size: ${archiveBytes.length}`,
+          `path: ${path.basename(fixture.artifactPath)}`,
+          `sha512: ${updaterSha512}`,
+          `releaseDate: '${new Date().toISOString()}'`,
+          "",
+        ].join("\n"),
+      );
+      const result = command(
+        process.execPath,
+        [
+          signerPath,
+          "--arch",
+          fixture.arch,
+          "--version",
+          fixture.version,
+          "--archive",
+          fixture.artifactPath,
+          "--metadata",
+          metadata,
+          "--signature-output",
+          signatureOutput,
+        ],
+        { allowFailure: true, env: signerEnv },
+      );
+      assert.equal(result.status, 0, result.output);
+      assert.equal(
+        fs.existsSync(signatureOutput),
+        true,
+        `${label} signer did not emit its detached signature`,
+      );
+      const signatureText = fs.readFileSync(signatureOutput, "utf8");
+      const signature = signatureText.match(
+        /(?:^|[^A-Za-z0-9+/])([A-Za-z0-9+/]{86}==)(?:$|[^A-Za-z0-9+/])/m,
+      )?.[1];
+      assert.ok(signature, `${label} signer output is not an Ed25519 signature`);
+      const metadataText = fs.readFileSync(metadata, "utf8");
+      assert.match(
+        metadataText,
+        new RegExp(
+          fixture.version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+        ),
+        `${label} metadata lost the exact candidate version`,
+      );
+      assert.match(
+        metadataText,
+        new RegExp(fullKeyId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        `${label} metadata does not contain the complete Ed25519 keyId`,
+      );
+      assert.match(
+        metadataText,
+        new RegExp(signature.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+        `${label} metadata does not contain the detached project signature`,
+      );
+      const exactPayload = canonicalNativePayload({
+        arch: fixture.arch,
+        bundleId,
+        payloadDomain,
+        sha512: fixture.sha512,
+        size: fixture.size,
+        version: fixture.version,
+      });
+      assert.equal(
+        cryptoVerify(
+          null,
+          Buffer.from(exactPayload),
+          signingKeys.publicKey,
+          Buffer.from(signature, "base64"),
+        ),
+        true,
+        `${label} signature does not cover the exact canonical payload`,
+      );
+      const stableAlias = fixture.version.replace(
+        /-alpha\.nightly\.\d{8}$/,
+        "",
+      );
+      if (stableAlias !== fixture.version) {
+        assert.equal(
+          cryptoVerify(
+            null,
+            Buffer.from(
+              canonicalNativePayload({
+                arch: fixture.arch,
+                bundleId,
+                payloadDomain,
+                sha512: fixture.sha512,
+                size: fixture.size,
+                version: stableAlias,
+              }),
+            ),
+            signingKeys.publicKey,
+            Buffer.from(signature, "base64"),
+          ),
+          false,
+          `${label} signature also validates after stripping its nightly suffix`,
+        );
+      }
+      return { ...fixture, signature };
+    };
+    const expectSignerRejectsVersion = (candidateVersion) => {
+      const fixture = makeFixture({
+        root: path.join(
+          tempRoot,
+          `signer-invalid-${candidateVersion.replaceAll("/", "-")}`,
+        ),
+        version: candidateVersion,
+      });
+      const metadata = path.join(
+        path.dirname(fixture.artifactPath),
+        "latest-mac.yml",
+      );
+      const signatureOutput = path.join(
+        path.dirname(fixture.artifactPath),
+        "signature.txt",
+      );
+      const archiveBytes = fs.readFileSync(fixture.artifactPath);
+      const updaterSha512 = createHash("sha512")
+        .update(archiveBytes)
+        .digest("base64");
+      fs.writeFileSync(
+        metadata,
+        [
+          `version: ${candidateVersion}`,
+          "files:",
+          `  - url: ${path.basename(fixture.artifactPath)}`,
+          `    sha512: ${updaterSha512}`,
+          `    size: ${archiveBytes.length}`,
+          `path: ${path.basename(fixture.artifactPath)}`,
+          `sha512: ${updaterSha512}`,
+          "",
+        ].join("\n"),
+      );
+      const metadataBefore = fs.readFileSync(metadata);
+      const result = command(
+        process.execPath,
+        [
+          signerPath,
+          "--arch",
+          fixture.arch,
+          "--version",
+          candidateVersion,
+          "--archive",
+          fixture.artifactPath,
+          "--metadata",
+          metadata,
+          "--signature-output",
+          signatureOutput,
+        ],
+        { allowFailure: true, env: signerEnv },
+      );
+      assert.notEqual(
+        result.status,
+        0,
+        `release signer accepted invalid nightly ${candidateVersion}`,
+      );
+      assert.equal(fs.existsSync(signatureOutput), false);
+      assert.deepEqual(
+        fs.readFileSync(metadata),
+        metadataBefore,
+        `release signer modified metadata for invalid ${candidateVersion}`,
+      );
+    };
+    const invokeViaJsRuntime = (fixture, targetApp) =>
+      command(
+        process.execPath,
+        [
+          helperRunnerPath,
+          "--helper",
+          helperPath,
+          "--",
+          ...nativeInstallArgs({ ...fixture, targetApp }),
+        ],
+        { allowFailure: true },
+      );
+    const expectVersionTransition = ({
+      accepted,
+      candidateVersion,
+      currentVersion,
+      fixture,
+      label,
+    }) => {
+      const updateFixture =
+        fixture ??
+        makeFixture({
+          root: path.join(
+            tempRoot,
+            `version-${label.replaceAll(" ", "-")}`,
+          ),
+          version: candidateVersion,
+        });
+      const target = makeOldTarget(
+        path.join(tempRoot, `target-${label.replaceAll(" ", "-")}`),
+        bundleId,
+        helperArch,
+        oldQuarantine,
+        currentVersion,
+      );
+      const before = treeDigest(target.targetApp);
+      const result = invokeViaJsRuntime(updateFixture, target.targetApp);
+      assert.equal(
+        result.status === 0,
+        accepted,
+        `${label} returned status=${result.status}\n${result.output}`,
+      );
+      if (accepted) {
+        assert.equal(
+          command("plutil", [
+            "-extract",
+            "CFBundleShortVersionString",
+            "raw",
+            path.join(target.targetApp, "Contents", "Info.plist"),
+          ]).output,
+          candidateVersion,
+          `${label} did not install the exact candidate version`,
+        );
+      } else {
+        assert.equal(
+          treeDigest(target.targetApp),
+          before,
+          `${label} changed the rejected target`,
+        );
+        assert.equal(
+          quarantineValue(target.targetApp),
+          oldQuarantine,
+          `${label} changed quarantine on a rejected target`,
+        );
+      }
+      assert.equal(userTrustSettingsDigest(), initialTrust);
+      console.log(
+        `[project-updater] PASS native version transition: ${label}`,
+      );
+    };
+
+    const nightlyEarly =
+      "2.0.1-selfhost.6-alpha.nightly.20260728";
+    const nightlyLate =
+      "2.0.1-selfhost.6-alpha.nightly.20260729";
+    const releaseSignedNightly = signWithReleaseCli(
+      makeFixture({
+        root: path.join(tempRoot, "release-signed-nightly"),
+        version: nightlyLate,
+      }),
+      "release signed nightly",
+    );
+    expectVersionTransition({
+      accepted: true,
+      candidateVersion: nightlyLate,
+      currentVersion: nightlyEarly,
+      fixture: releaseSignedNightly,
+      label: "release signer metadata JS runtime native helper nightly chain",
+    });
+    for (const transition of [
+      {
+        accepted: true,
+        candidateVersion: "2.0.1-selfhost.6",
+        currentVersion: nightlyLate,
+        label: "same revision nightly to stable",
+      },
+      {
+        accepted: false,
+        candidateVersion: nightlyLate,
+        currentVersion: "2.0.1-selfhost.6",
+        label: "same revision stable to nightly",
+      },
+      {
+        accepted: false,
+        candidateVersion: nightlyLate,
+        currentVersion: nightlyLate,
+        label: "same nightly date replay",
+      },
+      {
+        accepted: false,
+        candidateVersion: nightlyEarly,
+        currentVersion: nightlyLate,
+        label: "later nightly to earlier nightly",
+      },
+      {
+        accepted: true,
+        candidateVersion:
+          "2.0.1-selfhost.7-alpha.nightly.20260730",
+        currentVersion: "2.0.1-selfhost.6",
+        label: "higher revision nightly",
+      },
+      {
+        accepted: true,
+        candidateVersion: "2.0.1-selfhost.6",
+        currentVersion: "2.0.1-selfhost.5",
+        label: "stable behavior remains unchanged",
+      },
+    ]) {
+      expectVersionTransition(transition);
+    }
+    for (const invalidVersion of [
+      "2.0.1-selfhost.6-alpha.nightly.20260230",
+      "2.0.1-selfhost.6-alpha.nightly",
+      "2.0.1-selfhost.6-alpha.nightly.20260729.extra",
+    ]) {
+      expectSignerRejectsVersion(invalidVersion);
+      expectVersionTransition({
+        accepted: false,
+        candidateVersion: invalidVersion,
+        currentVersion: "2.0.1-selfhost.6",
+        label: `invalid nightly ${invalidVersion}`,
+      });
+    }
 
     const wrongKey = makeFixture({
       privateKeyPem: wrongPrivateKeyPem,
@@ -1974,6 +2339,42 @@ addCase(cases, "release signing is fail-closed on an external private key", () =
     );
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+addCase(cases, "nightly signing is reachable for both macOS architectures", () => {
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const signerPath = discoverSignerPath(workflow);
+  for (const [jobName, arch] of [
+    ["build-macos-x64", "x64"],
+    ["build-macos-arm64", "arm64"],
+  ]) {
+    const job = workflowJobSource(workflow, jobName);
+    const signerIndex = job.indexOf(path.basename(signerPath));
+    assert.notEqual(
+      signerIndex,
+      -1,
+      `${jobName} does not invoke the project signer`,
+    );
+    const signerContext = job.slice(
+      Math.max(0, signerIndex - 800),
+      signerIndex + 1200,
+    );
+    assert.match(
+      signerContext,
+      new RegExp(`(?:--arch\\s+${arch}\\b|--${arch}\\b)`),
+      `${jobName} does not sign its ${arch} artifact`,
+    );
+    assert.match(
+      signerContext,
+      /--version[\s\S]{0,120}steps\.ref\.outputs\.version/,
+      `${jobName} does not pass the exact workflow version to the signer`,
+    );
+    assert.doesNotMatch(
+      signerContext,
+      /build-target\s*!=\s*['"]nightly|build-target\s*==\s*['"]stable/,
+      `${jobName} makes the signer unreachable for nightly builds`,
+    );
   }
 });
 
