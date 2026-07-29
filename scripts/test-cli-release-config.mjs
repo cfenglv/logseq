@@ -924,8 +924,8 @@ assert.match(
 );
 assert.match(
   electronUpdater,
-  /install-selfhost-update-support-policy![\s\S]*?default-is-update-supported update-info[\s\S]*?selfhostProjectUpdateAllowed/,
-  "the Electron runtime should preserve default support checks before rejecting cross-track metadata",
+  /install-selfhost-update-support-policy![\s\S]*?default-is-update-supported update-info[\s\S]*?selfhostUpdateInfoAllowed[\s\S]*?:arch[\s\S]*?:platform[\s\S]*?:updateInfo/,
+  "the Electron runtime should preserve default support checks before validating all update metadata",
 );
 assert.match(
   electronUpdaterConfig,

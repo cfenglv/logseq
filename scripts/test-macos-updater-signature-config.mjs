@@ -297,7 +297,7 @@ const cases = [
       );
       assert.match(
         electronUpdater,
-        /install-selfhost-update-support-policy![\s\S]*?default-is-update-supported update-info[\s\S]*?<project-signature-module![\s\S]*?selfhostProjectUpdateAllowed/,
+        /install-selfhost-update-support-policy![\s\S]*?default-is-update-supported update-info[\s\S]*?<project-signature-module![\s\S]*?selfhostUpdateInfoAllowed[\s\S]*?:arch[\s\S]*?:platform[\s\S]*?:updateInfo/,
       );
       assert.match(
         electronUpdater,

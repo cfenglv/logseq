@@ -10,6 +10,7 @@ import {
   macosUpdaterMetadataName,
   resolveSelfhostUpdaterVersions,
 } from "./selfhost-updater-version.mjs";
+import { selfhostUpdateInfoAllowed } from "./project-updater-signature.mjs";
 
 const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(path.join(packageRoot, "package.json"));
@@ -201,6 +202,16 @@ for (const [platform, arch] of [
     const info = await provider.getLatestVersion();
     assert.equal(info.tag, nextVersion);
     assert.equal(info.version, nextVersion);
+    assert.equal(
+      selfhostUpdateInfoAllowed({
+        arch,
+        currentVersion,
+        platform,
+        updateInfo: info,
+      }),
+      true,
+      `${platform}/${arch} stable provider metadata must pass the runtime fail-closed policy`,
+    );
     assert.ok(
       requests.some((request) => request.endsWith("/releases/latest")),
       `${platform}/${arch} must select GitHub's latest production release`,
@@ -270,6 +281,16 @@ for (const [platform, arch] of [
       makeNightlyProvider({ platform, arch });
     const info = await provider.getLatestVersion();
     assert.equal(info.version, nightlyNext);
+    assert.equal(
+      selfhostUpdateInfoAllowed({
+        arch,
+        currentVersion: nightlyCurrent,
+        platform,
+        updateInfo: info,
+      }),
+      true,
+      `${platform}/${arch} nightly provider metadata must pass the runtime fail-closed policy`,
+    );
     assert.ok(
       requests.some((request) => request.endsWith(`/${expectedMetadata}`)),
       `${platform}/${arch} nightly must request isolated ${expectedMetadata}`,
@@ -295,5 +316,5 @@ for (const [platform, arch] of [
 }
 
 console.log(
-  `[updater-provider] OK stable ${currentVersion} -> ${nextVersion} stays on GitHub production latest and nightly ${nightlyCurrent} -> ${nightlyNext} stays on the isolated rolling prerelease across six platform/architecture contracts; legacy macOS .4 stays on pinned metadata${isNightlyRehearsal ? ` (normalized from ${packageJson.version})` : ""}`,
+  `[updater-provider] OK stable ${currentVersion} -> ${nextVersion} stays on GitHub production latest and nightly ${nightlyCurrent} -> ${nightlyNext} stays on the isolated rolling prerelease; both pass the fail-closed updateInfo policy across six platform/architecture contracts; legacy macOS .4 stays on pinned metadata${isNightlyRehearsal ? ` (normalized from ${packageJson.version})` : ""}`,
 );

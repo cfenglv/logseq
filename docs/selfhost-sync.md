@@ -275,7 +275,10 @@ rolling `nightly` GitHub prerelease and use a separate GenericProvider feed.
 Stable clients never discover or download that feed. Nightly clients can
 advance to a later dated nightly, including a higher nightly revision, but
 returning from nightly to any stable release, including a higher stable
-revision, requires a manual installation.
+revision, requires a manual installation. Before any platform downloads an
+update, the runtime also verifies the increasing same-track version, expected
+stable or rolling tag semantics, and the exact platform-, architecture-, and
+version-specific installer filenames.
 
 Use the NSIS installer on Windows and the AppImage on Linux when in-application
 installation is required. On macOS, moving from `.4` to `.5` requires manually

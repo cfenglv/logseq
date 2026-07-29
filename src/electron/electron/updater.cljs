@@ -137,10 +137,12 @@
                       (.then
                        (fn [^js signature-module]
                          (boolean
-                          (.selfhostProjectUpdateAllowed
+                          (.selfhostUpdateInfoAllowed
                            signature-module
-                           electron-version
-                           (.-version update-info)))))
+                           #js {:arch (.-arch js/process)
+                                :currentVersion electron-version
+                                :platform (.-platform js/process)
+                                :updateInfo update-info}))))
                       (.catch
                        (fn [error]
                          (logger/warn

@@ -105,6 +105,82 @@ export const selfhostProjectUpdateAllowed = (
   );
 };
 
+export const selfhostUpdateAssetContract = ({
+  arch,
+  platform,
+  version,
+}) => {
+  parseSelfhostProjectVersion(version);
+  if (!["arm64", "x64"].includes(arch)) {
+    throw new Error(`unsupported updater architecture ${arch}`);
+  }
+  let primary;
+  let secondary;
+  if (platform === "darwin") {
+    primary = `Logseq-darwin-${arch}-${version}.zip`;
+    secondary = `Logseq-darwin-${arch}-${version}.dmg`;
+  } else if (platform === "win32") {
+    primary = `Logseq-win-${arch}-${version}-nsis.exe`;
+    secondary = `Logseq-win-${arch}-${version}.zip`;
+  } else if (platform === "linux") {
+    const artifactArch = arch === "x64" ? "x86_64" : arch;
+    primary = `Logseq-linux-${artifactArch}-${version}.AppImage`;
+    secondary = `Logseq-linux-${artifactArch}-${version}.zip`;
+  } else {
+    throw new Error(`unsupported updater platform ${platform}`);
+  }
+  return Object.freeze({
+    allowed: Object.freeze([primary, secondary]),
+    primary,
+  });
+};
+
+export const selfhostUpdateInfoAllowed = ({
+  arch,
+  currentVersion,
+  platform,
+  updateInfo,
+}) => {
+  try {
+    const candidateVersion = updateInfo?.version;
+    if (!selfhostProjectUpdateAllowed(currentVersion, candidateVersion)) {
+      return false;
+    }
+    const current = parseSelfhostProjectVersion(currentVersion);
+    const nightly = current.nightlyDate !== undefined;
+    const tag = updateInfo?.tag;
+    if (
+      nightly
+        ? tag !== undefined && tag !== null && tag !== "nightly"
+        : tag !== candidateVersion
+    ) {
+      return false;
+    }
+
+    const { allowed, primary } = selfhostUpdateAssetContract({
+      arch,
+      platform,
+      version: candidateVersion,
+    });
+    const files = updateInfo?.files;
+    if (!Array.isArray(files) || files.length === 0) return false;
+    const urls = files.map((file) => file?.url);
+    if (
+      urls.some((url) => typeof url !== "string" || !allowed.includes(url)) ||
+      new Set(urls).size !== urls.length ||
+      !urls.includes(primary)
+    ) {
+      return false;
+    }
+    if (updateInfo?.path !== undefined && updateInfo.path !== primary) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 export const projectSignedMacosUpdater = (
   version,
   platform = process.platform,

@@ -11,6 +11,8 @@ import {
   compareSelfhostProjectVersions,
   parseSelfhostProjectVersion,
   selfhostProjectUpdateAllowed,
+  selfhostUpdateAssetContract,
+  selfhostUpdateInfoAllowed,
 } from '../resources/project-updater-signature.mjs'
 
 const repoRoot = path.resolve(
@@ -128,75 +130,233 @@ const makeAppUpdater = (currentVersion) =>
     relaunch() {},
     onQuit() {},
   })
-const installSelfhostTrackPolicy = (updater, currentVersion) => {
+const installSelfhostUpdateInfoPolicy = (
+  updater,
+  { arch, currentVersion, platform }
+) => {
   const defaultIsUpdateSupported =
     updater.isUpdateSupported.bind(updater)
   updater.isUpdateSupported = async (updateInfo) =>
     (await defaultIsUpdateSupported(updateInfo)) &&
-    selfhostProjectUpdateAllowed(currentVersion, updateInfo.version)
+    selfhostUpdateInfoAllowed({
+      arch,
+      currentVersion,
+      platform,
+      updateInfo,
+    })
 }
-const electronUpdaterAvailable = async (
+const makeUpdateInfo = ({
+  arch,
   currentVersion,
   candidateVersion,
-  allowPrerelease
-) => {
-  const updater = makeAppUpdater(currentVersion)
-  updater.allowPrerelease = allowPrerelease
-  updater.allowDowngrade = false
-  updater.isUserWithinRollout = () => true
-  installSelfhostTrackPolicy(updater, currentVersion)
-  return updater.isUpdateAvailable({ version: candidateVersion })
+  platform,
+  assetArch = arch,
+  assetPlatform = platform,
+  assetVersion = candidateVersion,
+  nightlyTag,
+}) => {
+  const { allowed, primary } = selfhostUpdateAssetContract({
+    arch: assetArch,
+    platform: assetPlatform,
+    version: assetVersion,
+  })
+  const updateInfo = {
+    version: candidateVersion,
+    files: allowed.map((url) => ({ url, sha512: 'YQ==' })),
+    path: primary,
+  }
+  if (parseSelfhostProjectVersion(currentVersion).nightlyDate === undefined) {
+    updateInfo.tag = candidateVersion
+  } else if (nightlyTag !== undefined) {
+    updateInfo.tag = nightlyTag
+  }
+  return updateInfo
 }
-for (const [currentVersion, candidateVersion, expected, allowPrerelease] of [
-  [stable, nextStable, true, false],
-  [earlyNightly, lateNightly, true, true],
-  [nextStable, lateNightly, false, false],
-]) {
-  assert.equal(
-    await electronUpdaterAvailable(
-      currentVersion,
-      candidateVersion,
-      allowPrerelease
-    ),
-    expected,
-    `electron-updater discovery compare ${currentVersion} -> ${candidateVersion}`
-  )
+const runActualAppUpdaterCheck = async ({
+  arch,
+  currentVersion,
+  platform,
+  updateInfo,
+}) => {
+  const updater = makeAppUpdater(currentVersion)
+  updater.logger = { error() {}, info() {}, warn() {} }
+  updater.allowPrerelease =
+    parseSelfhostProjectVersion(currentVersion).nightlyDate !== undefined
+  updater.allowDowngrade = false
+  updater.autoDownload = true
+  updater.isUserWithinRollout = () => true
+  installSelfhostUpdateInfoPolicy(updater, {
+    arch,
+    currentVersion,
+    platform,
+  })
+  updater.getUpdateInfoAndProvider = async () => ({
+    info: updateInfo,
+    provider: {},
+  })
+  let downloadCount = 0
+  updater.downloadUpdate = () => {
+    downloadCount += 1
+    return Promise.resolve([])
+  }
+  const result = await updater.doCheckForUpdates()
+  return { downloadCount, result }
 }
 
-const misconfiguredStableUpdater = makeAppUpdater(stable)
-misconfiguredStableUpdater.allowPrerelease = false
-misconfiguredStableUpdater.allowDowngrade = false
-misconfiguredStableUpdater.autoDownload = true
-misconfiguredStableUpdater.isUserWithinRollout = () => true
-installSelfhostTrackPolicy(misconfiguredStableUpdater, stable)
-misconfiguredStableUpdater.getUpdateInfoAndProvider = async () => ({
-  info: {
-    version: earlyNightly,
-    files: [{ url: 'nightly.zip', sha512: 'YQ==' }],
-  },
-  provider: {},
-})
-let misconfiguredDownloadCount = 0
-misconfiguredStableUpdater.downloadUpdate = () => {
-  misconfiguredDownloadCount += 1
-  return Promise.resolve([])
+const updaterTargets = [
+  ['darwin', 'x64'],
+  ['darwin', 'arm64'],
+  ['win32', 'x64'],
+  ['win32', 'arm64'],
+  ['linux', 'x64'],
+  ['linux', 'arm64'],
+]
+const otherPlatform = {
+  darwin: 'win32',
+  win32: 'linux',
+  linux: 'darwin',
 }
-const misconfiguredResult =
-  await misconfiguredStableUpdater.doCheckForUpdates()
-assert.equal(misconfiguredResult.isUpdateAvailable, false)
-assert.equal(
-  misconfiguredDownloadCount,
-  0,
-  'cross-track metadata must never reach electron-updater downloadUpdate'
-)
+let appUpdaterMetadataCases = 0
+for (const [platform, arch] of updaterTargets) {
+  const validStable = makeUpdateInfo({
+    arch,
+    currentVersion: stable,
+    candidateVersion: nextStable,
+    platform,
+  })
+  const validNightly = makeUpdateInfo({
+    arch,
+    currentVersion: earlyNightly,
+    candidateVersion: lateNightly,
+    platform,
+  })
+  const rollingNightly = makeUpdateInfo({
+    arch,
+    currentVersion: earlyNightly,
+    candidateVersion: lateNightly,
+    nightlyTag: 'nightly',
+    platform,
+  })
+  const crossWiredFile = makeUpdateInfo({
+    arch,
+    assetArch: arch === 'x64' ? 'arm64' : 'x64',
+    currentVersion: stable,
+    candidateVersion: nextStable,
+    platform,
+  }).files[0]
+  for (const [label, currentVersion, updateInfo, expectedDownloads] of [
+    ['valid stable', stable, validStable, 1],
+    ['valid nightly without tag', earlyNightly, validNightly, 1],
+    ['valid rolling nightly tag', earlyNightly, rollingNightly, 1],
+    [
+      'wrong architecture',
+      stable,
+      makeUpdateInfo({
+        arch,
+        assetArch: arch === 'x64' ? 'arm64' : 'x64',
+        currentVersion: stable,
+        candidateVersion: nextStable,
+        platform,
+      }),
+      0,
+    ],
+    [
+      'correct primary with cross-wired extra file',
+      stable,
+      { ...validStable, files: [...validStable.files, crossWiredFile] },
+      0,
+    ],
+    [
+      'wrong platform',
+      stable,
+      makeUpdateInfo({
+        arch,
+        assetPlatform: otherPlatform[platform],
+        currentVersion: stable,
+        candidateVersion: nextStable,
+        platform,
+      }),
+      0,
+    ],
+    [
+      'wrong asset version',
+      stable,
+      makeUpdateInfo({
+        arch,
+        assetVersion: '2.0.1-selfhost.7',
+        currentVersion: stable,
+        candidateVersion: nextStable,
+        platform,
+      }),
+      0,
+    ],
+    [
+      'stable tag/version mismatch',
+      stable,
+      { ...validStable, tag: stable },
+      0,
+    ],
+    [
+      'legacy path does not name the primary installer',
+      stable,
+      { ...validStable, path: validStable.files[1].url },
+      0,
+    ],
+    [
+      'stable to nightly cross-track metadata',
+      stable,
+      makeUpdateInfo({
+        arch,
+        currentVersion: stable,
+        candidateVersion: earlyNightly,
+        platform,
+      }),
+      0,
+    ],
+    [
+      'nightly candidate version tag instead of rolling tag',
+      earlyNightly,
+      { ...validNightly, tag: lateNightly },
+      0,
+    ],
+  ]) {
+    const { downloadCount, result } = await runActualAppUpdaterCheck({
+      arch,
+      currentVersion,
+      platform,
+      updateInfo,
+    })
+    assert.equal(
+      downloadCount,
+      expectedDownloads,
+      `${platform}/${arch} ${label} download count`
+    )
+    assert.equal(
+      result.isUpdateAvailable,
+      expectedDownloads === 1,
+      `${platform}/${arch} ${label} availability`
+    )
+    appUpdaterMetadataCases += 1
+  }
+}
+assert.equal(appUpdaterMetadataCases, 66)
 
 const minimumSystemUpdater = makeAppUpdater(stable)
 minimumSystemUpdater.allowDowngrade = false
 minimumSystemUpdater.isUserWithinRollout = () => true
-installSelfhostTrackPolicy(minimumSystemUpdater, stable)
+installSelfhostUpdateInfoPolicy(minimumSystemUpdater, {
+  arch: 'arm64',
+  currentVersion: stable,
+  platform: 'darwin',
+})
 assert.equal(
   await minimumSystemUpdater.isUpdateAvailable({
-    version: nextStable,
+    ...makeUpdateInfo({
+      arch: 'arm64',
+      currentVersion: stable,
+      candidateVersion: nextStable,
+      platform: 'darwin',
+    }),
     minimumSystemVersion: '9999.0.0',
   }),
   false,
@@ -215,5 +375,5 @@ assert.match(
 )
 
 console.log(
-  '[selfhost-nightly-semver-contract] PASS AppUpdater rejects cross-track download metadata, preserves minimumSystemVersion, and allows only isolated stable/nightly tracks'
+  `[selfhost-nightly-semver-contract] PASS AppUpdater metadata cases=${appUpdaterMetadataCases}; wrong track/tag/platform/arch/version never downloads, valid stable/nightly downloads once, minimumSystemVersion is preserved`
 )
