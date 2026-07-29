@@ -6,10 +6,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  signedBaselineManifest,
-  updaterSignatureGatePlan,
-} from "./run-macos-updater-signature-policy.mjs";
+import { updaterSignatureGatePlan } from "./run-macos-updater-signature-policy.mjs";
 import {
   classifyShipItOutcome,
   UpdaterSignatureGateError,
@@ -25,6 +22,9 @@ const read = (relativePath) =>
 const workflow = read(".github/workflows/build-desktop-release.yml");
 const verifier = read("scripts/verify-macos-updater-signature.mjs");
 const electronUpdater = read("src/electron/electron/updater.cljs");
+const nativeHelper = read(
+  "resources/macos-project-updater/ProjectUpdater.swift",
+);
 const baseline = JSON.parse(
   read("scripts/fixtures/macos-updater-baseline.json"),
 );
@@ -119,21 +119,16 @@ const cases = [
     },
   ],
   [
-    ".5 remains manual while both future architecture jobs use project signatures",
+    ".5 remains manual and future releases route only through project signatures",
     () => {
       assert.equal(
-        updaterSignatureGatePlan("2.0.1-selfhost.5", false).mode,
+        updaterSignatureGatePlan("2.0.1-selfhost.5").mode,
         "manual-migration",
       );
-      assert.throws(
-        () => updaterSignatureGatePlan("2.0.1-selfhost.6", false),
-        /published Developer ID signed and notarized 2\.0\.1-selfhost\.5/,
-      );
       assert.deepEqual(
-        updaterSignatureGatePlan("2.0.1-selfhost.6", true),
-        { mode: "signed-baseline", manifest: signedBaselineManifest },
+        updaterSignatureGatePlan("2.0.1-selfhost.6"),
+        { mode: "project-signed" },
       );
-      assert.equal(fs.existsSync(signedBaselineManifest), false);
       assert.equal(
         workflow.match(/build-project-update-helper\.mjs/g)?.length,
         2,
@@ -146,6 +141,22 @@ const cases = [
         workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length,
         2,
       );
+      const policy = read("scripts/run-macos-updater-signature-policy.mjs");
+      assert.match(policy, /verifyProjectSignedMacosUpdate/);
+      assert.doesNotMatch(policy, /requireDeveloperIdBaseline/);
+      assert.doesNotMatch(policy, /macos-updater-signed-baseline/);
+    },
+  ],
+  [
+    "native replacement uses one atomic macOS directory exchange",
+    () => {
+      assert.match(nativeHelper, /renameatx_np\(/);
+      assert.match(nativeHelper, /RENAME_SWAP/);
+      assert.doesNotMatch(
+        nativeHelper,
+        /moveItem\(at: arguments\.target/,
+      );
+      assert.doesNotMatch(nativeHelper, /project-update-backup/);
     },
   ],
   [

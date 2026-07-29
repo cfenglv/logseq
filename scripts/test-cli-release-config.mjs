@@ -132,6 +132,9 @@ const macosUpdaterSignatureVerifier = readText(
 const macosUpdaterSignaturePolicy = readText(
   "scripts/run-macos-updater-signature-policy.mjs",
 );
+const projectSignedMacosUpdaterVerifier = readText(
+  "scripts/verify-project-signed-macos-update.mjs",
+);
 const macosUpdaterBaseline = readJson(
   "scripts/fixtures/macos-updater-baseline.json",
 );
@@ -638,8 +641,13 @@ assert.equal(
 );
 assert.match(
   macosUpdaterSignaturePolicy,
-  /manual-migration[\s\S]*revision > 5[\s\S]*macos-updater-signed-baseline\.json/,
-  "the signature policy should defer the physical gate until a signed .5 baseline exists",
+  /manual-migration[\s\S]*revision > 5[\s\S]*project-signed[\s\S]*verifyProjectSignedMacosUpdate/,
+  "the signature policy should route post-bootstrap releases through project signatures",
+);
+assert.doesNotMatch(
+  macosUpdaterSignaturePolicy,
+  /requireDeveloperIdBaseline|macos-updater-signed-baseline/,
+  "the project signature policy must not require an Apple signing baseline",
 );
 assert.match(
   desktopReleaseWorkflow,
@@ -713,9 +721,9 @@ assert.deepEqual(
   "macOS updater regression reproducer should pin the published arm64 and x64 baseline assets",
 );
 assert.match(
-  macosUpdaterSignatureVerifier,
-  /published baseline Developer ID identity/,
-  "future physical updater gates should require a Developer ID baseline",
+  projectSignedMacosUpdaterVerifier,
+  /loadProjectSigningPolicy[\s\S]*projectUpdatePayload[\s\S]*verify\(/,
+  "future physical updater gates should require the fixed project key signature",
 );
 for (const requiredVerifierContract of [
   "LOGSEQ_UPDATER_BASELINE_ZIP",

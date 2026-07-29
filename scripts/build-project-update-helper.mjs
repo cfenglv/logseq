@@ -21,6 +21,21 @@ const manifestPath = path.join(
   "project-signing-policy.json",
 );
 
+const usage = `Usage:
+  node scripts/build-project-update-helper.mjs --arch <arm64|x64> --output <path>
+
+Production builds always embed the key from resources/updater/project-signing-policy.json.
+
+TEST-ONLY:
+  node scripts/build-project-update-helper.mjs --test-only --public-key-base64 <raw-ed25519-base64> --arch <arm64|x64> --output <path>
+
+--public-key-base64 is forbidden unless --test-only is also present.
+`;
+if (process.argv.length === 3 && process.argv[2] === "--help") {
+  process.stdout.write(usage);
+  process.exit(0);
+}
+
 const values = new Map();
 let testOnly = false;
 for (let index = 2; index < process.argv.length; index += 1) {
@@ -102,6 +117,7 @@ try {
       "swiftc",
       "-O",
       "-whole-module-optimization",
+      ...(testOnly ? ["-DPROJECT_UPDATER_TESTING"] : []),
       "-target",
       target,
       generatedSource,

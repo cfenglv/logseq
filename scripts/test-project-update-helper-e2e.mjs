@@ -155,6 +155,19 @@ const expectFail = (name, args, pattern) => {
   console.log(`[project-updater-test] PASS ${name}`);
 };
 
+const expectStatus = (name, args, expectedStatus) => {
+  const result = invoke(args);
+  if (result.error || result.status !== expectedStatus) {
+    throw new Error(
+      `${name} expected exit=${expectedStatus}, got ${result.status}: ${
+        result.stderr || result.stdout || result.error?.message
+      }`,
+    );
+  }
+  passed += 1;
+  console.log(`[project-updater-test] PASS ${name}`);
+};
+
 const crcTable = Array.from({ length: 256 }, (_, index) => {
   let value = index;
   for (let bit = 0; bit < 8; bit += 1) {
@@ -208,6 +221,20 @@ const storedZip = (output, entryName, content) => {
 };
 
 try {
+  const help = run(process.execPath, [
+    path.join(repoRoot, "scripts", "build-project-update-helper.mjs"),
+    "--help",
+  ]).stdout;
+  if (
+    !help.includes("TEST-ONLY") ||
+    !help.includes("--test-only --public-key-base64") ||
+    !help.includes("--arch <arm64|x64> --output <path>")
+  ) {
+    throw new Error("helper build --help does not document the stable test-only contract");
+  }
+  passed += 1;
+  console.log("[project-updater-test] PASS helper build documents TEST-ONLY key override");
+
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const publicDer = publicKey.export({ format: "der", type: "spki" });
   const publicKeyBase64 = publicDer.subarray(-32).toString("base64");
@@ -346,6 +373,66 @@ try {
       target,
     }),
     /without following symlinks/,
+  );
+
+  const crashTargetParent = path.join(temporaryRoot, "crash-target");
+  fs.mkdirSync(crashTargetParent);
+  const crashTarget = createApp(
+    crashTargetParent,
+    "2.0.1-selfhost.4",
+    "installed-before-atomic-swap",
+  );
+  const crashArguments = signedArguments({
+    archive,
+    candidateVersion: "2.0.1-selfhost.5",
+    privateKey,
+    target: crashTarget,
+    verifyOnly: false,
+  });
+  crashArguments.push("--test-exit-after-swap");
+  expectStatus(
+    "simulated crash immediately after atomic exchange",
+    crashArguments,
+    86,
+  );
+  const crashTargetMarker = fs.readFileSync(
+    path.join(
+      crashTarget,
+      "Contents",
+      "Resources",
+      "release-marker.txt",
+    ),
+    "utf8",
+  );
+  const abandonedStaging = fs
+    .readdirSync(crashTargetParent)
+    .filter((name) => name.startsWith(".logseq-project-update-"));
+  if (
+    crashTargetMarker !== "candidate-selfhost.5\n" ||
+    abandonedStaging.length !== 1
+  ) {
+    throw new Error(
+      "atomic crash boundary did not leave the new App at the target and old App in staging",
+    );
+  }
+  const oldAppMarker = fs.readFileSync(
+    path.join(
+      crashTargetParent,
+      abandonedStaging[0],
+      "extracted",
+      "Logseq.app",
+      "Contents",
+      "Resources",
+      "release-marker.txt",
+    ),
+    "utf8",
+  );
+  if (oldAppMarker !== "installed-before-atomic-swap\n") {
+    throw new Error("atomic exchange did not leave the old App in staging");
+  }
+  passed += 1;
+  console.log(
+    "[project-updater-test] PASS crash boundary keeps target present and old App recoverable",
   );
 
   expectPass(

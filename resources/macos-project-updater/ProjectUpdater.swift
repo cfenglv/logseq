@@ -23,6 +23,7 @@ private struct Arguments {
     let relaunch: Bool
     let signature: Data
     let target: URL
+    let testExitAfterSwap: Bool
     let version: String
     let verifyOnly: Bool
 
@@ -43,6 +44,15 @@ private struct Arguments {
                 index += 1
                 continue
             }
+#if PROJECT_UPDATER_TESTING
+            if key == "--test-exit-after-swap" {
+                guard flags.insert(key).inserted else {
+                    try fail("duplicate \(key)")
+                }
+                index += 1
+                continue
+            }
+#endif
             guard key.hasPrefix("--"), index + 1 < argv.count else {
                 try fail("invalid argument near \(key)")
             }
@@ -88,6 +98,11 @@ private struct Arguments {
         }
         signature = signatureData
         verifyOnly = flags.contains("--verify-only")
+#if PROJECT_UPDATER_TESTING
+        testExitAfterSwap = flags.contains("--test-exit-after-swap")
+#else
+        testExitAfterSwap = false
+#endif
         guard arch == "arm64" || arch == "x64" else {
             try fail("--arch must be arm64 or x64")
         }
@@ -473,6 +488,24 @@ private func waitForParent(_ pid: pid_t) throws {
     try fail("parent application did not exit within 60 seconds")
 }
 
+private func atomicExchange(_ target: URL, _ candidate: URL) throws {
+    let result = target.path.withCString { targetPath in
+        candidate.path.withCString { candidatePath in
+            renameatx_np(
+                AT_FDCWD,
+                targetPath,
+                AT_FDCWD,
+                candidatePath,
+                UInt32(RENAME_SWAP)
+            )
+        }
+    }
+    guard result == 0 else {
+        let error = String(cString: strerror(errno))
+        try fail("atomic App exchange is unavailable or failed: \(error)")
+    }
+}
+
 private func execute(_ arguments: Arguments) throws {
     guard let publicKeyData = Data(base64Encoded: publicKeyBase64),
           publicKeyData.count == 32 else {
@@ -526,26 +559,15 @@ private func execute(_ arguments: Arguments) throws {
     }
 
     try waitForParent(arguments.parentPID)
-    let backup = targetParent.appendingPathComponent(
-        ".Logseq.project-update-backup-\(UUID().uuidString).app",
-        isDirectory: true
-    )
-    try fm.moveItem(at: arguments.target, to: backup)
-    do {
-        try fm.moveItem(at: candidate, to: arguments.target)
-    } catch {
-        do {
-            try fm.moveItem(at: backup, to: arguments.target)
-        } catch let rollbackError {
-            try fail("install failed and rollback failed: \(error); rollback: \(rollbackError)")
-        }
-        throw error
+    try atomicExchange(arguments.target, candidate)
+#if PROJECT_UPDATER_TESTING
+    if arguments.testExitAfterSwap {
+        _exit(86)
     }
-    do {
-        try fm.removeItem(at: backup)
-    } catch {
-        fputs("[project-updater] WARNING backup cleanup failed: \(error)\n", stderr)
-    }
+#endif
+    // After the atomic swap, the old App is at `candidate` inside staging.
+    // The deferred staging cleanup removes it; a crash only leaves that hidden
+    // copy behind while the new App is already present at the target path.
     if arguments.relaunch {
         _ = try run("/usr/bin/open", [arguments.target.path])
     }
