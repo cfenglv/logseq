@@ -852,35 +852,48 @@ const makeSignedNativeUpdate = ({
 };
 
 const makeTraversalArchive = ({ archive, sentinel }) => {
-  const root = fs.mkdtempSync(
-    path.join(os.tmpdir(), "logseq-traversal-zip-"),
-  );
-  try {
-    fs.writeFileSync(path.join(root, "payload.txt"), "path traversal");
-    command("zip", ["-q", archive, "payload.txt"], { cwd: root });
-    const note = command("zipnote", [archive]).output;
-    assert.match(note, /^@ payload\.txt$/m);
-    const renamed = note.replace(
-      /^@ payload\.txt$/m,
-      `@ payload.txt\n@=../../../../../../private/tmp/${sentinel}`,
-    );
-    const result = spawnSync("zipnote", ["-w", archive], {
-      encoding: "utf8",
-      input: `${renamed}\n`,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    assert.equal(
-      result.status,
-      0,
-      `${result.stdout || ""}${result.stderr || ""}`,
-    );
-    assert.match(
-      command("zipinfo", ["-1", archive]).output,
-      new RegExp(sentinel),
-    );
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+  const name = Buffer.from("Logseq.app/../escape");
+  const payload = Buffer.from(`path traversal fixture ${sentinel}`);
+  let crc = 0xffffffff;
+  for (const byte of payload) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
   }
+  crc = (crc ^ 0xffffffff) >>> 0;
+
+  const local = Buffer.alloc(30);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt32LE(crc, 14);
+  local.writeUInt32LE(payload.length, 18);
+  local.writeUInt32LE(payload.length, 22);
+  local.writeUInt16LE(name.length, 26);
+
+  const central = Buffer.alloc(46);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt32LE(crc, 16);
+  central.writeUInt32LE(payload.length, 20);
+  central.writeUInt32LE(payload.length, 24);
+  central.writeUInt16LE(name.length, 28);
+
+  const centralOffset = local.length + name.length + payload.length;
+  const centralSize = central.length + name.length;
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(1, 8);
+  end.writeUInt16LE(1, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(centralOffset, 16);
+
+  fs.writeFileSync(
+    archive,
+    Buffer.concat([local, name, payload, central, name, end]),
+  );
+  assert.equal(command("zipinfo", ["-1", archive]).output, name.toString());
 };
 
 const nativeInstallArgs = ({
