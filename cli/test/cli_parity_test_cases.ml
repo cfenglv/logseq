@@ -738,45 +738,14 @@ let () =
         remove_tree root;
         fail_test (Printexc.to_string exn));
 
-  test
-    "CLI parity auth expiry falls back to JWT exp only when expires-at is absent"
-    (fun () ->
-      let unexpired_id_token = id_token () in
-      let expired_id_token =
-        id_token_with_claims
-          "{\"sub\":\"legacy-user\",\"email\":\"legacy@example.com\",\"exp\":1}"
-      in
-      let missing_exp_id_token =
-        id_token_with_claims "{\"sub\":\"legacy-user\"}"
-      in
-      let malformed_exp_id_token =
-        id_token_with_claims "{\"sub\":\"legacy-user\",\"exp\":\"invalid\"}"
-      in
-      expect_bool "unexpired legacy JWT is not expired" false
-        (Auth_state.expired_auth
-           (sample_auth ~id_token:(Some unexpired_id_token) ()));
-      expect_bool "expired legacy JWT is expired" true
-        (Auth_state.expired_auth
-           (sample_auth ~id_token:(Some expired_id_token) ()));
-      expect_bool "missing legacy id-token is expired" true
-        (Auth_state.expired_auth (sample_auth ~id_token:None ()));
-      expect_bool "malformed legacy id-token is expired" true
-        (Auth_state.expired_auth
-           (sample_auth ~id_token:(Some "not-a-jwt") ()));
-      expect_bool "legacy JWT without exp is expired" true
-        (Auth_state.expired_auth
-           (sample_auth ~id_token:(Some missing_exp_id_token) ()));
-      expect_bool "legacy JWT with malformed exp is expired" true
-        (Auth_state.expired_auth
-           (sample_auth ~id_token:(Some malformed_exp_id_token) ()));
+  test "CLI parity auth expired status uses expires-at strictly" (fun () ->
+      expect_bool "missing expires-at is expired" true
+        (Auth_state.expired_auth (sample_auth ()));
       expect_bool "past expires-at is expired" true
         (Auth_state.expired_auth
-           (sample_auth ~id_token:(Some unexpired_id_token)
-              ~expires_at:(Time.time_of_epoch_ms 0L) ()));
+           (sample_auth ~expires_at:(Time.time_of_epoch_ms 0L) ()));
       expect_bool "future expires-at is not expired" false
-        (Auth_state.expired_auth
-           (sample_auth ~id_token:(Some expired_id_token)
-              ~expires_at:Time.max_time ())));
+        (Auth_state.expired_auth (sample_auth ~expires_at:Time.max_time ())));
 
   test
     "CLI parity auth read derives legacy expiry and keeps explicit expiry authoritative"
@@ -891,6 +860,53 @@ let () =
                 (config ~root_dir:root
                    ~auth_path:(Node.Path.join [| root; "missing.json" |])
                    ())));
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
+  test "CLI parity auth read derives only missing expires-at from JWT exp"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-derived-expiry-" in
+      let hyphen_path = Node.Path.join [| root; "hyphen.json" |] in
+      let underscore_path = Node.Path.join [| root; "underscore.json" |] in
+      let explicit_path = Node.Path.join [| root; "explicit.json" |] in
+      let future_id_token = id_token ~sub:"legacy-user" () in
+      let expired_id_token =
+        id_token_with_claims "{\"sub\":\"legacy-user\",\"exp\":1}"
+      in
+      let read path =
+        expect_some ("stored auth " ^ path)
+          (expect_ok ("read auth " ^ path)
+             (effect_result ("read auth " ^ path)
+                (Auth_state.read_auth_file
+                   (config ~root_dir:root ~auth_path:path ()))))
+      in
+      try
+        write_file hyphen_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}\n"
+             (Js.Json.stringify (Js.Json.string future_id_token)));
+        write_file underscore_path
+          (Printf.sprintf
+             "{\"id_token\":%s,\"access_token\":\"legacy-access\",\"refresh_token\":\"legacy-refresh\",\"updated_at\":1735686000000}\n"
+             (Js.Json.stringify (Js.Json.string future_id_token)));
+        write_file explicit_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"refresh-token\":\"legacy-refresh\",\"expires-at\":4102444800000,\"updated-at\":1735686000000}\n"
+             (Js.Json.stringify (Js.Json.string expired_id_token)));
+        expect_int64 "hyphen JWT-derived expires-at" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "hyphen derived expires-at"
+                (read hyphen_path).expires_at));
+        expect_int64 "underscore JWT-derived expires-at" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "underscore derived expires-at"
+                (read underscore_path).expires_at));
+        expect_int64 "explicit expires-at remains authoritative"
+          4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "explicit expires-at" (read explicit_path).expires_at));
         remove_tree root
       with exn ->
         remove_tree root;
