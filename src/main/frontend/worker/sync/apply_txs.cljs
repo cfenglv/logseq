@@ -1280,15 +1280,17 @@
        (keep tx-item-created-block-uuid-entry)
        (into {})))
 
-(defn- drop-stale-rebase-target-ops
-  "Drop updates to blocks that existed before rebase, were removed by remote
-  txs, and are not recreated by this tx.
+(defn- normalize-rebase-target-ops
+  "Resolve legacy targets for blocks that survived remote replay, and drop
+  targets removed by remote txs that are not recreated by this tx.
 
   Older pending :transact ops can contain numeric entity ids or bare UUID
-  strings, while normalized rows use block UUID lookup refs. A missing lookup
-  ref rejects the whole mixed tx; a stale numeric id or UUID string can instead
-  create a partial entity without :block/uuid. Keep unrelated targets in the
-  same pending tx so their local changes still rebase."
+  strings, which DataScript can interpret as stale ids or fresh tempids even
+  when the block still exists. Resolve those targets to stable UUID lookup refs.
+  Preserve actual tempids that declare :block/uuid in the same tx. A missing
+  lookup ref rejects the whole mixed tx; a stale numeric id or UUID string can
+  instead create a partial entity without :block/uuid. Keep unrelated targets
+  in the same pending tx so their local changes still rebase."
   [current-db rebase-db-before tx-data]
   (let [temp-id->uuid (tx-temp-id->uuid tx-data)
         created-block-uuids (into (set (vals temp-id->uuid))
@@ -1300,15 +1302,32 @@
                             (let [target (if (map? item)
                                            (:db/id item)
                                            (tx-item-entity item))]
-                              (tx-entity-uuid rebase-db-before temp-id->uuid target)))
+                              (if (contains? temp-id->uuid target)
+                                (get temp-id->uuid target)
+                                (tx-entity-uuid rebase-db-before temp-id->uuid target))))
         stale-block-uuids (->> tx-data
                                (keep target-block-uuid)
                                (remove created-block-uuids)
                                (filter #(nil? (d/entity current-db [:block/uuid %])))
                                set)]
-    (remove (fn [item]
-              (contains? stale-block-uuids (target-block-uuid item)))
-            tx-data)))
+    (keep (fn [item]
+            (let [target (if (map? item)
+                           (:db/id item)
+                           (tx-item-entity item))
+                  block-uuid (target-block-uuid item)]
+              (when-not (contains? stale-block-uuids block-uuid)
+                (if (and (or (vector? item) (map? item))
+                         (or (number? target)
+                             (and (string? target)
+                                  (common-util/uuid-string? target)))
+                         (not (contains? temp-id->uuid target))
+                         block-uuid
+                         (d/entity current-db [:block/uuid block-uuid]))
+                  (if (map? item)
+                    (assoc item :db/id [:block/uuid block-uuid])
+                    (assoc item 1 [:block/uuid block-uuid]))
+                  item))))
+          tx-data)))
 
 (defn- local-conflict-block-uuids
   [db local-txs]
@@ -1706,7 +1725,7 @@
     (let [[tx-data tx-meta] args
           tx-data (cond->> tx-data
                     rebase-db-before
-                    (drop-stale-rebase-target-ops @conn rebase-db-before))
+                    (normalize-rebase-target-ops @conn rebase-db-before))
           tx-data (expand-block-retracts-to-descendants @conn tx-data)]
       (when-let [tx-data (seq tx-data)]
         (ldb/transact! conn tx-data tx-meta)))))

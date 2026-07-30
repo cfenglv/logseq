@@ -6528,6 +6528,116 @@
         (is (empty? (:errors validation))
             (str (:errors validation)))))))
 
+(deftest rebase-transact-resolves-existing-bare-uuid-target-test
+  (testing "legacy bare UUID targets update the existing block in a mixed tx"
+    (let [{:keys [conn parent child1 child2]} (setup-parent-child)
+          existing-uuid (:block/uuid child1)
+          surviving-uuid (:block/uuid child2)
+          parent-uuid (:block/uuid parent)
+          page-uuid (:block/uuid (:block/page parent))
+          inserted-uuid (random-uuid)
+          inserted-tempid (str (random-uuid))
+          numeric-inserted-uuid (random-uuid)
+          numeric-inserted-tempid -1
+          rebase-db-before @conn
+          legacy-t 536870917]
+      ;; The legacy client-op row stores the existing block UUID as a bare
+      ;; string entity id. DataScript otherwise treats that string as a fresh
+      ;; tempid and the worker pipeline rejects the resulting UUID-less block.
+      (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+      (ldb/batch-transact-with-temp-conn!
+       conn
+       {:rtc-tx? true}
+       (fn [temp-conn]
+         (ldb/transact! temp-conn
+                        [[:db/add [:block/uuid surviving-uuid]
+                          :block/updated-at
+                          1770000000000]]
+                        {:transact-remote? true})
+         (#'sync-apply/replay-canonical-outliner-op!
+          temp-conn
+          [:transact
+           [[[:db/add (str existing-uuid)
+              :block/updated-at
+              1770000000001
+              legacy-t]
+             [:db/add (str existing-uuid)
+              :logseq.property/heading
+              3
+              legacy-t]
+             [:db/add (str existing-uuid)
+              :logseq.property.node/display-type
+              :math
+              legacy-t]
+             [:db/add [:block/uuid surviving-uuid]
+              :block/title
+              "surviving local change"
+              legacy-t]
+             [:db/add inserted-tempid :block/uuid inserted-uuid legacy-t]
+             [:db/add inserted-tempid :block/title "new local block" legacy-t]
+             [:db/add inserted-tempid
+              :block/parent
+              [:block/uuid parent-uuid]
+              legacy-t]
+             [:db/add inserted-tempid
+              :block/page
+              [:block/uuid page-uuid]
+              legacy-t]
+             [:db/add inserted-tempid :block/order "a4" legacy-t]
+             [:db/add inserted-tempid :block/created-at 1770000000001 legacy-t]
+             [:db/add inserted-tempid
+              :block/updated-at
+              1770000000001
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/uuid
+              numeric-inserted-uuid
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/title
+              "new numeric-tempid block"
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/parent
+              [:block/uuid parent-uuid]
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/page
+              [:block/uuid page-uuid]
+              legacy-t]
+             [:db/add numeric-inserted-tempid :block/order "a5" legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/created-at
+              1770000000001
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/updated-at
+              1770000000001
+              legacy-t]]
+            {:outliner-op :rebase
+             :db-sync/rebased-local? true}]]
+          rebase-db-before)))
+      (let [existing (d/entity @conn [:block/uuid existing-uuid])]
+        (is (= 1770000000001 (:block/updated-at existing)))
+        (is (= 3 (:logseq.property/heading existing)))
+        (is (= :math (:logseq.property.node/display-type existing))))
+      (is (= "surviving local change"
+             (:block/title (d/entity @conn [:block/uuid surviving-uuid]))))
+      (is (= "new local block"
+             (:block/title (d/entity @conn [:block/uuid inserted-uuid]))))
+      (is (= "new numeric-tempid block"
+             (:block/title
+              (d/entity @conn [:block/uuid numeric-inserted-uuid]))))
+      (is (empty?
+           (d/q '[:find [?e ...]
+                  :where
+                  [?e :logseq.property/heading 3]
+                  [(missing? $ ?e :block/uuid)]]
+                @conn)))
+      (let [validation (db-validate/validate-local-db! @conn)]
+        (is (empty? (:errors validation))
+            (str (:errors validation)))))))
+
 (deftest missing-parent-after-remote-delete-removes-descendants-test
   (testing "remote hard delete tx removes descendants when full delete tx-data is provided"
     (let [{:keys [conn parent child1]} (setup-parent-child)
