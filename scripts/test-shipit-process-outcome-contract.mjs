@@ -34,6 +34,192 @@ const functionBlock = (source, start, end, label) => {
   return block;
 };
 
+const escapeRegExp = (value) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const identityDeclarations = (source) =>
+  [...source.matchAll(
+    /\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*([\s\S]*?);/g,
+  )].filter(([, name, value]) =>
+    /CFBundleIdentifier|bundle(?:Identifier|Id|ID)/i.test(
+      `${name} ${value}`,
+    ),
+  );
+
+const hasNonEmptyGuard = (source, name) => {
+  const escaped = escapeRegExp(name);
+  return [
+    new RegExp(`assert(?:\\.ok)?\\s*\\(\\s*${escaped}\\b`),
+    new RegExp(
+      `assert\\.notEqual\\s*\\(\\s*${escaped}\\s*,\\s*["']\\s*["']`,
+    ),
+    new RegExp(
+      `if\\s*\\([\\s\\S]{0,400}!\\s*${escaped}\\b[\\s\\S]{0,400}\\)\\s*\\{?[\\s\\S]{0,250}?throw\\b`,
+    ),
+    new RegExp(
+      `if\\s*\\([\\s\\S]{0,400}${escaped}\\s*(?:===|==)\\s*["']\\s*["'][\\s\\S]{0,400}\\)\\s*\\{?[\\s\\S]{0,250}?throw\\b`,
+    ),
+    new RegExp(
+      `if\\s*\\([\\s\\S]{0,400}${escaped}\\.length\\s*(?:===|==|<=)\\s*0\\b[\\s\\S]{0,400}\\)\\s*\\{?[\\s\\S]{0,250}?throw\\b`,
+    ),
+  ].some((pattern) => pattern.test(source));
+};
+
+const assertDerivedMatchingBundleIdentifier = ({
+  block,
+  label,
+  moduleSource,
+}) => {
+  assert.match(
+    moduleSource,
+    /CFBundleIdentifier/,
+    `${label} never reads CFBundleIdentifier from an App Info.plist`,
+  );
+  const declarations = identityDeclarations(block);
+  const target = declarations.find(([, , value]) =>
+    /\btargetApp\b/.test(value),
+  );
+  const update = declarations.find(([, , value]) =>
+    /\bupdateApp\b/.test(value),
+  );
+  assert.ok(
+    target,
+    `${label} does not derive the request identity from targetApp`,
+  );
+  assert.ok(
+    update,
+    `${label} does not derive an identity from updateApp`,
+  );
+  const targetName = target[1];
+  const updateName = update[1];
+  assert.notEqual(
+    targetName,
+    updateName,
+    `${label} does not keep independently read target/update identities`,
+  );
+  assert.ok(
+    hasNonEmptyGuard(block, targetName) ||
+      hasNonEmptyGuard(block, updateName),
+    `${label} does not reject an empty bundle identity`,
+  );
+
+  const targetPattern = escapeRegExp(targetName);
+  const updatePattern = escapeRegExp(updateName);
+  const exactMatchGuards = [
+    new RegExp(
+      `if\\s*\\([\\s\\S]{0,400}\\b${targetPattern}\\b\\s*!==\\s*\\b${updatePattern}\\b[\\s\\S]{0,400}\\)\\s*\\{?[\\s\\S]{0,250}?throw\\b`,
+    ),
+    new RegExp(
+      `if\\s*\\([\\s\\S]{0,400}\\b${updatePattern}\\b\\s*!==\\s*\\b${targetPattern}\\b[\\s\\S]{0,400}\\)\\s*\\{?[\\s\\S]{0,250}?throw\\b`,
+    ),
+    new RegExp(
+      `assert\\.(?:equal|strictEqual|deepEqual)\\s*\\(\\s*${targetPattern}\\s*,\\s*${updatePattern}\\b`,
+    ),
+    new RegExp(
+      `assert\\.(?:equal|strictEqual|deepEqual)\\s*\\(\\s*${updatePattern}\\s*,\\s*${targetPattern}\\b`,
+    ),
+    new RegExp(
+      `if\\s*\\([\\s\\S]{0,400}!\\s*Object\\.is\\s*\\(\\s*${targetPattern}\\s*,\\s*${updatePattern}\\s*\\)[\\s\\S]{0,400}\\)\\s*\\{?[\\s\\S]{0,250}?throw\\b`,
+    ),
+    new RegExp(
+      `if\\s*\\([\\s\\S]{0,400}!\\s*Object\\.is\\s*\\(\\s*${updatePattern}\\s*,\\s*${targetPattern}\\s*\\)[\\s\\S]{0,400}\\)\\s*\\{?[\\s\\S]{0,250}?throw\\b`,
+    ),
+  ];
+  assert.ok(
+    exactMatchGuards.some((pattern) => pattern.test(block)),
+    `${label} does not reject a target/update bundle-identity mismatch`,
+  );
+
+  const explicitProperty = block.match(
+    /(?:["']bundleIdentifier["']|bundleIdentifier)\s*:\s*([^,\n}]+)/,
+  );
+  const shorthandProperty =
+    targetName === "bundleIdentifier" &&
+    /(?:\{|,)\s*bundleIdentifier\s*(?:,|\})/.test(block);
+  assert.ok(
+    explicitProperty || shorthandProperty,
+    `${label} does not write a bundleIdentifier into the ShipIt request`,
+  );
+  if (explicitProperty) {
+    const requestValue = explicitProperty[1].trim();
+    assert.doesNotMatch(
+      requestValue,
+      /^(?:null|undefined|["']\s*["'])$/,
+      `${label} writes a null or empty ShipIt request identity`,
+    );
+    assert.match(
+      requestValue,
+      new RegExp(`\\b${targetPattern}\\b`),
+      `${label} does not write the target App identity into the request`,
+    );
+  }
+};
+
+const identityContractControl = `
+  const targetBundleIdentifier = plistValue(
+    targetApp,
+    "CFBundleIdentifier",
+  );
+  const updateBundleIdentifier = plistValue(
+    updateApp,
+    "CFBundleIdentifier",
+  );
+  if (
+    !targetBundleIdentifier ||
+    targetBundleIdentifier !== updateBundleIdentifier
+  ) {
+    throw new Error("invalid fixture identity");
+  }
+  fs.writeFileSync(
+    statePath,
+    JSON.stringify({ bundleIdentifier: targetBundleIdentifier }),
+  );
+`;
+
+const verifyIdentityContractOracle = () => {
+  assert.doesNotThrow(() =>
+    assertDerivedMatchingBundleIdentifier({
+      block: identityContractControl,
+      label: "identity contract control",
+      moduleSource: identityContractControl,
+    }),
+  );
+  for (const [label, unsafe] of [
+    [
+      "null request identity",
+      identityContractControl.replace(
+        "bundleIdentifier: targetBundleIdentifier",
+        "bundleIdentifier: null",
+      ),
+    ],
+    [
+      "empty identity accepted",
+      identityContractControl.replace(
+        "!targetBundleIdentifier ||",
+        "false ||",
+      ),
+    ],
+    [
+      "mismatched identity accepted",
+      identityContractControl.replace(
+        "targetBundleIdentifier !== updateBundleIdentifier",
+        "false",
+      ),
+    ],
+  ]) {
+    assert.throws(
+      () =>
+        assertDerivedMatchingBundleIdentifier({
+          block: unsafe,
+          label,
+          moduleSource: unsafe,
+        }),
+      undefined,
+      `identity oracle accepted ${label}`,
+    );
+  }
+};
+
 const expectGateError = (input, predicate, label) => {
   assert.throws(
     () => classifyShipItOutcome(input),
@@ -61,6 +247,24 @@ test("production classifier separates success, unreadable request, and signal te
     }),
     "ShipIt exit=0 target-before=2.0.1-selfhost.5 target-after=2.0.1-selfhost.6",
   );
+
+  for (const [label, status, after] of [
+    ["unchanged target", 0, "2.0.1-selfhost.5"],
+    ["nonzero process", 1, "2.0.1-selfhost.6"],
+  ]) {
+    expectGateError(
+      {
+        status,
+        signal: null,
+        log: "",
+        before: "2.0.1-selfhost.5",
+        after,
+        newVersion: "2.0.1-selfhost.6",
+      },
+      (error) => assert.equal(error.kind, "install-failure"),
+      label,
+    );
+  }
 
   expectGateError(
     {
@@ -106,6 +310,7 @@ test("production classifier separates success, unreadable request, and signal te
 });
 
 test("physical ShipIt fixture supplies identity and treats signals as failures", () => {
+  verifyIdentityContractOracle();
   const runShipIt = functionBlock(
     physicalHarness,
     "runShipIt",
@@ -124,16 +329,11 @@ test("physical ShipIt fixture supplies identity and treats signals as failures",
     "sha256",
     "physical command",
   );
-  assert.match(
-    runShipIt,
-    /bundleIdentifier:\s*["']com\.logseq\.logseq["']/,
-    "physical ShipIt request omits its non-null bundle identity",
-  );
-  assert.doesNotMatch(
-    runShipIt,
-    /bundleIdentifier:\s*null/,
-    "physical ShipIt request retains the crashing null bundle identity",
-  );
+  assertDerivedMatchingBundleIdentifier({
+    block: runShipIt,
+    label: "physical ShipIt",
+    moduleSource: physicalHarness,
+  });
   assert.match(
     command,
     /signal:\s*result\.signal/,
@@ -178,16 +378,11 @@ test("production physical verifier supplies identity and preserves spawn signals
     "loadBaseline",
     "production ShipIt",
   );
-  assert.match(
-    runShipItInstall,
-    /bundleIdentifier:\s*["']com\.logseq\.logseq["']/,
-    "production ShipIt request omits its non-null bundle identity",
-  );
-  assert.doesNotMatch(
-    runShipItInstall,
-    /bundleIdentifier:\s*null/,
-    "production ShipIt request retains the crashing null bundle identity",
-  );
+  assertDerivedMatchingBundleIdentifier({
+    block: runShipItInstall,
+    label: "production ShipIt",
+    moduleSource: productionVerifier,
+  });
   assert.match(
     runShipItInstall,
     /signal:\s*result\.signal/,
