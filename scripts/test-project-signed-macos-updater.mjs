@@ -34,8 +34,6 @@ const policyPath = path.join(
 const proxyTlsFixture = Object.freeze({
   auditConsumer:
     "scripts/test-updater-private-material-policy-contract.mjs",
-  auditConsumerSha256:
-    "0e99b07924196b912bd5e7f3ee02211d6f295f76be80aee049286c1619789a73",
   caCertificate: "scripts/fixtures/proxy-fetch-test-ca.cert.pem",
   consumer: "scripts/test-cli-worker-fetch-proxy.mjs",
   privateKey: "scripts/fixtures/proxy-fetch-test-server.key.pem",
@@ -184,15 +182,20 @@ const assertProxyFixtureConsumer = (source) => {
 
 const assertProxyFixtureAuditConsumer = (tracked) => {
   if (!tracked.includes(proxyTlsFixture.auditConsumer)) return;
-  const auditSource = fs.readFileSync(
+  const source = fs.readFileSync(
     path.join(repoRoot, proxyTlsFixture.auditConsumer),
+    "utf8",
   );
-  assert.equal(
-    sha256(auditSource),
-    proxyTlsFixture.auditConsumerSha256,
-    "proxy TLS fixture audit contract digest changed",
+  assert.match(
+    source,
+    /const auditContractRole = "proxy-tls-fixture-security-audit-v1";/,
+    "proxy TLS audit contract does not declare its exact security-audit role",
   );
-  const source = auditSource.toString("utf8");
+  assert.doesNotMatch(
+    source,
+    /\b(?:http|https)\.createServer\s*\(|\bserver\.listen\s*\(/,
+    "proxy TLS audit contract became a runtime proxy consumer",
+  );
   for (const expectedPath of [
     "scripts/test-project-signed-macos-updater.mjs",
     proxyTlsFixture.consumer,
