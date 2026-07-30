@@ -1541,20 +1541,25 @@ const runShipIt = ({ baseline, candidate, tempRoot }) => {
   fs.mkdirSync(path.dirname(updateApp), { recursive: true });
   command("ditto", [baseline, targetApp]);
   command("ditto", [candidate, updateApp]);
-  const bundleIdentifier = command("plutil", [
+  const targetBundleIdentifier = command("plutil", [
     "-extract",
     "CFBundleIdentifier",
     "raw",
     path.join(targetApp, "Contents", "Info.plist"),
   ]).output;
+  const updateBundleIdentifier = command("plutil", [
+    "-extract",
+    "CFBundleIdentifier",
+    "raw",
+    path.join(updateApp, "Contents", "Info.plist"),
+  ]).output;
+  assert.ok(
+    targetBundleIdentifier,
+    "ShipIt fixture target App requires a bundle identifier",
+  );
   assert.equal(
-    command("plutil", [
-      "-extract",
-      "CFBundleIdentifier",
-      "raw",
-      path.join(updateApp, "Contents", "Info.plist"),
-    ]).output,
-    bundleIdentifier,
+    updateBundleIdentifier,
+    targetBundleIdentifier,
     "ShipIt fixture requires matching target and update bundle identifiers",
   );
   const statePath = path.join(tempRoot, "ShipItState.plist");
@@ -1563,7 +1568,7 @@ const runShipIt = ({ baseline, candidate, tempRoot }) => {
     JSON.stringify({
       updateBundleURL: new URL(`file://${updateApp}`).href,
       targetBundleURL: new URL(`file://${targetApp}`).href,
-      bundleIdentifier,
+      bundleIdentifier: targetBundleIdentifier,
       launchAfterInstallation: false,
       useUpdateBundleName: false,
     }),
