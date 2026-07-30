@@ -1084,6 +1084,16 @@ test("formal preflight and CI execute updater source, native, and provider contr
     /electron-test-preload\.cjs/,
     "full preflight does not preload its Node-only Electron test doubles",
   );
+  assert.match(
+    fullPreflight,
+    /path\.(?:join|resolve)\(\s*repoRoot,[\s\S]{0,180}electron-test-preload\.cjs/,
+    "full preflight only checks the preload filename instead of selecting a repo-rooted path",
+  );
+  assert.doesNotMatch(
+    fullPreflight,
+    /electronTestPreload\s*=\s*(?:preloadCandidate\s*\?\?\s*)?["']scripts\/fixtures\/electron-test-preload\.cjs["']/,
+    "full preflight retains a bare relative preload specifier",
+  );
   for (const commandName of [
     "test:selfhost-updater-source-contracts",
     "test:selfhost-updater-provider-contract",

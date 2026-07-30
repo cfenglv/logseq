@@ -13,6 +13,59 @@ const repoRoot = path.resolve(
 );
 const allowDirty = process.argv.includes("--allow-dirty");
 const cliDir = path.join(repoRoot, "cli");
+const electronTestPreloadProbe =
+  "--electron-test-preload-contract-probe";
+const probeIndex = process.argv.indexOf(electronTestPreloadProbe);
+const preloadCandidateIndex = process.argv.indexOf(
+  "--electron-test-preload-candidate",
+);
+const preloadCandidate =
+  preloadCandidateIndex === -1
+    ? null
+    : process.argv[preloadCandidateIndex + 1];
+if (preloadCandidateIndex !== -1 && !preloadCandidate) {
+  throw new Error("missing --electron-test-preload-candidate value");
+}
+if (preloadCandidateIndex !== -1 && probeIndex === -1) {
+  throw new Error(
+    "--electron-test-preload-candidate is restricted to the contract probe",
+  );
+}
+const electronTestPreload =
+  preloadCandidate ?? "scripts/fixtures/electron-test-preload.cjs";
+const electronTestInvocationFor = (testBundle, namespaceFilter) => ({
+  args: [
+    "--require",
+    electronTestPreload,
+    testBundle,
+    "-r",
+    namespaceFilter,
+    "-e",
+    "fix-me",
+  ],
+  command: process.execPath,
+  cwd: repoRoot,
+  shell: false,
+});
+if (probeIndex !== -1) {
+  const namespaceFilter = [
+    "^(electron\\.",
+    "(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|",
+    "frontend\\.handler\\.db-based\\.(rtc-background-tasks|sync)-test|",
+    "frontend\\.worker\\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|",
+    "frontend\\.worker\\.sync\\..*-test|logseq\\.cli\\.command\\.sync-test|",
+    "logseq\\.db-worker\\.daemon-test)$",
+  ].join("");
+  console.log(
+    `ELECTRON_TEST_PRELOAD_CONTRACT ${JSON.stringify(
+      electronTestInvocationFor(
+        ["static", "tests.js"].join("/"),
+        namespaceFilter,
+      ),
+    )}`,
+  );
+  process.exit(0);
+}
 
 const run = (label, command, args, options = {}) => {
   const startedAt = Date.now();
@@ -98,19 +151,19 @@ pnpm("isolated desktop test install", [
   "--ignore-workspace",
 ]);
 pnpm("desktop release contract tests", ["desktop:test-release-contracts"]);
+const electronTestNamespaceFilter =
+  "^(electron\\.(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|frontend\\.handler\\.db-based\\.(rtc-background-tasks|sync)-test|frontend\\.worker\\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\\.worker\\.sync\\..*-test|logseq\\.cli\\.command\\.sync-test|logseq\\.db-worker\\.daemon-test)$";
+const electronTestInvocation =
+  electronTestInvocationFor(
+    "static/tests.js",
+    electronTestNamespaceFilter,
+  );
 run(
   "RTC client and Electron tests",
-  process.execPath,
-  [
-    "--require",
-    "scripts/fixtures/electron-test-preload.cjs",
-    "static/tests.js",
-    "-r",
-    "^(electron\\.(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|frontend\\.handler\\.db-based\\.(rtc-background-tasks|sync)-test|frontend\\.worker\\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\\.worker\\.sync\\..*-test|logseq\\.cli\\.command\\.sync-test|logseq\\.db-worker\\.daemon-test)$",
-    "-e",
-    "fix-me",
-  ],
+  electronTestInvocation.command,
+  electronTestInvocation.args,
   {
+    cwd: electronTestInvocation.cwd,
     env: { LOGSEQ_STABLE_IDENTS: "1" },
     timeout: 45 * 60 * 1000,
   },
