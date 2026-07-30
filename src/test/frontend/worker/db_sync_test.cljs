@@ -1658,6 +1658,123 @@
                    drop-txs))
             (is (= [valid-tx-id] (mapv :tx-id tx-entries)))))))))
 
+(deftest prepare-upload-tx-entries-recovers-legacy-rebased-delete-outliner-op-test
+  (testing "legacy semantic delete rebases upload with delete sanitation while raw and non-delete rebases stay rebases"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          delete-blocks-tx-id (random-uuid)
+          delete-page-tx-id (random-uuid)
+          raw-empty-tx-id (random-uuid)
+          raw-transact-tx-id (random-uuid)
+          insert-tx-id (random-uuid)
+          delete-block-uuids (vec (repeatedly 521 random-uuid))
+          delete-page-uuid (random-uuid)
+          child-uuid (:block/uuid child1)]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id delete-blocks-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:delete-blocks [delete-block-uuids {}]]]
+             :db-sync/normalized-tx-data
+             (mapv (fn [block-uuid]
+                     [:db/retractEntity [:block/uuid block-uuid]])
+                   delete-block-uuids)}
+            {:db-sync/tx-id delete-page-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 2
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:delete-page [delete-page-uuid]]]
+             :db-sync/normalized-tx-data
+             [[:db/retractEntity [:block/uuid delete-page-uuid]]]}
+            {:db-sync/tx-id raw-empty-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 3
+             :db-sync/outliner-op :rebase
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid child-uuid] :block/title "raw empty ops"]]}
+            {:db-sync/tx-id raw-transact-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 4
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:transact [[[:db/add [:block/uuid child-uuid]
+                             :block/title
+                             "raw transact"]]
+                           nil]]]
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid child-uuid] :block/title "raw transact"]]}
+            {:db-sync/tx-id insert-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 5
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:insert-blocks [[{:block/uuid (random-uuid)
+                                 :block/title "semantic insert"}]
+                               child-uuid
+                               {:sibling? false}]]]
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid child-uuid] :block/title "semantic insert"]]}])
+          (let [pending (#'sync-apply/pending-txs test-repo)
+                {:keys [tx-entries drop-tx-ids]}
+                (sync-apply/prepare-upload-tx-entries test-repo conn pending)
+                entry-by-id (into {} (map (juxt :tx-id identity)) tx-entries)]
+            (is (every? #(= :rebase (:outliner-op %)) pending))
+            (is (empty? drop-tx-ids))
+            (is (= 521 (count (:tx-data (get entry-by-id delete-blocks-tx-id)))))
+            (is (= :delete-blocks
+                   (:outliner-op (get entry-by-id delete-blocks-tx-id))))
+            (is (= :delete-page
+                   (:outliner-op (get entry-by-id delete-page-tx-id))))
+            (is (= :rebase (:outliner-op (get entry-by-id raw-empty-tx-id))))
+            (is (= :rebase (:outliner-op (get entry-by-id raw-transact-tx-id))))
+            (is (= :rebase (:outliner-op (get entry-by-id insert-tx-id))))))))))
+
+(deftest tx-meta-outliner-op-recovers-only-semantic-delete-rebases-test
+  (testing "future semantic delete rebases persist their server sanitation tag without reclassifying fallbacks"
+    (is (= :delete-blocks
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks
+             :db-sync/forward-outliner-ops [[:delete-blocks [[(random-uuid)] {}]]]})))
+    (is (= :delete-page
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-page
+             :db-sync/forward-outliner-ops [[:delete-page [(random-uuid)]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks
+             :db-sync/forward-outliner-ops
+             [[:transact [[[:db/retractEntity [:block/uuid (random-uuid)]]]
+                           nil]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks
+             :db-sync/forward-outliner-ops
+             [[:delete-blocks [[(random-uuid)] {}]]
+              [:save-block [{:block/uuid (random-uuid)}]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :save-block
+             :db-sync/forward-outliner-ops [[:delete-blocks [[(random-uuid)] {}]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :insert-blocks
+             :db-sync/forward-outliner-ops [[:insert-blocks [[] nil {}]]]})))))
+
 (defn- large-block-insert-upload-tx
   [page-uuid parent-uuid block-count]
   (vec
@@ -8965,7 +9082,7 @@
             (.finally done))))))
 
 (deftest rebase-persisted-row-contains-forward-and-inverse-outliner-ops-test
-  (testing "rebased pending tx should always persist both forward and inverse outliner ops"
+  (testing "rebased pending deletes persist their semantic upload tag and both history directions"
     (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)
           tx-id-holder (atom nil)]
       (with-datascript-conns conn client-ops-conn
@@ -8984,7 +9101,7 @@
 
           (let [pending-after (#'sync-apply/pending-tx-by-id test-repo @tx-id-holder)]
             (is (some? pending-after))
-            (is (= :rebase (:outliner-op pending-after)))
+            (is (= :delete-blocks (:outliner-op pending-after)))
             (is (seq (:forward-outliner-ops pending-after)))
             (is (seq (:inverse-outliner-ops pending-after)))))))))
 

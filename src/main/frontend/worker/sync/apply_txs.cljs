@@ -373,11 +373,34 @@
        (not (:redo? tx-meta))
        (not= :batch-import-edn (:outliner-op tx-meta))))
 
+(def ^:private server-delete-outliner-ops
+  #{:delete-blocks
+    :delete-page})
+
+(defn- singleton-semantic-delete-outliner-op
+  "Recover the server sanitation tag only from an unambiguous canonical delete.
+  Legacy pending rows can already be persisted as :rebase, while raw fallbacks
+  and mixed semantic rebases must retain generic rebase behavior."
+  [outliner-op forward-outliner-ops]
+  (when (and (= :rebase outliner-op)
+             (= 1 (count forward-outliner-ops)))
+    (let [semantic-op (ffirst forward-outliner-ops)]
+      (when (contains? server-delete-outliner-ops semantic-op)
+        semantic-op))))
+
 (defn- tx-meta-outliner-op
   [tx-meta]
-  (or (:outliner-op tx-meta)
-      (when (:db-migrate? tx-meta)
-        :db-migrate)))
+  (let [outliner-op (:outliner-op tx-meta)
+        semantic-delete-op
+        (singleton-semantic-delete-outliner-op
+         outliner-op
+         (or (:db-sync/forward-outliner-ops tx-meta)
+             (:forward-outliner-ops tx-meta)))]
+    (or (when (= (:original-outliner-op tx-meta) semantic-delete-op)
+          semantic-delete-op)
+        outliner-op
+        (when (:db-migrate? tx-meta)
+          :db-migrate))))
 
 (defn- apply-tx-meta
   [remote-tx]
@@ -688,9 +711,13 @@
   ([conn pending]
    (prepare-upload-tx-entries nil conn pending))
   ([repo conn pending]
-   (let [entries (mapv (fn [{:keys [tx-id tx outliner-op]}]
+   (let [entries (mapv (fn [{:keys [tx-id tx outliner-op forward-outliner-ops]}]
                          {:tx-id tx-id
-                          :outliner-op outliner-op
+                          :outliner-op
+                          (or (singleton-semantic-delete-outliner-op
+                               outliner-op
+                               forward-outliner-ops)
+                              outliner-op)
                           :tx-data (vec tx)})
                        pending)
          empty-tx-ids (->> entries
