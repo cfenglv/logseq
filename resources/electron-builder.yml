@@ -1,5 +1,6 @@
 appId: com.logseq.logseq
 electronUpdaterCompatibility: ">=2.16"
+beforePack: ./electron-builder-verify-runtime-revisions.cjs
 
 directories:
   buildResources: .

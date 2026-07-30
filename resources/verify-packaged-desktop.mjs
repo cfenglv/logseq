@@ -15,6 +15,7 @@ import {
 const require = createRequire(import.meta.url);
 const asar = require("@electron/asar");
 const stagedResourcesDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(stagedResourcesDir, "..");
 
 const parseArgs = (argv) => {
   if (argv[0] === "--") argv = argv.slice(1);
@@ -37,6 +38,13 @@ const expectedArch = args.arch;
 const expectedVersion = args.version;
 const expectedElectron =
   args["electron-version"] || require("./package.json").devDependencies.electron;
+const expectedRevision =
+  process.env.LOGSEQ_REVISION?.trim() ||
+  spawnSync("git", ["describe", "--long", "--always", "--dirty"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    shell: false,
+  }).stdout?.trim();
 
 if (!["darwin", "linux", "win32"].includes(expectedPlatform)) {
   throw new Error(`unsupported --platform: ${expectedPlatform}`);
@@ -46,6 +54,11 @@ if (!["x64", "arm64"].includes(expectedArch)) {
 }
 if (!expectedVersion) {
   throw new Error("--version is required");
+}
+if (!expectedRevision) {
+  throw new Error(
+    "could not determine the expected desktop runtime revision",
+  );
 }
 
 const findFiles = (directory, fileName, results = []) => {
@@ -225,6 +238,25 @@ if (packageJson.main !== "electron.js") {
   throw new Error(`packaged app main is ${packageJson.main}, expected electron.js`);
 }
 
+for (const relativePath of [
+  "js/logseq-cli.js",
+  "js/db-worker-node.js",
+]) {
+  const packagedPayload = asar.extractFile(appAsar, relativePath);
+  const stagedPath = path.join(stagedResourcesDir, relativePath);
+  const stagedPayload = fs.readFileSync(stagedPath);
+  if (!packagedPayload.equals(stagedPayload)) {
+    throw new Error(
+      `packaged ${relativePath} does not exactly match staged runtime ${stagedPath}`,
+    );
+  }
+  if (!packagedPayload.includes(expectedRevision)) {
+    throw new Error(
+      `packaged ${relativePath} does not contain current revision ${expectedRevision}`,
+    );
+  }
+}
+
 if (expectedPlatform === process.platform && expectedArch === process.arch) {
   const result = spawnSync(
     mainExecutable,
@@ -245,5 +277,5 @@ if (expectedPlatform === process.platform && expectedArch === process.arch) {
 }
 
 console.log(
-  `[verify-packaged-desktop] OK platform=${expectedPlatform} arch=${expectedArch} version=${expectedVersion}`,
+  `[verify-packaged-desktop] OK platform=${expectedPlatform} arch=${expectedArch} version=${expectedVersion} revision=${expectedRevision}`,
 );

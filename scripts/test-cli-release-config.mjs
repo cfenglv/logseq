@@ -204,6 +204,9 @@ const macosUpdaterBaseline = readJson(
 const packagedDesktopVerifier = readText(
   "resources/verify-packaged-desktop.mjs",
 );
+const desktopRuntimeRevisionBuilderHook = readText(
+  "resources/electron-builder-verify-runtime-revisions.cjs",
+);
 const packagedResourceContract = readText(
   "resources/packaged-resource-contract.mjs",
 );
@@ -420,11 +423,51 @@ assert.match(
   /publish:\s+- provider: github\s+owner: cfenglv\s+repo: logseq/,
   "packaged selfhost clients should read updates from the fork release feed",
 );
+assert.match(
+  desktopBuilderConfig,
+  /beforePack:\s+\.\/electron-builder-verify-runtime-revisions\.cjs/,
+  "all Electron builder entry points should verify runtime revisions before packaging",
+);
+assert.match(
+  desktopRuntimeRevisionBuilderHook,
+  /verify-desktop-runtime-revisions\.mjs/,
+  "the Electron builder hook should invoke the canonical runtime revision verifier",
+);
+assert.match(
+  desktopRuntimeRevisionBuilderHook,
+  /spawnSync\(process\.execPath/,
+  "the Electron builder hook should execute the verifier without a shell",
+);
+for (const relativePath of [
+  "js/logseq-cli.js",
+  "js/db-worker-node.js",
+]) {
+  assert.match(
+    packagedDesktopVerifier,
+    new RegExp(relativePath.replaceAll("/", "[\\\\/]")),
+    `package verification should inspect the CLI runtime ${relativePath}`,
+  );
+}
+assert.match(
+  packagedDesktopVerifier,
+  /packagedPayload\.equals\(stagedPayload\)/,
+  "package verification should compare CLI runtime bytes with the staged files",
+);
+assert.match(
+  packagedDesktopVerifier,
+  /packagedPayload\.includes\(expectedRevision\)/,
+  "package verification should require the current revision in CLI runtimes",
+);
 
 assert.match(
   rootPackage.scripts["desktop:verify-runtime-revisions"],
   /verify-desktop-runtime-revisions\.mjs/,
   "package.json should expose desktop runtime revision verification",
+);
+assert.match(
+  rootPackage.scripts["desktop:test-release-contracts"],
+  /^node \.\/scripts\/test-desktop-runtime-packaging-contract\.mjs &&/,
+  "desktop release contracts should execute the runtime packaging hook test",
 );
 assert.match(
   desktopPackagingGulpfile,

@@ -112,6 +112,7 @@ for (const relativePath of [
   "pnpm-lock.yaml",
   "resources/pnpm-lock.yaml",
   "resources/electron-builder.yml",
+  "resources/electron-builder-verify-runtime-revisions.cjs",
   "resources/electron-builder.unsigned.yml",
   "resources/electron-builder-unsigned.mjs",
   "resources/electron-builder-adhoc-after-sign.cjs",
@@ -134,6 +135,7 @@ for (const relativePath of [
   "scripts/test-project-update-helper-e2e.mjs",
   "scripts/verify-project-signed-macos-update.mjs",
   "scripts/test-desktop-sidecar-release-contract.mjs",
+  "scripts/test-desktop-runtime-packaging-contract.mjs",
   "scripts/test-desktop-preflight-preload-contract.mjs",
   "scripts/test-project-signing-policy-contract.mjs",
   "scripts/test-project-signed-macos-updater.mjs",
@@ -192,7 +194,7 @@ if (
 }
 if (
   rootPackage.scripts?.["desktop:test-release-contracts"] !==
-  "node ./scripts/test-updater-private-material-policy-contract.mjs && node ./scripts/test-shipit-process-outcome-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract && node ./scripts/test-desktop-preflight-preload-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --isolated-signer-algorithm-contract && node ./scripts/test-project-signed-macos-updater.mjs --managed-signer-native-key-alignment-contract && node ./scripts/test-project-signing-policy-contract.mjs && node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
+  "node ./scripts/test-desktop-runtime-packaging-contract.mjs && node ./scripts/test-updater-private-material-policy-contract.mjs && node ./scripts/test-shipit-process-outcome-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract && node ./scripts/test-desktop-preflight-preload-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --isolated-signer-algorithm-contract && node ./scripts/test-project-signed-macos-updater.mjs --managed-signer-native-key-alignment-contract && node ./scripts/test-project-signing-policy-contract.mjs && node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
 ) {
   fail("package.json must expose the exact desktop release contract gate");
 }
@@ -376,6 +378,11 @@ assertNotContains(
 const desktopBuilder = readText("resources/electron-builder.yml");
 assertContains(desktopBuilder, "- from: sidecar\n    to: sidecar", "desktop sidecar packaging");
 assertNotContains(desktopBuilder, "- from: ../sidecar", "desktop sidecar packaging");
+assertContains(
+  desktopBuilder,
+  "beforePack: ./electron-builder-verify-runtime-revisions.cjs",
+  "desktop runtime revision gate",
+);
 const desktopRuntimePreparation = readText("scripts/prepare-desktop-runtime-js.mjs");
 for (const needle of ['"sidecar", "embedding_server.py"', '"static"', '"sidecar"']) {
   assertContains(desktopRuntimePreparation, needle, "desktop sidecar staging");
