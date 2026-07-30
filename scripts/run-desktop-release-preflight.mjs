@@ -13,6 +13,8 @@ const repoRoot = path.resolve(
 );
 const allowDirty = process.argv.includes("--allow-dirty");
 const cliDir = path.join(repoRoot, "cli");
+const electronTestPreloadRelativePath =
+  "scripts/fixtures/electron-test-preload.cjs";
 const electronTestPreloadPath = path.join(
   repoRoot,
   "scripts",
@@ -37,8 +39,87 @@ if (preloadCandidateIndex !== -1 && probeIndex === -1) {
     "--electron-test-preload-candidate is restricted to the contract probe",
   );
 }
-const electronTestPreload =
-  preloadCandidate ?? electronTestPreloadPath;
+const requireSafeElectronTestPreload = (candidate) => {
+  if (!path.isAbsolute(candidate)) {
+    throw new Error("Electron test preload must be an absolute path");
+  }
+  if (candidate !== electronTestPreloadPath) {
+    throw new Error(
+      `Electron test preload must be ${electronTestPreloadPath}`,
+    );
+  }
+
+  let preloadStat;
+  try {
+    preloadStat = fs.lstatSync(candidate);
+  } catch (error) {
+    throw new Error(`Electron test preload is unavailable: ${candidate}`, {
+      cause: error,
+    });
+  }
+  if (preloadStat.isSymbolicLink() || !preloadStat.isFile()) {
+    throw new Error(
+      "Electron test preload must be a regular, non-symlink file",
+    );
+  }
+
+  const realRepoRoot = fs.realpathSync(repoRoot);
+  const realPreloadPath = fs.realpathSync(candidate);
+  const expectedRealPreloadPath = path.join(
+    realRepoRoot,
+    "scripts",
+    "fixtures",
+    "electron-test-preload.cjs",
+  );
+  const realPreloadRelativePath = path.relative(
+    realRepoRoot,
+    realPreloadPath,
+  );
+  const realPreloadIsInRepo =
+    realPreloadRelativePath !== "" &&
+    realPreloadRelativePath !== ".." &&
+    !realPreloadRelativePath.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(realPreloadRelativePath);
+  if (
+    !realPreloadIsInRepo ||
+    realPreloadPath !== expectedRealPreloadPath
+  ) {
+    throw new Error(
+      "Electron test preload realpath must remain at its repository path",
+    );
+  }
+
+  const tracked = spawnSync(
+    "git",
+    [
+      "ls-files",
+      "--error-unmatch",
+      "--",
+      electronTestPreloadRelativePath,
+    ],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (
+    tracked.error ||
+    tracked.status !== 0 ||
+    tracked.stdout.trim() !== electronTestPreloadRelativePath
+  ) {
+    throw new Error(
+      `Electron test preload must be tracked at ${electronTestPreloadRelativePath}`,
+      { cause: tracked.error },
+    );
+  }
+
+  return candidate;
+};
+const electronTestPreload = requireSafeElectronTestPreload(
+  preloadCandidate ?? electronTestPreloadPath,
+);
 const electronTestInvocationFor = (testBundle, namespaceFilter) => ({
   args: [
     "--require",
