@@ -27,11 +27,156 @@ const test = (name, callback) => cases.push([name, callback]);
 const functionBlock = (source, start, end, label) => {
   const block = source.match(
     new RegExp(
-      `(?:export )?const ${start} = [\\s\\S]*?(?=\\n(?:export )?const ${end} = )`,
+      `(?:export )?const ${start}\\s*=\\s*[\\s\\S]*?(?=\\n(?:export )?const ${end}\\s*=)`,
     ),
   )?.[0];
   assert.ok(block, `${label} function block is missing`);
   return block;
+};
+
+const sourceDeclarations = (source) =>
+  new Map(
+    [...source.matchAll(
+      /\bconst\s+([A-Za-z_$][\w$]*)\s*=\s*([\s\S]*?);/g,
+    )].map(([, name, value]) => [name, value.trim()]),
+  );
+
+const compactSource = (source) => source.replace(/\s+/g, "");
+
+const expandDeclaration = (name, declarations, seen = new Set()) => {
+  if (seen.has(name)) return name;
+  const value = declarations.get(name);
+  if (!value) return name;
+  const nextSeen = new Set(seen).add(name);
+  let expanded = value;
+  for (const dependency of declarations.keys()) {
+    if (
+      dependency !== name &&
+      new RegExp(`\\b${escapeRegExp(dependency)}\\b`).test(expanded)
+    ) {
+      expanded = expanded.replaceAll(
+        new RegExp(`\\b${escapeRegExp(dependency)}\\b`, "g"),
+        `(${expandDeclaration(dependency, declarations, nextSeen)})`,
+      );
+    }
+  }
+  return expanded;
+};
+
+const assertIsolatedShipItCacheContract = ({
+  block,
+  cleanupBlock,
+  label,
+}) => {
+  const declarations = sourceDeclarations(block);
+  const state = [...declarations].find(([, value]) =>
+    /ShipItState\.plist/.test(value),
+  );
+  assert.ok(
+    state,
+    `${label} does not use the Squirrel ShipItState.plist filename`,
+  );
+  const [stateName] = state;
+  const stateClosure = compactSource(
+    expandDeclaration(stateName, declarations),
+  );
+  for (const segment of ["Library", "Caches", "ShipItState.plist"]) {
+    assert.ok(
+      stateClosure.includes(segment),
+      `${label} state path omits ${segment}`,
+    );
+  }
+
+  const fixedHomeMatch = block.match(
+    /\bCFFIXED_USER_HOME\s*:\s*([A-Za-z_$][\w$]*)/,
+  );
+  const homeMatch = block.match(
+    /(?:^|[,{]\s*)HOME\s*:\s*([A-Za-z_$][\w$]*)/m,
+  );
+  assert.ok(
+    fixedHomeMatch && homeMatch,
+    `${label} does not override both CFFIXED_USER_HOME and HOME`,
+  );
+  assert.equal(
+    fixedHomeMatch[1],
+    homeMatch[1],
+    `${label} gives ShipIt different fixed and process homes`,
+  );
+  const homeName = fixedHomeMatch[1];
+  const homeClosure = compactSource(
+    expandDeclaration(homeName, declarations),
+  );
+  assert.match(
+    homeClosure,
+    /\b(?:tempRoot|installRoot)\b/,
+    `${label} fixed home is not isolated under its temporary fixture`,
+  );
+  assert.ok(
+    stateClosure.includes(homeClosure),
+    `${label} writes state outside the HOME/CFFIXED_USER_HOME cache tree`,
+  );
+
+  const spawnArgs = block.match(
+    new RegExp(
+      `\\[\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*${escapeRegExp(stateName)}\\s*\\]`,
+    ),
+  );
+  assert.ok(
+    spawnArgs,
+    `${label} does not pass one job label with its state path`,
+  );
+  const jobName = spawnArgs[1];
+  const jobClosure = compactSource(
+    expandDeclaration(jobName, declarations),
+  );
+  assert.notEqual(
+    jobClosure,
+    jobName,
+    `${label} job label is not an explicit fixture value`,
+  );
+  assert.match(jobClosure, /ShipIt/, `${label} job label is not a ShipIt job`);
+  assert.ok(
+    stateClosure.includes(jobClosure),
+    `${label} state directory and spawned job label do not match`,
+  );
+
+  const cacheDirectory = [...declarations].find(([name]) => {
+    if (name === stateName) return false;
+    const closure = compactSource(expandDeclaration(name, declarations));
+    return (
+      closure.includes("Library") &&
+      closure.includes("Caches") &&
+      closure.includes(homeClosure) &&
+      closure.includes(jobClosure)
+    );
+  });
+  const mkdirTarget = cacheDirectory
+    ? escapeRegExp(cacheDirectory[0])
+    : `path\\.dirname\\(\\s*${escapeRegExp(stateName)}\\s*\\)`;
+  const mkdir = block.match(
+    new RegExp(
+      `fs\\.mkdirSync\\(\\s*${mkdirTarget}\\s*,\\s*\\{[\\s\\S]*?recursive\\s*:\\s*true[\\s\\S]*?\\}\\s*\\)`,
+    ),
+  );
+  assert.ok(
+    mkdir,
+    `${label} does not create its dedicated job cache directory`,
+  );
+  assert.ok(
+    block.indexOf(mkdir[0]) < block.indexOf("fs.writeFileSync"),
+    `${label} writes state before creating its job cache directory`,
+  );
+
+  assert.match(
+    cleanupBlock,
+    /finally\s*\{/,
+    `${label} fixture has no unconditional cleanup`,
+  );
+  assert.match(
+    cleanupBlock,
+    /fs\.rmSync\(\s*tempRoot\s*,\s*\{[\s\S]*?recursive\s*:\s*true[\s\S]*?force\s*:\s*true[\s\S]*?\}\s*\)/,
+    `${label} does not recursively clean its isolated fixture home`,
+  );
 };
 
 const escapeRegExp = (value) =>
@@ -371,6 +516,33 @@ test("physical ShipIt fixture supplies identity and treats signals as failures",
   );
 });
 
+test("physical ShipIt fixture writes state in its isolated Squirrel cache", () => {
+  const runShipIt = functionBlock(
+    physicalHarness,
+    "runShipIt",
+    "physicalAdHocWeakness",
+    "physical ShipIt",
+  );
+  const physicalAdHocWeakness = functionBlock(
+    physicalHarness,
+    "physicalAdHocWeakness",
+    "explicitCertificateHashConsumerProbe",
+    "physical ShipIt cleanup",
+  );
+  assertIsolatedShipItCacheContract({
+    block: runShipIt,
+    cleanupBlock: physicalAdHocWeakness,
+    label: "physical ShipIt",
+  });
+  assert.equal(
+    JSON.parse(read("package.json")).scripts[
+      "project-update:test-physical-shipit-contract"
+    ],
+    "node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract",
+    "physical ShipIt gate must run in its default environment",
+  );
+});
+
 test("production physical verifier supplies identity and preserves spawn signals", () => {
   const runShipItInstall = functionBlock(
     productionVerifier,
@@ -401,6 +573,26 @@ test("production physical verifier supplies identity and preserves spawn signals
       classifier.indexOf('log.includes("SQRLShipItRequestErrorDomain")'),
     "production classifier checks request-unreadable before signal termination",
   );
+});
+
+test("production verifier writes state in its isolated Squirrel cache", () => {
+  const runShipItInstall = functionBlock(
+    productionVerifier,
+    "runShipItInstall",
+    "loadBaseline",
+    "production ShipIt",
+  );
+  const runGate = functionBlock(
+    productionVerifier,
+    "runGate",
+    "isEntrypoint",
+    "production ShipIt cleanup",
+  );
+  assertIsolatedShipItCacheContract({
+    block: runShipItInstall,
+    cleanupBlock: runGate,
+    label: "production ShipIt",
+  });
 });
 
 let passed = 0;
