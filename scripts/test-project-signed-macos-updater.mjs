@@ -2230,7 +2230,10 @@ const makeOldTarget = (
   return { parent, targetApp };
 };
 
-const runNativeHelperContract = async () => {
+const runNativeHelperContract = async ({
+  managedSignerFixture = null,
+  nativeFixtureSigningKeys = null,
+} = {}) => {
   if (process.platform !== "darwin") {
     throw new SkipTest("native replacement helper requires macOS");
   }
@@ -2252,7 +2255,7 @@ const runNativeHelperContract = async () => {
     payloadDomain,
     policy: productionPolicy,
     publicKeyRaw: productionPublicKeyRaw,
-  } = loadPolicy();
+  } = managedSignerFixture?.loadedPolicy ?? loadPolicy();
   const helperBuildPath = discoverHelperBuildPath();
   const [helpExecutable, helpArgs] = scriptCommand(helperBuildPath, ["--help"]);
   const help = command(helpExecutable, helpArgs, { allowFailure: true });
@@ -2276,7 +2279,8 @@ const runNativeHelperContract = async () => {
   );
   const initialTrust = userTrustSettingsDigest();
   try {
-    const signingKeys = generateKeyPairSync("ed25519");
+    const signingKeys =
+      nativeFixtureSigningKeys ?? generateKeyPairSync("ed25519");
     const wrongKeys = generateKeyPairSync("ed25519");
     const publicKeyPath = path.join(tempRoot, "test-public-key.pem");
     fs.writeFileSync(
@@ -2595,7 +2599,8 @@ const runNativeHelperContract = async () => {
     const managedSignerAvailable =
       productionPolicyConfigured &&
       signerSecrets.length > 0 &&
-      signerSecrets.some((name) => Boolean(process.env[name]));
+      (managedSignerFixture !== null ||
+        signerSecrets.some((name) => Boolean(process.env[name])));
     const productionCompositeBlockReason = !productionPolicyConfigured
       ? "production Ed25519 policy is UNCONFIGURED; managed signer/native composite is blocked"
       : !managedSignerAvailable
@@ -2642,7 +2647,7 @@ const runNativeHelperContract = async () => {
       signerSecrets.length > 0,
       "workflow does not expose the release signer private-key environment",
     );
-    const signerEnv = { ...process.env };
+    const signerEnv = managedSignerFixture?.signerEnv ?? { ...process.env };
     signWithReleaseCli = (fixture, label) => {
       const metadata = path.join(
         path.dirname(fixture.artifactPath),
@@ -2827,23 +2832,30 @@ const runNativeHelperContract = async () => {
       );
     };
     }
-    const invokeViaJsRuntime = (fixture, targetApp) =>
+    const invokeViaJsRuntimeWithHelper = (
+      fixture,
+      targetApp,
+      selectedHelperPath,
+    ) =>
       command(
         process.execPath,
         [
           helperRunnerPath,
           "--helper",
-          helperPath,
+          selectedHelperPath,
           "--",
           ...nativeInstallArgs({ ...fixture, targetApp }),
         ],
         { allowFailure: true },
       );
+    const invokeViaJsRuntime = (fixture, targetApp) =>
+      invokeViaJsRuntimeWithHelper(fixture, targetApp, helperPath);
     const expectVersionTransition = ({
       accepted,
       candidateVersion,
       currentVersion,
       fixture,
+      helperOverride,
       label,
     }) => {
       const updateFixture =
@@ -2863,7 +2875,13 @@ const runNativeHelperContract = async () => {
         currentVersion,
       );
       const before = treeDigest(target.targetApp);
-      const result = invokeViaJsRuntime(updateFixture, target.targetApp);
+      const result = helperOverride
+        ? invokeViaJsRuntimeWithHelper(
+            updateFixture,
+            target.targetApp,
+            helperOverride,
+          )
+        : invokeViaJsRuntime(updateFixture, target.targetApp);
       assert.equal(
         result.status === 0,
         accepted,
@@ -2891,6 +2909,11 @@ const runNativeHelperContract = async () => {
           oldQuarantine,
           `${label} changed quarantine on a rejected target`,
         );
+        assert.deepEqual(
+          fs.readdirSync(target.parent).sort(),
+          ["Logseq.app"],
+          `${label} left replacement debris`,
+        );
       }
       assert.equal(userTrustSettingsDigest(), initialTrust);
       console.log(
@@ -2909,6 +2932,20 @@ const runNativeHelperContract = async () => {
     const releaseSignedNightly = signWithReleaseCli
       ? signWithReleaseCli(nightlyFixture, "release signed nightly")
       : nightlyFixture;
+    if (
+      managedSignerFixture !== null &&
+      nativeFixtureSigningKeys === null
+    ) {
+      expectVersionTransition({
+        accepted: false,
+        candidateVersion: nightlyLate,
+        currentVersion: nightlyEarly,
+        fixture: releaseSignedNightly,
+        helperOverride: helperPath,
+        label:
+          "unrelated TEST-ONLY helper rejects managed signer nightly without damage",
+      });
+    }
     expectVersionTransition({
       accepted: true,
       candidateVersion: nightlyLate,
@@ -2985,6 +3022,17 @@ const runNativeHelperContract = async () => {
       root: path.join(tempRoot, "wrong-key"),
     });
     expectNoDamage({ fixture: wrongKey, label: "wrong signing key" });
+    const signatureTamper = makeFixture({
+      root: path.join(tempRoot, "signature-tamper"),
+    });
+    signatureTamper.signature = signatureTamper.signature.replace(
+      /^[A-Za-z0-9+/]/,
+      (firstCharacter) => (firstCharacter === "A" ? "B" : "A"),
+    );
+    expectNoDamage({
+      fixture: signatureTamper,
+      label: "tampered Ed25519 signature bytes",
+    });
 
     expectNoDamage({
       fixture: makeFixture({
@@ -3301,12 +3349,76 @@ const runNativeHelperContract = async () => {
   }
 };
 
+const isolatedManagedSignerFixture = () => {
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const signerSecrets = signingVariableNames(workflow);
+  assert.ok(
+    signerSecrets.length > 0,
+    "workflow does not expose the managed Ed25519 signing environment",
+  );
+  const managedKeys = generateKeyPairSync("ed25519");
+  const publicKeyRaw = Buffer.from(
+    managedKeys.publicKey.export({ format: "jwk" }).x,
+    "base64url",
+  );
+  const derivedKeyId = sha256(publicKeyRaw);
+  const bundleId = "com.logseq.logseq";
+  const payloadDomain = "logseq-selfhost-macos-update-v1";
+  const policy = {
+    algorithm: exactProjectSigningAlgorithm,
+    bundleIdentifier: bundleId,
+    keyId: `ed25519:${derivedKeyId}`,
+    minimumBootstrapRevision: 5,
+    payloadDomain,
+    publicKeyBase64: publicKeyRaw.toString("base64"),
+  };
+  const privateKeyBase64 = managedKeys.privateKey
+    .export({ format: "der", type: "pkcs8" })
+    .toString("base64");
+  const signerEnv = {
+    ...process.env,
+    ...Object.fromEntries(
+      signerSecrets.map((name) => [name, privateKeyBase64]),
+    ),
+  };
+  return {
+    managedKeys,
+    managedSignerFixture: {
+      loadedPolicy: {
+        bundleId,
+        configured: true,
+        derivedKeyId,
+        payloadDomain,
+        policy,
+        publicKeyRaw,
+      },
+      signerEnv,
+    },
+  };
+};
+
+const runIsolatedManagedSignerNativeKeyAlignmentContract = async ({
+  alignNativeFixtureKey = false,
+} = {}) => {
+  const { managedKeys, managedSignerFixture } =
+    isolatedManagedSignerFixture();
+  await runNativeHelperContract({
+    managedSignerFixture,
+    nativeFixtureSigningKeys: alignNativeFixtureKey
+      ? managedKeys
+      : null,
+  });
+};
+
 const cases = [];
 const releaseBlockSelfTest = process.argv.includes(
   "--release-block-self-test",
 );
 const isolatedSignerAlgorithmContractSelfTest = process.argv.includes(
   "--isolated-signer-algorithm-contract",
+);
+const managedSignerNativeKeyAlignmentContractSelfTest = process.argv.includes(
+  "--managed-signer-native-key-alignment-contract",
 );
 
 addCase(cases, "proxy TLS private-key exception is pinned and fail-closed", () => {
@@ -3712,7 +3824,22 @@ addCase(cases, "diagnostics leave user Trust Settings unchanged", () => {
   assert.equal(userTrustSettingsDigest(), initialUserTrustSettingsDigest);
 });
 
-if (isolatedSignerAlgorithmContractSelfTest) {
+if (managedSignerNativeKeyAlignmentContractSelfTest) {
+  cases.splice(0, cases.length);
+  addCase(
+    cases,
+    "isolated managed signer/native same-key control is fail-closed",
+    () =>
+      runIsolatedManagedSignerNativeKeyAlignmentContract({
+        alignNativeFixtureKey: true,
+      }),
+  );
+  addCase(
+    cases,
+    "managed signer and native helper embed the same Ed25519 policy key",
+    () => runIsolatedManagedSignerNativeKeyAlignmentContract(),
+  );
+} else if (isolatedSignerAlgorithmContractSelfTest) {
   cases.splice(0, cases.length);
   addCase(
     cases,
