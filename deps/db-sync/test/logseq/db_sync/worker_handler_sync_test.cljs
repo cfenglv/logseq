@@ -214,6 +214,53 @@
           (is (nil? (:checksum-version fields)))
           (is (nil? (:server-checksum fields))))))))
 
+(deftest large-title-marker-state-is-bound-to-current-checksums-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   self #js {:sql sql :conn conn :schema-ready true}
+                   page-uuid (random-uuid)
+                   block-uuid (random-uuid)
+                   marker {:asset-uuid "confirmed-large-title"
+                           :asset-type "txt"
+                           :payload-format "utf8-plain-v1"
+                           :payload-digest-alg "sha256-v1"
+                           :payload-digest (apply str (repeat 64 "a"))}
+                   request
+                   (js/Request.
+                    "http://localhost/checksum/large-title-markers?graph-id=graph-1"
+                    #js {:method "GET"})]
+               (d/transact!
+                conn
+                [{:block/uuid page-uuid
+                  :block/name "large-title-marker-state"
+                  :block/title "Large title marker state"}
+                 {:block/uuid block-uuid
+                  :block/title ""
+                  :block/page [:block/uuid page-uuid]
+                  :block/parent [:block/uuid page-uuid]
+                  :logseq.property.sync/large-title-object marker}])
+               (->
+                (p/let [response (sync-handler/handle-http self request)
+                        body (json-body response)]
+                  (is (= 200 (.-status response)))
+                  (is (= (storage/get-t sql) (:t body)))
+                  (is (= (sync-checksum/recompute-checksum @conn)
+                         (:checksum body)))
+                  (is (= sync-checksum/server-checksum-version
+                         (:checksum-version body)))
+                  (is (= (sync-checksum/recompute-server-checksum @conn)
+                         (:server-checksum body)))
+                  (is (= [{:block-uuid (str block-uuid)
+                           :marker marker}]
+                         (:large-title-markers body))))
+                (p/then (fn [] (done)))
+                (p/catch (fn [error]
+                           (is false (str error))
+                           (done)))))))))
+
 (deftest semantic-create-page-delegates-to-outliner-and-broadcasts-test
   (async done
          (with-memory-sql-async

@@ -893,6 +893,57 @@
              (:block/title
               (d/entity @conn [:block/uuid block-uuid])))))))
 
+(deftest acknowledged-large-title-marker-skips-deleted-or-recreated-target-test
+  (testing "an in-flight acknowledgement never attaches an old marker to a missing or replacement entity"
+    (doseq [recreate? [false true]]
+      (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+            block-uuid (:block/uuid parent)
+            target-eid (:db/id parent)
+            logical-title (:block/title parent)
+            marker
+            {:asset-uuid
+             (if recreate? "recreated-target" "deleted-target")
+             :asset-type "txt"
+             :payload-format
+             sync-large-title/large-title-plain-payload-format
+             :payload-digest-alg
+             sync-large-title/large-title-payload-digest-alg
+             :payload-digest (apply str (repeat 64 "a"))}
+            request
+            {:large-upload-progress []
+             :large-title-marker-tx-entries
+             [{:tx-id (random-uuid)
+               :marker-commits
+               [{:marker-tx
+                 [:db/add
+                  [:block/uuid block-uuid]
+                  sync-large-title/large-title-object-attr
+                  marker]
+                 :target-eid target-eid
+                 :logical-title logical-title}]}]}]
+        (with-datascript-conns
+          conn
+          client-ops-conn
+          (fn []
+            (d/transact! conn [[:db/retractEntity target-eid]])
+            (when recreate?
+              (d/transact! conn
+                           [{:block/uuid block-uuid
+                             :block/title logical-title}])
+              (is (not= target-eid
+                        (:db/id
+                         (d/entity @conn [:block/uuid block-uuid])))))
+            (is (= request
+                   (sync-apply/commit-upload-response!
+                    test-repo request nil)))
+            (is (nil?
+                 (get
+                  (d/entity @conn [:block/uuid block-uuid])
+                  sync-large-title/large-title-object-attr))
+                (if recreate?
+                  "replacement entity must not inherit the old marker"
+                  "missing target must not be recreated by the marker"))))))))
+
 (deftest reject-oversized-atomic-upload-before-websocket-send-test
   (testing "an oversized atomic tx is retained locally and its contents are not copied into error data"
     (let [secret-title "sensitive oversized block title"
@@ -1278,6 +1329,14 @@
                                                  :outliner-op
                                                  keyword)))
                                        "the server path must accept UUID upsert plus marker under one tempid")
+                                   (is (empty?
+                                        (filter
+                                         #(= sync-large-title/large-title-object-attr
+                                             (:a %))
+                                         (d/datoms @conn :eavt)))
+                                       "an unacknowledged upload must not change the local marker")
+                                   (sync-apply/ack-upload-response!
+                                    test-repo client)
                                    (let [local-marker-datoms
                                          (filter
                                           #(= sync-large-title/large-title-object-attr
@@ -1325,6 +1384,95 @@
                     (reset! worker-state/*db-sync-config config-prev)
                     (set! js/fetch fetch-prev)
                     (done))))))))
+
+(deftest flush-send-failure-does-not-persist-large-title-marker-test
+  (async done
+         (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+               block-uuid (:block/uuid parent)
+               title (apply str (repeat 5000 "s"))
+               tx-id (random-uuid)
+               marker {:asset-uuid "not-confirmed"
+                       :asset-type "txt"
+                       :payload-format
+                       sync-large-title/large-title-plain-payload-format
+                       :payload-digest-alg
+                       sync-large-title/large-title-payload-digest-alg
+                       :payload-digest (apply str (repeat 64 "a"))}
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :upload-request (atom nil)
+                       :last-sync-error (atom nil)
+                       :ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send"
+                                   (fn [_]
+                                     (throw
+                                      (js/Error.
+                                       "synthetic websocket send failure")))))}
+               latest-remote-prev @sync-apply/*repo->latest-remote-tx]
+           (d/transact! conn
+                        [[:db/add
+                          [:block/uuid block-uuid]
+                          :block/title
+                          title]])
+           (-> (with-datascript-conns
+                 conn
+                 client-ops-conn
+                 (fn []
+                   (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                   (client-op/update-local-tx test-repo 0)
+                   (client-op/update-local-checksum
+                    test-repo
+                    (sync-checksum/recompute-checksum @conn))
+                   (client-op/update-local-server-checksum
+                    test-repo
+                    (sync-checksum/recompute-server-checksum @conn))
+                   (seed-client-op-txs!
+                    test-repo
+                    [{:db-sync/tx-id tx-id
+                      :db-sync/created-at 1
+                      :db-sync/pending? true
+                      :db-sync/normalized-tx-data
+                      [[:db/add
+                        [:block/uuid block-uuid]
+                        :block/title
+                        title]]}])
+                   (p/with-redefs
+                     [worker-state/online? (constantly true)
+                      sync-crypt/graph-e2ee? (constantly false)
+                      sync-crypt/<ensure-graph-aes-key
+                      (fn [& _] (p/resolved nil))
+                      sync-apply/offload-large-titles
+                      (fn [_tx-data _opts]
+                        (p/resolved
+                         [[:db/add
+                           [:block/uuid block-uuid]
+                           :block/title
+                           ""]
+                          [:db/add
+                           [:block/uuid block-uuid]
+                           sync-large-title/large-title-object-attr
+                           marker]]))]
+                     (p/let [_ (#'sync-apply/flush-pending!
+                                test-repo client)]
+                       (is (nil?
+                            (get
+                             (d/entity @conn [:block/uuid block-uuid])
+                             sync-large-title/large-title-object-attr)))
+                       (is (= title
+                              (:block/title
+                               (d/entity
+                                @conn
+                                [:block/uuid block-uuid]))))
+                       (is (nil? @(:upload-request client)))))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally
+                (fn []
+                  (reset! sync-apply/*repo->latest-remote-tx
+                          latest-remote-prev)
+                  (done)))))))
 
 (deftest flush-pending-records-generic-async-preparation-failure-test
   (testing "a generic asynchronous preparation failure is visible in sync state and leaves durable work retryable"
@@ -3013,10 +3161,22 @@
 
 (deftest tx-reject-db-transact-failed-selectively-updates-inflight-ops-test
   (testing "tx/reject should mark success txs as non-pending and failed tx as failed, leaving later inflight pending"
-    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+    (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)
           success-tx-id (random-uuid)
           failed-tx-id (random-uuid)
           untouched-tx-id (random-uuid)
+          success-marker
+          {:asset-uuid "partial-success-marker"
+           :asset-type "txt"
+           :payload-format sync-large-title/large-title-plain-payload-format
+           :payload-digest-alg sync-large-title/large-title-payload-digest-alg
+           :payload-digest (apply str (repeat 64 "a"))}
+          failed-marker
+          {:asset-uuid "failed-marker"
+           :asset-type "txt"
+           :payload-format sync-large-title/large-title-plain-payload-format
+           :payload-digest-alg sync-large-title/large-title-payload-digest-alg
+           :payload-digest (apply str (repeat 64 "b"))}
           raw-message (js/JSON.stringify
                        (clj->js {:type "tx/reject"
                                  :reason "db transact failed"
@@ -3028,6 +3188,28 @@
           client {:repo test-repo
                   :graph-id "graph-1"
                   :inflight (atom [success-tx-id failed-tx-id untouched-tx-id])
+                  :upload-request
+                  (atom
+                   {:large-upload-progress []
+                    :large-title-marker-tx-entries
+                    [{:tx-id success-tx-id
+                      :marker-commits
+                      [{:marker-tx
+                        [:db/add
+                         [:block/uuid (:block/uuid parent)]
+                         sync-large-title/large-title-object-attr
+                         success-marker]
+                        :target-eid (:db/id parent)
+                        :logical-title (:block/title parent)}]}
+                     {:tx-id failed-tx-id
+                      :marker-commits
+                      [{:marker-tx
+                        [:db/add
+                         [:block/uuid (:block/uuid child1)]
+                         sync-large-title/large-title-object-attr
+                         failed-marker]
+                        :target-eid (:db/id child1)
+                        :logical-title (:block/title child1)}]}]})
                   :online-users (atom [])
                   :ws-state (atom :open)}]
       (with-datascript-conns conn client-ops-conn
@@ -3071,7 +3253,15 @@
             (is (= 0 (aget failed-ent "pending")))
             (is (= 1 (aget failed-ent "failed")))
             (is (= 1 (aget untouched-ent "pending")))
-            (is (not= 1 (aget untouched-ent "failed")))))))))
+            (is (not= 1 (aget untouched-ent "failed")))
+            (is (= success-marker
+                   (get
+                    (d/entity @conn [:block/uuid (:block/uuid parent)])
+                    sync-large-title/large-title-object-attr)))
+            (is (nil?
+                 (get
+                  (d/entity @conn [:block/uuid (:block/uuid child1)])
+                  sync-large-title/large-title-object-attr)))))))))
 
 (deftest tx-reject-with-no-successful-prefix-requeues-later-pending-op-test
   (testing "a first-entry rejection must not strand later entries from the same inflight batch"
@@ -3547,6 +3737,277 @@
    :payload-format "utf8-plain-v1"
    :payload-digest-alg "sha256-v1"
    :payload-digest (apply str (repeat 64 digest-char))})
+
+(deftest hello-recovers-confirmed-large-title-marker-for-plain-and-e2ee-test
+  (async done
+         (let [latest-tx-prev @db-sync/*repo->latest-remote-tx
+               latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+               latest-version-prev
+               @db-sync/*repo->latest-remote-checksum-version
+               run-case
+               (fn [e2ee?]
+                 (let [{:keys [conn client-ops-conn parent]}
+                       (setup-parent-child)
+                       parent-id (:db/id parent)
+                       block-uuid (:block/uuid parent)
+                       title (apply str (repeat 5000 (if e2ee? "e" "p")))
+                       payload-format
+                       (if e2ee?
+                         sync-large-title/large-title-encrypted-payload-format
+                         sync-large-title/large-title-plain-payload-format)
+                       local-marker
+                       (assoc (v2-large-title-object
+                               (str "local-" (name (if e2ee? :e2ee :plain)))
+                               "a")
+                              :payload-format payload-format)
+                       remote-marker
+                       (assoc (v2-large-title-object
+                               (str "remote-" (name (if e2ee? :e2ee :plain)))
+                               "b")
+                              :payload-format payload-format)
+                       aes-key (when e2ee? :test-aes-key)
+                       success-count* (atom 0)
+                       flush-count* (atom 0)
+                       client {:repo test-repo
+                               :graph-id "graph-1"
+                               :inflight (atom [])
+                               :online-users (atom [])
+                               :ws-state (atom :open)
+                               :sync-succeeded-f
+                               (fn [] (swap! success-count* inc))}]
+                   (d/transact!
+                    conn
+                    (cond-> [[:db/add parent-id :block/title title]
+                             [:db/add
+                              parent-id
+                              sync-large-title/large-title-object-attr
+                              local-marker]]
+                      e2ee?
+                      (conj {:db/ident :logseq.kv/graph-rtc-e2ee?
+                             :kv/value true})))
+                   (let [local-db @conn
+                         remote-db
+                         (:db-after
+                          (d/with
+                           local-db
+                           [[:db/add
+                             [:block/uuid block-uuid]
+                             sync-large-title/large-title-object-attr
+                             remote-marker]]))
+                         legacy-checksum
+                         (sync-checksum/recompute-checksum remote-db)
+                         remote-server-checksum
+                         (sync-checksum/recompute-server-checksum remote-db)
+                         marker-state
+                         (mapv
+                          (fn [{:keys [block-uuid marker]}]
+                            {:block-uuid (str block-uuid)
+                             :marker marker})
+                          (sync-checksum/server-large-title-markers remote-db))
+                         response
+                         {:t 2734
+                          :checksum legacy-checksum
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum remote-server-checksum
+                          :large-title-markers marker-state}
+                         raw-message
+                         (js/JSON.stringify
+                          (clj->js
+                           (assoc
+                            (select-keys
+                             response
+                             [:t
+                              :checksum
+                              :checksum-version
+                              :server-checksum])
+                            :type "hello")))]
+                     (is (= legacy-checksum
+                            (sync-checksum/recompute-checksum local-db)))
+                     (is (not=
+                          remote-server-checksum
+                          (sync-checksum/recompute-server-checksum local-db)))
+                     (with-datascript-conns
+                       conn
+                       client-ops-conn
+                       (fn []
+                         (client-op/update-local-tx test-repo 2734)
+                         (client-op/update-local-checksum
+                          test-repo
+                          (sync-checksum/recompute-checksum local-db))
+                         (client-op/update-local-server-checksum
+                          test-repo
+                          (sync-checksum/recompute-server-checksum local-db))
+                         (p/with-redefs
+                           [sync-handle-message/<fetch-large-title-marker-state
+                            (fn [repo graph-id]
+                              (is (= test-repo repo))
+                              (is (= "graph-1" graph-id))
+                              (p/resolved response))
+                            sync-crypt/graph-e2ee? (constantly e2ee?)
+                            sync-crypt/<ensure-graph-aes-key
+                            (fn [& _] (p/resolved aes-key))
+                            sync-apply/download-large-title!
+                            (fn [repo graph-id marker key]
+                              (is (= test-repo repo))
+                              (is (= "graph-1" graph-id))
+                              (is (= remote-marker marker))
+                              (is (= aes-key key))
+                              (p/resolved title))
+                            sync-apply/enqueue-flush-pending!
+                            (fn [& _] (swap! flush-count* inc))
+                            sync-assets/enqueue-asset-sync!
+                            (fn [& _] nil)]
+                           (p/let [_
+                                   (sync-handle-message/handle-message!
+                                    test-repo client raw-message)]
+                             (is (= remote-marker
+                                    (get
+                                     (d/entity
+                                      @conn
+                                      [:block/uuid block-uuid])
+                                     sync-large-title/large-title-object-attr)))
+                             (is (= remote-server-checksum
+                                    (sync-checksum/recompute-server-checksum
+                                     @conn)))
+                             (is (= remote-server-checksum
+                                    (client-op/get-local-server-checksum
+                                     test-repo)))
+                             (is (= 1 @success-count*))
+                             (is (= 1 @flush-count*)))))))))]
+           (->
+            (p/let [_ (run-case false)
+                    _ (run-case true)])
+            (p/catch (fn [error]
+                       (is false (str error))))
+            (p/finally
+             (fn []
+               (reset! db-sync/*repo->latest-remote-tx latest-tx-prev)
+               (reset! db-sync/*repo->latest-remote-checksum
+                       latest-checksum-prev)
+               (reset! db-sync/*repo->latest-remote-checksum-version
+                       latest-version-prev)
+               (done)))))))
+
+(deftest hello-marker-recovery-fails-closed-on-missing-marker-or-title-mismatch-test
+  (async done
+         (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+               parent-id (:db/id parent)
+               block-uuid (:block/uuid parent)
+               title (apply str (repeat 5000 "f"))
+               local-marker (v2-large-title-object "local-fail-closed" "a")
+               remote-marker (v2-large-title-object "remote-fail-closed" "b")
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :online-users (atom [])
+                       :ws-state (atom :open)}
+               latest-tx-prev @db-sync/*repo->latest-remote-tx
+               latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+               latest-version-prev
+               @db-sync/*repo->latest-remote-checksum-version]
+           (d/transact!
+            conn
+            [[:db/add parent-id :block/title title]
+             [:db/add
+              parent-id
+              sync-large-title/large-title-object-attr
+              local-marker]])
+           (let [local-db @conn
+                 remote-db
+                 (:db-after
+                  (d/with
+                   local-db
+                   [[:db/add
+                     [:block/uuid block-uuid]
+                     sync-large-title/large-title-object-attr
+                     remote-marker]]))
+                 legacy-checksum
+                 (sync-checksum/recompute-checksum remote-db)
+                 remote-server-checksum
+                 (sync-checksum/recompute-server-checksum remote-db)
+                 full-marker-state
+                 (mapv
+                  (fn [{:keys [block-uuid marker]}]
+                    {:block-uuid (str block-uuid)
+                     :marker marker})
+                  (sync-checksum/server-large-title-markers remote-db))
+                 raw-message
+                 (js/JSON.stringify
+                  (clj->js
+                   {:type "hello"
+                    :t 2734
+                    :checksum legacy-checksum
+                    :checksum-version
+                    sync-checksum/server-checksum-version
+                    :server-checksum remote-server-checksum}))
+                 run-failure
+                 (fn [marker-state downloaded-title expected-reason]
+                   (p/with-redefs
+                     [sync-handle-message/<fetch-large-title-marker-state
+                      (fn [& _]
+                        (p/resolved
+                         {:t 2734
+                          :checksum legacy-checksum
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum remote-server-checksum
+                          :large-title-markers marker-state}))
+                      sync-crypt/graph-e2ee? (constantly false)
+                      sync-apply/download-large-title!
+                      (fn [& _] (p/resolved downloaded-title))
+                      sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                      sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                     (->
+                      (sync-handle-message/handle-message!
+                       test-repo client raw-message)
+                      (p/then
+                       (fn [_]
+                         (is false "expected marker recovery to fail closed")))
+                      (p/catch
+                       (fn [error]
+                         (is (= :db-sync/checksum-mismatch
+                                (:type (ex-data error))))
+                         (is (= expected-reason
+                                (:marker-recovery-reason
+                                 (ex-data error))))
+                         (is (= local-marker
+                                (get
+                                 (d/entity
+                                  @conn
+                                  [:block/uuid block-uuid])
+                                 sync-large-title/large-title-object-attr))))))))]
+             (->
+              (with-datascript-conns
+                conn
+                client-ops-conn
+                (fn []
+                  (client-op/update-local-tx test-repo 2734)
+                  (client-op/update-local-checksum
+                   test-repo
+                   (sync-checksum/recompute-checksum local-db))
+                  (client-op/update-local-server-checksum
+                   test-repo
+                   (sync-checksum/recompute-server-checksum local-db))
+                  (p/let [_ (run-failure
+                             []
+                             title
+                             :marker-entity-set-mismatch)
+                          _ (run-failure
+                             full-marker-state
+                             (str title "-different")
+                             :logical-title-mismatch)])))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (reset! db-sync/*repo->latest-remote-tx
+                         latest-tx-prev)
+                 (reset! db-sync/*repo->latest-remote-checksum
+                         latest-checksum-prev)
+                 (reset! db-sync/*repo->latest-remote-checksum-version
+                         latest-version-prev)
+                 (done))))))))
 
 (deftest hello-accepts-old-and-versioned-server-checksums-for-large-title-test
   (testing "rehydrated large titles keep both old and versioned server checksum contracts"

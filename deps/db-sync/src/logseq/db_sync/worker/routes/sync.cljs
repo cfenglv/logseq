@@ -5,6 +5,8 @@
   [["/health" {:methods {"GET" :sync/health}}]
    ["/pull" {:methods {"GET" :sync/pull}}]
    ["/checksum/diagnostics" {:methods {"GET" :sync/checksum-diagnostics}}]
+   ["/checksum/large-title-markers"
+    {:methods {"GET" :sync/large-title-markers}}]
    ["/snapshot/download" {:methods {"GET" :sync/snapshot-download}}]
    ["/snapshot/stream" {:methods {"GET" :sync/snapshot-stream}}]
    ["/snapshot/download-v2" {:methods {"GET" :sync/snapshot-download-v2

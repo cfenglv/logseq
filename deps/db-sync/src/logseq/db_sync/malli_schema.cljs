@@ -256,6 +256,27 @@
    [:ok :boolean]
    [:count :int]])
 
+(def large-title-marker-schema
+  [:map
+   [:asset-uuid :string]
+   [:asset-type :string]
+   [:payload-format :string]
+   [:payload-digest-alg :string]
+   [:payload-digest :string]])
+
+(def large-title-marker-state-entry-schema
+  [:map
+   [:block-uuid :string]
+   [:marker large-title-marker-schema]])
+
+(def large-title-marker-state-response-schema
+  [:map
+   [:t :int]
+   [:checksum :string]
+   [:checksum-version [:= "server-db-v2"]]
+   [:server-checksum :string]
+   [:large-title-markers [:sequential large-title-marker-state-entry-schema]]])
+
 (def asset-get-response-schema
   [:or
    :any
@@ -283,6 +304,7 @@
    :sync/health http-ok-response-schema
    :sync/pull pull-ok-schema
    :sync/tx-batch [:or tx-batch-ok-schema tx-reject-schema http-error-response-schema]
+   :sync/large-title-markers large-title-marker-state-response-schema
    :sync/snapshot-download snapshot-download-response-schema
    :sync/snapshot-upload snapshot-upload-response-schema
    :sync/admin-reset http-ok-response-schema

@@ -117,6 +117,21 @@
   - Same as WS pull. Response: `{"type":"pull/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?,"txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`.
   - Error response (400): `{"error":"invalid since"}`.
   - Error response (409): `{"error":"graph not ready"}` when bootstrap upload/import has not finished.
+- `GET /sync/:graph-id/checksum/large-title-markers`
+  - Additive authenticated recovery endpoint for a same-cursor mismatch where
+    the legacy checksum matches but `server-db-v2` differs only by offloaded
+    large-title marker identity.
+  - Response:
+    `{"t":<t>,"checksum":"<legacy-hex>","checksum-version":"server-db-v2","server-checksum":"<v2-hex>","large-title-markers":[{"block-uuid":"<uuid>","marker":{"asset-uuid":"<uuid>","asset-type":"txt","payload-format":"utf8-plain-v1|aes-gcm-transit-v1","payload-digest-alg":"sha256-v1","payload-digest":"<sha256>"}}...]}`
+  - The marker list is the complete marker state contributing to the advertised
+    v2 checksum. Clients bind `t` and both checksums to the triggering response,
+    require the local and remote marker entity sets to match, authenticate each
+    referenced payload, compare its recovered plaintext with the current local
+    logical title, and verify the candidate v2 checksum before changing local
+    state. A missing/extra marker or failed verification remains a checksum
+    mismatch.
+  - Error response (409):
+    `{"error":"graph not ready"|"versioned checksum unavailable"}`.
 - `POST /sync/:graph-id/tx/batch`
   - Same as WS tx/batch. Body: `{"t-before":<t>,"txs":[{"tx":"<tx-transit>","tx-id":"<uuid?>","outliner-op":"<keyword?>"}, ...]}`.
   - Response: `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}` or `{"type":"tx/reject","reason":...}`.

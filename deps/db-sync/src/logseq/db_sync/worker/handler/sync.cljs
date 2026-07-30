@@ -1061,6 +1061,39 @@
           (http/json-response :sync/checksum-diagnostics
                               (checksum-diagnostics-response self)))))))
 
+(defn- large-title-marker-state-response
+  [^js self]
+  (ensure-conn! self)
+  (let [db @(.-conn self)
+        t (t-now self)
+        checksum (current-checksum self)
+        server-checksum (current-server-checksum self)
+        markers (sync-checksum/server-large-title-markers db)]
+    (when (and (string? checksum)
+               (string? server-checksum)
+               (vector? markers))
+      {:t t
+       :checksum checksum
+       :checksum-version sync-checksum/server-checksum-version
+       :server-checksum server-checksum
+       :large-title-markers
+       (mapv (fn [{:keys [block-uuid marker]}]
+               {:block-uuid (str block-uuid)
+                :marker marker})
+             markers)})))
+
+(defn- handle-sync-large-title-markers
+  [^js self request]
+  (let [graph-id (graph-id-from-request request)]
+    (if (not (seq graph-id))
+      (http/bad-request "missing graph id")
+      (p/let [ready-for-sync? (<ready-for-sync? self graph-id)]
+        (if-not ready-for-sync?
+          (http/error-response "graph not ready" 409)
+          (if-let [response (large-title-marker-state-response self)]
+            (http/json-response :sync/large-title-markers response)
+            (http/error-response "versioned checksum unavailable" 409)))))))
+
 (defn- handle-sync-snapshot-stream
   [^js self request frozen?]
   (ensure-schema! self)
@@ -1403,6 +1436,9 @@
 
     :sync/checksum-diagnostics
     (handle-sync-checksum-diagnostics self request)
+
+    :sync/large-title-markers
+    (handle-sync-large-title-markers self request)
 
     :sync/snapshot-stream
     (handle-sync-snapshot-stream self request false)

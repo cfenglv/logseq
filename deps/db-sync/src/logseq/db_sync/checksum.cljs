@@ -225,6 +225,22 @@
                 (large-title-object-v2? marker))))))
      (d/datoms db :avet :block/uuid))))
 
+(defn server-large-title-markers
+  "Return the complete marker state that contributes to server-db-v2.
+  Nil means the DB cannot advertise the versioned checksum contract."
+  [db]
+  (when (server-db-v2-valid? db)
+    (->> (d/datoms db :avet :block/uuid)
+         (keep
+          (fn [{:keys [e v]}]
+            (when (checksum-eligible-entity? db e)
+              (when-let [marker
+                         (get (d/entity db e) large-title-object-attr)]
+                {:block-uuid v
+                 :marker marker}))))
+         (sort-by (comp str :block-uuid))
+         vec)))
+
 (defn- entity-checksum-tuples
   [db eid e2ee? mode]
   (when-let [entity-uuid (get-block-uuid db eid)]

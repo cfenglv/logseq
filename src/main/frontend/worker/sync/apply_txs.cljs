@@ -85,10 +85,71 @@
              tx-data))))
        vec))
 
+(defn- normalized-upload-entity
+  [temp-id->uuid entity]
+  (if (and (string? entity)
+           (contains? temp-id->uuid entity))
+    [:block/uuid (get temp-id->uuid entity)]
+    entity))
+
+(defn- large-title-by-upload-entity
+  [tx-data]
+  (let [temp-id->uuid (tx-temp-id->uuid tx-data)]
+    (reduce
+     (fn [result item]
+       (if (and (vector? item)
+                (= :db/add (nth item 0 nil))
+                (= :block/title (nth item 2 nil))
+                (sync-large-title/large-title? (nth item 3 nil)))
+         (assoc result
+                (normalized-upload-entity
+                 temp-id->uuid
+                 (nth item 1))
+                (nth item 3))
+         result))
+     {}
+     tx-data)))
+
+(defn- versioned-large-title-marker-tx-entries
+  [db tx-entries]
+  (->> tx-entries
+       (keep
+        (fn [{:keys [tx-id] :as tx-entry}]
+          (let [marker-txs (versioned-large-title-marker-txs [tx-entry])
+                logical-title-by-entity
+                (large-title-by-upload-entity
+                 (:large-title-logical-tx-data tx-entry))
+                marker-commits
+                (mapv
+                 (fn [marker-tx]
+                   (let [entity-ref (nth marker-tx 1)
+                         logical-title
+                         (get logical-title-by-entity entity-ref)
+                         target-eid
+                         (some-> (d/entity db entity-ref) :db/id)]
+                     (when-not (and (sync-large-title/large-title?
+                                     logical-title)
+                                    (number? target-eid))
+                       (fail-fast
+                        :db-sync/invalid-large-title-marker-commit
+                        {:tx-id tx-id
+                         :has-logical-title?
+                         (sync-large-title/large-title? logical-title)
+                         :has-target? (number? target-eid)}))
+                     {:marker-tx marker-tx
+                      :target-eid target-eid
+                      :logical-title logical-title}))
+                 marker-txs)]
+            (when (seq marker-txs)
+              {:tx-id tx-id
+               :marker-commits marker-commits}))))
+       vec))
+
 (declare enqueue-asset-task!
          apply-remote-txs!
          cap-upload-request-tx-entries
          commit-large-upload-progress!
+         commit-upload-response!
          ref-attr?
          resolve-temp-id
          reverse-local-txs!
@@ -305,7 +366,59 @@
 (defn ack-upload-response!
   [repo client]
   (when-let [request (clear-upload-response-timeout! client)]
-    (commit-large-upload-progress! repo (:large-upload-progress request))))
+    (commit-upload-response! repo request nil)
+    request))
+
+(defn commit-upload-response!
+  "Commit local metadata only for entries the server confirmed. Nil means the
+  whole request was accepted; a collection selects partial-success tx ids."
+  [repo request accepted-tx-ids]
+  (let [accepted? (when (some? accepted-tx-ids)
+                    (set accepted-tx-ids))
+        select-entry
+        (fn [id-key entries]
+          (if (nil? accepted?)
+            entries
+            (filterv #(contains? accepted? (get % id-key)) entries)))
+        upload-progress
+        (select-entry :large-upload-original-tx-id
+                      (:large-upload-progress request))
+        marker-entries
+        (select-entry :tx-id (:large-title-marker-tx-entries request))
+        conn (worker-state/get-datascript-conn repo)
+        _ (when (and (seq marker-entries) (nil? conn))
+            (fail-fast :db-sync/missing-db
+                       {:repo repo :op :large-title-marker-ack}))
+        marker-txs
+        (when conn
+          (->> marker-entries
+               (mapcat :marker-commits)
+               (keep
+                (fn [{:keys [marker-tx target-eid logical-title]}]
+                  (let [entity-ref (nth marker-tx 1 nil)
+                        entity (d/entity @conn entity-ref)]
+                    (when (and (= target-eid (:db/id entity))
+                               (= logical-title (:block/title entity)))
+                      marker-tx))))
+               vec))]
+    (commit-large-upload-progress! repo upload-progress)
+    (when (seq marker-txs)
+      (if conn
+        (do
+          (ldb/transact!
+           conn
+           marker-txs
+           {:rtc-tx? true
+            :persist-op? false
+            :op :large-title-marker-ack})
+          (client-op/update-local-checksum
+           repo
+           (sync-checksum/recompute-checksum @conn))
+          (client-op/update-local-server-checksum
+           repo
+           (sync-checksum/recompute-server-checksum @conn)))
+        nil))
+    request))
 
 (defn upload-large-title! [repo graph-id title aes-key]
   (sync-large-title/upload-large-title!
@@ -317,6 +430,18 @@
     :auth-headers (auth-headers)
     :fail-fast-f fail-fast
     :encrypt-text-value-f sync-crypt/<encrypt-text-value}))
+
+(defn download-large-title! [repo graph-id obj aes-key]
+  (sync-large-title/download-large-title!
+   {:repo repo
+    :graph-id graph-id
+    :obj obj
+    :aes-key aes-key
+    :http-base (sync-auth/http-base-url @worker-state/*db-sync-config)
+    :auth-headers (auth-headers)
+    :fail-fast-f fail-fast
+    :decrypt-text-value-f sync-crypt/<decrypt-text-value
+    :strict-decrypt-text-value-f sync-crypt/<decrypt-text-value-strict}))
 
 (defn offload-large-titles [tx-data {:keys [upload-fn] :as opts}]
   (sync-large-title/offload-large-titles tx-data (assoc opts :upload-fn (or upload-fn upload-large-title!))))
@@ -1083,7 +1208,10 @@
                                                          tx-data** (if aes-key
                                                                      (sync-crypt/<encrypt-tx-data aes-key tx-data*)
                                                                      tx-data*)]
-                                                   (assoc tx-entry :tx-data tx-data**)))
+                                                   (assoc tx-entry
+                                                          :tx-data tx-data**
+                                                          :large-title-logical-tx-data
+                                                          tx-data)))
                                                tx-entries))
                             payload (mapv (fn [{:keys [tx-id tx-data outliner-op]}]
                                             (cond-> {:tx (sqlite-util/write-transit-str tx-data)}
@@ -1097,33 +1225,11 @@
                                           :t-before local-tx}
                             capped (cap-upload-request-bytes message-base tx-entries* payload)
                             tx-entries-to-send (:tx-entries capped)
-                            marker-txs
-                            (versioned-large-title-marker-txs
-                             tx-entries-to-send)
+                            marker-tx-entries
+                            (versioned-large-title-marker-tx-entries
+                             @conn tx-entries-to-send)
                             tx-ids (into [] (keep :tx-id) tx-entries-to-send)]
                       (when (seq tx-entries-to-send)
-                        (when (seq marker-txs)
-                          ;; Persist only markers for the prefix that will
-                          ;; actually be sent. Persisting markers from the
-                          ;; capped tail could advance the local checksum
-                          ;; before the corresponding tx reaches the server.
-                          (ldb/transact!
-                           conn
-                           marker-txs
-                           {:rtc-tx? true
-                            :persist-op? false
-                            :op :large-title-marker})
-                          ;; Marker persistence changes the unversioned
-                          ;; checksum from the logical large title to the old
-                          ;; server's empty transport placeholder. Cache both
-                          ;; representations before accepting an ack from
-                          ;; either an old or a versioned server.
-                          (client-op/update-local-checksum
-                           repo
-                           (sync-checksum/recompute-checksum @conn))
-                          (client-op/update-local-server-checksum
-                           repo
-                           (sync-checksum/recompute-server-checksum @conn)))
                         (reset! (:inflight client) tx-ids)
                         (p/do!
                          (send! ws (:message capped))
@@ -1135,6 +1241,7 @@
                                               distinct
                                               vec)
                            :large-upload-progress (large-upload-progress tx-entries-to-send)
+                           :large-title-marker-tx-entries marker-tx-entries
                            :t-before local-tx}))))
                     (p/catch (fn [error]
                                (sync-util/set-last-sync-error! client error)
