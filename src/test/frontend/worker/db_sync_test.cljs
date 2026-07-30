@@ -5522,6 +5522,156 @@
               (is (empty? (non-recycle-validation-entities validation))
                   (str (:errors validation))))))))))
 
+(deftest rebase-batch-drops-missing-uuid-tempid-and-keeps-valid-pending-update-test
+  (testing "batch final commit drops one stale UUID tempid without discarding another lookup update in the pending tx"
+    (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+          deleted-uuid (:block/uuid child1)
+          kept-uuid (:block/uuid child2)
+          deleted-ref [:block/uuid deleted-uuid]
+          deleted-tempid (str deleted-uuid)
+          kept-ref [:block/uuid kept-uuid]
+          pending-tx-id (random-uuid)
+          deleted-previous-updated-at (:block/updated-at child1)
+          kept-previous-updated-at (:block/updated-at child2)
+          deleted-updated-at 1770000000200
+          kept-updated-at 1770000000300
+          local-t 536900001
+          normalized-tx-data
+          [[:db/retract kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :logseq.property/heading
+            3
+            local-t]
+           [:db/add deleted-tempid
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/add deleted-tempid
+            :block/updated-at
+            deleted-updated-at
+            local-t]]
+          reversed-tx-data
+          [[:db/retract deleted-ref
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/retract deleted-ref
+            :block/updated-at
+            deleted-updated-at
+            local-t]
+           [:db/add deleted-ref
+            :block/updated-at
+            deleted-previous-updated-at
+            local-t]
+           [:db/retract kept-ref
+            :logseq.property/heading
+            3
+            local-t]
+           [:db/retract kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]]]
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+          "the initial local database must be valid")
+      ;; Model one legacy generic pending transaction that updated many blocks.
+      ;; Its durable payload uses the same five-element datoms returned by the
+      ;; production client-op reader. Most targets are stable lookup refs, but
+      ;; an older insertion path persisted a bare UUID string tempid.
+      (d/transact! conn
+                   [[:db/add (:db/id child1)
+                     :block/updated-at
+                     deleted-updated-at]
+                    [:db/add (:db/id child1)
+                     :logseq.property/heading
+                     2]
+                    [:db/add (:db/id child2)
+                     :logseq.property/heading
+                     3]
+                    [:db/add (:db/id child2)
+                     :block/updated-at
+                     kept-updated-at]])
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id pending-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op nil
+             :db-sync/forward-outliner-ops nil
+             :db-sync/inverse-outliner-ops nil
+             :db-sync/normalized-tx-data normalized-tx-data
+             :db-sync/reversed-tx-data reversed-tx-data}])
+          (let [pending-before (#'sync-apply/pending-txs test-repo)
+                pending-tx (first pending-before)]
+            (is (= 1 (count pending-before)))
+            (is (= pending-tx-id (:tx-id pending-tx)))
+            (is (= #{deleted-tempid kept-ref}
+                   (set (map second (:tx pending-tx))))
+                "one generic pending row must mix the UUID tempid and lookup target")
+            (is (empty? (:forward-outliner-ops pending-tx))
+                "the legacy row must enter the raw transact replay fallback")
+            (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+                "the database with the mixed pending update must remain valid")
+
+            (let [apply-error
+                  (try
+                    (sync-apply/apply-remote-txs!
+                     test-repo
+                     nil
+                     [{:t 1
+                       :tx-data [[:db/retractEntity deleted-ref]]}])
+                    nil
+                    (catch :default error
+                      error))
+                  pending-after (#'sync-apply/pending-txs test-repo)
+                  validation-after (db-validate/validate-local-db! @conn)]
+              (is (nil? apply-error)
+                  (str "remote apply must not fail final validation after "
+                       "replaying a stale UUID tempid update: "
+                       (some-> apply-error ex-message)
+                       "; cause: "
+                       (some-> apply-error ex-cause ex-message)))
+              (is (nil? (d/entity @conn deleted-ref))
+                  "the remote deletion must be retained")
+              (is (= 3
+                     (:logseq.property/heading
+                      (d/entity @conn kept-ref)))
+                  "the unrelated pending update must survive replay")
+              (is (= [pending-tx-id] (mapv :tx-id pending-after))
+                  "the pending row with a still-valid update must remain")
+              (is (every? #(not= deleted-tempid (second %))
+                          (:tx (first pending-after)))
+                  "the stale target's datoms must be removed from replay")
+              (is (some #(= [:db/add
+                              kept-ref
+                              :logseq.property/heading
+                              3]
+                            (subvec % 0 4))
+                        (:tx (first pending-after)))
+                  "the valid lookup-ref update must remain uploadable")
+              (is (= 1 (aget (client-op-tx-row
+                              client-ops-conn
+                              pending-tx-id)
+                             "pending"))
+                  "the mixed row must not be cleared wholesale")
+              (is (empty? (:errors validation-after))
+                  (str "the final database must be valid: "
+                       (:errors validation-after))))))))))
+
 (deftest rebase-insert-blocks-keeps-block-uuid-test
   (testing "rebased insert-blocks should preserve the original block uuid"
     (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)]
