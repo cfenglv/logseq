@@ -839,20 +839,17 @@
                                transport/invoke (fn [_ method _args]
                                                   (case method
                                                     :thread-api/db-sync-status
-                                                    (let [idx (swap! status-calls inc)]
-                                                      (p/resolved (if (= idx 1)
-                                                                    {:repo "logseq_db_demo"
-                                                                     :ws-state :connecting
-                                                                     :pending-local 0
-                                                                     :pending-asset 0
-                                                                     :pending-server 0}
-                                                                    {:repo "logseq_db_demo"
-                                                                     :ws-state :open
-                                                                     :pending-local 1
-                                                                     :pending-asset 0
-                                                                     :pending-server 2
-                                                                     :last-error {:code :decrypt-aes-key
-                                                                                  :message "decrypt-aes-key"}})))
+                                                    (do
+                                                      (swap! status-calls inc)
+                                                      (p/resolved
+                                                       {:repo "logseq_db_demo"
+                                                        :ws-state :syncing
+                                                        :sync-ready? false
+                                                        :pending-local 1
+                                                        :pending-asset 0
+                                                        :pending-server 2
+                                                        :last-error {:code :decrypt-aes-key
+                                                                     :message "decrypt-aes-key"}}))
                                                     (p/resolved {:ok true})))]
                  (p/let [result (execute-with-runtime-auth {:type :sync-start
                                                        :repo "logseq_db_demo"
@@ -861,7 +858,8 @@
                                                       {:root-dir "/tmp"})]
                    (is (= :error (:status result)))
                    (is (= :sync-start-runtime-error (get-in result [:error :code])))
-                   (is (= :decrypt-aes-key (get-in result [:error :last-error :code])))))
+                   (is (= :decrypt-aes-key (get-in result [:error :last-error :code])))
+                   (is (= 1 @status-calls))))
                (p/catch (fn [e]
                           (is false (str "unexpected error: " e))))
                (p/finally done)))))
@@ -957,7 +955,7 @@
                                   :wait-poll-interval-ms 0}
                                  {:root-dir "/tmp"})]
                    (is (= :error (:status result)))
-                   (is (= :sync-repair-required (get-in result [:error :code])))
+                   (is (= :sync-start-runtime-error (get-in result [:error :code])))
                    (is (= last-error (get-in result [:error :last-error])))
                    ;; execute-sync-start issues one explicit start request before
                    ;; polling; repair-required must prevent any retry request.

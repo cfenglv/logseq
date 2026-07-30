@@ -3767,6 +3767,7 @@
                                "b")
                               :payload-format payload-format)
                        aes-key (when e2ee? :test-aes-key)
+                       aes-key-attempts* (atom 0)
                        success-count* (atom 0)
                        flush-count* (atom 0)
                        client {:repo test-repo
@@ -3847,7 +3848,11 @@
                               (p/resolved response))
                             sync-crypt/graph-e2ee? (constantly e2ee?)
                             sync-crypt/<ensure-graph-aes-key
-                            (fn [& _] (p/resolved aes-key))
+                            (fn [& _]
+                              (let [attempt (swap! aes-key-attempts* inc)]
+                                (p/resolved
+                                 (when (or (not e2ee?) (> attempt 1))
+                                   aes-key))))
                             sync-apply/download-large-title!
                             (fn [repo graph-id marker key]
                               (is (= test-repo repo))
@@ -3859,7 +3864,40 @@
                             (fn [& _] (swap! flush-count* inc))
                             sync-assets/enqueue-asset-sync!
                             (fn [& _] nil)]
-                           (p/let [_
+                           (p/let [first-result
+                                   (if e2ee?
+                                     (->
+                                      (sync-handle-message/handle-message!
+                                       test-repo client raw-message)
+                                      (p/then (fn [_] :unexpected-success))
+                                      (p/catch (fn [error]
+                                                 {:error error})))
+                                     (p/resolved :not-applicable))
+                                   _ (when e2ee?
+                                       (is (not= :unexpected-success
+                                                 first-result))
+                                       (is (= :db-sync/e2ee-key-unavailable
+                                              (:type
+                                               (ex-data
+                                                (:error first-result)))))
+                                       (is (= :missing-aes-key
+                                              (:code
+                                               (ex-data
+                                                (:error first-result)))))
+                                       (is (sync-util/transient-sync-error?
+                                            (:error first-result)))
+                                       (is (= local-marker
+                                              (get
+                                               (d/entity
+                                                @conn
+                                                [:block/uuid block-uuid])
+                                               sync-large-title/large-title-object-attr)))
+                                       (is (zero? @success-count*))
+                                       (is (zero? @flush-count*))
+                                       (is (zero?
+                                            (client-op/get-pending-local-tx-count
+                                             test-repo))))
+                                   _
                                    (sync-handle-message/handle-message!
                                     test-repo client raw-message)]
                              (is (= remote-marker
@@ -3875,7 +3913,12 @@
                                     (client-op/get-local-server-checksum
                                      test-repo)))
                              (is (= 1 @success-count*))
-                             (is (= 1 @flush-count*)))))))))]
+                             (is (= 1 @flush-count*))
+                             (is (= (if e2ee? 2 0)
+                                    @aes-key-attempts*))
+                             (is (zero?
+                                  (client-op/get-pending-local-tx-count
+                                   test-repo))))))))))]
            (->
             (p/let [_ (run-case false)
                     _ (run-case true)])

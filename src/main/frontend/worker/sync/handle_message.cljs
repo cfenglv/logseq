@@ -322,9 +322,18 @@
                         :operation :large-title-marker-recovery
                         :stage :aes-key}))
             _ (when (and graph-e2ee? (nil? aes-key))
-                (marker-recovery-fail!
-                 :missing-aes-key
-                 {:repo repo}))
+                ;; A nil key means the provider has not made the secret
+                ;; available yet. Reconnect and replay hello instead of
+                ;; converting this transient condition into a persistent
+                ;; checksum mismatch. Decryption/integrity failures still
+                ;; take the fail-closed marker-recovery path below.
+                (throw
+                 (ex-info
+                  "graph E2EE key is temporarily unavailable"
+                  {:type :db-sync/e2ee-key-unavailable
+                   :code :missing-aes-key
+                   :repo repo
+                   :operation :large-title-marker-recovery})))
             _ (log/info :db-sync/large-title-marker-recovery
                         {:repo repo :t local-tx :stage :aes-key-ready})
             expected-payload-format

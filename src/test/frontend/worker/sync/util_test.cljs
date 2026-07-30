@@ -111,3 +111,12 @@
                  (:operation (ex-data error))))
           (is (sync-util/transient-sync-error? error)))))
      (p/finally done))))
+
+(deftest temporarily-unavailable-e2ee-key-is-transient-test
+  (let [error (ex-info "graph E2EE key is temporarily unavailable"
+                       {:type :db-sync/e2ee-key-unavailable
+                        :code :missing-aes-key
+                        :operation :large-title-marker-recovery})]
+    (is (sync-util/transient-sync-error? error))
+    (is (= :missing-aes-key
+           (:code (sync-util/error->diagnostic error))))))

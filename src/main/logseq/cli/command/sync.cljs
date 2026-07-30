@@ -750,6 +750,16 @@
                                      config-skipped-hint
                                      graph-id-skipped-hint)]
                 (cond
+                  (some? last-error)
+                  {:status :error
+                   :error {:code :sync-start-runtime-error
+                           :message "sync start encountered a runtime sync error before becoming ready"
+                           :repo repo
+                           :ws-state ws-state
+                           :status status
+                           :last-error last-error
+                           :hint runtime-error-hint}}
+
                   (= :repair-required ws-state)
                   {:status :error
                    :error {:code :sync-repair-required
@@ -763,16 +773,6 @@
                   (and (= :open ws-state) sync-ready? (nil? last-error))
                   {:status :ok
                    :data status}
-
-                  (and (>= (js/Date.now) deadline) (some? last-error))
-                  {:status :error
-                   :error {:code :sync-start-runtime-error
-                           :message "sync start reached open websocket but runtime sync error is present"
-                           :repo repo
-                           :ws-state ws-state
-                           :status status
-                           :last-error last-error
-                           :hint runtime-error-hint}}
 
                   (and initial? (contains? sync-start-skipped-states ws-state))
                   (p/let [_ (invoke-with-repo config repo :thread-api/db-sync-start [repo])

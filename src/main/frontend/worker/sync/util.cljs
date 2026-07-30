@@ -101,7 +101,8 @@
   [error]
   (contains? #{:db-sync/http-request-failed
                :db-sync/http-timeout
-               :db-sync/recovery-timeout}
+               :db-sync/recovery-timeout
+               :db-sync/e2ee-key-unavailable}
              (:type (ex-data error))))
 
 (defn with-timeout

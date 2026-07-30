@@ -284,6 +284,46 @@
         (finally
           (reset! worker-state/*db-sync-client prev-client))))))
 
+(deftest temporarily-unavailable-e2ee-key-reconnects-instead-of-requiring-repair-test
+  (let [prev-client @worker-state/*db-sync-client
+        original-set-timeout js/setTimeout
+        close-calls (atom 0)
+        ws #js {:readyState 1
+                :close (fn [] (swap! close-calls inc))}
+        client {:repo "e2ee-retry-repo"
+                :graph-id "graph-1"
+                :ws ws
+                :ws-state (atom :open)
+                :last-sync-error (atom nil)
+                :last-ws-message-ts (atom (js/Date.now))
+                :inflight (atom [])
+                :online-users (atom [])
+                :reconnect (atom {:attempt 0 :timer nil})
+                :stale-kill-timer (atom nil)}
+        error (ex-info "graph E2EE key is temporarily unavailable"
+                       {:type :db-sync/e2ee-key-unavailable
+                        :code :missing-aes-key})]
+    (set! js/setTimeout (fn [& _] :e2ee-retry-timer))
+    (reset! worker-state/*db-sync-client client)
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (#'sync/handle-runtime-sync-failure!
+         "e2ee-retry-repo"
+         client
+         ws
+         "wss://sync.example.test/sync/graph-1"
+         error
+         :message-failed)
+        (is (= 1 @close-calls))
+        (is (= :closed @(:ws-state client)))
+        (is (= :e2ee-retry-timer (:timer @(:reconnect client))))
+        (is (= :message-failed (:reason @(:reconnect client))))
+        (is (= :missing-aes-key
+               (:code @(:last-sync-error client))))
+        (finally
+          (set! js/setTimeout original-set-timeout)
+          (reset! worker-state/*db-sync-client prev-client))))))
+
 (deftest tx-reject-is-surfaced-without-reconnecting-a-healthy-socket-test
   (let [prev-client @worker-state/*db-sync-client
         close-calls (atom 0)
