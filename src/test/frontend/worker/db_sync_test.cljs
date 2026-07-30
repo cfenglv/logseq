@@ -6314,6 +6314,50 @@
               (is (some? tx-ent-after))
               (is (= 0 (aget tx-ent-after "pending"))))))))))
 
+(deftest rebase-transact-drops-stale-targets-without-dropping-valid-target-test
+  (testing "legacy numeric and bare UUID targets cannot break a mixed tx after remote delete"
+    (let [{:keys [conn child1 child2]} (setup-parent-child)
+          deleted-id (:db/id child1)
+          deleted-uuid (:block/uuid child1)
+          surviving-uuid (:block/uuid child2)
+          rebase-db-before @conn]
+      ;; Match the production worker: the per-test fixture otherwise removes
+      ;; the registered pipeline.
+      (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+      (ldb/batch-transact-with-temp-conn!
+       conn
+       {:rtc-tx? true}
+       (fn [temp-conn]
+         (ldb/transact! temp-conn
+                        [[:db/retractEntity [:block/uuid deleted-uuid]]]
+                        {:transact-remote? true})
+         (#'sync-apply/replay-canonical-outliner-op!
+          temp-conn
+          [:transact
+           [[[:db/add deleted-id :block/updated-at 1770000000000]
+             [:db/add (str deleted-uuid) :logseq.property/heading 3]
+             [:db/add (str deleted-uuid)
+              :logseq.property.node/display-type
+              :math]
+             [:db/add [:block/uuid surviving-uuid]
+              :block/title
+              "surviving local change"]]
+            {:outliner-op :rebase
+             :db-sync/rebased-local? true}]]
+          rebase-db-before)))
+      (is (nil? (d/entity @conn [:block/uuid deleted-uuid])))
+      (is (= "surviving local change"
+             (:block/title (d/entity @conn [:block/uuid surviving-uuid]))))
+      (is (empty?
+           (d/q '[:find [?e ...]
+                  :where
+                  [?e :logseq.property/heading 3]
+                  [(missing? $ ?e :block/uuid)]]
+                @conn)))
+      (let [validation (db-validate/validate-local-db! @conn)]
+        (is (empty? (:errors validation))
+            (str (:errors validation)))))))
+
 (deftest missing-parent-after-remote-delete-removes-descendants-test
   (testing "remote hard delete tx removes descendants when full delete tx-data is provided"
     (let [{:keys [conn parent child1]} (setup-parent-child)

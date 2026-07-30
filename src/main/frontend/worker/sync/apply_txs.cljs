@@ -1280,6 +1280,36 @@
        (keep tx-item-created-block-uuid-entry)
        (into {})))
 
+(defn- drop-stale-rebase-target-ops
+  "Drop updates to blocks that existed before rebase, were removed by remote
+  txs, and are not recreated by this tx.
+
+  Older pending :transact ops can contain numeric entity ids or bare UUID
+  strings, while normalized rows use block UUID lookup refs. A missing lookup
+  ref rejects the whole mixed tx; a stale numeric id or UUID string can instead
+  create a partial entity without :block/uuid. Keep unrelated targets in the
+  same pending tx so their local changes still rebase."
+  [current-db rebase-db-before tx-data]
+  (let [temp-id->uuid (tx-temp-id->uuid tx-data)
+        created-block-uuids (into (set (vals temp-id->uuid))
+                                  (comp (filter map?)
+                                        (keep :block/uuid)
+                                        (filter uuid?))
+                                  tx-data)
+        target-block-uuid (fn [item]
+                            (let [target (if (map? item)
+                                           (:db/id item)
+                                           (tx-item-entity item))]
+                              (tx-entity-uuid rebase-db-before temp-id->uuid target)))
+        stale-block-uuids (->> tx-data
+                               (keep target-block-uuid)
+                               (remove created-block-uuids)
+                               (filter #(nil? (d/entity current-db [:block/uuid %])))
+                               set)]
+    (remove (fn [item]
+              (contains? stale-block-uuids (target-block-uuid item)))
+            tx-data)))
+
 (defn- local-conflict-block-uuids
   [db local-txs]
   (->> local-txs
@@ -1674,6 +1704,9 @@
                        {:outliner-op :recycle-delete-permanently})))
 
     (let [[tx-data tx-meta] args
+          tx-data (cond->> tx-data
+                    rebase-db-before
+                    (drop-stale-rebase-target-ops @conn rebase-db-before))
           tx-data (expand-block-retracts-to-descendants @conn tx-data)]
       (when-let [tx-data (seq tx-data)]
         (ldb/transact! conn tx-data tx-meta)))))
