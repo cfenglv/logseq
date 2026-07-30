@@ -136,6 +136,7 @@ for (const relativePath of [
   "scripts/test-desktop-sidecar-release-contract.mjs",
   "scripts/test-project-signing-policy-contract.mjs",
   "scripts/test-project-signed-macos-updater.mjs",
+  "scripts/test-updater-private-material-policy-contract.mjs",
   "scripts/test-selfhost-macos-updater-release-contract.mjs",
   "scripts/test-updater-install-entry-contract.mjs",
   "scripts/test-selfhost-macos-user-guidance.mjs",
@@ -189,7 +190,7 @@ if (
 }
 if (
   rootPackage.scripts?.["desktop:test-release-contracts"] !==
-  "node ./scripts/test-project-signing-policy-contract.mjs && node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
+  "node ./scripts/test-updater-private-material-policy-contract.mjs && node ./scripts/test-project-signing-policy-contract.mjs && node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
 ) {
   fail("package.json must expose the exact desktop release contract gate");
 }
@@ -198,6 +199,12 @@ if (
   "node ./scripts/test-project-signing-policy-contract.mjs"
 ) {
   fail("package.json must expose the exact project signing policy contract");
+}
+if (
+  rootPackage.scripts?.["project-update:test-private-material-policy"] !==
+  "node ./scripts/test-updater-private-material-policy-contract.mjs"
+) {
+  fail("package.json must expose the exact updater private material contract");
 }
 if (
   rootPackage.scripts?.["project-update:require-signing-policy"] !==
