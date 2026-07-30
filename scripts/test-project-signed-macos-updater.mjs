@@ -2622,21 +2622,6 @@ const runNativeHelperContract = async ({
         x: productionPublicKeyRaw.toString("base64url"),
       },
     });
-    const productionHelperPath = path.join(
-      tempRoot,
-      "project-update-helper-production-key",
-    );
-    const [productionBuildExecutable, productionBuildArgs] = scriptCommand(
-      helperBuildPath,
-      [
-        "--arch",
-        helperArch,
-        "--output",
-        productionHelperPath,
-      ],
-    );
-    command(productionBuildExecutable, productionBuildArgs);
-    assert.equal(fs.existsSync(productionHelperPath), true);
     const isolatedSigner = createIsolatedSignerTree({
       bundleId,
       destinationRoot: path.join(tempRoot, "isolated-release-signer"),
@@ -2647,6 +2632,27 @@ const runNativeHelperContract = async ({
       signerPath: productionSignerPath,
       sourceRoot: repoRoot,
     });
+    const productionHelperPath = path.join(
+      tempRoot,
+      "project-update-helper-production-key",
+    );
+    const selectedHelperBuildPath = managedSignerFixture
+      ? path.join(
+          path.dirname(isolatedSigner.signerPath),
+          path.basename(helperBuildPath),
+        )
+      : helperBuildPath;
+    const [productionBuildExecutable, productionBuildArgs] = scriptCommand(
+      selectedHelperBuildPath,
+      [
+        "--arch",
+        helperArch,
+        "--output",
+        productionHelperPath,
+      ],
+    );
+    command(productionBuildExecutable, productionBuildArgs);
+    assert.equal(fs.existsSync(productionHelperPath), true);
     const signerPath = isolatedSigner.signerPath;
     assert.notEqual(
       signerPath,
