@@ -151,11 +151,12 @@ pnpm("isolated desktop test install", [
   "--ignore-workspace",
 ]);
 pnpm("desktop release contract tests", ["desktop:test-release-contracts"]);
+const compiledElectronTestBundle = "static/tests.js";
 const electronTestNamespaceFilter =
   "^(electron\\.(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|frontend\\.handler\\.db-based\\.(rtc-background-tasks|sync)-test|frontend\\.worker\\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\\.worker\\.sync\\..*-test|logseq\\.cli\\.command\\.sync-test|logseq\\.db-worker\\.daemon-test)$";
 const electronTestInvocation =
   electronTestInvocationFor(
-    "static/tests.js",
+    compiledElectronTestBundle,
     electronTestNamespaceFilter,
   );
 run(

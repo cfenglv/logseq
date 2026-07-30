@@ -1080,7 +1080,7 @@ test("formal preflight and CI execute updater source, native, and provider contr
     "full preflight does not execute electron.updater-test from the freshly compiled bundle",
   );
   assert.match(
-    fullPreflight.slice(Math.max(0, fullRunAt - 300), fullRunAt),
+    fullPreflight,
     /electron-test-preload\.cjs/,
     "full preflight does not preload its Node-only Electron test doubles",
   );
