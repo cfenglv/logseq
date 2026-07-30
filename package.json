@@ -111,6 +111,7 @@
     "db-worker-node:compile:bundle": "run-s db-worker-node:compile db-worker-node:bundle",
     "db-worker-node:e2e-compile:bundle": "run-s db-worker-node:e2e-compile db-worker-node:bundle",
     "cli:release": "pnpm --dir cli bundle && node ./scripts/stage-cli-runtime.mjs",
+    "test:cli-worker-fetch-proxy": "node --test ./scripts/test-cli-worker-fetch-proxy.mjs",
     "desktop:prepare-runtime-js": "node ./scripts/prepare-desktop-runtime-js.mjs",
     "desktop:verify-runtime-revisions": "node ./scripts/verify-desktop-runtime-revisions.mjs",
     "desktop:release-preflight:quick": "node ./scripts/desktop-release-preflight.mjs",
