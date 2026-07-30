@@ -1280,6 +1280,53 @@
        (keep tx-item-created-block-uuid-entry)
        (into {})))
 
+(def ^:private semantic-rebase-preserved-attrs
+  #{:block/created-at
+    :block/updated-at
+    :logseq.property/created-by-ref})
+
+(defn- tx-item-value
+  [item]
+  (if (vector? item)
+    (nth item 3 nil)
+    (:v item)))
+
+(defn- semantic-rebase-preserved-tx-data
+  "Restore stable metadata omitted from canonical outliner payloads.
+
+  Canonical ops intentionally exclude timestamps and creator attribution from
+  history payloads. During RTC rebase their raw pending tx is first reversed,
+  then those canonical ops are replayed inside an RTC batch where the normal
+  creator hook is disabled. Resolve only surviving UUID entities so remote
+  deletes still win and legacy tempids cannot create partial entities."
+  [current-db rebase-db-before tx-data]
+  (let [temp-id->uuid (tx-temp-id->uuid tx-data)]
+    (->> tx-data
+         (keep
+          (fn [item]
+            (let [attr (tx-item-attr item)]
+              (when (and (tx-item-add? item)
+                         (contains? semantic-rebase-preserved-attrs attr))
+                (let [entity-uuid (tx-entity-uuid
+                                   rebase-db-before
+                                   temp-id->uuid
+                                   (tx-item-entity item))
+                      entity-ref [:block/uuid entity-uuid]
+                      value (tx-item-value item)]
+                  (when (and entity-uuid
+                             (d/entity current-db entity-ref))
+                    (if (= :logseq.property/created-by-ref attr)
+                      (let [creator-uuid (tx-entity-uuid
+                                          rebase-db-before
+                                          temp-id->uuid
+                                          value)
+                            creator-ref [:block/uuid creator-uuid]]
+                        (when (and creator-uuid
+                                   (d/entity current-db creator-ref))
+                          [:db/add entity-ref attr creator-ref]))
+                      [:db/add entity-ref attr value])))))))
+         distinct)))
+
 (defn- normalize-rebase-target-ops
   "Resolve legacy targets for blocks that survived remote replay, and drop
   targets removed by remote txs that are not recreated by this tx.
@@ -1757,7 +1804,15 @@
                tx-meta
                (fn [conn]
                  (doseq [op forward-ops']
-                   (replay-canonical-outliner-op! conn op rebase-db-before))))
+                   (replay-canonical-outliner-op! conn op rebase-db-before))
+                 (when (seq forward-ops)
+                   (when-let [tx-data
+                              (seq
+                               (semantic-rebase-preserved-tx-data
+                                @conn
+                                rebase-db-before
+                                (:tx local-tx)))]
+                     (ldb/transact! conn tx-data tx-meta)))))
               status (if rebase-tx-report :rebased :no-op)]
           {:tx-id (:tx-id local-tx)
            :status status})

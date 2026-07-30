@@ -8159,6 +8159,53 @@
               (is (empty? (non-recycle-validation-entities validation))
                   (str (:errors validation))))))))))
 
+(deftest rebase-preserves-pending-insert-created-metadata-test
+  (testing "semantic replay keeps the original timestamps and creator attribution"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          block-uuid (random-uuid)
+          creator-id (:db/id (:block/page parent))]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (outliner-core/insert-blocks!
+           conn
+           [{:block/uuid block-uuid
+             :block/title "attributed pending insert"
+             :logseq.property/created-by-ref creator-id}]
+           parent
+           {:sibling? false
+            :keep-uuid? true})
+          (let [block-before (d/entity @conn [:block/uuid block-uuid])
+                created-at-before (:block/created-at block-before)
+                updated-at-before (:block/updated-at block-before)
+                creator-uuid-before (some-> block-before
+                                            :logseq.property/created-by-ref
+                                            :block/uuid)
+                pending-before (first (#'sync-apply/pending-txs test-repo))]
+            (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+            (is (some (fn [[_op _e attr]]
+                        (= :logseq.property/created-by-ref attr))
+                      (:tx pending-before)))
+            (is (nil? (get-in pending-before
+                              [:forward-outliner-ops 0 1 0 0
+                               :logseq.property/created-by-ref])))
+            (loop []
+              (when (<= (.now js/Date) updated-at-before)
+                (recur)))
+            (#'sync-apply/apply-remote-tx!
+             test-repo
+             nil
+             [[:db/add (:db/id parent) :block/title "parent remote metadata"]])
+            (let [block-after (d/entity @conn [:block/uuid block-uuid])
+                  validation (db-validate/validate-local-db! @conn)]
+              (is (= created-at-before (:block/created-at block-after)))
+              (is (= updated-at-before (:block/updated-at block-after)))
+              (is (= creator-uuid-before
+                     (some-> block-after
+                             :logseq.property/created-by-ref
+                             :block/uuid)))
+              (is (empty? (non-recycle-validation-entities validation))
+                  (str (:errors validation))))))))))
+
 (deftest rebase-create-then-delete-does-not-leave-anonymous-entities-test
   (testing "create+delete before sync should not leave anonymous entities after rebase"
     (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
