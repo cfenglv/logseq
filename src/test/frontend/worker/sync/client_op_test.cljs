@@ -226,6 +226,48 @@
   (sqlite-count db
                 "select count(*) as c from client_ops where kind = 'tx' and pending = 1"))
 
+(deftest pending-local-tx-count-waits-for-client-ops-store-test
+  (let [repo "repo-pending-before-store-ready"]
+    (with-client-ops-db
+      repo
+      (fn [db]
+        (try
+          (doseq [_ (range 13)]
+            (add-pending-tx! repo (random-uuid)))
+          (swap! worker-state/*client-ops-conns dissoc repo)
+          (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+
+          (testing "a startup read before the SQLite store is registered stays unknown"
+            (is (nil? (client-op/get-pending-local-tx-count repo)))
+            (is (not (contains? @client-op/*repo->pending-local-tx-count repo))))
+
+          (testing "the first mutation after store registration reconciles existing rows"
+            (swap! worker-state/*client-ops-conns assoc repo db)
+            (add-pending-tx! repo (random-uuid))
+            (client-op/adjust-pending-local-tx-count! repo 1)
+            (is (= 14 (sqlite-pending-tx-count db)))
+            (is (= 14 (client-op/get-pending-local-tx-count repo))))
+
+          (testing "an adjustment while the store is absent also stays unknown"
+            (swap! worker-state/*client-ops-conns dissoc repo)
+            (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+            (client-op/adjust-pending-local-tx-count! repo 1)
+            (is (not (contains? @client-op/*repo->pending-local-tx-count repo))))
+          (finally
+            (swap! client-op/*repo->pending-local-tx-count dissoc repo)))))))
+
+(deftest pending-local-tx-count-caches-zero-for-ready-store-test
+  (let [repo "repo-zero-pending-ready-store"]
+    (with-client-ops-db
+      repo
+      (fn [_db]
+        (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+        (try
+          (is (zero? (client-op/get-pending-local-tx-count repo)))
+          (is (= 0 (get @client-op/*repo->pending-local-tx-count repo)))
+          (finally
+            (swap! client-op/*repo->pending-local-tx-count dissoc repo)))))))
+
 (deftest pending-local-tx-count-cache-miss-after-storage-mutation-test
   (let [repo "repo-pending-local-tx-count"]
     (with-client-ops-db

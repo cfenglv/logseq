@@ -352,29 +352,29 @@
 
 (defn- persisted-pending-local-tx-count
   [repo]
-  (if-let [store (sqlite-store-or-throw repo)]
+  (when-let [store (sqlite-store-or-throw repo)]
     (or (some-> (sqlite-row store
                              "select count(*) as c from client_ops where kind = 'tx' and pending = 1"
                              [])
                 (aget "c"))
-        0)
-    0))
+        0)))
 
 (defn get-pending-local-tx-count
   [repo]
-  (if-let [cached (get @*repo->pending-local-tx-count repo)]
+  (if-some [cached (get @*repo->pending-local-tx-count repo)]
     cached
-    (let [count' (persisted-pending-local-tx-count repo)
-          counts (swap! *repo->pending-local-tx-count
-                        (fn [counts]
-                          (if (contains? counts repo)
-                            counts
-                            (assoc counts repo count'))))]
-      (get counts repo))))
+    (when-some [count' (persisted-pending-local-tx-count repo)]
+      (let [counts (swap! *repo->pending-local-tx-count
+                          (fn [counts]
+                            (if (contains? counts repo)
+                              counts
+                              (assoc counts repo count'))))]
+        (get counts repo)))))
 
 (defn adjust-pending-local-tx-count!
   "Adjust the warm pending count after the corresponding SQLite mutation.
-  A cold cache is reconciled from the already-updated SQLite state."
+  A cold cache is reconciled from the already-updated SQLite state. Before the
+  SQLite store is registered the count stays unknown and is not cached."
   [repo delta]
   (swap! *repo->pending-local-tx-count
          (fn [m]
@@ -384,7 +384,9 @@
              ;; Every caller changes SQLite before adjusting the cache. On a
              ;; cold worker SQLite already includes this delta, so initialize
              ;; from persisted state instead of applying the delta twice.
-             (assoc m repo (persisted-pending-local-tx-count repo))))))
+             (if-some [count' (persisted-pending-local-tx-count repo)]
+               (assoc m repo count')
+               m)))))
 
 (defn get-local-checksum
   [repo]
