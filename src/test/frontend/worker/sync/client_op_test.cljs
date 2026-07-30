@@ -237,8 +237,8 @@
           (swap! worker-state/*client-ops-conns dissoc repo)
           (swap! client-op/*repo->pending-local-tx-count dissoc repo)
 
-          (testing "a startup read before the SQLite store is registered stays unknown"
-            (is (nil? (client-op/get-pending-local-tx-count repo)))
+          (testing "a startup read returns zero without caching it before store registration"
+            (is (zero? (client-op/get-pending-local-tx-count repo)))
             (is (not (contains? @client-op/*repo->pending-local-tx-count repo))))
 
           (testing "the first mutation after store registration reconciles existing rows"

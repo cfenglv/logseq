@@ -363,13 +363,14 @@
   [repo]
   (if-some [cached (get @*repo->pending-local-tx-count repo)]
     cached
-    (when-some [count' (persisted-pending-local-tx-count repo)]
+    (if-some [count' (persisted-pending-local-tx-count repo)]
       (let [counts (swap! *repo->pending-local-tx-count
                           (fn [counts]
                             (if (contains? counts repo)
                               counts
                               (assoc counts repo count'))))]
-        (get counts repo)))))
+        (get counts repo))
+      0)))
 
 (defn adjust-pending-local-tx-count!
   "Adjust the warm pending count after the corresponding SQLite mutation.
