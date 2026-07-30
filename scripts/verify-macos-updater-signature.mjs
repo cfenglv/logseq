@@ -466,20 +466,6 @@ const runShipItInstall = ({
     );
   }
 
-  const statePath = path.join(installRoot, "state.json");
-  const toFileUrl = (file) => new URL(`file://${path.resolve(file)}`).href;
-  fs.writeFileSync(
-    statePath,
-    JSON.stringify({
-      updateBundleURL: toFileUrl(updateApp),
-      targetBundleURL: toFileUrl(targetApp),
-      bundleIdentifier,
-      launchAfterInstallation: false,
-      useUpdateBundleName: false,
-    }),
-    { mode: 0o600 },
-  );
-
   const shipIt = path.join(
     targetApp,
     "Contents",
@@ -494,34 +480,46 @@ const runShipItInstall = ({
     throw new Error(`old App does not contain Squirrel ShipIt at ${shipIt}`);
   }
 
-  const fixedHome = path.join(installRoot, "home");
-  fs.mkdirSync(fixedHome, { recursive: true });
-  const result = spawnSync(
-    shipIt,
-    [`com.logseq.updater-signature-gate.${process.pid}.ShipIt`, statePath],
-    {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        CFFIXED_USER_HOME: fixedHome,
-        HOME: fixedHome,
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
+  const jobLabel = `com.logseq.updater-signature-gate.${process.pid}.ShipIt`;
+  const userCaches = path.join(os.homedir(), "Library", "Caches");
+  const stateDirectory = fs.mkdtempSync(
+    path.join(userCaches, `${jobLabel}.`),
   );
-  const log = `${result.stdout || ""}${result.stderr || ""}`.trim();
-  const after = fs.existsSync(targetApp)
-    ? plistValue(targetApp, "CFBundleShortVersionString")
-    : "<missing>";
-  return classifyShipItOutcome({
-    spawnError: result.error,
-    signal: result.signal,
-    status: result.status,
-    log,
-    before,
-    after,
-    newVersion,
-  });
+  const toFileUrl = (file) => new URL(`file://${path.resolve(file)}`).href;
+  try {
+    fs.chmodSync(stateDirectory, 0o700);
+    const statePath = path.join(stateDirectory, "ShipItState.plist");
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        updateBundleURL: toFileUrl(updateApp),
+        targetBundleURL: toFileUrl(targetApp),
+        bundleIdentifier,
+        launchAfterInstallation: false,
+        useUpdateBundleName: false,
+      }),
+      { mode: 0o600 },
+    );
+    const result = spawnSync(shipIt, [jobLabel, statePath], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const log = `${result.stdout || ""}${result.stderr || ""}`.trim();
+    const after = fs.existsSync(targetApp)
+      ? plistValue(targetApp, "CFBundleShortVersionString")
+      : "<missing>";
+    return classifyShipItOutcome({
+      spawnError: result.error,
+      signal: result.signal,
+      status: result.status,
+      log,
+      before,
+      after,
+      newVersion,
+    });
+  } finally {
+    fs.rmSync(stateDirectory, { recursive: true, force: true });
+  }
 };
 
 export const loadBaseline = async (options, tempRoot) => {

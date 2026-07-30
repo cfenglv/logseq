@@ -1562,18 +1562,6 @@ const runShipIt = ({ baseline, candidate, tempRoot }) => {
     targetBundleIdentifier,
     "ShipIt fixture requires matching target and update bundle identifiers",
   );
-  const statePath = path.join(tempRoot, "ShipItState.plist");
-  fs.writeFileSync(
-    statePath,
-    JSON.stringify({
-      updateBundleURL: new URL(`file://${updateApp}`).href,
-      targetBundleURL: new URL(`file://${targetApp}`).href,
-      bundleIdentifier: targetBundleIdentifier,
-      launchAfterInstallation: false,
-      useUpdateBundleName: false,
-    }),
-    { mode: 0o644 },
-  );
   const shipIt = path.join(
     targetApp,
     "Contents",
@@ -1590,20 +1578,40 @@ const runShipIt = ({ baseline, candidate, tempRoot }) => {
     "raw",
     path.join(targetApp, "Contents", "Info.plist"),
   ]).output;
-  const result = command(
-    shipIt,
-    [`com.logseq.project-signed-test.${process.pid}.ShipIt`, statePath],
-    { allowFailure: true },
+  const jobLabel = `com.logseq.project-signed-test.${process.pid}.ShipIt`;
+  const userCaches = path.join(os.homedir(), "Library", "Caches");
+  const stateDirectory = fs.mkdtempSync(
+    path.join(userCaches, `${jobLabel}.`),
   );
-  const after = fs.existsSync(targetApp)
-    ? command("plutil", [
-        "-extract",
-        "CFBundleShortVersionString",
-        "raw",
-        path.join(targetApp, "Contents", "Info.plist"),
-      ]).output
-    : "<missing>";
-  return { ...result, before, after };
+  try {
+    fs.chmodSync(stateDirectory, 0o700);
+    const statePath = path.join(stateDirectory, "ShipItState.plist");
+    fs.writeFileSync(
+      statePath,
+      JSON.stringify({
+        updateBundleURL: new URL(`file://${updateApp}`).href,
+        targetBundleURL: new URL(`file://${targetApp}`).href,
+        bundleIdentifier: targetBundleIdentifier,
+        launchAfterInstallation: false,
+        useUpdateBundleName: false,
+      }),
+      { mode: 0o600 },
+    );
+    const result = command(shipIt, [jobLabel, statePath], {
+      allowFailure: true,
+    });
+    const after = fs.existsSync(targetApp)
+      ? command("plutil", [
+          "-extract",
+          "CFBundleShortVersionString",
+          "raw",
+          path.join(targetApp, "Contents", "Info.plist"),
+        ]).output
+      : "<missing>";
+    return { ...result, before, after };
+  } finally {
+    fs.rmSync(stateDirectory, { recursive: true, force: true });
+  }
 };
 
 const physicalAdHocWeakness = () => {
