@@ -3,10 +3,12 @@
 import assert from "node:assert/strict";
 import {
   createHash,
+  createPrivateKey,
   createPublicKey,
   generateKeyPairSync,
   sign as cryptoSign,
   verify as cryptoVerify,
+  X509Certificate,
 } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -29,6 +31,20 @@ const policyPath = path.join(
   "updater",
   "project-signing-policy.json",
 );
+const proxyTlsFixture = Object.freeze({
+  caCertificate: "scripts/fixtures/proxy-fetch-test-ca.cert.pem",
+  consumer: "scripts/test-cli-worker-fetch-proxy.mjs",
+  privateKey: "scripts/fixtures/proxy-fetch-test-server.key.pem",
+  serverCertificate: "scripts/fixtures/proxy-fetch-test-server.cert.pem",
+  sha256: Object.freeze({
+    "scripts/fixtures/proxy-fetch-test-ca.cert.pem":
+      "c07adf1132c0ea6c2df86eb5260e0dd0a90f9ee46d3859da1733a821a705082e",
+    "scripts/fixtures/proxy-fetch-test-server.cert.pem":
+      "307c758041e3b04bcd3eaf359a00532d79843f22f44051ee812af8f54b4aab23",
+    "scripts/fixtures/proxy-fetch-test-server.key.pem":
+      "84b5d6ec5bc56e117b5d8b21bad0de2244a603926a635544e43b446c2d7bb483",
+  }),
+});
 const helperRunnerPath = path.join(
   repoRoot,
   "scripts",
@@ -79,6 +95,105 @@ const fileSha256 = (file) => sha256(fs.readFileSync(file));
 
 const addCase = (cases, name, test) => cases.push([name, test]);
 
+const nulSeparatedFiles = (output) =>
+  output ? output.split("\0").filter(Boolean) : [];
+
+const trackedFiles = () =>
+  nulSeparatedFiles(command("git", ["ls-files", "-z"]).output);
+
+const gitGrepFiles = (pattern, { extended = false } = {}) => {
+  const args = ["grep", "-l", "-z", extended ? "-E" : "-F"];
+  args.push(
+    "-e",
+    pattern,
+    "--",
+    ".",
+    ":(exclude)scripts/test-project-signed-macos-updater.mjs",
+  );
+  const result = command("git", args, { allowFailure: true });
+  assert.ok(
+    result.status === 0 || result.status === 1,
+    `git grep failed with exit ${result.status}: ${result.output}`,
+  );
+  return result.status === 0 ? nulSeparatedFiles(result.output) : [];
+};
+
+const assertProxyFixturePathsTracked = (tracked) => {
+  for (const fixturePath of [
+    proxyTlsFixture.privateKey,
+    proxyTlsFixture.serverCertificate,
+    proxyTlsFixture.caCertificate,
+    proxyTlsFixture.consumer,
+  ]) {
+    assert.ok(
+      tracked.includes(fixturePath),
+      `${fixturePath} must remain tracked for the narrow TLS fixture exception`,
+    );
+  }
+};
+
+const assertPinnedProxyFixtureFile = (fixturePath, bytes) => {
+  assert.equal(
+    sha256(bytes),
+    proxyTlsFixture.sha256[fixturePath],
+    `${fixturePath} digest changed; the TLS fixture exception is fail-closed`,
+  );
+};
+
+const assertProxyFixtureConsumer = (source) => {
+  assert.match(
+    source,
+    /const caPath = path\.join\(\s*repoRoot,\s*"scripts",\s*"fixtures",\s*"proxy-fetch-test-ca\.cert\.pem",?\s*\);/,
+    "proxy test must load the pinned CA fixture",
+  );
+  assert.match(
+    source,
+    /const serverCertPath = path\.join\(\s*repoRoot,\s*"scripts",\s*"fixtures",\s*"proxy-fetch-test-server\.cert\.pem",?\s*\);/,
+    "proxy test must load the pinned server certificate fixture",
+  );
+  assert.match(
+    source,
+    /const serverKeyPath = path\.join\(\s*repoRoot,\s*"scripts",\s*"fixtures",\s*"proxy-fetch-test-server\.key\.pem",?\s*\);/,
+    "proxy test must load the pinned server private-key fixture",
+  );
+  assert.match(
+    source,
+    /server\.listen\(0,\s*"127\.0\.0\.1"/,
+    "proxy test servers must bind only to IPv4 loopback",
+  );
+  assert.match(
+    source,
+    /httpsTarget = https\.createServer\(\s*\{\s*cert:\s*fs\.readFileSync\(serverCertPath\),\s*key:\s*fs\.readFileSync\(serverKeyPath\),\s*\}/,
+    "proxy test must use the pinned key only for its local HTTPS target",
+  );
+  assert.match(
+    source,
+    /httpsTargetPort = await listen\(httpsTarget\)/,
+    "proxy test HTTPS target must use the loopback-only listener",
+  );
+  assert.match(
+    source,
+    /env\.NODE_EXTRA_CA_CERTS = caPath/,
+    "proxy test must trust only its adjacent CA fixture",
+  );
+};
+
+const privateMaterialFindings = ({ markerFiles, tracked }) => {
+  const allowed = proxyTlsFixture.privateKey;
+  return {
+    forbiddenNames: tracked.filter(
+      (file) =>
+        file !== allowed &&
+        /(?:^|\/)(?:[^/]+\.(?:p12|pfx|key)(?:\.pem)?|private[-_]?key(?:\.pem)?)$/i.test(
+          file,
+        ),
+    ),
+    markerFiles: markerFiles
+      .filter((file) => file !== allowed)
+      .join("\n"),
+  };
+};
+
 const userTrustSettingsDigest = () => {
   if (process.platform !== "darwin") return null;
   const tempRoot = fs.mkdtempSync(
@@ -100,34 +215,6 @@ const userTrustSettingsDigest = () => {
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
-};
-
-const trackedPrivateMaterial = () => {
-  const tracked = command("git", ["ls-files", "-z"]).output.split("\0");
-  const forbiddenNames = tracked.filter((file) =>
-    /(?:^|\/)(?:[^/]+\.(?:p12|pfx|key)|private[-_]?key(?:\.pem)?)$/i.test(
-      file,
-    ),
-  );
-  const marker = ["BEGIN", "PRIVATE", "KEY"].join(" ");
-  const markerSearch = command(
-    "git",
-    [
-      "grep",
-      "-l",
-      marker,
-      "--",
-      ".",
-      ":(exclude)scripts/test-project-signed-macos-updater.mjs",
-    ],
-    {
-      allowFailure: true,
-    },
-  );
-  return {
-    forbiddenNames,
-    markerFiles: markerSearch.status === 0 ? markerSearch.output : "",
-  };
 };
 
 const strictBase64 = (value, label) => {
@@ -289,6 +376,199 @@ const loadPolicy = () => {
     publicKeyPath,
     publicKeyRaw,
   };
+};
+
+const configuredProjectPublicKey = (loadedPolicy) => {
+  if (loadedPolicy.publicKeyPath) {
+    return createPublicKey(
+      fs.readFileSync(loadedPolicy.publicKeyPath, "utf8"),
+    );
+  }
+  return createPublicKey({
+    format: "jwk",
+    key: {
+      crv: "Ed25519",
+      kty: "OKP",
+      x: loadedPolicy.publicKeyRaw.toString("base64url"),
+    },
+  });
+};
+
+const validateTrackedProxyTlsFixture = (tracked) => {
+  assertProxyFixturePathsTracked(tracked);
+  const fixtureDirectory = path.posix.dirname(proxyTlsFixture.privateKey);
+  for (const certificatePath of [
+    proxyTlsFixture.serverCertificate,
+    proxyTlsFixture.caCertificate,
+  ]) {
+    assert.equal(
+      path.posix.dirname(certificatePath),
+      fixtureDirectory,
+      `${certificatePath} must remain adjacent to the proxy TLS private key`,
+    );
+  }
+
+  const fixtureBytes = new Map();
+  for (const fixturePath of [
+    proxyTlsFixture.privateKey,
+    proxyTlsFixture.serverCertificate,
+    proxyTlsFixture.caCertificate,
+  ]) {
+    const bytes = fs.readFileSync(path.join(repoRoot, fixturePath));
+    assertPinnedProxyFixtureFile(fixturePath, bytes);
+    fixtureBytes.set(fixturePath, bytes);
+    assert.deepEqual(
+      gitGrepFiles(path.posix.basename(fixturePath)),
+      [proxyTlsFixture.consumer],
+      `${fixturePath} must be referenced only by the local proxy E2E`,
+    );
+  }
+
+  const consumerSource = fs.readFileSync(
+    path.join(repoRoot, proxyTlsFixture.consumer),
+    "utf8",
+  );
+  assertProxyFixtureConsumer(consumerSource);
+
+  const privateKey = createPrivateKey(
+    fixtureBytes.get(proxyTlsFixture.privateKey),
+  );
+  const fixturePublicKey = createPublicKey(privateKey);
+  const serverCertificate = new X509Certificate(
+    fixtureBytes.get(proxyTlsFixture.serverCertificate),
+  );
+  const caCertificate = new X509Certificate(
+    fixtureBytes.get(proxyTlsFixture.caCertificate),
+  );
+  assert.equal(
+    privateKey.asymmetricKeyType,
+    "rsa",
+    "proxy TLS fixture must remain a non-release RSA key",
+  );
+  assert.equal(
+    fixturePublicKey.equals(serverCertificate.publicKey),
+    true,
+    "proxy TLS private key does not match its server certificate",
+  );
+  assert.equal(
+    serverCertificate.checkIssued(caCertificate) &&
+      serverCertificate.verify(caCertificate.publicKey),
+    true,
+    "proxy TLS server certificate does not verify against its adjacent CA",
+  );
+  assert.equal(
+    caCertificate.ca && caCertificate.verify(caCertificate.publicKey),
+    true,
+    "proxy TLS CA fixture is not a self-signed CA",
+  );
+  for (const loopbackAddress of ["127.0.0.1", "127.0.0.2"]) {
+    assert.equal(
+      serverCertificate.checkIP(loopbackAddress),
+      loopbackAddress,
+      `proxy TLS certificate is not pinned to ${loopbackAddress}`,
+    );
+  }
+
+  const productionPolicy = loadPolicy();
+  assert.notEqual(
+    fixturePublicKey.asymmetricKeyType,
+    "ed25519",
+    "proxy TLS fixture must not satisfy the Ed25519 release-signing policy",
+  );
+  if (productionPolicy.configured) {
+    assert.equal(
+      fixturePublicKey.equals(configuredProjectPublicKey(productionPolicy)),
+      false,
+      "proxy TLS fixture public key matches the project signing public key",
+    );
+  }
+};
+
+const trackedPrivateMaterial = () => {
+  const tracked = trackedFiles();
+  validateTrackedProxyTlsFixture(tracked);
+  return privateMaterialFindings({
+    markerFiles: gitGrepFiles(
+      "-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----",
+      { extended: true },
+    ),
+    tracked,
+  });
+};
+
+const testProxyTlsFixtureExceptionFailClosed = () => {
+  const tracked = trackedFiles();
+  assertProxyFixturePathsTracked(tracked);
+
+  const copiedKey =
+    "scripts/fixtures/proxy-fetch-test-server-copy.key.pem";
+  const renamedKey = "scripts/fixtures/proxy-fetch-renamed.pem";
+  const releaseKey = "resources/updater/release-signing.key";
+  const releasePem = "resources/updater/release-secret.pem";
+  const releaseP12 = "resources/updater/release-signing.p12";
+  const findings = privateMaterialFindings({
+    markerFiles: [
+      proxyTlsFixture.privateKey,
+      copiedKey,
+      renamedKey,
+      releasePem,
+    ],
+    tracked: [
+      proxyTlsFixture.privateKey,
+      copiedKey,
+      renamedKey,
+      releaseKey,
+      releasePem,
+      releaseP12,
+    ],
+  });
+  assert.deepEqual(findings.forbiddenNames, [
+    copiedKey,
+    releaseKey,
+    releaseP12,
+  ]);
+  assert.equal(
+    findings.markerFiles,
+    [copiedKey, renamedKey, releasePem].join("\n"),
+  );
+
+  assert.throws(
+    () =>
+      assertProxyFixturePathsTracked(
+        tracked.map((file) =>
+          file === proxyTlsFixture.privateKey ? renamedKey : file,
+        ),
+      ),
+    /must remain tracked/,
+    "renaming the exempt fixture must fail closed",
+  );
+  const privateKeyBytes = fs.readFileSync(
+    path.join(repoRoot, proxyTlsFixture.privateKey),
+  );
+  assert.throws(
+    () =>
+      assertPinnedProxyFixtureFile(
+        proxyTlsFixture.privateKey,
+        Buffer.concat([privateKeyBytes, Buffer.from("\n")]),
+      ),
+    /digest changed/,
+    "tampering with the exempt fixture must fail closed",
+  );
+  const consumerSource = fs.readFileSync(
+    path.join(repoRoot, proxyTlsFixture.consumer),
+    "utf8",
+  );
+  assert.throws(
+    () =>
+      assertProxyFixtureConsumer(
+        consumerSource.replace(
+          "key: fs.readFileSync(serverKeyPath),",
+          "key: Buffer.alloc(0),",
+        ),
+      ),
+    /local HTTPS target/,
+    "disconnecting the fixture from the proxy E2E must fail closed",
+  );
 };
 
 const scriptsMatching = (pattern) =>
@@ -2596,6 +2876,11 @@ const cases = [];
 const releaseBlockSelfTest = process.argv.includes(
   "--release-block-self-test",
 );
+
+addCase(cases, "proxy TLS private-key exception is pinned and fail-closed", () => {
+  validateTrackedProxyTlsFixture(trackedFiles());
+  testProxyTlsFixtureExceptionFailClosed();
+});
 
 addCase(cases, "repository contains no updater private key", () => {
   const tracked = trackedPrivateMaterial();
