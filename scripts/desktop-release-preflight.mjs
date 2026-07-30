@@ -137,6 +137,7 @@ for (const relativePath of [
   "scripts/test-desktop-preflight-preload-contract.mjs",
   "scripts/test-project-signing-policy-contract.mjs",
   "scripts/test-project-signed-macos-updater.mjs",
+  "scripts/test-shipit-process-outcome-contract.mjs",
   "scripts/test-updater-private-material-policy-contract.mjs",
   "scripts/test-selfhost-macos-updater-release-contract.mjs",
   "scripts/test-updater-install-entry-contract.mjs",
@@ -191,7 +192,7 @@ if (
 }
 if (
   rootPackage.scripts?.["desktop:test-release-contracts"] !==
-  "node ./scripts/test-updater-private-material-policy-contract.mjs && node ./scripts/test-desktop-preflight-preload-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --isolated-signer-algorithm-contract && node ./scripts/test-project-signed-macos-updater.mjs --managed-signer-native-key-alignment-contract && node ./scripts/test-project-signing-policy-contract.mjs && node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
+  "node ./scripts/test-updater-private-material-policy-contract.mjs && node ./scripts/test-shipit-process-outcome-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract && node ./scripts/test-desktop-preflight-preload-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --isolated-signer-algorithm-contract && node ./scripts/test-project-signed-macos-updater.mjs --managed-signer-native-key-alignment-contract && node ./scripts/test-project-signing-policy-contract.mjs && node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
 ) {
   fail("package.json must expose the exact desktop release contract gate");
 }
@@ -224,6 +225,18 @@ if (
   "node ./scripts/test-project-signed-macos-updater.mjs --managed-signer-native-key-alignment-contract"
 ) {
   fail("package.json must expose the managed signer/native key-alignment contract");
+}
+if (
+  rootPackage.scripts?.["project-update:test-physical-shipit-contract"] !==
+  "node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract"
+) {
+  fail("package.json must expose the physical ShipIt replacement contract");
+}
+if (
+  rootPackage.scripts?.["project-update:test-shipit-outcome-contract"] !==
+  "node ./scripts/test-shipit-process-outcome-contract.mjs"
+) {
+  fail("package.json must expose the ShipIt process-outcome contract");
 }
 if (
   rootPackage.scripts?.["project-update:require-signing-policy"] !==

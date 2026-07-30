@@ -88,7 +88,11 @@ const command = (
       }`,
     );
   }
-  return { output, status: result.status };
+  return {
+    output,
+    signal: result.signal,
+    status: result.status,
+  };
 };
 
 const sha256 = (value) =>
@@ -1631,12 +1635,22 @@ const physicalAdHocWeakness = () => {
       candidate,
       tempRoot: shipItRoot,
     });
-    if (
+    if (shipIt.signal) {
+      throw new Error(
+        [
+          `physical ShipIt terminated by ${shipIt.signal}`,
+          `exit=${shipIt.status} before=${shipIt.before} after=${shipIt.after}`,
+          shipIt.output,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      );
+    } else if (
       shipIt.output.includes("SQRLShipItRequestErrorDomain") ||
       shipIt.output.includes("Could not read update request")
     ) {
-      console.log(
-        `[project-updater] BLOCK physical ShipIt fixture exit=${shipIt.status} before=${shipIt.before} after=${shipIt.after}: request unreadable`,
+      throw new ReleaseBlock(
+        `physical ShipIt fixture exit=${shipIt.status} before=${shipIt.before} after=${shipIt.after}: request unreadable`,
       );
     } else {
       assert.equal(shipIt.status, 0, shipIt.output);
@@ -3449,6 +3463,9 @@ const isolatedSignerAlgorithmContractSelfTest = process.argv.includes(
 const managedSignerNativeKeyAlignmentContractSelfTest = process.argv.includes(
   "--managed-signer-native-key-alignment-contract",
 );
+const physicalShipItContractSelfTest = process.argv.includes(
+  "--physical-shipit-contract",
+);
 
 addCase(cases, "proxy TLS private-key exception is pinned and fail-closed", () => {
   validateTrackedProxyTlsFixture(trackedFiles());
@@ -3853,7 +3870,14 @@ addCase(cases, "diagnostics leave user Trust Settings unchanged", () => {
   assert.equal(userTrustSettingsDigest(), initialUserTrustSettingsDigest);
 });
 
-if (managedSignerNativeKeyAlignmentContractSelfTest) {
+if (physicalShipItContractSelfTest) {
+  cases.splice(0, cases.length);
+  addCase(
+    cases,
+    "physical ShipIt replacement distinguishes success, unreadable request, and signal termination",
+    () => physicalAdHocWeakness(),
+  );
+} else if (managedSignerNativeKeyAlignmentContractSelfTest) {
   cases.splice(0, cases.length);
   addCase(
     cases,
