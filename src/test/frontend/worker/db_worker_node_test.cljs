@@ -1,14 +1,21 @@
 (ns frontend.worker.db-worker-node-test
-  (:require ["fs" :as fs]
+  (:require ["child_process" :as child-process]
+            ["fs" :as fs]
             ["http" :as http]
             ["path" :as node-path]
+            ["ws" :as ws-module]
             [cljs.test :refer [async deftest is use-fixtures]]
             [clojure.string :as string]
+            [datascript.core :as d]
             [frontend.test.node-helper :as node-helper]
             [frontend.worker.db-core :as db-core]
             [frontend.worker.db-worker-node :as db-worker-node]
             [frontend.worker.db-worker-node-lock :as db-lock]
             [frontend.worker.platform.node :as platform-node]
+            [frontend.worker.state :as worker-state]
+            [frontend.worker.sync :as db-sync]
+            [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.large-title :as sync-large-title]
             [goog.object :as gobj]
             [logseq.cli.config :as cli-config]
             [logseq.cli.server :as cli-server]
@@ -17,6 +24,7 @@
             [logseq.common.config :as common-config]
             [logseq.common.version :as build-version]
             [logseq.db :as ldb]
+            [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-worker.log :as db-worker-log]
             [promesa.core :as p]))
 
@@ -111,6 +119,315 @@
   "Start daemon with quiet logging by default"
   [opts]
   (db-worker-node/start-daemon! (update opts :log-level #(or % "error"))))
+
+(defn- future-test-id-token
+  []
+  (let [header (.toString
+                (js/Buffer.from
+                 (js/JSON.stringify #js {:alg "none" :typ "JWT"}))
+                "base64url")
+        payload (.toString
+                 (js/Buffer.from
+                  (js/JSON.stringify
+                   #js {:sub "runtime-marker-test-user"
+                        :exp (+ (js/Math.floor (/ (js/Date.now) 1000))
+                                3600)}))
+                 "base64url")]
+    (str header "." payload ".test-signature")))
+
+(defn- <wait-for
+  [pred description]
+  (p/loop [remaining 150]
+    (cond
+      (pred)
+      true
+
+      (zero? remaining)
+      (throw (ex-info (str "timed out waiting for " description)
+                      {:description description}))
+
+      :else
+      (p/let [_ (p/delay 20)]
+        (p/recur (dec remaining))))))
+
+(defn- <wait-for-server
+  [root-dir repo ^js child]
+  (p/loop [remaining 200]
+    (p/let [servers
+            (-> (cli-server/list-servers
+                 {:root-dir root-dir})
+                (p/catch (fn [_] [])))
+            server
+            (some
+             (fn [entry]
+               (when (and (= repo (:repo entry))
+                          (= (.-pid child) (:pid entry)))
+                 entry))
+             servers)]
+      (cond
+        server
+        server
+
+        (not (nil? (.-exitCode child)))
+        (throw
+         (ex-info
+          "bundled db-worker-node exited before discovery"
+          {:exit-code (.-exitCode child)}))
+
+        (zero? remaining)
+        (throw
+         (ex-info
+          "timed out discovering bundled db-worker-node"
+          {:repo repo}))
+
+        :else
+        (p/let [_ (p/delay 25)]
+          (p/recur (dec remaining)))))))
+
+(defn- start-bundled-daemon!
+  [bundle-path root-dir repo]
+  (let [child
+        (.spawn
+         child-process
+         (.-execPath js/process)
+         (clj->js
+          [bundle-path
+           "--root-dir" root-dir
+           "--repo" repo
+           "--owner-source" "cli"
+           "--log-level" "error"])
+         #js {:env (.-env js/process)
+              :stdio #js ["ignore" "ignore" "ignore"]})]
+    (p/let [server (<wait-for-server root-dir repo child)]
+      (assoc
+       server
+       :child child
+       :stop!
+       (fn []
+         (p/let [_ (-> (http-request
+                        {:hostname (:host server)
+                         :port (:port server)
+                         :path "/v1/shutdown"
+                         :method "POST"}
+                        nil)
+                       (p/catch (fn [_] nil)))
+                 _ (p/delay 50)]
+           (when (nil? (.-exitCode child))
+             (.kill child "SIGTERM"))
+           nil))))))
+
+(defn- <wait-for-sync-status
+  [host port repo pred description]
+  (p/loop [remaining 150]
+    (p/let [status
+            (-> (invoke
+                 host port
+                 "thread-api/db-sync-status"
+                 [repo])
+                (p/catch (fn [_] nil)))]
+      (cond
+        (and status (pred status))
+        status
+
+        (zero? remaining)
+        (throw
+         (ex-info
+          (str "timed out waiting for " description)
+          {:description description
+           :last-status status}))
+
+        :else
+        (p/let [_ (p/delay 20)]
+          (p/recur (dec remaining)))))))
+
+(defn- start-runtime-sync-peer!
+  [{:keys [graph-id token state* requests* ws-messages*]}]
+  (p/create
+   (fn [resolve reject]
+     (let [hanging-marker-responses* (atom #{})
+           send-marker-state-response!
+           (fn [^js res]
+             (let [{:keys [t checksum checksum-version
+                           server-checksum block-uuid
+                           remote-marker]}
+                   @state*]
+               (.writeHead
+                res
+                200
+                #js {"content-type" "application/json"})
+               (.end
+                res
+                (js/JSON.stringify
+                 (clj->js
+                  {:t t
+                   :checksum checksum
+                   :checksum-version checksum-version
+                   :server-checksum server-checksum
+                   :large-title-markers
+                   [{:block-uuid (str block-uuid)
+                     :marker remote-marker}]})))))
+           server
+           (.createServer
+            http
+            (fn [^js req ^js res]
+              (let [url (js/URL. (.-url req) "http://127.0.0.1")
+                    path (.-pathname url)
+                    authorization (aget (.-headers req) "authorization")
+                    {:keys [remote-marker payload marker-response-mode]}
+                    @state*]
+                (swap! requests* conj
+                       {:method (.-method req)
+                        :path path
+                        :authorization authorization})
+                (cond
+                  (= path
+                     (str "/sync/" graph-id
+                          "/checksum/large-title-markers"))
+                  (if (= :hang marker-response-mode)
+                    (swap! hanging-marker-responses* conj res)
+                    (send-marker-state-response! res))
+
+                  (= path
+                     (str "/assets/" graph-id "/"
+                          (:asset-uuid remote-marker) "."
+                          (:asset-type remote-marker)))
+                  (do
+                    (.writeHead
+                     res
+                     200
+                     #js {"content-type"
+                          "text/plain; charset=utf-8"})
+                    (.end res (js/Buffer.from payload)))
+
+                  :else
+                  (do
+                    (.writeHead
+                     res
+                     404
+                     #js {"content-type" "application/json"})
+                    (.end res "{\"error\":\"not found\"}"))))))
+           WebSocketServer (.-WebSocketServer ws-module)
+           wss (new WebSocketServer #js {:noServer true})]
+       (.on
+        server
+        "upgrade"
+        (fn [^js req ^js socket head]
+          (let [url (js/URL. (.-url req) "http://127.0.0.1")]
+            (if (and (= (.-pathname url)
+                        (str "/sync/" graph-id))
+                     (= (.get (.-searchParams url) "token") token))
+              (.handleUpgrade
+               wss
+               req
+               socket
+               head
+               (fn [socket*]
+                 (.emit wss "connection" socket* req)))
+              (.destroy socket)))))
+       (.on
+        wss
+        "connection"
+        (fn [^js socket]
+          (.on
+           socket
+           "message"
+           (fn [^js raw]
+             (let [message
+                   (js->clj
+                    (js/JSON.parse (.toString raw))
+                    :keywordize-keys true)
+                   {:keys [t checksum checksum-version server-checksum
+                           hello-delay-ms]}
+                   @state*]
+               (swap! ws-messages* conj message)
+               (when (= "hello" (:type message))
+                 (let [send-hello!
+                       (fn []
+                         (.send
+                          socket
+                          (js/JSON.stringify
+                           (clj->js
+                            {:type "hello"
+                             :t t
+                             :checksum checksum
+                             :checksum-version checksum-version
+                             :server-checksum server-checksum}))))]
+                   (if (pos? (or hello-delay-ms 0))
+                     (js/setTimeout send-hello! hello-delay-ms)
+                     (send-hello!))))))))
+       (.once server "error" reject)
+       (.listen
+        server
+        0
+        "127.0.0.1"
+        (fn []
+          (let [port (.-port (.address server))]
+            (resolve
+             {:port port
+              :release-marker-responses!
+              (fn []
+                (let [responses @hanging-marker-responses*]
+                  (reset! hanging-marker-responses* #{})
+                  (swap! state* dissoc :marker-response-mode)
+                  (doseq [response responses]
+                    (send-marker-state-response! response))))
+              :stop!
+              (fn []
+                (doseq [^js response
+                        @hanging-marker-responses*]
+                  (try (.destroy response)
+                       (catch :default _ nil)))
+                (reset! hanging-marker-responses* #{})
+                (doseq [socket (array-seq (.-clients wss))]
+                  (try (.terminate socket) (catch :default _ nil)))
+                (p/create
+                 (fn [resolve-stop _]
+                   (.close
+                    wss
+                    (fn []
+                      (.close server resolve-stop))))))})))))))))
+
+(defn- seed-cold-runtime-marker-split!
+  [repo cursor graph-id large-title local-marker]
+  (let [conn (worker-state/get-datascript-conn repo)
+        page-uuid (random-uuid)]
+    (ldb/transact!
+     conn
+     [{:block/uuid page-uuid
+       :block/name "runtime-marker-page"
+       :block/title large-title
+       :block/tags :logseq.class/Page
+       :block/created-at 1785400000000
+       :block/updated-at 1785400000000
+       sync-large-title/large-title-object-attr local-marker}]
+     {:rtc-tx? true
+      :persist-op? false})
+    ;; A newly created desktop graph may carry its bootstrap transaction.
+    ;; The observed incident has no pending logical edits, so retire only the
+    ;; fixture's own bootstrap/persistence entries before freezing the cursor.
+    (let [pending-tx-ids
+          (mapv :tx-id
+                (client-op/get-pending-local-txs repo))
+          removed
+          (client-op/mark-pending-txs-false!
+           repo pending-tx-ids)]
+      (when (pos? (or removed 0))
+        (client-op/adjust-pending-local-tx-count!
+         repo
+         (- removed))))
+    (client-op/update-graph-uuid repo graph-id)
+    (client-op/update-local-tx repo cursor)
+    (client-op/update-local-checksum
+     repo
+     (sync-checksum/recompute-checksum @conn))
+    (client-op/update-local-server-checksum
+     repo
+     (sync-checksum/recompute-server-checksum @conn))
+    {:block-uuid page-uuid
+     :local-checksum
+     (sync-checksum/recompute-checksum @conn)
+     :local-server-checksum
+     (sync-checksum/recompute-server-checksum @conn)}))
 
 (defn- semantic-search-integration-enabled?
   []
@@ -894,6 +1211,721 @@
                             (if-let [stop! (:stop! @daemon)]
                               (-> (stop!) (p/finally (fn [] (done))))
                               (done))))))))
+
+(deftest db-worker-node-cold-start-recovers-marker-split-over-real-transports
+  (async
+   done
+   (let [seed-daemon* (atom nil)
+         runtime-daemon* (atom nil)
+         peer* (atom nil)
+         data-dir
+         (node-helper/create-tmp-dir "db-worker-marker-recovery")
+         repo
+         (str "logseq_db_marker_recovery_"
+              (subs (str (random-uuid)) 0 8))
+         graph-id "runtime-marker-graph"
+         cursor 2734
+         token (future-test-id-token)
+         large-title
+         (str (apply str (repeat 1535 "汉"))
+              " cold-runtime-marker-split")
+         payload (.encode sync-large-title/text-encoder large-title)
+         state* (atom nil)
+         requests* (atom [])
+         ws-messages* (atom [])]
+     (->
+      (p/let [{seed-stop! :stop!}
+              (start-daemon!
+               {:root-dir data-dir
+                :repo repo
+                :owner-source :cli})
+              _ (reset! seed-daemon* seed-stop!)
+              payload-digest
+              (sync-large-title/<sha256-hex payload)
+              local-marker
+              (sync-large-title/large-title-object
+               "11111111-1111-4111-8111-111111111111"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-plain-payload-format
+               payload-digest)
+              remote-marker
+              (sync-large-title/large-title-object
+               "22222222-2222-4222-8222-222222222222"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-plain-payload-format
+               payload-digest)
+              {:keys [block-uuid
+                      local-checksum
+                      local-server-checksum]}
+              (seed-cold-runtime-marker-split!
+               repo cursor graph-id large-title local-marker)
+              conn (worker-state/get-datascript-conn repo)
+              remote-db
+              (:db-after
+               (d/with
+                @conn
+                [[:db/add
+                  [:block/uuid block-uuid]
+                  :block/title
+                  ""]
+                 [:db/add
+                  [:block/uuid block-uuid]
+                  sync-large-title/large-title-object-attr
+                  remote-marker]]))
+              remote-checksum
+              (sync-checksum/recompute-checksum remote-db)
+              remote-server-checksum
+              (sync-checksum/recompute-server-checksum remote-db)
+              _ (is (= local-checksum remote-checksum)
+                    "the cold fixture must match the observed legacy checksum")
+              _ (is (not= local-server-checksum
+                          remote-server-checksum)
+                    "only the persisted randomized marker may differ")
+              _ (reset!
+                 state*
+                 {:t cursor
+                  :checksum remote-checksum
+                  :checksum-version
+                  sync-checksum/server-checksum-version
+                  :server-checksum remote-server-checksum
+                  :block-uuid block-uuid
+                  :remote-marker remote-marker
+                  :payload payload})
+              _ (seed-stop!)
+              _ (reset! seed-daemon* nil)
+              peer
+              (start-runtime-sync-peer!
+               {:graph-id graph-id
+                :token token
+                :state* state*
+                :requests* requests*
+                :ws-messages* ws-messages*})
+              _ (reset! peer* peer)
+              {runtime-host :host
+               runtime-port :port
+               runtime-stop! :stop!}
+              (start-daemon!
+               {:root-dir data-dir
+                :repo repo
+                :owner-source :cli})
+              _ (reset! runtime-daemon* runtime-stop!)
+              cold-conn (worker-state/get-datascript-conn repo)
+              cold-entity
+              (d/entity @cold-conn [:block/uuid block-uuid])
+              _ (is (= large-title (:block/title cold-entity))
+                    "the logical title must survive the daemon cold start")
+              _ (is (= local-marker
+                       (get cold-entity
+                            sync-large-title/large-title-object-attr))
+                    "the mismatched local marker must survive the cold start")
+              _ (is (= 1
+                       (count
+                        (sync-checksum/server-large-title-markers
+                         @cold-conn))))
+              _ (is (= cursor (client-op/get-local-tx repo)))
+              _ (is (zero?
+                     (client-op/get-pending-local-tx-count repo)))
+              _ (is (= local-checksum
+                       (sync-checksum/recompute-checksum @cold-conn)
+                       (client-op/get-local-checksum repo)))
+              _ (is (= local-server-checksum
+                       (sync-checksum/recompute-server-checksum @cold-conn)
+                       (client-op/get-local-server-checksum repo)))
+              http-base
+              (str "http://127.0.0.1:" (:port peer))
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/set-db-sync-config"
+                 [{:ws-url
+                   (str "ws://127.0.0.1:" (:port peer)
+                        "/sync/%s")
+                   :http-base http-base}])
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/sync-app-state"
+                 [{:auth/id-token token}])
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/db-sync-start"
+                 [repo])
+              _ (<wait-for
+                 #(some
+                   (fn [message]
+                     (= "hello" (:type message)))
+                   @ws-messages*)
+                 "WebSocket hello from cold db-worker-node")
+              _ (<wait-for
+                 #(some
+                   (fn [{:keys [path]}]
+                     (= path
+                        (str "/sync/" graph-id
+                             "/checksum/large-title-markers")))
+                   @requests*)
+                 "authenticated marker-state request")
+              _ (<wait-for
+                 #(= remote-server-checksum
+                     (client-op/get-local-server-checksum repo))
+                 "durable local marker checksum convergence")
+              first-status
+              (invoke
+               runtime-host
+               runtime-port
+               "thread-api/db-sync-status"
+               [repo])
+              recovered-entity
+              (d/entity
+               @(worker-state/get-datascript-conn repo)
+               [:block/uuid block-uuid])
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/db-sync-stop"
+                 [])
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/db-sync-start"
+                 [repo])
+              _ (<wait-for
+                 #(<= 2
+                      (count
+                       (filter
+                        (fn [message]
+                          (= "hello" (:type message)))
+                        @ws-messages*)))
+                 "fresh hello after runtime restart")
+              restart-status
+              (invoke
+               runtime-host
+               runtime-port
+               "thread-api/db-sync-status"
+               [repo])]
+        (let [marker-state-requests
+              (filterv
+               (fn [{:keys [path]}]
+                 (= path
+                    (str "/sync/" graph-id
+                         "/checksum/large-title-markers")))
+               @requests*)
+              marker-asset-requests
+              (filterv
+               (fn [{:keys [path]}]
+                 (= path
+                    (str "/assets/" graph-id "/"
+                         "22222222-2222-4222-8222-222222222222.txt")))
+               @requests*)]
+          (is (= :open (:ws-state first-status)))
+          (is (nil? (:last-error first-status)))
+          (is (= cursor
+                 (:local-tx first-status)
+                 (:remote-tx first-status)))
+          (is (zero? (:pending-local first-status)))
+          (is (= large-title (:block/title recovered-entity))
+              "automatic transport recovery must preserve the logical title")
+          (is (= (:remote-marker @state*)
+                 (get recovered-entity
+                      sync-large-title/large-title-object-attr))
+              "the cold SQLite marker must converge to server authority")
+          (is (= 1 (count marker-state-requests))
+              "a fresh synchronized restart must not repeat recovery")
+          (is (= 1 (count marker-asset-requests)))
+          (is (every?
+               #(= (str "Bearer " token) (:authorization %))
+               (concat marker-state-requests marker-asset-requests))
+              "both control and payload HTTP requests must use runtime auth")
+          (is (not-any?
+               #(string/includes? (:path %) "/snapshot/")
+               @requests*)
+              "runtime recovery must not use snapshot upload/download")
+          (is (not-any?
+               #(= "tx/batch" (:type %))
+               @ws-messages*)
+              "runtime recovery must not upload a manual repair transaction")
+          (is (= :open (:ws-state restart-status)))
+          (is (nil? (:last-error restart-status)))
+          (is (= remote-server-checksum
+                 (:local-checksum restart-status)
+                 (:remote-checksum restart-status)))))
+      (p/catch
+       (fn [error]
+         (is false
+             (str "cold runtime marker recovery failed: " error))))
+      (p/finally
+       (fn []
+         (->
+          (p/let [_ (db-sync/stop!)
+                  _ (when-let [stop! @runtime-daemon*]
+                      (stop!))
+                  _ (when-let [stop! @seed-daemon*]
+                      (stop!))
+                  _ (when-let [stop! (:stop! @peer*)]
+                      (stop!))]
+            nil)
+          (p/finally done))))))))
+
+(deftest db-worker-node-does-not-advertise-open-while-marker-recovery-is-unsettled
+  (async
+   done
+   (let [seed-daemon* (atom nil)
+         runtime-daemon* (atom nil)
+         peer* (atom nil)
+         data-dir
+         (node-helper/create-tmp-dir
+          "db-worker-marker-recovery-unsettled")
+         repo
+         (str "logseq_db_marker_recovery_unsettled_"
+              (subs (str (random-uuid)) 0 8))
+         graph-id "runtime-marker-unsettled-graph"
+         cursor 2734
+         token (future-test-id-token)
+         large-title
+         (str (apply str (repeat 1535 "汉"))
+              " unsettled-runtime-marker-split")
+         payload (.encode
+                  sync-large-title/text-encoder
+                  large-title)
+         state* (atom nil)
+         requests* (atom [])
+         ws-messages* (atom [])]
+     (->
+      (p/let [{seed-stop! :stop!}
+              (start-daemon!
+               {:root-dir data-dir
+                :repo repo
+                :owner-source :cli})
+              _ (reset! seed-daemon* seed-stop!)
+              payload-digest
+              (sync-large-title/<sha256-hex payload)
+              local-marker
+              (sync-large-title/large-title-object
+               "55555555-5555-4555-8555-555555555555"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-plain-payload-format
+               payload-digest)
+              remote-marker
+              (sync-large-title/large-title-object
+               "66666666-6666-4666-8666-666666666666"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-plain-payload-format
+               payload-digest)
+              {:keys [block-uuid
+                      local-checksum
+                      local-server-checksum]}
+              (seed-cold-runtime-marker-split!
+               repo cursor graph-id large-title local-marker)
+              conn (worker-state/get-datascript-conn repo)
+              remote-db
+              (:db-after
+               (d/with
+                @conn
+                [[:db/add
+                  [:block/uuid block-uuid]
+                  :block/title
+                  ""]
+                 [:db/add
+                  [:block/uuid block-uuid]
+                  sync-large-title/large-title-object-attr
+                  remote-marker]]))
+              remote-checksum
+              (sync-checksum/recompute-checksum remote-db)
+              remote-server-checksum
+              (sync-checksum/recompute-server-checksum remote-db)
+              _ (is (= local-checksum remote-checksum))
+              _ (is (not= local-server-checksum
+                          remote-server-checksum))
+              _ (is (zero?
+                     (client-op/get-pending-local-tx-count repo)))
+              _ (reset!
+                 state*
+                 {:t cursor
+                  :checksum remote-checksum
+                  :checksum-version
+                  sync-checksum/server-checksum-version
+                  :server-checksum remote-server-checksum
+                  :block-uuid block-uuid
+                  :remote-marker remote-marker
+                  :payload payload
+                  :marker-response-mode :hang})
+              _ (seed-stop!)
+              _ (reset! seed-daemon* nil)
+              peer
+              (start-runtime-sync-peer!
+               {:graph-id graph-id
+                :token token
+                :state* state*
+                :requests* requests*
+                :ws-messages* ws-messages*})
+              _ (reset! peer* peer)
+              {runtime-host :host
+               runtime-port :port
+               runtime-stop! :stop!}
+              (start-daemon!
+               {:root-dir data-dir
+                :repo repo
+                :owner-source :cli})
+              _ (reset! runtime-daemon* runtime-stop!)
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/set-db-sync-config"
+                 [{:ws-url
+                   (str "ws://127.0.0.1:" (:port peer)
+                        "/sync/%s")
+                   :http-base
+                   (str "http://127.0.0.1:" (:port peer))}])
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/sync-app-state"
+                 [{:auth/id-token token}])
+              _ (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/db-sync-start"
+                 [repo])
+              _ (<wait-for
+                 #(some
+                   (fn [{:keys [path]}]
+                     (= path
+                        (str "/sync/" graph-id
+                             "/checksum/large-title-markers")))
+                   @requests*)
+                 "unsettled marker-state request")
+              _ (p/delay 200)
+              stalled-status
+              (invoke
+               runtime-host
+               runtime-port
+               "thread-api/db-sync-status"
+               [repo])
+              _ (is (= cursor
+                       (:local-tx stalled-status)
+                       (:remote-tx stalled-status)))
+              _ (is (zero? (:pending-local stalled-status)))
+              _ (is (= local-server-checksum
+                       (:local-checksum stalled-status)))
+              _ (is (= remote-server-checksum
+                       (:remote-checksum stalled-status)))
+              _ (is (not
+                     (and (= :open (:ws-state stalled-status))
+                          (nil? (:last-error stalled-status))))
+                    (str
+                     "an unresolved hello recovery must not remain "
+                     "indistinguishable from healthy open sync: "
+                     (select-keys
+                      stalled-status
+                      [:ws-state
+                       :last-error
+                       :local-tx
+                       :remote-tx
+                       :pending-local
+                       :local-checksum
+                       :remote-checksum])))
+              _ ((:release-marker-responses! peer))
+              recovered-status
+              (<wait-for-sync-status
+               runtime-host
+               runtime-port
+               repo
+               #(and (= :open (:ws-state %))
+                     (nil? (:last-error %))
+                     (= remote-server-checksum
+                        (:local-checksum %)
+                        (:remote-checksum %)))
+               "eventual marker recovery after response resumes")
+              recovered-entity
+              (d/entity
+               @(worker-state/get-datascript-conn repo)
+               [:block/uuid block-uuid])]
+        (is (= :open (:ws-state recovered-status)))
+        (is (= large-title (:block/title recovered-entity)))
+        (is (= remote-marker
+               (get
+                recovered-entity
+                sync-large-title/large-title-object-attr)))
+        (is (= 1
+               (count
+                (filter
+                 (fn [{:keys [path]}]
+                   (= path
+                      (str "/sync/" graph-id
+                           "/checksum/large-title-markers")))
+                 @requests*)))
+            "resuming the same request must not create a manual retry")
+        (is (not-any?
+             #(= "tx/batch" (:type %))
+             @ws-messages*)))
+      (p/catch
+       (fn [error]
+         (is false
+             (str "unsettled runtime marker recovery failed: "
+                  error))))
+      (p/finally
+       (fn []
+         (->
+          (p/let [_ (db-sync/stop!)
+                  _ (when-let [stop! @runtime-daemon*]
+                      (stop!))
+                  _ (when-let [stop! @seed-daemon*]
+                      (stop!))
+                  _ (when-let [stop! (:stop! @peer*)]
+                      (stop!))]
+            nil)
+          (p/finally done))))))))
+
+(deftest bundled-db-worker-node-recovers-cold-marker-split-over-real-transports
+  (if-let [bundle-path
+           (some-> (gobj/get
+                    (.-env js/process)
+                    "LOGSEQ_MARKER_RECOVERY_BUNDLE")
+                   not-empty)]
+    (async
+     done
+     (let [seed-daemon* (atom nil)
+           runtime* (atom nil)
+           peer* (atom nil)
+           data-dir
+           (node-helper/create-tmp-dir
+            "bundled-db-worker-marker-recovery")
+           repo
+           (str "logseq_db_bundled_marker_recovery_"
+                (subs (str (random-uuid)) 0 8))
+           graph-id "bundled-runtime-marker-graph"
+           cursor 2734
+           token (future-test-id-token)
+           large-title
+           (str (apply str (repeat 1535 "汉"))
+                " bundled-cold-runtime-marker-split")
+           payload (.encode
+                    sync-large-title/text-encoder
+                    large-title)
+           state* (atom nil)
+           requests* (atom [])
+           ws-messages* (atom [])]
+       (->
+        (p/let [_ (is (fs/existsSync bundle-path)
+                      (str "missing bundled db-worker-node: "
+                           bundle-path))
+                {seed-stop! :stop!}
+                (start-daemon!
+                 {:root-dir data-dir
+                  :repo repo
+                  :owner-source :cli})
+                _ (reset! seed-daemon* seed-stop!)
+                payload-digest
+                (sync-large-title/<sha256-hex payload)
+                local-marker
+                (sync-large-title/large-title-object
+                 "33333333-3333-4333-8333-333333333333"
+                 sync-large-title/large-title-asset-type
+                 sync-large-title/large-title-plain-payload-format
+                 payload-digest)
+                remote-marker
+                (sync-large-title/large-title-object
+                 "44444444-4444-4444-8444-444444444444"
+                 sync-large-title/large-title-asset-type
+                 sync-large-title/large-title-plain-payload-format
+                 payload-digest)
+                {:keys [block-uuid
+                        local-checksum
+                        local-server-checksum]}
+                (seed-cold-runtime-marker-split!
+                 repo
+                 cursor
+                 graph-id
+                 large-title
+                 local-marker)
+                conn (worker-state/get-datascript-conn repo)
+                remote-db
+                (:db-after
+                 (d/with
+                  @conn
+                  [[:db/add
+                    [:block/uuid block-uuid]
+                    :block/title
+                    ""]
+                   [:db/add
+                    [:block/uuid block-uuid]
+                    sync-large-title/large-title-object-attr
+                    remote-marker]]))
+                remote-checksum
+                (sync-checksum/recompute-checksum remote-db)
+                remote-server-checksum
+                (sync-checksum/recompute-server-checksum remote-db)
+                _ (is (= local-checksum remote-checksum))
+                _ (is (not= local-server-checksum
+                            remote-server-checksum))
+                _ (is (zero?
+                       (client-op/get-pending-local-tx-count repo)))
+                _ (reset!
+                   state*
+                   {:t cursor
+                    :checksum remote-checksum
+                    :checksum-version
+                    sync-checksum/server-checksum-version
+                    :server-checksum remote-server-checksum
+                    :block-uuid block-uuid
+                    :remote-marker remote-marker
+                    :payload payload})
+                _ (seed-stop!)
+                _ (reset! seed-daemon* nil)
+                peer
+                (start-runtime-sync-peer!
+                 {:graph-id graph-id
+                  :token token
+                  :state* state*
+                  :requests* requests*
+                  :ws-messages* ws-messages*})
+                _ (reset! peer* peer)
+                runtime
+                (start-bundled-daemon!
+                 bundle-path data-dir repo)
+                _ (reset! runtime* runtime)
+                runtime-host (:host runtime)
+                runtime-port (:port runtime)
+                _ (invoke
+                   runtime-host
+                   runtime-port
+                   "thread-api/set-db-sync-config"
+                   [{:ws-url
+                     (str "ws://127.0.0.1:" (:port peer)
+                          "/sync/%s")
+                     :http-base
+                     (str "http://127.0.0.1:" (:port peer))}])
+                _ (invoke
+                   runtime-host
+                   runtime-port
+                   "thread-api/sync-app-state"
+                   [{:auth/id-token token}])
+                _ (invoke
+                   runtime-host
+                   runtime-port
+                   "thread-api/db-sync-start"
+                   [repo])
+                _ (<wait-for
+                   #(some
+                     (fn [message]
+                       (= "hello" (:type message)))
+                     @ws-messages*)
+                   "WebSocket hello from bundled db-worker-node")
+                _ (<wait-for
+                   #(some
+                     (fn [{:keys [path]}]
+                       (= path
+                          (str "/sync/" graph-id
+                               "/checksum/large-title-markers")))
+                     @requests*)
+                   "bundled authenticated marker-state request")
+                first-status
+                (<wait-for-sync-status
+                 runtime-host
+                 runtime-port
+                 repo
+                 #(and (= :open (:ws-state %))
+                       (= cursor
+                          (:local-tx %)
+                          (:remote-tx %))
+                       (= remote-server-checksum
+                          (:local-checksum %)
+                          (:remote-checksum %)))
+                 "bundled marker checksum convergence")
+                recovered-entity
+                (invoke
+                 runtime-host
+                 runtime-port
+                 "thread-api/pull"
+                 [repo
+                  [:block/title
+                   sync-large-title/large-title-object-attr]
+                  [:block/uuid block-uuid]])
+                _ (invoke
+                   runtime-host
+                   runtime-port
+                   "thread-api/db-sync-stop"
+                   [])
+                _ (invoke
+                   runtime-host
+                   runtime-port
+                   "thread-api/db-sync-start"
+                   [repo])
+                _ (<wait-for
+                   #(<= 2
+                        (count
+                         (filter
+                          (fn [message]
+                            (= "hello" (:type message)))
+                          @ws-messages*)))
+                   "fresh bundled hello after restart")
+                restart-status
+                (<wait-for-sync-status
+                 runtime-host
+                 runtime-port
+                 repo
+                 #(and (= :open (:ws-state %))
+                       (= remote-server-checksum
+                          (:local-checksum %)
+                          (:remote-checksum %)))
+                 "bundled restart checksum stability")]
+          (let [marker-state-requests
+                (filterv
+                 (fn [{:keys [path]}]
+                   (= path
+                      (str "/sync/" graph-id
+                           "/checksum/large-title-markers")))
+                 @requests*)
+                marker-asset-requests
+                (filterv
+                 (fn [{:keys [path]}]
+                   (= path
+                      (str "/assets/" graph-id "/"
+                           "44444444-4444-4444-8444-444444444444.txt")))
+                 @requests*)]
+            (is (= :open (:ws-state first-status)))
+            (is (nil? (:last-error first-status)))
+            (is (zero? (:pending-local first-status)))
+            (is (= large-title
+                   (:block/title recovered-entity)))
+            (is (= remote-marker
+                   (get
+                    recovered-entity
+                    sync-large-title/large-title-object-attr)))
+            (is (= 1 (count marker-state-requests)))
+            (is (= 1 (count marker-asset-requests)))
+            (is (every?
+                 #(= (str "Bearer " token)
+                     (:authorization %))
+                 (concat
+                  marker-state-requests
+                  marker-asset-requests)))
+            (is (not-any?
+                 #(string/includes? (:path %) "/snapshot/")
+                 @requests*))
+            (is (not-any?
+                 #(= "tx/batch" (:type %))
+                 @ws-messages*))
+            (is (= :open (:ws-state restart-status)))
+            (is (nil? (:last-error restart-status)))))
+        (p/catch
+         (fn [error]
+           (is false
+               (str "bundled cold marker recovery failed: "
+                    error))))
+        (p/finally
+         (fn []
+           (->
+            (p/let [_ (when-let [stop! (:stop! @runtime*)]
+                        (stop!))
+                    _ (when-let [stop! @seed-daemon*]
+                        (stop!))
+                    _ (when-let [stop! (:stop! @peer*)]
+                        (stop!))]
+              nil)
+            (p/finally done)))))))
+    (is true
+        "set LOGSEQ_MARKER_RECOVERY_BUNDLE to exercise the release bundle")))
 
 (deftest db-worker-node-daemon-smoke-test
   (async done
