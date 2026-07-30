@@ -866,6 +866,67 @@
                           (is false (str "unexpected error: " e))))
                (p/finally done)))))
 
+(deftest test-execute-sync-start-aes-key-recovery-timeout-is-immediate-error
+  (async done
+         (let [status-calls (atom 0)
+               start-calls (atom 0)
+               last-error {:code :marker-recovery-aes-key-timeout
+                           :stage :aes-key
+                           :message "marker recovery timed out waiting for AES key"}]
+           (-> (p/with-redefs [cli-server/ensure-server!
+                               (fn [config _repo]
+                                 (p/resolved
+                                  (assoc config
+                                         :base-url "http://example")))
+                               transport/invoke
+                               (fn [_ method _args]
+                                 (case method
+                                   :thread-api/db-sync-start
+                                   (do
+                                     (swap! start-calls inc)
+                                     (p/resolved nil))
+
+                                   :thread-api/db-sync-status
+                                   (do
+                                     (swap! status-calls inc)
+                                     (p/resolved
+                                      {:repo "logseq_db_demo"
+                                       :graph-id "graph-uuid"
+                                       :ws-state :syncing
+                                       :ready false
+                                       :local-tx 2734
+                                       :remote-tx 2734
+                                       :pending-local 0
+                                       :pending-server 0
+                                       :last-error last-error}))
+
+                                   (p/resolved {:ok true})))]
+                 (p/let [result
+                         (execute-with-runtime-auth
+                          {:type :sync-start
+                           :repo "logseq_db_demo"
+                           :wait-timeout-ms 200
+                           :wait-poll-interval-ms 0}
+                          {:root-dir "/tmp"})]
+                   (is (= :error (:status result))
+                       "sync start must not silently succeed after a recovery timeout")
+                   (is (= :sync-start-runtime-error
+                          (get-in result [:error :code])))
+                   (is (= :syncing
+                          (get-in result [:error :ws-state])))
+                   (is (= last-error
+                          (get-in result [:error :last-error])))
+                   (is (= 1 @status-calls)
+                       "a terminal runtime error must stop polling immediately")
+                   (is (= 1 @start-calls)
+                       "the CLI must not repeatedly issue sync-start while recovery is failed")))
+               (p/catch
+                (fn [error]
+                  (is false
+                      (str "unexpected AES-key timeout result: "
+                           error))))
+               (p/finally done)))))
+
 (deftest test-execute-sync-start-stops-on-repair-required
   (async done
          (let [start-calls (atom 0)

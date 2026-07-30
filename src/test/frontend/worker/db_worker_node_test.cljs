@@ -7,6 +7,7 @@
             [cljs.test :refer [async deftest is use-fixtures]]
             [clojure.string :as string]
             [datascript.core :as d]
+            [frontend.common.crypt :as crypt]
             [frontend.test.node-helper :as node-helper]
             [frontend.worker.db-core :as db-core]
             [frontend.worker.db-worker-node :as db-worker-node]
@@ -15,6 +16,7 @@
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.crypt :as sync-crypt]
             [frontend.worker.sync.large-title :as sync-large-title]
             [goog.object :as gobj]
             [logseq.cli.config :as cli-config]
@@ -136,19 +138,21 @@
     (str header "." payload ".test-signature")))
 
 (defn- <wait-for
-  [pred description]
-  (p/loop [remaining 150]
-    (cond
-      (pred)
-      true
+  ([pred description]
+   (<wait-for pred description 150 20))
+  ([pred description attempts delay-ms]
+   (p/loop [remaining attempts]
+     (cond
+       (pred)
+       true
 
-      (zero? remaining)
-      (throw (ex-info (str "timed out waiting for " description)
-                      {:description description}))
+       (zero? remaining)
+       (throw (ex-info (str "timed out waiting for " description)
+                       {:description description}))
 
-      :else
-      (p/let [_ (p/delay 20)]
-        (p/recur (dec remaining))))))
+       :else
+       (p/let [_ (p/delay delay-ms)]
+         (p/recur (dec remaining)))))))
 
 (defn- <wait-for-server
   [root-dir repo ^js child]
@@ -388,46 +392,53 @@
                       (.close server resolve-stop))))))})))))))))
 
 (defn- seed-cold-runtime-marker-split!
-  [repo cursor graph-id large-title local-marker]
-  (let [conn (worker-state/get-datascript-conn repo)
-        page-uuid (random-uuid)]
-    (ldb/transact!
-     conn
-     [{:block/uuid page-uuid
-       :block/name "runtime-marker-page"
-       :block/title large-title
-       :block/tags :logseq.class/Page
-       :block/created-at 1785400000000
-       :block/updated-at 1785400000000
-       sync-large-title/large-title-object-attr local-marker}]
-     {:rtc-tx? true
-      :persist-op? false})
-    ;; A newly created desktop graph may carry its bootstrap transaction.
-    ;; The observed incident has no pending logical edits, so retire only the
-    ;; fixture's own bootstrap/persistence entries before freezing the cursor.
-    (let [pending-tx-ids
-          (mapv :tx-id
-                (client-op/get-pending-local-txs repo))
-          removed
-          (client-op/mark-pending-txs-false!
-           repo pending-tx-ids)]
-      (when (pos? (or removed 0))
-        (client-op/adjust-pending-local-tx-count!
-         repo
-         (- removed))))
-    (client-op/update-graph-uuid repo graph-id)
-    (client-op/update-local-tx repo cursor)
-    (client-op/update-local-checksum
-     repo
-     (sync-checksum/recompute-checksum @conn))
-    (client-op/update-local-server-checksum
-     repo
-     (sync-checksum/recompute-server-checksum @conn))
-    {:block-uuid page-uuid
-     :local-checksum
-     (sync-checksum/recompute-checksum @conn)
-     :local-server-checksum
-     (sync-checksum/recompute-server-checksum @conn)}))
+  ([repo cursor graph-id large-title local-marker]
+   (seed-cold-runtime-marker-split!
+    repo cursor graph-id large-title local-marker {}))
+  ([repo cursor graph-id large-title local-marker {:keys [e2ee?]}]
+   (let [conn (worker-state/get-datascript-conn repo)
+         page-uuid (random-uuid)]
+     (ldb/transact!
+      conn
+      (cond->
+       [{:block/uuid page-uuid
+         :block/name "runtime-marker-page"
+         :block/title large-title
+         :block/tags :logseq.class/Page
+         :block/created-at 1785400000000
+         :block/updated-at 1785400000000
+         sync-large-title/large-title-object-attr local-marker}]
+        e2ee?
+        (conj {:db/ident :logseq.kv/graph-rtc-e2ee?
+               :kv/value true}))
+      {:rtc-tx? true
+       :persist-op? false})
+     ;; A newly created desktop graph may carry its bootstrap transaction.
+     ;; The observed incident has no pending logical edits, so retire only the
+     ;; fixture's own bootstrap/persistence entries before freezing the cursor.
+     (let [pending-tx-ids
+           (mapv :tx-id
+                 (client-op/get-pending-local-txs repo))
+           removed
+           (client-op/mark-pending-txs-false!
+            repo pending-tx-ids)]
+       (when (pos? (or removed 0))
+         (client-op/adjust-pending-local-tx-count!
+          repo
+          (- removed))))
+     (client-op/update-graph-uuid repo graph-id)
+     (client-op/update-local-tx repo cursor)
+     (client-op/update-local-checksum
+      repo
+      (sync-checksum/recompute-checksum @conn))
+     (client-op/update-local-server-checksum
+      repo
+      (sync-checksum/recompute-server-checksum @conn))
+     {:block-uuid page-uuid
+      :local-checksum
+      (sync-checksum/recompute-checksum @conn)
+      :local-server-checksum
+      (sync-checksum/recompute-server-checksum @conn)})))
 
 (defn- semantic-search-integration-enabled?
   []
@@ -1453,6 +1464,365 @@
        (fn [error]
          (is false
              (str "cold runtime marker recovery failed: " error))))
+      (p/finally
+       (fn []
+         (->
+          (p/let [_ (db-sync/stop!)
+                  _ (when-let [stop! @runtime-daemon*]
+                      (stop!))
+                  _ (when-let [stop! @seed-daemon*]
+                      (stop!))
+                  _ (when-let [stop! (:stop! @peer*)]
+                      (stop!))]
+            nil)
+          (p/finally done))))))))
+
+(deftest db-worker-node-e2ee-marker-recovery-retries-aes-key-until-available
+  (async
+   done
+   (let [seed-daemon* (atom nil)
+         runtime-daemon* (atom nil)
+         peer* (atom nil)
+         data-dir
+         (node-helper/create-tmp-dir
+          "db-worker-e2ee-marker-recovery-delayed-key")
+         repo
+         (str "logseq_db_e2ee_marker_recovery_"
+              (subs (str (random-uuid)) 0 8))
+         graph-id "runtime-e2ee-marker-graph"
+         cursor 2734
+         token (future-test-id-token)
+         large-title
+         (str (apply str (repeat 1535 "密"))
+              " delayed-aes-key-marker-split")
+         state* (atom nil)
+         requests* (atom [])
+         ws-messages* (atom [])
+         key-available?* (atom false)
+         key-lookups* (atom [])]
+     (->
+      (p/let [aes-key (crypt/<generate-aes-key)
+              encrypted-payload
+              (sync-crypt/<encrypt-text-value aes-key large-title)
+              payload
+              (.encode
+               sync-large-title/text-encoder
+               encrypted-payload)
+              payload-digest
+              (sync-large-title/<sha256-hex payload)
+              local-marker
+              (sync-large-title/large-title-object
+               "33333333-3333-4333-8333-333333333333"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-encrypted-payload-format
+               payload-digest)
+              remote-marker
+              (sync-large-title/large-title-object
+               "44444444-4444-4444-8444-444444444444"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-encrypted-payload-format
+               payload-digest)
+              _
+              (p/with-redefs
+                [sync-crypt/<ensure-graph-aes-key
+                 (fn [lookup-repo lookup-graph-id]
+                   (swap! key-lookups*
+                          conj
+                          {:repo lookup-repo
+                           :graph-id lookup-graph-id
+                           :available? @key-available?*})
+                   (p/resolved
+                    (when @key-available?*
+                      aes-key)))]
+                (p/let [{seed-stop! :stop!}
+                        (start-daemon!
+                         {:root-dir data-dir
+                          :repo repo
+                          :owner-source :cli})
+                        _ (reset! seed-daemon* seed-stop!)
+                        {:keys [block-uuid
+                                local-checksum
+                                local-server-checksum]}
+                        (seed-cold-runtime-marker-split!
+                         repo
+                         cursor
+                         graph-id
+                         large-title
+                         local-marker
+                         {:e2ee? true})
+                        conn
+                        (worker-state/get-datascript-conn repo)
+                        remote-db
+                        (:db-after
+                         (d/with
+                          @conn
+                          [[:db/add
+                            [:block/uuid block-uuid]
+                            :block/title
+                            ""]
+                           [:db/add
+                            [:block/uuid block-uuid]
+                            sync-large-title/large-title-object-attr
+                            remote-marker]]))
+                        remote-checksum
+                        (sync-checksum/recompute-checksum remote-db)
+                        remote-server-checksum
+                        (sync-checksum/recompute-server-checksum remote-db)
+                        _
+                        (is (= local-checksum remote-checksum)
+                            "the delayed-key fixture must keep the legacy cursor/checksum contract")
+                        _
+                        (is (not= local-server-checksum
+                                  remote-server-checksum)
+                            "the E2EE fixture must differ only in v2 marker identity")
+                        _
+                        (reset!
+                         state*
+                         {:t cursor
+                          :checksum remote-checksum
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum remote-server-checksum
+                          :block-uuid block-uuid
+                          :remote-marker remote-marker
+                          :payload payload})
+                        _ (seed-stop!)
+                        _ (reset! seed-daemon* nil)
+                        peer
+                        (start-runtime-sync-peer!
+                         {:graph-id graph-id
+                          :token token
+                          :state* state*
+                          :requests* requests*
+                          :ws-messages* ws-messages*})
+                        _ (reset! peer* peer)
+                        {runtime-host :host
+                         runtime-port :port
+                         runtime-stop! :stop!}
+                        (start-daemon!
+                         {:root-dir data-dir
+                          :repo repo
+                          :owner-source :cli})
+                        _ (reset! runtime-daemon* runtime-stop!)
+                        http-base
+                        (str "http://127.0.0.1:" (:port peer))
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/set-db-sync-config"
+                         [{:ws-url
+                           (str "ws://127.0.0.1:"
+                                (:port peer)
+                                "/sync/%s")
+                           :http-base http-base}])
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/sync-app-state"
+                         [{:auth/id-token token}])
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-start"
+                         [repo])
+                        _
+                        (<wait-for
+                         #(seq @key-lookups*)
+                         "the first unavailable E2EE AES-key lookup")
+                        waiting-status
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-status"
+                         [repo])
+                        waiting-entity
+                        (d/entity
+                         @(worker-state/get-datascript-conn repo)
+                         [:block/uuid block-uuid])
+                        _
+                        (is (not= :open (:ws-state waiting-status))
+                            "an unavailable AES key must not advertise Online")
+                        _
+                        (is (= cursor
+                               (:local-tx waiting-status)
+                               (:remote-tx waiting-status)))
+                        _
+                        (is (zero? (:pending-local waiting-status)))
+                        _
+                        (is (= large-title
+                               (:block/title waiting-entity))
+                            "waiting for the AES key must preserve the logical title")
+                        _
+                        (is (= local-marker
+                               (get
+                                waiting-entity
+                                sync-large-title/large-title-object-attr))
+                            "waiting for the AES key must not partially commit the remote marker")
+                        _
+                        (is (= local-server-checksum
+                               (client-op/get-local-server-checksum
+                                repo))
+                            "waiting for the AES key must leave the v2 mismatch intact")
+                        _
+                        (is (not-any?
+                             #(= "tx/batch" (:type %))
+                             @ws-messages*)
+                            "the unavailable-key phase must not emit repair transactions")
+                        _ (reset! key-available?* true)
+                        _
+                        (<wait-for
+                         #(some :available? @key-lookups*)
+                         "an automatic AES-key retry after the key becomes available"
+                         500
+                         20)
+                        _
+                        (<wait-for
+                         #(= remote-server-checksum
+                             (client-op/get-local-server-checksum repo))
+                         "automatic E2EE marker recovery convergence"
+                         500
+                         20)
+                        recovered-status
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-status"
+                         [repo])
+                        recovered-entity
+                        (d/entity
+                         @(worker-state/get-datascript-conn repo)
+                         [:block/uuid block-uuid])
+                        key-lookups-after-recovery
+                        (count @key-lookups*)
+                        marker-requests-after-recovery
+                        (count
+                         (filter
+                          (fn [{:keys [path]}]
+                            (= path
+                               (str
+                                "/sync/"
+                                graph-id
+                                "/checksum/large-title-markers")))
+                          @requests*))
+                        _ (p/delay 300)
+                        _
+                        (is (= key-lookups-after-recovery
+                               (count @key-lookups*))
+                            "successful recovery must not keep retrying AES-key acquisition")
+                        _
+                        (is (= marker-requests-after-recovery
+                               (count
+                                (filter
+                                 (fn [{:keys [path]}]
+                                   (= path
+                                      (str
+                                       "/sync/"
+                                       graph-id
+                                       "/checksum/large-title-markers")))
+                                 @requests*)))
+                            "successful recovery must not loop marker-state requests")
+                        hello-count-before-restart
+                        (count
+                         (filter
+                          #(= "hello" (:type %))
+                          @ws-messages*))
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-stop"
+                         [])
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-start"
+                         [repo])
+                        _
+                        (<wait-for
+                         #(< hello-count-before-restart
+                             (count
+                              (filter
+                               (fn [message]
+                                 (= "hello" (:type message)))
+                               @ws-messages*)))
+                         "a healthy E2EE restart after marker recovery")
+                        restart-status
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-status"
+                         [repo])]
+                  (let [marker-asset-requests
+                        (filterv
+                         (fn [{:keys [path]}]
+                           (= path
+                              (str "/assets/"
+                                   graph-id
+                                   "/44444444-4444-4444-8444-444444444444.txt")))
+                         @requests*)]
+                    (is (<= 2 (count @key-lookups*))
+                        "recovery must retry after initial AES-key unavailability")
+                    (is (every?
+                         #(= {:repo repo
+                              :graph-id graph-id}
+                             (select-keys % [:repo :graph-id]))
+                         @key-lookups*))
+                    (is (= :open (:ws-state recovered-status)))
+                    (is (nil? (:last-error recovered-status)))
+                    (is (= cursor
+                           (:local-tx recovered-status)
+                           (:remote-tx recovered-status)))
+                    (is (zero? (:pending-local recovered-status)))
+                    (is (= remote-server-checksum
+                           (:local-checksum recovered-status)
+                           (:remote-checksum recovered-status)))
+                    (is (= large-title
+                           (:block/title recovered-entity))
+                        "decryption must authenticate the original logical title")
+                    (is (= remote-marker
+                           (get
+                            recovered-entity
+                            sync-large-title/large-title-object-attr))
+                        "only the authenticated remote marker may be committed")
+                    (is (seq marker-asset-requests))
+                    (is (every?
+                         #(= (str "Bearer " token)
+                             (:authorization %))
+                         marker-asset-requests))
+                    (is (not-any?
+                         #(string/includes? (:path %) "/tx/batch")
+                         @requests*)
+                        "E2EE recovery must not mutate the remote transaction log")
+                    (is (not-any?
+                         #(= "tx/batch" (:type %))
+                         @ws-messages*)
+                        "E2EE recovery must not upload a manual repair transaction")
+                    (is (= :open (:ws-state restart-status)))
+                    (is (nil? (:last-error restart-status)))
+                    (is (= key-lookups-after-recovery
+                           (count @key-lookups*))
+                        "a converged restart must not re-enter AES-key recovery")
+                    (is (= marker-requests-after-recovery
+                           (count
+                            (filter
+                             (fn [{:keys [path]}]
+                               (= path
+                                  (str
+                                   "/sync/"
+                                   graph-id
+                                   "/checksum/large-title-markers")))
+                             @requests*)))
+                        "a converged restart must not repeat marker repair"))))]
+        nil)
+      (p/catch
+       (fn [error]
+         (is false
+             (str "delayed AES-key marker recovery failed: "
+                  error))))
       (p/finally
        (fn []
          (->

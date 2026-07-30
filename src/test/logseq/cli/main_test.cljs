@@ -137,6 +137,64 @@
     (is (= 1 (result->exit-code {:status :error})))
     (is (= 7 (result->exit-code {:status :error :exit-code 7})))))
 
+(deftest test-sync-start-recovery-timeout-produces-nonzero-json-output
+  (async done
+         (let [last-error
+               {:code :marker-recovery-aes-key-timeout
+                :stage :aes-key
+                :message "marker recovery timed out waiting for AES key"}]
+           (->
+            (p/with-redefs
+              [commands/execute
+               (fn [_action _config]
+                 (p/resolved
+                  {:status :error
+                   :error
+                   {:code :sync-start-runtime-error
+                    :message "sync start failed during marker recovery"
+                    :repo "logseq_db_demo"
+                    :ws-state :syncing
+                    :last-error last-error}}))]
+              (p/let [result
+                      (cli-main/run!
+                       ["--root-dir"
+                        "/tmp"
+                        "--graph"
+                        "demo"
+                        "--output"
+                        "json"
+                        "sync"
+                        "start"]
+                       {:exit? false})
+                      output (:output result)
+                      payload
+                      (js->clj
+                       (js/JSON.parse output)
+                       :keywordize-keys true)]
+                (is (= 1 (:exit-code result))
+                    "a failed recovery must produce a nonzero process result")
+                (is (not (string/blank? output))
+                    "structured sync start errors must never have empty stdout")
+                (is (= "error" (:status payload)))
+                (is (= "sync-start-runtime-error"
+                       (get-in payload [:error :code])))
+                (is (= "marker-recovery-aes-key-timeout"
+                       (get-in payload
+                               [:error
+                                :last-error
+                                :code])))
+                (is (= "aes-key"
+                       (get-in payload
+                               [:error
+                                :last-error
+                                :stage])))))
+            (p/catch
+             (fn [error]
+               (is false
+                   (str "unexpected CLI recovery timeout output: "
+                        error))))
+            (p/finally done)))))
+
 (deftest test-profile-output-enabled-for-version
   (async done
     (-> (p/let [result (cli-main/run! ["--profile" "--version"] {:exit? false})
