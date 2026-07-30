@@ -249,6 +249,7 @@
   (p/create
    (fn [resolve reject]
      (let [hanging-marker-responses* (atom #{})
+           hanging-batch-acks* (atom [])
            send-marker-state-response!
            (fn [^js res]
              (let [{:keys [t checksum checksum-version
@@ -270,6 +271,33 @@
                    :large-title-markers
                    [{:block-uuid (str block-uuid)
                      :marker remote-marker}]})))))
+           send-batch-ack!
+           (fn [^js socket]
+             (let [{:keys [ack-t ack-checksum
+                           ack-checksum-version
+                           ack-server-checksum]}
+                   @state*]
+               (swap! state*
+                      (fn [state]
+                        (-> state
+                            (assoc
+                             :t ack-t
+                             :checksum ack-checksum
+                             :checksum-version
+                             ack-checksum-version
+                             :server-checksum
+                             ack-server-checksum)
+                            (dissoc
+                             :tx-batch-response-mode))))
+               (.send
+                socket
+                (js/JSON.stringify
+                 (clj->js
+                  {:type "tx/batch/ok"
+                   :t ack-t
+                   :checksum ack-checksum
+                   :checksum-version ack-checksum-version
+                   :server-checksum ack-server-checksum})))))
            server
            (.createServer
             http
@@ -344,7 +372,8 @@
                            hello-delay-ms]}
                    @state*]
                (swap! ws-messages* conj message)
-               (when (= "hello" (:type message))
+               (case (:type message)
+                 "hello"
                  (let [send-hello!
                        (fn []
                          (.send
@@ -358,7 +387,15 @@
                              :server-checksum server-checksum}))))]
                    (if (pos? (or hello-delay-ms 0))
                      (js/setTimeout send-hello! hello-delay-ms)
-                     (send-hello!))))))))
+                     (send-hello!)))
+
+                 "tx/batch"
+                 (if (= :hang
+                        (:tx-batch-response-mode @state*))
+                   (swap! hanging-batch-acks* conj socket)
+                   (send-batch-ack! socket))
+
+                 nil)))))
        (.once server "error" reject)
        (.listen
         server
@@ -375,6 +412,12 @@
                   (swap! state* dissoc :marker-response-mode)
                   (doseq [response responses]
                     (send-marker-state-response! response))))
+              :release-batch-acks!
+              (fn []
+                (let [sockets @hanging-batch-acks*]
+                  (reset! hanging-batch-acks* [])
+                  (doseq [socket sockets]
+                    (send-batch-ack! socket))))
               :stop!
               (fn []
                 (doseq [^js response
@@ -382,6 +425,7 @@
                   (try (.destroy response)
                        (catch :default _ nil)))
                 (reset! hanging-marker-responses* #{})
+                (reset! hanging-batch-acks* [])
                 (doseq [socket (array-seq (.-clients wss))]
                   (try (.terminate socket) (catch :default _ nil)))
                 (p/create
@@ -1823,6 +1867,556 @@
          (is false
              (str "delayed AES-key marker recovery failed: "
                   error))))
+      (p/finally
+       (fn []
+         (->
+          (p/let [_ (db-sync/stop!)
+                  _ (when-let [stop! @runtime-daemon*]
+                      (stop!))
+                  _ (when-let [stop! @seed-daemon*]
+                      (stop!))
+                  _ (when-let [stop! (:stop! @peer*)]
+                      (stop!))]
+            nil)
+          (p/finally done))))))))
+
+(deftest db-worker-node-pending-ack-defers-ready-until-e2ee-marker-recovery
+  (async
+   done
+   (let [seed-daemon* (atom nil)
+         runtime-daemon* (atom nil)
+         peer* (atom nil)
+         data-dir
+         (node-helper/create-tmp-dir
+          "db-worker-pending-post-ack-marker-recovery")
+         repo
+         (str "logseq_db_pending_post_ack_"
+              (subs (str (random-uuid)) 0 8))
+         graph-id "runtime-pending-post-ack-graph"
+         cursor 2734
+         ack-cursor (inc cursor)
+         token (future-test-id-token)
+         large-title
+         (str (apply str (repeat 1535 "密"))
+              " pending-post-ack-marker-split")
+         pending-page-uuid (random-uuid)
+         pending-page-title "pending user transaction survives exactly once"
+         state* (atom nil)
+         requests* (atom [])
+         ws-messages* (atom [])
+         aes-key-lookups* (atom [])]
+     (->
+      (p/let [aes-key (crypt/<generate-aes-key)
+              encrypted-payload
+              (sync-crypt/<encrypt-text-value aes-key large-title)
+              payload
+              (.encode
+               sync-large-title/text-encoder
+               encrypted-payload)
+              payload-digest
+              (sync-large-title/<sha256-hex payload)
+              local-marker
+              (sync-large-title/large-title-object
+               "55555555-5555-4555-8555-555555555555"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-encrypted-payload-format
+               payload-digest)
+              remote-marker
+              (sync-large-title/large-title-object
+               "66666666-6666-4666-8666-666666666666"
+               sync-large-title/large-title-asset-type
+               sync-large-title/large-title-encrypted-payload-format
+               payload-digest)
+              _
+              (p/with-redefs
+                [sync-crypt/<ensure-graph-aes-key
+                 (fn [lookup-repo lookup-graph-id]
+                   (swap! aes-key-lookups*
+                          conj
+                          {:repo lookup-repo
+                           :graph-id lookup-graph-id})
+                   (p/resolved aes-key))]
+                (p/let [{seed-stop! :stop!}
+                        (start-daemon!
+                         {:root-dir data-dir
+                          :repo repo
+                          :owner-source :cli})
+                        _ (reset! seed-daemon* seed-stop!)
+                        {:keys [block-uuid]}
+                        (seed-cold-runtime-marker-split!
+                         repo
+                         cursor
+                         graph-id
+                         large-title
+                         local-marker
+                         {:e2ee? true})
+                        conn
+                        (worker-state/get-datascript-conn repo)
+                        base-db @conn
+                        remote-pre-db
+                        (:db-after
+                         (d/with
+                          base-db
+                          [[:db/add
+                            [:block/uuid block-uuid]
+                            :block/title
+                            ""]
+                           [:db/add
+                            [:block/uuid block-uuid]
+                            sync-large-title/large-title-object-attr
+                            remote-marker]]))
+                        _
+                        (ldb/transact!
+                         conn
+                         [{:block/uuid pending-page-uuid
+                           :block/name
+                           "pending-user-transaction-page"
+                           :block/title pending-page-title
+                           :block/tags :logseq.class/Page
+                           :block/created-at 1785400001000
+                           :block/updated-at 1785400001000}]
+                         {:outliner-op :save-block})
+                        _
+                        (<wait-for
+                         #(= 1
+                             (client-op/get-pending-local-tx-count
+                              repo))
+                         "one durable pending user transaction")
+                        pending-before-cold-start
+                        (client-op/get-pending-local-txs repo)
+                        local-db @conn
+                        local-legacy-checksum
+                        (sync-checksum/recompute-checksum local-db)
+                        local-v2-checksum
+                        (sync-checksum/recompute-server-checksum
+                         local-db)
+                        remote-post-db
+                        (:db-after
+                         (d/with
+                          local-db
+                          [[:db/add
+                            [:block/uuid block-uuid]
+                            :block/title
+                            ""]
+                           [:db/add
+                            [:block/uuid block-uuid]
+                            sync-large-title/large-title-object-attr
+                            remote-marker]]))
+                        pre-legacy-checksum
+                        (sync-checksum/recompute-checksum
+                         remote-pre-db)
+                        pre-v2-checksum
+                        (sync-checksum/recompute-server-checksum
+                         remote-pre-db)
+                        post-legacy-checksum
+                        (sync-checksum/recompute-checksum
+                         remote-post-db)
+                        post-v2-checksum
+                        (sync-checksum/recompute-server-checksum
+                         remote-post-db)
+                        _
+                        (is (= 1
+                               (count pending-before-cold-start)))
+                        _
+                        (is (not= pre-legacy-checksum
+                                  local-legacy-checksum)
+                            "the initial hello is stale only because the user transaction is pending")
+                        _
+                        (is (= post-legacy-checksum
+                               local-legacy-checksum)
+                            "the acknowledged user transaction must align the legacy checksum")
+                        _
+                        (is (not= post-v2-checksum
+                                  local-v2-checksum)
+                            "the post-ack state must retain only the marker v2 split")
+                        _
+                        (reset!
+                         state*
+                         {:t cursor
+                          :checksum pre-legacy-checksum
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum pre-v2-checksum
+                          :ack-t ack-cursor
+                          :ack-checksum post-legacy-checksum
+                          :ack-checksum-version
+                          sync-checksum/server-checksum-version
+                          :ack-server-checksum post-v2-checksum
+                          :tx-batch-response-mode :hang
+                          :marker-response-mode :hang
+                          :block-uuid block-uuid
+                          :remote-marker remote-marker
+                          :payload payload})
+                        _ (seed-stop!)
+                        _ (reset! seed-daemon* nil)
+                        peer
+                        (start-runtime-sync-peer!
+                         {:graph-id graph-id
+                          :token token
+                          :state* state*
+                          :requests* requests*
+                          :ws-messages* ws-messages*})
+                        _ (reset! peer* peer)
+                        {runtime-host :host
+                         runtime-port :port
+                         runtime-stop! :stop!}
+                        (start-daemon!
+                         {:root-dir data-dir
+                          :repo repo
+                          :owner-source :cli})
+                        _ (reset! runtime-daemon* runtime-stop!)
+                        cold-conn
+                        (worker-state/get-datascript-conn repo)
+                        cold-pending-page
+                        (d/entity
+                         @cold-conn
+                         [:block/uuid pending-page-uuid])
+                        _
+                        (is (= pending-page-title
+                               (:block/title cold-pending-page))
+                            "the pending user transaction must survive the cold start")
+                        _
+                        (is (= 1
+                               (client-op/get-pending-local-tx-count
+                                repo)))
+                        _
+                        (is (= (mapv :tx-id
+                                     pending-before-cold-start)
+                               (mapv
+                                :tx-id
+                                (client-op/get-pending-local-txs
+                                 repo)))
+                            "the cold start must preserve the exact pending transaction identity")
+                        http-base
+                        (str "http://127.0.0.1:" (:port peer))
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/set-db-sync-config"
+                         [{:ws-url
+                           (str "ws://127.0.0.1:"
+                                (:port peer)
+                                "/sync/%s")
+                           :http-base http-base}])
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/sync-app-state"
+                         [{:auth/id-token token}])
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-start"
+                         [repo])
+                        _
+                        (<wait-for
+                         #(some
+                           (fn [message]
+                             (= "tx/batch" (:type message)))
+                           @ws-messages*)
+                         "the pending transaction upload")
+                        batch-before-ack
+                        (first
+                         (filter
+                          #(= "tx/batch" (:type %))
+                          @ws-messages*))
+                        pre-ack-status
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-status"
+                         [repo])
+                        _
+                        (is (not= :open
+                                  (:ws-state pre-ack-status))
+                            "sync must not report Online while the pending upload is unacknowledged")
+                        _
+                        (is (false?
+                             (:sync-ready? pre-ack-status))
+                            "sync readiness must wait for the upload acknowledgement and marker recovery")
+                        _
+                        (is (= cursor
+                               (:local-tx pre-ack-status)
+                               (:remote-tx pre-ack-status)))
+                        _
+                        (is (= 1
+                               (:pending-local pre-ack-status)))
+                        _
+                        (is (= 1 (count (:txs batch-before-ack)))
+                            "the pending user transaction must be uploaded in exactly one entry")
+                        _
+                        (is (= (str
+                                (:tx-id
+                                 (first
+                                  pending-before-cold-start)))
+                               (str
+                                (get-in
+                                 batch-before-ack
+                                 [:txs 0 :tx-id])))
+                            "the upload must preserve the pending transaction identity")
+                        _
+                        ((:release-batch-acks! peer))
+                        post-ack-status
+                        (<wait-for-sync-status
+                         runtime-host
+                         runtime-port
+                         repo
+                         #(and (= ack-cursor
+                                  (:local-tx %))
+                               (zero?
+                                (:pending-local %)))
+                         "the exact pending transaction acknowledgement")
+                        post-ack-entity
+                        (d/entity
+                         @(worker-state/get-datascript-conn repo)
+                         [:block/uuid block-uuid])
+                        post-ack-pending-page
+                        (d/entity
+                         @(worker-state/get-datascript-conn repo)
+                         [:block/uuid pending-page-uuid])
+                        _
+                        (is (= ack-cursor
+                               (:local-tx post-ack-status)
+                               (:remote-tx post-ack-status))
+                            "one acknowledged batch must advance the cursor exactly once")
+                        _
+                        (is (not= :repair-required
+                                  (:ws-state post-ack-status))
+                            "a marker-only post-ack v2 split must enter recovery, not repair-required")
+                        _
+                        (is (not= :open
+                                  (:ws-state post-ack-status))
+                            "post-ack sync must wait for the held marker recovery response")
+                        _
+                        (is (false?
+                             (:sync-ready? post-ack-status))
+                            "post-ack marker recovery must keep readiness false")
+                        _
+                        (is (= pending-page-title
+                               (:block/title
+                                post-ack-pending-page))
+                            "acknowledgement must not lose the user transaction")
+                        _
+                        (is (= large-title
+                               (:block/title post-ack-entity)))
+                        _
+                        (is (= local-marker
+                               (get
+                                post-ack-entity
+                                sync-large-title/large-title-object-attr))
+                            "the remote marker must not be committed before its encrypted payload is authenticated")
+                        _
+                        (<wait-for
+                         #(some
+                           (fn [{:keys [path]}]
+                             (= path
+                                (str
+                                 "/sync/"
+                                 graph-id
+                                 "/checksum/large-title-markers")))
+                           @requests*)
+                         "post-ack marker-state recovery request")
+                        held-recovery-status
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-status"
+                         [repo])
+                        _
+                        (is (not= :open
+                                  (:ws-state held-recovery-status)))
+                        _
+                        (is (false?
+                             (:sync-ready?
+                              held-recovery-status)))
+                        _
+                        ((:release-marker-responses! peer))
+                        _
+                        (<wait-for
+                         #(= post-v2-checksum
+                             (client-op/get-local-server-checksum
+                              repo))
+                         "post-ack E2EE marker checksum convergence"
+                         500
+                         20)
+                        final-status
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-status"
+                         [repo])
+                        final-entity
+                        (d/entity
+                         @(worker-state/get-datascript-conn repo)
+                         [:block/uuid block-uuid])
+                        final-pending-page
+                        (d/entity
+                         @(worker-state/get-datascript-conn repo)
+                         [:block/uuid pending-page-uuid])
+                        batch-count-after-recovery
+                        (count
+                         (filter
+                          #(= "tx/batch" (:type %))
+                          @ws-messages*))
+                        hello-count-before-restart
+                        (count
+                         (filter
+                          #(= "hello" (:type %))
+                          @ws-messages*))
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-stop"
+                         [])
+                        _
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-start"
+                         [repo])
+                        _
+                        (<wait-for
+                         #(< hello-count-before-restart
+                             (count
+                              (filter
+                               (fn [message]
+                                 (= "hello" (:type message)))
+                               @ws-messages*)))
+                         "post-recovery restart hello")
+                        _ (p/delay 300)
+                        restart-status
+                        (invoke
+                         runtime-host
+                         runtime-port
+                         "thread-api/db-sync-status"
+                         [repo])]
+                  (let [batch-messages
+                        (filterv
+                         #(= "tx/batch" (:type %))
+                         @ws-messages*)
+                        marker-state-requests
+                        (filterv
+                         (fn [{:keys [path]}]
+                           (= path
+                              (str
+                               "/sync/"
+                               graph-id
+                               "/checksum/large-title-markers")))
+                         @requests*)
+                        marker-asset-requests
+                        (filterv
+                         (fn [{:keys [path]}]
+                           (= path
+                              (str
+                               "/assets/"
+                               graph-id
+                               "/66666666-6666-4666-8666-666666666666.txt")))
+                         @requests*)
+                        final-client
+                        @worker-state/*db-sync-client]
+                    (is (= :open (:ws-state final-status)))
+                    (is (true?
+                         (:sync-ready? final-status)))
+                    (is (nil? (:last-error final-status)))
+                    (is (= ack-cursor
+                           (:local-tx final-status)
+                           (:remote-tx final-status)))
+                    (is (zero? (:pending-local final-status)))
+                    (is (= post-v2-checksum
+                           (:local-checksum final-status)
+                           (:remote-checksum final-status)))
+                    (is (= post-legacy-checksum
+                           (sync-checksum/recompute-checksum
+                            @(worker-state/get-datascript-conn
+                              repo)))
+                        "legacy checksum must remain converged after marker recovery")
+                    (is (= large-title
+                           (:block/title final-entity))
+                        "E2EE recovery must preserve the authenticated logical title")
+                    (is (= remote-marker
+                           (get
+                            final-entity
+                            sync-large-title/large-title-object-attr))
+                        "the authenticated server marker must become durable")
+                    (is (= pending-page-title
+                           (:block/title final-pending-page))
+                        "the acknowledged user transaction must remain durable")
+                    (is (= 1
+                           batch-count-after-recovery
+                           (count batch-messages))
+                        "the user transaction must never be uploaded twice")
+                    (is (= 1
+                           (reduce
+                            +
+                            (map
+                             #(count (:txs %))
+                             batch-messages)))
+                        "the server must receive exactly one transaction entry")
+                    (is (empty?
+                         (some-> final-client
+                                 :inflight
+                                 deref))
+                        "the acknowledged transaction must leave no inflight residue")
+                    (is (= 1
+                           (count marker-state-requests))
+                        "post-ack marker recovery must run exactly once")
+                    (is (= 1
+                           (count marker-asset-requests)))
+                    (is (every?
+                         #(= (str "Bearer " token)
+                             (:authorization %))
+                         (concat
+                          marker-state-requests
+                          marker-asset-requests)))
+                    (is (seq @aes-key-lookups*)
+                        "the E2EE payload must use the controlled AES-key boundary")
+                    (is (every?
+                         #(= {:repo repo
+                              :graph-id graph-id}
+                             %)
+                         @aes-key-lookups*))
+                    (is (= :open
+                           (:ws-state restart-status)))
+                    (is (true?
+                         (:sync-ready? restart-status)))
+                    (is (nil?
+                         (:last-error restart-status)))
+                    (is (= ack-cursor
+                           (:local-tx restart-status)
+                           (:remote-tx restart-status)))
+                    (is (zero?
+                         (:pending-local restart-status)))
+                    (is (= post-v2-checksum
+                           (:local-checksum restart-status)
+                           (:remote-checksum restart-status)))
+                    (is (= batch-count-after-recovery
+                           (count
+                            (filter
+                             #(= "tx/batch" (:type %))
+                             @ws-messages*)))
+                        "restart must not re-upload the acknowledged transaction")
+                    (is (= 1
+                           (count
+                            (filter
+                             (fn [{:keys [path]}]
+                               (= path
+                                  (str
+                                   "/sync/"
+                                   graph-id
+                                   "/checksum/large-title-markers")))
+                             @requests*)))
+                        "restart must not repeat a converged marker recovery"))))]
+        nil)
+      (p/catch
+       (fn [error]
+         (is false
+             (str
+              "pending post-ack marker recovery failed: "
+              error))))
       (p/finally
        (fn []
          (->
