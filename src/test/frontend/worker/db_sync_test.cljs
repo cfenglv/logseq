@@ -217,6 +217,65 @@
        (remove (fn [entity]
                  (contains? recycle-built-in-props (:db/ident entity))))))
 
+(def ^:private created-by-rebase-test-user-uuid
+  #uuid "11111111-1111-4111-8111-111111111111")
+
+(def ^:private created-by-rebase-test-user-claims
+  {:sub (str created-by-rebase-test-user-uuid)
+   :cognito:username "rebase-test-user"
+   :email "rebase-test-user@example.test"})
+
+(defn- seed-created-by-rebase-test-user!
+  [conn]
+  (d/transact! conn
+               [{:block/uuid created-by-rebase-test-user-uuid
+                 :block/name "rebase-test-user"
+                 :block/title "rebase-test-user"
+                 :block/tags :logseq.class/Page
+                 :block/created-at 1784725856064
+                 :block/updated-at 1784725856064
+                 :logseq.property.user/name "rebase-test-user"
+                 :logseq.property.user/email "rebase-test-user@example.test"}]
+               {:persist-op? false}))
+
+(defn- created-by-ref-uuid
+  [entity]
+  (some-> entity :logseq.property/created-by-ref :block/uuid))
+
+(defn- uuid-less-rebase-entities
+  [db]
+  (let [created-by-linked-eids
+        (mapcat (fn [datom]
+                  [(:e datom) (:v datom)])
+                (d/datoms db :avet :logseq.property/created-by-ref))
+        timestamped-eids
+        (map :e (d/datoms db :avet :block/created-at))]
+    (->> (concat created-by-linked-eids timestamped-eids)
+         distinct
+         (map #(d/entity db %))
+         (remove nil?)
+         (remove (fn [entity]
+                   (or (uuid? (:block/uuid entity))
+                       (keyword? (:db/ident entity)))))
+         (map #(select-keys % [:db/id
+                               :db/ident
+                               :block/uuid
+                               :block/title
+                               :block/created-at
+                               :block/updated-at
+                               :logseq.property/created-by-ref]))
+         distinct
+         vec)))
+
+(defn- entity-ids-with-title
+  [db title]
+  (d/q '[:find [?e ...]
+         :in $ ?title
+         :where
+         [?e :block/title ?title]]
+       db
+       title))
+
 (defn- new-client-ops-db
   []
   (let [Database (js/require "better-sqlite3")
@@ -7765,6 +7824,307 @@
                     :value "remote page"}}
                  (set (concat (sync-conflict-rows client-ops-conn block-uuid)
                               (sync-conflict-rows client-ops-conn page-uuid))))))))))
+
+(deftest rebase-preserves-created-by-ref-on-locally-created-block-test
+  (testing "a remote tx must not strip the creator from a pending local block creation"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          clock (atom 1784725856000)]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    common-util/time-ms (fn [] @clock)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title "pending created-by block"}]
+             parent
+             {:sibling? false})
+            (let [block-before (db-test/find-block-by-content @conn "pending created-by block")
+                  block-uuid (:block/uuid block-before)
+                  creator-before (:logseq.property/created-by-ref block-before)
+                  creator-id-before (:db/id creator-before)
+                  created-at-before (:block/created-at block-before)
+                  updated-at-before (:block/updated-at block-before)]
+              (is (= created-by-rebase-test-user-uuid
+                     (:block/uuid creator-before)))
+              (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+              (reset! clock 1784725956000)
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725857000]])
+              (let [block-after (d/entity @conn [:block/uuid block-uuid])
+                    creator-after (:logseq.property/created-by-ref block-after)
+                    creator-by-uuid (d/entity @conn
+                                              [:block/uuid created-by-rebase-test-user-uuid])]
+                (is (= "pending created-by block" (:block/title block-after)))
+                (is (= created-by-rebase-test-user-uuid
+                       (:block/uuid creator-after))
+                    "rebase must preserve the logical creator UUID")
+                (is (= creator-id-before (:db/id creator-after))
+                    "rebase must keep the ref on the same user entity")
+                (is (= (:db/id creator-by-uuid) (:db/id creator-after))
+                    "the creator ref must resolve through the user's UUID")
+                (is (= created-at-before (:block/created-at block-after))
+                    "rebase must not rewrite the block's original creation time")
+                (is (= updated-at-before (:block/updated-at block-after))
+                    "rebase must not replace the original update time with its wall clock")
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))))))))))
+
+(deftest rebase-preserves-created-by-and-timestamps-on-pending-local-block-tree-test
+  (testing "a pending three-level local tree keeps creator and timestamps through remote rebase"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          root-uuid #uuid "22222222-2222-4222-8222-222222222221"
+          child-uuid #uuid "22222222-2222-4222-8222-222222222222"
+          grandchild-uuid #uuid "22222222-2222-4222-8222-222222222223"
+          block-uuids [root-uuid child-uuid grandchild-uuid]
+          clock (atom 1784725856000)]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    common-util/time-ms (fn [] @clock)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/uuid root-uuid
+               :block/title "pending tree root"}
+              {:block/uuid child-uuid
+               :block/title "pending tree child"
+               :block/parent [:block/uuid root-uuid]}
+              {:block/uuid grandchild-uuid
+               :block/title "pending tree grandchild"
+               :block/parent [:block/uuid child-uuid]}]
+             parent
+             {:sibling? false
+              :keep-uuid? true})
+            (let [blocks-before (mapv #(d/entity @conn [:block/uuid %])
+                                      block-uuids)
+                  timestamps-before
+                  (mapv #(select-keys % [:block/created-at :block/updated-at])
+                        blocks-before)]
+              (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+              (is (= [created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid]
+                     (mapv created-by-ref-uuid blocks-before)))
+              (reset! clock 1784725956000)
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725955000]])
+              (let [blocks-after (mapv #(d/entity @conn [:block/uuid %])
+                                       block-uuids)
+                    timestamps-after
+                    (mapv #(select-keys % [:block/created-at :block/updated-at])
+                          blocks-after)]
+                (is (= ["pending tree root"
+                        "pending tree child"
+                        "pending tree grandchild"]
+                       (mapv :block/title blocks-after)))
+                (is (= [(:block/uuid parent) root-uuid child-uuid]
+                       (mapv #(some-> % :block/parent :block/uuid) blocks-after))
+                    "rebase must keep the local tree hierarchy")
+                (is (= [created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid]
+                       (mapv created-by-ref-uuid blocks-after)))
+                (is (= timestamps-before timestamps-after)
+                    (str {:before timestamps-before
+                          :after timestamps-after
+                          :rebase-wall-clock @clock}))
+                (is (every? #(not= @clock (:block/created-at %)) blocks-after)
+                    "created-at must not be replaced by the rebase wall clock")
+                (is (every? #(not= @clock (:block/updated-at %)) blocks-after)
+                    "updated-at must not be replaced by the rebase wall clock")
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))))))))))
+
+(deftest rebase-preserves-created-by-ref-across-multiple-pending-ops-test
+  (testing "mixed local creates and an empty-block edit keep their creators through one remote rebase"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "created-by mixed page"}
+                   :blocks [{:block/title "created-by mixed parent"
+                             :build/children [{:block/title ""}]}]}]})
+          client-ops-conn (new-client-ops-db)
+          parent (db-test/find-block-by-content @conn "created-by mixed parent")
+          empty-block (first (:block/_parent parent))]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title "first pending creator"}]
+             parent
+             {:sibling? false})
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title "second pending creator"}]
+             parent
+             {:sibling? false})
+            (apply-ops!
+             conn
+             [[:save-block [{:block/uuid (:block/uuid empty-block)
+                             :block/title "filled pending creator"} nil]]]
+             local-tx-meta)
+            (let [titles ["first pending creator"
+                          "second pending creator"
+                          "filled pending creator"]
+                  block-uuids (mapv (fn [title]
+                                      (:block/uuid
+                                       (db-test/find-block-by-content @conn title)))
+                                    titles)
+                  uuid-entity-count-before
+                  (d/q '[:find (count ?e) .
+                         :where
+                         [?e :block/uuid]]
+                       @conn)]
+              (is (= 3 (count (#'sync-apply/pending-txs test-repo))))
+              (is (= [created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid]
+                     (mapv (fn [block-uuid]
+                             (created-by-ref-uuid
+                              (d/entity @conn [:block/uuid block-uuid])))
+                           block-uuids)))
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725858000]])
+              (let [blocks-after (mapv #(d/entity @conn [:block/uuid %])
+                                       block-uuids)
+                    creator (d/entity @conn
+                                      [:block/uuid created-by-rebase-test-user-uuid])
+                    uuid-entity-count-after
+                    (d/q '[:find (count ?e) .
+                           :where
+                           [?e :block/uuid]]
+                         @conn)]
+                (is (= titles (mapv :block/title blocks-after)))
+                (is (= [created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid]
+                       (mapv created-by-ref-uuid blocks-after))
+                    "every pending operation must retain its creator after rebase")
+                (is (= "rebase-test-user"
+                       (:logseq.property.user/name creator)))
+                (is (= uuid-entity-count-before uuid-entity-count-after)
+                    "an unrelated remote tx must not create or remove UUID entities")
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))))))))))
+
+(deftest rebase-create-then-delete-does-not-revive-created-entity-test
+  (testing "a local create followed by delete stays absent after a remote rebase"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          title "transient created-by block"]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title title}]
+             parent
+             {:sibling? false})
+            (let [block (db-test/find-block-by-content @conn title)
+                  block-uuid (:block/uuid block)]
+              (is (= created-by-rebase-test-user-uuid
+                     (created-by-ref-uuid block)))
+              (outliner-core/delete-blocks! conn [block] {})
+              (is (nil? (d/entity @conn [:block/uuid block-uuid])))
+              (is (= 2 (count (#'sync-apply/pending-txs test-repo))))
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725859000]])
+              (is (nil? (d/entity @conn [:block/uuid block-uuid])))
+              (is (empty? (entity-ids-with-title @conn title))
+                  "the deleted node must not return under a UUID-less tempid")
+              (is (= created-by-rebase-test-user-uuid
+                     (:block/uuid
+                      (d/entity @conn
+                                [:block/uuid created-by-rebase-test-user-uuid]))))
+              (is (empty? (uuid-less-rebase-entities @conn))
+                  (str (uuid-less-rebase-entities @conn))))))))))
+
+(deftest rebase-remote-delete-does-not-revive-created-by-entity-test
+  (testing "a remote delete wins over a pending local edit without reviving the block or its creator ref"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          block-uuid (:block/uuid child1)
+          block-id (:db/id child1)
+          local-title "locally edited before remote delete"]
+      (seed-created-by-rebase-test-user! conn)
+      (d/transact! conn
+                   [[:db/add block-id
+                     :logseq.property/created-by-ref
+                     (:db/id
+                      (d/entity @conn
+                                [:block/uuid created-by-rebase-test-user-uuid]))]])
+      (let [remote-delete-tx
+            (:tx-data
+             (outliner-core/delete-blocks @conn [(d/entity @conn block-id)] {}))]
+        (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                      worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                      db-sync/enqueue-local-tx!
+                      (let [orig db-sync/enqueue-local-tx!]
+                        (fn [repo tx-report]
+                          (when-not (:rtc-tx? (:tx-meta tx-report))
+                            (orig repo tx-report))))]
+          (with-datascript-conns conn client-ops-conn
+            (fn []
+              (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+              (apply-ops!
+               conn
+               [[:save-block [{:block/uuid block-uuid
+                               :block/title local-title} nil]]]
+               local-tx-meta)
+              (is (= created-by-rebase-test-user-uuid
+                     (created-by-ref-uuid
+                      (d/entity @conn [:block/uuid block-uuid]))))
+              (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               remote-delete-tx)
+              (is (nil? (d/entity @conn [:block/uuid block-uuid])))
+              (is (empty? (entity-ids-with-title @conn local-title))
+                  "a failed stale rebase must not recreate the block anonymously")
+              (is (= created-by-rebase-test-user-uuid
+                     (:block/uuid
+                      (d/entity @conn
+                                [:block/uuid created-by-rebase-test-user-uuid]))))
+              (is (empty? (uuid-less-rebase-entities @conn))
+                  (str (uuid-less-rebase-entities @conn))))))))))
 
 (deftest rebase-does-not-leave-anonymous-created-by-entities-test
   (testing "rebase should not leave entities with timestamps/created-by but without identity attrs"
