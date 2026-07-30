@@ -743,30 +743,31 @@
     (letfn [(poll! [initial?]
               (p/let [status (invoke-with-repo config repo :thread-api/db-sync-status [repo])
                       ws-state (:ws-state status)
+                      sync-ready? (true? (:sync-ready? status))
                       graph-id (:graph-id status)
                       last-error (:last-error status)
                       skipped-hint (if (seq graph-id)
                                      config-skipped-hint
                                      graph-id-skipped-hint)]
                 (cond
-                  (and (= :open ws-state) (some? last-error))
+                  (= :repair-required ws-state)
                   {:status :error
-                   :error {:code :sync-start-runtime-error
-                           :message "sync start reached open websocket but runtime sync error is present"
+                   :error {:code :sync-repair-required
+                           :message "sync stopped after detecting a persistent data inconsistency"
                            :repo repo
                            :ws-state ws-state
                            :status status
                            :last-error last-error
                            :hint runtime-error-hint}}
 
-                  (= :open ws-state)
+                  (and (= :open ws-state) sync-ready? (nil? last-error))
                   {:status :ok
                    :data status}
 
-                  (= :repair-required ws-state)
+                  (and (>= (js/Date.now) deadline) (some? last-error))
                   {:status :error
-                   :error {:code :sync-repair-required
-                           :message "sync stopped after detecting a persistent data inconsistency"
+                   :error {:code :sync-start-runtime-error
+                           :message "sync start reached open websocket but runtime sync error is present"
                            :repo repo
                            :ws-state ws-state
                            :status status

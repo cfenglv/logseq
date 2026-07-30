@@ -244,7 +244,9 @@
           "/sync/"
           (js/encodeURIComponent graph-id)
           "/checksum/large-title-markers")
-     {:method "GET"}
+     {:method "GET"
+      :operation :large-title-marker-state
+      :timeout-ms 30000}
      {:response-schema :sync/large-title-markers
       :error-schema :error})))
 
@@ -255,7 +257,11 @@
         graph-id (:graph-id client)]
     (when-not conn
       (marker-recovery-fail! :missing-db {:repo repo}))
+    (log/info :db-sync/large-title-marker-recovery
+              {:repo repo :t local-tx :stage :metadata-start})
     (p/let [response (<fetch-large-title-marker-state repo graph-id)
+            _ (log/info :db-sync/large-title-marker-recovery
+                        {:repo repo :t local-tx :stage :metadata-ready})
             db-before @conn
             local-checksum
             (sync-checksum/recompute-checksum db-before)
@@ -308,11 +314,19 @@
                  {:repo repo}))
             graph-e2ee? (sync-crypt/graph-e2ee? repo)
             aes-key (when graph-e2ee?
-                      (sync-crypt/<ensure-graph-aes-key repo graph-id))
+                      (sync-util/with-timeout
+                       (sync-crypt/<ensure-graph-aes-key repo graph-id)
+                       60000
+                       {:type :db-sync/recovery-timeout
+                        :code :marker-recovery-aes-key-timeout
+                        :operation :large-title-marker-recovery
+                        :stage :aes-key}))
             _ (when (and graph-e2ee? (nil? aes-key))
                 (marker-recovery-fail!
                  :missing-aes-key
                  {:repo repo}))
+            _ (log/info :db-sync/large-title-marker-recovery
+                        {:repo repo :t local-tx :stage :aes-key-ready})
             expected-payload-format
             (expected-large-title-payload-format graph-e2ee?)
             marker-txs
@@ -349,6 +363,12 @@
                      sync-large-title/large-title-object-attr
                      marker])))
               differing-block-uuids))
+            _ (log/info :db-sync/large-title-marker-recovery
+                        {:repo repo
+                         :t local-tx
+                         :stage :payloads-ready
+                         :changed-marker-count
+                         (count differing-block-uuids)})
             _ (when-not (identical? db-before @conn)
                 (marker-recovery-fail!
                  :local-db-changed
@@ -458,11 +478,13 @@
              :server-checksum server-checksum})
            (p/catch
             (fn [error]
-              (report-checksum-mismatch!
-               (assoc mismatch-data
-                      :marker-recovery-failed? true
-                      :marker-recovery-reason
-                      (:reason (ex-data error)))))))
+              (if (sync-util/transient-sync-error? error)
+                (throw error)
+                (report-checksum-mismatch!
+                 (assoc mismatch-data
+                        :marker-recovery-failed? true
+                        :marker-recovery-reason
+                        (:reason (ex-data error))))))))
           (report-checksum-mismatch! mismatch-data))
 
         ;; The versioned representation intentionally bridges logical large

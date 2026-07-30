@@ -735,6 +735,7 @@
                            (p/resolved "token")))
                        :ws old-ws
                        :ws-state (atom :closed)
+                       :sync-ready? (atom true)
                        :last-ws-message-ts (atom 0)
                        :inflight (atom [(random-uuid)])
                        :online-users (atom [])
@@ -768,9 +769,12 @@
                    ((.-onopen new-ws) #js {})
                    (is (= ["{\"type\":\"hello\",\"client\":\"retry-repo\"}"] @sent*))
                    (is (= :open @(:ws-state client)))
+                   (is (false? @(:sync-ready? client))
+                       "transport open must not imply initial synchronization readiness")
                    (is (= {:attempt 2 :timer nil} @(:reconnect client))
                        "opening the socket alone must not erase repeated catch-up failures")
                    ((:sync-succeeded-f @worker-state/*db-sync-client))
+                   (is (true? @(:sync-ready? client)))
                    (is (= {:attempt 0 :timer nil} @(:reconnect client)))))
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))

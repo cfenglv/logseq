@@ -3,7 +3,7 @@
   (:require [datascript.core :as d]
             [logseq.db :as ldb]
             [promesa.core :as p]
-            [frontend.worker.sync.util :refer [get-graph-id]]))
+            [frontend.worker.sync.util :as sync-util :refer [get-graph-id]]))
 
 (def large-title-byte-limit 4096)
 (def large-title-asset-type "txt")
@@ -125,9 +125,11 @@
             headers (merge {"content-type" "text/plain; charset=utf-8"
                             "x-amz-meta-type" asset-type}
                            auth-headers)
-            resp (js/fetch url #js {:method "PUT"
-                                    :headers (clj->js headers)
-                                    :body payload})]
+            resp (sync-util/fetch url {:method "PUT"
+                                       :headers headers
+                                       :body payload
+                                       :operation :large-title-upload
+                                       :timeout-ms 120000})]
       (if (.-ok resp)
         (large-title-object
          asset-uuid asset-type payload-format payload-digest)
@@ -149,12 +151,20 @@
   (when-not (seq graph-id)
     (fail-fast-f :db-sync/missing-field {:repo repo :field :graph-id}))
   (let [url (asset-url http-base graph-id (:asset-uuid obj) (:asset-type obj))]
-    (p/let [resp (js/fetch url #js {:method "GET"
-                                    :headers (clj->js auth-headers)})]
+    (p/let [resp (sync-util/fetch url {:method "GET"
+                                       :headers auth-headers
+                                       :operation :large-title-download
+                                       :timeout-ms 120000})]
       (when-not (.-ok resp)
         (fail-fast-f :db-sync/large-title-download-failed
                      {:repo repo :status (.-status resp)}))
-      (p/let [buf (.arrayBuffer resp)
+      (p/let [buf (sync-util/with-timeout
+                    (.arrayBuffer resp)
+                    120000
+                    {:type :db-sync/http-timeout
+                     :code :http-body-timeout
+                     :operation :large-title-download
+                     :stage :response-body})
               payload (js/Uint8Array. buf)
               actual-digest (<sha256-hex payload)
               _ (when (and (large-title-object-v2? obj)

@@ -14,7 +14,9 @@
 (def ^:private diagnostic-data-keys
   [:type :code :error :status :field :message-type :stage :operation
    :local-tx :remote-tx :expected-count :actual-count :payload-bytes
-   :response-error-code])
+   :response-error-code :timeout-ms])
+
+(def ^:private default-http-timeout-ms 60000)
 
 (defn- safe-diagnostic-value?
   [value]
@@ -95,6 +97,40 @@
   (when-let [*last-error (:last-sync-error client)]
     (reset! *last-error nil)))
 
+(defn transient-sync-error?
+  [error]
+  (contains? #{:db-sync/http-request-failed
+               :db-sync/http-timeout
+               :db-sync/recovery-timeout}
+             (:type (ex-data error))))
+
+(defn with-timeout
+  [promise timeout-ms {:keys [type code] :as context}]
+  (if-not (and (number? timeout-ms) (pos? timeout-ms))
+    promise
+    (p/create
+     (fn [resolve reject]
+       (let [settled? (atom false)
+             settle! (fn [f value]
+                       (when (compare-and-set! settled? false true)
+                         (f value)))
+             timeout-id
+             (js/setTimeout
+              (fn []
+                (settle!
+                 reject
+                 (ex-info "db-sync operation timeout"
+                          (merge {:type (or type :db-sync/http-timeout)
+                                  :code (or code :timeout)
+                                  :timeout-ms timeout-ms}
+                                 context))))
+              timeout-ms)]
+         (->
+          promise
+          (p/then #(settle! resolve %))
+          (p/catch #(settle! reject %))
+          (p/finally #(js/clearTimeout timeout-id))))))))
+
 (def ^:private invalid-coerce ::invalid-coerce)
 
 (defn coerce
@@ -141,10 +177,61 @@
     (assoc opts :headers (merge (or (:headers opts) {}) auth))
     opts))
 
+(defn fetch
+  [url opts]
+  (let [opts (or opts {})
+        timeout-ms (or (:timeout-ms opts) default-http-timeout-ms)
+        operation (or (:operation opts) :db-sync/http-request)
+        supplied-signal (:signal opts)
+        controller (when-not supplied-signal (js/AbortController.))
+        timed-out? (atom false)
+        timeout-id
+        (when (and controller (number? timeout-ms) (pos? timeout-ms))
+          (js/setTimeout
+           (fn []
+             (reset! timed-out? true)
+             (.abort controller))
+           timeout-ms))
+        request-opts
+        (cond-> (dissoc opts :timeout-ms :operation)
+          controller (assoc :signal (.-signal controller)))
+        request
+        (try
+          (js/fetch url (clj->js request-opts))
+          (catch :default error
+            (p/rejected error)))]
+    (->
+     request
+     (p/catch
+      (fn [error]
+        (throw
+         (ex-info
+          (if @timed-out?
+            "db-sync http request timeout"
+            "db-sync http request failed")
+          {:type (if @timed-out?
+                   :db-sync/http-timeout
+                   :db-sync/http-request-failed)
+           :code (if @timed-out? :http-timeout :http-request-failed)
+           :operation operation
+           :timeout-ms timeout-ms}
+          error))))
+     (p/finally
+      (fn []
+        (when timeout-id
+          (js/clearTimeout timeout-id)))))))
+
 (defn fetch-json
   [url opts {:keys [response-schema error-schema] :or {error-schema :error}}]
-  (p/let [resp (js/fetch url (clj->js (with-auth-headers opts)))
-          text (.text resp)
+  (p/let [resp (fetch url (with-auth-headers opts))
+          text (with-timeout
+                (.text resp)
+                (or (:timeout-ms opts) default-http-timeout-ms)
+                {:type :db-sync/http-timeout
+                 :code :http-body-timeout
+                 :operation (or (:operation opts)
+                                :db-sync/http-response-body)
+                 :stage :response-body})
           data (when (seq text) (js/JSON.parse text))]
     (if (.-ok resp)
       (let [body (js->clj data :keywordize-keys true)

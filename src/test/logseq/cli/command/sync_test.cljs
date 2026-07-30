@@ -395,7 +395,8 @@
                                                     :thread-api/db-sync-status
                                                     (let [idx (swap! status-calls inc)]
                                                       (p/resolved {:repo "logseq_db_demo"
-                                                                   :ws-state (if (= idx 1) :connecting :open)
+                                                                   :ws-state :open
+                                                                   :sync-ready? (> idx 1)
                                                                    :pending-local 0
                                                                    :pending-asset 0
                                                                    :pending-server 0}))
@@ -434,6 +435,7 @@
                                                     :thread-api/db-sync-status
                                                     (p/resolved {:repo "logseq_db_demo"
                                                                  :ws-state (if (seq (:ws-url @worker-sync-config)) :open :stopped)
+                                                                 :sync-ready? (boolean (seq (:ws-url @worker-sync-config)))
                                                                  :pending-local 0
                                                                  :pending-asset 0
                                                                  :pending-server 0})
@@ -467,6 +469,7 @@
                                                     :thread-api/verify-and-save-e2ee-password (p/resolved nil)
                                                     :thread-api/db-sync-status (p/resolved {:repo "logseq_db_demo"
                                                                                             :ws-state :open
+                                                                                            :sync-ready? true
                                                                                             :pending-local 0
                                                                                             :pending-asset 0
                                                                                             :pending-server 0})
@@ -540,6 +543,7 @@
                                                                     {:repo "logseq_db_demo"
                                                                      :graph-id "graph-uuid"
                                                                      :ws-state :open
+                                                                     :sync-ready? true
                                                                      :pending-local 0
                                                                      :pending-asset 0
                                                                      :pending-server 0})))

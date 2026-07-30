@@ -53,6 +53,7 @@
           ws-url (:ws-url @worker-state/*db-sync-config)
           ws-state (or (some-> client :ws-state deref)
                        (if (seq ws-url) :stopped :inactive))
+          sync-ready? (true? (some-> client :sync-ready? deref))
           last-error (some-> client :last-sync-error deref)]
       {:repo repo
        :graph-id graph-uuid
@@ -65,6 +66,7 @@
        :local-checksum local-checksum
        :remote-checksum remote-checksum
        :ws-state ws-state
+       :sync-ready? sync-ready?
        :last-error last-error})))
 
 (defn normalize-online-users
@@ -86,7 +88,7 @@
         online-users @(:online-users client)
         {:keys [pending-local pending-asset missing-asset-upload-files pending-server
                 local-tx remote-tx local-checksum remote-checksum graph-id
-                last-error]}
+                sync-ready? last-error]}
         (sync-counts-f repo)]
     {:rtc-state {:ws-state ws-state}
      :rtc-lock (= :open ws-state)
@@ -100,6 +102,7 @@
      :remote-tx remote-tx
      :local-checksum local-checksum
      :remote-checksum remote-checksum
+     :sync-ready? sync-ready?
      :last-sync-error last-error
      :graph-uuid graph-id}))
 
