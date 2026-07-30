@@ -5672,6 +5672,176 @@
                   (str "the final database must be valid: "
                        (:errors validation-after))))))))))
 
+(deftest rebase-batch-resolves-surviving-uuid-tempid-to-existing-entity-test
+  (testing "batch final commit resolves a bare UUID tempid when its target survives the remote transaction"
+    (let [{:keys [conn client-ops-conn parent child1 child2]} (setup-parent-child)
+          target-uuid (:block/uuid child1)
+          target-ref [:block/uuid target-uuid]
+          target-tempid (str target-uuid)
+          target-id (:db/id child1)
+          kept-uuid (:block/uuid child2)
+          kept-ref [:block/uuid kept-uuid]
+          parent-ref [:block/uuid (:block/uuid parent)]
+          pending-tx-id (random-uuid)
+          target-previous-updated-at (:block/updated-at child1)
+          kept-previous-updated-at (:block/updated-at child2)
+          target-updated-at 1770000000400
+          kept-updated-at 1770000000500
+          remote-parent-title "parent remote surviving UUID target"
+          local-t 536900002
+          normalized-tx-data
+          [[:db/add target-tempid
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/add target-tempid
+            :block/updated-at
+            target-updated-at
+            local-t]
+           [:db/retract kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :logseq.property/heading
+            3
+            local-t]]
+          reversed-tx-data
+          [[:db/retract kept-ref
+            :logseq.property/heading
+            3
+            local-t]
+           [:db/retract kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]
+           [:db/retract target-ref
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/retract target-ref
+            :block/updated-at
+            target-updated-at
+            local-t]
+           [:db/add target-ref
+            :block/updated-at
+            target-previous-updated-at
+            local-t]]]
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+          "the initial local database must be valid")
+      ;; Model a legacy generic pending row whose reverse side is stable but
+      ;; whose replay payload mixes an old bare UUID string tempid with the
+      ;; lookup refs used by current rows.
+      (d/transact! conn
+                   [[:db/add target-id
+                     :block/updated-at
+                     target-updated-at]
+                    [:db/add target-id
+                     :logseq.property/heading
+                     2]
+                    [:db/add (:db/id child2)
+                     :block/updated-at
+                     kept-updated-at]
+                    [:db/add (:db/id child2)
+                     :logseq.property/heading
+                     3]])
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id pending-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 2
+             :db-sync/outliner-op nil
+             :db-sync/forward-outliner-ops nil
+             :db-sync/inverse-outliner-ops nil
+             :db-sync/normalized-tx-data normalized-tx-data
+             :db-sync/reversed-tx-data reversed-tx-data}])
+          (let [pending-before (#'sync-apply/pending-txs test-repo)
+                pending-tx (first pending-before)]
+            (is (= [pending-tx-id] (mapv :tx-id pending-before)))
+            (is (= #{target-tempid kept-ref}
+                   (set (map second (:tx pending-tx))))
+                "the legacy row must enter rebase with mixed target formats")
+            (is (empty? (:forward-outliner-ops pending-tx))
+                "the generic row must use the raw transaction replay path")
+            (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+                "the local state represented by the pending row must be valid")
+
+            (let [apply-error
+                  (try
+                    (sync-apply/apply-remote-txs!
+                     test-repo
+                     nil
+                     [{:t 2
+                       :tx-data [[:db/add
+                                  parent-ref
+                                  :block/title
+                                  remote-parent-title]]}])
+                    nil
+                    (catch :default error
+                      error))
+                  target-after (d/entity @conn target-ref)
+                  kept-after (d/entity @conn kept-ref)
+                  pending-after (#'sync-apply/pending-txs test-repo)
+                  heading-two-entity-ids
+                  (set
+                   (d/q '[:find [?e ...]
+                          :where
+                          [?e :logseq.property/heading 2]]
+                        @conn))
+                  validation-after (db-validate/validate-local-db! @conn)]
+              (is (nil? apply-error)
+                  (str "remote apply must resolve the surviving UUID tempid "
+                       "before the final batch commit: "
+                       (some-> apply-error ex-message)
+                       "; cause: "
+                       (some-> apply-error ex-cause ex-message)
+                       "; data: "
+                       (some-> apply-error ex-cause ex-data pr-str)))
+              (is (= remote-parent-title
+                     (:block/title (d/entity @conn parent-ref)))
+                  "the unrelated remote change must be retained")
+              (is (= target-id (:db/id target-after))
+                  "the bare UUID target must resolve to the original entity")
+              (is (= 2 (:logseq.property/heading target-after))
+                  "the bare-target property update must land on the original entity")
+              (is (= target-updated-at (:block/updated-at target-after))
+                  "the bare-target updated-at must land on the original entity")
+              (is (= 3 (:logseq.property/heading kept-after))
+                  "the lookup-ref update in the same pending row must survive")
+              (is (= kept-updated-at (:block/updated-at kept-after))
+                  "the lookup-ref updated-at must survive")
+              (is (= [pending-tx-id] (mapv :tx-id pending-after))
+                  "the mixed pending row must remain pending")
+              (is (some #(= [:db/add
+                              kept-ref
+                              :logseq.property/heading
+                              3]
+                            (subvec % 0 4))
+                        (:tx (first pending-after)))
+                  "the valid lookup-ref update must remain uploadable")
+              (is (= #{target-id} heading-two-entity-ids)
+                  "replay must not allocate a UUID-less heading-only ghost")
+              (is (= 1 (aget (client-op-tx-row
+                              client-ops-conn
+                              pending-tx-id)
+                             "pending"))
+                  "the mixed row must not be cleared wholesale")
+              (is (empty? (:errors validation-after))
+                  (str "the final database must be valid: "
+                       (:errors validation-after))))))))))
+
 (deftest rebase-insert-blocks-keeps-block-uuid-test
   (testing "rebased insert-blocks should preserve the original block uuid"
     (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)]
