@@ -211,3 +211,57 @@
         (.exec db "VACUUM")
         (is (= 42 (client-op/get-local-tx repo))
             "local-tx should still be 42 after VACUUM")))))
+
+(defn- add-pending-tx!
+  [repo tx-id]
+  (client-op/upsert-local-tx-entry!
+   repo
+   {:tx-id tx-id
+    :pending? true
+    :normalized-tx-data []
+    :reversed-tx-data []}))
+
+(defn- sqlite-pending-tx-count
+  [db]
+  (sqlite-count db
+                "select count(*) as c from client_ops where kind = 'tx' and pending = 1"))
+
+(deftest pending-local-tx-count-cache-miss-after-storage-mutation-test
+  (let [repo "repo-pending-local-tx-count"]
+    (with-client-ops-db
+      repo
+      (fn [db]
+        (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+        (try
+          (doseq [_ (range 13)]
+            (add-pending-tx! repo (random-uuid)))
+
+          (testing "the first positive delta after worker startup uses persisted pending rows"
+            (add-pending-tx! repo (random-uuid))
+            (client-op/adjust-pending-local-tx-count! repo 1)
+            (is (= 14 (sqlite-pending-tx-count db)))
+            (is (= 14 (client-op/get-pending-local-tx-count repo))))
+
+          (testing "a warm cache still applies subsequent deltas"
+            (add-pending-tx! repo (random-uuid))
+            (client-op/adjust-pending-local-tx-count! repo 1)
+            (is (= 15 (sqlite-pending-tx-count db)))
+            (is (= 15 (client-op/get-pending-local-tx-count repo))))
+
+          (testing "the first negative delta after a cache reset uses post-update storage"
+            (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+            (let [tx-id (-> (client-op/get-pending-local-txs repo)
+                            first
+                            :tx-id)
+                  removed (client-op/mark-pending-txs-false! repo [tx-id])]
+              (is (= 1 removed))
+              (client-op/adjust-pending-local-tx-count! repo (- removed))
+              (is (= 14 (sqlite-pending-tx-count db)))
+              (is (= 14 (client-op/get-pending-local-tx-count repo)))))
+
+          (testing "a warm cache never becomes negative"
+            (reset! client-op/*repo->pending-local-tx-count {repo 1})
+            (client-op/adjust-pending-local-tx-count! repo -2)
+            (is (zero? (client-op/get-pending-local-tx-count repo))))
+          (finally
+            (swap! client-op/*repo->pending-local-tx-count dissoc repo)))))))
