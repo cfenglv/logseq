@@ -1,8 +1,8 @@
 {
   "algorithm": "ed25519-sha512-manifest-v1",
   "bundleIdentifier": "com.logseq.logseq",
-  "keyId": "UNCONFIGURED",
+  "keyId": "ed25519:88043c73895ef8fdc2902e469b3c9583e44f5a0b9e768d6c3919efc88577b475",
   "minimumBootstrapRevision": 5,
   "payloadDomain": "logseq-selfhost-macos-update-v1",
-  "publicKeyBase64": "UNCONFIGURED"
+  "publicKeyBase64": "mLwLaBoZ3qbMF5cnee6B3BRJieEL0rhpZGyKpAjqlkE="
 }
