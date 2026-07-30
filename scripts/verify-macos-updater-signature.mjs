@@ -435,6 +435,23 @@ const runShipItInstall = ({
   if (before !== oldVersion) {
     throw new Error(`isolated target starts at ${before}, expected ${oldVersion}`);
   }
+  const bundleIdentifier = plistValue(targetApp, "CFBundleIdentifier");
+  const updateBundleIdentifier = plistValue(
+    updateApp,
+    "CFBundleIdentifier",
+  );
+  if (!bundleIdentifier) {
+    throw new UpdaterSignatureGateError(
+      "fixture-error",
+      "published baseline App has no CFBundleIdentifier",
+    );
+  }
+  if (updateBundleIdentifier !== bundleIdentifier) {
+    throw new UpdaterSignatureGateError(
+      "signature-incompatible",
+      `candidate bundle identifier ${updateBundleIdentifier} does not match baseline ${bundleIdentifier}`,
+    );
+  }
 
   const statePath = path.join(installRoot, "state.json");
   const toFileUrl = (file) => new URL(`file://${path.resolve(file)}`).href;
@@ -443,7 +460,7 @@ const runShipItInstall = ({
     JSON.stringify({
       updateBundleURL: toFileUrl(updateApp),
       targetBundleURL: toFileUrl(targetApp),
-      bundleIdentifier: null,
+      bundleIdentifier,
       launchAfterInstallation: false,
       useUpdateBundleName: false,
     }),

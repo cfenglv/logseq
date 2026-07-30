@@ -27,6 +27,9 @@ const read = (relativePath) =>
 
 const workflow = read(".github/workflows/build-desktop-release.yml");
 const verifier = read("scripts/verify-macos-updater-signature.mjs");
+const projectUpdaterContract = read(
+  "scripts/test-project-signed-macos-updater.mjs",
+);
 const electronUpdater = read("src/electron/electron/updater.cljs");
 const electronCore = read("src/electron/electron/core.cljs");
 const rendererIpc = read("src/main/electron/ipc.cljs");
@@ -390,6 +393,22 @@ const cases = [
     },
   ],
   [
+    "ShipIt requests carry the matching App bundle identifier",
+    () => {
+      for (const source of [verifier, projectUpdaterContract]) {
+        assert.doesNotMatch(source, /bundleIdentifier:\s*null/);
+      }
+      assert.match(
+        verifier,
+        /updateBundleIdentifier !== bundleIdentifier/,
+      );
+      assert.match(
+        projectUpdaterContract,
+        /ShipIt fixture requires matching target and update bundle identifiers/,
+      );
+    },
+  ],
+  [
     "compatible future identity passes only after ShipIt replaces the target",
     () => {
       assert.match(
@@ -419,6 +438,23 @@ const cases = [
           error instanceof UpdaterSignatureGateError &&
           error.kind === "fixture-error" &&
           /not an updater signature regression/.test(error.message),
+      ),
+  ],
+  [
+    "ShipIt abnormal termination remains an install failure",
+    () =>
+      assert.throws(
+        () =>
+          classifyShipItOutcome({
+            status: null,
+            log: "NSInternalInconsistencyException",
+            before: "2.0.1-selfhost.5",
+            after: "2.0.1-selfhost.5",
+            newVersion: "2.0.1-selfhost.6",
+          }),
+        (error) =>
+          error instanceof UpdaterSignatureGateError &&
+          error.kind === "install-failure",
       ),
   ],
   [
