@@ -280,6 +280,7 @@
   (async done
     (let [calls (atom [])
           secrets (atom {})
+          fallback-secrets (atom {})
           keychain (js-obj
                     "setPassword" (fn [service key value]
                                     (swap! calls conj [:save service key value])
@@ -292,16 +293,21 @@
                                        (swap! calls conj [:delete service key])
                                        (swap! secrets dissoc key)
                                        (js/Promise.resolve true)))
-          fallback-kv {:get (fn [_] (js/Promise.reject (js/Error. "unexpected fallback read")))
-                       :set! (fn [& _] (js/Promise.reject (js/Error. "unexpected fallback write")))}
+          fallback-kv {:get (fn [key] (p/resolved (get @fallback-secrets key)))
+                       :set! (fn [key value]
+                               (swap! fallback-secrets assoc key value)
+                               (p/resolved nil))}
           crypto (#'platform-node/keychain-secret-store fallback-kv keychain)
           key "logseq-encrypted-password"]
       (-> (p/let [_ ((:save-secret-text! crypto) key "encrypted-value")
+                  fallback-after-save (get @fallback-secrets key)
                   secret-value ((:read-secret-text crypto) key)
                   _ ((:delete-secret-text! crypto) key)
                   deleted-value ((:read-secret-text crypto) key)]
             (is (= "encrypted-value" secret-value))
+            (is (= "encrypted-value" fallback-after-save))
             (is (nil? deleted-value))
+            (is (nil? (get @fallback-secrets key)))
             (is (= [[:save "Logseq E2EE" key "encrypted-value"]
                     [:read "Logseq E2EE" key]
                     [:delete "Logseq E2EE" key]
@@ -310,6 +316,66 @@
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
+
+(deftest production-keychain-timeout-migrates-legacy-secret-to-kv
+  (async done
+    (let [restore-platform! (set-process-platform-arch! "darwin" "arm64")
+          calls (atom {:native-read 0 :legacy-read 0})
+          fallback-secrets (atom {})
+          keychain (js-obj
+                    "getPassword" (fn [& _]
+                                    (swap! calls update :native-read inc)
+                                    (js/Promise. (fn [_resolve _reject]))))
+          fallback-kv {:get (fn [key] (p/resolved (get @fallback-secrets key)))
+                       :set! (fn [key value]
+                               (swap! fallback-secrets assoc key value)
+                               (p/resolved nil))}
+          legacy-read-fn (fn [_key]
+                           (swap! calls update :legacy-read inc)
+                           (p/resolved "legacy-encrypted-value"))
+          crypto (#'platform-node/keychain-secret-store
+                  fallback-kv keychain
+                  {:owner-source :cli
+                   :timeout-ms 10
+                   :legacy-read-fn legacy-read-fn})
+          key "logseq-encrypted-password"]
+      (-> (p/let [first-read ((:read-secret-text crypto) key)
+                  second-read ((:read-secret-text crypto) key)]
+            (is (= "legacy-encrypted-value" first-read))
+            (is (= "legacy-encrypted-value" second-read))
+            (is (= "legacy-encrypted-value" (get @fallback-secrets key)))
+            (is (= {:native-read 1 :legacy-read 1} @calls)))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (restore-platform!)
+                       (done)))))))
+
+(deftest production-keychain-legacy-bridge-is-not-used-for-electron-owner
+  (async done
+    (let [restore-platform! (set-process-platform-arch! "darwin" "arm64")
+          legacy-calls (atom 0)
+          keychain (js-obj
+                    "getPassword" (fn [& _]
+                                    (p/rejected (js/Error. "native unavailable"))))
+          fallback-kv {:get (fn [_key] (p/resolved nil))
+                       :set! (fn [& _] (p/resolved nil))}
+          crypto (#'platform-node/keychain-secret-store
+                  fallback-kv keychain
+                  {:owner-source :electron
+                   :timeout-ms 10
+                   :legacy-read-fn (fn [_]
+                                     (swap! legacy-calls inc)
+                                     (p/resolved "must-not-read"))})]
+      (-> ((:read-secret-text crypto) "logseq-encrypted-password")
+          (p/then (fn [secret]
+                    (is (nil? secret))
+                    (is (zero? @legacy-calls))))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (restore-platform!)
+                       (done)))))))
 
 (deftest kv-store-preserves-uint8array-values-across-reloads-test
   (async done

@@ -2,6 +2,7 @@
   "Node.js platform adapter for db-worker."
   (:require ["fs" :as node-fs]
             ["fs/promises" :as fs]
+            ["node:child_process" :as child-process]
             ["node:sqlite" :as node-sqlite]
             ["os" :as os]
             ["path" :as node-path]
@@ -729,33 +730,180 @@
 
 (def ^:private keychain-service "Logseq E2EE")
 (def ^:private test-secret-storage-file "test-only-e2ee-secret-store.json")
+(def ^:private keychain-operation-timeout-ms 3000)
+(def ^:private legacy-keychain-read-timeout-ms 5000)
+(def ^:private legacy-keychain-max-output-bytes (* 1024 1024))
+
+(defn- with-timeout
+  [promise timeout-ms context]
+  (p/create
+   (fn [resolve reject]
+     (let [settled? (atom false)
+           settle! (fn [f value]
+                     (when (compare-and-set! settled? false true)
+                       (f value)))
+           timeout-id (js/setTimeout
+                       (fn []
+                         (settle! reject
+                                  (ex-info "keychain operation timeout"
+                                           (assoc context
+                                                  :type :db-worker/keychain-timeout
+                                                  :timeout-ms timeout-ms))))
+                       timeout-ms)]
+       (-> promise
+           (p/then #(settle! resolve %))
+           (p/catch #(settle! reject %))
+           (p/finally #(js/clearTimeout timeout-id)))))))
+
+(defn- executable-file?
+  [path]
+  (try
+    (and (seq path)
+         (.isFile (node-fs/statSync path))
+         (do
+           (node-fs/accessSync path (.-X_OK node-fs/constants))
+           true))
+    (catch :default _
+      false)))
+
+(defn- canonical-path
+  [path]
+  (try
+    (node-fs/realpathSync path)
+    (catch :default _
+      (node-path/resolve path))))
+
+(defn- system-node-executable
+  []
+  (let [path-value (or (gobj/get (.-env js/process) "PATH") "")
+        path-candidates (map #(node-path/join % "node")
+                             (remove string/blank?
+                                     (string/split path-value
+                                                   (if (= ";" node-path/delimiter)
+                                                     #";"
+                                                     #":"))))
+        candidates (concat path-candidates
+                           ["/opt/homebrew/bin/node"
+                            "/usr/local/bin/node"
+                            "/usr/bin/node"])
+        current-executable (canonical-path (.-execPath js/process))]
+    (some (fn [candidate]
+            (when (and (executable-file? candidate)
+                       (not= current-executable (canonical-path candidate)))
+              candidate))
+          candidates)))
+
+(defn- unpacked-keytar-module-path
+  []
+  (try
+    (let [resolved (.resolve js/require "keytar")
+          asar-segment (str node-path/sep "app.asar" node-path/sep)
+          unpacked-segment (str node-path/sep "app.asar.unpacked" node-path/sep)
+          unpacked (string/replace resolved asar-segment unpacked-segment)]
+      (when (and (node-fs/existsSync unpacked)
+                 (.isFile (node-fs/statSync unpacked)))
+        unpacked))
+    (catch :default _
+      nil)))
+
+(def ^:private legacy-keychain-read-script
+  (string/join
+   "\n"
+   ["const keytar = require(process.argv[1]);"
+    "keytar.getPassword(process.argv[2], process.argv[3]).then((value) => {"
+    "  if (typeof value === 'string') process.stdout.write(value);"
+    "}, () => { process.exitCode = 2; });"]))
+
+(defn- <read-legacy-keychain-secret
+  [key]
+  (let [executable (system-node-executable)
+        module-path (unpacked-keytar-module-path)]
+    (if-not (and executable module-path)
+      (p/resolved nil)
+      (p/create
+       (fn [resolve _reject]
+         (.execFile child-process
+                    executable
+                    #js ["-e" legacy-keychain-read-script
+                         module-path keychain-service key]
+                    #js {:encoding "utf8"
+                         :timeout legacy-keychain-read-timeout-ms
+                         :maxBuffer legacy-keychain-max-output-bytes
+                         :windowsHide true}
+                    (fn [error stdout _stderr]
+                      (resolve (when (and (nil? error)
+                                          (string? stdout)
+                                          (not (string/blank? stdout)))
+                                 stdout)))))))))
 
 (defn- keychain-secret-store
-  [kv keychain]
-  {:save-secret-text!
-   (fn [key text]
-     (-> (p/let [_ (.setPassword ^js keychain keychain-service key text)]
-           nil)
-         (p/catch (fn [e]
-                    (log/warn :db-worker/keychain-save-failed {:error e
-                                                               :key key})
-                    ((:set! kv) key text)))))
-   :read-secret-text
-   (fn [key]
-     (-> (p/let [secret (.getPassword ^js keychain keychain-service key)]
-           secret)
-         (p/catch (fn [e]
-                    (log/warn :db-worker/keychain-read-failed {:error e
-                                                               :key key})
-                    ((:get kv) key)))))
-   :delete-secret-text!
-   (fn [key]
-     (-> (p/let [_ (.deletePassword ^js keychain keychain-service key)]
-           nil)
-         (p/catch (fn [e]
-                    (log/warn :db-worker/keychain-delete-failed {:error e
-                                                                 :key key})
-                    ((:set! kv) key nil)))))})
+  ([kv keychain]
+   (keychain-secret-store kv keychain {}))
+  ([kv keychain {:keys [owner-source timeout-ms legacy-read-fn]
+                 :or {timeout-ms keychain-operation-timeout-ms}}]
+   (let [native-disabled? (atom false)
+         legacy-read-fn (when (and (= :cli owner-source) (macos?))
+                          (or legacy-read-fn <read-legacy-keychain-secret))
+         native-call
+         (fn [operation key f]
+           (if @native-disabled?
+             (p/rejected (ex-info "native keychain disabled after timeout"
+                                  {:type :db-worker/keychain-disabled
+                                   :operation operation
+                                   :key key}))
+             (-> (with-timeout (f) timeout-ms
+                               {:operation operation
+                                :key key})
+                 (p/catch
+                  (fn [error]
+                    (when (= :db-worker/keychain-timeout
+                             (:type (ex-data error)))
+                      (reset! native-disabled? true))
+                    (throw error))))))
+         fallback-or-legacy
+         (fn [key]
+           (p/let [fallback ((:get kv) key)]
+             (if (or (some? fallback) (nil? legacy-read-fn))
+               fallback
+               (p/let [legacy-secret (legacy-read-fn key)
+                       _ (when (some? legacy-secret)
+                           ((:set! kv) key legacy-secret))]
+                 legacy-secret))))]
+     {:save-secret-text!
+      (fn [key text]
+        (-> (native-call :save key
+                         #(.setPassword ^js keychain keychain-service key text))
+            (p/catch (fn [error]
+                       (log/warn :db-worker/keychain-save-failed
+                                 {:error error :key key})
+                       nil))
+            (p/then (fn [_]
+                      ((:set! kv) key text)))))
+      :read-secret-text
+      (fn [key]
+        (-> (native-call :read key
+                         #(.getPassword ^js keychain keychain-service key))
+            (p/then
+             (fn [secret]
+               (if (some? secret)
+                 (p/let [_ ((:set! kv) key secret)]
+                   secret)
+                 (fallback-or-legacy key))))
+            (p/catch
+             (fn [error]
+               (log/warn :db-worker/keychain-read-failed
+                         {:error error :key key})
+               (fallback-or-legacy key)))))
+      :delete-secret-text!
+      (fn [key]
+        (-> (native-call :delete key
+                         #(.deletePassword ^js keychain keychain-service key))
+            (p/catch (fn [error]
+                       (log/warn :db-worker/keychain-delete-failed
+                                 {:error error :key key})
+                       nil))
+            (p/then (fn [_]
+                      ((:set! kv) key nil)))))})))
 
 (defn- kv-secret-store
   [kv]
@@ -764,10 +912,10 @@
    :delete-secret-text! (fn [key] ((:set! kv) key nil))})
 
 (defn- resolve-secret-store
-  [test-storage-enabled? production-kv test-kv]
+  [test-storage-enabled? production-kv test-kv owner-source]
   (if test-storage-enabled?
     (kv-secret-store test-kv)
-    (keychain-secret-store production-kv keytar)))
+    (keychain-secret-store production-kv keytar {:owner-source owner-source})))
 
 (defn- kv-store
   ([data-dir]
@@ -813,7 +961,8 @@
         kv (kv-store root-dir)
         test-kv (when test-secret-storage-enabled?
                   (kv-store root-dir test-secret-storage-file))
-        secret-store (resolve-secret-store test-secret-storage-enabled? kv test-kv)]
+        secret-store (resolve-secret-store test-secret-storage-enabled?
+                                           kv test-kv owner-source)]
     (p/do!
      (ensure-dir! root-dir)
      (ensure-dir! data-dir)

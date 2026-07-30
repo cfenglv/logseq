@@ -457,6 +457,22 @@ let status_last_error status =
   | Some value when not (Edn_util.is_null value) -> Some value
   | _ -> None
 
+let status_sync_ready status =
+  Option.value (Edn_util.get_bool status "sync-ready?") ~default:false
+
+type sync_start_readiness =
+  | Sync_start_ready
+  | Sync_start_runtime_failure of Melange_edn_melange.any
+  | Sync_start_waiting
+
+let sync_start_readiness status =
+  match status_last_error status with
+  | Some last_error -> Sync_start_runtime_failure last_error
+  | None
+    when status_ws_state status = Some "open" && status_sync_ready status ->
+      Sync_start_ready
+  | None -> Sync_start_waiting
+
 let invoke_global_config ?(create_empty_db = false) config =
   match (config.Cli_config.base_url, config.repo) with
   | Some base_url, _ ->
@@ -830,7 +846,7 @@ let runtime_error repo status last_error =
               (kw "last-error", last_error);
             |]))
     Error.Sync_start_runtime_error
-    "sync start reached open websocket but runtime sync error is present"
+    "sync start encountered a runtime sync error before becoming ready"
 
 let sync_start_timeout_error repo status =
   Error.make
@@ -855,13 +871,15 @@ let wait_sync_start_ready config invoke_config repo =
   in
   let rec loop () =
     Transport.thread_api_db_sync_status invoke_config ~repo >>= fun status ->
-    match (status_ws_state status, status_last_error status) with
-    | Some "open", Some last_error ->
+    match sync_start_readiness status with
+    | Sync_start_runtime_failure last_error ->
         Cli_effect.pure (Error (runtime_error repo status last_error))
-    | Some "open", _ -> Cli_effect.pure (Ok status)
-    | _ when Time.compare_time (Time.now ()) deadline >= 0 ->
+    | Sync_start_ready -> Cli_effect.pure (Ok status)
+    | Sync_start_waiting
+      when Time.compare_time (Time.now ()) deadline >= 0 ->
         Cli_effect.pure (Error (sync_start_timeout_error repo status))
-    | _ -> Cli_effect.sleep (Time.span_of_ms 100L) >>= fun () -> loop ()
+    | Sync_start_waiting ->
+        Cli_effect.sleep (Time.span_of_ms 100L) >>= fun () -> loop ()
   in
   loop ()
 

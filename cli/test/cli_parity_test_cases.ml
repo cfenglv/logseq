@@ -4350,6 +4350,54 @@ let () =
           expect_bool "ensure keys upload" true action.upload_keys
       | _ -> fail_test "expected Sync_ensure_keys action");
 
+  test_promise
+    "CLI parity sync start surfaces syncing runtime error before timeout"
+    (fun () ->
+      let status_calls = ref 0 in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/q" body then "false"
+            else if
+              Js.String.includes ~search:"thread-api/db-sync-status" body
+            then (
+              incr status_calls;
+              "[\"^ \
+               \",\"~:repo\",\"logseq_db_demo\",\"~:ws-state\",\"~:syncing\",\"~:sync-ready?\",false,\"~:last-error\",[\"^ \
+               \",\"~:code\",\"~:marker-recovery-aes-key-timeout\"]]")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let action =
+            Sync.Sync_start
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                e2ee_password = None;
+              }
+          in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+              timeout_span = Time.span_of_ms 5_000L;
+            }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Sync.execute action cfg Output.Mode.Json)
+          in
+          expect_bool "sync start returns error" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "sync start runtime error code"
+                "sync-start-runtime-error"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected sync start runtime error");
+          expect_int "sync status checked once" 1 !status_calls;
+          Js.Promise.resolve pass));
+
   test "CLI parity sync build validates config and asset download actions"
     (fun () ->
       expect_error_code "config set missing key" "invalid-options"

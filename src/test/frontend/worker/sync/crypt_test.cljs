@@ -323,6 +323,8 @@
          (let [platform-map {:env {:runtime :node
                                    :owner-source :electron}}
                secret-calls (atom [])
+               native-calls (atom [])
+               kv-calls (atom [])
                file-calls (atom [])
                auth-read-calls (atom [])
                encrypt-calls (atom [])]
@@ -339,6 +341,15 @@
                                                                                       :key key
                                                                                       :text text})
                                                             (p/resolved nil))
+                               platform/kv-set! (fn [platform' key text]
+                                                  (swap! kv-calls conj {:platform platform'
+                                                                        :key key
+                                                                        :text text})
+                                                  (p/resolved nil))
+                               ui-request/<request (fn [action payload & _opts]
+                                                     (swap! native-calls conj {:action action
+                                                                               :payload payload})
+                                                     (p/resolved {:supported? true}))
                                platform/write-text! (fn [platform' path text]
                                                       (swap! file-calls conj {:platform platform'
                                                                               :path path
@@ -349,10 +360,14 @@
                          (is (= 1 (count @auth-read-calls)))
                          (is (= "~/logseq/auth.json" (:path (first @auth-read-calls))))
                          (is (= [["refresh-from-auth-file" "password"]] @encrypt-calls))
-                         (is (= 1 (count @secret-calls)))
-                         (is (= platform-map (:platform (first @secret-calls))))
-                         (is (= "logseq-encrypted-password" (:key (first @secret-calls))))
-                         (is (string? (:text (first @secret-calls))))
+                         (is (empty? @secret-calls))
+                         (is (= 1 (count @native-calls)))
+                         (is (= :native-save-e2ee-password
+                                (:action (first @native-calls))))
+                         (is (= 1 (count @kv-calls)))
+                         (is (= platform-map (:platform (first @kv-calls))))
+                         (is (= "logseq-encrypted-password" (:key (first @kv-calls))))
+                         (is (string? (:text (first @kv-calls))))
                          (is (empty? @file-calls))))
                (p/catch (fn [e]
                           (is false (str e))))
@@ -473,12 +488,25 @@
          (let [platform-map {:env {:runtime :node
                                    :owner-source :electron}}
                secret-calls (atom [])
+               native-calls (atom [])
+               kv-calls (atom [])
+               encrypted-text (ldb/write-transit-str {:cipher "payload"})
                file-calls (atom [])]
            (-> (p/with-redefs [platform/current (fn [] platform-map)
                                platform/read-secret-text (fn [platform' key]
                                                            (swap! secret-calls conj {:platform platform'
                                                                                      :key key})
-                                                           (p/resolved (ldb/write-transit-str {:cipher "payload"})))
+                                                           (p/rejected (ex-info "should-not-read-worker-keychain" {})))
+                               platform/kv-set! (fn [platform' key text]
+                                                  (swap! kv-calls conj {:platform platform'
+                                                                        :key key
+                                                                        :text text})
+                                                  (p/resolved nil))
+                               ui-request/<request (fn [action payload & _opts]
+                                                     (swap! native-calls conj {:action action
+                                                                               :payload payload})
+                                                     (p/resolved {:supported? true
+                                                                  :encrypted-text encrypted-text}))
                                platform/read-text! (fn [platform' path]
                                                      (swap! file-calls conj {:platform platform'
                                                                              :path path})
@@ -488,8 +516,14 @@
                  (#'sync-crypt/<read-e2ee-password "refresh-token"))
                (p/then (fn [password]
                          (is (= "decrypted-password" password))
-                         (is (= 1 (count @secret-calls)))
-                         (is (= "logseq-encrypted-password" (:key (first @secret-calls))))
+                         (is (empty? @secret-calls))
+                         (is (= [{:action :native-get-e2ee-password
+                                  :payload {:key "logseq-encrypted-password"}}]
+                                @native-calls))
+                         (is (= [{:platform platform-map
+                                  :key "logseq-encrypted-password"
+                                  :text encrypted-text}]
+                                @kv-calls))
                          (is (empty? @file-calls))))
                (p/catch (fn [e]
                           (is false (str e))))
