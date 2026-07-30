@@ -84,6 +84,40 @@ let starts_with ~prefix value =
   let prefix_len = String.length prefix in
   String.length value >= prefix_len && String.sub value 0 prefix_len = prefix
 
+let non_empty_env_value env keys =
+  keys
+  |> Vec.find_map (fun key ->
+         let prefix = key ^ "=" in
+         env
+         |> Vec.find_map (fun entry ->
+                if starts_with ~prefix entry then
+                  let value =
+                    String.sub entry (String.length prefix)
+                      (String.length entry - String.length prefix)
+                  in
+                  if String.trim value = "" then None else Some (key, value)
+                else None))
+
+let add_all_proxy_http_fallbacks env =
+  match
+    non_empty_env_value env (Vec.of_array [| "ALL_PROXY"; "all_proxy" |])
+  with
+  | None -> env
+  | Some (source_key, proxy_url) ->
+      let uppercase = source_key = "ALL_PROXY" in
+      Vec.of_array
+        [|
+          ( (if uppercase then "HTTP_PROXY" else "http_proxy"),
+            Vec.of_array [| "HTTP_PROXY"; "http_proxy" |] );
+          ( (if uppercase then "HTTPS_PROXY" else "https_proxy"),
+            Vec.of_array [| "HTTPS_PROXY"; "https_proxy" |] );
+        |]
+      |> Vec.fold_left
+           (fun env (target_key, explicit_keys) ->
+             if Option.is_some (non_empty_env_value env explicit_keys) then env
+             else Vec.push_back env (target_key ^ "=" ^ proxy_url))
+           env
+
 let server_list_path config =
   Filename.concat (resolve_root_dir config) "server-list"
 
@@ -271,6 +305,7 @@ let env_with_node_runtime () =
         (Vec.exists
            (fun key -> starts_with ~prefix:(key ^ "=") entry)
            node_runtime_keys))
+  |> add_all_proxy_http_fallbacks
   |> fun env ->
   Vec.append (Vec.map (fun key -> key ^ "=1") node_runtime_keys) env
   |> Vec.to_array
