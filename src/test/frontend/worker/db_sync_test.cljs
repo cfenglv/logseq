@@ -35,6 +35,7 @@
    [logseq.db-sync.checksum :as sync-checksum]
    [logseq.db-sync.storage :as sync-storage]
    [logseq.db-sync.worker.handler.sync :as sync-handler]
+   [logseq.db-sync.worker.handler.ws :as sync-ws-handler]
    [logseq.db-sync.worker.ws :as ws]
    [logseq.db.common.normalize :as db-normalize]
    [logseq.db.frontend.schema :as db-schema]
@@ -11368,3 +11369,787 @@
                 (is (= 1770000000100
                        (:block/updated-at
                         (d/entity @conn [:block/uuid (:block/uuid parent)]))))))))))))
+
+(defn- parse-loopback-message
+  [raw]
+  (js->clj (js/JSON.parse raw) :keywordize-keys true))
+
+(defn- <settle-loopback-client!
+  [client]
+  ;; A server response enters the receive queue, and hello/pull handling can
+  ;; enqueue more work on the send queue. Drain both public connection queues
+  ;; repeatedly so the test observes a stable protocol state rather than one
+  ;; promise turn in the middle of the handshake.
+  (p/loop [remaining 12]
+    (if (zero? remaining)
+      nil
+      (p/let [_ (p/delay 0)
+              _ (when-let [queue (:receive-queue client)]
+                  @queue)
+              _ (when-let [queue (:send-queue client)]
+                  @queue)]
+        (p/recur (dec remaining))))))
+
+(defn- make-sync-loopback
+  [server-self failure-mode]
+  (let [client-messages* (atom [])
+        server-messages* (atom [])
+        sockets* (atom [])
+        dropped-batch-ack?* (atom false)
+        failed-batch-send?* (atom false)]
+    (aset
+     server-self
+     "state"
+     #js {:getWebSockets
+          (fn []
+            (to-array (map :server-ws @sockets*)))})
+    {:client-messages* client-messages*
+     :server-messages* server-messages*
+     :sockets* sockets*
+     :dropped-batch-ack?* dropped-batch-ack?*
+     :failed-batch-send?* failed-batch-send?*
+     :connect
+     (fn [_url]
+       (let [client-ws (js-obj)
+             server-ws (js-obj)
+             connection-number (inc (count @sockets*))
+             network-close!
+             (fn []
+               (when-not (= 3 (.-readyState client-ws))
+                 (set! (.-readyState client-ws) 3)
+                 (set! (.-readyState server-ws) 3)
+                 (when-let [onclose (.-onclose client-ws)]
+                   (onclose #js {}))))
+             deliver-server-message!
+             (fn [raw]
+               (let [message (parse-loopback-message raw)]
+                 (swap! server-messages*
+                        conj
+                        {:connection connection-number
+                         :message message})
+                 (if (and (= :drop-first-batch-ack failure-mode)
+                          (= "tx/batch/ok" (:type message))
+                          (compare-and-set! dropped-batch-ack?* false true))
+                   ;; The server has already committed before its socket sends
+                   ;; this response. Lose only the acknowledgement, then model
+                   ;; the transport closing and let the public client reconnect.
+                   (js/queueMicrotask network-close!)
+                   (js/queueMicrotask
+                    (fn []
+                      (when (and (= 1 (.-readyState client-ws))
+                                 (fn? (.-onmessage client-ws)))
+                        ((.-onmessage client-ws) #js {:data raw})))))))
+             send-client-message!
+             (fn [raw]
+               (let [message (parse-loopback-message raw)]
+                 (swap! client-messages*
+                        conj
+                        {:connection connection-number
+                         :message message})
+                 (if (and (= :fail-first-batch-send failure-mode)
+                          (= "tx/batch" (:type message))
+                          (compare-and-set! failed-batch-send?* false true))
+                   ;; No server handler call: this failure is observably before
+                   ;; commit, not a committed request whose response was lost.
+                   (throw (js/Error. "loopback send failed before server commit"))
+                   (sync-ws-handler/handle-ws-message!
+                    server-self server-ws raw))))]
+         (set! (.-readyState client-ws) 0)
+         (set! (.-readyState server-ws) 1)
+         (set! (.-send client-ws) send-client-message!)
+         (set! (.-send server-ws) deliver-server-message!)
+         (set! (.-close client-ws)
+               (fn [& _]
+                 (set! (.-readyState client-ws) 3)
+                 (set! (.-readyState server-ws) 3)))
+         (set! (.-close server-ws)
+               (fn [& _]
+                 (js/queueMicrotask network-close!)))
+         (swap! sockets* conj
+                {:connection connection-number
+                 :client-ws client-ws
+                 :server-ws server-ws})
+         client-ws))}))
+
+(defn- install-memory-asset-fetch!
+  [assets* requests*]
+  (fn [url opts]
+    (let [method (or (some-> opts .-method) "GET")
+          url* (str url)]
+      (swap! requests* conj {:method method :url url*})
+      (case method
+        "PUT"
+        (let [payload (js/Uint8Array. (.-body opts))]
+          (swap! assets* assoc url* payload)
+          (p/resolved #js {:ok true :status 200}))
+
+        "GET"
+        (if-let [payload (get @assets* url*)]
+          (let [copy (js/Uint8Array. payload)]
+            (p/resolved
+             #js {:ok true
+                  :status 200
+                  :arrayBuffer (fn [] (p/resolved (.-buffer copy)))}))
+          (p/resolved #js {:ok false :status 404}))
+
+        (p/resolved #js {:ok false :status 405})))))
+
+(defn- open-current-loopback-client!
+  []
+  (let [client @worker-state/*db-sync-client
+        ws (:ws client)]
+    (set! (.-readyState ws) 1)
+    ((.-onopen ws) #js {})
+    client))
+
+(defn- <run-e2ee-large-title-retry-scenario
+  [failure-mode]
+  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+        block-uuid (:block/uuid child1)
+        _ (ldb/transact!
+           conn
+           [(ldb/kv :logseq.kv/graph-rtc-e2ee? true)]
+           {:persist-op? false})
+        original-server-db @conn
+        server-seed-storage (make-storage-sql)
+        _ (d/conn-from-datoms
+           (d/datoms original-server-db :eavt)
+           (d/schema original-server-db)
+           {:storage
+            (sync-storage/new-sqlite-storage
+             (:sql server-seed-storage))})
+        server-storage (make-storage-sql)
+        _ (#'sync-handler/import-snapshot-rows!
+           (:sql server-storage)
+           "kvs"
+           (kvs-rows (:state server-seed-storage)))
+        ;; open-conn installs the same storage-update listener used by the
+        ;; deployed sync server, so a successful tx/batch advances durable
+        ;; t/checksum metadata before its acknowledgement is delivered.
+        server-conn (sync-storage/open-conn (:sql server-storage))
+        server-self #js {:sql (:sql server-storage)
+                         :conn server-conn
+                         :schema-ready true}
+        loopback (make-sync-loopback server-self failure-mode)
+        assets* (atom {})
+        asset-requests* (atom [])
+        large-title (str (apply str (repeat 1535 "汉"))
+                         " ack-loss-retry")
+        initial-t 2733
+        fetch-prev js/fetch
+        client-prev @worker-state/*db-sync-client
+        config-prev @worker-state/*db-sync-config
+        start-inflight-prev @db-sync/*start-inflight
+        latest-tx-prev @sync-apply/*repo->latest-remote-tx
+        latest-checksum-prev @sync-apply/*repo->latest-remote-checksum
+        latest-version-prev @sync-apply/*repo->latest-remote-checksum-version
+        platform-prev (try
+                        (platform/current)
+                        (catch :default _ nil))]
+    (sync-storage/set-t! (:sql server-storage) initial-t)
+    (reset! worker-state/*db-sync-config
+            {:ws-url "wss://sync.example.test/sync/%s"
+             :http-base "https://sync.example.test"})
+    (reset! worker-state/*db-sync-client nil)
+    (reset! db-sync/*start-inflight nil)
+    (reset! sync-apply/*repo->latest-remote-tx {})
+    (reset! sync-apply/*repo->latest-remote-checksum {})
+    (reset! sync-apply/*repo->latest-remote-checksum-version {})
+    (set! js/fetch
+          (install-memory-asset-fetch! assets* asset-requests*))
+    (platform/set-platform!
+     (assoc (minimal-platform :node)
+            :websocket {:connect (:connect loopback)}))
+    (->
+     (p/let [aes-key (crypt/<generate-aes-key)]
+       (with-datascript-conns
+         conn
+         client-ops-conn
+         (fn []
+           (p/with-redefs
+             [worker-state/online? (constantly true)
+              db-sync/<resolve-ws-token (fn [] (p/resolved "loopback-token"))
+              sync-crypt/graph-e2ee? (constantly true)
+              sync-crypt/<ensure-graph-aes-key
+              (fn [_repo _graph-id] (p/resolved aes-key))
+              sync-assets/enqueue-asset-sync! (fn [& _] nil)
+              shared-service/broadcast-to-clients! (fn [& _] nil)]
+             (client-op/update-graph-uuid test-repo "graph-1")
+             (client-op/update-local-tx test-repo initial-t)
+             (client-op/update-local-checksum
+              test-repo
+              (sync-checksum/recompute-checksum @conn))
+             (client-op/update-local-server-checksum
+              test-repo
+              (sync-checksum/recompute-server-checksum @conn))
+
+             ;; Use the production DB listener for the local edit so the
+             ;; pending transaction and both checksum representations originate
+             ;; from the same path as the desktop/db-worker runtime.
+             (d/unlisten! conn ::listen-db)
+             (db-listener/listen-db-changes!
+              test-repo conn :handler-keys [:db-sync])
+             (ldb/transact!
+              conn
+              [[:db/add (:db/id child1) :block/title large-title]]
+              {:outliner-op :save-block})
+
+             (p/let [_ (db-sync/start! test-repo)
+                     first-client (open-current-loopback-client!)
+                     _ (<settle-loopback-client! first-client)
+                     first-observation
+                     {:server-t-after-first
+                      (sync-handler/t-now server-self)
+                      :local-t-after-first
+                      (client-op/get-local-tx test-repo)
+                      :pending-after-first
+                      (client-op/get-pending-local-tx-count test-repo)
+                      :first-ws-state @(:ws-state first-client)
+                      :server-marker-after-first
+                      (get
+                       (d/entity @server-conn
+                                 [:block/uuid block-uuid])
+                       sync-large-title/large-title-object-attr)}
+                     _ (db-sync/start! test-repo)
+                     second-client (open-current-loopback-client!)
+                     _ (<settle-loopback-client! second-client)
+                     second-observation
+                     {:server-t-after-retry
+                      (sync-handler/t-now server-self)
+                      :local-t-after-retry
+                      (client-op/get-local-tx test-repo)
+                      :pending-after-retry
+                      (client-op/get-pending-local-tx-count test-repo)
+                      :retry-ws-state @(:ws-state second-client)}
+                     _ (db-sync/rehydrate-large-titles-from-db!
+                        test-repo "graph-1")
+                     _ (db-sync/stop!)
+                     _ (db-sync/start! test-repo)
+                     restarted-client (open-current-loopback-client!)
+                     _ (<settle-loopback-client! restarted-client)]
+               (let [local-entity
+                     (d/entity @conn [:block/uuid block-uuid])
+                     server-entity
+                     (d/entity @server-conn [:block/uuid block-uuid])
+                     local-marker
+                     (get local-entity
+                          sync-large-title/large-title-object-attr)
+                     server-marker
+                     (get server-entity
+                          sync-large-title/large-title-object-attr)
+                     marker-url
+                     (when local-marker
+                       (sync-large-title/asset-url
+                        "https://sync.example.test"
+                        "graph-1"
+                        (:asset-uuid local-marker)
+                        (:asset-type local-marker)))]
+                 (d/unlisten! conn ::db-listener/listen-db-changes!)
+                 (merge
+                  first-observation
+                  second-observation
+                  {:restart-ws-state @(:ws-state restarted-client)
+                   :restart-last-error @(:last-sync-error restarted-client)
+                   :local-t (client-op/get-local-tx test-repo)
+                   :server-t (sync-handler/t-now server-self)
+                   :pending
+                   (client-op/get-pending-local-tx-count test-repo)
+                   :large-title large-title
+                   :local-title (:block/title local-entity)
+                   :local-marker local-marker
+                   :server-marker server-marker
+                   :local-legacy
+                   (sync-checksum/recompute-checksum @conn)
+                   :server-legacy
+                   (sync-checksum/recompute-checksum @server-conn)
+                   :local-v2
+                   (sync-checksum/recompute-server-checksum @conn)
+                   :server-v2
+                   (sync-checksum/recompute-server-checksum @server-conn)
+                   :marker-asset-present? (contains? @assets* marker-url)
+                   :asset-requests @asset-requests*
+                   :asset-count (count @assets*)
+                   :client-messages @(:client-messages* loopback)
+                   :server-messages @(:server-messages* loopback)
+                   :dropped-batch-ack?
+                   @(:dropped-batch-ack?* loopback)
+                   :failed-batch-send?
+                   @(:failed-batch-send?* loopback)})))))))
+     (p/finally
+      (fn []
+        (db-sync/stop!)
+        (reset! worker-state/*db-sync-client client-prev)
+        (reset! worker-state/*db-sync-config config-prev)
+        (reset! db-sync/*start-inflight start-inflight-prev)
+        (reset! sync-apply/*repo->latest-remote-tx latest-tx-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum
+                latest-checksum-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum-version
+                latest-version-prev)
+        (set! js/fetch fetch-prev)
+        (platform/set-platform!
+         (or platform-prev (minimal-platform :browser))))))))
+
+(defn- <run-existing-e2ee-marker-mismatch-scenario
+  []
+  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+        block-uuid (:block/uuid child1)
+        _ (ldb/transact!
+           conn
+           [(ldb/kv :logseq.kv/graph-rtc-e2ee? true)]
+           {:persist-op? false})
+        server-seed-storage (make-storage-sql)
+        _ (d/conn-from-datoms
+           (d/datoms @conn :eavt)
+           (d/schema @conn)
+           {:storage
+            (sync-storage/new-sqlite-storage
+             (:sql server-seed-storage))})
+        server-storage (make-storage-sql)
+        _ (#'sync-handler/import-snapshot-rows!
+           (:sql server-storage)
+           "kvs"
+           (kvs-rows (:state server-seed-storage)))
+        server-conn (sync-storage/open-conn (:sql server-storage))
+        server-self #js {:sql (:sql server-storage)
+                         :conn server-conn
+                         :schema-ready true}
+        loopback (make-sync-loopback server-self nil)
+        assets* (atom {})
+        asset-requests* (atom [])
+        large-title (str (apply str (repeat 1535 "汉"))
+                         " existing-marker-split")
+        cursor 2734
+        fetch-prev js/fetch
+        client-prev @worker-state/*db-sync-client
+        config-prev @worker-state/*db-sync-config
+        start-inflight-prev @db-sync/*start-inflight
+        latest-tx-prev @sync-apply/*repo->latest-remote-tx
+        latest-checksum-prev @sync-apply/*repo->latest-remote-checksum
+        latest-version-prev @sync-apply/*repo->latest-remote-checksum-version
+        platform-prev (try
+                        (platform/current)
+                        (catch :default _ nil))]
+    (reset! worker-state/*db-sync-config
+            {:ws-url "wss://sync.example.test/sync/%s"
+             :http-base "https://sync.example.test"})
+    (reset! worker-state/*db-sync-client nil)
+    (reset! db-sync/*start-inflight nil)
+    (reset! sync-apply/*repo->latest-remote-tx {})
+    (reset! sync-apply/*repo->latest-remote-checksum {})
+    (reset! sync-apply/*repo->latest-remote-checksum-version {})
+    (set! js/fetch
+          (install-memory-asset-fetch! assets* asset-requests*))
+    (platform/set-platform!
+     (assoc (minimal-platform :node)
+            :websocket {:connect (:connect loopback)}))
+    (->
+     (p/let [aes-key (crypt/<generate-aes-key)
+             marker-a
+             (sync-large-title/upload-large-title!
+              {:repo test-repo
+               :graph-id "graph-1"
+               :title large-title
+               :aes-key aes-key
+               :http-base "https://sync.example.test"
+               :auth-headers nil
+               :fail-fast-f db-sync/fail-fast
+               :encrypt-text-value-f sync-crypt/<encrypt-text-value})
+             marker-b
+             (sync-large-title/upload-large-title!
+              {:repo test-repo
+               :graph-id "graph-1"
+               :title large-title
+               :aes-key aes-key
+               :http-base "https://sync.example.test"
+               :auth-headers nil
+               :fail-fast-f db-sync/fail-fast
+               :encrypt-text-value-f sync-crypt/<encrypt-text-value})]
+       (with-datascript-conns
+         conn
+         client-ops-conn
+         (fn []
+           (p/with-redefs
+             [worker-state/online? (constantly true)
+              db-sync/<resolve-ws-token (fn [] (p/resolved "loopback-token"))
+              sync-crypt/<ensure-graph-aes-key
+              (fn [_repo _graph-id] (p/resolved aes-key))
+              shared-service/broadcast-to-clients! (fn [& _] nil)]
+             ;; Construct the observed durable state: the server retained
+             ;; attempt A's transport marker while the client retained
+             ;; attempt B's marker and rehydrated logical title.
+             (d/transact!
+              server-conn
+              [[:db/add
+                [:block/uuid block-uuid]
+                :block/title
+                ""]
+               [:db/add
+                [:block/uuid block-uuid]
+                sync-large-title/large-title-object-attr
+                marker-a]])
+             (ldb/transact!
+              conn
+              [[:db/add
+                [:block/uuid block-uuid]
+                :block/title
+                large-title]
+               [:db/add
+                [:block/uuid block-uuid]
+                sync-large-title/large-title-object-attr
+                marker-b]]
+              {:rtc-tx? true
+               :persist-op? false})
+             (sync-storage/set-t! (:sql server-storage) cursor)
+             (client-op/update-graph-uuid test-repo "graph-1")
+             (client-op/update-local-tx test-repo cursor)
+             (client-op/update-local-checksum
+              test-repo
+              (sync-checksum/recompute-checksum @conn))
+             (client-op/update-local-server-checksum
+              test-repo
+              (sync-checksum/recompute-server-checksum @conn))
+
+             (let [legacy-before-local
+                   (sync-checksum/recompute-checksum @conn)
+                   legacy-before-server
+                   (sync-checksum/recompute-checksum @server-conn)
+                   v2-before-local
+                   (sync-checksum/recompute-server-checksum @conn)
+                   v2-before-server
+                   (sync-checksum/recompute-server-checksum @server-conn)]
+               (p/let [_ (db-sync/start! test-repo)
+                       client (open-current-loopback-client!)
+                       _ (<settle-loopback-client! client)
+                       first-state @(:ws-state client)
+                       first-error @(:last-sync-error client)
+                       _ (db-sync/stop!)
+                       _ (db-sync/start! test-repo)
+                       restarted-client (open-current-loopback-client!)
+                       _ (<settle-loopback-client! restarted-client)]
+                 (let [local-entity
+                       (d/entity @conn [:block/uuid block-uuid])
+                       server-entity
+                       (d/entity @server-conn
+                                 [:block/uuid block-uuid])]
+                   {:legacy-before-local legacy-before-local
+                    :legacy-before-server legacy-before-server
+                    :v2-before-local v2-before-local
+                    :v2-before-server v2-before-server
+                    :first-state first-state
+                    :first-error first-error
+                    :restart-state @(:ws-state restarted-client)
+                    :restart-error @(:last-sync-error restarted-client)
+                    :local-t (client-op/get-local-tx test-repo)
+                    :server-t (sync-handler/t-now server-self)
+                    :pending
+                    (client-op/get-pending-local-tx-count test-repo)
+                    :large-title large-title
+                    :local-title (:block/title local-entity)
+                    :local-marker
+                    (get local-entity
+                         sync-large-title/large-title-object-attr)
+                    :server-marker
+                    (get server-entity
+                         sync-large-title/large-title-object-attr)
+                    :local-legacy
+                    (sync-checksum/recompute-checksum @conn)
+                    :server-legacy
+                    (sync-checksum/recompute-checksum @server-conn)
+                    :local-v2
+                    (sync-checksum/recompute-server-checksum @conn)
+                    :server-v2
+                    (sync-checksum/recompute-server-checksum @server-conn)
+                    :asset-requests @asset-requests*
+                    :client-messages @(:client-messages* loopback)})))))))
+     (p/finally
+      (fn []
+        (db-sync/stop!)
+        (reset! worker-state/*db-sync-client client-prev)
+        (reset! worker-state/*db-sync-config config-prev)
+        (reset! db-sync/*start-inflight start-inflight-prev)
+        (reset! sync-apply/*repo->latest-remote-tx latest-tx-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum
+                latest-checksum-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum-version
+                latest-version-prev)
+        (set! js/fetch fetch-prev)
+        (platform/set-platform!
+         (or platform-prev (minimal-platform :browser))))))))
+
+(deftest existing-e2ee-marker-only-mismatch-recovers-through-client-sync-test
+  (async done
+         (->
+          (<run-existing-e2ee-marker-mismatch-scenario)
+          (p/then
+           (fn [{:keys [legacy-before-local
+                        legacy-before-server
+                        v2-before-local
+                        v2-before-server
+                        first-state
+                        first-error
+                        restart-state
+                        restart-error
+                        local-t
+                        server-t
+                        pending
+                        large-title
+                        local-title
+                        local-marker
+                        server-marker
+                        local-legacy
+                        server-legacy
+                        local-v2
+                        server-v2
+                        asset-requests]}]
+             (is (= legacy-before-local legacy-before-server)
+                 "the fixture must match the observed legacy checksum")
+             (is (not= v2-before-local v2-before-server)
+                 "only the randomized transport marker may differ")
+             (is (= :open first-state)
+                 "the real hello path must reconcile a marker-only split")
+             (is (nil? first-error))
+             (is (= :open restart-state)
+                 "a fresh hello must verify the durable recovery")
+             (is (nil? restart-error))
+             (is (= 2734 local-t server-t))
+             (is (zero? pending))
+             (is (= large-title local-title))
+             (is (= local-marker server-marker))
+             (is (= local-legacy server-legacy))
+             (is (= local-v2 server-v2))
+             (is (every?
+                  #(string/includes? (:url %)
+                                     "/assets/graph-1/")
+                  asset-requests)
+                 "recovery may fetch title assets but not snapshots")))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
+
+(deftest same-cursor-non-marker-divergence-remains-fail-closed-test
+  (testing "ordinary content divergence must not use marker reconciliation"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          cursor 2734
+          server-db @conn
+          remote-legacy
+          (sync-checksum/recompute-checksum server-db)
+          remote-v2
+          (sync-checksum/recompute-server-checksum server-db)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :last-sync-error (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}
+          raw-message
+          (js/JSON.stringify
+           (clj->js
+            {:type "hello"
+             :t cursor
+             :checksum remote-legacy
+             :checksum-version
+             sync-checksum/server-checksum-version
+             :server-checksum remote-v2}))]
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (client-op/update-local-tx test-repo cursor)
+          (ldb/transact!
+           conn
+           [[:db/add
+             [:block/uuid (:block/uuid child1)]
+             :block/title
+             "true non-marker divergence"]]
+           {:rtc-tx? true
+            :persist-op? false})
+          (let [local-legacy
+                (sync-checksum/recompute-checksum @conn)
+                local-v2
+                (sync-checksum/recompute-server-checksum @conn)]
+            (client-op/update-local-checksum test-repo local-legacy)
+            (client-op/update-local-server-checksum test-repo local-v2)
+            (let [error
+                  (try
+                    (with-redefs
+                      [shared-service/broadcast-to-clients!
+                       (fn [& _] nil)
+                       sync-assets/enqueue-asset-sync!
+                       (fn [& _] nil)]
+                      (sync-handle-message/handle-message!
+                       test-repo client raw-message))
+                    nil
+                    (catch :default error
+                      error))]
+              (is (nil?
+                   (get
+                    (d/entity @conn
+                              [:block/uuid (:block/uuid child1)])
+                    sync-large-title/large-title-object-attr))
+                  "the divergent entity must not carry a title marker")
+              (is (not= local-legacy remote-legacy))
+              (is (not= local-v2 remote-v2))
+              (is (= :db-sync/checksum-mismatch
+                     (:type (ex-data error))))
+              (is (= cursor (client-op/get-local-tx test-repo)))
+              (is (zero?
+                   (client-op/get-pending-local-tx-count test-repo))))))))))
+
+(deftest v1-hello-retains-legacy-checksum-compatibility-test
+  (testing "a v1 server without versioned fields remains governed by legacy checksum"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          cursor 2734
+          legacy (sync-checksum/recompute-checksum @conn)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :last-sync-error (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}
+          raw-message
+          (js/JSON.stringify
+           (clj->js {:type "hello"
+                     :t cursor
+                     :checksum legacy}))]
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (client-op/update-local-tx test-repo cursor)
+          (client-op/update-local-checksum test-repo legacy)
+          ;; This intentionally cannot match any advertised v2 value. A v1
+          ;; hello must not accidentally consult it.
+          (client-op/update-local-server-checksum
+           test-repo
+           "ffffffffffffffff")
+          (with-redefs
+            [shared-service/broadcast-to-clients! (fn [& _] nil)
+             sync-apply/enqueue-flush-pending! (fn [& _] nil)
+             sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+            (is (nil?
+                 (sync-handle-message/handle-message!
+                  test-repo client raw-message))))
+          (is (= :open @(:ws-state client)))
+          (is (nil? @(:last-sync-error client)))
+          (is (= cursor (client-op/get-local-tx test-repo))))))))
+
+(deftest e2ee-large-title-commit-with-lost-ack-converges-through-reconnect-test
+  (async done
+         (->
+          (<run-e2ee-large-title-retry-scenario :drop-first-batch-ack)
+          (p/then
+           (fn [{:keys [server-t-after-first
+                        local-t-after-first
+                        pending-after-first
+                        first-ws-state
+                        server-marker-after-first
+                        server-t-after-retry
+                        local-t-after-retry
+                        pending-after-retry
+                        retry-ws-state
+                        restart-ws-state
+                        restart-last-error
+                        local-t
+                        server-t
+                        pending
+                        large-title
+                        local-title
+                        local-marker
+                        server-marker
+                        local-legacy
+                        server-legacy
+                        local-v2
+                        server-v2
+                        marker-asset-present?
+                        asset-requests
+                        asset-count
+                        client-messages
+                        dropped-batch-ack?]}]
+             (is dropped-batch-ack?
+                 "the first server commit acknowledgement must be lost")
+             (is (= 2734 server-t-after-first)
+                 "the first attempt must commit exactly once before disconnect")
+             (is (= 2733 local-t-after-first)
+                 "a lost acknowledgement must not fabricate local cursor progress")
+             (is (= 1 pending-after-first)
+                 "the unacknowledged logical edit remains durable")
+             (is (= :closed first-ws-state))
+             (is (sync-large-title/large-title-object-v2?
+                  server-marker-after-first))
+             (is (= server-t-after-retry local-t-after-retry)
+                 "the public retry path must finish on one authoritative cursor")
+             (is (zero? pending-after-retry))
+             (is (= :open retry-ws-state)
+                 "marker-only reconciliation must not enter repair-required")
+             (is (= :open restart-ws-state)
+                 "the reconciled state must survive a fresh hello")
+             (is (nil? restart-last-error))
+             (is (= local-t server-t))
+             (is (zero? pending))
+             (is (= large-title local-title)
+                 "reconciliation must preserve the logical E2EE title")
+             (is (= local-marker server-marker)
+                 "the durable marker must converge to the server marker")
+             (is (not= server-marker-after-first server-marker)
+                 "the retry must exercise a distinct randomized E2EE marker")
+             (is (= local-legacy server-legacy))
+             (is (= local-v2 server-v2))
+             (is (sync-large-title/large-title-object-v2? local-marker))
+             (is marker-asset-present?
+                 "the converged marker must still resolve to uploaded ciphertext")
+             (is (<= 2 asset-count)
+                 "retrying randomized E2EE offload should produce distinct attempts")
+             (is (every?
+                  #(string/includes? (:url %)
+                                     "/assets/graph-1/")
+                  asset-requests)
+                 "automatic recovery must not use snapshot upload/download")
+             (is (some #(= "pull" (get-in % [:message :type]))
+                       client-messages)
+                 "the reconnect must catch up through the sync protocol")))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
+
+(deftest e2ee-large-title-send-failure-before-commit-retries-without-data-loss-test
+  (async done
+         (->
+          (<run-e2ee-large-title-retry-scenario :fail-first-batch-send)
+          (p/then
+           (fn [{:keys [server-t-after-first
+                        local-t-after-first
+                        pending-after-first
+                        server-t-after-retry
+                        local-t-after-retry
+                        pending-after-retry
+                        retry-ws-state
+                        restart-ws-state
+                        large-title
+                        local-title
+                        local-marker
+                        server-marker
+                        local-v2
+                        server-v2
+                        marker-asset-present?
+                        failed-batch-send?]}]
+             (is failed-batch-send?)
+             (is (= 2733 server-t-after-first)
+                 "a send failure before the server handler must not commit")
+             (is (= 2733 local-t-after-first))
+             (is (= 1 pending-after-first))
+             (is (= 2734 server-t-after-retry))
+             (is (= server-t-after-retry local-t-after-retry))
+             (is (zero? pending-after-retry))
+             (is (= :open retry-ws-state))
+             (is (= :open restart-ws-state))
+             (is (= large-title local-title))
+             (is (= local-marker server-marker))
+             (is (= local-v2 server-v2))
+             (is marker-asset-present?)))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
