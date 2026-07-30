@@ -89,6 +89,7 @@
         (aset js/console "error" original-console-error)))))
 
 (def ^:private *logseq-db-hooks (atom nil))
+(def ^:private *db-sync-remote-state (atom nil))
 
 (def reset-logseq-db-hooks-fixture
   {:before
@@ -108,8 +109,33 @@
        (reset! ldb/*transact-invalid-callback transact-invalid-callback)
        (reset! *logseq-db-hooks nil)))})
 
+(def reset-db-sync-remote-state-fixture
+  {:before
+   (fn []
+     (reset! *db-sync-remote-state
+             {:latest-remote-tx @sync-apply/*repo->latest-remote-tx
+              :latest-remote-checksum @sync-apply/*repo->latest-remote-checksum
+              :latest-remote-checksum-version
+              @sync-apply/*repo->latest-remote-checksum-version})
+     (reset! sync-apply/*repo->latest-remote-tx {})
+     (reset! sync-apply/*repo->latest-remote-checksum {})
+     (reset! sync-apply/*repo->latest-remote-checksum-version {}))
+   :after
+   (fn []
+     (let [{:keys [latest-remote-tx
+                   latest-remote-checksum
+                   latest-remote-checksum-version]}
+           @*db-sync-remote-state]
+       (reset! sync-apply/*repo->latest-remote-tx latest-remote-tx)
+       (reset! sync-apply/*repo->latest-remote-checksum latest-remote-checksum)
+       (reset! sync-apply/*repo->latest-remote-checksum-version
+               latest-remote-checksum-version)
+       (reset! *db-sync-remote-state nil)))})
+
 (use-fixtures :once (test-noise/mute-console-fixture ::db-sync-test))
-(use-fixtures :each reset-logseq-db-hooks-fixture)
+(use-fixtures :each
+  reset-logseq-db-hooks-fixture
+  reset-db-sync-remote-state-fixture)
 
 (defn- js-row
   [m]
