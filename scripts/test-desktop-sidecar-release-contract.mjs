@@ -32,6 +32,11 @@ const preflightPath = path.join(
 );
 const version = "2.0.1-selfhost.5";
 const electronVersion = "42.4.1";
+const packagedRevision = "packaged-runtime-fixture-revision";
+const cliRuntimeRelativePaths = [
+  path.join("js", "logseq-cli.js"),
+  path.join("js", "db-worker-node.js"),
+];
 const verifierSource = fs.readFileSync(verifierPath, "utf8");
 
 const cases = [];
@@ -342,9 +347,10 @@ const createAsarShim = (root) => {
     [
       '"use strict";',
       'const fs = require("node:fs");',
+      'const path = require("node:path");',
       "exports.extractFile = (archive, entry) => {",
-      '  if (entry !== "package.json") throw new Error(`unexpected asar entry: ${entry}`);',
-      "  return fs.readFileSync(archive);",
+      '  if (entry === "package.json") return fs.readFileSync(archive);',
+      '  return fs.readFileSync(path.join(path.dirname(archive), "app-asar-contents", entry));',
       "};",
       "",
     ].join("\n"),
@@ -481,6 +487,18 @@ const createPackagedFixture = ({ arch, platform, root }) => {
     path.join(layout.resourcesDir, "app.asar"),
     JSON.stringify({ main: "electron.js", version }),
   );
+  for (const relativePath of cliRuntimeRelativePaths) {
+    const filePath = path.join(
+      layout.resourcesDir,
+      "app-asar-contents",
+      relativePath,
+    );
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(
+      filePath,
+      `console.log(${JSON.stringify(`${relativePath} ${packagedRevision}`)});\n`,
+    );
+  }
   writeExecutable(
     path.join(
       layout.resourcesDir,
@@ -557,6 +575,16 @@ const createStagedVerifier = (root, packagedResourcesDir) => {
     fs.copyFileSync(source, destination);
     fs.chmodSync(destination, fs.statSync(source).mode & 0o777);
   }
+  for (const relativePath of cliRuntimeRelativePaths) {
+    const source = path.join(
+      packagedResourcesDir,
+      "app-asar-contents",
+      relativePath,
+    );
+    const destination = path.join(staticRoot, relativePath);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(source, destination);
+  }
   return {
     staticRoot,
     verifierPath: path.join(staticRoot, "verify-packaged-desktop.mjs"),
@@ -607,7 +635,12 @@ const verifierInvocation = ({
       "--electron-version",
       electronVersion,
     ],
-    { env: { NODE_PATH: asarNodePath } },
+    {
+      env: {
+        LOGSEQ_REVISION: packagedRevision,
+        NODE_PATH: asarNodePath,
+      },
+    },
   );
 
 const withPackagedFixture = ({ arch, platform }, callback) => {
@@ -807,6 +840,40 @@ for (const platform of ["linux", "win32", "darwin"]) {
     );
   }
 }
+
+test("packaged verifier rejects a CLI-selected worker that differs from the staged runtime", () =>
+  withPackagedFixture({ arch: "x64", platform: "linux" }, (fixture) => {
+    fs.appendFileSync(
+      path.join(
+        fixture.layout.resourcesDir,
+        "app-asar-contents",
+        "js",
+        "db-worker-node.js",
+      ),
+      "// packaged worker tamper\n",
+    );
+    expectVerifierFailure(fixture, "packaged CLI worker tampering");
+  }));
+
+test("packaged verifier rejects matching CLI runtimes without the expected revision", () =>
+  withPackagedFixture({ arch: "x64", platform: "linux" }, (fixture) => {
+    for (const relativePath of cliRuntimeRelativePaths) {
+      const payload = `console.log(${JSON.stringify(relativePath)});\n`;
+      fs.writeFileSync(
+        path.join(
+          fixture.layout.resourcesDir,
+          "app-asar-contents",
+          relativePath,
+        ),
+        payload,
+      );
+      fs.writeFileSync(
+        path.join(fixture.staticRoot, relativePath),
+        payload,
+      );
+    }
+    expectVerifierFailure(fixture, "packaged CLI runtimes missing revision");
+  }));
 
 test("darwin verifier rejects a missing native helper", () =>
   withPackagedFixture(
