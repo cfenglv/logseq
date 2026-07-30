@@ -684,6 +684,7 @@ const discoverSignerPath = (workflow) => {
 };
 
 const createIsolatedSignerTree = ({
+  algorithm = projectUpdateAlgorithm,
   bundleId,
   destinationRoot,
   fullKeyId,
@@ -778,7 +779,7 @@ const createIsolatedSignerTree = ({
     for (const [key, child] of Object.entries(value)) {
       const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (normalizedKeys.algorithm.has(normalized)) {
-        value[key] = projectUpdateAlgorithm;
+        value[key] = algorithm;
         replacements.algorithm += 1;
       } else if (normalizedKeys.bundleId.has(normalized)) {
         value[key] = bundleId;
@@ -825,7 +826,7 @@ const createIsolatedSignerTree = ({
       .every((value) => value === 0)
   ) {
     Object.assign(policy, {
-      algorithm: projectUpdateAlgorithm,
+      algorithm,
       bundleId,
       keyId: fullKeyId,
       payloadDomain,
@@ -1125,6 +1126,7 @@ const withIsolatedProductionSigner = (test) => {
         label.replaceAll(/[^a-z0-9]+/gi, "-"),
       );
       const isolated = createIsolatedSignerTree({
+        algorithm,
         bundleId: policy.bundleIdentifier,
         destinationRoot,
         fullKeyId,
