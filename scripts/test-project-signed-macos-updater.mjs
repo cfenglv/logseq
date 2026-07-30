@@ -16,6 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { updaterSignatureGatePlan } from "./run-macos-updater-signature-policy.mjs";
+import { projectUpdateAlgorithm } from "../resources/project-updater-signature.mjs";
 import {
   macosUpdaterChannel,
   resolveSelfhostUpdaterVersions,
@@ -777,7 +778,7 @@ const createIsolatedSignerTree = ({
     for (const [key, child] of Object.entries(value)) {
       const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, "");
       if (normalizedKeys.algorithm.has(normalized)) {
-        value[key] = "Ed25519";
+        value[key] = projectUpdateAlgorithm;
         replacements.algorithm += 1;
       } else if (normalizedKeys.bundleId.has(normalized)) {
         value[key] = bundleId;
@@ -824,7 +825,7 @@ const createIsolatedSignerTree = ({
       .every((value) => value === 0)
   ) {
     Object.assign(policy, {
-      algorithm: "Ed25519",
+      algorithm: projectUpdateAlgorithm,
       bundleId,
       keyId: fullKeyId,
       payloadDomain,
@@ -934,6 +935,7 @@ const runIsolatedSignerTreeSelfTest = () => {
         'const key = createPrivateKey({ key: Buffer.from(process.env.TEST_SIGNER_KEY_BASE64, "base64"), format: "der", type: "pkcs8" });',
         'const raw = Buffer.from(createPublicKey(key).export({ format: "jwk" }).x, "base64url");',
         'const keyId = `ed25519:${createHash("sha256").update(raw).digest("hex")}`;',
+        `if (policy.algorithm !== ${JSON.stringify(projectUpdateAlgorithm)}) throw new Error("isolated policy algorithm mismatch");`,
         'if (policy.publicKeyBase64 !== raw.toString("base64") || policy.keyId !== keyId) throw new Error("isolated policy mismatch");',
         'const outputIndex = process.argv.indexOf("--signature-output");',
         'if (outputIndex < 0 || !process.argv[outputIndex + 1]) throw new Error("missing signature output");',
@@ -963,6 +965,44 @@ const runIsolatedSignerTreeSelfTest = () => {
       sourceRoot,
     });
     const signatureOutput = path.join(tempRoot, "signature.txt");
+    const isolatedPolicy = JSON.parse(
+      fs.readFileSync(isolated.policyPath, "utf8"),
+    );
+    assert.equal(isolatedPolicy.algorithm, projectUpdateAlgorithm);
+    fs.writeFileSync(
+      isolated.policyPath,
+      `${JSON.stringify(
+        { ...isolatedPolicy, algorithm: "Ed25519" },
+        null,
+        2,
+      )}\n`,
+    );
+    const rejected = command(
+      process.execPath,
+      [
+        isolated.signerPath,
+        "--signature-output",
+        signatureOutput,
+      ],
+      {
+        allowFailure: true,
+        env: {
+          ...process.env,
+          TEST_SIGNER_KEY_BASE64: privateKeyPkcs8Base64,
+        },
+      },
+    );
+    assert.notEqual(
+      rejected.status,
+      0,
+      "isolated signer accepted a generic Ed25519 algorithm label",
+    );
+    assert.match(rejected.output, /isolated policy algorithm mismatch/);
+    assert.equal(fs.existsSync(signatureOutput), false);
+    fs.writeFileSync(
+      isolated.policyPath,
+      `${JSON.stringify(isolatedPolicy, null, 2)}\n`,
+    );
     const result = command(
       process.execPath,
       [
@@ -3621,8 +3661,10 @@ addCase(cases, "runtime replacement has no direct unauthenticated bypass", () =>
   );
 });
 
-addCase(cases, "isolated signer fixture reaches verified output", () =>
-  runIsolatedSignerTreeSelfTest(),
+addCase(
+  cases,
+  "isolated signer fixture rejects a generic algorithm and reaches verified output",
+  () => runIsolatedSignerTreeSelfTest(),
 );
 
 addCase(
