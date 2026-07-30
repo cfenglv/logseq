@@ -1697,6 +1697,77 @@
             (is (= tx-id (:tx-id (first tx-entries))))
             (is (= tx-data (:tx-data (first tx-entries))))))))))
 
+(deftest prepare-upload-tx-entries-restores-legacy-rebase-delete-semantics-test
+  (testing "a persisted legacy rebase row keeps its semantic delete on upload without classifying raw rebases as deletes"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          delete-tx-id (random-uuid)
+          raw-rebase-tx-id (random-uuid)
+          target-uuids (vec (repeatedly 521 random-uuid))
+          delete-tx-data
+          (mapv (fn [block-uuid]
+                  [:db/retractEntity [:block/uuid block-uuid]])
+                target-uuids)
+          raw-rebase-tx-data
+          [[:db/add [:block/uuid (:block/uuid child1)]
+            :block/title
+            "raw legacy rebase"]]]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id delete-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:delete-blocks [target-uuids {}]]]
+             :db-sync/normalized-tx-data delete-tx-data}
+            {:db-sync/tx-id raw-rebase-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 2
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops []
+             :db-sync/normalized-tx-data raw-rebase-tx-data}])
+          (let [pending (#'sync-apply/pending-txs test-repo)
+                delete-pending (first pending)
+                raw-rebase-pending (second pending)
+                {:keys [tx-entries drop-tx-ids]}
+                (sync-apply/prepare-upload-tx-entries test-repo conn pending)
+                delete-entry (first tx-entries)
+                raw-rebase-entry (second tx-entries)
+                delete-payload
+                {:tx-id (str delete-tx-id)
+                 :tx (sqlite-util/write-transit-str (:tx-data delete-entry))
+                 :outliner-op (:outliner-op delete-entry)}
+                capped (#'sync-apply/cap-upload-request-bytes
+                        {:type "tx/batch"
+                         :client-revision "legacy-rebase-delete-test"
+                         :t-before 0}
+                        [delete-entry]
+                        [delete-payload])
+                uploaded-delete
+                (sqlite-util/read-transit-str
+                 (get-in capped [:message :txs 0 :tx]))]
+            (is (= :rebase (:outliner-op delete-pending))
+                "exercise the already-persisted legacy row shape")
+            (is (= [[:delete-blocks [target-uuids {}]]]
+                   (:forward-outliner-ops delete-pending)))
+            (is (= :rebase (:outliner-op raw-rebase-pending)))
+            (is (empty? drop-tx-ids))
+            (is (= [delete-tx-id raw-rebase-tx-id]
+                   (mapv :tx-id tx-entries)))
+            (is (= :delete-blocks (:outliner-op delete-entry))
+                "upload must recover the durable forward delete semantics")
+            (is (= :rebase (:outliner-op raw-rebase-entry))
+                "a raw rebase without semantic forward ops stays a rebase")
+            (is (= 521 (count (:tx-data delete-entry))))
+            (is (= delete-tx-data (:tx-data delete-entry)))
+            (is (= 1 (count (:tx-entries capped)))
+                "the byte cap must retain the complete logical tx entry")
+            (is (= 1 (count (get-in capped [:message :txs]))))
+            (is (= 521 (count uploaded-delete)))
+            (is (= delete-tx-data uploaded-delete))))))))
+
 (deftest sync-counts-counts-only-true-pending-local-ops-test
   (testing "pending-local should count only rows with :db-sync/pending? true"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
@@ -8076,6 +8147,211 @@
                                 [:block/uuid created-by-rebase-test-user-uuid]))))
               (is (empty? (uuid-less-rebase-entities @conn))
                   (str (uuid-less-rebase-entities @conn))))))))))
+
+(defn- large-explicit-delete-graph
+  []
+  {:pages-and-blocks
+   [{:page {:block/title "large explicit delete page"}
+     :blocks
+     (into
+      [{:block/title "large explicit delete root"
+        :build/children
+        [{:block/title "large explicit delete child"
+          :build/children
+          [{:block/title "large explicit delete grandchild"}]}]}]
+      (mapv (fn [idx]
+              {:block/title (str "large explicit delete sibling " idx)})
+            (range 518)))}]})
+
+(defn- large-delete-target-uuids
+  [db target-order]
+  (let [root-uuid (:block/uuid
+                   (db-test/find-block-by-content
+                    db
+                    "large explicit delete root"))
+        child-uuid (:block/uuid
+                    (db-test/find-block-by-content
+                     db
+                     "large explicit delete child"))
+        grandchild-uuid (:block/uuid
+                         (db-test/find-block-by-content
+                          db
+                          "large explicit delete grandchild"))
+        sibling-uuids
+        (mapv (fn [idx]
+                (:block/uuid
+                 (db-test/find-block-by-content
+                  db
+                  (str "large explicit delete sibling " idx))))
+              (range 518))]
+    (case target-order
+      :ancestor-first
+      (vec (concat [root-uuid] sibling-uuids [child-uuid grandchild-uuid]))
+
+      :descendant-first
+      (vec (concat [grandchild-uuid child-uuid] sibling-uuids [root-uuid])))))
+
+(deftest remote-rebase-large-delete-upload-keeps-delete-semantics-test
+  (doseq [target-order [:ancestor-first :descendant-first]]
+    (testing (str "521 explicit multi-level targets apply atomically after remote rebase: "
+                  (name target-order))
+      (let [conn (db-test/create-conn-with-blocks (large-explicit-delete-graph))
+            client-ops-conn (new-client-ops-db)
+            target-uuids (large-delete-target-uuids @conn target-order)
+            target-refs (mapv #(vector :block/uuid %) target-uuids)
+            expected-delete-tx
+            (mapv (fn [target-ref]
+                    [:db/retractEntity target-ref])
+                  target-refs)
+            page (db-test/find-page-by-title @conn "large explicit delete page")
+            page-uuid (:block/uuid page)
+            grandchild-uuid
+            (:block/uuid
+             (db-test/find-block-by-content
+              @conn
+              "large explicit delete grandchild"))
+            server-only-descendant-uuid (random-uuid)
+            server-conn (d/conn-from-db @conn)
+            remote-tx
+            [[:db/add [:block/uuid page-uuid]
+              :block/updated-at
+              1785388800000]]]
+        (d/transact!
+         server-conn
+         [{:block/uuid server-only-descendant-uuid
+           :block/title "server-only delete descendant"
+           :block/page [:block/uuid page-uuid]
+           :block/parent [:block/uuid grandchild-uuid]
+           :block/order "a0"
+           :block/created-at 1785388799000
+           :block/updated-at 1785388799000}])
+        (d/transact! server-conn remote-tx)
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (ldb/transact!
+             conn
+             expected-delete-tx
+             {:local-tx? true
+              :outliner-op :delete-blocks
+              :outliner-ops
+              [[:delete-blocks [target-uuids {}]]]})
+            (let [pending-before (first (#'sync-apply/pending-txs test-repo))
+                  delete-tx-id (:tx-id pending-before)]
+              (is (= 521 (count target-uuids)))
+              (is (= :delete-blocks (:outliner-op pending-before)))
+              (is (= [[:delete-blocks [target-uuids {}]]]
+                     (:forward-outliner-ops pending-before)))
+              (is (= 521 (count (:tx pending-before))))
+              (is (true? (= (frequencies expected-delete-tx)
+                            (frequencies (:tx pending-before))))
+                  "the normalized tx must contain every explicit target exactly once")
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               remote-tx)
+              (let [pending-after (first (#'sync-apply/pending-txs test-repo))
+                    {:keys [tx-entries drop-tx-ids]}
+                    (sync-apply/prepare-upload-tx-entries
+                     test-repo
+                     conn
+                     [pending-after])
+                    prepared-entry (first tx-entries)
+                    payload
+                    {:tx-id (str (:tx-id prepared-entry))
+                     :tx (sqlite-util/write-transit-str
+                          (:tx-data prepared-entry))
+                     :outliner-op (:outliner-op prepared-entry)}
+                    capped (#'sync-apply/cap-upload-request-bytes
+                            {:type "tx/batch"
+                             :client-revision "large-delete-rebase-test"
+                             :t-before 0}
+                            [prepared-entry]
+                            [payload])
+                    wire-entry (first (get-in capped [:message :txs]))
+                    uploaded-delete
+                    (sqlite-util/read-transit-str (:tx wire-entry))
+                    server-tx-metas (atom [])
+                    apply-result
+                    (try
+                      (d/listen! server-conn
+                                 ::large-rebased-delete-server-apply
+                                 (fn [{:keys [tx-meta]}]
+                                   (swap! server-tx-metas conj tx-meta)))
+                      {:value
+                       (with-redefs [cljs.core/prn (fn [& _] nil)]
+                         (#'sync-handler/apply-tx-entry!
+                          server-conn
+                          wire-entry))}
+                      (catch :default error
+                        {:error error})
+                      (finally
+                        (d/unlisten! server-conn
+                                     ::large-rebased-delete-server-apply)))
+                    client-validation (db-validate/validate-local-db! @conn)
+                    server-validation
+                    (db-validate/validate-local-db! @server-conn)]
+                (is (= delete-tx-id (:tx-id pending-after))
+                    "remote rebase must update the durable row in place")
+                (let [rebased-target-uuids
+                      (get-in pending-after
+                              [:forward-outliner-ops 0 1 0])]
+                  (is (= :delete-blocks
+                         (ffirst (:forward-outliner-ops pending-after))))
+                  (is (= 521 (count rebased-target-uuids)))
+                  (is (true? (= (frequencies target-uuids)
+                                (frequencies rebased-target-uuids)))
+                      "rebase may reorder semantic targets but must not drop or duplicate one"))
+                (is (empty? drop-tx-ids))
+                (is (= 1 (count tx-entries)))
+                (is (= :delete-blocks (:outliner-op prepared-entry))
+                    "the server must receive delete semantics, not generic rebase semantics")
+                (is (= 521 (count (:tx-data prepared-entry))))
+                (is (true? (= (frequencies expected-delete-tx)
+                              (frequencies (:tx-data prepared-entry)))))
+                (is (= 1 (count (:tx-entries capped)))
+                    "the quantity and byte caps must not truncate the tx entry")
+                (is (= 1 (count (get-in capped [:message :txs]))))
+                (is (= 521 (count uploaded-delete)))
+                (is (= (:tx-data prepared-entry) uploaded-delete)
+                    "the byte cap must preserve the prepared tx byte-for-byte")
+                (is (true?
+                     (every? nil?
+                             (map #(d/entity @conn %) target-refs))))
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))
+                (is (empty? (non-recycle-validation-entities
+                             client-validation))
+                    (str (:errors client-validation)))
+                (if-let [apply-error (:error apply-result)]
+                  (let [error-data (ex-data apply-error)
+                        cause-data (some-> apply-error ex-cause ex-data)]
+                    (is (= :ok :server-apply-failed)
+                        (pr-str
+                         {:message (.-message apply-error)
+                          :type (:type error-data)
+                          :error (:error error-data)
+                          :cause-type (:type cause-data)
+                          :cause-error (:error cause-data)})))
+                  (do
+                    (is (true? (:value apply-result)))
+                    (is (seq @server-tx-metas))
+                    (is (every? #(= :apply-client-tx (:op %))
+                                @server-tx-metas))
+                    (is (not-any? :skip-validate-db? @server-tx-metas)
+                        "server apply must use strict validation")
+                    (is (true?
+                         (every? nil?
+                                 (map #(d/entity @server-conn %)
+                                      target-refs))))
+                    (is (nil? (d/entity @server-conn
+                                        [:block/uuid
+                                         server-only-descendant-uuid]))
+                        "delete semantics must expand to a descendant omitted from the wire tx")
+                    (is (empty? (uuid-less-rebase-entities @server-conn))
+                        (str (uuid-less-rebase-entities @server-conn)))
+                    (is (empty? (non-recycle-validation-entities
+                                 server-validation))
+                        (str (:errors server-validation)))))))))))))
 
 (deftest rebase-remote-delete-does-not-revive-created-by-entity-test
   (testing "a remote delete wins over a pending local edit without reviving the block or its creator ref"
