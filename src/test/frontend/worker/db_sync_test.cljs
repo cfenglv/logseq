@@ -11762,8 +11762,8 @@
          (or platform-prev (minimal-platform :browser))))))))
 
 (defn- <run-existing-e2ee-marker-mismatch-scenario
-  []
-  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+  [pending-local-edit?]
+  (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
         block-uuid (:block/uuid child1)
         _ (ldb/transact!
            conn
@@ -11885,6 +11885,14 @@
              (client-op/update-local-server-checksum
               test-repo
               (sync-checksum/recompute-server-checksum @conn))
+             (when pending-local-edit?
+               (ldb/transact!
+                conn
+                [[:db/add
+                  [:block/uuid (:block/uuid child2)]
+                  :block/title
+                  "pending edit during marker split"]]
+                {:outliner-op :save-block}))
 
              (let [legacy-before-local
                    (sync-checksum/recompute-checksum @conn)
@@ -11899,45 +11907,80 @@
                        _ (<settle-loopback-client! client)
                        first-state @(:ws-state client)
                        first-error @(:last-sync-error client)
+                       pending-before-restart
+                        (client-op/get-pending-local-tx-count test-repo)
+                       local-t-before-restart
+                        (client-op/get-local-tx test-repo)
+                       server-t-before-restart
+                        (sync-handler/t-now server-self)
+                       local-marker-before-restart
+                        (get
+                         (d/entity @conn [:block/uuid block-uuid])
+                         sync-large-title/large-title-object-attr)
+                       server-marker-before-restart
+                        (get
+                         (d/entity @server-conn
+                                   [:block/uuid block-uuid])
+                         sync-large-title/large-title-object-attr)
+                       local-v2-before-restart
+                        (sync-checksum/recompute-server-checksum @conn)
+                       server-v2-before-restart
+                        (sync-checksum/recompute-server-checksum
+                         @server-conn)
                        _ (db-sync/stop!)
                        _ (db-sync/start! test-repo)
                        restarted-client (open-current-loopback-client!)
-                       _ (<settle-loopback-client! restarted-client)]
-                 (let [local-entity
-                       (d/entity @conn [:block/uuid block-uuid])
-                       server-entity
-                       (d/entity @server-conn
-                                 [:block/uuid block-uuid])]
-                   {:legacy-before-local legacy-before-local
-                    :legacy-before-server legacy-before-server
-                    :v2-before-local v2-before-local
-                    :v2-before-server v2-before-server
-                    :first-state first-state
-                    :first-error first-error
-                    :restart-state @(:ws-state restarted-client)
-                    :restart-error @(:last-sync-error restarted-client)
-                    :local-t (client-op/get-local-tx test-repo)
-                    :server-t (sync-handler/t-now server-self)
-                    :pending
-                    (client-op/get-pending-local-tx-count test-repo)
-                    :large-title large-title
-                    :local-title (:block/title local-entity)
-                    :local-marker
-                    (get local-entity
-                         sync-large-title/large-title-object-attr)
-                    :server-marker
-                    (get server-entity
-                         sync-large-title/large-title-object-attr)
-                    :local-legacy
-                    (sync-checksum/recompute-checksum @conn)
-                    :server-legacy
-                    (sync-checksum/recompute-checksum @server-conn)
-                    :local-v2
-                    (sync-checksum/recompute-server-checksum @conn)
-                    :server-v2
-                    (sync-checksum/recompute-server-checksum @server-conn)
-                    :asset-requests @asset-requests*
-                    :client-messages @(:client-messages* loopback)})))))))
+                       _ (<settle-loopback-client! restarted-client)
+                       result
+                       (let [local-entity
+                             (d/entity @conn [:block/uuid block-uuid])
+                             server-entity
+                             (d/entity @server-conn
+                                       [:block/uuid block-uuid])]
+                         {:legacy-before-local legacy-before-local
+                          :legacy-before-server legacy-before-server
+                          :v2-before-local v2-before-local
+                          :v2-before-server v2-before-server
+                          :first-state first-state
+                          :first-error first-error
+                          :pending-before-restart pending-before-restart
+                          :local-t-before-restart local-t-before-restart
+                          :server-t-before-restart server-t-before-restart
+                          :local-marker-before-restart
+                          local-marker-before-restart
+                          :server-marker-before-restart
+                          server-marker-before-restart
+                          :local-v2-before-restart
+                          local-v2-before-restart
+                          :server-v2-before-restart
+                          server-v2-before-restart
+                          :restart-state @(:ws-state restarted-client)
+                          :restart-error @(:last-sync-error restarted-client)
+                          :local-t (client-op/get-local-tx test-repo)
+                          :server-t (sync-handler/t-now server-self)
+                          :pending
+                          (client-op/get-pending-local-tx-count test-repo)
+                          :large-title large-title
+                          :local-title (:block/title local-entity)
+                          :local-marker
+                          (get local-entity
+                               sync-large-title/large-title-object-attr)
+                          :server-marker
+                          (get server-entity
+                               sync-large-title/large-title-object-attr)
+                          :local-legacy
+                          (sync-checksum/recompute-checksum @conn)
+                          :server-legacy
+                          (sync-checksum/recompute-checksum @server-conn)
+                          :local-v2
+                          (sync-checksum/recompute-server-checksum @conn)
+                          :server-v2
+                          (sync-checksum/recompute-server-checksum @server-conn)
+                          :asset-requests @asset-requests*
+                          :client-messages
+                          @(:client-messages* loopback)})
+                       _ (db-sync/stop!)]
+                 result))))))
      (p/finally
       (fn []
         (db-sync/stop!)
@@ -11957,7 +12000,7 @@
 (deftest existing-e2ee-marker-only-mismatch-recovers-through-client-sync-test
   (async done
          (->
-          (<run-existing-e2ee-marker-mismatch-scenario)
+          (<run-existing-e2ee-marker-mismatch-scenario false)
           (p/then
            (fn [{:keys [legacy-before-local
                         legacy-before-server
@@ -12026,6 +12069,156 @@
                     #(= "tx/batch" (get-in % [:message :type]))
                     client-messages)
                    "marker recovery must not mutate the server DB"))))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
+
+(deftest same-cursor-hello-with-pending-edit-does-not-report-ready-test
+  (let [{:keys [conn client-ops-conn child2]} (setup-parent-child)
+        cursor 2734
+        success-count* (atom 0)
+        flush-count* (atom 0)
+        client {:repo test-repo
+                :graph-id "graph-1"
+                :inflight (atom [])
+                :online-users (atom [])
+                :ws-state (atom :syncing)
+                :sync-succeeded-f
+                (fn [] (swap! success-count* inc))}
+        raw-message
+        (js/JSON.stringify
+         (clj->js
+          {:type "hello"
+           :t cursor
+           :checksum "server-legacy-before-pending-edit"
+           :checksum-version sync-checksum/server-checksum-version
+           :server-checksum "server-v2-before-pending-edit"}))]
+    (with-datascript-conns
+      conn
+      client-ops-conn
+      (fn []
+        (client-op/update-local-tx test-repo cursor)
+        (ldb/transact!
+         conn
+         [[:db/add
+           [:block/uuid (:block/uuid child2)]
+           :block/title
+           "pending edit before hello"]]
+         {:outliner-op :save-block})
+        (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
+        (with-redefs
+          [shared-service/broadcast-to-clients! (fn [& _] nil)
+           sync-apply/enqueue-flush-pending!
+           (fn [& _] (swap! flush-count* inc))
+           sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+          (sync-handle-message/handle-message!
+           test-repo client raw-message))
+        (is (zero? @success-count*)
+            "hello must not report ready while checksum comparison is deferred")
+        (is (= 1 @flush-count*)
+            "the pending edit still needs to advance through the normal upload path")
+        (is (= 1 (client-op/get-pending-local-tx-count test-repo)))))))
+
+(deftest tx-batch-ok-awaits-async-checksum-recovery-before-ready-test
+  (async done
+         (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+               tx-id (random-uuid)
+               resolve-verification* (atom nil)
+               verification
+               (p/create
+                (fn [resolve _reject]
+                  (reset! resolve-verification* resolve)))
+               success-count* (atom 0)
+               flush-count* (atom 0)
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [tx-id])
+                       :online-users (atom [])
+                       :ws-state (atom :syncing)
+                       :last-sync-error (atom nil)
+                       :sync-succeeded-f
+                       (fn [] (swap! success-count* inc))}
+               raw-message
+               (js/JSON.stringify
+                (clj->js
+                 {:type "tx/batch/ok"
+                  :t 2735
+                  :checksum "legacy-after-upload"
+                  :checksum-version sync-checksum/server-checksum-version
+                  :server-checksum "server-v2-after-upload"}))]
+           (with-datascript-conns
+             conn
+             client-ops-conn
+             (fn []
+               (client-op/update-local-tx test-repo 2734)
+               (seed-client-op-txs!
+                test-repo
+                [{:db-sync/tx-id tx-id
+                  :db-sync/created-at 1
+                  :db-sync/pending? true}])
+               (->
+                (p/with-redefs
+                  [sync-handle-message/verify-sync-checksum!
+                   (fn [& _] verification)
+                   shared-service/broadcast-to-clients! (fn [& _] nil)
+                   sync-apply/enqueue-flush-pending!
+                   (fn [& _] (swap! flush-count* inc))]
+                  (let [result
+                        (sync-handle-message/handle-message!
+                         test-repo client raw-message)]
+                    (is (p/promise? result)
+                        "receive queue must observe the async recovery")
+                    (is (zero? @success-count*))
+                    (is (zero? @flush-count*))
+                    (is (zero?
+                         (client-op/get-pending-local-tx-count
+                          test-repo)))
+                    (@resolve-verification* true)
+                    result))
+                (p/then
+                 (fn [_]
+                   (is (= 1 @success-count*))
+                   (is (= 1 @flush-count*))
+                   (is (= 2735
+                          (client-op/get-local-tx test-repo)))))
+                (p/catch
+                 (fn [error]
+                   (is false (str "unexpected async failure: " error))))
+                (p/finally done)))))))
+
+(deftest pending-local-edit-and-existing-marker-split-converge-before-restart-test
+  (async done
+         (->
+          (<run-existing-e2ee-marker-mismatch-scenario true)
+          (p/then
+           (fn [{:keys [first-state
+                        first-error
+                        pending-before-restart
+                        local-t-before-restart
+                        server-t-before-restart
+                        local-marker-before-restart
+                        server-marker-before-restart
+                        local-v2-before-restart
+                        server-v2-before-restart
+                        client-messages]}]
+             (is (= :open first-state)
+                 "the first connection must converge without repair or restart")
+             (is (nil? first-error))
+             (is (zero? pending-before-restart))
+             (is (= 2735
+                    local-t-before-restart
+                    server-t-before-restart))
+             (is (= local-marker-before-restart
+                    server-marker-before-restart))
+             (is (= local-v2-before-restart
+                    server-v2-before-restart))
+             (is (= 1
+                    (count
+                     (filter
+                      #(= "tx/batch" (get-in % [:message :type]))
+                      client-messages)))
+                 "the pending edit must upload exactly once")))
           (p/catch
            (fn [error]
              (is false (str "unexpected scenario failure: " error))))

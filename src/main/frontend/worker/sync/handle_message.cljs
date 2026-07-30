@@ -178,6 +178,11 @@
        (not (pending-local-tx? repo))
        (empty? @(:inflight client))))
 
+(defn- mark-sync-succeeded-if-ready!
+  [repo client local-t remote-t]
+  (when (synced-checksum-ready? repo client local-t remote-t)
+    (mark-sync-succeeded! client)))
+
 (defn- checksum-compare-ready?
   [repo client local-t remote-t]
   (synced-checksum-ready? repo client local-t remote-t))
@@ -473,7 +478,8 @@
         ;; A recognized advertised checksum is authoritative. A matching
         ;; historical value must not hide a stale/corrupt server checksum.
         (and versioned-checksum? (not versioned-match?))
-        (if (and (= "hello" (:type context))
+        (if (and (contains? #{"hello" "pull/ok" "tx/batch/ok"}
+                            (:type context))
                  (string? checksum)
                  legacy-match?
                  conn
@@ -615,7 +621,8 @@
     ;; stale cursor in parallel only creates an avoidable tx/reject race.
     (request-pull! client local-tx)
     (do
-      (mark-sync-succeeded! client)
+      (mark-sync-succeeded-if-ready!
+       repo client local-tx remote-tx)
       (sync-apply/enqueue-flush-pending! repo client)))
   (sync-assets/enqueue-asset-sync!
    repo client
@@ -672,12 +679,21 @@
         next-local-tx (max current-local-tx remote-tx)]
     (client-op/update-local-tx repo next-local-tx)
     (sync-util/clear-last-sync-error! client)
-    (broadcast-rtc-state! client)
     (sync-apply/mark-pending-txs-false! repo @(:inflight client))
     (reset! (:inflight client) [])
-    (verify-sync-checksum! repo client next-local-tx remote-tx checksum-fields {:type "tx/batch/ok"})
-    (mark-sync-succeeded! client)
-    (sync-apply/enqueue-flush-pending! repo client)))
+    (broadcast-rtc-state! client)
+    (let [verification
+          (verify-sync-checksum!
+           repo client next-local-tx remote-tx checksum-fields
+           {:type "tx/batch/ok"})
+          finish!
+          (fn []
+            (mark-sync-succeeded-if-ready!
+             repo client next-local-tx remote-tx)
+            (sync-apply/enqueue-flush-pending! repo client))]
+      (if (p/promise? verification)
+        (p/then verification (fn [_] (finish!)))
+        (finish!)))))
 
 (defn- update-latest-remote-state!
   [repo message]
@@ -841,7 +857,8 @@
              (clear-pending-pull! client)
              (broadcast-rtc-state! client)
              (verify-sync-checksum! repo client remote-tx remote-tx checksum-fields {:type "pull/ok"})
-             (mark-sync-succeeded! client)
+             (mark-sync-succeeded-if-ready!
+              repo client remote-tx remote-tx)
              (sync-apply/enqueue-flush-pending! repo client))
            (p/then (fn [_]
                      (sync-util/clear-last-sync-error! client)))
@@ -864,7 +881,8 @@
       :else
       (do
         (clear-pending-pull! client)
-        (mark-sync-succeeded! client)
+        (mark-sync-succeeded-if-ready!
+         repo client local-tx remote-tx)
         (sync-apply/enqueue-flush-pending! repo client)
         (p/resolved nil)))
     (catch :default error
