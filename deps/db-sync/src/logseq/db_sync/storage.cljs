@@ -110,7 +110,13 @@
       (delete-meta! sql :server-checksum-v2-t))))
 
 (def ^:private checksum-metadata-contract-version
-  "server-db-v2+legacy-v1-verified-v1")
+  "server-db-v2+legacy-v1-verified-v2")
+
+(def ^:private absent-checksum-marker "")
+
+(defn- checksum->metadata-marker
+  [checksum]
+  (or checksum absent-checksum-marker))
 
 (defn checksum-metadata-verified?
   [sql t]
@@ -122,6 +128,11 @@
          (= t
             (some-> (get-meta sql :checksum-metadata-contract-t)
                     (js/parseInt 10)))
+         (= (checksum->metadata-marker checksum)
+            (get-meta sql :checksum-metadata-contract-checksum))
+         (= (checksum->metadata-marker server-checksum)
+            (get-meta sql
+                      :checksum-metadata-contract-server-checksum-v2))
          (or (and (zero? t) (nil? checksum))
              (sync-checksum/valid-checksum? checksum))
          (or (and (nil? server-checksum)
@@ -133,7 +144,11 @@
   [sql t]
   (set-meta! sql :checksum-metadata-contract-version
              checksum-metadata-contract-version)
-  (set-meta! sql :checksum-metadata-contract-t t))
+  (set-meta! sql :checksum-metadata-contract-t t)
+  (set-meta! sql :checksum-metadata-contract-checksum
+             (checksum->metadata-marker (get-checksum sql)))
+  (set-meta! sql :checksum-metadata-contract-server-checksum-v2
+             (checksum->metadata-marker (get-server-checksum sql))))
 
 (defn get-t [sql]
   (let [value (get-meta sql :t)]

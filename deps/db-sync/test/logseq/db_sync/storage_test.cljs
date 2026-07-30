@@ -178,6 +178,33 @@
                   sql
                   (storage/get-t sql))))))))
 
+(deftest checksum-metadata-verification-watermark-binds-verified-values-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "checksum-watermark-values"
+           :block/title "Checksum watermark values"}])
+        (let [t (storage/get-t sql)
+              checksum (storage/get-checksum sql)
+              server-checksum (storage/get-server-checksum sql)]
+          (is (storage/checksum-metadata-verified? sql t))
+
+          (storage/set-checksum! sql "0000000000000000")
+          (is (not (storage/checksum-metadata-verified? sql t)))
+
+          (storage/set-checksum! sql checksum)
+          (storage/mark-checksum-metadata-verified! sql t)
+          (storage/set-server-checksum! sql nil nil)
+          (is (not (storage/checksum-metadata-verified? sql t)))
+
+          (storage/set-server-checksum! sql server-checksum t)
+          (storage/mark-checksum-metadata-verified! sql t)
+          (is (storage/checksum-metadata-verified? sql t)))))))
+
 (defn- normal-block-uuids
   [db]
   (->> (d/datoms db :avet :block/uuid)
