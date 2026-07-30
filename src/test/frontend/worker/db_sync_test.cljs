@@ -1015,6 +1015,325 @@
             (is (= 0 @send-calls)))
           (#'sync-apply/set-upload-stopped! test-repo false))))))
 
+(deftest e2ee-flush-pending-sends-tempid-large-title-with-rebases-and-large-delete-test
+  (testing "an E2EE backlog keeps tempid identity while offloading a large title and batching rebases with a semantic delete"
+    (async done
+           (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+                 large-title (str (apply str (repeat 1535 "汉")) "a")
+                 large-block-uuid (:block/uuid child1)
+                 large-tempid (str large-block-uuid)
+                 lookup-block-uuid (:block/uuid child2)
+                 lookup-title "existing lookup ref remains valid"
+                 large-tx-id (random-uuid)
+                 lookup-tx-id (random-uuid)
+                 ordinary-tx-ids (vec (repeatedly 11 random-uuid))
+                 delete-tx-id (random-uuid)
+                 delete-targets (vec (repeatedly 521 random-uuid))
+                 rebase-rows
+                 (vec
+                  (concat
+                   [{:db-sync/tx-id large-tx-id
+                     :db-sync/pending? true
+                     :db-sync/created-at 1
+                     :db-sync/outliner-op :rebase
+                     :db-sync/normalized-tx-data
+                     [[:db/add large-tempid :block/uuid large-block-uuid]
+                      [:db/add large-tempid :block/title large-title]]}
+                    {:db-sync/tx-id lookup-tx-id
+                     :db-sync/pending? true
+                     :db-sync/created-at 2
+                     :db-sync/outliner-op :rebase
+                     :db-sync/normalized-tx-data
+                     [[:db/add [:block/uuid lookup-block-uuid]
+                       :block/title
+                       lookup-title]]}]
+                   (map-indexed
+                    (fn [idx tx-id]
+                      {:db-sync/tx-id tx-id
+                       :db-sync/pending? true
+                       :db-sync/created-at (+ idx 3)
+                       :db-sync/outliner-op :rebase
+                       :db-sync/normalized-tx-data
+                       [[:db/add [:block/uuid lookup-block-uuid]
+                         :block/updated-at
+                         (+ 2000 idx)]]})
+                    ordinary-tx-ids)))
+                 delete-row
+                 {:db-sync/tx-id delete-tx-id
+                  :db-sync/pending? true
+                  :db-sync/created-at 14
+                  :db-sync/outliner-op :rebase
+                  :db-sync/forward-outliner-ops
+                  [[:delete-blocks [delete-targets {}]]]
+                  :db-sync/normalized-tx-data
+                  (mapv (fn [block-uuid]
+                          [:db/retractEntity [:block/uuid block-uuid]])
+                        delete-targets)}
+                 pending-rows (conj rebase-rows delete-row)
+                 expected-tx-ids (mapv :db-sync/tx-id pending-rows)
+                 sent (atom [])
+                 uploaded (atom [])
+                 fetch-prev js/fetch
+                 config-prev @worker-state/*db-sync-config
+                 latest-remote-prev @sync-apply/*repo->latest-remote-tx
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :last-sync-error (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [raw]
+                                              (swap! sent conj
+                                                     (js->clj (js/JSON.parse raw)
+                                                              :keywordize-keys true)))))}
+                 _ (d/transact! conn
+                                [[:db/add (:db/id child1)
+                                  :block/title
+                                  large-title]])
+                 server-conn (d/conn-from-db @conn)]
+             (is (= 4606 (sync-large-title/utf8-byte-length large-title))
+                 "the regression title must cross the 4096-byte boundary by UTF-8 bytes")
+             (reset! worker-state/*db-sync-config
+                     {:http-base "https://sync.example.test"})
+             (set! js/fetch
+                   (fn [url opts]
+                     (swap! uploaded conj
+                            {:url url
+                             :body (.-body opts)})
+                     (js/Promise.resolve #js {:ok true})))
+             (-> (p/let [aes-key (crypt/<generate-aes-key)]
+                   (with-datascript-conns
+                     conn
+                     client-ops-conn
+                     (fn []
+                       (p/with-redefs
+                         [worker-state/online? (constantly true)
+                          worker-state/get-id-token (constantly "test-id-token")
+                          sync-crypt/graph-e2ee? (constantly true)
+                          sync-crypt/<ensure-graph-aes-key
+                          (fn [repo graph-id]
+                            (is (= test-repo repo))
+                            (is (= "graph-1" graph-id))
+                            (p/resolved aes-key))]
+                         (#'sync-apply/set-upload-stopped! test-repo false)
+                         (reset! sync-apply/*repo->latest-remote-tx
+                                 {test-repo 2720})
+                         (client-op/update-local-tx test-repo 2720)
+                         (client-op/update-local-checksum
+                          test-repo
+                          (sync-checksum/recompute-checksum @conn))
+                         (client-op/update-local-server-checksum
+                          test-repo
+                          (sync-checksum/recompute-server-checksum @conn))
+                         (seed-client-op-txs! test-repo pending-rows)
+                         (is (= 14 (count (#'sync-apply/pending-txs test-repo))))
+                         (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                           (is (= 1 (count @sent))
+                               "the valid batch must reach WebSocket.send")
+                           (is (= 1 (count @uploaded))
+                               "the sole large title must be uploaded exactly once")
+                           (is (= expected-tx-ids @(:inflight client))
+                               "all sent durable tx ids stay inflight until acknowledgement")
+                           (is (= expected-tx-ids
+                                  (mapv :tx-id
+                                        (#'sync-apply/pending-txs test-repo)))
+                               "sending without an acknowledgement must retain every pending row")
+                           (is (nil? @(:last-sync-error client)))
+                           (when-let [message (first @sent)]
+                             (let [wire-entries (:txs message)
+                                   wire-by-id
+                                   (into {} (map (juxt :tx-id identity)) wire-entries)
+                                   large-wire
+                                   (get wire-by-id (str large-tx-id))
+                                   lookup-wire
+                                   (get wire-by-id (str lookup-tx-id))
+                                   delete-wire
+                                   (get wire-by-id (str delete-tx-id))
+                                   large-encrypted-tx
+                                   (some-> large-wire :tx sqlite-util/read-transit-str)
+                                   lookup-encrypted-tx
+                                   (some-> lookup-wire :tx sqlite-util/read-transit-str)]
+                               (is (= "tx/batch" (:type message)))
+                               (is (= 2720 (:t-before message)))
+                               (is (= 14 (count wire-entries)))
+                               (is (= expected-tx-ids
+                                      (mapv (comp uuid :tx-id) wire-entries)))
+                               (is (= (vec (repeat 13 "rebase"))
+                                      (mapv :outliner-op
+                                            (take 13 wire-entries))))
+                               (is (= "delete-blocks"
+                                      (:outliner-op delete-wire)))
+                               (is (= 521
+                                      (count
+                                       (some-> delete-wire
+                                               :tx
+                                               sqlite-util/read-transit-str))))
+                               (p/let [large-decrypted-tx
+                                       (sync-crypt/<decrypt-tx-data
+                                        aes-key large-encrypted-tx)
+                                       lookup-decrypted-tx
+                                       (sync-crypt/<decrypt-tx-data
+                                        aes-key lookup-encrypted-tx)
+                                       uploaded-body (:body (first @uploaded))
+                                       uploaded-digest
+                                       (sync-large-title/<sha256-hex uploaded-body)
+                                       uploaded-title
+                                       (sync-crypt/<decrypt-text-value
+                                        aes-key
+                                        (.decode (js/TextDecoder.) uploaded-body))]
+                                 (let [uuid-item
+                                       (some #(when (= :block/uuid (nth % 2 nil)) %)
+                                             large-decrypted-tx)
+                                       title-item
+                                       (some #(when (= :block/title (nth % 2 nil)) %)
+                                             large-decrypted-tx)
+                                       marker-item
+                                       (some
+                                        #(when (= sync-large-title/large-title-object-attr
+                                                   (nth % 2 nil))
+                                           %)
+                                        large-decrypted-tx)
+                                       marker-object (nth marker-item 3 nil)]
+                                   (is (= large-tempid (nth uuid-item 1 nil)))
+                                   (is (= large-tempid (nth title-item 1 nil)))
+                                   (is (= large-tempid (nth marker-item 1 nil))
+                                       "wire data must retain the original same-tx tempid relation")
+                                   (is (= large-block-uuid (nth uuid-item 3 nil)))
+                                   (is (= "" (nth title-item 3 nil)))
+                                   (is (sync-large-title/large-title-object-v2?
+                                        marker-object))
+                                   (is (= sync-large-title/large-title-encrypted-payload-format
+                                          (:payload-format marker-object)))
+                                   (is (= uploaded-digest
+                                          (:payload-digest marker-object)))
+                                   (is (= large-title uploaded-title))
+                                   (is (= [[:db/add
+                                            [:block/uuid lookup-block-uuid]
+                                            :block/title
+                                            lookup-title]]
+                                          lookup-decrypted-tx)
+                                       "lookup-ref uploads must retain their existing identity form")
+                                   (is (true?
+                                        (#'sync-handler/apply-tx-entry!
+                                         server-conn
+                                         (update large-wire
+                                                 :outliner-op
+                                                 keyword)))
+                                       "the server path must accept UUID upsert plus marker under one tempid")
+                                   (let [local-marker-datoms
+                                         (filter
+                                          #(= sync-large-title/large-title-object-attr
+                                              (:a %))
+                                          (d/datoms @conn :eavt))
+                                         local-marker-entity
+                                         (when-let [marker-eid
+                                                    (some-> local-marker-datoms
+                                                            first
+                                                            :e)]
+                                           (d/entity @conn marker-eid))
+                                         server-marker-entity
+                                         (d/entity @server-conn
+                                                   [:block/uuid large-block-uuid])]
+                                     (is (= 1 (count local-marker-datoms)))
+                                     (is (= large-block-uuid
+                                            (:block/uuid local-marker-entity))
+                                         "local marker persistence must target the existing UUID entity")
+                                     (is (not-any?
+                                          (fn [datom]
+                                            (nil?
+                                             (:block/uuid
+                                              (d/entity @conn (:e datom)))))
+                                          local-marker-datoms)
+                                         "marker persistence must not create a marker-only orphan entity")
+                                     (is (= marker-object
+                                            (get server-marker-entity
+                                                 sync-large-title/large-title-object-attr)))
+                                     (is (= (sync-checksum/recompute-checksum @conn)
+                                            (client-op/get-local-checksum test-repo)))
+                                     (is (=
+                                          (sync-checksum/recompute-server-checksum
+                                           @conn)
+                                          (client-op/get-local-server-checksum
+                                           test-repo)))))))))))))
+                 (p/catch (fn [error]
+                            (is false (str "unexpected flush failure: " error))))
+                 (p/finally
+                  (fn []
+                    (sync-apply/clear-upload-response-timeout! client)
+                    (reset! (:inflight client) [])
+                    (#'sync-apply/set-upload-stopped! test-repo false)
+                    (reset! sync-apply/*repo->latest-remote-tx
+                            latest-remote-prev)
+                    (reset! worker-state/*db-sync-config config-prev)
+                    (set! js/fetch fetch-prev)
+                    (done))))))))
+
+(deftest flush-pending-records-generic-async-preparation-failure-test
+  (testing "a generic asynchronous preparation failure is visible in sync state and leaves durable work retryable"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 tx-id (random-uuid)
+                 failure (js/Error. "synthetic async upload preparation failure")
+                 sent (atom 0)
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :last-sync-error (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [_raw]
+                                              (swap! sent inc))))}]
+             (-> (with-datascript-conns
+                   conn
+                   client-ops-conn
+                   (fn []
+                     (p/with-redefs
+                       [worker-state/online? (constantly true)
+                        sync-crypt/graph-e2ee? (constantly false)
+                        sync-apply/offload-large-titles
+                        (fn [& _]
+                          (p/rejected failure))]
+                       (#'sync-apply/set-upload-stopped! test-repo false)
+                       (reset! sync-apply/*repo->latest-remote-tx
+                               {test-repo 0})
+                       (client-op/update-local-tx test-repo 0)
+                       (seed-client-op-txs!
+                        test-repo
+                        [{:db-sync/tx-id tx-id
+                          :db-sync/pending? true
+                          :db-sync/created-at 1
+                          :db-sync/outliner-op :rebase
+                          :db-sync/normalized-tx-data
+                          [[:db/add [:block/uuid (:block/uuid child1)]
+                            :block/title
+                            "retry after failure"]]}])
+                       (-> (#'sync-apply/flush-pending! test-repo client)
+                           (p/then (fn [_]
+                                     {:state :resolved}))
+                           (p/catch (fn [error]
+                                      {:state :rejected
+                                       :error error}))
+                           (p/then
+                            (fn [{:keys [state error]}]
+                              (is (= :resolved state)
+                                  "one failed flush must not poison the serialized send queue")
+                              (is (nil? error))
+                              (is (= 0 @sent))
+                              (is (empty? @(:inflight client)))
+                              (is (= [tx-id]
+                                     (mapv
+                                      :tx-id
+                                      (#'sync-apply/pending-txs test-repo))))
+                              (is (= :exception
+                                     (:code @(:last-sync-error client)))
+                                  "the caught failure must remain observable")))))))
+                 (p/finally
+                  (fn []
+                    (#'sync-apply/set-upload-stopped! test-repo false)
+                    (done))))))))
+
 (deftest flush-pending-splits-large-upload-request-test
   (async done
          (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
