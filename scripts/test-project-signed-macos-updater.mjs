@@ -2622,6 +2622,21 @@ const runNativeHelperContract = async ({
         x: productionPublicKeyRaw.toString("base64url"),
       },
     });
+    const productionHelperPath = path.join(
+      tempRoot,
+      "project-update-helper-production-key",
+    );
+    const [productionBuildExecutable, productionBuildArgs] = scriptCommand(
+      helperBuildPath,
+      [
+        "--arch",
+        helperArch,
+        "--output",
+        productionHelperPath,
+      ],
+    );
+    command(productionBuildExecutable, productionBuildArgs);
+    assert.equal(fs.existsSync(productionHelperPath), true);
     const isolatedSigner = createIsolatedSignerTree({
       bundleId,
       destinationRoot: path.join(tempRoot, "isolated-release-signer"),
@@ -2766,7 +2781,11 @@ const runNativeHelperContract = async ({
           `${label} signature also validates after stripping its nightly suffix`,
         );
       }
-      return { ...fixture, signature };
+      return {
+        ...fixture,
+        nativeHelperPath: productionHelperPath,
+        signature,
+      };
     };
     expectSignerRejectsVersion = (candidateVersion) => {
       const fixture = makeFixture({
@@ -2849,7 +2868,11 @@ const runNativeHelperContract = async ({
         { allowFailure: true },
       );
     const invokeViaJsRuntime = (fixture, targetApp) =>
-      invokeViaJsRuntimeWithHelper(fixture, targetApp, helperPath);
+      invokeViaJsRuntimeWithHelper(
+        fixture,
+        targetApp,
+        fixture.nativeHelperPath ?? helperPath,
+      );
     const expectVersionTransition = ({
       accepted,
       candidateVersion,
