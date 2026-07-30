@@ -3312,6 +3312,156 @@
               (is (= 1 (aget untouched-ent "pending")))
               (is (not= 1 (aget untouched-ent "failed"))))))))))
 
+(deftest tx-reject-with-authoritative-remote-ahead-pulls-before-retry-test
+  (testing "a genuine remote cursor lead must pull before retrying later pending ops"
+    (async done
+           (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+                 failed-tx-id (random-uuid)
+                 untouched-tx-id (random-uuid)
+                 *sent (atom [])
+                 flush-calls (atom [])
+                 ws (doto (js-obj)
+                      (aset "readyState" 1)
+                      (aset "send"
+                            (fn [raw]
+                              (swap! *sent conj
+                                     (js->clj
+                                      (js/JSON.parse raw)
+                                      :keywordize-keys true)))))
+                 raw-message (js/JSON.stringify
+                              (clj->js {:type "tx/reject"
+                                        :reason "db transact failed"
+                                        :t 4
+                                        :success-tx-ids []
+                                        :failed-tx-id (str failed-tx-id)}))
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :ws ws
+                         :send-queue (atom (p/resolved nil))
+                         :pending-pull-since (atom nil)
+                         :inflight (atom [failed-tx-id untouched-tx-id])
+                         :online-users (atom [])
+                         :ws-state (atom :open)}]
+             (with-datascript-conns
+               conn client-ops-conn
+               (fn []
+                 (seed-client-op-txs!
+                  test-repo
+                  [{:db-sync/tx-id failed-tx-id
+                    :db-sync/created-at 1
+                    :db-sync/pending? true}
+                   {:db-sync/tx-id untouched-tx-id
+                    :db-sync/created-at 2
+                    :db-sync/pending? true}])
+                 (client-op/update-local-tx test-repo 4)
+                 (reset! sync-apply/*repo->latest-remote-tx {test-repo 5})
+                 (reset! sync-apply/*repo->latest-remote-checksum
+                         {test-repo "authoritative-remote-checksum"})
+                 (reset! sync-apply/*repo->latest-remote-checksum-version
+                         {test-repo sync-checksum/server-checksum-version})
+                 (let [error
+                       (with-redefs [sync-apply/enqueue-flush-pending!
+                                     (fn [repo client']
+                                       (swap! flush-calls conj [repo client']))]
+                         (try
+                           (with-silenced-console-error
+                             #(sync-handle-message/handle-message!
+                               test-repo client raw-message))
+                           nil
+                           (catch :default e
+                             e)))]
+                   (->
+                    @(:send-queue client)
+                    (p/then
+                     (fn [_]
+                       (let [failed-ent
+                             (client-op-tx-row client-ops-conn failed-tx-id)
+                             untouched-ent
+                             (client-op-tx-row client-ops-conn untouched-tx-id)]
+                         (is (= :db-sync/tx-rejected
+                                (:type (ex-data error))))
+                         (is (= [{:type "pull" :since 4}] @*sent))
+                         (is (empty? @flush-calls))
+                         (is (= 5
+                                (get @sync-apply/*repo->latest-remote-tx
+                                     test-repo)))
+                         (is (= "authoritative-remote-checksum"
+                                (get @sync-apply/*repo->latest-remote-checksum
+                                     test-repo)))
+                         (is (= sync-checksum/server-checksum-version
+                                (get
+                                 @sync-apply/*repo->latest-remote-checksum-version
+                                 test-repo)))
+                         (is (= 1 (aget failed-ent "failed")))
+                         (is (= 1 (aget untouched-ent "pending")))
+                         (is (not= 1 (aget untouched-ent "failed"))))))
+                    (p/catch
+                     (fn [error]
+                       (is false (str error))))
+                    (p/finally done)))))))))
+
+(deftest tx-reject-retry-starts-with-isolated-remote-state-test
+  (testing "a following test must not inherit remote cursor or checksum state"
+    (is (nil? (get @sync-apply/*repo->latest-remote-tx test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum-version
+                   test-repo)))
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          failed-tx-id (random-uuid)
+          untouched-tx-id (random-uuid)
+          raw-message (js/JSON.stringify
+                       (clj->js {:type "tx/reject"
+                                 :reason "db transact failed"
+                                 :t 4
+                                 :success-tx-ids []
+                                 :failed-tx-id (str failed-tx-id)}))
+          flush-calls (atom [])
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [failed-tx-id untouched-tx-id])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id failed-tx-id
+             :db-sync/created-at 1
+             :db-sync/pending? true}
+            {:db-sync/tx-id untouched-tx-id
+             :db-sync/created-at 2
+             :db-sync/pending? true}])
+          (client-op/update-local-tx test-repo 4)
+          (let [error
+                (with-redefs [sync-apply/enqueue-flush-pending!
+                              (fn [repo client']
+                                (swap! flush-calls conj [repo client']))]
+                  (try
+                    (with-silenced-console-error
+                      #(sync-handle-message/handle-message!
+                        test-repo client raw-message))
+                    nil
+                    (catch :default e
+                      e)))
+                failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
+                untouched-ent
+                (client-op-tx-row client-ops-conn untouched-tx-id)]
+            (is (= :db-sync/tx-rejected (:type (ex-data error))))
+            (is (= [[test-repo client]] @flush-calls))
+            (is (= 4
+                   (get @sync-apply/*repo->latest-remote-tx test-repo)))
+            (is (= 1 (aget failed-ent "failed")))
+            (is (= 1 (aget untouched-ent "pending")))
+            (is (not= 1 (aget untouched-ent "failed")))))))))
+
+(deftest tx-reject-retry-does-not-leak-remote-state-test
+  (testing "a completed retry test must not leak remote state to the next test"
+    (is (nil? (get @sync-apply/*repo->latest-remote-tx test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum-version
+                   test-repo)))))
+
 (deftest tx-reject-missing-blocks-marks-failed-tx-failed-test
   (testing "tx/reject with missing block ids should fail the rejected tx"
     (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
