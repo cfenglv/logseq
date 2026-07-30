@@ -34,6 +34,9 @@ const functionBlock = (source, start, end, label) => {
   return block;
 };
 
+const escapeRegExp = (value) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const sourceDeclarations = (source) =>
   new Map(
     [...source.matchAll(
@@ -63,12 +66,26 @@ const expandDeclaration = (name, declarations, seen = new Set()) => {
   return expanded;
 };
 
-const assertIsolatedShipItCacheContract = ({
-  block,
-  cleanupBlock,
-  label,
-}) => {
+const assertActualUserCacheContract = ({ block, label }) => {
   const declarations = sourceDeclarations(block);
+  const dedicatedDirectory = [...declarations].find(([, value]) =>
+    /fs\.mkdtempSync\s*\(/.test(value),
+  );
+  assert.ok(
+    dedicatedDirectory,
+    `${label} does not allocate a unique cache directory`,
+  );
+  const [dedicatedName] = dedicatedDirectory;
+  const dedicatedClosure = compactSource(
+    expandDeclaration(dedicatedName, declarations),
+  );
+  for (const segment of ["os.homedir()", "Library", "Caches"]) {
+    assert.ok(
+      dedicatedClosure.includes(segment),
+      `${label} dedicated directory is not under the actual user ${segment}`,
+    );
+  }
+
   const state = [...declarations].find(([, value]) =>
     /ShipItState\.plist/.test(value),
   );
@@ -80,107 +97,100 @@ const assertIsolatedShipItCacheContract = ({
   const stateClosure = compactSource(
     expandDeclaration(stateName, declarations),
   );
-  for (const segment of ["Library", "Caches", "ShipItState.plist"]) {
-    assert.ok(
-      stateClosure.includes(segment),
-      `${label} state path omits ${segment}`,
-    );
-  }
-
-  const fixedHomeMatch = block.match(
-    /\bCFFIXED_USER_HOME\s*:\s*([A-Za-z_$][\w$]*)/,
-  );
-  const homeMatch = block.match(
-    /(?:^|[,{]\s*)HOME\s*:\s*([A-Za-z_$][\w$]*)/m,
-  );
   assert.ok(
-    fixedHomeMatch && homeMatch,
-    `${label} does not override both CFFIXED_USER_HOME and HOME`,
-  );
-  assert.equal(
-    fixedHomeMatch[1],
-    homeMatch[1],
-    `${label} gives ShipIt different fixed and process homes`,
-  );
-  const homeName = fixedHomeMatch[1];
-  const homeClosure = compactSource(
-    expandDeclaration(homeName, declarations),
-  );
-  assert.match(
-    homeClosure,
-    /\b(?:tempRoot|installRoot)\b/,
-    `${label} fixed home is not isolated under its temporary fixture`,
-  );
-  assert.ok(
-    stateClosure.includes(homeClosure),
-    `${label} writes state outside the HOME/CFFIXED_USER_HOME cache tree`,
+    stateClosure.includes(dedicatedClosure) &&
+      stateClosure.includes("ShipItState.plist"),
+    `${label} state is not inside its unique cache directory`,
   );
 
-  const spawnArgs = block.match(
-    new RegExp(
-      `\\[\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*${escapeRegExp(stateName)}\\s*\\]`,
-    ),
-  );
-  assert.ok(
-    spawnArgs,
-    `${label} does not pass one job label with its state path`,
-  );
-  const jobName = spawnArgs[1];
-  const jobClosure = compactSource(
-    expandDeclaration(jobName, declarations),
-  );
+  const finallyIndex = block.lastIndexOf("finally");
   assert.notEqual(
-    jobClosure,
-    jobName,
-    `${label} job label is not an explicit fixture value`,
+    finallyIndex,
+    -1,
+    `${label} has no unconditional dedicated-directory cleanup`,
   );
-  assert.match(jobClosure, /ShipIt/, `${label} job label is not a ShipIt job`);
-  assert.ok(
-    stateClosure.includes(jobClosure),
-    `${label} state directory and spawned job label do not match`,
+  const cleanup = block.slice(finallyIndex);
+  assert.match(
+    cleanup,
+    new RegExp(
+      `fs\\.rmSync\\(\\s*${escapeRegExp(dedicatedName)}\\s*,\\s*\\{[\\s\\S]*?\\}\\s*\\)`,
+    ),
+    `${label} does not clean the exact dedicated directory`,
   );
+  assert.match(cleanup, /recursive\s*:\s*true/);
+  assert.match(cleanup, /force\s*:\s*true/);
 
-  const cacheDirectory = [...declarations].find(([name]) => {
-    if (name === stateName) return false;
+  for (const [name] of declarations) {
     const closure = compactSource(expandDeclaration(name, declarations));
-    return (
+    if (
+      name !== dedicatedName &&
+      closure.includes("os.homedir()") &&
       closure.includes("Library") &&
       closure.includes("Caches") &&
-      closure.includes(homeClosure) &&
-      closure.includes(jobClosure)
-    );
-  });
-  const mkdirTarget = cacheDirectory
-    ? escapeRegExp(cacheDirectory[0])
-    : `path\\.dirname\\(\\s*${escapeRegExp(stateName)}\\s*\\)`;
-  const mkdir = block.match(
-    new RegExp(
-      `fs\\.mkdirSync\\(\\s*${mkdirTarget}\\s*,\\s*\\{[\\s\\S]*?recursive\\s*:\\s*true[\\s\\S]*?\\}\\s*\\)`,
-    ),
-  );
-  assert.ok(
-    mkdir,
-    `${label} does not create its dedicated job cache directory`,
-  );
-  assert.ok(
-    block.indexOf(mkdir[0]) < block.indexOf("fs.writeFileSync"),
-    `${label} writes state before creating its job cache directory`,
-  );
-
-  assert.match(
-    cleanupBlock,
-    /finally\s*\{/,
-    `${label} fixture has no unconditional cleanup`,
-  );
-  assert.match(
-    cleanupBlock,
-    /fs\.rmSync\(\s*tempRoot\s*,\s*\{[\s\S]*?recursive\s*:\s*true[\s\S]*?force\s*:\s*true[\s\S]*?\}\s*\)/,
-    `${label} does not recursively clean its isolated fixture home`,
+      !closure.includes("mkdtempSync")
+    ) {
+      assert.doesNotMatch(
+        block,
+        new RegExp(`fs\\.rmSync\\(\\s*${escapeRegExp(name)}\\b`),
+        `${label} deletes the user Caches root`,
+      );
+    }
+  }
+  assert.doesNotMatch(
+    block,
+    /fs\.rmSync\(\s*path\.join\([\s\S]{0,300}?os\.homedir\(\)[\s\S]{0,300}?["']Library["'][\s\S]{0,300}?["']Caches["']/,
+    `${label} directly deletes the user Caches root`,
   );
 };
 
-const escapeRegExp = (value) =>
-  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const userCacheContractControl = `
+  const cacheRoot = path.join(os.homedir(), "Library", "Caches");
+  const dedicatedDirectory = fs.mkdtempSync(
+    path.join(cacheRoot, "logseq-shipit-test-"),
+  );
+  try {
+    const statePath = path.join(
+      dedicatedDirectory,
+      "ShipItState.plist",
+    );
+    fs.writeFileSync(statePath, "{}");
+  } finally {
+    fs.rmSync(dedicatedDirectory, { recursive: true, force: true });
+  }
+`;
+
+const verifyUserCacheContractOracle = () => {
+  assert.doesNotThrow(() =>
+    assertActualUserCacheContract({
+      block: userCacheContractControl,
+      label: "actual-user-cache control",
+    }),
+  );
+  for (const [label, unsafe] of [
+    ["/var cache", userCacheContractControl.replace("os.homedir()", '"/var"')],
+    [
+      "repo-local cache",
+      userCacheContractControl.replace("os.homedir()", "repoRoot"),
+    ],
+    [
+      "missing cleanup",
+      userCacheContractControl.replace("finally {", "if (false) {"),
+    ],
+    [
+      "Caches-root deletion",
+      userCacheContractControl.replace(
+        "fs.rmSync(dedicatedDirectory",
+        "fs.rmSync(cacheRoot",
+      ),
+    ],
+  ]) {
+    assert.throws(
+      () => assertActualUserCacheContract({ block: unsafe, label }),
+      undefined,
+      `user-cache oracle accepted ${label}`,
+    );
+  }
+};
 
 const identityDeclarations = (source) =>
   [...source.matchAll(
@@ -516,22 +526,16 @@ test("physical ShipIt fixture supplies identity and treats signals as failures",
   );
 });
 
-test("physical ShipIt fixture writes state in its isolated Squirrel cache", () => {
+test("physical ShipIt fixture writes state in a unique actual-user cache", () => {
+  verifyUserCacheContractOracle();
   const runShipIt = functionBlock(
     physicalHarness,
     "runShipIt",
     "physicalAdHocWeakness",
     "physical ShipIt",
   );
-  const physicalAdHocWeakness = functionBlock(
-    physicalHarness,
-    "physicalAdHocWeakness",
-    "explicitCertificateHashConsumerProbe",
-    "physical ShipIt cleanup",
-  );
-  assertIsolatedShipItCacheContract({
+  assertActualUserCacheContract({
     block: runShipIt,
-    cleanupBlock: physicalAdHocWeakness,
     label: "physical ShipIt",
   });
   assert.equal(
@@ -575,22 +579,15 @@ test("production physical verifier supplies identity and preserves spawn signals
   );
 });
 
-test("production verifier writes state in its isolated Squirrel cache", () => {
+test("production verifier writes state in a unique actual-user cache", () => {
   const runShipItInstall = functionBlock(
     productionVerifier,
     "runShipItInstall",
     "loadBaseline",
     "production ShipIt",
   );
-  const runGate = functionBlock(
-    productionVerifier,
-    "runGate",
-    "isEntrypoint",
-    "production ShipIt cleanup",
-  );
-  assertIsolatedShipItCacheContract({
+  assertActualUserCacheContract({
     block: runShipItInstall,
-    cleanupBlock: runGate,
     label: "production ShipIt",
   });
 });
