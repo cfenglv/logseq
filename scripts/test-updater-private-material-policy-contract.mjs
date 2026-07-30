@@ -18,6 +18,9 @@ const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+const auditContractPath =
+  "scripts/test-updater-private-material-policy-contract.mjs";
+const auditContractRole = "proxy-tls-fixture-security-audit-v1";
 const scannerPath = "scripts/test-project-signed-macos-updater.mjs";
 const proxyTestPath = "scripts/test-cli-worker-fetch-proxy.mjs";
 const proxyProbePath =
@@ -98,6 +101,7 @@ const initializeProbeRepository = (mutate = () => {}) => {
     proxyCertPath,
     proxyKeyPath,
     policyPath,
+    auditContractPath,
   ]) {
     copyFromRepository(relativePath, root);
   }
@@ -191,7 +195,7 @@ const cases = [];
 const addCase = (name, test) => cases.push([name, test]);
 
 addCase(
-  "localhost proxy TLS key is tracked, referenced, certificate-matched, and not the updater key",
+  "localhost proxy TLS key has one runtime consumer and one exact audit consumer",
   () => {
     for (const relativePath of [proxyKeyPath, proxyCertPath]) {
       const tracked = command(
@@ -219,6 +223,35 @@ addCase(
         `${proxyTestPath} does not reference ${fixtureName}`,
       );
     }
+    assert.match(proxyTest, /https\.createServer\s*\(/);
+
+    const auditContract = fs.readFileSync(
+      path.join(repoRoot, auditContractPath),
+      "utf8",
+    );
+    assert.ok(
+      auditContract.includes(auditContractRole),
+      `${auditContractPath} does not declare the pinned audit role`,
+    );
+    assert.doesNotMatch(
+      auditContract,
+      /\b(?:http|https)\.createServer\s*\(|\bserver\.listen\s*\(/,
+      `${auditContractPath} became a runtime proxy consumer`,
+    );
+    const trackedConsumers = command(
+      "git",
+      ["grep", "-l", path.basename(proxyKeyPath), "--", "scripts"],
+      { allowFailure: true },
+    ).output
+      .split("\n")
+      .filter(Boolean)
+      .filter((relativePath) => relativePath !== scannerPath)
+      .sort();
+    assert.deepEqual(
+      trackedConsumers,
+      [proxyTestPath, auditContractPath].sort(),
+      "proxy TLS private key must have exactly one runtime and one audit consumer",
+    );
 
     const privateKey = createPrivateKey(
       fs.readFileSync(path.join(repoRoot, proxyKeyPath)),
@@ -286,6 +319,58 @@ addCase("production scanner allows only the legitimate proxy TLS fixture", async
 });
 
 for (const [name, mutate] of [
+  [
+    "copied audit contract is rejected",
+    (root) =>
+      fs.copyFileSync(
+        path.join(root, auditContractPath),
+        path.join(
+          root,
+          "scripts",
+          "test-updater-private-material-policy-contract-copy.mjs",
+        ),
+      ),
+  ],
+  [
+    "renamed audit contract is rejected",
+    (root) =>
+      fs.renameSync(
+        path.join(root, auditContractPath),
+        path.join(
+          root,
+          "scripts",
+          "renamed-updater-private-material-audit.mjs",
+        ),
+      ),
+  ],
+  [
+    "audit contract changed into a runtime proxy consumer is rejected",
+    (root) =>
+      fs.copyFileSync(
+        path.join(root, proxyTestPath),
+        path.join(root, auditContractPath),
+      ),
+  ],
+  [
+    "third runtime consumer is rejected",
+    (root) => {
+      const thirdConsumer = path.join(
+        root,
+        "scripts",
+        "third-proxy-key-consumer.mjs",
+      );
+      fs.writeFileSync(
+        thirdConsumer,
+        [
+          'import fs from "node:fs";',
+          `fs.readFileSync(new URL("./fixtures/${path.basename(
+            proxyKeyPath,
+          )}", import.meta.url));`,
+          "",
+        ].join("\n"),
+      );
+    },
+  ],
   [
     "copied proxy private key is rejected",
     (root) =>
