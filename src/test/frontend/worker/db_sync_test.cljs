@@ -359,6 +359,26 @@
                                "where kind = 'tx' and pending = 1"))
           (aget "c")))
 
+(defn- seed-sqlite-pending-local-txs!
+  [db tx-ids]
+  (let [encoded-empty-ops (sqlite-util/write-transit-str [])
+        ^js stmt
+        (.prepare
+         ^js db
+         (str "insert into client_ops ("
+              "kind, created_at, tx_id, pending, failed, outliner_op, "
+              "forward_outliner_ops, inverse_outliner_ops, inferred_outliner_ops, "
+              "normalized_tx_data, reversed_tx_data"
+              ") values ('tx', ?, ?, 1, 0, 'rebase', ?, ?, 0, ?, ?)"))]
+    (doseq [[index tx-id] (map-indexed vector tx-ids)]
+      (.run stmt
+            (inc index)
+            (str tx-id)
+            encoded-empty-ops
+            encoded-empty-ops
+            encoded-empty-ops
+            encoded-empty-ops))))
+
 (defn- public-pending-local-tx-count
   [repo]
   (:pending-local
@@ -1961,6 +1981,98 @@
           (is (= (inc stored-count)
                  (public-pending-local-tx-count test-repo))
               "public sync status must report N+1, never just the +1 delta"))))))
+
+(deftest client-ops-registration-after-early-status-retains-disk-count-test
+  (testing "an early status read before client-ops registration must not poison the later disk-backed count"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          stored-count 13
+          stored-tx-ids (vec (repeatedly stored-count random-uuid))
+          previous-datascript-conns @worker-state/*datascript-conns
+          previous-client-ops-conns @worker-state/*client-ops-conns
+          previous-count-cache @client-op/*repo->pending-local-tx-count]
+      (seed-sqlite-pending-local-txs! client-ops-conn stored-tx-ids)
+      (try
+        (reset! worker-state/*datascript-conns {test-repo conn})
+        (reset! worker-state/*client-ops-conns {})
+        (reset! client-op/*repo->pending-local-tx-count {})
+        (undo-redo/clear-history! test-repo)
+
+        (is (= 0 (public-pending-local-tx-count test-repo))
+            "status remains usable while the client-ops store is not mounted")
+        (is (not (contains? @client-op/*repo->pending-local-tx-count test-repo))
+            "store absence is unknown, not a durable zero that may be cached")
+
+        (reset! worker-state/*client-ops-conns {test-repo client-ops-conn})
+        (client-op/update-local-tx test-repo 0)
+        (d/listen! conn ::pending-count-store-registration
+                   (fn [tx-report]
+                     (db-sync/enqueue-local-tx! test-repo tx-report)))
+        (ldb/transact! conn
+                       [[:db/add (:db/id child1) :block/title "post-mount local edit"]]
+                       {:outliner-op :save-block})
+
+        (is (= (inc stored-count)
+               (sqlite-pending-local-tx-count client-ops-conn)))
+        (is (= (inc stored-count)
+               (count (#'sync-apply/pending-txs test-repo))))
+        (is (= (inc stored-count)
+               (public-pending-local-tx-count test-repo))
+            "the first real delta after mount must be based on all 13 disk rows")
+        (finally
+          (d/unlisten! conn ::pending-count-store-registration)
+          (undo-redo/clear-history! test-repo)
+          (reset! worker-state/*datascript-conns previous-datascript-conns)
+          (reset! worker-state/*client-ops-conns previous-client-ops-conns)
+          (reset! client-op/*repo->pending-local-tx-count previous-count-cache)
+          (.close client-ops-conn))))))
+
+(deftest opened-empty-client-ops-count-is-cacheable-and-repo-scoped-test
+  (testing "a mounted empty store may cache zero without masking another repo's disk rows"
+    (let [empty-repo "pending-count-open-empty"
+          populated-repo "pending-count-open-populated"
+          empty-db (new-client-ops-db)
+          populated-db (new-client-ops-db)
+          populated-count 13
+          previous-client-ops-conns @worker-state/*client-ops-conns
+          previous-count-cache @client-op/*repo->pending-local-tx-count]
+      (seed-sqlite-pending-local-txs!
+       populated-db
+       (repeatedly populated-count random-uuid))
+      (try
+        (reset! worker-state/*client-ops-conns
+                {empty-repo empty-db
+                 populated-repo populated-db})
+        (reset! client-op/*repo->pending-local-tx-count {})
+
+        (is (= 0 (client-op/get-pending-local-tx-count empty-repo)))
+        (is (= 0 (get @client-op/*repo->pending-local-tx-count empty-repo))
+            "zero is valid and cacheable once SQLite is actually mounted")
+        (is (= populated-count
+               (client-op/get-pending-local-tx-count populated-repo)))
+
+        (let [{:keys [should-inc-pending?]}
+              (client-op/upsert-local-tx-entry!
+               populated-repo
+               {:tx-id (random-uuid)
+                :created-at 30
+                :pending? true
+                :failed? false
+                :normalized-tx-data []
+                :reversed-tx-data []})]
+          (when should-inc-pending?
+            (client-op/adjust-pending-local-tx-count! populated-repo 1)))
+
+        (is (= 0 (client-op/get-pending-local-tx-count empty-repo)))
+        (is (= (inc populated-count)
+               (client-op/get-pending-local-tx-count populated-repo)))
+        (is (= 0 (sqlite-pending-local-tx-count empty-db)))
+        (is (= (inc populated-count)
+               (sqlite-pending-local-tx-count populated-db)))
+        (finally
+          (.close empty-db)
+          (.close populated-db)
+          (reset! worker-state/*client-ops-conns previous-client-ops-conns)
+          (reset! client-op/*repo->pending-local-tx-count previous-count-cache))))))
 
 (deftest cache-miss-batch-removal-and-flush-stay-aligned-test
   (testing "negative deltas on a cache miss remain aligned with SQLite and never underflow"
