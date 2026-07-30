@@ -359,6 +359,7 @@ class Reporter {
 
 export const classifyShipItOutcome = ({
   spawnError,
+  signal,
   status,
   log,
   before,
@@ -370,6 +371,18 @@ export const classifyShipItOutcome = ({
       "fixture-error",
       `could not execute ShipIt: ${spawnError.message}`,
       { cause: spawnError },
+    );
+  }
+  if (signal) {
+    throw new UpdaterSignatureGateError(
+      "fixture-error",
+      [
+        `ShipIt terminated by ${signal}`,
+        `target-before=${before} target-after=${after}`,
+        log,
+      ]
+        .filter(Boolean)
+        .join("\n"),
     );
   }
   if (
@@ -502,6 +515,7 @@ const runShipItInstall = ({
     : "<missing>";
   return classifyShipItOutcome({
     spawnError: result.error,
+    signal: result.signal,
     status: result.status,
     log,
     before,

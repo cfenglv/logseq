@@ -406,6 +406,9 @@ const cases = [
         projectUpdaterContract,
         /ShipIt fixture requires matching target and update bundle identifiers/,
       );
+      for (const source of [verifier, projectUpdaterContract]) {
+        assert.match(source, /signal:\s*result\.signal/);
+      }
     },
   ],
   [
@@ -441,20 +444,22 @@ const cases = [
       ),
   ],
   [
-    "ShipIt abnormal termination remains an install failure",
+    "ShipIt signal termination is a hard fixture error",
     () =>
       assert.throws(
         () =>
           classifyShipItOutcome({
+            signal: "SIGABRT",
             status: null,
-            log: "NSInternalInconsistencyException",
+            log: "SQRLCodeSignatureErrorDomain",
             before: "2.0.1-selfhost.5",
             after: "2.0.1-selfhost.5",
             newVersion: "2.0.1-selfhost.6",
           }),
         (error) =>
           error instanceof UpdaterSignatureGateError &&
-          error.kind === "install-failure",
+          error.kind === "fixture-error" &&
+          error.message.includes("terminated by SIGABRT"),
       ),
   ],
   [
