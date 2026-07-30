@@ -262,13 +262,17 @@ let resolve_script_path config =
            ^ Vec.string_concat ", " candidates))
 
 let env_with_node_runtime () =
-  let without_key key =
-    Cli_unix.environment () |> Vec.of_array
-    |> Vec.filter (fun entry ->
-        let prefix = key ^ "=" in
-        not (starts_with ~prefix entry))
+  let node_runtime_keys =
+    Vec.of_array [| "ELECTRON_RUN_AS_NODE"; "NODE_USE_ENV_PROXY" |]
   in
-  Vec.push_front (without_key "ELECTRON_RUN_AS_NODE") "ELECTRON_RUN_AS_NODE=1"
+  Cli_unix.environment () |> Vec.of_array
+  |> Vec.filter (fun entry ->
+      not
+        (Vec.exists
+           (fun key -> starts_with ~prefix:(key ^ "=") entry)
+           node_runtime_keys))
+  |> fun env ->
+  Vec.append (Vec.map (fun key -> key ^ "=1") node_runtime_keys) env
   |> Vec.to_array
 
 let db_worker_spawn_args ~executable ~script ~root_dir ~repo ~owner_source
@@ -303,10 +307,11 @@ let shell_quote value =
 let db_worker_command_line ~script ~root_dir ~repo ~owner_source
     ~create_empty_db =
   let executable = parent_executable_path () in
-  Vec.push_front
+  Vec.append
+    (Vec.of_array
+       [| "ELECTRON_RUN_AS_NODE=1"; "NODE_USE_ENV_PROXY=1" |])
     (db_worker_spawn_args ~executable ~script ~root_dir ~repo ~owner_source
        ~create_empty_db)
-    "ELECTRON_RUN_AS_NODE=1"
   |> Vec.map shell_quote |> Vec.string_concat " "
 
 let spawn_server_process ~script ~root_dir ~repo ~owner_source ~create_empty_db
