@@ -352,6 +352,25 @@
       :normalized-tx-data (or (:db-sync/normalized-tx-data tx) [])
       :reversed-tx-data (or (:db-sync/reversed-tx-data tx) [])})))
 
+(defn- sqlite-pending-local-tx-count
+  [db]
+  (some-> (sqlite-get-row db
+                          (str "select count(*) as c from client_ops "
+                               "where kind = 'tx' and pending = 1"))
+          (aget "c")))
+
+(defn- public-pending-local-tx-count
+  [repo]
+  (:pending-local
+   (sync-presence/sync-counts
+    {:get-datascript-conn worker-state/get-datascript-conn
+     :get-pending-local-tx-count client-op/get-pending-local-tx-count
+     :get-unpushed-asset-ops-count client-op/get-unpushed-asset-ops-count
+     :get-local-tx client-op/get-local-tx
+     :get-graph-uuid (constantly nil)
+     :latest-remote-tx {}}
+    repo)))
+
 (defn- promise-like?
   [result]
   (or (p/promise? result)
@@ -1911,6 +1930,157 @@
                          :latest-remote-tx {}}
                         test-repo)]
             (is (= 1 (:pending-local counts)))))))))
+
+(deftest fresh-cache-local-edit-retains-preexisting-pending-count-test
+  (testing "a fresh process adds a new local tx to the pending rows already stored in SQLite"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          stored-count 13
+          stored-txs (mapv (fn [created-at]
+                             {:db-sync/tx-id (random-uuid)
+                              :db-sync/created-at created-at
+                              :db-sync/pending? true
+                              :db-sync/outliner-op :rebase})
+                           (range 1 (inc stored-count)))]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs! test-repo stored-txs)
+          (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
+          (is (not (contains? @client-op/*repo->pending-local-tx-count test-repo))
+              "simulate a fresh worker whose in-memory count cache is empty")
+
+          (ldb/transact! conn
+                         [[:db/add (:db/id child1) :block/title "fresh local edit"]]
+                         {:outliner-op :save-block})
+
+          (is (= (inc stored-count)
+                 (sqlite-pending-local-tx-count client-ops-conn))
+              "SQLite contains the legacy queue plus the newly persisted tx")
+          (is (= (inc stored-count)
+                 (count (#'sync-apply/pending-txs test-repo)))
+              "the durable pending queue is complete")
+          (is (= (inc stored-count)
+                 (public-pending-local-tx-count test-repo))
+              "public sync status must report N+1, never just the +1 delta"))))))
+
+(deftest cache-miss-batch-removal-and-flush-stay-aligned-test
+  (testing "negative deltas on a cache miss remain aligned with SQLite and never underflow"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          pending-tx-ids (vec (repeatedly 13 random-uuid))
+          completed-tx-id (random-uuid)
+          failed-tx-id (random-uuid)]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           (concat
+            (map-indexed
+             (fn [index tx-id]
+               {:db-sync/tx-id tx-id
+                :db-sync/created-at (inc index)
+                :db-sync/pending? true
+                :db-sync/outliner-op :rebase})
+             pending-tx-ids)
+            [{:db-sync/tx-id completed-tx-id
+              :db-sync/created-at 20
+              :db-sync/pending? false}
+             {:db-sync/tx-id failed-tx-id
+              :db-sync/created-at 21
+              :db-sync/pending? false
+              :db-sync/failed? true}]))
+          (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
+
+          (sync-apply/mark-pending-txs-false!
+           test-repo
+           (subvec pending-tx-ids 0 4))
+          (is (= 9 (sqlite-pending-local-tx-count client-ops-conn)))
+          (is (= 9 (public-pending-local-tx-count test-repo))
+              "a partial batch drop must not reset the visible count to zero")
+          (is (not (neg? (get @client-op/*repo->pending-local-tx-count
+                              test-repo
+                              0))))
+
+          (sync-apply/mark-failed-txs!
+           test-repo
+           (subvec pending-tx-ids 4 6))
+          (is (= 7 (sqlite-pending-local-tx-count client-ops-conn)))
+          (is (= 7 (public-pending-local-tx-count test-repo))
+              "marking a batch failed must subtract from the durable base")
+
+          (sync-apply/clear-pending-txs! test-repo)
+          (is (= 0 (sqlite-pending-local-tx-count client-ops-conn)))
+          (is (= 0 (public-pending-local-tx-count test-repo)))
+          (sync-apply/clear-pending-txs! test-repo)
+          (is (= 0 (public-pending-local-tx-count test-repo))
+              "an idempotent second flush must stay at zero")
+          (is (empty? (#'sync-apply/pending-txs test-repo))
+              "pending=false and failed rows are excluded from the queue"))))))
+
+(deftest cache-hit-pending-count-is-repo-scoped-test
+  (testing "warm count caches adjust normally without leaking across repos"
+    (let [repo-a "pending-count-repo-a"
+          repo-b "pending-count-repo-b"
+          db-a (new-client-ops-db)
+          db-b (new-client-ops-db)
+          previous-client-ops-conns @worker-state/*client-ops-conns
+          previous-count-cache @client-op/*repo->pending-local-tx-count
+          repo-a-pending (vec (repeatedly 13 random-uuid))
+          repo-b-pending (vec (repeatedly 5 random-uuid))]
+      (try
+        (reset! worker-state/*client-ops-conns {repo-a db-a repo-b db-b})
+        (reset! client-op/*repo->pending-local-tx-count {})
+        (seed-client-op-txs!
+         repo-a
+         (concat
+          (map-indexed
+           (fn [index tx-id]
+             {:db-sync/tx-id tx-id
+              :db-sync/created-at (inc index)
+              :db-sync/pending? true})
+           repo-a-pending)
+          [{:db-sync/tx-id (random-uuid)
+            :db-sync/created-at 20
+            :db-sync/pending? false}
+           {:db-sync/tx-id (random-uuid)
+            :db-sync/created-at 21
+            :db-sync/pending? false
+            :db-sync/failed? true}]))
+        (seed-client-op-txs!
+         repo-b
+         (map-indexed
+          (fn [index tx-id]
+            {:db-sync/tx-id tx-id
+             :db-sync/created-at (inc index)
+             :db-sync/pending? true})
+          repo-b-pending))
+
+        (is (= 13 (client-op/get-pending-local-tx-count repo-a)))
+        (is (= 5 (client-op/get-pending-local-tx-count repo-b)))
+
+        (let [{:keys [should-inc-pending?]}
+              (client-op/upsert-local-tx-entry!
+               repo-a
+               {:tx-id (random-uuid)
+                :created-at 30
+                :pending? true
+                :failed? false
+                :normalized-tx-data []
+                :reversed-tx-data []})]
+          (when should-inc-pending?
+            (client-op/adjust-pending-local-tx-count! repo-a 1)))
+        (let [removed (client-op/mark-pending-txs-false!
+                       repo-b
+                       [(first repo-b-pending)])]
+          (client-op/adjust-pending-local-tx-count! repo-b (- removed)))
+
+        (is (= 14 (client-op/get-pending-local-tx-count repo-a)))
+        (is (= 4 (client-op/get-pending-local-tx-count repo-b)))
+        (is (= 14 (sqlite-pending-local-tx-count db-a)))
+        (is (= 4 (sqlite-pending-local-tx-count db-b)))
+        (finally
+          (.close db-a)
+          (.close db-b)
+          (reset! worker-state/*client-ops-conns previous-client-ops-conns)
+          (reset! client-op/*repo->pending-local-tx-count previous-count-cache))))))
 
 (deftest sync-counts-reports-stored-local-checksum-test
   (testing "sync status reports stored local checksum without recomputing from client db"
