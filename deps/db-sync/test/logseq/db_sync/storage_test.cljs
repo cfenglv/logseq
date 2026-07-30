@@ -137,6 +137,47 @@
         (is (= (storage/get-t sql)
                (storage/get-server-checksum-t sql)))))))
 
+(deftest checksum-metadata-verification-watermark-tracks-only-verified-history-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "verified-checksum-watermark"
+           :block/title "Verified checksum watermark"}])
+        (let [first-t (storage/get-t sql)]
+          (is (storage/checksum-metadata-verified? sql first-t))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (storage/get-checksum sql)))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql))))
+
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "Verified checksum watermark updated"]])
+        (let [second-t (storage/get-t sql)]
+          (is (storage/checksum-metadata-verified? sql second-t))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (storage/get-checksum sql)))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql))))
+
+        ;; Model a rollback to a server that does not know the new watermark.
+        ;; The cursor advances, but the old verification proof must not.
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "Written by an older server"]]
+         {:db-sync/skip-checksum-update? true})
+        (is (not (storage/checksum-metadata-verified?
+                  sql
+                  (storage/get-t sql))))))))
+
 (defn- normal-block-uuids
   [db]
   (->> (d/datoms db :avet :block/uuid)

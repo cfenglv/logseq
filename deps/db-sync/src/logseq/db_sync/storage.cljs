@@ -109,6 +109,32 @@
       (delete-meta! sql :server-checksum-v2)
       (delete-meta! sql :server-checksum-v2-t))))
 
+(def ^:private checksum-metadata-contract-version
+  "server-db-v2+legacy-v1-verified-v1")
+
+(defn checksum-metadata-verified?
+  [sql t]
+  (let [checksum (get-checksum sql)
+        server-checksum (get-server-checksum sql)
+        server-checksum-t (get-server-checksum-t sql)]
+    (and (= checksum-metadata-contract-version
+            (get-meta sql :checksum-metadata-contract-version))
+         (= t
+            (some-> (get-meta sql :checksum-metadata-contract-t)
+                    (js/parseInt 10)))
+         (or (and (zero? t) (nil? checksum))
+             (sync-checksum/valid-checksum? checksum))
+         (or (and (nil? server-checksum)
+                  (nil? server-checksum-t))
+             (and (sync-checksum/valid-checksum? server-checksum)
+                  (= t server-checksum-t))))))
+
+(defn mark-checksum-metadata-verified!
+  [sql t]
+  (set-meta! sql :checksum-metadata-contract-version
+             checksum-metadata-contract-version)
+  (set-meta! sql :checksum-metadata-contract-t t))
+
 (defn get-t [sql]
   (let [value (get-meta sql :t)]
     (if (string? value)
@@ -246,12 +272,16 @@
         sql
         (fn []
           (let [prev-t (get-t sql)
-                new-t (inc prev-t)]
+                new-t (inc prev-t)
+                prev-checksum (get-checksum sql)
+                verified-checksum-metadata?
+                (or (checksum-metadata-verified? sql prev-t)
+                    (and (zero? prev-t)
+                         (nil? prev-checksum)))]
             (append-tx! sql new-t tx-str created-at (:outliner-op tx-meta))
             (set-t! sql new-t)
             (when-not (:db-sync/skip-checksum-update? tx-meta)
-              (let [prev-checksum (get-checksum sql)
-                    checksum (sync-checksum/update-checksum
+              (let [checksum (sync-checksum/update-checksum
                               prev-checksum
                               (assoc tx-report :tx-data normalized-data))
                     prev-server-checksum (get-server-checksum sql)
@@ -261,15 +291,19 @@
                 ;; maintaining the additive versioned metadata. Never extend a
                 ;; stale checksum and then stamp it with the new cursor.
                 (set-checksum! sql checksum)
-                (when (string? prev-server-checksum)
+                (when (or verified-checksum-metadata?
+                          (string? prev-server-checksum))
                   (set-server-checksum!
                    sql
-                   (if (= prev-t prev-server-checksum-t)
+                   (if (and (string? prev-server-checksum)
+                            (= prev-t prev-server-checksum-t))
                      (sync-checksum/update-server-checksum
                       prev-server-checksum
                       (assoc tx-report :tx-data normalized-data))
                      (sync-checksum/recompute-server-checksum db-after))
-                   new-t))))))))))
+                   new-t))
+                (when verified-checksum-metadata?
+                  (mark-checksum-metadata-verified! sql new-t))))))))))
 
 (defn- listen-db-updates!
   [sql conn]

@@ -103,6 +103,91 @@
             (is (= (storage/get-t sql)
                    (storage/get-server-checksum-t sql)))))))))
 
+(deftest checksum-response-repairs-same-cursor-persisted-drift-test
+  (testing "a restarted worker must verify the DB instead of trusting checksum metadata at the same t"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              page-uuid (random-uuid)
+              block-uuid (random-uuid)]
+          (d/transact!
+           conn
+           [{:block/uuid page-uuid
+             :block/name "same-cursor-drift"
+             :block/title "Same cursor drift"}
+            {:block/uuid block-uuid
+             :block/title "content"
+             :block/order "a0"
+             :block/parent [:block/uuid page-uuid]
+             :block/page [:block/uuid page-uuid]}])
+          (let [current-t (storage/get-t sql)
+                expected-legacy (sync-checksum/recompute-checksum @conn)
+                expected-server (sync-checksum/recompute-server-checksum @conn)
+                stale-legacy "aaaaaaaaaaaaaaaa"
+                stale-server "bbbbbbbbbbbbbbbb"]
+            (is (not= stale-legacy expected-legacy))
+            (is (not= stale-server expected-server))
+            (storage/set-checksum! sql stale-legacy)
+            (storage/set-server-checksum! sql stale-server current-t)
+            ;; Persisted graphs from the older deployed Worker have no
+            ;; verification watermark even though their checksum cursor may
+            ;; equal the graph cursor.
+            (storage/delete-meta! sql :checksum-metadata-contract-version)
+            (storage/delete-meta! sql :checksum-metadata-contract-t)
+            (let [restarted-self #js {:sql sql
+                                      :conn nil
+                                      :schema-ready true}
+                  fields (sync-handler/checksum-response-fields restarted-self)]
+              (is (= expected-legacy (:checksum fields)))
+              (is (= expected-server (:server-checksum fields)))
+              (is (= expected-legacy (storage/get-checksum sql)))
+              (is (= expected-server (storage/get-server-checksum sql)))
+              (is (= current-t (storage/get-server-checksum-t sql))))))))))
+
+(deftest tx-batch-migrates-persisted-drift-before-extending-checksum-test
+  (testing "the first HTTP-style batch after upgrade repairs old metadata before applying new txs"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              page-uuid (random-uuid)
+              _ (d/transact!
+                 conn
+                 [{:block/uuid page-uuid
+                   :block/name "batch-checksum-migration"
+                   :block/title "Before migration"}])
+              t-before (storage/get-t sql)
+              _ (storage/set-checksum! sql "aaaaaaaaaaaaaaaa")
+              _ (storage/set-server-checksum!
+                 sql "bbbbbbbbbbbbbbbb" t-before)
+              _ (storage/delete-meta!
+                 sql :checksum-metadata-contract-version)
+              _ (storage/delete-meta! sql :checksum-metadata-contract-t)
+              tx-entry
+              {:tx (protocol/tx->transit
+                    [[:db/add [:block/uuid page-uuid]
+                      :block/title
+                      "After migration"]])
+               :tx-id (random-uuid)
+               :outliner-op :save-block}
+              self #js {:sql sql
+                        :conn conn
+                        :schema-ready true}
+              response
+              (with-redefs [ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 self nil [tx-entry] t-before))]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (:checksum response))
+              "the v1 field used by legacy clients stays strict")
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (:server-checksum response)))
+          (is (storage/checksum-metadata-verified?
+               sql
+               (storage/get-t sql))))))))
+
 (deftest legacy-large-title-marker-omits-v2-but-keeps-old-client-checksum-test
   (with-memory-sql
     (fn [sql]
@@ -1617,6 +1702,88 @@
                               (is false (str error))))
                    (p/finally done)))))))
 
+(deftest snapshot-download-repairs-checksum-before-freezing-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   page-uuid (random-uuid)
+                   block-uuid (random-uuid)
+                   _ (d/transact!
+                      conn
+                      [{:block/uuid page-uuid
+                        :block/name "snapshot-checksum-repair"
+                        :block/title "Snapshot checksum repair"}
+                       {:block/uuid block-uuid
+                        :block/title "content"
+                        :block/order "a0"
+                        :block/parent [:block/uuid page-uuid]
+                        :block/page [:block/uuid page-uuid]}])
+                   current-t (storage/get-t sql)
+                   expected-checksum
+                   (sync-checksum/recompute-checksum @conn)
+                   _ (storage/set-checksum! sql "aaaaaaaaaaaaaaaa")
+                   _ (storage/set-server-checksum!
+                      sql "bbbbbbbbbbbbbbbb" current-t)
+                   _ (storage/delete-meta!
+                      sql :checksum-metadata-contract-version)
+                   _ (storage/delete-meta!
+                      sql :checksum-metadata-contract-t)
+                   self #js {:env
+                             #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                             :conn nil
+                             :schema-ready true
+                             :sql sql}
+                   {:keys [request url]} (request-url)]
+               (-> (p/with-redefs
+                     [sync-handler/<ready-for-sync?
+                      (fn [_self _graph-id] (p/resolved true))]
+                     (p/let [metadata-response
+                             (sync-handler/handle
+                              {:self self
+                               :request request
+                               :url url
+                               :route {:handler
+                                       :sync/snapshot-download-v2}})
+                             metadata (json-body metadata-response)
+                             stream-response
+                             (sync-handler/handle-http
+                              self
+                              (js/Request. (:url metadata)
+                                           #js {:method "GET"}))
+                             buffer (.arrayBuffer stream-response)
+                             rows
+                             (snapshot/finalize-framed-buffer
+                              (js/Uint8Array. buffer))
+                             restored-checksum
+                             (with-memory-sql
+                               (fn [restored-sql]
+                                 (storage/init-schema! restored-sql)
+                                 (doseq [[addr content addresses] rows]
+                                   (common/sql-exec
+                                    restored-sql
+                                    (str "insert or replace into kvs "
+                                         "(addr, content, addresses) "
+                                         "values (?, ?, ?)")
+                                    addr content addresses))
+                                 (let [restored-conn
+                                       (storage/open-conn restored-sql)]
+                                   (sync-checksum/recompute-checksum
+                                    @restored-conn))))]
+                       (is (= 200 (.-status metadata-response)))
+                       (is (= expected-checksum (:checksum metadata)))
+                       (is (= expected-checksum restored-checksum)
+                           "downloaded DB state must match its advertised checksum")
+                       (is (= (count rows) (:row-count metadata)))
+                       (is (= expected-checksum
+                              (storage/get-checksum sql)))
+                       (is (storage/checksum-metadata-verified?
+                            sql current-t))))
+                   (p/catch (fn [error]
+                              (is false (str error))))
+                   (p/finally done)))))))
+
 (deftest snapshot-download-stream-is-frozen-at-metadata-watermark-test
   (async done
          (with-memory-sql-async
@@ -1626,7 +1793,10 @@
                               "insert into kvs (addr, content, addresses) values (?, ?, ?)"
                               1 "snapshot-row" nil)
              (storage/set-t! sql 7)
-             (storage/set-checksum! sql "snapshot-checksum")
+             (storage/set-checksum! sql "1111111111111111")
+             ;; This fixture exercises snapshot freezing, not checksum
+             ;; migration, and its hand-written row is not a Datascript store.
+             (storage/mark-checksum-metadata-verified! sql 7)
              (let [self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
                              :conn nil
                              :schema-ready true
@@ -1663,7 +1833,7 @@
                                "select download_id from snapshot_downloads"))]
                        (is (= 200 (.-status metadata-response)))
                        (is (= 7 (:t metadata)))
-                       (is (= "snapshot-checksum" (:checksum metadata)))
+                       (is (= "1111111111111111" (:checksum metadata)))
                        (is (= 1 (:row-count metadata)))
                        (is (= [[1 "snapshot-row" nil]] rows)
                            "the stream must not include writes committed after metadata")
@@ -1723,6 +1893,9 @@
                      "(download_id, addr, content, addresses) "
                      "values (?, ?, ?, ?)")
                 download-id 1 "stale" nil))
+             ;; Keep this capacity-only fixture from materializing an empty
+             ;; Datascript store while verifying checksum metadata.
+             (storage/mark-checksum-metadata-verified! sql 0)
              (let [self #js {:env
                              #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
                              :conn nil

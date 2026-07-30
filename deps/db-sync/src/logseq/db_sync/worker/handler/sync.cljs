@@ -75,24 +75,47 @@
   (ensure-schema! self)
   (storage/get-t (.-sql self)))
 
+(defn- verify-current-checksums!
+  [^js self]
+  (ensure-schema! self)
+  (let [sql (.-sql self)
+        current-t (storage/get-t sql)]
+    (when-not (storage/checksum-metadata-verified? sql current-t)
+      (ensure-conn! self)
+      (let [conn (.-conn self)
+            stored-checksum (storage/get-checksum sql)
+            stored-server-checksum (storage/get-server-checksum sql)
+            stored-server-checksum-t (storage/get-server-checksum-t sql)
+            checksum (when (or (string? stored-checksum)
+                               (pos? current-t))
+                       (sync-checksum/recompute-checksum @conn))
+            server-checksum (sync-checksum/recompute-server-checksum @conn)
+            checksum-drift? (and (string? stored-checksum)
+                                 (not= stored-checksum checksum))
+            server-checksum-drift?
+            (and (= current-t stored-server-checksum-t)
+                 (string? stored-server-checksum)
+                 (not= stored-server-checksum server-checksum))]
+        (storage/with-sql-transaction!
+         sql
+         (fn []
+           (when (string? checksum)
+             (storage/set-checksum! sql checksum))
+           (storage/set-server-checksum! sql server-checksum current-t)
+           (storage/mark-checksum-metadata-verified! sql current-t)))
+        (when (or checksum-drift? server-checksum-drift?)
+          (log/warn :db-sync/checksum-metadata-repaired
+                    {:t current-t
+                     :legacy-drift? checksum-drift?
+                     :server-v2-drift? server-checksum-drift?})))))
+  {:checksum (storage/get-checksum (.-sql self))
+   :server-checksum (storage/get-server-checksum (.-sql self))})
+
 (defn current-checksum [^js self]
-  (ensure-conn! self)
-  (storage/get-checksum (.-sql self)))
+  (:checksum (verify-current-checksums! self)))
 
 (defn current-server-checksum [^js self]
-  (ensure-conn! self)
-  (let [sql (.-sql self)
-        current-t (storage/get-t sql)
-        stored-checksum (storage/get-server-checksum sql)
-        stored-t (storage/get-server-checksum-t sql)]
-    (if (and (string? stored-checksum)
-             (= current-t stored-t))
-      stored-checksum
-      (let [checksum (sync-checksum/recompute-server-checksum @(.-conn self))]
-        ;; The cursor prevents a new -> old -> new rolling deployment from
-        ;; trusting metadata that the old server could not maintain.
-        (storage/set-server-checksum! sql checksum current-t)
-        checksum))))
+  (:server-checksum (verify-current-checksums! self)))
 
 (defn checksum-response-fields [^js self]
   (let [legacy-checksum (current-checksum self)
@@ -314,7 +337,10 @@
 
 (defn- create-snapshot-download!
   [^js self]
-  (ensure-schema! self)
+  ;; A frozen snapshot and its checksum must come from the same verified DB
+  ;; state. This also repairs persisted same-cursor drift before the checksum is
+  ;; copied into snapshot_downloads.
+  (verify-current-checksums! self)
   (let [sql (.-sql self)
         download-id (str (random-uuid))
         now (js/Date.now)]
@@ -776,6 +802,8 @@
         prev-checksum (when sql (storage/get-checksum sql))
         prev-server-checksum (when sql (storage/get-server-checksum sql))
         prev-server-checksum-t (when sql (storage/get-server-checksum-t sql))
+        verified-checksum-metadata?
+        (when sql (storage/checksum-metadata-verified? sql prev-t))
         logical-tx-data (volatile! [])
         chunk-count (volatile! 0)]
     (log/info :db-sync/apply-large-tx-entry-start
@@ -814,16 +842,22 @@
                {:db-before db-before
                 :db-after @conn
                 :tx-data @logical-tx-data}))
-             (when (string? prev-server-checksum)
+             (when (or verified-checksum-metadata?
+                       (string? prev-server-checksum))
                (storage/set-server-checksum!
                 sql
-                (if (= prev-t prev-server-checksum-t)
+                (if (and (string? prev-server-checksum)
+                         (= prev-t prev-server-checksum-t))
                   (sync-checksum/update-server-checksum
                    prev-server-checksum
                    {:db-before db-before
                     :db-after @conn
                     :tx-data @logical-tx-data})
                   (sync-checksum/recompute-server-checksum @conn))
+                (storage/get-t sql)))
+             (when verified-checksum-metadata?
+               (storage/mark-checksum-metadata-verified!
+                sql
                 (storage/get-t sql))))
            (finally
              (when sql
@@ -952,6 +986,10 @@
        :else
        (if (seq txs)
          (try
+           ;; Migrate persisted checksum metadata before extending it. Older
+           ;; deployed servers did not write the verification watermark, so a
+           ;; first HTTP batch is just as safe as a hello/pull-first session.
+           (verify-current-checksums! self)
            (let [{:keys [t applied?]} (apply-tx! self txs request-context)]
              (when applied?
                ;; Broadcast once per processed batch after tx-log/checksum settle.
