@@ -814,6 +814,7 @@
                      :payload-digest (apply str (repeat 64 digest-char))})
         sent-object (v2-object "sent-object" "a")
         deferred-object (v2-object "deferred-object" "b")
+        stable-block-uuid (random-uuid)
         sent-entry {:tx-id "sent"
                     :tx-data [[:db/add 1
                                :logseq.property.sync/large-title-object
@@ -821,7 +822,13 @@
         deferred-entry {:tx-id "deferred"
                         :tx-data [[:db/add 2
                                    :logseq.property.sync/large-title-object
-                                   deferred-object]]}]
+                                   deferred-object]]}
+        stable-entry
+        {:tx-id "stable"
+         :tx-data [[:db/add
+                    [:block/uuid stable-block-uuid]
+                    :logseq.property.sync/large-title-object
+                    sent-object]]}]
     (is (= [[:db/add 1
              :logseq.property.sync/large-title-object
              sent-object]]
@@ -834,7 +841,57 @@
     (is (= 2
            (count
             (#'sync-apply/versioned-large-title-marker-txs
-             [sent-entry deferred-entry]))))))
+             [sent-entry deferred-entry]))))
+    (is (= (:tx-data stable-entry)
+           (#'sync-apply/versioned-large-title-marker-txs
+            [stable-entry])))))
+
+(deftest versioned-e2ee-large-title-marker-tempid-resolves-for-local-persistence-test
+  (let [conn (d/create-conn
+              {:block/uuid {:db/unique :db.unique/identity}})
+        block-uuid (random-uuid)
+        deleted-block-uuid (random-uuid)
+        tempid "large-title-block"
+        object {:asset-uuid "encrypted-large-title"
+                :asset-type "txt"
+                :payload-format
+                sync-large-title/large-title-encrypted-payload-format
+                :payload-digest-alg
+                sync-large-title/large-title-payload-digest-alg
+                :payload-digest (apply str (repeat 64 "a"))}
+        tx-entries
+        [{:tx-id "large-title"
+          :tx-data [[:db/add tempid :block/uuid block-uuid]
+                    [:db/add tempid :block/title ""]
+                    [:db/add tempid
+                     sync-large-title/large-title-object-attr
+                     object]]}
+         {:tx-id "delete"
+          :outliner-op :delete-blocks
+          :tx-data [[:db/retractEntity
+                     [:block/uuid deleted-block-uuid]]]}]
+        original-entries tx-entries]
+    (d/transact! conn
+                 [{:block/uuid block-uuid
+                   :block/title "logical large title"}
+                  {:block/uuid deleted-block-uuid
+                   :block/title "deleted block"}])
+    (let [marker-txs
+          (#'sync-apply/versioned-large-title-marker-txs tx-entries)]
+      (is (= [[:db/add
+               [:block/uuid block-uuid]
+               sync-large-title/large-title-object-attr
+               object]]
+             marker-txs))
+      (is (= original-entries tx-entries)
+          "the websocket payload keeps its same-tx tempid relationship")
+      (d/transact! conn marker-txs)
+      (is (= object
+             (get (d/entity @conn [:block/uuid block-uuid])
+                  sync-large-title/large-title-object-attr)))
+      (is (= "logical large title"
+             (:block/title
+              (d/entity @conn [:block/uuid block-uuid])))))))
 
 (deftest reject-oversized-atomic-upload-before-websocket-send-test
   (testing "an oversized atomic tx is retained locally and its contents are not copied into error data"

@@ -60,18 +60,30 @@
   [repo]
   (true? (get @*repo->upload-stopped? repo)))
 
+(declare tx-temp-id->uuid)
+
 (defn- versioned-large-title-marker-txs
   [tx-entries]
   (->> tx-entries
-       (mapcat :tx-data)
-       (filterv
-        (fn [item]
-          (and (vector? item)
-               (= :db/add (nth item 0 nil))
-               (= sync-large-title/large-title-object-attr
-                  (nth item 2 nil))
-               (sync-large-title/large-title-object-v2?
-                (nth item 3 nil)))))))
+       (mapcat
+        (fn [{:keys [tx-data]}]
+          (let [temp-id->uuid (tx-temp-id->uuid tx-data)]
+            (keep
+             (fn [item]
+               (when (and (vector? item)
+                          (= :db/add (nth item 0 nil))
+                          (= sync-large-title/large-title-object-attr
+                             (nth item 2 nil))
+                          (sync-large-title/large-title-object-v2?
+                           (nth item 3 nil)))
+                 (let [entity (nth item 1 nil)]
+                   (if (and (string? entity)
+                            (contains? temp-id->uuid entity))
+                     (assoc item 1
+                            [:block/uuid (get temp-id->uuid entity)])
+                     item))))
+             tx-data))))
+       vec))
 
 (declare enqueue-asset-task!
          apply-remote-txs!
@@ -79,7 +91,6 @@
          commit-large-upload-progress!
          ref-attr?
          resolve-temp-id
-         tx-temp-id->uuid
          reverse-local-txs!
          rebase-local-txs!
          repair-applied-txs!
