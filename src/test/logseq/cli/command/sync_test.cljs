@@ -395,7 +395,7 @@
                                                     :thread-api/db-sync-status
                                                     (let [idx (swap! status-calls inc)]
                                                       (p/resolved {:repo "logseq_db_demo"
-                                                                   :ws-state :open
+                                                                   :ws-state (if (= idx 1) :syncing :open)
                                                                    :sync-ready? (> idx 1)
                                                                    :pending-local 0
                                                                    :pending-asset 0

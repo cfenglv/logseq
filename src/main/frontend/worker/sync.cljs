@@ -107,15 +107,13 @@
      :rtc-sync-state
      (sync-presence/rtc-state-payload status client))))
 
-(defn- set-ws-state!
-  [client ws-state]
-  (sync-presence/set-ws-state! broadcast-rtc-state! client ws-state))
-
-(defn- set-sync-ready!
-  [client ready?]
+(defn- set-sync-state!
+  [client ws-state ready?]
+  (when-let [*ws-state (:ws-state client)]
+    (reset! *ws-state ws-state))
   (when-let [*sync-ready? (:sync-ready? client)]
-    (reset! *sync-ready? (true? ready?))
-    (broadcast-rtc-state! client)))
+    (reset! *sync-ready? (true? ready?)))
+  (broadcast-rtc-state! client))
 
 (defn- update-online-users!
   [client users]
@@ -331,9 +329,8 @@
   (clear-inflight! client)
   (when-let [pending-pull-since (:pending-pull-since client)]
     (reset! pending-pull-since nil))
-  (set-sync-ready! client false)
   (update-online-users! client [])
-  (set-ws-state! client :closed)
+  (set-sync-state! client :closed false)
   (when ws
     (detach-ws-handlers! ws)
     (when close-ws?
@@ -361,10 +358,9 @@
     (clear-reconnect-timer! reconnect))
   (when-let [pending-pull-since (:pending-pull-since client)]
     (reset! pending-pull-since nil))
-  (set-sync-ready! client false)
   (sync-util/set-last-sync-error! client error)
   (update-online-users! client [])
-  (set-ws-state! client :repair-required)
+  (set-sync-state! client :repair-required false)
   (when ws
     (detach-ws-handlers! ws)
     (try (.close ws) (catch :default _ nil)))
@@ -468,9 +464,8 @@
     (clear-reconnect-timer! reconnect))
   (when-let [ws (:ws client)]
     (detach-ws-handlers! ws)
-    (set-sync-ready! client false)
     (update-online-users! client [])
-    (set-ws-state! client :closed)
+    (set-sync-state! client :closed false)
     (try (.close ws) (catch :default _ nil))))
 
 (defn- active-client-for?
@@ -585,7 +580,7 @@
                                         (identical? ws (:ws current)))
                                (reset-reconnect! current)
                                (sync-util/clear-last-sync-error! current)
-                               (set-sync-ready! current true)))))]
+                               (set-sync-state! current :open true)))))]
       (attach-ws-handlers! repo updated ws url)
       (set! (.-onopen ws)
             (fn [_]
@@ -594,8 +589,7 @@
               (when-let [reconnect (:reconnect updated)]
                 (clear-reconnect-timer! reconnect))
               (touch-last-ws-message! updated)
-              (set-sync-ready! updated false)
-              (set-ws-state! updated :open)
+              (set-sync-state! updated :syncing false)
               (send! ws {:type "hello" :client repo})
               (sync-assets/enqueue-asset-sync!
                repo updated

@@ -721,6 +721,12 @@
                callbacks* (atom [])
                token-calls* (atom 0)
                sent* (atom [])
+               broadcasts* (atom [])
+               last-broadcast-health
+               (fn []
+                 (let [[_event payload] (last @broadcasts*)]
+                   (assoc (select-keys payload [:sync-ready? :rtc-lock])
+                          :ws-state (get-in payload [:rtc-state :ws-state]))))
                new-ws #js {:readyState 0
                            :send (fn [payload] (swap! sent* conj payload))
                            :close (fn [] nil)}
@@ -757,7 +763,8 @@
              :timers {}
              :sqlite {}})
            (-> (p/with-redefs [shared-service/broadcast-to-clients!
-                               (fn [& _] nil)]
+                               (fn [event payload]
+                                 (swap! broadcasts* conj [event payload]))]
                  (#'sync/schedule-reconnect! repo client url :test)
                  (p/let [_ ((:f (first @callbacks*)))
                          _ (is (= 2 (count @callbacks*)))
@@ -768,13 +775,25 @@
                    (aset new-ws "readyState" 1)
                    ((.-onopen new-ws) #js {})
                    (is (= ["{\"type\":\"hello\",\"client\":\"retry-repo\"}"] @sent*))
-                   (is (= :open @(:ws-state client)))
+                   (is (= :syncing @(:ws-state client))
+                       "transport open must remain visibly non-healthy while hello is pending")
                    (is (false? @(:sync-ready? client))
                        "transport open must not imply initial synchronization readiness")
+                   (is (= {:ws-state :syncing
+                           :sync-ready? false
+                           :rtc-lock false}
+                          (last-broadcast-health))
+                       "the UI payload must not describe hello-pending recovery as Online")
                    (is (= {:attempt 2 :timer nil} @(:reconnect client))
                        "opening the socket alone must not erase repeated catch-up failures")
                    ((:sync-succeeded-f @worker-state/*db-sync-client))
                    (is (true? @(:sync-ready? client)))
+                   (is (= :open @(:ws-state client)))
+                   (is (= {:ws-state :open
+                           :sync-ready? true
+                           :rtc-lock true}
+                          (last-broadcast-health))
+                       "successful catch-up must automatically restore healthy Online state")
                    (is (= {:attempt 0 :timer nil} @(:reconnect client)))))
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))

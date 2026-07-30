@@ -85,10 +85,11 @@
   [sync-counts-f client]
   (let [repo (:repo client)
         ws-state @(:ws-state client)
+        sync-ready? (true? (some-> client :sync-ready? deref))
         online-users @(:online-users client)
         {:keys [pending-local pending-asset missing-asset-upload-files pending-server
                 local-tx remote-tx local-checksum remote-checksum graph-id
-                sync-ready? last-error]}
+                last-error]}
         (sync-counts-f repo)]
     {:rtc-state {:ws-state ws-state}
      :rtc-lock (= :open ws-state)
