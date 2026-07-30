@@ -32,6 +32,10 @@ const policyPath = path.join(
   "project-signing-policy.json",
 );
 const proxyTlsFixture = Object.freeze({
+  auditConsumer:
+    "scripts/test-updater-private-material-policy-contract.mjs",
+  auditConsumerSha256:
+    "0e99b07924196b912bd5e7f3ee02211d6f295f76be80aee049286c1619789a73",
   caCertificate: "scripts/fixtures/proxy-fetch-test-ca.cert.pem",
   consumer: "scripts/test-cli-worker-fetch-proxy.mjs",
   privateKey: "scripts/fixtures/proxy-fetch-test-server.key.pem",
@@ -178,13 +182,73 @@ const assertProxyFixtureConsumer = (source) => {
   );
 };
 
+const assertProxyFixtureAuditConsumer = (tracked) => {
+  if (!tracked.includes(proxyTlsFixture.auditConsumer)) return;
+  const auditSource = fs.readFileSync(
+    path.join(repoRoot, proxyTlsFixture.auditConsumer),
+  );
+  assert.equal(
+    sha256(auditSource),
+    proxyTlsFixture.auditConsumerSha256,
+    "proxy TLS fixture audit contract digest changed",
+  );
+  const source = auditSource.toString("utf8");
+  for (const expectedPath of [
+    "scripts/test-project-signed-macos-updater.mjs",
+    proxyTlsFixture.consumer,
+    proxyTlsFixture.privateKey,
+    proxyTlsFixture.serverCertificate,
+    proxyTlsFixture.caCertificate,
+  ]) {
+    assert.ok(
+      source.includes(`"${expectedPath}"`),
+      `proxy TLS audit contract is not wired to ${expectedPath}`,
+    );
+  }
+  assert.match(
+    source,
+    /const child = spawn\(process\.execPath, \[scannerPath\]/,
+    "proxy TLS audit contract does not invoke the production scanner",
+  );
+  assert.match(
+    source,
+    /assert\.deepEqual\(\s*fixturePublicKey,\s*certificatePublicKey/,
+    "proxy TLS audit contract does not verify the key-certificate pair",
+  );
+  assert.match(
+    source,
+    /copied proxy private key is rejected[\s\S]*renamed proxy private key is rejected[\s\S]*replacement private key at the allowed path is rejected[\s\S]*byte-modified allowed fixture is rejected/,
+    "proxy TLS audit contract does not cover copy, rename, replacement, and tampering",
+  );
+  assert.match(
+    source,
+    /additional \.key private material is rejected[\s\S]*additional \.pem private material is rejected[\s\S]*private-key marker outside the exact fixture is rejected/,
+    "proxy TLS audit contract does not cover other private material",
+  );
+};
+
+const expectedProxyFixtureConsumers = (tracked) => [
+  proxyTlsFixture.consumer,
+  ...(tracked.includes(proxyTlsFixture.auditConsumer)
+    ? [proxyTlsFixture.auditConsumer]
+    : []),
+];
+
+const assertProxyFixtureConsumers = (tracked, fixturePath, consumers) => {
+  assert.deepEqual(
+    consumers,
+    expectedProxyFixtureConsumers(tracked),
+    `${fixturePath} must be referenced only by the local proxy E2E and its pinned audit contract`,
+  );
+};
+
 const privateMaterialFindings = ({ markerFiles, tracked }) => {
   const allowed = proxyTlsFixture.privateKey;
   return {
     forbiddenNames: tracked.filter(
       (file) =>
         file !== allowed &&
-        /(?:^|\/)(?:[^/]+\.(?:p12|pfx|key)(?:\.pem)?|private[-_]?key(?:\.pem)?)$/i.test(
+        /(?:^|\/)(?:[^/]+\.(?:p12|pfx|key)(?:\.pem)?|private[-_]?key(?:\.pem)?|release[-_]?key(?:\.[^/]+)?)$/i.test(
           file,
         ),
     ),
@@ -417,10 +481,10 @@ const validateTrackedProxyTlsFixture = (tracked) => {
     const bytes = fs.readFileSync(path.join(repoRoot, fixturePath));
     assertPinnedProxyFixtureFile(fixturePath, bytes);
     fixtureBytes.set(fixturePath, bytes);
-    assert.deepEqual(
+    assertProxyFixtureConsumers(
+      tracked,
+      fixturePath,
       gitGrepFiles(path.posix.basename(fixturePath)),
-      [proxyTlsFixture.consumer],
-      `${fixturePath} must be referenced only by the local proxy E2E`,
     );
   }
 
@@ -429,6 +493,7 @@ const validateTrackedProxyTlsFixture = (tracked) => {
     "utf8",
   );
   assertProxyFixtureConsumer(consumerSource);
+  assertProxyFixtureAuditConsumer(tracked);
 
   const privateKey = createPrivateKey(
     fixtureBytes.get(proxyTlsFixture.privateKey),
@@ -476,8 +541,12 @@ const validateTrackedProxyTlsFixture = (tracked) => {
     "proxy TLS fixture must not satisfy the Ed25519 release-signing policy",
   );
   if (productionPolicy.configured) {
+    const projectPublicKey =
+      configuredProjectPublicKey(productionPolicy);
     assert.equal(
-      fixturePublicKey.equals(configuredProjectPublicKey(productionPolicy)),
+      fixturePublicKey.asymmetricKeyType ===
+        projectPublicKey.asymmetricKeyType &&
+        fixturePublicKey.equals(projectPublicKey),
       false,
       "proxy TLS fixture public key matches the project signing public key",
     );
@@ -504,6 +573,7 @@ const testProxyTlsFixtureExceptionFailClosed = () => {
     "scripts/fixtures/proxy-fetch-test-server-copy.key.pem";
   const renamedKey = "scripts/fixtures/proxy-fetch-renamed.pem";
   const releaseKey = "resources/updater/release-signing.key";
+  const releaseKeyText = "resources/updater/release-key.txt";
   const releasePem = "resources/updater/release-secret.pem";
   const releaseP12 = "resources/updater/release-signing.p12";
   const findings = privateMaterialFindings({
@@ -518,6 +588,7 @@ const testProxyTlsFixtureExceptionFailClosed = () => {
       copiedKey,
       renamedKey,
       releaseKey,
+      releaseKeyText,
       releasePem,
       releaseP12,
     ],
@@ -525,6 +596,7 @@ const testProxyTlsFixtureExceptionFailClosed = () => {
   assert.deepEqual(findings.forbiddenNames, [
     copiedKey,
     releaseKey,
+    releaseKeyText,
     releaseP12,
   ]);
   assert.equal(
@@ -568,6 +640,19 @@ const testProxyTlsFixtureExceptionFailClosed = () => {
       ),
     /local HTTPS target/,
     "disconnecting the fixture from the proxy E2E must fail closed",
+  );
+  assert.throws(
+    () =>
+      assertProxyFixtureConsumers(
+        tracked,
+        proxyTlsFixture.privateKey,
+        [
+          ...expectedProxyFixtureConsumers(tracked),
+          "scripts/test-unrelated-private-key-consumer.mjs",
+        ],
+      ),
+    /referenced only/,
+    "an additional private-key consumer must fail closed",
   );
 };
 
