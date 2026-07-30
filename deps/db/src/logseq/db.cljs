@@ -370,6 +370,8 @@
   [blocks]
   (sort-by :block/order blocks))
 
+(def get-block-direct-full-children common-initial-data/get-block-direct-full-children)
+
 (defn- get-block-and-children-aux
   [entity & {:keys [include-property-block?]
              :or {include-property-block? false}

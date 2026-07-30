@@ -1185,12 +1185,19 @@
     (:db/id entity)))
 
 (defn- block-descendants
-  [entity]
-  (letfn [(collect [block]
-            (mapcat (fn [child]
-                      (cons child (collect child)))
-                    (sort-by :block/order (:block/_parent block))))]
-    (collect entity)))
+  [db entity]
+  (loop [pending (ldb/get-block-direct-full-children db entity)
+         seen-ids #{(:db/id entity)}
+         result []]
+    (if-let [block (first pending)]
+      (if (or (nil? (:db/id block))
+              (contains? seen-ids (:db/id block)))
+        (recur (rest pending) seen-ids result)
+        (recur (concat (ldb/get-block-direct-full-children db block)
+                       (rest pending))
+               (conj seen-ids (:db/id block))
+               (conj result block)))
+      result)))
 
 (defn- retract-entity-op?
   [item]
@@ -1211,7 +1218,7 @@
                 (block-ref? (second item))
                 (block-entity db (second item)))
          (let [root (block-entity db (second item))]
-           (concat (->> (block-descendants root)
+           (concat (->> (block-descendants db root)
                         (remove #(contains? explicit-retracts (:db/id %)))
                         (map (fn [entity]
                                [:db/retractEntity (block-entity-ref entity)])))
