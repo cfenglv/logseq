@@ -778,6 +778,83 @@ let () =
            (sample_auth ~id_token:(Some expired_id_token)
               ~expires_at:Time.max_time ())));
 
+  test
+    "CLI parity auth read derives legacy expiry and keeps explicit expiry authoritative"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-legacy-expiry-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let config = config ~root_dir:root ~auth_path () in
+      let read_auth name =
+        expect_some name
+          (expect_ok name
+             (effect_result name (Auth_state.read_auth_file config)))
+      in
+      try
+        let future_id_token = id_token () in
+        write_file auth_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}"
+             (Js.Json.stringify (Js.Json.string future_id_token)));
+        let future_auth = read_auth "future legacy auth" in
+        expect_int64 "future legacy expiry" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "future legacy expires-at" future_auth.expires_at));
+        expect_bool "future legacy auth is not expired" false
+          (Auth_state.expired_auth future_auth);
+
+        write_file auth_path
+          "{\"id-token\":\"not-a-jwt\",\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"expires-at\":4102444800000}";
+        let explicit_auth = read_auth "explicit expiry auth" in
+        expect_int64 "explicit expiry wins" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "explicit expires-at" explicit_auth.expires_at));
+        expect_bool "explicit future auth is not expired" false
+          (Auth_state.expired_auth explicit_auth);
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
+  test
+    "CLI parity auth read keeps missing malformed and exp-less tokens refreshable"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-legacy-invalid-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let config = config ~root_dir:root ~auth_path () in
+      let read_auth name =
+        expect_some name
+          (expect_ok name
+             (effect_result name (Auth_state.read_auth_file config)))
+      in
+      let expect_refreshable name auth =
+        expect_none (name ^ " expires-at") auth.Auth_state.expires_at;
+        expect_bool (name ^ " is expired") true (Auth_state.expired_auth auth)
+      in
+      try
+        write_file auth_path
+          "{\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\"}";
+        expect_refreshable "missing id-token"
+          (read_auth "missing id-token auth");
+
+        write_file auth_path
+          "{\"id-token\":\"not-a-jwt\",\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\"}";
+        expect_refreshable "malformed id-token"
+          (read_auth "malformed id-token auth");
+
+        let exp_less_id_token =
+          jwt_token "{\"sub\":\"legacy-user\",\"email\":\"legacy@example.com\"}"
+        in
+        write_file auth_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\"}"
+             (Js.Json.stringify (Js.Json.string exp_less_id_token)));
+        expect_refreshable "exp-less id-token"
+          (read_auth "exp-less id-token auth");
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
   test "CLI parity auth read supports old underscore fields and config tokens"
     (fun () ->
       let root = temp_dir "logseq-cli-parity-auth-compat-" in
@@ -1160,6 +1237,66 @@ let () =
             (expect_some "stored id token" stored.id_token);
           expect_equal "stored refresh token" "resolved-refresh-token"
             (expect_some "stored refresh token" stored.refresh_token);
+          remove_tree root;
+          Js.Promise.resolve pass));
+
+  test_promise
+    "CLI parity resolve auth skips refresh for valid legacy jwt and refreshes expired jwt"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-resolve-legacy-expiry-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let request_count = ref 0 in
+      let server =
+        create_server (fun[@u] req res ->
+            if req_method req <> "POST" || req_url req <> "/oauth2/token" then
+              write_json res 404 (error_response "not found")
+            else (
+              request_count := !request_count + 1;
+              write_json res 200
+                (token_response ~sub:"refreshed-user"
+                   ~email:"refreshed@example.com" ())))
+      in
+      with_server server (fun base_url ->
+          let raw_config =
+            Edn_util.map
+              [
+                ( Edn_util.keyword "oauth-token-endpoint",
+                  Edn_util.string (base_url ^ "/oauth2/token") );
+              ]
+          in
+          let config =
+            config ~root_dir:root ~auth_path ~raw_file_config:raw_config ()
+          in
+          let future_id_token = id_token ~sub:"legacy-user" () in
+          write_file auth_path
+            (Printf.sprintf
+               "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}"
+               (Js.Json.stringify (Js.Json.string future_id_token)));
+          let* future_result =
+            effect_to_promise (Auth_state.resolve_auth config)
+          in
+          let future_auth = expect_ok "resolve future legacy auth" future_result in
+          expect_equal "future legacy token preserved" future_id_token
+            (expect_some "future legacy id-token" future_auth.id_token);
+          expect_int "future legacy refresh count" 0 !request_count;
+
+          let expired_id_token =
+            jwt_token
+              "{\"sub\":\"legacy-user\",\"email\":\"legacy@example.com\",\"exp\":0}"
+          in
+          write_file auth_path
+            (Printf.sprintf
+               "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}"
+               (Js.Json.stringify (Js.Json.string expired_id_token)));
+          let* expired_result =
+            effect_to_promise (Auth_state.resolve_auth config)
+          in
+          let expired_auth =
+            expect_ok "resolve expired legacy auth" expired_result
+          in
+          expect_equal "expired legacy token refreshed" "refreshed-user"
+            (expect_some "refreshed legacy sub" expired_auth.sub);
+          expect_int "expired legacy refresh count" 1 !request_count;
           remove_tree root;
           Js.Promise.resolve pass));
 
