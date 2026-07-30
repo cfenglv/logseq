@@ -11472,27 +11472,49 @@
          client-ws))}))
 
 (defn- install-memory-asset-fetch!
-  [assets* requests*]
+  [assets* requests* server-self]
   (fn [url opts]
     (let [method (or (some-> opts .-method) "GET")
-          url* (str url)]
-      (swap! requests* conj {:method method :url url*})
-      (case method
-        "PUT"
-        (let [payload (js/Uint8Array. (.-body opts))]
-          (swap! assets* assoc url* payload)
-          (p/resolved #js {:ok true :status 200}))
+          url* (str url)
+          control-request?
+          (= "/sync/graph-1/checksum/large-title-markers"
+             (.-pathname (js/URL. url*)))
+          request (when control-request?
+                    (js/Request. url* opts))
+          authorization
+          (when request
+            (.get (.-headers request) "authorization"))]
+      (swap! requests* conj
+             (cond-> {:method method :url url*}
+               control-request?
+               (assoc :authorization authorization)))
+      (if control-request?
+        ;; Exercise the production Durable Object route. The public Worker
+        ;; authenticates before forwarding this request; the loopback records
+        ;; and asserts the Authorization header produced by the real client.
+        (if (= "Bearer loopback-token" authorization)
+          (sync-handler/handle-http server-self request)
+          (p/resolved
+           (js/Response.
+            (js/JSON.stringify #js {:error "unauthorized"})
+            #js {:status 401
+                 :headers #js {"content-type" "application/json"}})))
+        (case method
+          "PUT"
+          (let [payload (js/Uint8Array. (.-body opts))]
+            (swap! assets* assoc url* payload)
+            (p/resolved #js {:ok true :status 200}))
 
-        "GET"
-        (if-let [payload (get @assets* url*)]
-          (let [copy (js/Uint8Array. payload)]
-            (p/resolved
-             #js {:ok true
-                  :status 200
-                  :arrayBuffer (fn [] (p/resolved (.-buffer copy)))}))
-          (p/resolved #js {:ok false :status 404}))
+          "GET"
+          (if-let [payload (get @assets* url*)]
+            (let [copy (js/Uint8Array. payload)]
+              (p/resolved
+               #js {:ok true
+                    :status 200
+                    :arrayBuffer (fn [] (p/resolved (.-buffer copy)))}))
+            (p/resolved #js {:ok false :status 404}))
 
-        (p/resolved #js {:ok false :status 405})))))
+          (p/resolved #js {:ok false :status 405}))))))
 
 (defn- open-current-loopback-client!
   []
@@ -11537,6 +11559,7 @@
                          " ack-loss-retry")
         initial-t 2733
         fetch-prev js/fetch
+        worker-state-prev @worker-state/*state
         client-prev @worker-state/*db-sync-client
         config-prev @worker-state/*db-sync-config
         start-inflight-prev @db-sync/*start-inflight
@@ -11550,13 +11573,17 @@
     (reset! worker-state/*db-sync-config
             {:ws-url "wss://sync.example.test/sync/%s"
              :http-base "https://sync.example.test"})
+    (reset! worker-state/*state
+            (assoc worker-state-prev
+                   :auth/id-token "loopback-token"))
     (reset! worker-state/*db-sync-client nil)
     (reset! db-sync/*start-inflight nil)
     (reset! sync-apply/*repo->latest-remote-tx {})
     (reset! sync-apply/*repo->latest-remote-checksum {})
     (reset! sync-apply/*repo->latest-remote-checksum-version {})
     (set! js/fetch
-          (install-memory-asset-fetch! assets* asset-requests*))
+          (install-memory-asset-fetch!
+           assets* asset-requests* server-self))
     (platform/set-platform!
      (assoc (minimal-platform :node)
             :websocket {:connect (:connect loopback)}))
@@ -11680,6 +11707,7 @@
         (db-sync/stop!)
         (reset! worker-state/*db-sync-client client-prev)
         (reset! worker-state/*db-sync-config config-prev)
+        (reset! worker-state/*state worker-state-prev)
         (reset! db-sync/*start-inflight start-inflight-prev)
         (reset! sync-apply/*repo->latest-remote-tx latest-tx-prev)
         (reset! sync-apply/*repo->latest-remote-checksum
@@ -11721,6 +11749,7 @@
                          " existing-marker-split")
         cursor 2734
         fetch-prev js/fetch
+        worker-state-prev @worker-state/*state
         client-prev @worker-state/*db-sync-client
         config-prev @worker-state/*db-sync-config
         start-inflight-prev @db-sync/*start-inflight
@@ -11733,13 +11762,17 @@
     (reset! worker-state/*db-sync-config
             {:ws-url "wss://sync.example.test/sync/%s"
              :http-base "https://sync.example.test"})
+    (reset! worker-state/*state
+            (assoc worker-state-prev
+                   :auth/id-token "loopback-token"))
     (reset! worker-state/*db-sync-client nil)
     (reset! db-sync/*start-inflight nil)
     (reset! sync-apply/*repo->latest-remote-tx {})
     (reset! sync-apply/*repo->latest-remote-checksum {})
     (reset! sync-apply/*repo->latest-remote-checksum-version {})
     (set! js/fetch
-          (install-memory-asset-fetch! assets* asset-requests*))
+          (install-memory-asset-fetch!
+           assets* asset-requests* server-self))
     (platform/set-platform!
      (assoc (minimal-platform :node)
             :websocket {:connect (:connect loopback)}))
@@ -11867,6 +11900,7 @@
         (db-sync/stop!)
         (reset! worker-state/*db-sync-client client-prev)
         (reset! worker-state/*db-sync-config config-prev)
+        (reset! worker-state/*state worker-state-prev)
         (reset! db-sync/*start-inflight start-inflight-prev)
         (reset! sync-apply/*repo->latest-remote-tx latest-tx-prev)
         (reset! sync-apply/*repo->latest-remote-checksum
@@ -11901,7 +11935,8 @@
                         server-legacy
                         local-v2
                         server-v2
-                        asset-requests]}]
+                        asset-requests
+                        client-messages]}]
              (is (= legacy-before-local legacy-before-server)
                  "the fixture must match the observed legacy checksum")
              (is (not= v2-before-local v2-before-server)
@@ -11918,11 +11953,36 @@
              (is (= local-marker server-marker))
              (is (= local-legacy server-legacy))
              (is (= local-v2 server-v2))
-             (is (every?
-                  #(string/includes? (:url %)
-                                     "/assets/graph-1/")
-                  asset-requests)
-                 "recovery may fetch title assets but not snapshots")))
+             (let [marker-state-requests
+                   (filterv
+                    #(string/includes?
+                      (:url %)
+                      "/sync/graph-1/checksum/large-title-markers")
+                    asset-requests)
+                   marker-asset-downloads
+                   (filterv
+                    #(and (= "GET" (:method %))
+                          (string/includes?
+                           (:url %)
+                           "/assets/graph-1/"))
+                    asset-requests)]
+               (is (= 1 (count marker-state-requests))
+                   "recovery must use the additive marker control route")
+               (is (every?
+                    #(= "Bearer loopback-token"
+                        (:authorization %))
+                    marker-state-requests)
+                   "the production client must authenticate marker recovery")
+               (is (= 1 (count marker-asset-downloads))
+                   "recovery must authenticate and verify the server marker payload")
+               (is (not-any?
+                    #(string/includes? (:url %) "/snapshot/")
+                    asset-requests)
+                   "marker recovery must not use snapshot upload/download")
+               (is (not-any?
+                    #(= "tx/batch" (get-in % [:message :type]))
+                    client-messages)
+                   "marker recovery must not mutate the server DB"))))
           (p/catch
            (fn [error]
              (is false (str "unexpected scenario failure: " error))))
@@ -12101,11 +12161,19 @@
                  "the converged marker must still resolve to uploaded ciphertext")
              (is (<= 2 asset-count)
                  "retrying randomized E2EE offload should produce distinct attempts")
-             (is (every?
-                  #(string/includes? (:url %)
-                                     "/assets/graph-1/")
+             (is (not-any?
+                  #(string/includes? (:url %) "/snapshot/")
                   asset-requests)
                  "automatic recovery must not use snapshot upload/download")
+             (is (every?
+                  #(or (not
+                        (string/includes?
+                         (:url %)
+                         "/checksum/large-title-markers"))
+                       (= "Bearer loopback-token"
+                          (:authorization %)))
+                  asset-requests)
+                 "any marker control request must be authenticated")
              (is (some #(= "pull" (get-in % [:message :type]))
                        client-messages)
                  "the reconnect must catch up through the sync protocol")))
