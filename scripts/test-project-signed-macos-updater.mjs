@@ -1004,6 +1004,305 @@ const runIsolatedSignerTreeSelfTest = () => {
   }
 };
 
+const exactProjectSigningAlgorithm = "ed25519-sha512-manifest-v1";
+
+const withIsolatedProductionSigner = (test) => {
+  const tempRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "logseq-isolated-production-signer-"),
+  );
+  try {
+    const sourceRoot = path.join(tempRoot, "source");
+    const workflow = fs.readFileSync(workflowPath, "utf8");
+    const productionSignerPath = discoverSignerPath(workflow);
+    const relativeSignerPath = path.relative(
+      repoRoot,
+      productionSignerPath,
+    );
+    const relativeVerifierPath =
+      "scripts/verify-project-signed-macos-update.mjs";
+    const copyRelativeModuleClosure = (
+      relativePath,
+      seen = new Set(),
+    ) => {
+      if (seen.has(relativePath)) return;
+      seen.add(relativePath);
+      const source = path.join(repoRoot, relativePath);
+      const destination = path.join(sourceRoot, relativePath);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.copyFileSync(source, destination);
+      const sourceText = fs.readFileSync(source, "utf8");
+      for (const match of sourceText.matchAll(
+        /(?:from\s+|import\s*\(\s*)["'](\.[^"']+\.(?:c?js|mjs))["']/g,
+      )) {
+        const dependency = path
+          .normalize(path.join(path.dirname(relativePath), match[1]))
+          .replaceAll(path.sep, "/");
+        copyRelativeModuleClosure(dependency, seen);
+      }
+    };
+    copyRelativeModuleClosure(relativeSignerPath);
+    copyRelativeModuleClosure(relativeVerifierPath);
+
+    const signingKeys = generateKeyPairSync("ed25519");
+    const publicKeyRaw = Buffer.from(
+      signingKeys.publicKey.export({ format: "jwk" }).x,
+      "base64url",
+    );
+    const publicKeyRawBase64 = publicKeyRaw.toString("base64");
+    const fullKeyId = `ed25519:${sha256(publicKeyRaw)}`;
+    const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
+    Object.assign(policy, {
+      algorithm: exactProjectSigningAlgorithm,
+      keyId: fullKeyId,
+      publicKeyBase64: publicKeyRawBase64,
+    });
+    const sourcePolicyPath = path.join(
+      sourceRoot,
+      "resources",
+      "updater",
+      "project-signing-policy.json",
+    );
+    fs.mkdirSync(path.dirname(sourcePolicyPath), { recursive: true });
+    const sourcePolicyText = `${JSON.stringify(policy, null, 2)}\n`;
+    fs.writeFileSync(sourcePolicyPath, sourcePolicyText);
+
+    const privateKeyBase64 = signingKeys.privateKey
+      .export({ format: "der", type: "pkcs8" })
+      .toString("base64");
+    const signingEnvironmentNames = signingVariableNames(workflow);
+    assert.ok(
+      signingEnvironmentNames.length > 0,
+      "release workflow exposes no Ed25519 signing environment",
+    );
+    const signerEnv = { ...process.env };
+    for (const name of signingEnvironmentNames) {
+      signerEnv[name] = privateKeyBase64;
+    }
+
+    const makeFixture = (algorithm, label) => {
+      const destinationRoot = path.join(
+        tempRoot,
+        label.replaceAll(/[^a-z0-9]+/gi, "-"),
+      );
+      const isolated = createIsolatedSignerTree({
+        bundleId: policy.bundleIdentifier,
+        destinationRoot,
+        fullKeyId,
+        payloadDomain: policy.payloadDomain,
+        policyTemplate: { ...policy, algorithm },
+        publicKeyRawBase64,
+        signerPath: path.join(sourceRoot, relativeSignerPath),
+        sourceRoot,
+      });
+      const archive = path.join(destinationRoot, "update.zip");
+      const metadata = path.join(destinationRoot, "latest-mac.yml");
+      const signatureOutput = path.join(
+        destinationRoot,
+        "signature.json",
+      );
+      const archiveBytes = Buffer.from(
+        `isolated production signer ${label}\n`,
+      );
+      fs.writeFileSync(archive, archiveBytes);
+      const sha512 = createHash("sha512")
+        .update(archiveBytes)
+        .digest("base64");
+      fs.writeFileSync(
+        metadata,
+        [
+          "version: 2.0.1-selfhost.6",
+          "files:",
+          "  - url: update.zip",
+          `    sha512: ${sha512}`,
+          `    size: ${archiveBytes.length}`,
+          "path: update.zip",
+          `sha512: ${sha512}`,
+          "",
+        ].join("\n"),
+      );
+      const signerArgs = [
+        isolated.signerPath,
+        "--arch",
+        "arm64",
+        "--version",
+        "2.0.1-selfhost.6",
+        "--archive",
+        archive,
+        "--metadata",
+        metadata,
+        "--signature-output",
+        signatureOutput,
+      ];
+      const verifierArgs = [
+        fs.realpathSync(
+          path.join(destinationRoot, relativeVerifierPath),
+        ),
+        "--arch",
+        "arm64",
+        "--version",
+        "2.0.1-selfhost.6",
+        "--archive",
+        archive,
+        "--metadata",
+        metadata,
+      ];
+      return {
+        algorithm,
+        archive,
+        archiveBytes,
+        isolated,
+        metadata,
+        signatureOutput,
+        signerArgs,
+        verifierArgs,
+      };
+    };
+
+    test({
+      makeFixture,
+      signerEnv,
+    });
+    assert.equal(
+      fs.readFileSync(sourcePolicyPath, "utf8"),
+      sourcePolicyText,
+      "isolated signer contract modified its source policy",
+    );
+  } finally {
+    fs.rmSync(tempRoot, { force: true, recursive: true });
+  }
+};
+
+const runIsolatedSignerAlgorithmRejections = () =>
+  withIsolatedProductionSigner(({ makeFixture, signerEnv }) => {
+    for (const [label, algorithm] of [
+      ["generic", "Ed25519"],
+      ["case-variant", "ED25519-SHA512-MANIFEST-V1"],
+      ["near-match", "ed25519-sha512-manifest-v2"],
+      ["empty", ""],
+    ]) {
+      const fixture = makeFixture(algorithm, label);
+      const metadataBefore = fs.readFileSync(fixture.metadata, "utf8");
+      const result = command(process.execPath, fixture.signerArgs, {
+        allowFailure: true,
+        env: signerEnv,
+      });
+      assert.notEqual(result.status, 0, `${label} algorithm was accepted`);
+      assert.equal(
+        fs.existsSync(fixture.signatureOutput),
+        false,
+        `${label} algorithm emitted a signature`,
+      );
+      assert.equal(
+        fs.readFileSync(fixture.metadata, "utf8"),
+        metadataBefore,
+        `${label} algorithm modified release metadata`,
+      );
+      console.log(
+        `[project-updater] PASS isolated signer algorithm rejection: ${label}`,
+      );
+    }
+  });
+
+const runIsolatedSignerExactAlgorithmRoundTrip = ({
+  exactPolicyControl = false,
+} = {}) =>
+  withIsolatedProductionSigner(({ makeFixture, signerEnv }) => {
+    const fixture = makeFixture(
+      exactProjectSigningAlgorithm,
+      exactPolicyControl
+        ? "exact-policy-signer-verifier-control"
+        : "exact-production-algorithm",
+    );
+    if (exactPolicyControl) {
+      const isolatedPolicy = JSON.parse(
+        fs.readFileSync(fixture.isolated.policyPath, "utf8"),
+      );
+      isolatedPolicy.algorithm = exactProjectSigningAlgorithm;
+      fs.writeFileSync(
+        fixture.isolated.policyPath,
+        `${JSON.stringify(isolatedPolicy, null, 2)}\n`,
+      );
+    }
+    const signed = command(process.execPath, fixture.signerArgs, {
+      allowFailure: true,
+      env: signerEnv,
+    });
+    assert.equal(
+      signed.status,
+      0,
+      `exact production algorithm was rejected:\n${signed.output}`,
+    );
+    assert.equal(
+      fs.existsSync(fixture.signatureOutput),
+      true,
+      "exact production algorithm emitted no detached signature",
+    );
+    assert.equal(
+      JSON.parse(
+        fs.readFileSync(fixture.isolated.policyPath, "utf8"),
+      ).algorithm,
+      exactProjectSigningAlgorithm,
+      "isolated fixture did not preserve the exact production algorithm",
+    );
+    const verified = command(process.execPath, fixture.verifierArgs, {
+      allowFailure: true,
+    });
+    assert.equal(verified.status, 0, verified.output);
+    assert.match(
+      verified.output,
+      /\[project-update-verify\] OK/,
+      "isolated verifier did not execute its CLI entrypoint",
+    );
+    const signedMetadata = fs.readFileSync(fixture.metadata, "utf8");
+
+    fs.appendFileSync(fixture.archive, "tampered");
+    const artifactTamper = command(
+      process.execPath,
+      fixture.verifierArgs,
+      { allowFailure: true },
+    );
+    assert.notEqual(artifactTamper.status, 0, "artifact tamper was accepted");
+    console.log("[project-updater] PASS isolated verifier rejects artifact tamper");
+    fs.writeFileSync(fixture.archive, fixture.archiveBytes);
+
+    const signatureTamper = signedMetadata.replace(
+      /(^  signature: )([A-Za-z0-9+/])/m,
+      (_, prefix, firstCharacter) =>
+        `${prefix}${firstCharacter === "A" ? "B" : "A"}`,
+    );
+    assert.notEqual(signatureTamper, signedMetadata);
+    fs.writeFileSync(fixture.metadata, signatureTamper);
+    const invalidSignature = command(
+      process.execPath,
+      fixture.verifierArgs,
+      { allowFailure: true },
+    );
+    assert.notEqual(
+      invalidSignature.status,
+      0,
+      "signature tamper was accepted",
+    );
+    console.log("[project-updater] PASS isolated verifier rejects signature tamper");
+
+    const metadataTamper = signedMetadata.replace(
+      /^  bundleId: .+$/m,
+      "  bundleId: com.example.tampered",
+    );
+    assert.notEqual(metadataTamper, signedMetadata);
+    fs.writeFileSync(fixture.metadata, metadataTamper);
+    const invalidMetadata = command(
+      process.execPath,
+      fixture.verifierArgs,
+      { allowFailure: true },
+    );
+    assert.notEqual(
+      invalidMetadata.status,
+      0,
+      "signed metadata tamper was accepted",
+    );
+    console.log("[project-updater] PASS isolated verifier rejects metadata tamper");
+  });
+
 const workflowJobSource = (workflow, jobName) => {
   const match = workflow.match(
     new RegExp(
@@ -2964,6 +3263,9 @@ const cases = [];
 const releaseBlockSelfTest = process.argv.includes(
   "--release-block-self-test",
 );
+const isolatedSignerAlgorithmContractSelfTest = process.argv.includes(
+  "--isolated-signer-algorithm-contract",
+);
 
 addCase(cases, "proxy TLS private-key exception is pinned and fail-closed", () => {
   validateTrackedProxyTlsFixture(trackedFiles());
@@ -3325,6 +3627,27 @@ addCase(cases, "isolated signer fixture reaches verified output", () =>
 
 addCase(
   cases,
+  "isolated signer rejects non-production algorithms without output",
+  () => runIsolatedSignerAlgorithmRejections(),
+);
+
+addCase(
+  cases,
+  "exact-policy signer/verifier control rejects tampering",
+  () =>
+    runIsolatedSignerExactAlgorithmRoundTrip({
+      exactPolicyControl: true,
+    }),
+);
+
+addCase(
+  cases,
+  "isolated signer preserves exact production algorithm and rejects tampering",
+  () => runIsolatedSignerExactAlgorithmRoundTrip(),
+);
+
+addCase(
+  cases,
   "native helper is fail-closed, atomic, and rollback-safe",
   async () => runNativeHelperContract(),
 );
@@ -3345,7 +3668,27 @@ addCase(cases, "diagnostics leave user Trust Settings unchanged", () => {
   assert.equal(userTrustSettingsDigest(), initialUserTrustSettingsDigest);
 });
 
-if (releaseBlockSelfTest) {
+if (isolatedSignerAlgorithmContractSelfTest) {
+  cases.splice(0, cases.length);
+  addCase(
+    cases,
+    "isolated signer rejects non-production algorithms without output",
+    () => runIsolatedSignerAlgorithmRejections(),
+  );
+  addCase(
+    cases,
+    "exact-policy signer/verifier control rejects tampering",
+    () =>
+      runIsolatedSignerExactAlgorithmRoundTrip({
+        exactPolicyControl: true,
+      }),
+  );
+  addCase(
+    cases,
+    "isolated signer preserves exact production algorithm and rejects tampering",
+    () => runIsolatedSignerExactAlgorithmRoundTrip(),
+  );
+} else if (releaseBlockSelfTest) {
   cases.splice(0, cases.length);
   addCase(cases, "UNCONFIGURED production signing policy", () => {
     throw new ReleaseBlock(
