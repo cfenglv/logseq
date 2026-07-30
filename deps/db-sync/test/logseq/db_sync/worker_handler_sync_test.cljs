@@ -3931,6 +3931,212 @@
       (is (nil? (d/entity @conn [:block/uuid child-a-uuid])))
       (is (nil? (d/entity @conn [:block/uuid child-b-uuid]))))))
 
+(deftest current-cursor-corrupt-checksum-metadata-is-never-published-test
+  (testing "hello/ack fields and a clean snapshot advertise checksums for the actual frozen DB"
+    (async done
+           (with-memory-sql-async
+             (fn [sql]
+               (storage/init-schema! sql)
+               (let [conn (storage/open-conn sql)
+                     page-uuid (random-uuid)
+                     block-uuid (random-uuid)
+                     _ (d/transact!
+                        conn
+                        [{:block/uuid page-uuid
+                          :block/name "same-cursor-drift-page"
+                          :block/title "Same cursor drift page"}
+                         {:block/uuid block-uuid
+                          :block/title "content remains intact"
+                          :block/page [:block/uuid page-uuid]
+                          :block/parent [:block/uuid page-uuid]
+                          :block/order "a0"}])
+                     self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                               :sql sql
+                               :conn conn
+                               :schema-ready true}
+                     current-t (storage/get-t sql)
+                     expected-legacy
+                     (sync-checksum/recompute-checksum @conn)
+                     expected-versioned
+                     (sync-checksum/recompute-server-checksum @conn)
+                     corrupt-legacy
+                     (if (= expected-legacy "0000000000000000")
+                       "ffffffffffffffff"
+                       "0000000000000000")
+                     corrupt-versioned
+                     (if (= expected-versioned "0000000000000000")
+                       "ffffffffffffffff"
+                       "0000000000000000")
+                     _ (storage/set-checksum! sql corrupt-legacy)
+                     _ (storage/set-server-checksum!
+                        sql corrupt-versioned current-t)
+                     response-fields
+                     (sync-handler/checksum-response-fields self)
+                     {:keys [request url]} (request-url)]
+                 (-> (p/with-redefs
+                       [sync-handler/<ready-for-sync?
+                        (fn [_self _graph-id] (p/resolved true))]
+                       (p/let [response
+                               (sync-handler/handle
+                                {:self self
+                                 :request request
+                                 :url url
+                                 :route {:handler :sync/snapshot-download-v2}})
+                               metadata (json-body response)]
+                         (is (= expected-legacy (:checksum response-fields))
+                             "wire checksum must describe the live DB, not corrupt stored metadata")
+                         (is (= expected-versioned
+                                (:server-checksum response-fields))
+                             "versioned wire checksum must be independently validated at the same cursor")
+                         (is (= sync-checksum/server-checksum-version
+                                (:checksum-version response-fields)))
+                         (is (= expected-legacy (:checksum metadata))
+                             "clean snapshot finalize receives the checksum of its frozen rows")
+                         (is (= current-t (:t metadata)))
+                         (is (= expected-legacy (storage/get-checksum sql))
+                             "validated legacy metadata is persisted for subsequent responses")
+                         (is (= expected-versioned
+                                (storage/get-server-checksum sql))
+                             "validated versioned metadata is persisted for subsequent responses")
+                         (is (= current-t
+                                (storage/get-server-checksum-t sql)))))
+                     (p/then (fn [] (done)))
+                     (p/catch (fn [error]
+                                (is false (str error))
+                                (done))))))))))
+
+(deftest upgrade-from-legacy-metadata-keeps-v1-checksum-and-adds-v2-test
+  (testing "a .4/v1 client keeps its historical checksum while the upgraded server migrates v2 metadata"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              page-uuid (random-uuid)
+              _ (d/transact!
+                 conn
+                 [{:block/uuid page-uuid
+                   :block/name "legacy-upgrade-page"
+                   :block/title "Legacy upgrade page"}])
+              current-t (storage/get-t sql)
+              expected-legacy (sync-checksum/recompute-checksum @conn)
+              expected-versioned
+              (sync-checksum/recompute-server-checksum @conn)
+              _ (storage/set-checksum! sql expected-legacy)
+              _ (storage/set-server-checksum! sql nil current-t)
+              self #js {:sql sql
+                        :conn nil
+                        :schema-ready true}
+              fields (sync-handler/checksum-response-fields self)]
+          (is (= expected-legacy (:checksum fields))
+              "legacy clients must still receive the unchanged v1 field")
+          (is (= sync-checksum/server-checksum-version
+                 (:checksum-version fields)))
+          (is (= expected-versioned (:server-checksum fields))
+              "new clients receive an additive migrated field")
+          (is (= expected-legacy (storage/get-checksum sql))
+              "v2 migration must not rewrite legacy metadata")
+          (is (= current-t (storage/get-server-checksum-t sql))))))))
+
+(deftest rebase-backlog-followed-by-large-delete-keeps-wire-checksums-recomputable-test
+  (testing "thirteen rebases plus one >500-datom delete converge incrementally and after restart"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              page-uuid (random-uuid)
+              parent-uuid (random-uuid)
+              child-uuids (vec (repeatedly 520 random-uuid))
+              _ (d/transact!
+                 conn
+                 (vec
+                  (concat
+                   [{:block/uuid page-uuid
+                     :block/name "backlog-large-delete-page"
+                     :block/title "Backlog large delete page"}
+                    {:block/uuid parent-uuid
+                     :block/title "delete root"
+                     :block/page [:block/uuid page-uuid]
+                     :block/parent [:block/uuid page-uuid]
+                     :block/order "a0"
+                     :block/created-at 1
+                     :block/updated-at 1}]
+                   (map-indexed
+                    (fn [idx child-uuid]
+                      {:block/uuid child-uuid
+                       :block/title (str "delete child " idx)
+                       :block/page [:block/uuid page-uuid]
+                       :block/parent [:block/uuid parent-uuid]
+                       :block/order (str "a" (inc idx))
+                       :block/created-at (+ idx 2)
+                       :block/updated-at (+ idx 2)})
+                    child-uuids))))
+              self #js {:sql sql
+                        :conn conn
+                        :schema-ready true}
+              initial-fields (sync-handler/checksum-response-fields self)
+              t-before (storage/get-t sql)
+              _ (storage/set-checksum!
+                 sql
+                 (if (= "0000000000000000" (:checksum initial-fields))
+                   "ffffffffffffffff"
+                   "0000000000000000"))
+              _ (storage/set-server-checksum!
+                 sql
+                 (if (= "0000000000000000"
+                        (:server-checksum initial-fields))
+                   "ffffffffffffffff"
+                   "0000000000000000")
+                 t-before)
+              rebase-entries
+              (mapv
+               (fn [idx]
+                 {:tx (protocol/tx->transit
+                       [[:db/add [:block/uuid page-uuid]
+                         :block/updated-at
+                         (+ 2000 idx)]])
+                  :tx-id (random-uuid)
+                  :outliner-op :rebase})
+               (range 13))
+              delete-entry
+              {:tx (protocol/tx->transit
+                    [[:db/retractEntity [:block/uuid parent-uuid]]])
+               :tx-id (random-uuid)
+               :outliner-op :delete-blocks}
+              response
+              (with-redefs [ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 self nil (conj rebase-entries delete-entry) t-before))
+              recomputed-legacy
+              (sync-checksum/recompute-checksum @conn)
+              recomputed-versioned
+              (sync-checksum/recompute-server-checksum @conn)
+              restarted-self #js {:sql sql
+                                   :conn nil
+                                   :schema-ready true}
+              restart-fields
+              (sync-handler/checksum-response-fields restarted-self)]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (nil? (d/entity @conn [:block/uuid parent-uuid])))
+          (is (every? nil?
+                      (map #(d/entity @conn [:block/uuid %])
+                           child-uuids)))
+          (is (= recomputed-legacy (:checksum response))
+              "tx/batch/ok must not extend corrupt legacy metadata")
+          (is (= recomputed-versioned (:server-checksum response))
+              "tx/batch/ok must not extend same-cursor corrupt versioned metadata")
+          (is (= recomputed-legacy (storage/get-checksum sql))
+              "incremental legacy metadata must converge")
+          (is (= recomputed-versioned
+                 (storage/get-server-checksum sql))
+              "incremental versioned metadata must converge")
+          (is (= (:t response)
+                 (storage/get-server-checksum-t sql)))
+          (is (= recomputed-legacy (:checksum restart-fields))
+              "restart hello fields must not revive a stale checksum")
+          (is (= recomputed-versioned
+                 (:server-checksum restart-fields))
+              "restart hello fields must not trigger repair-required"))))))
+
 (deftest sync-pull-is-blocked-when-graph-is-not-ready-for-use-test
   (async done
          (let [self #js {:env #js {"DB" :db}

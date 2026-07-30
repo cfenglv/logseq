@@ -3432,6 +3432,114 @@
               (finally
                 (reset! db-sync/*repo->latest-remote-tx latest-prev)))))))))
 
+(deftest upgraded-server-heals-checksum-metadata-before-hello-and-restart-test
+  (testing "server migration prevents false repair-required while preserving strict clients"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          server-storage (make-storage-sql)
+          server-sql (:sql server-storage)
+          server-conn (sync-storage/open-conn server-sql)
+          _ (reset! server-conn @conn)
+          server-self #js {:sql server-sql
+                           :conn server-conn
+                           :schema-ready true}
+          expected-legacy (sync-checksum/recompute-checksum @server-conn)
+          expected-versioned
+          (sync-checksum/recompute-server-checksum @server-conn)
+          wrong-versioned
+          (if (= expected-versioned "0000000000000000")
+            "ffffffffffffffff"
+            "0000000000000000")
+          _ (sync-storage/set-checksum! server-sql expected-legacy)
+          _ (sync-storage/set-server-checksum!
+             server-sql wrong-versioned 0)
+          server-fields (sync-handler/checksum-response-fields server-self)
+          current-client
+          {:repo test-repo
+           :graph-id "graph-1"
+           :inflight (atom [])
+           :online-users (atom [])
+           :ws-state (atom :open)}
+          restarted-client
+          {:repo test-repo
+           :graph-id "graph-1"
+           :inflight (atom [])
+           :online-users (atom [])
+           :ws-state (atom :open)}
+          latest-tx-prev @db-sync/*repo->latest-remote-tx
+          latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+          latest-version-prev @db-sync/*repo->latest-remote-checksum-version]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (reset! db-sync/*repo->latest-remote-tx {})
+          (reset! db-sync/*repo->latest-remote-checksum {})
+          (reset! db-sync/*repo->latest-remote-checksum-version {})
+          (client-op/update-local-tx test-repo 0)
+          (client-op/update-local-checksum
+           test-repo expected-legacy)
+          (client-op/update-local-server-checksum
+           test-repo expected-versioned)
+          (with-redefs [sync-apply/enqueue-flush-pending!
+                        (fn [& _] nil)
+                        sync-assets/enqueue-asset-sync!
+                        (fn [& _] nil)]
+            (try
+              (doseq [[label client message]
+                      [["initial hello"
+                        current-client
+                        (merge {:type "hello" :t 0}
+                               server-fields)]
+                       ["restart hello"
+                        restarted-client
+                        (merge {:type "hello" :t 0}
+                               (sync-handler/checksum-response-fields
+                                #js {:sql server-sql
+                                     :conn nil
+                                     :schema-ready true}))]
+                       [".4 legacy hello"
+                        restarted-client
+                        {:type "hello"
+                         :t 0
+                         :checksum expected-legacy}]]]
+                (let [error
+                      (try
+                        (sync-handle-message/handle-message!
+                         test-repo
+                         client
+                         (js/JSON.stringify (clj->js message)))
+                        nil
+                        (catch :default error
+                          error))]
+                  (is (nil? error)
+                      (str label
+                           " must not enter repair-required: "
+                           (some-> error ex-data pr-str)))))
+              (let [strict-error
+                    (try
+                      (sync-handle-message/handle-message!
+                       test-repo
+                       restarted-client
+                       (js/JSON.stringify
+                        (clj->js
+                         {:type "hello"
+                          :t 0
+                          :checksum expected-legacy
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum wrong-versioned})))
+                      nil
+                      (catch :default error
+                        error))]
+                (is (= :db-sync/checksum-mismatch
+                       (:type (ex-data strict-error)))
+                    "the client remains strict; repair is server-side metadata validation"))
+              (finally
+                (reset! db-sync/*repo->latest-remote-tx latest-tx-prev)
+                (reset! db-sync/*repo->latest-remote-checksum
+                        latest-checksum-prev)
+                (reset! db-sync/*repo->latest-remote-checksum-version
+                        latest-version-prev)))))))))
+
 (defn- v2-large-title-object
   [asset-uuid digest-char]
   {:asset-uuid asset-uuid

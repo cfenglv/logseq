@@ -8,7 +8,10 @@
             [frontend.worker.sync.crypt :as sync-crypt]
             [frontend.worker.sync.download :as sync-download]
             [frontend.worker.sync.log-and-state :as rtc-log-and-state]
+            [logseq.db :as ldb]
+            [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-sync.snapshot :as snapshot]
+            [logseq.db.test.helper :as db-test]
             [promesa.core :as p]))
 
 (defn- frame-bytes
@@ -496,6 +499,124 @@
                (p/finally
                 (fn []
                   (vreset! thread-api/*thread-apis thread-apis-prev)
+                  (done)))))))
+
+(defn- install-finalize-test-state!
+  [repo graph-id import-id conn]
+  (reset! @#'sync-download/*import-state
+          {:aes-key nil
+           :conn conn
+           :graph-e2ee? false
+           :graph-id graph-id
+           :import-id import-id
+           :imported-datoms 0
+           :repo repo
+           :reset? true
+           :rows-imported? false
+           :target-prepared? true}))
+
+(deftest clean-snapshot-finalize-requires-and-accepts-exact-checksum-test
+  (async done
+         (let [repo "clean-finalize-repo"
+               graph-id (str (random-uuid))
+               import-id (str (random-uuid))
+               conn
+               (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "clean snapshot page"}
+                   :blocks [{:block/title "clean snapshot block"}]}]})
+               _ (ldb/transact!
+                  conn
+                  [(ldb/kv :logseq.kv/graph-uuid (uuid graph-id))
+                   (ldb/kv :logseq.kv/graph-remote? true)
+                   (ldb/kv :logseq.kv/graph-rtc-e2ee? false)]
+                  {:persist-op? false})
+               expected-checksum
+               (sync-checksum/recompute-checksum @conn)
+               stored* (atom {})]
+           (install-finalize-test-state!
+            repo graph-id import-id conn)
+           (-> (p/with-redefs
+                 [sync-download/complete-datoms-import!
+                  (fn [_repo _graph-id _remote-tx after-rehydrate-f]
+                    (after-rehydrate-f)
+                    (p/resolved :finalized))
+                  client-op/update-local-checksum
+                  (fn [_repo checksum]
+                    (swap! stored* assoc :legacy checksum))
+                  client-op/update-local-server-checksum
+                  (fn [_repo checksum]
+                    (swap! stored* assoc :versioned checksum))]
+                 (sync-download/finalize-import!
+                  repo graph-id 2734 import-id expected-checksum))
+               (p/then
+                (fn [result]
+                  (is (= :finalized result))
+                  (is (= expected-checksum (:legacy @stored*)))
+                  (is (= (sync-checksum/recompute-server-checksum @conn)
+                         (:versioned @stored*))
+                      "a successful clean download stores the independently recomputed v2 checksum")))
+               (p/catch
+                (fn [error]
+                  (is false (str "clean finalize unexpectedly failed: " error))))
+               (p/finally
+                (fn []
+                  (sync-download/close-import-state-for-repo! repo)
+                  (done)))))))
+
+(deftest clean-snapshot-finalize-never-accepts-mismatch-test
+  (async done
+         (let [repo "strict-finalize-repo"
+               graph-id (str (random-uuid))
+               import-id (str (random-uuid))
+               conn
+               (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "strict snapshot page"}
+                   :blocks [{:block/title "strict snapshot block"}]}]})
+               _ (ldb/transact!
+                  conn
+                  [(ldb/kv :logseq.kv/graph-uuid (uuid graph-id))
+                   (ldb/kv :logseq.kv/graph-remote? true)
+                   (ldb/kv :logseq.kv/graph-rtc-e2ee? false)]
+                  {:persist-op? false})
+               actual-checksum
+               (sync-checksum/recompute-checksum @conn)
+               wrong-checksum
+               (if (= actual-checksum "0000000000000000")
+                 "ffffffffffffffff"
+                 "0000000000000000")]
+           (install-finalize-test-state!
+            repo graph-id import-id conn)
+           (-> (p/with-redefs
+                 [sync-download/complete-datoms-import!
+                  (fn [_repo _graph-id _remote-tx after-rehydrate-f]
+                    (try
+                      (after-rehydrate-f)
+                      (p/resolved :incorrectly-accepted)
+                      (catch :default error
+                        (p/rejected error))))
+                  client-op/update-local-checksum
+                  (fn [& _]
+                    (throw
+                     (ex-info "mismatch must not be persisted"
+                              {:type :test/mismatch-persisted})))]
+                 (sync-download/finalize-import!
+                  repo graph-id 2734 import-id wrong-checksum))
+               (p/then
+                (fn [_]
+                  (is false "checksum mismatch was incorrectly accepted")))
+               (p/catch
+                (fn [error]
+                  (is (= :db-sync/snapshot-checksum-mismatch
+                         (:type (ex-data error))))
+                  (is (= wrong-checksum
+                         (:expected-checksum (ex-data error))))
+                  (is (= actual-checksum
+                         (:actual-checksum (ex-data error))))))
+               (p/finally
+                (fn []
+                  (sync-download/close-import-state-for-repo! repo)
                   (done)))))))
 
 (deftest corrupt-snapshot-is-rejected-before-local-graph-is-replaced-test
