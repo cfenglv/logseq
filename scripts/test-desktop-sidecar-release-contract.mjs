@@ -987,6 +987,62 @@ test("full local preflight invokes the explicit macOS test-helper gate", () => {
   );
 });
 
+test("full local preflight resolves the Electron test preload independent of cwd", () => {
+  const source = fs.readFileSync(preflightPath, "utf8");
+  assert.match(
+    source,
+    /const electronTestPreloadPath = path\.join\(\s*repoRoot,\s*"scripts",\s*"fixtures",\s*"electron-test-preload\.cjs",?\s*\);/,
+    "full preflight does not resolve the Electron test preload from repoRoot",
+  );
+  assert.match(
+    source,
+    /const electronTestPreload\s*=\s*[\s\S]{0,100}preloadCandidate\s*\?\?\s*electronTestPreloadPath/,
+    "full preflight does not select the repo-rooted preload by default",
+  );
+  assert.match(
+    source,
+    /"--require",\s*electronTestPreload,/,
+    "full preflight does not pass the resolved Electron test preload to Node",
+  );
+
+  const temporaryRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "logseq preload contract "),
+  );
+  try {
+    const fixtureDir = path.join(temporaryRoot, "fixture path with spaces");
+    const workingDir = path.join(temporaryRoot, "working directory with spaces");
+    fs.mkdirSync(fixtureDir, { recursive: true });
+    fs.mkdirSync(workingDir, { recursive: true });
+    const copiedPreloadPath = path.join(
+      fixtureDir,
+      "electron-test-preload.cjs",
+    );
+    fs.copyFileSync(
+      path.join(repoRoot, "scripts", "fixtures", "electron-test-preload.cjs"),
+      copiedPreloadPath,
+    );
+
+    const probe = run(
+      process.execPath,
+      [
+        "--require",
+        copiedPreloadPath,
+        "-e",
+        "process.stdout.write('preload-ok')",
+      ],
+      { cwd: workingDir },
+    );
+    assert.equal(
+      probe.status,
+      0,
+      `absolute Electron test preload failed from a different cwd: ${probe.output}`,
+    );
+    assert.equal(probe.output, "preload-ok");
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("formal preflight and CI execute updater source, native, and provider contracts", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
   const sourcePreflight = workflowJob(workflow, "source-preflight");

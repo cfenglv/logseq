@@ -13,6 +13,12 @@ const repoRoot = path.resolve(
 );
 const allowDirty = process.argv.includes("--allow-dirty");
 const cliDir = path.join(repoRoot, "cli");
+const electronTestPreloadPath = path.join(
+  repoRoot,
+  "scripts",
+  "fixtures",
+  "electron-test-preload.cjs",
+);
 const electronTestPreloadProbe =
   "--electron-test-preload-contract-probe";
 const probeIndex = process.argv.indexOf(electronTestPreloadProbe);
@@ -32,7 +38,7 @@ if (preloadCandidateIndex !== -1 && probeIndex === -1) {
   );
 }
 const electronTestPreload =
-  preloadCandidate ?? "scripts/fixtures/electron-test-preload.cjs";
+  preloadCandidate ?? electronTestPreloadPath;
 const electronTestInvocationFor = (testBundle, namespaceFilter) => ({
   args: [
     "--require",
