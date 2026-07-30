@@ -175,9 +175,13 @@ test("space-containing repository path remains one shell-free argv item", () => 
       "space-containing repository",
     );
     const selectedPreload = requireArgument(invocation);
+    const canonicalRoot = fs.realpathSync(root);
     assert.match(selectedPreload, / /, "preload path fixture has no space");
-    assert.equal(invocation.cwd, root);
-    assertTrackedRegularPreload(root, selectedPreload);
+    assert.equal(
+      fs.realpathSync(invocation.cwd),
+      canonicalRoot,
+    );
+    assertTrackedRegularPreload(canonicalRoot, selectedPreload);
     executeSelectedPreload(
       invocation,
       os.tmpdir(),
