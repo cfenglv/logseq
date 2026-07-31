@@ -12838,8 +12838,19 @@
                                             (str "ciphertext-nonce-"
                                                  nonce "-" idx)))
                                    (range)
-                                   tx-data))))]
-                       (p/let [_ (#'sync-apply/flush-pending! repo client)
+                                   tx-data))))
+                        sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                        sync-assets/enqueue-asset-sync! (fn [& _] nil)
+                        shared-service/broadcast-to-clients! (fn [& _] nil)]
+                       (p/let [_ (sync-handle-message/handle-message!
+                                  repo client
+                                  (js/JSON.stringify
+                                   (clj->js
+                                    {:type "hello"
+                                     :t 0
+                                     :capabilities
+                                     ["tx-upload-staged-v1"]})))
+                               _ (#'sync-apply/flush-pending! repo client)
                                first-wire (first @sent)
                                _ (do
                                    (sync-apply/clear-upload-response-timeout! client)
