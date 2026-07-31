@@ -121,6 +121,8 @@
     (assert! (< max-old-generation-used (* 128 1024 1024))
              (str "observed V8 old generation reached 128 MiB: "
                   max-old-generation-used))
+    (assert! (< max-heap-used (* 128 1024 1024))
+             (str "observed V8 heapUsed reached 128 MiB: " max-heap-used))
     (assert! (< max-heap-used heap-limit)
              (str "observed V8 heapUsed reached runtime heap limit: " heap-limit))
     (doseq [sample samples]
