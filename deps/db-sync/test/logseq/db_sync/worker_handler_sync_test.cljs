@@ -5284,6 +5284,7 @@
             full-tx [[:db/add [:block/uuid block-uuid] :block/title "chunk-0"]
                      [:db/add [:block/uuid block-uuid] :block/updated-at 1]
                      [:db/add [:block/uuid block-uuid] :block/title "bad-gap"]]
+            t-before (storage/get-t sql)
             first-response
             (apply-identified-entry!
              self
@@ -5294,7 +5295,7 @@
                :chunk-index 0
                :chunk-final? false}))]
         (is (= "tx/batch/ok" (:type first-response)))
-        (is (= 0 (:t first-response)))
+        (is (= t-before (:t first-response)))
         (assert-rejected-without-graph-change!
          self conn
          (modern-session-entry
@@ -5416,9 +5417,7 @@
                       :full-tx-data full-tx
                       :chunk-tx-data [(nth full-tx 2)]
                       :chunk-index 2
-                      :chunk-final? true})
-            response-2 (apply-identified-entry! self final-2)
-            final-retry (apply-identified-entry! self final-2)]
+                      :chunk-final? true})]
         (is (= "tx/batch/ok" (:type response-0)))
         (is (= "tx/batch/ok" (:type retry-0)))
         (is (= t-before (:t response-0) (:t retry-0))
@@ -5430,18 +5429,20 @@
             "all nonfinal chunks leave t unchanged")
         (is (= graph-before (sync-checksum/recompute-server-checksum @conn))
             "all nonfinal chunks leave the graph unchanged")
-        (is (= "tx/batch/ok" (:type response-2)))
-        (is (= (inc t-before) (:t response-2))
-            "the final chunk commits the logical transaction once")
-        (is (= (sync-checksum/recompute-server-checksum @expected-conn)
-               (sync-checksum/recompute-server-checksum @conn))
-            "final commit atomically applies the full staged transaction")
-        (is (= "final-2"
-               (:block/title
-                (d/entity @conn [:block/uuid block-uuid]))))
-        (is (= "tx/batch/ok" (:type final-retry)))
-        (is (= (:t response-2) (:t final-retry))
-            "an ACK-loss retry of the final chunk does not reapply it")))))
+        (let [response-2 (apply-identified-entry! self final-2)
+              final-retry (apply-identified-entry! self final-2)]
+          (is (= "tx/batch/ok" (:type response-2)))
+          (is (= (inc t-before) (:t response-2))
+              "the final chunk commits the logical transaction once")
+          (is (= (sync-checksum/recompute-server-checksum @expected-conn)
+                 (sync-checksum/recompute-server-checksum @conn))
+              "final commit atomically applies the full staged transaction")
+          (is (= "final-2"
+                 (:block/title
+                  (d/entity @conn [:block/uuid block-uuid]))))
+          (is (= "tx/batch/ok" (:type final-retry)))
+          (is (= (:t response-2) (:t final-retry))
+              "an ACK-loss retry of the final chunk does not reapply it"))))))
 
 (deftest snapshot-reset-clears-incomplete-logical-chunk-session-test
   (with-memory-sql
