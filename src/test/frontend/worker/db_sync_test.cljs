@@ -13475,3 +13475,315 @@
                  (.close (:sql server-seed-storage))
                  (.close (:sql server-storage))
                  (done))))))))
+
+(defn- write-client-upload-session!
+  [^js client-ops-db logical-tx-id session-data]
+  (let [^js stmt
+        (.prepare
+         client-ops-db
+         (str "insert into client_tx_upload_state "
+              "(logical_tx_id, session_data, updated_at) values (?, ?, ?) "
+              "on conflict(logical_tx_id) do update set "
+              "session_data = excluded.session_data, "
+              "updated_at = excluded.updated_at"))]
+    (.run stmt
+          (str logical-tx-id)
+          (sqlite-util/write-transit-str session-data)
+          1)))
+
+(defn- read-client-upload-session
+  [client-ops-db logical-tx-id]
+  (some-> (sqlite-get-row
+           client-ops-db
+           (str "select session_data from client_tx_upload_state "
+                "where logical_tx_id = ? limit 1")
+           (str logical-tx-id))
+          (aget "session_data")
+          sqlite-util/read-transit-str))
+
+(defn- cursor-restart-test-tx
+  [block-uuid]
+  (mapv (fn [idx]
+          [:db/add [:block/uuid block-uuid]
+           :block/title (str "cursor-restart-" idx)])
+        (range 5001)))
+
+(deftest cold-client-rebuilds-every-invalid-persisted-upload-cursor-shape-test
+  (testing "legacy, partial, negative, and non-integral cursor state restarts from source zero and ordinal zero"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          repo test-repo
+          logical-tx-id (random-uuid)
+          tx-data (cursor-restart-test-tx (:block/uuid child1))
+          pending {:tx-id logical-tx-id
+                   :tx tx-data
+                   :outliner-op :save-block}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           repo
+           [{:db-sync/tx-id logical-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op :save-block
+             :db-sync/normalized-tx-data tx-data}])
+          (clear-all-process-upload-state!)
+          (sync-apply/prepare-upload-tx-entries repo conn [pending])
+          (let [valid-session (read-client-upload-session
+                               client-ops-conn logical-tx-id)
+                source-digest (:source-digest valid-session)
+                invalid-sessions
+                [["legacy next-index only"
+                  {:source-digest source-digest
+                   :next-index 5000}]
+                 ["missing source cursor"
+                  (dissoc valid-session :source-next-index)]
+                 ["missing ordinal cursor"
+                  (dissoc valid-session :chunk-seq)]
+                 ["negative source cursor"
+                  (assoc valid-session :source-next-index -1)]
+                 ["negative ordinal cursor"
+                  (assoc valid-session :chunk-seq -1)]
+                 ["fractional source cursor"
+                  (assoc valid-session :source-next-index 0.5)]
+                 ["string ordinal cursor"
+                  (assoc valid-session :chunk-seq "0")]]]
+            (is (string? source-digest)
+                "the control session must expose the current source digest")
+            (is (some? (:source-next-index valid-session))
+                "the current durable shape has an explicit source cursor")
+            (is (some? (:chunk-seq valid-session))
+                "the current durable shape has an explicit wire ordinal")
+            (doseq [[label invalid-session] invalid-sessions]
+              (testing label
+                (write-client-upload-session!
+                 client-ops-conn logical-tx-id invalid-session)
+                (clear-all-process-upload-state!)
+                (let [entry
+                      (-> (sync-apply/prepare-upload-tx-entries
+                           repo conn [pending])
+                          :tx-entries first)
+                      rebuilt-session
+                      (read-client-upload-session
+                       client-ops-conn logical-tx-id)]
+                  (is (= 0 (:chunk-index entry))
+                      "invalid durable state must never leak a nil/stale ordinal")
+                  (is (false? (:chunk-final? entry)))
+                  (is (= 5000 (count (:tx-data entry))))
+                  (is (= (first tx-data) (first (:tx-data entry)))
+                      "rebuilt upload starts at source index zero")
+                  (is (= (nth tx-data 4999) (last (:tx-data entry)))
+                      "rebuilt first chunk ends at the expected source boundary")
+                  (is (= source-digest (:source-digest rebuilt-session)))
+                  (is (= 0 (:source-next-index rebuilt-session)))
+                  (is (= 0 (:chunk-seq rebuilt-session)))
+                  (is (not (contains? rebuilt-session :next-index))
+                      "legacy positional cursor is discarded, not migrated ambiguously"))))))))))
+
+(defn- shared-tempid-5001-tx
+  [tempid block-uuid]
+  (into [[:db/add tempid :block/uuid block-uuid]]
+        (map (fn [idx]
+               [:db/add tempid
+                (keyword "large-upload.group" (str "attr-" idx))
+                idx])
+             (range 5000))))
+
+(deftest e2e-shared-tempid-group-uses-empty-final-and-retries-it-after-cold-ack-loss-test
+  (testing "real client and strict server preserve an indivisible 5001-datom group behind an empty final terminator"
+    (async done
+           (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+                 repo test-repo
+                 logical-tx-id (random-uuid)
+                 block-uuid (random-uuid)
+                 logical-tx (shared-tempid-5001-tx
+                             "shared-tempid-empty-final" block-uuid)
+                 server-seed-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-seed-storage))
+                 _ (d/conn-from-datoms
+                    (d/datoms @conn :eavt)
+                    (d/schema @conn)
+                    {:storage
+                     (sync-storage/new-sqlite-storage
+                      (:sql server-seed-storage))})
+                 server-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-storage))
+                 _ (#'sync-handler/import-snapshot-rows!
+                    (:sql server-storage)
+                    "kvs"
+                    (real-kvs-rows (:sql server-seed-storage)))
+                 server-conn (sync-storage/open-conn (:sql server-storage))
+                 server-self #js {:sql (:sql server-storage)
+                                  :conn server-conn
+                                  :schema-ready false}
+                 server-t0 (sync-handler/t-now server-self)
+                 server-checksum0
+                 (sync-checksum/recompute-server-checksum @server-conn)
+                 server-response* (atom nil)
+                 server-ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [raw]
+                                            (reset! server-response* raw))))
+                 _ (d/transact! conn logical-tx)
+                 expected-checksum
+                 (sync-checksum/recompute-server-checksum @conn)
+                 first-sent* (atom [])
+                 second-sent* (atom [])
+                 first-client (manual-modern-client repo first-sent*)]
+             (sync-storage/set-t! (:sql server-storage) server-t0)
+             (->
+              (with-datascript-conns
+                conn client-ops-conn
+                (fn []
+                  (client-op/update-graph-uuid repo "graph-1")
+                  (client-op/update-local-tx repo server-t0)
+                  (client-op/update-local-checksum
+                   repo (sync-checksum/recompute-checksum @conn))
+                  (client-op/update-local-server-checksum
+                   repo expected-checksum)
+                  (seed-client-op-txs!
+                   repo
+                   [{:db-sync/tx-id logical-tx-id
+                     :db-sync/pending? true
+                     :db-sync/created-at 1
+                     :db-sync/outliner-op :save-block
+                     :db-sync/normalized-tx-data logical-tx}])
+                  (reset! sync-apply/*repo->latest-remote-tx {repo server-t0})
+                  (let [pending {:tx-id logical-tx-id
+                                 :tx logical-tx
+                                 :outliner-op :save-block}]
+                    ;; Build a valid current record only to obtain its exact
+                    ;; source digest, then replace it with the old persisted
+                    ;; shape and discard every process-local generation/cache.
+                    (sync-apply/prepare-upload-tx-entries repo conn [pending])
+                    (let [source-digest
+                          (:source-digest
+                           (read-client-upload-session
+                            client-ops-conn logical-tx-id))]
+                      (is (string? source-digest))
+                      (write-client-upload-session!
+                       client-ops-conn logical-tx-id
+                       {:source-digest source-digest
+                        :next-index 5000})
+                      (clear-all-process-upload-state!))
+                    (p/with-redefs
+                      [worker-state/online? (constantly true)
+                       sync-crypt/graph-e2ee? (constantly false)
+                       shared-service/broadcast-to-clients! (fn [& _] nil)
+                       sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                      (p/let [_ (<observe-real-server-hello!
+                                repo first-client server-self server-ws
+                                server-response*)
+                              first-exchange
+                              (<exchange-one-real-upload!
+                               repo first-client first-sent*
+                               server-self server-ws server-response* true)
+                              first-entry (-> first-exchange :request :txs first)
+                              first-wire-tx
+                              (sync-protocol/transit->tx (:tx first-entry))
+                              _ (do
+                                  (is (= 0 (:chunk-index first-entry)))
+                                  (is (false? (:chunk-final? first-entry)))
+                                  (is (= 5001 (count first-wire-tx)))
+                                  (is (= (test-sha256-hex
+                                          (sync-protocol/tx->transit logical-tx))
+                                         (test-sha256-hex
+                                          (sync-protocol/tx->transit first-wire-tx)))
+                                      "ordinal zero carries the indivisible group intact")
+                                  (is (= "tx/batch/ok"
+                                         (-> first-exchange :response :type)))
+                                  (is (= server-t0
+                                         (sync-handler/t-now server-self)))
+                                  (is (= server-checksum0
+                                         (sync-checksum/recompute-server-checksum
+                                          @server-conn)))
+                                  (is (nil? (d/entity @server-conn
+                                                      [:block/uuid block-uuid])))
+                                  (is (= 1
+                                         (client-op/get-pending-local-tx-count
+                                          repo))))
+                              final-attempt
+                              (<exchange-one-real-upload!
+                               repo first-client first-sent*
+                               server-self server-ws server-response* false)
+                              final-entry (-> final-attempt :request :txs first)
+                              _ (do
+                                  (is (= 1 (:chunk-index final-entry)))
+                                  (is (true? (:chunk-final? final-entry)))
+                                  (is (empty?
+                                       (sync-protocol/transit->tx
+                                        (:tx final-entry)))
+                                      "ordinal one is the explicit empty terminator")
+                                  (is (= "tx/batch/ok"
+                                         (-> final-attempt :response :type)))
+                                  (is (= (inc server-t0)
+                                         (sync-handler/t-now server-self)))
+                                  (is (= expected-checksum
+                                         (sync-checksum/recompute-server-checksum
+                                          @server-conn)
+                                         (sync-storage/get-checksum
+                                          (:sql server-storage))))
+                                  (let [server-entity
+                                        (d/entity @server-conn
+                                                  [:block/uuid block-uuid])]
+                                    (is (some? server-entity))
+                                    (is (= 5001
+                                           (count
+                                            (d/datoms @server-conn :eavt
+                                                      (:db/id server-entity))))
+                                        "all 5001 staged datoms become visible together"))
+                                  (is (= 1
+                                         (client-op/get-pending-local-tx-count
+                                          repo))
+                                      "lost final ACK leaves the logical op pending"))
+                              _ (do
+                                  (sync-apply/clear-upload-response-timeout!
+                                   first-client)
+                                  (reset! (:inflight first-client) [])
+                                  (clear-all-process-upload-state!))
+                              second-client
+                              (manual-modern-client repo second-sent*)
+                              _ (<observe-real-server-hello!
+                                 repo second-client server-self server-ws
+                                 server-response*)
+                              pull-raw
+                              (sync-protocol/encode-message
+                               (sync-handler/pull-response server-self server-t0))
+                              _ (p/with-redefs
+                                  [sync-apply/enqueue-flush-pending!
+                                   (fn [& _] nil)
+                                   sync-assets/enqueue-asset-sync!
+                                   (fn [& _] nil)
+                                   shared-service/broadcast-to-clients!
+                                   (fn [& _] nil)]
+                                  (sync-handle-message/handle-message!
+                                   repo second-client pull-raw))
+                              _ (reset! second-sent* [])
+                              completed-retry
+                              (<exchange-one-real-upload!
+                               repo second-client second-sent*
+                               server-self server-ws server-response* true)]
+                        (is (= final-entry
+                               (-> completed-retry :request :txs first))
+                            "cold restart retries the identical empty final wire entry")
+                        (is (= "tx/batch/ok"
+                               (-> completed-retry :response :type)))
+                        (is (zero?
+                             (client-op/get-pending-local-tx-count repo)))
+                        (is (= (inc server-t0)
+                               (sync-handler/t-now server-self)))
+                        (is (= expected-checksum
+                               (sync-checksum/recompute-server-checksum
+                                @server-conn))))))))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (doseq [client [first-client
+                                 @worker-state/*db-sync-client]]
+                   (when (map? client)
+                     (sync-apply/clear-upload-response-timeout! client)))
+                 (clear-all-process-upload-state!)
+                 (.close (:sql server-seed-storage))
+                 (.close (:sql server-storage))
+                 (done))))))))

@@ -5410,6 +5410,68 @@
            :chunk-final? true})
          block-uuid "before")))))
 
+(deftest active-modern-session-accepts-empty-final-terminator-test
+  (testing "only an already-active contiguous session may finish with an empty wire chunk"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              logical-id (random-uuid)
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "empty-final-terminator"
+                                    :block/title "before"}])
+              full-tx [[:db/add [:block/uuid block-uuid]
+                        :block/title "after"]
+                       [:db/add [:block/uuid block-uuid]
+                        :block/updated-at 77]]
+              expected-conn (d/conn-from-db @conn)
+              _ (d/transact! expected-conn full-tx)
+              t-before (storage/get-t sql)
+              checksum-before (storage/get-checksum sql)
+              graph-before (sync-checksum/recompute-server-checksum @conn)
+              chunk-0 (modern-session-entry
+                       {:logical-tx-id logical-id
+                        :full-tx-data full-tx
+                        :chunk-tx-data full-tx
+                        :chunk-index 0
+                        :chunk-final? false})
+              empty-final-1 (modern-session-entry
+                             {:logical-tx-id logical-id
+                              :full-tx-data full-tx
+                              :chunk-tx-data []
+                              :chunk-index 1
+                              :chunk-final? true})
+              empty-final-first (modern-session-entry
+                                 {:logical-tx-id (random-uuid)
+                                  :full-tx-data full-tx
+                                  :chunk-tx-data []
+                                  :chunk-index 0
+                                  :chunk-final? true})
+              first-response (apply-identified-entry! self chunk-0)]
+          (is (= "tx/batch/ok" (:type first-response)))
+          (is (= t-before (:t first-response) (storage/get-t sql)))
+          (is (= checksum-before (storage/get-checksum sql)))
+          (is (= graph-before
+                 (sync-checksum/recompute-server-checksum @conn)))
+          (assert-rejected-without-graph-change!
+           self conn empty-final-first block-uuid "before")
+          (let [final-response (apply-identified-entry! self empty-final-1)
+                fresh-conn (storage/open-conn sql)]
+            (is (= "tx/batch/ok" (:type final-response)))
+            (is (= (inc t-before)
+                   (:t final-response)
+                   (storage/get-t sql)))
+            (is (= (sync-checksum/recompute-server-checksum @expected-conn)
+                   (sync-checksum/recompute-server-checksum @conn)
+                   (sync-checksum/recompute-server-checksum @fresh-conn)))
+            (is (= "after"
+                   (:block/title
+                    (d/entity @conn [:block/uuid block-uuid]))
+                   (:block/title
+                    (d/entity @fresh-conn [:block/uuid block-uuid]))))))))))
+
 (deftest logical-chunk-session-rejects-second-final-and-post-completion-chunk-test
   (doseq [post-entry-final? [true false]]
     (testing (if post-entry-final?
