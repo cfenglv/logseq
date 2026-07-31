@@ -836,12 +836,28 @@ assert.equal(
   0,
   "workflow steps should use the complete finalized-release verifier",
 );
+for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
+  assert.equal(
+    workflowJob(desktopReleaseWorkflow, jobName).match(
+      /verify-unsigned-macos-project-update-candidate\.mjs/g,
+    )?.length,
+    1,
+    `${jobName} should verify its unsigned candidate metadata exactly once`,
+  );
+}
+assert.equal(
+  workflowJob(desktopReleaseWorkflow, "selfhost-release-signing").match(
+    /verify-unsigned-macos-project-update-candidate\.mjs/g,
+  )?.length,
+  1,
+  "the protected signer should independently reverify both macOS candidates",
+);
 assert.equal(
   desktopReleaseWorkflow.match(
     /verify-unsigned-macos-project-update-candidate\.mjs/g,
   )?.length,
-  2,
-  "both macOS builders should verify their unsigned candidate metadata",
+  3,
+  "only both macOS builders and the protected signer should verify unsigned candidates",
 );
 assert.match(
   desktopReleaseWorkflow,
