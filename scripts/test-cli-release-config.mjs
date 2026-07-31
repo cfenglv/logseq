@@ -198,6 +198,9 @@ const macosUpdaterSignaturePolicy = readText(
 const projectSignedMacosUpdaterVerifier = readText(
   "scripts/verify-project-signed-macos-update.mjs",
 );
+const localProjectUpdateSigningContract = readText(
+  "scripts/test-local-project-update-signing-contract.mjs",
+);
 const macosUpdaterBaseline = readJson(
   "scripts/fixtures/macos-updater-baseline.json",
 );
@@ -807,10 +810,10 @@ assert.equal(
   2,
   "both macOS builders should embed the project updater helper",
 );
-assert.match(
+assert.doesNotMatch(
   desktopReleaseWorkflow,
   /LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64/,
-  "the macOS release gate should require the external project signing key",
+  "the macOS candidate workflow must not consume the local signing key",
 );
 assert.equal(
   desktopReleaseWorkflow.match(
@@ -822,16 +825,38 @@ assert.equal(
 assert.equal(
   desktopReleaseWorkflow.match(
     /sign-macos-project-update\.mjs/g,
-  )?.length,
-  2,
-  "both macOS builders should sign the project update manifest",
+  )?.length ?? 0,
+  0,
+  "CI must not invoke the local project update signer",
 );
 assert.equal(
   desktopReleaseWorkflow.match(
     /verify-project-signed-macos-update\.mjs/g,
+  )?.length ?? 0,
+  0,
+  "CI must not claim to verify a project signature it cannot create",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /verify-unsigned-macos-project-update-candidate\.mjs/g,
   )?.length,
   2,
-  "both macOS builders should verify the signed manifest against the ZIP",
+  "both macOS builders should verify their unsigned candidate metadata",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /nightly-release:[\s\S]{0,260}!contains\(needs\.release-assets-preflight\.outputs\.version,\s*'-selfhost\.'\)/,
+  "nightly release job must not publish unsigned selfhost metadata",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /release:[\s\S]{0,260}!contains\(needs\.release-assets-preflight\.outputs\.version,\s*'-selfhost\.'\)/,
+  "stable/beta release job must not publish unsigned selfhost metadata",
+);
+assert.match(
+  localProjectUpdateSigningContract,
+  /local macOS publisher only|refuses CI/,
+  "local signing contract must exercise the CI release block",
 );
 assert.doesNotMatch(
   desktopReleaseWorkflow,

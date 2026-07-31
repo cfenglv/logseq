@@ -1,127 +1,128 @@
 #!/usr/bin/env node
 
-import {
-  createPrivateKey,
-  createPublicKey,
-  createHash,
-  sign,
-} from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  projectUpdateAlgorithm,
-  projectUpdateBundleIdentifier,
-  projectUpdateKeyId,
-  projectUpdatePayload,
+  loadProjectSigningPolicy,
   parseSelfhostProjectVersion,
-} from "./project-update-signing.mjs";
+} from "../resources/project-updater-signature.mjs";
+import {
+  assertLocalMacosProjectUpdatePublisher,
+  loadProjectUpdateSigningKey,
+} from "./project-update-keychain.mjs";
+import { createProjectUpdateSignature } from "./project-update-signer-core.mjs";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const values = new Map();
-for (let index = 2; index < process.argv.length; index += 2) {
-  const key = process.argv[index];
-  const value = process.argv[index + 1];
-  if (!key?.startsWith("--") || !value) {
-    throw new Error(`invalid argument near ${key || "<end>"}`);
+const parseArgs = (argv) => {
+  const values = new Map();
+  for (let index = 0; index < argv.length; index += 2) {
+    const key = argv[index];
+    const value = argv[index + 1];
+    if (!key?.startsWith("--") || !value || values.has(key)) {
+      throw new Error(`invalid or duplicate argument near ${key || "<end>"}`);
+    }
+    values.set(key, value);
   }
-  if (values.has(key)) throw new Error(`duplicate ${key}`);
-  values.set(key, value);
-}
-const required = (key) => {
-  const value = values.get(key);
-  if (!value) throw new Error(`missing ${key}`);
-  return value;
+  const required = (key) => {
+    const value = values.get(key);
+    if (!value) throw new Error(`missing ${key}`);
+    return value;
+  };
+  return Object.freeze({
+    arch: required("--arch"),
+    archive: path.resolve(required("--archive")),
+    metadata: path.resolve(required("--metadata")),
+    signatureOutput: values.get("--signature-output")
+      ? path.resolve(values.get("--signature-output"))
+      : undefined,
+    version: required("--version"),
+  });
 };
-const arch = required("--arch");
-const version = required("--version");
-const archive = path.resolve(required("--archive"));
-const metadata = path.resolve(required("--metadata"));
-if (!["arm64", "x64"].includes(arch)) throw new Error("unsupported architecture");
-parseSelfhostProjectVersion(version);
-const privateKeyBase64 =
-  process.env.LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64?.trim();
-if (!privateKeyBase64) {
-  throw new Error(
-    "missing LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64; signing is fail-closed",
-  );
-}
-const privateKey = createPrivateKey({
-  key: Buffer.from(privateKeyBase64, "base64"),
-  format: "der",
-  type: "pkcs8",
-});
-if (privateKey.asymmetricKeyType !== "ed25519") {
-  throw new Error("project update private key must be Ed25519 PKCS#8 DER");
-}
-const publicKey = createPublicKey(privateKey);
-const spki = publicKey.export({ format: "der", type: "spki" });
-const rawPublicKey = spki.subarray(-32);
-const publicManifest = JSON.parse(
-  fs.readFileSync(
-    path.join(
-      repoRoot,
-      "resources",
-      "updater",
-      "project-signing-policy.json",
-    ),
-    "utf8",
-  ),
-);
-if (
-  publicManifest.algorithm !== projectUpdateAlgorithm ||
-  rawPublicKey.toString("base64") !== publicManifest.publicKeyBase64 ||
-  projectUpdateKeyId(rawPublicKey) !== publicManifest.keyId
-) {
-  throw new Error("private key does not match the fixed project update public key");
-}
 
-const archiveHash = createHash("sha512");
-let size = 0;
-for await (const chunk of fs.createReadStream(archive)) {
-  size += chunk.length;
-  archiveHash.update(chunk);
-}
-const sha512 = archiveHash.digest("hex");
-const payload = projectUpdatePayload({ arch, sha512, size, version });
-const signature = sign(null, Buffer.from(payload), privateKey).toString("base64");
-const block = [
-  "projectUpdateSignature:",
-  `  algorithm: ${projectUpdateAlgorithm}`,
-  `  keyId: ${publicManifest.keyId}`,
-  `  bundleId: ${projectUpdateBundleIdentifier}`,
-  `  version: ${version}`,
-  `  arch: ${arch}`,
-  `  zipSize: '${size}'`,
-  `  zipSha512: ${sha512}`,
-  `  signature: ${signature}`,
-  "",
-].join("\n");
-const currentMetadata = fs.readFileSync(metadata, "utf8");
-if (/^projectUpdateSignature:/m.test(currentMetadata)) {
-  throw new Error("metadata already contains a project update signature");
-}
-fs.appendFileSync(metadata, block);
-const signatureOutput = values.get("--signature-output");
-if (signatureOutput) {
-  fs.writeFileSync(
-    path.resolve(signatureOutput),
-    `${JSON.stringify(
-      {
-        algorithm: projectUpdateAlgorithm,
-        arch,
-        bundleId: projectUpdateBundleIdentifier,
-        keyId: publicManifest.keyId,
-        sha512,
-        signature,
-        size: String(size),
-        version,
-      },
-      null,
-      2,
-    )}\n`,
+const atomicWrite = (destination, contents) => {
+  const temporary = path.join(
+    path.dirname(destination),
+    `.${path.basename(destination)}.${process.pid}.tmp`,
   );
+  try {
+    fs.writeFileSync(temporary, contents, {
+      flag: "wx",
+      mode: fs.statSync(destination).mode,
+    });
+    fs.renameSync(temporary, destination);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+};
+
+export const signMacosProjectUpdate = async ({
+  arch,
+  archive,
+  metadata,
+  privateKey,
+  policy,
+  signatureOutput,
+  version,
+}) => {
+  const result = await createProjectUpdateSignature({
+    arch,
+    archive,
+    metadata,
+    policy,
+    privateKey,
+    version,
+  });
+  if (signatureOutput) {
+    fs.writeFileSync(
+      signatureOutput,
+      `${JSON.stringify(
+        {
+          algorithm: policy.algorithm,
+          arch,
+          bundleId: policy.bundleIdentifier,
+          keyId: policy.keyId,
+          sha512: result.sha512,
+          signature: result.signature,
+          size: result.size,
+          version,
+        },
+        null,
+        2,
+      )}\n`,
+      { flag: "wx", mode: 0o644 },
+    );
+  }
+  atomicWrite(metadata, result.metadata);
+  return result;
+};
+
+const isEntrypoint =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isEntrypoint) {
+  try {
+    const args = parseArgs(process.argv.slice(2));
+    if (!["arm64", "x64"].includes(args.arch)) {
+      throw new Error("unsupported architecture");
+    }
+    parseSelfhostProjectVersion(args.version);
+    assertLocalMacosProjectUpdatePublisher();
+    const policy = loadProjectSigningPolicy();
+    const privateKey = loadProjectUpdateSigningKey(policy);
+    const result = await signMacosProjectUpdate({
+      ...args,
+      policy,
+      privateKey,
+    });
+    console.log(
+      `[project-update-sign] OK version=${result.version} arch=${result.arch} keyId=${result.keyId} sha512=${result.sha512}`,
+    );
+  } catch (error) {
+    console.error(
+      `[project-update-sign] RELEASE BLOCKED: ${
+        error instanceof Error ? error.message : error
+      }`,
+    );
+    process.exitCode = 1;
+  }
 }
-console.log(
-  `[project-update-sign] OK version=${version} arch=${arch} keyId=${publicManifest.keyId} sha512=${sha512}`,
-);

@@ -296,6 +296,54 @@ application bundle may require **Open Anyway** again the first time it is
 opened. The updater never changes certificate Trust Settings and never clears
 or removes quarantine attributes.
 
+#### Local project-update signing and publication
+
+The project-update private key is held only by the publisher's macOS login
+Keychain. GitHub Actions builds and verifies unsigned macOS candidates, but
+selfhost stable, beta, and nightly jobs cannot publish them. This release-side
+handoff does not change the client experience: `.5` clients still discover,
+download, verify, and install `.6+` updates through the normal in-app flow.
+
+Provision the existing PKCS#8 DER base64 value with **Keychain Access** as one
+generic password item. Do not put it in a shell variable, command argument,
+file, repository secret, or CI setting:
+
+- Keychain: `login`
+- Service:
+  `com.logseq.selfhost.project-update-signing.ed25519-pkcs8-base64`
+- Account: the complete `keyId` from
+  `resources/updater/project-signing-policy.json`
+- Password: the matching Ed25519 PKCS#8 DER value encoded as canonical base64
+
+The account is deliberately bound to the public-policy `keyId`; rotating the
+public key therefore cannot silently reuse the wrong private key. The signer
+queries this exact service and account in `login.keychain-db`. It never changes
+the Keychain search list, default Keychain, certificate Trust Settings, or
+item access policy. Back up the same private key separately using an offline
+encrypted medium before publishing `.5`.
+
+Run the GitHub workflow as a build-only candidate job, then download and merge
+all `logseq-*-builds` artifacts into one directory. On the publisher Mac, from
+the exact tested source revision, finalize the directory:
+
+```bash
+version="$(cat /absolute/path/to/release-candidates/VERSION)"
+
+pnpm project-update:finalize-local-macos-candidates -- \
+  --dir /absolute/path/to/release-candidates \
+  --version "$version"
+```
+
+The finalizer refuses CI and non-macOS hosts. It first checks that both macOS
+metadata files are unsigned candidates matching their exact ZIPs, reads the
+single fixed Keychain identity, signs arm64 and x64 metadata, verifies both
+project signatures, verifies the complete cross-platform artifact set, and
+rewrites `SHA256SUMS.txt`. A failure restores the original candidate metadata
+and checksum file. Only the directory from a successful finalizer run may be
+uploaded to the GitHub Release. Before upload, record the exact source SHA and
+inspect `git status` to ensure the signing policy has not changed since the
+candidate build.
+
 ## 10. Reproducibility and release checks
 
 Before publishing a server/client revision:

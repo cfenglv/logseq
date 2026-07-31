@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createProjectUpdateSignature } from "./project-update-signer-core.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -209,7 +210,7 @@ addCase("production policy contains no private or suspicious secret material", (
   assertNoPrivateMaterial(policy);
 });
 
-addCase("temporary Ed25519 sign/verify roundtrip rejects tampering", () => {
+addCase("temporary Ed25519 sign/verify roundtrip rejects tampering", async () => {
   writeJson(
     path.join(
       isolatedRoot,
@@ -231,34 +232,19 @@ addCase("temporary Ed25519 sign/verify roundtrip rejects tampering", () => {
       "",
     ].join("\n"),
   );
-  const privateKeyBase64 = fixtureKeys.privateKey
-    .export({ format: "der", type: "pkcs8" })
-    .toString("base64");
-  const signer = command(
-    [
-      "scripts/sign-macos-project-update.mjs",
-      "--arch",
-      "arm64",
-      "--version",
-      "2.0.1-selfhost.6",
-      "--archive",
-      archive,
-      "--metadata",
-      metadata,
-    ],
-    {
-      cwd: isolatedRoot,
-      env: {
-        ...process.env,
-        LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64: privateKeyBase64,
-      },
-    },
-  );
-  assert.equal(signer.status, 0, signer.output);
-  assert.equal(
-    signer.output.includes(privateKeyBase64),
-    false,
-    "signer output exposed the temporary private key",
+  const signed = await createProjectUpdateSignature({
+    arch: "arm64",
+    archive,
+    metadata,
+    policy: fixturePolicy,
+    privateKey: fixtureKeys.privateKey,
+    version: "2.0.1-selfhost.6",
+  });
+  fs.writeFileSync(metadata, signed.metadata);
+  assert.doesNotMatch(
+    signed.metadata,
+    /PRIVATE KEY|privateKey|pkcs8/i,
+    "signed metadata exposed private-key material",
   );
 
   const verifyArgs = [

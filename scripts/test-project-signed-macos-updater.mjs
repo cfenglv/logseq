@@ -671,20 +671,23 @@ const scriptsMatching = (pattern) =>
     .map((entry) => path.join(repoRoot, "scripts", entry.name));
 
 const discoverSignerPath = (workflow) => {
-  const candidates = scriptsMatching(
-    /^(?:sign|create)(?=.*(?:project|macos))(?=.*update).*\.mjs$/i,
-  );
-  const referenced = candidates.filter((candidate) =>
-    workflow.includes(path.basename(candidate)),
+  const signer = path.join(
+    repoRoot,
+    "scripts",
+    "fixtures",
+    "run-project-update-signer-test-only.mjs",
   );
   assert.equal(
-    referenced.length,
-    1,
-    `expected one workflow-referenced project update signer, found ${referenced
-      .map((file) => path.basename(file))
-      .join(", ") || "none"}`,
+    fs.existsSync(signer),
+    true,
+    "test-only project update signer fixture is missing",
   );
-  return referenced[0];
+  assert.equal(
+    workflow.includes(path.basename(signer)),
+    false,
+    "release workflow references the test-only signer fixture",
+  );
+  return signer;
 };
 
 const createIsolatedSignerTree = ({
@@ -1119,7 +1122,7 @@ const withIsolatedProductionSigner = (test) => {
       signingEnvironmentNames.length > 0,
       "release workflow exposes no Ed25519 signing environment",
     );
-    const signerEnv = { ...process.env };
+    const signerEnv = { ...process.env, NODE_ENV: "test" };
     for (const name of signingEnvironmentNames) {
       signerEnv[name] = privateKeyBase64;
     }
@@ -1168,6 +1171,7 @@ const withIsolatedProductionSigner = (test) => {
       );
       const signerArgs = [
         isolated.signerPath,
+        "--test-only",
         "--arch",
         "arm64",
         "--version",
@@ -1361,15 +1365,12 @@ const workflowJobSource = (workflow, jobName) => {
 };
 
 const signingVariableNames = (workflow) => {
-  const secretNames = [
-    ...workflow.matchAll(/secrets\.([A-Z][A-Z0-9_]*ED25519[A-Z0-9_]*)/g),
-  ].map((match) => match[1]);
-  const environmentNames = [
-    ...workflow.matchAll(
-      /^\s*([A-Z][A-Z0-9_]+):\s*\${{\s*secrets\.[A-Z0-9_]+\s*}}/gm,
-    ),
-  ].map((match) => match[1]);
-  return [...new Set([...secretNames, ...environmentNames])];
+  assert.doesNotMatch(
+    workflow,
+    /LOGSEQ_PROJECT_UPDATE_SIGNER_TEST_ONLY_KEY_BASE64/,
+    "release workflow references the test-only signer key",
+  );
+  return ["LOGSEQ_PROJECT_UPDATE_SIGNER_TEST_ONLY_KEY_BASE64"];
 };
 
 const discoverHelperBuildPath = () => {
@@ -2641,14 +2642,10 @@ const runNativeHelperContract = async ({
     const signerSecrets = signingVariableNames(workflow);
     const managedSignerAvailable =
       productionPolicyConfigured &&
-      signerSecrets.length > 0 &&
-      (managedSignerFixture !== null ||
-        signerSecrets.some((name) => Boolean(process.env[name])));
+      managedSignerFixture !== null;
     const productionCompositeBlockReason = !productionPolicyConfigured
       ? "production Ed25519 policy is UNCONFIGURED; managed signer/native composite is blocked"
-      : !managedSignerAvailable
-        ? "managed production Ed25519 private key is unavailable; signer/native composite is blocked"
-        : null;
+      : null;
     let signWithReleaseCli = null;
     let expectSignerRejectsVersion = null;
     if (managedSignerAvailable) {
@@ -2681,7 +2678,7 @@ const runNativeHelperContract = async ({
     );
     const selectedHelperBuildPath = managedSignerFixture
       ? path.join(
-          path.dirname(isolatedSigner.signerPath),
+          path.dirname(path.dirname(isolatedSigner.signerPath)),
           path.basename(helperBuildPath),
         )
       : helperBuildPath;
@@ -2743,6 +2740,7 @@ const runNativeHelperContract = async ({
         process.execPath,
         [
           signerPath,
+          "--test-only",
           "--arch",
           fixture.arch,
           "--version",
@@ -2874,6 +2872,7 @@ const runNativeHelperContract = async ({
         process.execPath,
         [
           signerPath,
+          "--test-only",
           "--arch",
           fixture.arch,
           "--version",
@@ -3449,6 +3448,7 @@ const isolatedManagedSignerFixture = () => {
     .toString("base64");
   const signerEnv = {
     ...process.env,
+    NODE_ENV: "test",
     ...Object.fromEntries(
       signerSecrets.map((name) => [name, privateKeyBase64]),
     ),
@@ -3557,27 +3557,24 @@ addCase(cases, ".4 legacy feed remains pinned and .5 remains manual", () => {
   }
 });
 
-addCase(cases, "release signing is fail-closed on an external private key", () => {
+addCase(cases, "release signing is local-only and CI remains unsigned", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
-  const secretNames = signingVariableNames(workflow);
-  const ed25519SecretNames = [
-    ...workflow.matchAll(/secrets\.([A-Z][A-Z0-9_]*ED25519[A-Z0-9_]*)/g),
-  ].map((match) => match[1]);
-  assert.ok(
-    ed25519SecretNames.some((name) => /PRIVATE|SIGNING/i.test(name)),
-    "release workflow does not consume an external Ed25519 signing secret",
+  assert.doesNotMatch(
+    workflow,
+    /secrets\.[A-Z][A-Z0-9_]*ED25519[A-Z0-9_]*/,
+    "release workflow consumes an Ed25519 signing secret",
   );
-  assert.match(workflow, /arm64/i);
-  assert.match(workflow, /x64/i);
-  const signerPath = discoverSignerPath(workflow);
-  const signerReferences =
-    workflow.match(new RegExp(path.basename(signerPath), "g"))?.length ?? 0;
-  assert.ok(
-    signerReferences >= 2 ||
-      /matrix:[\s\S]{0,500}(?:arm64[\s\S]{0,100}x64|x64[\s\S]{0,100}arm64)/i.test(
-        workflow,
-      ),
-    "project signer is not wired to both macOS architectures",
+  assert.doesNotMatch(
+    workflow,
+    /sign-macos-project-update\.mjs/,
+    "release workflow invokes the local signer",
+  );
+  assert.equal(
+    workflow.match(
+      /verify-unsigned-macos-project-update-candidate\.mjs/g,
+    )?.length,
+    2,
+    "CI does not verify both unsigned macOS candidates",
   );
   const tempRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "logseq-project-signer-no-key-"),
@@ -3605,10 +3602,10 @@ addCase(cases, "release signing is fail-closed on an external private key", () =
       ].join("\n"),
     );
     const metadataBefore = fs.readFileSync(metadata, "utf8");
-    const missingKey = command(
+    const blockedCiSigner = command(
       process.execPath,
       [
-        signerPath,
+        path.join(repoRoot, "scripts", "sign-macos-project-update.mjs"),
         "--arch",
         "arm64",
         "--version",
@@ -3624,15 +3621,16 @@ addCase(cases, "release signing is fail-closed on an external private key", () =
         allowFailure: true,
         env: {
           ...process.env,
-          ...Object.fromEntries(secretNames.map((name) => [name, ""])),
+          CI: "true",
         },
       },
     );
     assert.notEqual(
-      missingKey.status,
+      blockedCiSigner.status,
       0,
-      "release signer accepted a missing private key",
+      "local release signer ran in CI",
     );
+    assert.match(blockedCiSigner.output, /refuses CI|local macOS publisher/i);
     assert.equal(
       fs.existsSync(signatureOutput),
       false,
@@ -3648,38 +3646,34 @@ addCase(cases, "release signing is fail-closed on an external private key", () =
   }
 });
 
-addCase(cases, "nightly signing is reachable for both macOS architectures", () => {
+addCase(cases, "selfhost CI candidates cannot reach a release publisher", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
-  const signerPath = discoverSignerPath(workflow);
   for (const [jobName, arch] of [
     ["build-macos-x64", "x64"],
     ["build-macos-arm64", "arm64"],
   ]) {
     const job = workflowJobSource(workflow, jobName);
-    const signerIndex = job.indexOf(path.basename(signerPath));
-    assert.notEqual(
-      signerIndex,
-      -1,
-      `${jobName} does not invoke the project signer`,
-    );
-    const signerContext = job.slice(
-      Math.max(0, signerIndex - 800),
-      signerIndex + 1200,
+    assert.match(
+      job,
+      /verify-unsigned-macos-project-update-candidate\.mjs/,
+      `${jobName} does not verify its unsigned candidate`,
     );
     assert.match(
-      signerContext,
+      job,
       new RegExp(`(?:--arch\\s+${arch}\\b|--${arch}\\b)`),
-      `${jobName} does not sign its ${arch} artifact`,
+      `${jobName} does not bind its ${arch} candidate`,
     );
     assert.match(
-      signerContext,
+      job,
       /--version[\s\S]{0,120}steps\.ref\.outputs\.version/,
-      `${jobName} does not pass the exact workflow version to the signer`,
+      `${jobName} does not pass the exact workflow version to candidate verification`,
     );
-    assert.doesNotMatch(
-      signerContext,
-      /build-target\s*!=\s*['"]nightly|build-target\s*==\s*['"]stable/,
-      `${jobName} makes the signer unreachable for nightly builds`,
+  }
+  for (const jobName of ["nightly-release", "release"]) {
+    assert.match(
+      workflowJobSource(workflow, jobName),
+      /!contains\(needs\.release-assets-preflight\.outputs\.version,\s*'-selfhost\.'\)/,
+      `${jobName} can publish unsigned selfhost metadata`,
     );
   }
 });

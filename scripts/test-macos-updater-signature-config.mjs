@@ -64,7 +64,7 @@ const runProjectUpdateScript = (script, version) =>
       encoding: "utf8",
       env: {
         ...process.env,
-        LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64: "",
+        CI: "true",
       },
     },
   );
@@ -199,7 +199,7 @@ const cases = [
       const valid = "2.0.1-selfhost.5.nightly.20260729";
       const signer = runProjectUpdateScript("sign-macos-project-update.mjs", valid);
       assert.notEqual(signer.status, 0);
-      assert.match(signer.stderr, /missing LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY/);
+      assert.match(signer.stderr, /local macOS publisher only|refuses CI/i);
       const verifier = runProjectUpdateScript("verify-project-signed-macos-update.mjs", valid);
       assert.notEqual(verifier.status, 0);
       assert.match(verifier.stderr, /ENOENT|no such file/i);
@@ -231,8 +231,13 @@ const cases = [
         mode: "project-signed",
       });
       assert.equal(workflow.match(/build-project-update-helper\.mjs/g)?.length, 2);
-      assert.equal(workflow.match(/sign-macos-project-update\.mjs/g)?.length, 2);
-      assert.equal(workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length, 2);
+      assert.equal(workflow.match(/sign-macos-project-update\.mjs/g)?.length, undefined);
+      assert.equal(workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length, undefined);
+      assert.equal(
+        workflow.match(/verify-unsigned-macos-project-update-candidate\.mjs/g)
+          ?.length,
+        2,
+      );
       const policy = read("scripts/run-macos-updater-signature-policy.mjs");
       assert.match(policy, /verifyProjectSignedMacosUpdate/);
       assert.doesNotMatch(policy, /requireDeveloperIdBaseline/);

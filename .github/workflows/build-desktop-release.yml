@@ -120,6 +120,7 @@ jobs:
           node scripts/test-updater-install-entry-contract.mjs
           node scripts/test-selfhost-macos-user-guidance.mjs
           node scripts/test-macos-updater-signature-config.mjs
+          node scripts/test-local-project-update-signing-contract.mjs
           node scripts/test-packaged-project-signature-runtime.mjs
 
       - name: Test self-host updater source contracts
@@ -838,22 +839,15 @@ jobs:
         run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch x64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
-      - name: Sign and verify x64 project update manifest
+      - name: Verify unsigned x64 project update candidate
         run: |
           candidate_zip="$(find static/dist -maxdepth 1 -type f -name 'Logseq-darwin-x64-*.zip' -print -quit)"
           test -n "$candidate_zip"
-          node release-gate-source/scripts/sign-macos-project-update.mjs \
+          node release-gate-source/scripts/verify-unsigned-macos-project-update-candidate.mjs \
             --arch x64 \
             --version "${{ steps.ref.outputs.version }}" \
             --archive "$candidate_zip" \
             --metadata static/dist/latest-mac.yml
-          node release-gate-source/scripts/verify-project-signed-macos-update.mjs \
-            --arch x64 \
-            --version "${{ steps.ref.outputs.version }}" \
-            --archive "$candidate_zip" \
-            --metadata static/dist/latest-mac.yml
-        env:
-          LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64: ${{ secrets.LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64 }}
 
       - name: Verify fork macOS app can load Electron
         if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
@@ -1004,22 +998,15 @@ jobs:
         run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch arm64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
-      - name: Sign and verify arm64 project update manifest
+      - name: Verify unsigned arm64 project update candidate
         run: |
           candidate_zip="$(find static/dist -maxdepth 1 -type f -name 'Logseq-darwin-arm64-*.zip' -print -quit)"
           test -n "$candidate_zip"
-          node release-gate-source/scripts/sign-macos-project-update.mjs \
+          node release-gate-source/scripts/verify-unsigned-macos-project-update-candidate.mjs \
             --arch arm64 \
             --version "${{ steps.ref.outputs.version }}" \
             --archive "$candidate_zip" \
             --metadata static/dist/latest-mac.yml
-          node release-gate-source/scripts/verify-project-signed-macos-update.mjs \
-            --arch arm64 \
-            --version "${{ steps.ref.outputs.version }}" \
-            --archive "$candidate_zip" \
-            --metadata static/dist/latest-mac.yml
-        env:
-          LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64: ${{ secrets.LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64 }}
 
       - name: Verify fork macOS app can load Electron
         if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
@@ -1110,7 +1097,7 @@ jobs:
           cat "${RUNNER_TEMP}/desktop-release-assets/SHA256SUMS.txt"
 
   nightly-release:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' }}
+    if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
     needs: [ release-assets-preflight ]
     runs-on: ubuntu-22.04
     permissions:
@@ -1199,7 +1186,7 @@ jobs:
             ./*.apk
 
   release:
-    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
     needs: [ release-assets-preflight ]
     runs-on: ubuntu-22.04
     permissions:
