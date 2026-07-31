@@ -96,9 +96,23 @@ export const signMacosProjectUpdate = async ({
   return result;
 };
 
+const sameRealFile = (left, right) => {
+  try {
+    return (
+      fs.realpathSync.native(left) ===
+      fs.realpathSync.native(right)
+    );
+  } catch {
+    return false;
+  }
+};
+
 const isEntrypoint =
   process.argv[1] &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+  sameRealFile(
+    path.resolve(process.argv[1]),
+    fileURLToPath(import.meta.url),
+  );
 if (isEntrypoint) {
   try {
     const args = parseArgs(process.argv.slice(2));

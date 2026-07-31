@@ -98,6 +98,57 @@ addCase("legacy environment injection is rejected before signing in CI", () => {
   }
 });
 
+addCase("symlink and realpath entrypoints still execute the signer gate", () => {
+  const tempRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "logseq-project-signer-entrypoint-"),
+  );
+  try {
+    const signerLink = path.join(tempRoot, "sign-project-update.mjs");
+    fs.symlinkSync(
+      path.join(repoRoot, "scripts", "sign-macos-project-update.mjs"),
+      signerLink,
+    );
+    const archive = path.join(tempRoot, "update.zip");
+    const metadata = path.join(tempRoot, "latest.yml");
+    fs.writeFileSync(archive, "candidate");
+    fs.writeFileSync(
+      metadata,
+      "version: 2.0.1-selfhost.6\npath: update.zip\n",
+    );
+    const before = fs.readFileSync(metadata);
+    const result = spawnSync(
+      process.execPath,
+      [
+        signerLink,
+        "--arch",
+        "arm64",
+        "--version",
+        "2.0.1-selfhost.6",
+        "--archive",
+        archive,
+        "--metadata",
+        metadata,
+      ],
+      {
+        encoding: "utf8",
+        env: { ...process.env, CI: "true" },
+      },
+    );
+    assert.notEqual(
+      result.status,
+      0,
+      "signer silently skipped its entrypoint through a symlink",
+    );
+    assert.match(
+      `${result.stdout}${result.stderr}`,
+      /local macOS publisher only|refuses CI/i,
+    );
+    assert.deepEqual(fs.readFileSync(metadata), before);
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
 addCase("GitHub Actions builds candidates but cannot sign or publish selfhost", () => {
   const workflow = read(".github/workflows/build-desktop-release.yml");
   assert.doesNotMatch(
