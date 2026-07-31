@@ -943,6 +943,10 @@
      :tx-data tx-data
      :boundaries (large-upload-boundaries db tx-data)
      :next-index 0
+     ;; Large-title offload can expand one logical datom into two wire datoms.
+     ;; Track the server's contiguous wire offset independently from the
+     ;; logical source boundary used to resume local preparation.
+     :wire-next-index 0
      ;; This freezes randomized E2EE/offload wire content until ACK. A retry is
      ;; byte-equivalent, so the server can verify it without trusting metadata.
      :wire-cache {}}))
@@ -1011,8 +1015,9 @@
         chunk (subvec tx-data start next-index)
         final? (>= next-index total)
         session-id (:session-id session)
+        wire-start (or (:wire-next-index session) (:next-index session) 0)
         chunk-tx-id (sync-protocol/tx-chunk-id
-                     tx-id session-id start final?)]
+                     tx-id session-id wire-start final?)]
     (log/info :db-sync/large-upload-request-chunk
               {:repo repo
                :tx-id tx-id
@@ -1025,7 +1030,7 @@
            :tx-data chunk
            :logical-tx-id tx-id
            :upload-session-id session-id
-           :chunk-index start
+           :chunk-index wire-start
            :chunk-final? final?
            :large-upload-original-tx-id tx-id
            :large-upload-next-index next-index
@@ -1041,17 +1046,7 @@
             next-datom-count (+ datom-count entry-datom-count)]
         (cond
           (and (empty? result) (> entry-datom-count max-upload-request-datoms))
-          (if (staged-tx-upload-supported? repo)
-            [(large-upload-request-entry repo db entry)]
-            ;; An old server would apply an additive modern chunk as an
-            ;; ordinary tx. Fail before building/sending any envelope so the
-            ;; logical pending row remains available for a server-first
-            ;; upgrade.
-            (fail-fast :db-sync/staged-tx-upload-unsupported
-                       {:type :db-sync/staged-tx-upload-unsupported
-                        :repo repo
-                        :tx-id (:tx-id entry)
-                        :datom-count entry-datom-count}))
+          [(large-upload-request-entry repo db entry)]
 
           (> next-datom-count max-upload-request-datoms)
           result
@@ -1108,6 +1103,7 @@
   (doseq [{:keys [large-upload-original-tx-id
                   upload-session-id
                   large-upload-next-index
+                  large-upload-wire-next-index
                   large-upload-final?]} tx-entries]
     (when large-upload-original-tx-id
       (let [progress-key (large-upload-progress-key repo large-upload-original-tx-id)]
@@ -1121,7 +1117,10 @@
               (swap! *repo->large-upload-sessions dissoc progress-key)
               (persist-large-upload-session!
                repo large-upload-original-tx-id
-               (assoc session :next-index large-upload-next-index)))))))))
+               (assoc session
+                      :next-index large-upload-next-index
+                      :wire-next-index (or large-upload-wire-next-index
+                                           large-upload-next-index)))))))))
 
 (defn- large-upload-progress
   [tx-entries]
@@ -1130,12 +1129,14 @@
                           tx-id
                           upload-session-id
                           large-upload-next-index
+                          large-upload-wire-next-index
                           large-upload-final?]}]
                (when large-upload-original-tx-id
                  {:large-upload-original-tx-id large-upload-original-tx-id
                   :tx-id tx-id
                   :upload-session-id upload-session-id
                   :large-upload-next-index large-upload-next-index
+                  :large-upload-wire-next-index large-upload-wire-next-index
                   :large-upload-final? large-upload-final?})))
        vec))
 
@@ -1334,7 +1335,34 @@
         (when (and (ws-open? ws) (worker-state/online?) (not (upload-stopped? repo)))
           (let [batch (pending-txs repo {:limit 50})]
             (when (seq batch)
-              (let [{:keys [tx-entries drop-tx-ids drop-txs]} (prepare-upload-tx-entries repo conn batch)]
+              (let [oversized-entry (some #(when (> (count (:tx %))
+                                                     max-upload-request-datoms)
+                                             %)
+                                          batch)]
+                (if (and oversized-entry
+                         (not (staged-tx-upload-supported? repo)))
+                  ;; Keep capability enforcement at the real send boundary.
+                  ;; Pure preparation remains usable for local rollback/error
+                  ;; bookkeeping, while no session or modern envelope can be
+                  ;; constructed for an old/unknown server.
+                  (let [error (ex-info "staged-tx-upload-unsupported"
+                                       {:type :db-sync/staged-tx-upload-unsupported
+                                        :repo repo
+                                        :tx-id (:tx-id oversized-entry)
+                                        :datom-count (count (:tx oversized-entry))})]
+                    ;; This is a small, locally constructed capability error;
+                    ;; retain the exception so callers can distinguish the
+                    ;; actionable upgrade gate without exposing server data.
+                    (when-let [*last-error (:last-sync-error client)]
+                      (reset! *last-error error))
+                    (log/error :db-sync/flush-pending-failed
+                               {:repo repo
+                                :diagnostic
+                                (dissoc
+                                 (sync-util/error->diagnostic error)
+                                 :at)}))
+                  (let [{:keys [tx-entries drop-tx-ids drop-txs]}
+                        (prepare-upload-tx-entries repo conn batch)]
                 (when (seq drop-tx-ids)
                   (log/info :db-sync/drop-tx-ids {:tx-ids drop-tx-ids
                                                   :drops drop-txs})
@@ -1352,7 +1380,12 @@
                                                             (large-upload-wire-cache-entry
                                                              repo logical-tx-id
                                                              upload-session-id chunk-index))]
-                                                   (p/resolved (merge tx-entry cached))
+                                                   (p/resolved
+                                                    (let [entry* (merge tx-entry cached)]
+                                                      (assoc entry*
+                                                             :large-upload-wire-next-index
+                                                             (+ chunk-index
+                                                                (count (:tx-data entry*))))))
                                                    (p/let [tx-data* (offload-large-titles
                                                                      tx-data
                                                                      {:repo repo
@@ -1368,7 +1401,11 @@
                                                        (cache-large-upload-wire-entry!
                                                         repo logical-tx-id upload-session-id
                                                         chunk-index chunk-final? wire-entry))
-                                                     (merge tx-entry wire-entry))))
+                                                     (let [entry* (merge tx-entry wire-entry)]
+                                                       (assoc entry*
+                                                              :large-upload-wire-next-index
+                                                              (+ chunk-index
+                                                                 (count (:tx-data entry*))))))))
                                                tx-entries))
                             payload (mapv (fn [{:keys [tx-id logical-tx-id upload-session-id
                                                       chunk-index chunk-final? tx-data outliner-op]}]
@@ -1421,7 +1458,7 @@
                                            :diagnostic
                                            (dissoc
                                             (sync-util/error->diagnostic error)
-                                            :at)}))))))))))))
+                                            :at)}))))))))))))))
 
 (defn enqueue-flush-pending!
   [repo client]

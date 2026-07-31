@@ -16,6 +16,7 @@
             [lambdaisland.glogi :as log]
             [logseq.db :as ldb]
             [logseq.db-sync.checksum :as sync-checksum]
+            [logseq.db-sync.protocol :as sync-protocol]
             [promesa.core :as p]))
 
 (defn- fail-fast
@@ -561,8 +562,18 @@
             (when (and failed-tx-id (contains? inflight-set failed-tx-id))
               failed-tx-id)
             failed-tx-id
-            (or (some (fn [{:keys [tx-id large-upload-original-tx-id]}]
-                        (when (= failed-wire-tx-id tx-id)
+            (or (some (fn [{:keys [tx-id large-upload-original-tx-id
+                                   logical-tx-id upload-session-id chunk-index
+                                   chunk-final?]}]
+                        (when (= failed-wire-tx-id
+                                 (or tx-id
+                                     (when (and logical-tx-id
+                                                upload-session-id
+                                                (some? chunk-index)
+                                                (some? chunk-final?))
+                                       (sync-protocol/tx-chunk-id
+                                        logical-tx-id upload-session-id
+                                        chunk-index chunk-final?))))
                           large-upload-original-tx-id))
                       (:large-upload-progress upload-request))
                 failed-wire-tx-id)

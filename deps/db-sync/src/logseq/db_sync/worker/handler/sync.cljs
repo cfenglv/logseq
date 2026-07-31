@@ -6,6 +6,7 @@
             [logseq.db-sync.batch :as batch]
             [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-sync.common :as common]
+            [logseq.db.common.normalize :as db-normalize]
             [logseq.db-sync.index :as index]
             [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.snapshot :as snapshot]
@@ -900,6 +901,7 @@
         prev-server-checksum-t (when sql (storage/get-server-checksum-t sql))
         verified-checksum-metadata?
         (when sql (storage/checksum-metadata-verified? sql prev-t))
+        staged-upload-final? (::staged-upload-final? tx-entry)
         logical-tx-data (volatile! [])
         chunk-count (volatile! 0)]
     (log/info :db-sync/apply-large-tx-entry-start
@@ -926,15 +928,30 @@
                              chunk
                              (cond-> tx-meta
                                sql
-                               (assoc :db-sync/skip-checksum-update? true)))
+                               (assoc :db-sync/skip-checksum-update? true)
+                               (and sql staged-upload-final?)
+                               (assoc :db-sync/skip-tx-log? true)))
               nil)
             nil
             tx-data)
            (when sql
-             ;; Chunk rows share one logical client tx-id. Bind it to the
-             ;; final row only after every chunk has applied successfully;
-             ;; the surrounding SQL transaction makes that marker atomic.
-             (storage/set-tx-id-for-t! sql (storage/get-t sql) tx-id)
+             (if staged-upload-final?
+               ;; Staged chunks are already the wire-level split of one
+               ;; logical transaction. The later Datascript safety chunks are
+               ;; an implementation detail, so expose one normalized row/t.
+               (let [new-t (inc prev-t)
+                     normalized-data (->> @logical-tx-data
+                                          (db-normalize/normalize-tx-data
+                                           @conn db-before)
+                                          vec)]
+                 (storage/append-tx! sql new-t
+                                     (common/write-transit normalized-data)
+                                     (common/now-ms) outliner-op tx-id)
+                 (storage/set-t! sql new-t))
+               ;; Preserve the established ordinary-large-tx history shape:
+               ;; its internal chunk rows remain visible and only the final
+               ;; row carries the idempotency tx id.
+               (storage/set-tx-id-for-t! sql (storage/get-t sql) tx-id))
              (storage/set-checksum!
               sql
               (sync-checksum/update-checksum
@@ -1111,7 +1128,8 @@
                                            (assoc :tx-id logical-tx-id
                                                   :tx (protocol/tx->transit full-tx-data)
                                                   ::identity (str "upload/" logical-tx-id)
-                                                  ::payload-digest completed-digest)
+                                                  ::payload-digest completed-digest
+                                                  ::staged-upload-final? true)
                                            (dissoc ::upload?))]
                        ;; Final assembly must enter exactly the same sanitize,
                        ;; no-op, stale rebase/fix, delete, migration, and large
