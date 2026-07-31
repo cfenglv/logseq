@@ -134,14 +134,33 @@ addCase("signer merges six-platform candidates into one finalized artifact", () 
 
 addCase("secretless verifier rechecks complete assets and signatures", () => {
   const verifier = workflowJob("selfhost-release-verifier");
-  assert.match(verifier, /needs:\s*\[\s*selfhost-release-signing\s*\]/);
+  assert.match(
+    verifier,
+    /needs:\s*\[\s*selfhost-release-signing,\s*release-rehearsal-gate\s*\]/,
+  );
   assert.match(verifier, /permissions:\s*\n\s+actions:\s*read\s*\n\s+contents:\s*read/);
   assert.doesNotMatch(verifier, /environment:|secrets\./);
   assert.match(verifier, /name:\s*selfhost-finalized-release-assets/);
   assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
   assert.match(
     verifier,
-    /--source-revision[\s\S]{0,160}selfhost-release-signing\.outputs\.source-sha/,
+    /--source-revision[\s\S]{0,160}release-rehearsal-gate\.outputs\.source-sha/,
+  );
+  assert.match(
+    verifier,
+    /source-ref:\s*\$\{\{ needs\.release-rehearsal-gate\.outputs\.source-ref \}\}/,
+  );
+  assert.match(
+    verifier,
+    /source-sha:\s*\$\{\{ needs\.release-rehearsal-gate\.outputs\.source-sha \}\}/,
+  );
+  assert.match(
+    verifier,
+    /ref:\s*\$\{\{ needs\.release-rehearsal-gate\.outputs\.source-sha \}\}/,
+  );
+  assert.match(
+    verifier,
+    /version:\s*\$\{\{ needs\.selfhost-release-signing\.outputs\.version \}\}/,
   );
   const verifierClosure = [
     ...relativeModuleClosure("scripts/verify-finalized-selfhost-release.mjs"),

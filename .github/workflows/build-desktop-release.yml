@@ -1174,21 +1174,21 @@ jobs:
           retention-days: 7
 
   selfhost-release-verifier:
-    needs: [ selfhost-release-signing ]
+    needs: [ selfhost-release-signing, release-rehearsal-gate ]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
       actions: read
       contents: read
     outputs:
-      source-ref: ${{ needs.selfhost-release-signing.outputs.source-ref }}
-      source-sha: ${{ needs.selfhost-release-signing.outputs.source-sha }}
+      source-ref: ${{ needs.release-rehearsal-gate.outputs.source-ref }}
+      source-sha: ${{ needs.release-rehearsal-gate.outputs.source-sha }}
       version: ${{ needs.selfhost-release-signing.outputs.version }}
     steps:
       - name: Check out exact signed release verifier
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.selfhost-release-signing.outputs.source-sha }}
+          ref: ${{ needs.release-rehearsal-gate.outputs.source-sha }}
           persist-credentials: false
 
       - name: Install Node.js
@@ -1206,7 +1206,7 @@ jobs:
         run: |
           node scripts/verify-finalized-selfhost-release.mjs \
             --dir "${RUNNER_TEMP}/selfhost-finalized-release-assets" \
-            --source-revision "${{ needs.selfhost-release-signing.outputs.source-sha }}" \
+            --source-revision "${{ needs.release-rehearsal-gate.outputs.source-sha }}" \
             --version "${{ needs.selfhost-release-signing.outputs.version }}"
 
   selfhost-release:
