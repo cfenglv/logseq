@@ -24,15 +24,61 @@ const productionPolicyRelativePath =
   "resources/updater/project-signing-policy.json";
 const privateKeyEnvironmentName =
   "LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64";
-const isolatedFiles = [
-  "resources/project-updater-signature.mjs",
-  "scripts/project-update-signing.mjs",
-  signerRelativePath,
-  verifierRelativePath,
-];
 
 const read = (relativePath, root = repoRoot) =>
   fs.readFileSync(path.join(root, relativePath), "utf8");
+
+const relativeModuleClosure = (
+  entryPaths,
+  root = repoRoot,
+  seen = new Set(),
+) => {
+  for (const relativePath of entryPaths) {
+    if (seen.has(relativePath)) continue;
+    seen.add(relativePath);
+    const source = read(relativePath, root);
+    const dependencies = [
+      ...source.matchAll(
+        /(?:from\s+|import\s*\(\s*|import\s+)["'](\.[^"']+\.(?:c?js|mjs))["']/g,
+      ),
+    ].map((match) =>
+      path
+        .normalize(path.join(path.dirname(relativePath), match[1]))
+        .replaceAll(path.sep, "/"),
+    );
+    for (const dependency of dependencies) {
+      assert.doesNotMatch(
+        dependency,
+        /^(?:\.\.(?:\/|$)|\/)/,
+        `${relativePath} imports outside the repository: ${dependency}`,
+      );
+    }
+    relativeModuleClosure(dependencies, root, seen);
+  }
+  return seen;
+};
+
+const copyRelativeModuleClosure = (entryPaths, destinationRoot) => {
+  const closure = relativeModuleClosure(entryPaths);
+  for (const relativePath of closure) {
+    const destination = path.join(destinationRoot, relativePath);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.copyFileSync(path.join(repoRoot, relativePath), destination);
+  }
+  return closure;
+};
+
+const securityLookupLocations = (closure, root = repoRoot) => {
+  const pattern = /(["'])\/usr\/bin\/security\1/g;
+  const locations = [];
+  for (const relativePath of closure) {
+    const source = read(relativePath, root);
+    for (const match of source.matchAll(pattern)) {
+      locations.push({ relativePath, index: match.index });
+    }
+  }
+  return locations;
+};
 
 const run = (executable, args, options = {}) => {
   const result = spawnSync(executable, args, {
@@ -97,16 +143,25 @@ process.stdout.write(privateKey);
   fs.writeFileSync(filePath, source, { mode: 0o700 });
 };
 
-const replaceSecurityExecutableForTest = (signerPath, probePath) => {
-  const source = fs.readFileSync(signerPath, "utf8");
-  const pattern = /(["'])\/usr\/bin\/security\1/g;
-  const matches = [...source.matchAll(pattern)];
-  assert.ok(
-    matches.length > 0,
-    `${signerRelativePath} must invoke the absolute /usr/bin/security binary`,
+const replaceSecurityExecutableForTest = (
+  closure,
+  isolatedRoot,
+  probePath,
+) => {
+  const locations = securityLookupLocations(closure, isolatedRoot);
+  assert.equal(
+    locations.length,
+    1,
+    `signer import closure must contain exactly one absolute /usr/bin/security lookup, found ${locations.length}`,
   );
+  const securityModulePath = path.join(
+    isolatedRoot,
+    locations[0].relativePath,
+  );
+  const source = fs.readFileSync(securityModulePath, "utf8");
+  const pattern = /(["'])\/usr\/bin\/security\1/g;
   fs.writeFileSync(
-    signerPath,
+    securityModulePath,
     source.replaceAll(pattern, JSON.stringify(probePath)),
   );
 };
@@ -115,11 +170,10 @@ const createIsolatedSignerFixture = () => {
   const root = fs.mkdtempSync(
     path.join(os.tmpdir(), "logseq-local-keychain-signer-contract-"),
   );
-  for (const relativePath of isolatedFiles) {
-    const destination = path.join(root, relativePath);
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    fs.copyFileSync(path.join(repoRoot, relativePath), destination);
-  }
+  const signerClosure = copyRelativeModuleClosure(
+    [signerRelativePath, verifierRelativePath],
+    root,
+  );
 
   const signingKeys = generateKeyPairSync("ed25519");
   const wrongKeys = generateKeyPairSync("ed25519");
@@ -161,7 +215,8 @@ const createIsolatedSignerFixture = () => {
     .toString("base64");
   writeKeychainProbe({ filePath: probe, privateKeyBase64 });
   replaceSecurityExecutableForTest(
-    path.join(root, signerRelativePath),
+    signerClosure,
+    root,
     probe,
   );
 
@@ -304,8 +359,7 @@ const discoverLocalFinalizer = () => {
   const packageJson = JSON.parse(read("package.json"));
   const candidates = Object.entries(packageJson.scripts ?? {}).filter(
     ([name]) =>
-      /^project-update:.*finali[sz].*release$/i.test(name) ||
-      /^project-update:.*release.*finali[sz]$/i.test(name),
+      /^project-update:.*(?:local.*finali[sz]|finali[sz].*local)$/i.test(name),
   );
   assert.equal(
     candidates.length,
@@ -492,8 +546,16 @@ for (const [label, environment, nodePrefix, errorPattern] of [
 addCase(
   "production signer is read-only toward Keychain and never accepts secret argv, env, or files",
   () => {
-    const source = read(signerRelativePath);
-    assert.match(source, /\/usr\/bin\/security/);
+    const closure = relativeModuleClosure([signerRelativePath]);
+    const locations = securityLookupLocations(closure);
+    assert.equal(
+      locations.length,
+      1,
+      `signer import closure must contain exactly one absolute /usr/bin/security lookup, found ${locations.length}`,
+    );
+    const source = [...closure]
+      .map((relativePath) => read(relativePath))
+      .join("\n");
     assert.match(source, /find-generic-password/);
     assert.doesNotMatch(
       source,
@@ -706,7 +768,7 @@ addCase(
     );
     assert.match(
       combined,
-      /(?:private key|私钥)[\s\S]{0,260}(?:never|does not|will not|must not|不(?:会|得|上传))[\s\S]{0,160}(?:GitHub|GitHub Actions)|(?:GitHub|GitHub Actions)[\s\S]{0,260}(?:never|does not|will not|must not|不(?:会|得|上传))[\s\S]{0,160}(?:private key|私钥)/i,
+      /(?:private key|私钥)[\s\S]{0,320}(?:(?:never|does not|will not|must not|is not|outside|out of|external to|不(?:会|得|上传|在))[\s\S]{0,180}(?:GitHub(?: Actions)?|repository secrets?)|(?:GitHub(?: Actions)?|repository secrets?)[\s\S]{0,180}(?:never|does not|will not|must not|outside|out of|external to|不(?:会|得|上传|在)))|(?:GitHub(?: Actions)?|repository secrets?)[\s\S]{0,320}(?:private key|私钥)[\s\S]{0,180}(?:never|does not|will not|must not|outside|out of|external to|不(?:会|得|上传|在))/i,
       "docs do not prohibit uploading the project private key to GitHub",
     );
     assert.match(
