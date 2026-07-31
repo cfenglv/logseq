@@ -23,7 +23,7 @@ const workflowRelativePath =
 const productionPolicyRelativePath =
   "resources/updater/project-signing-policy.json";
 const privateKeyEnvironmentName =
-  "LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64";
+  "LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64";
 
 const read = (relativePath, root = repoRoot) =>
   fs.readFileSync(path.join(root, relativePath), "utf8");

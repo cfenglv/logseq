@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workflowRelativePath = ".github/workflows/build-desktop-release.yml";
 const privateKeyEnvironmentName =
-  "LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64";
+  "LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64";
 const signingEnvironmentName = "selfhost-release-signing";
 const publishingEnvironmentName = "selfhost-production";
 
@@ -96,7 +96,16 @@ const assertSelfhostDispatchCondition = (jobSource, label) => {
     /(?:contains\([^\n]*-selfhost\.|-selfhost\.[^\n]*(?:==|!=))/i,
     `${label} is not restricted to selfhost versions`,
   );
-  assert.doesNotMatch(condition, /schedule|nightly|push|pull_request/i);
+  assert.doesNotMatch(
+    condition,
+    /github\.event_name\s*==\s*['"](?:schedule|push|pull_request)['"]/i,
+    `${label} positively enables a non-dispatch event`,
+  );
+  assert.doesNotMatch(
+    condition,
+    /build-target[^\n]*(?:==\s*['"]nightly['"]|['"]nightly['"]\s*==)/i,
+    `${label} positively enables nightly signing or publishing`,
+  );
 };
 
 const jobNeeds = (jobSource) => {
@@ -162,6 +171,25 @@ const scriptsInvokedByJob = (jobSource) => {
     }
   }
   return [...entries];
+};
+
+const jobProductionScriptClosureSource = (jobSource) => {
+  const entries = scriptsInvokedByJob(jobSource).filter(
+    (relativePath) => !/^scripts\/test-/.test(relativePath),
+  );
+  const closure = relativeModuleClosure(entries);
+  return [...closure].map((relativePath) => read(relativePath)).join("\n");
+};
+
+const artifactNamesFor = (jobSource, operation) => {
+  const pattern = new RegExp(
+    `^        uses:\\s*actions\\/${operation}-artifact@v4[^\\n]*\\n(?:^        [^\\n]+\\n)*?^        with:\\s*\\n((?:^          [^\\n]+\\n?)+)`,
+    "gm",
+  );
+  return [...jobSource.matchAll(pattern)]
+    .map((match) => match[1].match(/^          name:\s*(.+)$/m)?.[1]?.trim())
+    .filter(Boolean)
+    .map((name) => name.replace(/^(["'])(.*)\1$/, "$2"));
 };
 
 const discoverCiSigningEntry = (signingJobSource) => {
@@ -255,7 +283,11 @@ addCase(
   () => {
     const workflows = allWorkflowSources();
     const references = workflows.flatMap(({ name, source }) =>
-      [...source.matchAll(new RegExp(privateKeyEnvironmentName, "g"))].map(() => name),
+      [
+        ...source.matchAll(
+          new RegExp(`secrets\\.${privateKeyEnvironmentName}\\b`, "g"),
+        ),
+      ].map(() => name),
     );
     assert.deepEqual(
       references,
@@ -263,6 +295,11 @@ addCase(
       `${privateKeyEnvironmentName} must occur exactly once across workflows`,
     );
     const { signing } = signingContext();
+    assert.equal(
+      [...signing.source.matchAll(/\bsecrets\./g)].length,
+      1,
+      "signing job must not consume any additional GitHub secret",
+    );
     assert.match(
       signing.source,
       new RegExp(
@@ -436,7 +473,6 @@ addCase(
       "Logseq-win-arm64-",
       "Logseq-win-x64-",
       "VERSION",
-      "SOURCE_REVISION",
     ]) {
       assert.ok(verifier.includes(expected), `release verifier omits ${expected}`);
     }
@@ -446,11 +482,6 @@ addCase(
         (/\["arm64",\s*"x64"\]/.test(verifier) &&
           /macosUpdaterMetadataName/.test(verifier)),
       "release verifier does not require both arm64 and x64 project metadata",
-    );
-    assert.match(
-      verifier,
-      /--source-(?:sha|revision)|args\[["']source-(?:sha|revision)["']\]|args\.source(?:Sha|Revision)/,
-      "release verifier cannot compare SOURCE_REVISION with the rehearsed SHA",
     );
     const signing = singleJobWithEnvironment(jobs, signingEnvironmentName);
     assert.match(
@@ -463,7 +494,70 @@ addCase(
       /needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha)/,
       "signing job does not consume the rehearsed source SHA",
     );
-    assert.match(signing.source, /SOURCE_REVISION|--source-(?:sha|revision)/);
+    assert.match(
+      signing.source,
+      /(?:SOURCE_REVISION|--source-(?:sha|revision))[\s\S]{0,160}(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))|(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))[\s\S]{0,160}(?:SOURCE_REVISION|--source-(?:sha|revision))/,
+      "SOURCE_REVISION is not bound directly to the exact rehearsed SHA",
+    );
+    const signingEffectiveSource = `${signing.source}\n${jobProductionScriptClosureSource(
+      signing.source,
+    )}`;
+    assert.match(
+      signingEffectiveSource,
+      /SOURCE_REVISION/,
+      "signing closure does not create the provenance sentinel",
+    );
+    assert.match(
+      signingEffectiveSource,
+      /(?:writeFile(?:Sync)?|appendFile(?:Sync)?)[\s\S]{0,280}SOURCE_REVISION|SOURCE_REVISION[\s\S]{0,280}(?:writeFile(?:Sync)?|appendFile(?:Sync)?)/,
+      "signing closure does not write SOURCE_REVISION into the finalized artifact",
+    );
+
+    const finalVerifierMatches = [...jobs].filter(([name, source]) => {
+      if (name === signing.name || !jobNeeds(source).includes(signing.name)) {
+        return false;
+      }
+      const effectiveSource = `${source}\n${jobProductionScriptClosureSource(source)}`;
+      return (
+        /verify-project-signed-macos-update\.mjs/.test(effectiveSource) &&
+        /verify-desktop-release-assets\.mjs/.test(effectiveSource) &&
+        /SOURCE_REVISION/.test(effectiveSource)
+      );
+    });
+    assert.equal(
+      finalVerifierMatches.length,
+      1,
+      "expected one final verifier wrapper that also validates SOURCE_REVISION",
+    );
+    const [, finalVerifier] = finalVerifierMatches[0];
+    assert.ok(
+      jobNeeds(finalVerifier).includes("release-rehearsal-gate"),
+      "final verifier does not depend on the exact rehearsal SHA",
+    );
+    assert.match(
+      finalVerifier,
+      /(?:SOURCE_REVISION|--source-(?:sha|revision))[\s\S]{0,160}(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))|(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))[\s\S]{0,160}(?:SOURCE_REVISION|--source-(?:sha|revision))/,
+      "final verifier is not passed the exact rehearsed SHA",
+    );
+    const finalVerifierEffectiveSource = `${finalVerifier}\n${jobProductionScriptClosureSource(
+      finalVerifier,
+    )}`;
+    assert.match(
+      finalVerifierEffectiveSource,
+      /(?:readFile(?:Sync)?)[\s\S]{0,280}SOURCE_REVISION|SOURCE_REVISION[\s\S]{0,280}(?:readFile(?:Sync)?)/,
+      "final verifier does not read SOURCE_REVISION",
+    );
+    assert.match(
+      finalVerifierEffectiveSource,
+      /(?:!==|===|assert\.(?:equal|strictEqual)|timingSafeEqual)/,
+      "final verifier does not compare provenance exactly",
+    );
+    const publishing = singleJobWithEnvironment(jobs, publishingEnvironmentName);
+    assert.match(
+      publishing.source,
+      /SOURCE_REVISION/,
+      "published release does not include SOURCE_REVISION",
+    );
   },
 );
 
@@ -472,10 +566,17 @@ addCase(
   () => {
     const workflow = read(workflowRelativePath);
     const jobs = workflowJobs(workflow);
+    const invokesBothVerifiers = (source) => {
+      const effectiveSource = `${source}\n${jobProductionScriptClosureSource(source)}`;
+      return (
+        /verify-project-signed-macos-update\.mjs/.test(effectiveSource) &&
+        /verify-desktop-release-assets\.mjs/.test(effectiveSource)
+      );
+    };
     const postSigningVerifierCandidates = [...jobs].filter(
       ([, source]) =>
-        /verify-project-signed-macos-update\.mjs/.test(source) &&
-        /verify-desktop-release-assets\.mjs/.test(source) &&
+        invokesBothVerifiers(source) &&
+        /actions\/download-artifact@v4/.test(source) &&
         /^    runs-on:\s*ubuntu-/m.test(source),
     );
     assert.ok(
@@ -488,8 +589,7 @@ addCase(
       if (name === signing.name || name === publishing.name) return false;
       return (
         jobNeeds(source).includes(signing.name) &&
-        /verify-project-signed-macos-update\.mjs/.test(source) &&
-        /verify-desktop-release-assets\.mjs/.test(source)
+        invokesBothVerifiers(source)
       );
     });
     assert.equal(
@@ -503,8 +603,8 @@ addCase(
     assert.match(verifier, /^    runs-on:\s*ubuntu-/m);
     assertOnlyReadPermissions(verifier);
     assert.doesNotMatch(verifier, new RegExp(privateKeyEnvironmentName));
+    assert.doesNotMatch(verifier, /\bsecrets\./, "verifier references a secret");
     assert.match(verifier, /actions\/download-artifact@/);
-    assert.match(verifier, /actions\/upload-artifact@/);
     assert.ok(
       jobNeeds(publishing.source).includes(verifierName),
       "publishing job does not depend on the independent verifier",
@@ -517,9 +617,38 @@ addCase(
       "publishing job has unrelated write permissions",
     );
     assert.doesNotMatch(publishing.source, new RegExp(privateKeyEnvironmentName));
+    assert.doesNotMatch(
+      publishing.source,
+      /\bsecrets\./,
+      "publisher references a secret instead of its scoped contents permission",
+    );
     assert.doesNotMatch(signing.source, /contents:\s*write/);
     assert.doesNotMatch(verifier, /contents:\s*write/);
     assert.match(publishing.source, /actions\/download-artifact@/);
+    const signingUploads = artifactNamesFor(signing.source, "upload");
+    const verifierDownloads = artifactNamesFor(verifier, "download");
+    const verifierUploads = artifactNamesFor(verifier, "upload");
+    const publisherDownloads = artifactNamesFor(publishing.source, "download");
+    assert.deepEqual(
+      verifierUploads.filter((name) => signingUploads.includes(name)),
+      [],
+      "artifact v4 verifier attempts to overwrite the immutable signing artifact",
+    );
+    const sharedFinalizedArtifacts = [
+      ...new Set(
+        signingUploads.filter(
+          (name) =>
+            verifierDownloads.includes(name) && publisherDownloads.includes(name),
+        ),
+      ),
+    ];
+    assert.equal(
+      sharedFinalizedArtifacts.length,
+      1,
+      `signer, verifier, and publisher must share one immutable finalized artifact; found ${
+        sharedFinalizedArtifacts.join(", ") || "none"
+      }`,
+    );
   },
 );
 
@@ -544,7 +673,11 @@ addCase(
     assert.match(publishing.source, /uses:\s*softprops\/action-gh-release@v2/);
     const verifierName = jobNeeds(publishing.source).find((name) => {
       const source = jobs.get(name) ?? "";
-      return /verify-project-signed-macos-update\.mjs/.test(source);
+      const effectiveSource = `${source}\n${jobProductionScriptClosureSource(source)}`;
+      return (
+        /verify-project-signed-macos-update\.mjs/.test(effectiveSource) &&
+        /verify-desktop-release-assets\.mjs/.test(effectiveSource)
+      );
     });
     assert.ok(verifierName, "publishing job has no signed-artifact verifier dependency");
     assert.match(
@@ -554,10 +687,15 @@ addCase(
       ),
       "release tag is not the independently verified VERSION",
     );
-    assert.match(publishing.source, /draft:\s*false/);
+    assert.match(
+      publishing.source,
+      /draft:\s*(?:false|\$\{\{[^\n]*(?:github\.event\.inputs|inputs)\.is-draft[^\n]*\}\})/,
+      "release draft state is not explicitly controlled by protected dispatch input",
+    );
     assert.match(publishing.source, /prerelease:[^\n]*(?:beta|is-pre-release)/i);
     for (const asset of [
       "VERSION",
+      "SOURCE_REVISION",
       "SHA256SUMS.txt",
       ".zip",
       ".dmg",
