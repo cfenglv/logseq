@@ -12797,18 +12797,16 @@
                        (range 5001))
                  encrypt-call (atom 0)
                  sent (atom [])
-                 client {:repo repo
+                 client (assoc
+                         (#'db-sync/ensure-client-state! repo)
                          :graph-id "graph-1"
-                         :inflight (atom [])
-                         :upload-request (atom nil)
-                         :last-sync-error (atom nil)
                          :ws (doto (js-obj)
                                (aset "readyState" 1)
                                (aset "send"
                                      (fn [raw]
                                        (swap! sent conj
                                               (js->clj (js/JSON.parse raw)
-                                                       :keywordize-keys true)))))}
+                                                       :keywordize-keys true))))))
                  previous-remote @sync-apply/*repo->latest-remote-tx]
              (-> (with-datascript-conns
                    conn client-ops-conn
