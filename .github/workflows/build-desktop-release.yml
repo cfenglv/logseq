@@ -7,6 +7,7 @@ on:
   push:
     branches:
       - selfhost/cloudflare-rtc
+      - 'release/2.0.1-selfhost.*'
   workflow_dispatch:
     inputs:
       build-target:
@@ -134,6 +135,9 @@ jobs:
     needs: [ source-preflight ]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
+    outputs:
+      source-ref: ${{ steps.source.outputs.ref }}
+      source-sha: ${{ steps.source.outputs.sha }}
     permissions:
       actions: read
       contents: read
@@ -146,7 +150,11 @@ jobs:
 
       - name: Resolve requested commit
         id: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "ref=${REQUESTED_SOURCE_REF}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          REQUESTED_SOURCE_REF: ${{ github.event.inputs.git-ref || github.ref_name }}
 
       - name: Verify successful push rehearsal
         if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
@@ -1095,6 +1103,157 @@ jobs:
             --version "$version" \
             --write-checksums
           cat "${RUNNER_TEMP}/desktop-release-assets/SHA256SUMS.txt"
+
+  selfhost-release-signing:
+    if: ${{ github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.release-rehearsal-gate.outputs.source-ref && github.sha == needs.release-rehearsal-gate.outputs.source-sha && contains(needs.release-assets-preflight.outputs.version, '-selfhost.') && !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}
+    needs: [ release-assets-preflight, release-rehearsal-gate ]
+    runs-on: macos-14
+    timeout-minutes: 20
+    environment: selfhost-release-signing
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source-ref: ${{ needs.release-rehearsal-gate.outputs.source-ref }}
+      source-sha: ${{ needs.release-rehearsal-gate.outputs.source-sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out exact rehearsed release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-rehearsal-gate.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download all six-platform candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: logseq-*-builds
+          path: ${{ runner.temp }}/selfhost-release-assets
+          merge-multiple: true
+
+      - name: Reverify complete unsigned release candidates
+        id: release
+        run: |
+          version="$(cat "${RUNNER_TEMP}/selfhost-release-assets/VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir "${RUNNER_TEMP}/selfhost-release-assets" \
+            --version "$version" \
+            --write-checksums
+          for arch in arm64 x64; do
+            metadata_name="$(node resources/selfhost-updater-version.mjs macos-metadata-name "$version" "$arch")"
+            node scripts/verify-unsigned-macos-project-update-candidate.mjs \
+              --arch "$arch" \
+              --version "$version" \
+              --archive "${RUNNER_TEMP}/selfhost-release-assets/Logseq-darwin-${arch}-${version}.zip" \
+              --metadata "${RUNNER_TEMP}/selfhost-release-assets/${metadata_name}"
+          done
+
+      - name: Sign and finalize both macOS update metadata files
+        run: |
+          node scripts/finalize-github-macos-project-update.mjs \
+            --dir "${RUNNER_TEMP}/selfhost-release-assets" \
+            --version "${{ steps.release.outputs.version }}"
+        env:
+          LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64: ${{ secrets.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 }}
+          LOGSEQ_RELEASE_BUILD_TARGET: ${{ github.event.inputs.build-target }}
+          LOGSEQ_RELEASE_SOURCE_REF: ${{ needs.release-rehearsal-gate.outputs.source-ref }}
+          LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.release-rehearsal-gate.outputs.source-sha }}
+
+      - name: Upload single finalized release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: ${{ runner.temp }}/selfhost-release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  selfhost-release-verifier:
+    needs: [ selfhost-release-signing ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source-ref: ${{ needs.selfhost-release-signing.outputs.source-ref }}
+      source-sha: ${{ needs.selfhost-release-signing.outputs.source-sha }}
+      version: ${{ needs.selfhost-release-signing.outputs.version }}
+    steps:
+      - name: Check out exact signed release verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.selfhost-release-signing.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download finalized release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: ${{ runner.temp }}/selfhost-finalized-release-assets
+
+      - name: Reverify complete assets and both project signatures
+        run: |
+          node scripts/verify-finalized-selfhost-release.mjs \
+            --dir "${RUNNER_TEMP}/selfhost-finalized-release-assets" \
+            --version "${{ needs.selfhost-release-signing.outputs.version }}"
+
+  selfhost-release:
+    if: ${{ github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.selfhost-release-verifier.outputs.source-ref && github.sha == needs.selfhost-release-verifier.outputs.source-sha && contains(needs.selfhost-release-verifier.outputs.version, '-selfhost.') && !contains(needs.selfhost-release-verifier.outputs.version, '.nightly.') }}
+    needs: [ selfhost-release-verifier ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: selfhost-production
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      version: ${{ needs.selfhost-release-verifier.outputs.version }}
+    steps:
+      - name: Check out exact release notes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.selfhost-release-verifier.outputs.source-sha }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Download verified finalized release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: release-assets
+
+      - name: Create protected selfhost GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.selfhost-release-verifier.outputs.version }}
+          name: ${{ github.event.inputs.build-target == 'beta' && format('Logseq Selfhost {0} (Beta)', needs.selfhost-release-verifier.outputs.version) || format('Logseq Selfhost {0}', needs.selfhost-release-verifier.outputs.version) }}
+          body_path: release-source/docs/releases/${{ needs.selfhost-release-verifier.outputs.version }}.md
+          draft: ${{ github.event.inputs.is-draft }}
+          prerelease: ${{ github.event.inputs.build-target == 'beta' }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/VERSION
+            release-assets/SHA256SUMS.txt
+            release-assets/*.zip
+            release-assets/*.dmg
+            release-assets/*.exe
+            release-assets/*.yml
+            release-assets/*.blockmap
+            release-assets/*.AppImage
+            release-assets/*.apk
 
   nightly-release:
     if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}

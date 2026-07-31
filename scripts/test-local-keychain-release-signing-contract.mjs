@@ -590,7 +590,7 @@ addCase(
 );
 
 addCase(
-  "GitHub Actions never receives a project-update private key or signs macOS metadata",
+  "only the protected GitHub signer job receives the project-update Environment secret",
   () => {
     const workflowDirectory = path.join(repoRoot, ".github", "workflows");
     for (const entry of fs.readdirSync(workflowDirectory)) {
@@ -599,24 +599,40 @@ addCase(
       assert.doesNotMatch(
         source,
         new RegExp(privateKeyEnvironmentName),
-        `${entry} references the project-update private key environment`,
-      );
-      assert.doesNotMatch(
-        source,
-        /secrets\.[A-Z][A-Z0-9_]*(?:ED25519|PROJECT_UPDATE)[A-Z0-9_]*(?:PRIVATE|SIGN|KEY)|secrets\.[A-Z][A-Z0-9_]*(?:PRIVATE|SIGN)[A-Z0-9_]*(?:ED25519|PROJECT_UPDATE|KEY)/i,
-        `${entry} consumes a project-update signing secret`,
+        `${entry} references the removed local signing-key environment`,
       );
       assert.doesNotMatch(
         source,
         /sign-macos-project-update\.mjs/,
-        `${entry} signs project-update metadata inside GitHub Actions`,
+        `${entry} invokes the publisher-local signer inside GitHub Actions`,
       );
+      const protectedSecret =
+        /secrets\.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/g;
+      if (entry === path.basename(workflowRelativePath)) {
+        assert.equal(
+          source.match(protectedSecret)?.length,
+          1,
+          "protected Environment signing secret must have one workflow consumer",
+        );
+        const signer = workflowJobSource(source, "selfhost-release-signing");
+        assert.match(signer, /environment:\s*selfhost-release-signing/);
+        assert.match(
+          signer,
+          /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64:\s*\$\{\{ secrets\.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 \}\}/,
+        );
+      } else {
+        assert.doesNotMatch(
+          source,
+          protectedSecret,
+          `${entry} consumes the protected project-update signing secret`,
+        );
+      }
     }
   },
 );
 
 addCase(
-  "CI may upload private unsigned candidates but cannot publish a selfhost GitHub Release",
+  "candidate builders cannot publish and protected publication depends on the secretless verifier",
   () => {
     const workflow = read(workflowRelativePath);
     for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
@@ -634,6 +650,16 @@ addCase(
     }
     assertSelfhostPublicReleaseBlocked(workflow, "nightly-release");
     assertSelfhostPublicReleaseBlocked(workflow, "release");
+    const verifier = workflowJobSource(workflow, "selfhost-release-verifier");
+    assert.doesNotMatch(
+      verifier,
+      /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64|secrets\./,
+    );
+    assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
+    const publisher = workflowJobSource(workflow, "selfhost-release");
+    assert.match(publisher, /needs:\s*\[\s*selfhost-release-verifier\s*\]/);
+    assert.match(publisher, /environment:\s*selfhost-production/);
+    assert.match(publisher, /contents:\s*write/);
   },
 );
 
@@ -740,7 +766,9 @@ addCase(
         (file) =>
           /(?:project|update|release)[\s\S]*(?:private|secret|seed|pkcs8)|(?:private|secret|seed|pkcs8)[\s\S]*(?:project|update|release)/i.test(
             file,
-          ) && !/^scripts\/test-/i.test(file),
+          ) &&
+          !/^scripts\/test-/i.test(file) &&
+          file !== "scripts/project-update-private-key.mjs",
       );
     assert.deepEqual(
       suspiciousNames,
@@ -768,13 +796,13 @@ addCase(
     const combined = `${releaseNotes}\n${guide}\n${readme}`;
     assert.match(
       combined,
-      /(?:private key|私钥)[\s\S]{0,220}(?:publisher|release machine|maintainer|发布者|发布机器|维护者)[\s\S]{0,220}(?:macOS\s+)?Keychain|(?:macOS\s+)?Keychain[\s\S]{0,220}(?:private key|私钥)/i,
-      "docs do not say that only the publisher's local macOS Keychain holds the private key",
+      /(?:local|fallback)[\s\S]{0,320}(?:macOS\s+)?(?:login\s+)?Keychain|(?:macOS\s+)?(?:login\s+)?Keychain[\s\S]{0,320}(?:local|fallback)/i,
+      "docs do not preserve the publisher-local macOS Keychain fallback",
     );
     assert.match(
       combined,
-      /(?:private key|私钥)[\s\S]{0,320}(?:(?:never|does not|will not|must not|is not|outside|out of|external to|不(?:会|得|上传|在))[\s\S]{0,180}(?:GitHub(?: Actions)?|repository secrets?)|(?:GitHub(?: Actions)?|repository secrets?)[\s\S]{0,180}(?:never|does not|will not|must not|outside|out of|external to|不(?:会|得|上传|在)))|(?:GitHub(?: Actions)?|repository secrets?)[\s\S]{0,320}(?:private key|私钥)[\s\S]{0,180}(?:never|does not|will not|must not|outside|out of|external to|不(?:会|得|上传|在))/i,
-      "docs do not prohibit uploading the project private key to GitHub",
+      /(?:private key|私钥)[\s\S]{0,320}(?:not public|never public|非公开)[\s\S]{0,320}selfhost-release-signing|selfhost-release-signing[\s\S]{0,320}(?:private key|私钥)[\s\S]{0,320}(?:not public|never public|非公开)/i,
+      "docs do not restrict the non-public key to the protected signing Environment",
     );
     assert.match(
       combined,

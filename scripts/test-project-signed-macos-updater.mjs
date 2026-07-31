@@ -3557,13 +3557,8 @@ addCase(cases, ".4 legacy feed remains pinned and .5 remains manual", () => {
   }
 });
 
-addCase(cases, "release signing is local-only and CI remains unsigned", () => {
+addCase(cases, "local signer stays local while protected CI uses a separate provider", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
-  assert.doesNotMatch(
-    workflow,
-    /secrets\.[A-Z][A-Z0-9_]*ED25519[A-Z0-9_]*/,
-    "release workflow consumes an Ed25519 signing secret",
-  );
   assert.doesNotMatch(
     workflow,
     /sign-macos-project-update\.mjs/,
@@ -3575,6 +3570,23 @@ addCase(cases, "release signing is local-only and CI remains unsigned", () => {
     )?.length,
     2,
     "CI does not verify both unsigned macOS candidates",
+  );
+  const protectedSigner = workflowJobSource(
+    workflow,
+    "selfhost-release-signing",
+  );
+  assert.match(protectedSigner, /environment:\s*selfhost-release-signing/);
+  assert.match(
+    protectedSigner,
+    /secrets\.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/,
+  );
+  assert.match(
+    protectedSigner,
+    /finalize-github-macos-project-update\.mjs/,
+  );
+  assert.doesNotMatch(
+    protectedSigner,
+    /\/usr\/bin\/security|Keychain|contents:\s*write/,
   );
   const tempRoot = fs.mkdtempSync(
     path.join(os.tmpdir(), "logseq-project-signer-no-key-"),
@@ -3646,7 +3658,7 @@ addCase(cases, "release signing is local-only and CI remains unsigned", () => {
   }
 });
 
-addCase(cases, "selfhost CI candidates cannot reach a release publisher", () => {
+addCase(cases, "selfhost CI candidates reach publication only through protected verification", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
   for (const [jobName, arch] of [
     ["build-macos-x64", "x64"],
@@ -3676,6 +3688,22 @@ addCase(cases, "selfhost CI candidates cannot reach a release publisher", () => 
       `${jobName} can publish unsigned selfhost metadata`,
     );
   }
+  const signer = workflowJobSource(workflow, "selfhost-release-signing");
+  assert.match(
+    signer,
+    /needs:\s*\[\s*release-assets-preflight,\s*release-rehearsal-gate\s*\]/,
+  );
+  assert.match(signer, /github\.event_name == 'workflow_dispatch'/);
+  const verifier = workflowJobSource(workflow, "selfhost-release-verifier");
+  assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
+  assert.doesNotMatch(
+    verifier,
+    /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64|secrets\.|environment:/,
+  );
+  const publisher = workflowJobSource(workflow, "selfhost-release");
+  assert.match(publisher, /needs:\s*\[\s*selfhost-release-verifier\s*\]/);
+  assert.match(publisher, /environment:\s*selfhost-production/);
+  assert.match(publisher, /contents:\s*write/);
 });
 
 addCase(cases, "runtime replacement has no direct unauthenticated bypass", () => {

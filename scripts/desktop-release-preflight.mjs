@@ -154,6 +154,7 @@ for (const relativePath of [
   "scripts/test-updater-private-material-policy-contract.mjs",
   "scripts/test-local-keychain-release-signing-contract.mjs",
   "scripts/test-github-project-update-signing-provider.mjs",
+  "scripts/test-protected-selfhost-release-workflow.mjs",
   "scripts/test-selfhost-macos-updater-release-contract.mjs",
   "scripts/test-updater-install-entry-contract.mjs",
   "scripts/test-selfhost-macos-user-guidance.mjs",
@@ -210,6 +211,7 @@ const requiredDesktopReleaseContracts = [
   "node ./scripts/test-updater-private-material-policy-contract.mjs",
   "node ./scripts/test-local-keychain-release-signing-contract.mjs",
   "node ./scripts/test-github-project-update-signing-provider.mjs",
+  "node ./scripts/test-protected-selfhost-release-workflow.mjs",
   "node ./scripts/test-desktop-release-contract-gate-drift.mjs",
   "node ./scripts/test-shipit-process-outcome-contract.mjs",
   "node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract",
@@ -297,6 +299,12 @@ if (
   "node ./scripts/test-github-project-update-signing-provider.mjs"
 ) {
   fail("package.json must expose the GitHub signing provider contract");
+}
+if (
+  rootPackage.scripts?.["project-update:test-protected-release-workflow"] !==
+  "node ./scripts/test-protected-selfhost-release-workflow.mjs"
+) {
+  fail("package.json must expose the protected selfhost release workflow contract");
 }
 if (
   rootPackage.scripts?.[

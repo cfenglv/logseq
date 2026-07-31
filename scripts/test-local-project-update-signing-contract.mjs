@@ -186,13 +186,12 @@ addCase("symlink and realpath entrypoints still execute the signer gate", () => 
   }
 });
 
-addCase("GitHub Actions builds candidates but cannot sign or publish selfhost", () => {
+addCase("GitHub Actions isolates selfhost signing and publication", () => {
   const workflow = read(".github/workflows/build-desktop-release.yml");
   assert.doesNotMatch(
     workflow,
     /LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64/,
   );
-  assert.doesNotMatch(workflow, /secrets\.[A-Z0-9_]*ED25519[A-Z0-9_]*/);
   for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
     const job = workflowJob(workflow, jobName);
     assert.doesNotMatch(job, /sign-macos-project-update\.mjs/);
@@ -206,6 +205,21 @@ addCase("GitHub Actions builds candidates but cannot sign or publish selfhost", 
       `${jobName} can publish unsigned selfhost metadata`,
     );
   }
+  const signer = workflowJob(workflow, "selfhost-release-signing");
+  assert.match(signer, /environment:\s*selfhost-release-signing/);
+  assert.match(signer, /github\.event_name == 'workflow_dispatch'/);
+  assert.match(
+    signer,
+    /secrets\.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/,
+  );
+  assert.doesNotMatch(signer, /contents:\s*write/);
+  const verifier = workflowJob(workflow, "selfhost-release-verifier");
+  assert.doesNotMatch(verifier, /secrets\.|environment:/);
+  assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
+  const publisher = workflowJob(workflow, "selfhost-release");
+  assert.match(publisher, /needs:\s*\[\s*selfhost-release-verifier\s*\]/);
+  assert.match(publisher, /environment:\s*selfhost-production/);
+  assert.match(publisher, /contents:\s*write/);
 });
 
 addCase("local finalizer signs and verifies both macOS candidates", () => {
@@ -232,7 +246,7 @@ addCase("local finalizer signs and verifies both macOS candidates", () => {
   );
 });
 
-addCase("publisher documentation keeps private material local", () => {
+addCase("publisher documentation preserves protected CI and local Keychain paths", () => {
   const guide = read("docs/selfhost-sync.md");
   assert.match(guide, /project-update:finalize-local-macos-candidates/);
   assert.match(guide, /Keychain Access/);
@@ -241,10 +255,13 @@ addCase("publisher documentation keeps private material local", () => {
     /com\.logseq\.selfhost\.project-update-signing\.ed25519-pkcs8-base64/,
   );
   assert.match(guide, /account[\s\S]{0,160}keyId/i);
-  assert.doesNotMatch(
+  assert.match(guide, /selfhost-release-signing/);
+  assert.match(guide, /selfhost-production/);
+  assert.match(
     guide,
-    /LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64/,
+    /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/,
   );
+  assert.match(guide, /required reviewers?/i);
 });
 
 let passed = 0;

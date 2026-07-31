@@ -296,17 +296,51 @@ application bundle may require **Open Anyway** again the first time it is
 opened. The updater never changes certificate Trust Settings and never clears
 or removes quarantine attributes.
 
-#### Local project-update signing and publication
+#### Protected project-update signing and publication
 
-The project-update private key is held only by the publisher's macOS login
-Keychain. GitHub Actions builds and verifies unsigned macOS candidates, but
-selfhost stable, beta, and nightly jobs cannot publish them. This release-side
-handoff does not change the client experience: `.5` clients still discover,
-download, verify, and install `.6+` updates through the normal in-app flow.
+The project-update private key is never public and is never stored in the
+repository or a normal repository secret. Users and clients do not need this
+key. Release maintainers may use either the protected GitHub Environment flow
+or the existing local macOS login Keychain flow. Both produce the same signed
+metadata, and neither changes the `.5` client's normal `.6+` discovery,
+download, verification, or **Restart and install** experience.
 
-Provision the existing PKCS#8 DER base64 value with **Keychain Access** as one
-generic password item. Do not put it in a shell variable, command argument,
-file, repository secret, or CI setting:
+For automated stable/beta publication, configure these two GitHub
+Environments before dispatching the workflow:
+
+- `selfhost-release-signing`: enable required reviewers and deployment branch
+  or tag restrictions for the protected release ref, such as
+  `release/2.0.1-selfhost.*`. Store the matching canonical PKCS#8 DER base64
+  value only as the Environment secret
+  `LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64`.
+- `selfhost-production`: separately enable required reviewers and the same
+  deployment branch or tag restrictions. Do not add the project-update private
+  key to this Environment; it grants only the publication approval boundary.
+
+Run `workflow_dispatch` from the exact ref named by `git-ref`. Its resolved SHA
+must equal the workflow SHA and must already have a successful push rehearsal;
+the workflow's push trigger is deliberately limited to
+`selfhost/cloudflare-rtc` and `release/2.0.1-selfhost.*`. The signing job also
+requires stable/beta, all six desktop platforms, a non-nightly selfhost
+version, and the complete candidate preflight. Only that GitHub-hosted macOS
+job receives the Environment secret, scoped to its Node signing step. The
+script deletes the value from its own environment immediately after copying it
+to an in-memory buffer and never writes it to a file, argv, Keychain, artifact,
+or log. Missing, malformed, non-PKCS#8, non-Ed25519, or policy/keyId-mismatched
+material blocks the release before metadata changes.
+
+The signer uploads one immutable `selfhost-finalized-release-assets` artifact.
+A separate GitHub-hosted verifier has no signing Environment or secret and
+rechecks the exact cross-platform asset set, checksums, and both macOS project
+signatures. Only after it passes can the `selfhost-production` job, with
+`contents:write`, create the stable or beta GitHub Release. Push, pull request,
+nightly, non-selfhost, partial-platform, repository/ref mismatch, and failed or
+missing rehearsal runs cannot enter either protected publication path.
+
+The local fallback remains supported. Provision the existing PKCS#8 DER base64
+value with **Keychain Access** as one generic password item. Do not put the
+local copy in a shell variable, command argument, file, or normal repository
+secret:
 
 - Keychain: `login`
 - Service:
@@ -322,9 +356,10 @@ the Keychain search list, default Keychain, certificate Trust Settings, or
 item access policy. Back up the same private key separately using an offline
 encrypted medium before publishing `.5`.
 
-Run the GitHub workflow as a build-only candidate job, then download and merge
-all `logseq-*-builds` artifacts into one directory. On the publisher Mac, from
-the exact tested source revision, finalize the directory:
+To use the local fallback, run the GitHub workflow as a build-only candidate
+job, then download and merge all `logseq-*-builds` artifacts into one
+directory. On the publisher Mac, from the exact tested source revision,
+finalize the directory:
 
 ```bash
 version="$(cat /absolute/path/to/release-candidates/VERSION)"

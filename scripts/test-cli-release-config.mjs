@@ -834,7 +834,7 @@ assert.equal(
     /verify-project-signed-macos-update\.mjs/g,
   )?.length ?? 0,
   0,
-  "CI must not claim to verify a project signature it cannot create",
+  "workflow steps should use the complete finalized-release verifier",
 );
 assert.equal(
   desktopReleaseWorkflow.match(
@@ -857,6 +857,53 @@ assert.match(
   localProjectUpdateSigningContract,
   /local macOS publisher only|refuses CI/,
   "local signing contract must exercise the CI release block",
+);
+const protectedSelfhostSigner = workflowJob(
+  desktopReleaseWorkflow,
+  "selfhost-release-signing",
+);
+assert.match(
+  protectedSelfhostSigner,
+  /environment:\s*selfhost-release-signing/,
+  "selfhost signer must use its protected Environment",
+);
+assert.match(
+  protectedSelfhostSigner,
+  /secrets\.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/,
+  "selfhost signer must consume the Environment-scoped project key",
+);
+assert.doesNotMatch(
+  protectedSelfhostSigner,
+  /contents:\s*write|action-gh-release|nightly-release/,
+  "selfhost signer must not publish",
+);
+const protectedSelfhostVerifier = workflowJob(
+  desktopReleaseWorkflow,
+  "selfhost-release-verifier",
+);
+assert.match(
+  protectedSelfhostVerifier,
+  /verify-finalized-selfhost-release\.mjs/,
+  "secretless verifier must recheck finalized assets",
+);
+assert.doesNotMatch(
+  protectedSelfhostVerifier,
+  /secrets\.|environment:/,
+  "finalized-release verifier must not receive a protected Environment",
+);
+const protectedSelfhostPublisher = workflowJob(
+  desktopReleaseWorkflow,
+  "selfhost-release",
+);
+assert.match(
+  protectedSelfhostPublisher,
+  /needs:\s*\[\s*selfhost-release-verifier\s*\]/,
+  "selfhost publisher must depend on the secretless verifier",
+);
+assert.match(
+  protectedSelfhostPublisher,
+  /environment:\s*selfhost-production[\s\S]*contents:\s*write/,
+  "selfhost publisher must use the protected production write boundary",
 );
 assert.doesNotMatch(
   desktopReleaseWorkflow,
