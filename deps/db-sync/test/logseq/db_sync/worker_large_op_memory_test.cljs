@@ -63,7 +63,7 @@
                           (.join node-path (.tmpdir node-os)
                                  "logseq-modern-staged-"))
         db-path (.join node-path dir "graph.sqlite")
-        db (new sqlite db-path nil)
+        ^js db (new sqlite db-path nil)
         sql (sqlite-adapter db)]
     (try
       (.pragma db "journal_mode = DELETE")
