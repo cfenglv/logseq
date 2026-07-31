@@ -51,6 +51,8 @@
 (def ^:private upload-response-timeout-ms (* 2 60 1000))
 (def ^:private max-upload-request-datoms 5000)
 (defonce ^:private *repo->large-upload-sessions (atom {}))
+
+(def ^:private large-upload-session-version 2)
 (defonce ^:private *repo->server-capabilities (atom {}))
 
 (defn set-server-capabilities!
@@ -908,14 +910,74 @@
   [repo tx-id]
   [repo tx-id])
 
+(defn- nonnegative-integer?
+  [value]
+  (and (integer? value) (not (neg? value))))
+
+(defn- contiguous-large-upload-boundaries?
+  [boundaries total]
+  (and (vector? boundaries)
+       (loop [expected-start 0
+              remaining boundaries]
+         (if-let [[start end :as boundary] (first remaining)]
+           (and (= 2 (count boundary))
+                (= expected-start start)
+                (nonnegative-integer? end)
+                (< start end)
+                (<= end total)
+                (recur end (next remaining)))
+           (= expected-start total)))))
+
+(defn- normalize-large-upload-session
+  [session]
+  (let [tx-data (:tx-data session)
+        boundaries (:boundaries session)
+        source-next-index (:source-next-index session)
+        chunk-seq (:chunk-seq session)
+        total (count tx-data)]
+    (when (and (map? session)
+               (= large-upload-session-version (:session-version session))
+               (string? (:session-id session))
+               (string? (:source-digest session))
+               (vector? tx-data)
+               (map? (:wire-cache session))
+               (nonnegative-integer? source-next-index)
+               (nonnegative-integer? chunk-seq)
+               (contiguous-large-upload-boundaries? boundaries total)
+               (<= chunk-seq (count boundaries))
+               (= source-next-index
+                  (if (< chunk-seq (count boundaries))
+                    (first (nth boundaries chunk-seq))
+                    total)))
+      session)))
+
+(defn- large-upload-session-state
+  [repo logical-tx-id]
+  (let [session-key (large-upload-progress-key repo logical-tx-id)
+        ;; SQLite is the restart authority. Reading it first also prevents a
+        ;; stale process-local cache from masking an externally recovered or
+        ;; transactionally updated durable cursor.
+        raw-session (or (client-op/get-client-tx-upload-state
+                         repo logical-tx-id)
+                        (get @*repo->large-upload-sessions session-key))
+        session (normalize-large-upload-session raw-session)]
+    (if session
+      (do
+        (swap! *repo->large-upload-sessions assoc session-key session)
+        {:session session})
+      (do
+        ;; A legacy or partially written cursor is ambiguous: its source
+        ;; position cannot be reconstructed from a wire ordinal after title
+        ;; offload. Drop both the generation and frozen wire bytes rather than
+        ;; guessing, then let the caller start again at source/ordinal zero.
+        (swap! *repo->large-upload-sessions dissoc session-key)
+        (when raw-session
+          (client-op/delete-client-tx-upload-state! repo logical-tx-id))
+        {:invalid? (some? raw-session)}))))
+
 (defn- large-upload-session
   [repo logical-tx-id]
-  (let [session-key (large-upload-progress-key repo logical-tx-id)]
-    (or (get @*repo->large-upload-sessions session-key)
-        (when-let [session (client-op/get-client-tx-upload-state
-                            repo logical-tx-id)]
-          (swap! *repo->large-upload-sessions assoc session-key session)
-          session))))
+  (:session (large-upload-session-state repo logical-tx-id)))
 
 (defn- persist-large-upload-session!
   [repo logical-tx-id session]
@@ -950,19 +1012,28 @@
         result))))
 
 (defn- new-large-upload-session
-  [db {:keys [tx-id tx-data outliner-op]}]
+  [db {:keys [tx-id tx-data outliner-op]} replace-invalid-generation?]
   (let [tx-data (vec tx-data)
-        session-id (sync-protocol/tx-upload-session-id
-                    tx-id outliner-op tx-data)]
-    {:session-id session-id
-     :source-digest session-id
+        source-digest (sync-protocol/tx-upload-session-id
+                       tx-id outliner-op tx-data)
+        session-id (if replace-invalid-generation?
+                     ;; An invalid durable record may correspond to a staged
+                     ;; server generation whose randomized wire cache is no
+                     ;; longer available. A distinct authenticated generation
+                     ;; lets ordinal zero replace it safely.
+                     (sync-protocol/tx-upload-session-id
+                      (random-uuid) outliner-op [source-digest])
+                     source-digest)]
+    {:session-version large-upload-session-version
+     :session-id session-id
+     :source-digest source-digest
      :outliner-op outliner-op
      :tx-data tx-data
      :boundaries (large-upload-boundaries db tx-data)
      ;; Source slicing and wire ordering are independent. Offload/encryption
      ;; may change the wire datom count without changing either cursor.
      :source-next-index 0
-     :next-chunk-seq 0
+     :chunk-seq 0
      ;; This freezes randomized E2EE/offload wire content until ACK. A retry is
      ;; byte-equivalent, so the server can verify it without trusting metadata.
      :wire-cache {}}))
@@ -1015,22 +1086,30 @@
   [repo db {:keys [tx-id tx-data outliner-op] :as entry}]
   (let [source-digest (sync-protocol/tx-upload-session-id
                        tx-id outliner-op tx-data)
-        existing (large-upload-session repo tx-id)
+        {:keys [session invalid?]} (large-upload-session-state repo tx-id)
+        existing session
         session (if (or (= source-digest (:source-digest existing))
                         (:final-wire-frozen? existing))
                   existing
-                  (let [replacement (new-large-upload-session db entry)]
+                  (let [replacement (new-large-upload-session
+                                     db entry invalid?)]
                     (persist-large-upload-session! repo tx-id replacement)))
         tx-data (:tx-data session)
         total (count tx-data)
         requested-start (:source-next-index session)
-        chunk-seq (:next-chunk-seq session)
+        chunk-seq (:chunk-seq session)
         [start next-index]
-        (or (some #(when (= requested-start (first %)) %)
-                  (:boundaries session))
-            (first (:boundaries session)))
+        (if (= requested-start total)
+          [total total]
+          (or (some #(when (= requested-start (first %)) %)
+                    (:boundaries session))
+              (fail-fast :db-sync/invalid-large-upload-boundary
+                         {:start requested-start :total total})))
         chunk (subvec tx-data start next-index)
-        final? (>= next-index total)
+        ;; The strict server intentionally forbids final-first. When one
+        ;; indivisible tempid group consumes the whole source, stage it as
+        ;; ordinal zero and finish with an explicit empty ordinal-one chunk.
+        final? (and (>= next-index total) (pos? chunk-seq))
         session-id (:session-id session)
         chunk-tx-id (sync-protocol/tx-chunk-id
                      tx-id session-id chunk-seq final?)]
@@ -1140,9 +1219,9 @@
                repo large-upload-original-tx-id
                (assoc session
                       :source-next-index large-upload-next-index
-                      :next-chunk-seq
+                      :chunk-seq
                       (or large-upload-next-chunk-seq
-                          (inc (or (:next-chunk-seq session) 0))))))))))))
+                          (inc (or (:chunk-seq session) 0))))))))))))
 
 (defn- large-upload-progress
   [tx-entries]
