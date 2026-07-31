@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { parseSelfhostProjectVersion } from "../resources/project-updater-signature.mjs";
 import { macosUpdaterMetadataName } from "../resources/selfhost-updater-version.mjs";
 import { verifyProjectSignedMacosUpdate } from "./verify-project-signed-macos-update.mjs";
+import { verifySourceRevision } from "./selfhost-release-provenance.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -30,6 +31,7 @@ const parseArgs = (argv) => {
   };
   return Object.freeze({
     dir: path.resolve(required("--dir")),
+    sourceRevision: required("--source-revision"),
     version: required("--version"),
   });
 };
@@ -68,12 +70,13 @@ const verifyCompleteAssets = ({ dir, version }) => {
 };
 
 const main = () => {
-  const { dir, version } = parseArgs(process.argv.slice(2));
+  const { dir, sourceRevision, version } = parseArgs(process.argv.slice(2));
   const parsed = parseSelfhostProjectVersion(version);
   if (parsed.nightlyDate !== undefined) {
     throw new Error("finalized stable/beta release cannot be a nightly version");
   }
   verifyCompleteAssets({ dir, version });
+  verifySourceRevision({ dir, sourceRevision });
   const architectures = ["arm64", "x64"];
   for (const arch of architectures) {
     verifyProjectSignedMacosUpdate({

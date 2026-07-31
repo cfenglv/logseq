@@ -13,6 +13,23 @@ const read = (relativePath) =>
   fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
 const workflow = read(".github/workflows/build-desktop-release.yml");
 
+const relativeModuleClosure = (relativePath, seen = new Set()) => {
+  if (seen.has(relativePath)) return seen;
+  seen.add(relativePath);
+  const source = read(relativePath);
+  for (const match of source.matchAll(
+    /(?:from\s+|import\s*\(\s*)["'](\.[^"']+\.(?:c?js|mjs))["']/g,
+  )) {
+    relativeModuleClosure(
+      path
+        .normalize(path.join(path.dirname(relativePath), match[1]))
+        .replaceAll(path.sep, "/"),
+      seen,
+    );
+  }
+  return seen;
+};
+
 const workflowJob = (name) => {
   const match = workflow.match(
     new RegExp(
@@ -110,6 +127,9 @@ addCase("signer merges six-platform candidates into one finalized artifact", () 
     1,
   );
   assert.match(signer, /name:\s*selfhost-finalized-release-assets/);
+  const finalizer = read("scripts/finalize-github-macos-project-update.mjs");
+  assert.match(finalizer, /writeSourceRevision/);
+  assert.match(finalizer, /context\.sourceSha/);
 });
 
 addCase("secretless verifier rechecks complete assets and signatures", () => {
@@ -119,10 +139,19 @@ addCase("secretless verifier rechecks complete assets and signatures", () => {
   assert.doesNotMatch(verifier, /environment:|secrets\./);
   assert.match(verifier, /name:\s*selfhost-finalized-release-assets/);
   assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
-  const verifierSource = read("scripts/verify-finalized-selfhost-release.mjs");
-  assert.match(verifierSource, /verify-desktop-release-assets\.mjs/);
-  assert.match(verifierSource, /verifyProjectSignedMacosUpdate/);
-  assert.match(verifierSource, /\["arm64", "x64"\]/);
+  assert.match(
+    verifier,
+    /--source-revision[\s\S]{0,160}selfhost-release-signing\.outputs\.source-sha/,
+  );
+  const verifierClosure = [
+    ...relativeModuleClosure("scripts/verify-finalized-selfhost-release.mjs"),
+  ]
+    .map(read)
+    .join("\n");
+  assert.match(verifierClosure, /verify-desktop-release-assets\.mjs/);
+  assert.match(verifierClosure, /verifyProjectSignedMacosUpdate/);
+  assert.match(verifierClosure, /verifySourceRevision/);
+  assert.match(verifierClosure, /\["arm64", "x64"\]/);
 });
 
 addCase("publisher has separate protected write boundary after verifier", () => {
@@ -133,6 +162,7 @@ addCase("publisher has separate protected write boundary after verifier", () => 
   assert.match(publisher, /permissions:[\s\S]{0,100}contents:\s*write/);
   assert.match(publisher, /uses:\s*softprops\/action-gh-release@v2/);
   assert.match(publisher, /name:\s*selfhost-finalized-release-assets/);
+  assert.match(publisher, /release-assets\/SOURCE_REVISION/);
   assert.doesNotMatch(
     publisher,
     /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64|finalize-github-macos/,
@@ -172,6 +202,10 @@ addCase("documentation requires protected Environments and no user key", () => {
   assert.match(docs, /deployment branch[\s\S]{0,80}(?:tag )?restrictions?/i);
   assert.match(docs, /Environment secret[\s\S]{0,160}(?:never public|not public)|(?:never public|not public)[\s\S]{0,160}Environment secret/i);
   assert.match(docs, /users?[\s\S]{0,100}(?:do not|never|no need)[\s\S]{0,100}(?:key|secret)/i);
+  assert.match(
+    docs,
+    /local macOS login Keychain finalizer[\s\S]{0,160}supported compatibility[\s\S]{0,120}(?:alternative|fallback)/i,
+  );
 });
 
 addCase("formal release contracts execute this workflow gate", () => {

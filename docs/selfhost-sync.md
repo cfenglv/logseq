@@ -329,7 +329,9 @@ to an in-memory buffer and never writes it to a file, argv, Keychain, artifact,
 or log. Missing, malformed, non-PKCS#8, non-Ed25519, or policy/keyId-mismatched
 material blocks the release before metadata changes.
 
-The signer uploads one immutable `selfhost-finalized-release-assets` artifact.
+The signer records the exact rehearsed commit in the top-level
+`SOURCE_REVISION` file and uploads one immutable
+`selfhost-finalized-release-assets` artifact.
 A separate GitHub-hosted verifier has no signing Environment or secret and
 rechecks the exact cross-platform asset set, checksums, and both macOS project
 signatures. Only after it passes can the `selfhost-production` job, with
@@ -337,10 +339,11 @@ signatures. Only after it passes can the `selfhost-production` job, with
 nightly, non-selfhost, partial-platform, repository/ref mismatch, and failed or
 missing rehearsal runs cannot enter either protected publication path.
 
-The local fallback remains supported. Provision the existing PKCS#8 DER base64
-value with **Keychain Access** as one generic password item. Do not put the
-local copy in a shell variable, command argument, file, or normal repository
-secret:
+The local macOS login Keychain finalizer remains a supported compatibility
+alternative and fallback to the automated GitHub Environment Secret path.
+Provision the existing PKCS#8 DER base64 value with **Keychain Access** as one
+generic password item. Do not put the local copy in a shell variable, command
+argument, file, or normal repository secret:
 
 - Keychain: `login`
 - Service:
@@ -363,9 +366,11 @@ finalize the directory:
 
 ```bash
 version="$(cat /absolute/path/to/release-candidates/VERSION)"
+source_revision="<exact-successful-push-rehearsal-commit-sha>"
 
 pnpm project-update:finalize-local-macos-candidates -- \
   --dir /absolute/path/to/release-candidates \
+  --source-revision "$source_revision" \
   --version "$version"
 ```
 

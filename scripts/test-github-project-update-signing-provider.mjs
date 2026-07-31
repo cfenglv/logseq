@@ -6,6 +6,7 @@ import {
   generateKeyPairSync,
 } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -13,6 +14,11 @@ import {
   githubProjectUpdateSigningSecretName,
   loadGithubProjectUpdateSigningKey,
 } from "./project-update-github-actions.mjs";
+import {
+  removeSourceRevision,
+  verifySourceRevision,
+  writeSourceRevision,
+} from "./selfhost-release-provenance.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -75,12 +81,50 @@ const addCase = (name, test) => cases.push([name, test]);
 
 addCase("exact workflow/source ref and SHA context is accepted", () => {
   withEnvironment({}, () => {
-    assert.doesNotThrow(() =>
-      assertGithubProjectUpdateSigningContext({
-        version: "2.0.1-selfhost.5",
-      }),
-    );
+    const context = assertGithubProjectUpdateSigningContext({
+      version: "2.0.1-selfhost.5",
+    });
+    assert.equal(context.sourceSha, "a".repeat(40));
+    assert.equal(context.sourceRef, "release/2.0.1-selfhost.5");
   });
+});
+
+addCase("SOURCE_REVISION is exact, immutable, and fail-closed", () => {
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "logseq-source-revision-"),
+  );
+  try {
+    const sourceRevision = "a".repeat(40);
+    writeSourceRevision({ dir: root, sourceRevision });
+    assert.equal(
+      fs.readFileSync(path.join(root, "SOURCE_REVISION"), "utf8"),
+      `${sourceRevision}\n`,
+    );
+    assert.equal(
+      verifySourceRevision({ dir: root, sourceRevision }),
+      sourceRevision,
+    );
+    assert.throws(
+      () => verifySourceRevision({ dir: root, sourceRevision: "b".repeat(40) }),
+      /does not equal the exact rehearsed source SHA/,
+    );
+    assert.throws(
+      () => writeSourceRevision({ dir: root, sourceRevision }),
+      /already contain SOURCE_REVISION/,
+    );
+    assert.throws(
+      () =>
+        verifySourceRevision({
+          dir: root,
+          sourceRevision: "A".repeat(40),
+        }),
+      /exact lowercase 40-hex/,
+    );
+    removeSourceRevision(root);
+    assert.equal(fs.existsSync(path.join(root, "SOURCE_REVISION")), false);
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 });
 
 for (const [name, overrides, version, pattern] of [
@@ -237,7 +281,14 @@ addCase("shared finalizer verifies before and after both metadata signatures", (
   const complete = source.lastIndexOf("verifyCompleteReleaseAssets");
   assert.ok(unsigned !== -1 && unsigned < sign);
   assert.ok(sign < signed && signed < complete);
+  assert.ok(complete < source.lastIndexOf("finalizeArtifact"));
+  assert.match(source, /rollbackArtifact/);
   assert.match(source, /for \(const arch of \["arm64", "x64"\]\)/);
+  const githubFinalizer = read(
+    "scripts/finalize-github-macos-project-update.mjs",
+  );
+  assert.match(githubFinalizer, /writeSourceRevision/);
+  assert.match(githubFinalizer, /removeSourceRevision/);
 });
 
 let passed = 0;

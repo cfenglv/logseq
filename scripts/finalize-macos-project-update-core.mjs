@@ -43,7 +43,9 @@ const verifyCompleteReleaseAssets = ({ dir, version }) => {
 
 export const finalizeMacosProjectUpdate = async ({
   dir,
+  finalizeArtifact,
   policy,
+  rollbackArtifact,
   signingKey,
   version,
 }) => {
@@ -89,14 +91,19 @@ export const finalizeMacosProjectUpdate = async ({
       verifyProjectSignedMacosUpdate(candidate);
     }
     verifyCompleteReleaseAssets({ dir, version });
+    await finalizeArtifact?.();
   } catch (error) {
-    for (const [metadata, contents] of originalMetadata) {
-      fs.writeFileSync(metadata, contents);
-    }
-    if (originalChecksum) {
-      fs.writeFileSync(checksumPath, originalChecksum);
-    } else {
-      fs.rmSync(checksumPath, { force: true });
+    try {
+      await rollbackArtifact?.();
+    } finally {
+      for (const [metadata, contents] of originalMetadata) {
+        fs.writeFileSync(metadata, contents);
+      }
+      if (originalChecksum) {
+        fs.writeFileSync(checksumPath, originalChecksum);
+      } else {
+        fs.rmSync(checksumPath, { force: true });
+      }
     }
     throw error;
   }

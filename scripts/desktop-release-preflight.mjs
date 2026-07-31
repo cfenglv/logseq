@@ -135,6 +135,7 @@ for (const relativePath of [
   "scripts/project-update-keychain.mjs",
   "scripts/project-update-private-key.mjs",
   "scripts/project-update-github-actions.mjs",
+  "scripts/selfhost-release-provenance.mjs",
   "scripts/project-update-signer-core.mjs",
   "scripts/sign-macos-project-update.mjs",
   "scripts/finalize-macos-project-update-core.mjs",

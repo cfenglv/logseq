@@ -1206,6 +1206,7 @@ jobs:
         run: |
           node scripts/verify-finalized-selfhost-release.mjs \
             --dir "${RUNNER_TEMP}/selfhost-finalized-release-assets" \
+            --source-revision "${{ needs.selfhost-release-signing.outputs.source-sha }}" \
             --version "${{ needs.selfhost-release-signing.outputs.version }}"
 
   selfhost-release:
@@ -1246,6 +1247,7 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release-assets/VERSION
+            release-assets/SOURCE_REVISION
             release-assets/SHA256SUMS.txt
             release-assets/*.zip
             release-assets/*.dmg

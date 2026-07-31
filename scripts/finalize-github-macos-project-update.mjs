@@ -9,6 +9,11 @@ import {
   assertGithubProjectUpdateSigningContext,
   loadGithubProjectUpdateSigningKey,
 } from "./project-update-github-actions.mjs";
+import {
+  assertSourceRevisionAbsent,
+  removeSourceRevision,
+  writeSourceRevision,
+} from "./selfhost-release-provenance.mjs";
 
 const parseArgs = (argv) => {
   const values = new Map();
@@ -33,12 +38,19 @@ const parseArgs = (argv) => {
 
 const main = async () => {
   const args = parseArgs(process.argv.slice(2));
-  assertGithubProjectUpdateSigningContext(args);
+  const context = assertGithubProjectUpdateSigningContext(args);
+  assertSourceRevisionAbsent(args.dir);
   const policy = loadProjectSigningPolicy();
   const signingKey = loadGithubProjectUpdateSigningKey(policy);
   const result = await finalizeMacosProjectUpdate({
     ...args,
+    finalizeArtifact: () =>
+      writeSourceRevision({
+        dir: args.dir,
+        sourceRevision: context.sourceSha,
+      }),
     policy,
+    rollbackArtifact: () => removeSourceRevision(args.dir),
     signingKey,
   });
   console.log(

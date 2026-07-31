@@ -60,6 +60,11 @@ export const assertGithubProjectUpdateSigningContext = ({ version }) => {
       "GitHub release signing requires the workflow SHA to equal the resolved source SHA",
     );
   }
+  return Object.freeze({
+    buildTarget,
+    sourceRef,
+    sourceSha: workflowSha.toLowerCase(),
+  });
 };
 
 export const loadGithubProjectUpdateSigningKey = (policy) => {

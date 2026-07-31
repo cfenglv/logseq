@@ -9,6 +9,12 @@ import {
   assertLocalMacosProjectUpdatePublisher,
   loadProjectUpdateSigningKey,
 } from "./project-update-keychain.mjs";
+import {
+  assertSourceRevision,
+  assertSourceRevisionAbsent,
+  removeSourceRevision,
+  writeSourceRevision,
+} from "./selfhost-release-provenance.mjs";
 
 const parseArgs = (argv) => {
   const values = new Map();
@@ -27,6 +33,9 @@ const parseArgs = (argv) => {
   };
   return Object.freeze({
     dir: path.resolve(required("--dir")),
+    sourceRevision: values.has("--source-revision")
+      ? assertSourceRevision(values.get("--source-revision"))
+      : undefined,
     version: required("--version"),
   });
 };
@@ -34,11 +43,22 @@ const parseArgs = (argv) => {
 const main = async () => {
   assertLocalMacosProjectUpdatePublisher();
   const args = parseArgs(process.argv.slice(2));
+  if (args.sourceRevision) assertSourceRevisionAbsent(args.dir);
   const policy = loadProjectSigningPolicy();
   const signingKey = loadProjectUpdateSigningKey(policy);
   const result = await finalizeMacosProjectUpdate({
     ...args,
+    finalizeArtifact: args.sourceRevision
+      ? () =>
+          writeSourceRevision({
+            dir: args.dir,
+            sourceRevision: args.sourceRevision,
+          })
+      : undefined,
     policy,
+    rollbackArtifact: args.sourceRevision
+      ? () => removeSourceRevision(args.dir)
+      : undefined,
     signingKey,
   });
   console.log(
