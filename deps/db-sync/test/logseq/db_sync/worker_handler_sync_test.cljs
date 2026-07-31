@@ -5028,26 +5028,72 @@
       (.update value "utf8")
       (.digest "hex")))
 
-(defn- declared-client-payload-digest
-  [tx-data outliner-op chunk-final?]
+(defn- modern-upload-session-id
+  [logical-tx-id outliner-op full-tx-data]
   (sha256-hex
    (protocol/tx->transit
-    [:client-tx-payload-v1 outliner-op (boolean chunk-final?) tx-data])))
+    [:client-tx-upload-session-v1
+     logical-tx-id
+     outliner-op
+     full-tx-data])))
 
-(defn- identified-wire-entry
-  [{:keys [tx-id logical-tx-id chunk-index chunk-final?
-           tx-data outliner-op payload-digest]
+(defn- modern-nonfinal-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index]
+  (let [raw (sha256-hex
+             (str "logseq-tx-chunk-v1/"
+                  logical-tx-id "/"
+                  upload-session-id "/"
+                  chunk-index))
+        versioned (str (subs raw 0 12)
+                       "5"
+                       (subs raw 13 16)
+                       "8"
+                       (subs raw 17 32))]
+    (uuid (str (subs versioned 0 8) "-"
+               (subs versioned 8 12) "-"
+               (subs versioned 12 16) "-"
+               (subs versioned 16 20) "-"
+               (subs versioned 20 32)))))
+
+(defn- modern-session-entry
+  [{:keys [logical-tx-id full-tx-data chunk-tx-data chunk-index
+           chunk-final? outliner-op upload-session-id tx-id]
     :or {outliner-op :save-block}}]
-  (cond-> {:tx-id tx-id
-           :tx (protocol/tx->transit tx-data)
-           :outliner-op outliner-op
-           :payload-digest
-           (or payload-digest
-               (declared-client-payload-digest
-                tx-data outliner-op chunk-final?))}
-    logical-tx-id (assoc :logical-tx-id logical-tx-id)
-    (some? chunk-index) (assoc :chunk-index chunk-index)
-    (some? chunk-final?) (assoc :chunk-final? chunk-final?)))
+  (let [session-id (or upload-session-id
+                       (modern-upload-session-id
+                        logical-tx-id outliner-op full-tx-data))
+        chunk-tx-id (or tx-id
+                        (if chunk-final?
+                          logical-tx-id
+                          (modern-nonfinal-chunk-tx-id
+                           logical-tx-id session-id chunk-index)))]
+    {:tx (protocol/tx->transit chunk-tx-data)
+     :tx-id chunk-tx-id
+     :logical-tx-id logical-tx-id
+     :upload-session-id session-id
+     :chunk-index chunk-index
+     :chunk-final? (boolean chunk-final?)
+     :outliner-op outliner-op}))
+
+(defn- modern-wire-digest
+  [entry]
+  (sha256-hex
+   (protocol/tx->transit
+    [:client-tx-wire-v1
+     (:tx-id entry)
+     (:logical-tx-id entry)
+     (:upload-session-id entry)
+     (:chunk-index entry)
+     (boolean (:chunk-final? entry))
+     (:outliner-op entry)
+     (protocol/transit->tx (:tx entry))])))
+
+(defn- ordinary-identified-wire-entry
+  [{:keys [tx-id tx-data outliner-op]
+    :or {outliner-op :save-block}}]
+  {:tx-id tx-id
+   :tx (protocol/tx->transit tx-data)
+   :outliner-op outliner-op})
 
 (defn- apply-identified-entry!
   [self entry]
@@ -5055,24 +5101,30 @@
     (sync-handler/handle-tx-batch!
      self nil [entry] (storage/get-t (.-sql ^js self)))))
 
-(deftest declared-payload-digest-cannot-authorize-different-actual-wire-entry-test
-  (doseq [{:keys [label mutate-entry expected-title]}
-          [{:label "wire tx bytes"
+(deftest modern-wire-identity-rejects-every-conflicting-retry-dimension-test
+  (doseq [{:keys [label mutate-entry]}
+          [{:label "forged self-reported payload digest"
+            :mutate-entry
+            (fn [entry block-uuid]
+              (assoc entry
+                     :payload-digest (apply str (repeat 64 "a"))
+                     :tx (protocol/tx->transit
+                          [[:db/add [:block/uuid block-uuid]
+                            :block/title "forged-declaration"]])))}
+           {:label "wire tx bytes"
             :mutate-entry
             (fn [entry block-uuid]
               (assoc entry
                      :tx (protocol/tx->transit
                           [[:db/add [:block/uuid block-uuid]
-                            :block/title "different-wire-tx"]])))
-            :expected-title "payload-a"}
+                            :block/title "different-wire-tx"]])))}
            {:label "randomized ciphertext"
             :mutate-entry
             (fn [entry block-uuid]
               (assoc entry
                      :tx (protocol/tx->transit
                           [[:db/add [:block/uuid block-uuid]
-                            :block/title "ciphertext-with-a-new-nonce"]])))
-            :expected-title "payload-a"}
+                            :block/title "ciphertext-with-a-new-nonce"]])))}
            {:label "offload marker metadata"
             :mutate-entry
             (fn [entry block-uuid]
@@ -5085,101 +5137,116 @@
                          :asset-type "txt"
                          :payload-format "utf8-plain-v1"
                          :payload-digest-alg "sha256-v1"
-                         :payload-digest (apply str (repeat 64 "b"))}]])))
-            :expected-title "payload-a"}
+                         :payload-digest (apply str (repeat 64 "b"))}]])))}
            {:label "outliner metadata"
             :mutate-entry (fn [entry _]
-                            (assoc entry :outliner-op :move-blocks))
-            :expected-title "payload-a"}
-           {:label "final metadata"
+                            (assoc entry :outliner-op :move-blocks))}
+           {:label "upload session identity"
             :mutate-entry (fn [entry _]
-                            (assoc entry :chunk-final? true))
-            :expected-title "payload-a"}
-           {:label "logical identity metadata"
+                            (assoc entry :upload-session-id
+                                   (apply str (repeat 64 "c"))))}
+           {:label "logical transaction identity"
             :mutate-entry (fn [entry _]
-                            (assoc entry
-                                   :logical-tx-id (random-uuid)
-                                   :chunk-index 0
-                                   :chunk-final? false))
-            :expected-title "payload-a"}
-           {:label "chunk index metadata"
+                            (assoc entry :logical-tx-id (random-uuid)))}
+           {:label "chunk index"
             :mutate-entry (fn [entry _]
-                            (assoc entry
-                                   :logical-tx-id (random-uuid)
-                                   :chunk-index 500
-                                   :chunk-final? false))
-            :expected-title "payload-a"}]]
-    (testing (str "same tx-id and self-reported digest cannot hide changed " label)
+                            (assoc entry :chunk-index 500))}
+           {:label "final flag"
+            :mutate-entry (fn [entry _]
+                            (assoc entry :chunk-final? true))}
+           {:label "derived chunk tx-id"
+            :mutate-entry (fn [entry _]
+                            (assoc entry :tx-id (random-uuid)))}]]
+    (testing (str "an accepted identity cannot hide changed " label)
       (with-memory-sql
         (fn [sql]
           (storage/init-schema! sql)
           (let [conn (storage/open-conn sql)
                 self #js {:sql sql :conn conn :schema-ready true}
                 block-uuid (random-uuid)
-                tx-id (random-uuid)
+                logical-tx-id (random-uuid)
                 _ (d/transact! conn [{:block/uuid block-uuid
-                                      :block/name "declared-digest"
+                                      :block/name "modern-wire-conflict"
                                       :block/title "before"}])
-                tx-a [[:db/add [:block/uuid block-uuid]
-                       :block/title "payload-a"]]
-                entry-a (identified-wire-entry
-                         {:tx-id tx-id
-                          :tx-data tx-a
-                          :outliner-op :save-block})
+                full-tx [[:db/add [:block/uuid block-uuid]
+                          :block/title "payload-a"]
+                         [:db/add [:block/uuid block-uuid]
+                          :block/updated-at 1]]
+                entry-a (modern-session-entry
+                         {:logical-tx-id logical-tx-id
+                          :full-tx-data full-tx
+                          :chunk-tx-data [(first full-tx)]
+                          :chunk-index 0
+                          :chunk-final? false})
+                t-before (storage/get-t sql)
+                graph-before (sync-checksum/recompute-server-checksum @conn)
                 response-a (apply-identified-entry! self entry-a)
-                t-after-a (:t response-a)
                 conflicting-entry (mutate-entry entry-a block-uuid)
-                response-b (apply-identified-entry!
-                            self conflicting-entry)]
+                response-b (apply-identified-entry! self conflicting-entry)]
+            (is (nil? (:payload-digest entry-a))
+                "modern clients do not declare a payload digest")
             (is (= "tx/batch/ok" (:type response-a)))
+            (is (= t-before (:t response-a))
+                "nonfinal chunks stage without advancing t")
+            (is (= graph-before
+                   (sync-checksum/recompute-server-checksum @conn))
+                "nonfinal chunks remain invisible to the graph")
+            (is (not= (modern-wire-digest entry-a)
+                      (modern-wire-digest conflicting-entry)))
             (is (= "tx/reject" (:type response-b)))
-            (is (= t-after-a (:t response-b))
+            (is (= t-before (:t response-b))
                 "a conflicting identity must not advance the cursor")
-            (is (= expected-title
+            (is (= graph-before
+                   (sync-checksum/recompute-server-checksum @conn)))
+            (is (= "before"
                    (:block/title
                     (d/entity @conn [:block/uuid block-uuid]))))))))))
 
-(defn- session-entry
-  [logical-tx-id chunk-index chunk-final? block-uuid title]
-  (let [tx-id
-        (if chunk-final?
-          logical-tx-id
-          (let [raw (sha256-hex
-                     (str "logseq-tx-chunk-v1/"
-                          logical-tx-id "/" chunk-index))
-                versioned (str (subs raw 0 12)
-                               "5"
-                               (subs raw 13 16)
-                               "8"
-                               (subs raw 17 32))]
-            (uuid (str (subs versioned 0 8) "-"
-                       (subs versioned 8 12) "-"
-                       (subs versioned 12 16) "-"
-                       (subs versioned 16 20) "-"
-                       (subs versioned 20 32)))))]
-    (identified-wire-entry
-   {:tx-id tx-id
-    :logical-tx-id logical-tx-id
-    :chunk-index chunk-index
-    :chunk-final? chunk-final?
-    :tx-data [[:db/add [:block/uuid block-uuid] :block/title title]]
-    :outliner-op :save-block})))
-
 (defn- assert-rejected-without-graph-change!
-  [self conn entry expected-title]
+  [self conn entry block-uuid expected-title]
   (let [sql (.-sql ^js self)
         t-before (storage/get-t sql)
         checksum-before (storage/get-checksum sql)
+        graph-before (sync-checksum/recompute-server-checksum @conn)
         response (apply-identified-entry! self entry)]
     (is (= "tx/reject" (:type response)))
     (is (= t-before (storage/get-t sql)))
     (is (= checksum-before (storage/get-checksum sql)))
+    (is (= graph-before (sync-checksum/recompute-server-checksum @conn)))
     (is (= expected-title
            (:block/title
-            (d/entity @conn
-                      [:block/uuid
-                       (-> entry :tx protocol/transit->tx first second second)]))))
+            (d/entity @conn [:block/uuid block-uuid]))))
     response))
+
+(deftest partial-modern-chunk-metadata-is-always-rejected-test
+  (doseq [missing-key [:tx :tx-id :logical-tx-id :upload-session-id
+                       :chunk-index :chunk-final? :outliner-op]]
+    (testing (str "modern chunk entry missing " missing-key)
+      (with-memory-sql
+        (fn [sql]
+          (storage/init-schema! sql)
+          (let [conn (storage/open-conn sql)
+                self #js {:sql sql :conn conn :schema-ready true}
+                logical-tx-id (random-uuid)
+                block-uuid (random-uuid)
+                _ (d/transact! conn [{:block/uuid block-uuid
+                                      :block/name "partial-modern-entry"
+                                      :block/title "before"}])
+                full-tx [[:db/add [:block/uuid block-uuid]
+                          :block/title "must-stay-staged"]
+                         [:db/add [:block/uuid block-uuid]
+                          :block/updated-at 1]]
+                incomplete-entry
+                (dissoc
+                 (modern-session-entry
+                  {:logical-tx-id logical-tx-id
+                   :full-tx-data full-tx
+                   :chunk-tx-data [(first full-tx)]
+                   :chunk-index 0
+                   :chunk-final? false})
+                 missing-key)]
+            (assert-rejected-without-graph-change!
+             self conn incomplete-entry block-uuid "before")))))))
 
 (deftest logical-chunk-session-rejects-first-index-500-test
   (with-memory-sql
@@ -5191,10 +5258,17 @@
             _ (d/transact! conn [{:block/uuid block-uuid
                                   :block/name "session-first-500"
                                   :block/title "before"}])]
-        (assert-rejected-without-graph-change!
-         self conn
-         (session-entry (random-uuid) 500 false block-uuid "bad-500")
-         "before")))))
+        (let [full-tx [[:db/add [:block/uuid block-uuid]
+                        :block/title "bad-500"]]]
+          (assert-rejected-without-graph-change!
+           self conn
+           (modern-session-entry
+            {:logical-tx-id (random-uuid)
+             :full-tx-data full-tx
+             :chunk-tx-data full-tx
+             :chunk-index 500
+             :chunk-final? false})
+           block-uuid "before"))))))
 
 (deftest logical-chunk-session-rejects-index-gap-test
   (with-memory-sql
@@ -5207,15 +5281,29 @@
             _ (d/transact! conn [{:block/uuid block-uuid
                                   :block/name "session-gap"
                                   :block/title "before"}])
-            first-response (apply-identified-entry!
-                            self
-                            (session-entry logical-id 0 false
-                                           block-uuid "chunk-0"))]
+            full-tx [[:db/add [:block/uuid block-uuid] :block/title "chunk-0"]
+                     [:db/add [:block/uuid block-uuid] :block/updated-at 1]
+                     [:db/add [:block/uuid block-uuid] :block/title "bad-gap"]]
+            first-response
+            (apply-identified-entry!
+             self
+             (modern-session-entry
+              {:logical-tx-id logical-id
+               :full-tx-data full-tx
+               :chunk-tx-data [(nth full-tx 0)]
+               :chunk-index 0
+               :chunk-final? false}))]
         (is (= "tx/batch/ok" (:type first-response)))
+        (is (= 0 (:t first-response)))
         (assert-rejected-without-graph-change!
          self conn
-         (session-entry logical-id 2 false block-uuid "bad-gap")
-         "chunk-0")))))
+         (modern-session-entry
+          {:logical-tx-id logical-id
+           :full-tx-data full-tx
+           :chunk-tx-data [(nth full-tx 2)]
+           :chunk-index 2
+           :chunk-final? false})
+         block-uuid "before")))))
 
 (deftest logical-chunk-session-rejects-final-first-test
   (with-memory-sql
@@ -5227,10 +5315,17 @@
             _ (d/transact! conn [{:block/uuid block-uuid
                                   :block/name "session-final-first"
                                   :block/title "before"}])]
-        (assert-rejected-without-graph-change!
-         self conn
-         (session-entry (random-uuid) 0 true block-uuid "bad-final-first")
-         "before")))))
+        (let [full-tx [[:db/add [:block/uuid block-uuid]
+                        :block/title "bad-final-first"]]]
+          (assert-rejected-without-graph-change!
+           self conn
+           (modern-session-entry
+            {:logical-tx-id (random-uuid)
+             :full-tx-data full-tx
+             :chunk-tx-data full-tx
+             :chunk-index 0
+             :chunk-final? true})
+           block-uuid "before"))))))
 
 (deftest logical-chunk-session-rejects-second-final-and-post-completion-chunk-test
   (doseq [post-entry-final? [true false]]
@@ -5246,22 +5341,42 @@
                 block-uuid (random-uuid)
                 _ (d/transact! conn [{:block/uuid block-uuid
                                       :block/name "session-complete"
-                                      :block/title "before"}])]
+                                      :block/title "before"}])
+                full-tx [[:db/add [:block/uuid block-uuid]
+                          :block/title "chunk-0"]
+                         [:db/add [:block/uuid block-uuid]
+                          :block/title "final-1"]]
+                chunk-0 (modern-session-entry
+                         {:logical-tx-id logical-id
+                          :full-tx-data full-tx
+                          :chunk-tx-data [(nth full-tx 0)]
+                          :chunk-index 0
+                          :chunk-final? false})
+                final-1 (modern-session-entry
+                         {:logical-tx-id logical-id
+                          :full-tx-data full-tx
+                          :chunk-tx-data [(nth full-tx 1)]
+                          :chunk-index 1
+                          :chunk-final? true})]
             (is (= "tx/batch/ok"
-                   (:type (apply-identified-entry!
-                           self
-                           (session-entry logical-id 0 false
-                                          block-uuid "chunk-0")))))
+                   (:type (apply-identified-entry! self chunk-0))))
             (is (= "tx/batch/ok"
-                   (:type (apply-identified-entry!
-                           self
-                           (session-entry logical-id 1 true
-                                          block-uuid "final-1")))))
+                   (:type (apply-identified-entry! self final-1))))
+            (let [t-after-final (storage/get-t sql)
+                  final-retry (apply-identified-entry! self final-1)]
+              (is (= "tx/batch/ok" (:type final-retry))
+                  "an identical final retry is ACKed")
+              (is (= t-after-final (:t final-retry))))
             (assert-rejected-without-graph-change!
              self conn
-             (session-entry logical-id 2 post-entry-final?
-                            block-uuid "post-completion")
-             "final-1")))))))
+             (modern-session-entry
+              {:logical-tx-id logical-id
+               :full-tx-data full-tx
+               :chunk-tx-data [[:db/add [:block/uuid block-uuid]
+                                :block/title "post-completion"]]
+               :chunk-index 2
+               :chunk-final? post-entry-final?})
+             block-uuid "final-1")))))))
 
 (deftest logical-chunk-session-contiguous-sequence-and-same-chunk-retry-test
   (with-memory-sql
@@ -5274,24 +5389,59 @@
             _ (d/transact! conn [{:block/uuid block-uuid
                                   :block/name "session-contiguous"
                                   :block/title "before"}])
-            chunk-0 (session-entry logical-id 0 false block-uuid "chunk-0")
+            full-tx [[:db/add [:block/uuid block-uuid] :block/title "chunk-0"]
+                     [:db/add [:block/uuid block-uuid] :block/updated-at 2]
+                     [:db/add [:block/uuid block-uuid] :block/title "final-2"]]
+            expected-conn (d/conn-from-db @conn)
+            _ (d/transact! expected-conn full-tx)
+            t-before (storage/get-t sql)
+            graph-before (sync-checksum/recompute-server-checksum @conn)
+            chunk-0 (modern-session-entry
+                     {:logical-tx-id logical-id
+                      :full-tx-data full-tx
+                      :chunk-tx-data [(nth full-tx 0)]
+                      :chunk-index 0
+                      :chunk-final? false})
             response-0 (apply-identified-entry! self chunk-0)
             retry-0 (apply-identified-entry! self chunk-0)
-            chunk-1 (session-entry logical-id 1 false block-uuid "chunk-1")
+            chunk-1 (modern-session-entry
+                     {:logical-tx-id logical-id
+                      :full-tx-data full-tx
+                      :chunk-tx-data [(nth full-tx 1)]
+                      :chunk-index 1
+                      :chunk-final? false})
             response-1 (apply-identified-entry! self chunk-1)
-            final-2 (session-entry logical-id 2 true block-uuid "final-2")
-            response-2 (apply-identified-entry! self final-2)]
+            final-2 (modern-session-entry
+                     {:logical-tx-id logical-id
+                      :full-tx-data full-tx
+                      :chunk-tx-data [(nth full-tx 2)]
+                      :chunk-index 2
+                      :chunk-final? true})
+            response-2 (apply-identified-entry! self final-2)
+            final-retry (apply-identified-entry! self final-2)]
         (is (= "tx/batch/ok" (:type response-0)))
         (is (= "tx/batch/ok" (:type retry-0)))
-        (is (= (:t response-0) (:t retry-0))
+        (is (= t-before (:t response-0) (:t retry-0))
             "same chunk retry is exactly-once")
+        (is (= graph-before (sync-checksum/recompute-server-checksum @conn))
+            "retrying the first staged chunk does not expose it")
         (is (= "tx/batch/ok" (:type response-1)))
-        (is (= (inc (:t response-0)) (:t response-1)))
+        (is (= t-before (:t response-1))
+            "all nonfinal chunks leave t unchanged")
+        (is (= graph-before (sync-checksum/recompute-server-checksum @conn))
+            "all nonfinal chunks leave the graph unchanged")
         (is (= "tx/batch/ok" (:type response-2)))
-        (is (= (inc (:t response-1)) (:t response-2)))
+        (is (= (inc t-before) (:t response-2))
+            "the final chunk commits the logical transaction once")
+        (is (= (sync-checksum/recompute-server-checksum @expected-conn)
+               (sync-checksum/recompute-server-checksum @conn))
+            "final commit atomically applies the full staged transaction")
         (is (= "final-2"
                (:block/title
-                (d/entity @conn [:block/uuid block-uuid]))))))))
+                (d/entity @conn [:block/uuid block-uuid]))))
+        (is (= "tx/batch/ok" (:type final-retry)))
+        (is (= (:t response-2) (:t final-retry))
+            "an ACK-loss retry of the final chunk does not reapply it")))))
 
 (deftest snapshot-reset-clears-incomplete-logical-chunk-session-test
   (with-memory-sql
@@ -5304,78 +5454,78 @@
             _ (d/transact! conn [{:block/uuid old-block-uuid
                                   :block/name "snapshot-session-old"
                                   :block/title "before"}])
+            full-tx [[:db/add [:block/uuid old-block-uuid]
+                      :block/title "old-chunk-0"]
+                     [:db/add [:block/uuid old-block-uuid]
+                      :block/title "old-final"]]
+            chunk-0 (modern-session-entry
+                     {:logical-tx-id logical-id
+                      :full-tx-data full-tx
+                      :chunk-tx-data [(first full-tx)]
+                      :chunk-index 0
+                      :chunk-final? false})
+            t-before (storage/get-t sql)
             first-response
             (apply-identified-entry!
-             self
-             (session-entry logical-id 0 false old-block-uuid "old-chunk-0"))]
+             self chunk-0)]
         (is (= "tx/batch/ok" (:type first-response)))
+        (is (= t-before (:t first-response)))
+        (is (= "before"
+               (:block/title
+                (d/entity @conn [:block/uuid old-block-uuid]))))
         (#'sync-handler/import-snapshot! self [] true)
         (let [new-conn (storage/open-conn sql)
-              new-block-uuid (random-uuid)
               _ (set! (.-conn self) new-conn)
-              _ (d/transact! new-conn
-                             [{:block/uuid new-block-uuid
-                               :block/name "snapshot-session-new"
-                               :block/title "new-before"}]
-                             {:db-sync/skip-tx-log? true})
               restarted-response
-              (apply-identified-entry!
-               self
-               (session-entry logical-id 0 false
-                              new-block-uuid "new-chunk-0"))]
+              (apply-identified-entry! self chunk-0)]
           (is (= "tx/batch/ok" (:type restarted-response))
               "snapshot reset starts a fresh logical chunk namespace")
-          (is (= "new-chunk-0"
-                 (:block/title
-                  (d/entity @new-conn [:block/uuid new-block-uuid])))))))))
+          (is (= 0 (:t restarted-response)))
+          (is (nil? (d/entity @new-conn [:block/uuid old-block-uuid]))
+              "the restarted nonfinal chunk is staged, not written"))))))
 
 (deftest admin-reset-clears-incomplete-logical-chunk-session-test
   (async done
-         (-> (with-memory-sql-async
-           (fn [sql]
-             (storage/init-schema! sql)
-             (let [conn (storage/open-conn sql)
-                   logical-id (random-uuid)
-                   old-block-uuid (random-uuid)
-                   self #js {:sql sql
-                             :conn conn
-                             :schema-ready true
-                             :state
-                             #js {:storage #js {}
-                                  :getWebSockets (fn [] #js [])}}
-                   _ (d/transact! conn [{:block/uuid old-block-uuid
-                                         :block/name "admin-session-old"
-                                         :block/title "before"}])
-                   first-response
-                   (apply-identified-entry!
-                    self
-                    (session-entry logical-id 0 false
-                                   old-block-uuid "old-chunk-0"))]
-               (is (= "tx/batch/ok" (:type first-response)))
-               (p/let [_ (#'sync-handler/handle-sync-admin-reset self)
-                       new-conn (storage/open-conn sql)
-                       new-block-uuid (random-uuid)
-                       _ (set! (.-conn self) new-conn)
-                       _ (d/transact! new-conn
-                                      [{:block/uuid new-block-uuid
-                                        :block/name "admin-session-new"
-                                        :block/title "new-before"}]
-                                      {:db-sync/skip-tx-log? true})
-                       restarted-response
-                       (apply-identified-entry!
-                        self
-                        (session-entry logical-id 0 false
-                                       new-block-uuid "new-chunk-0"))]
-                 (is (= "tx/batch/ok" (:type restarted-response))
-                     "admin reset starts a fresh logical chunk namespace")
-                 (is (= "new-chunk-0"
-                        (:block/title
-                         (d/entity @new-conn
-                                   [:block/uuid new-block-uuid]))))))))
-         (p/then (fn [] (done)))
-         (p/catch (fn [error]
-                    (is false (str error))
-                    (done))))))
+    (-> (with-memory-sql-async
+         (fn [sql]
+           (storage/init-schema! sql)
+           (let [conn (storage/open-conn sql)
+                 logical-id (random-uuid)
+                 old-block-uuid (random-uuid)
+                 self #js {:sql sql
+                           :conn conn
+                           :schema-ready true
+                           :state
+                           #js {:storage #js {}
+                                :getWebSockets (fn [] #js [])}}
+                 _ (d/transact! conn [{:block/uuid old-block-uuid
+                                       :block/name "admin-session-old"
+                                       :block/title "before"}])
+                 full-tx [[:db/add [:block/uuid old-block-uuid]
+                           :block/title "old-chunk-0"]
+                          [:db/add [:block/uuid old-block-uuid]
+                           :block/title "old-final"]]
+                 chunk-0 (modern-session-entry
+                          {:logical-tx-id logical-id
+                           :full-tx-data full-tx
+                           :chunk-tx-data [(first full-tx)]
+                           :chunk-index 0
+                           :chunk-final? false})
+                 first-response (apply-identified-entry! self chunk-0)]
+             (is (= "tx/batch/ok" (:type first-response)))
+             (p/let [_ (#'sync-handler/handle-sync-admin-reset self)
+                     new-conn (storage/open-conn sql)
+                     _ (set! (.-conn self) new-conn)
+                     restarted-response (apply-identified-entry! self chunk-0)]
+               (is (= "tx/batch/ok" (:type restarted-response))
+                   "admin reset starts a fresh logical chunk namespace")
+               (is (= 0 (:t restarted-response)))
+               (is (nil? (d/entity @new-conn
+                                   [:block/uuid old-block-uuid])))))))
+        (p/then (fn [] (done)))
+        (p/catch (fn [error]
+                   (is false (str error))
+                   (done))))))
 
 (defn- identity-marker-table-names
   [sql]
@@ -5403,13 +5553,13 @@
   [self count first-target-uuid]
   (let [first-id (random-uuid)
         entries
-        (into [(identified-wire-entry
+        (into [(ordinary-identified-wire-entry
                 {:tx-id first-id
                  :tx-data [[:db/add [:block/uuid first-target-uuid]
                             :block/title "stale-oldest"]]
                  :outliner-op :rebase})]
               (map (fn [_]
-                     (identified-wire-entry
+                     (ordinary-identified-wire-entry
                       {:tx-id (random-uuid)
                        :tx-data []
                        :outliner-op :rebase}))

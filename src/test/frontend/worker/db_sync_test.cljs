@@ -1,5 +1,6 @@
 (ns frontend.worker.db-sync-test
   (:require
+   ["crypto" :as node-crypto]
    [cljs.test :refer [async deftest is testing use-fixtures]]
    [clojure.set :as set]
    [clojure.string :as string]
@@ -33,6 +34,7 @@
    [logseq.common.util.page-ref :as page-ref]
    [logseq.db :as ldb]
    [logseq.db-sync.checksum :as sync-checksum]
+   [logseq.db-sync.protocol :as sync-protocol]
    [logseq.db-sync.storage :as sync-storage]
    [logseq.db-sync.worker.handler.sync :as sync-handler]
    [logseq.db-sync.worker.handler.ws :as sync-ws-handler]
@@ -12682,6 +12684,39 @@
              (is false (str "unexpected scenario failure: " error))))
           (p/finally done))))
 
+(defn- test-sha256-hex
+  [value]
+  (-> (.createHash node-crypto "sha256")
+      (.update value "utf8")
+      (.digest "hex")))
+
+(defn- expected-upload-session-id
+  [logical-tx-id outliner-op full-tx-data]
+  (test-sha256-hex
+   (sync-protocol/tx->transit
+    [:client-tx-upload-session-v1
+     logical-tx-id
+     outliner-op
+     full-tx-data])))
+
+(defn- expected-nonfinal-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index]
+  (let [raw (test-sha256-hex
+             (str "logseq-tx-chunk-v1/"
+                  logical-tx-id "/"
+                  upload-session-id "/"
+                  chunk-index))
+        versioned (str (subs raw 0 12)
+                       "5"
+                       (subs raw 13 16)
+                       "8"
+                       (subs raw 17 32))]
+    (uuid (str (subs versioned 0 8) "-"
+               (subs versioned 8 12) "-"
+               (subs versioned 12 16) "-"
+               (subs versioned 16 20) "-"
+               (subs versioned 20 32)))))
+
 (deftest nonfinal-large-upload-chunk-has-stable-idempotency-id-test
   (testing "a lost ACK resends the same nonfinal chunk with the same server-visible identity"
     (let [{:keys [conn child1]} (setup-parent-child)
@@ -12702,12 +12737,24 @@
                            repo conn pending)
                           :tx-entries first)]
       (is (false? (:large-upload-final? first-entry)))
+      (is (false? (:chunk-final? first-entry)))
+      (is (= 0 (:chunk-index first-entry)))
+      (is (= logical-tx-id (:logical-tx-id first-entry)))
+      (is (= (expected-upload-session-id
+              logical-tx-id :save-block tx-data)
+             (:upload-session-id first-entry)))
+      (is (re-matches #"[0-9a-f]{64}" (:upload-session-id first-entry)))
       (is (uuid? (:tx-id first-entry))
           "every transmitted nonfinal chunk needs an idempotency identity")
       (is (not= logical-tx-id (:tx-id first-entry))
           "the chunk identity must not consume the logical id reserved for final completion")
+      (is (= (expected-nonfinal-chunk-tx-id
+              logical-tx-id (:upload-session-id first-entry) 0)
+             (:tx-id first-entry)))
       (is (= (:tx-id first-entry) (:tx-id retry-entry))
           "retrying before ACK must derive exactly the same chunk identity")
+      (is (= (:upload-session-id first-entry)
+             (:upload-session-id retry-entry)))
       (is (= (:tx-data first-entry) (:tx-data retry-entry))))))
 
 (deftest rebased-large-upload-starts-new-frozen-session-at-zero-test
@@ -12758,6 +12805,12 @@
            (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
                  repo "e2ee-stable-wire-retry-repo"
                  tx-id (random-uuid)
+                 block-uuid (:block/uuid child1)
+                 logical-plaintext
+                 (mapv (fn [idx]
+                         [:db/add [:block/uuid block-uuid]
+                          :block/title (str "logical-plaintext-" idx)])
+                       (range 5001))
                  encrypt-call (atom 0)
                  sent (atom [])
                  client {:repo repo
@@ -12784,20 +12837,22 @@
                         :db-sync/pending? true
                         :db-sync/created-at 1
                         :db-sync/outliner-op :save-block
-                        :db-sync/normalized-tx-data
-                        [[:db/add [:block/uuid (:block/uuid child1)]
-                          :block/title "logical plaintext"]]}])
+                        :db-sync/normalized-tx-data logical-plaintext}])
                      (p/with-redefs
                        [worker-state/online? (constantly true)
                         sync-crypt/graph-e2ee? (constantly true)
                         sync-crypt/<ensure-graph-aes-key
                         (fn [& _] (p/resolved #js {:test-key true}))
                         sync-crypt/<encrypt-tx-data
-                        (fn [_key _tx-data]
+                        (fn [_key tx-data]
                           (let [nonce (swap! encrypt-call inc)]
                             (p/resolved
-                             [[:db/add [:block/uuid (:block/uuid child1)]
-                               :block/title (str "ciphertext-nonce-" nonce)]])))]
+                             (mapv (fn [idx datom]
+                                     (assoc datom 3
+                                            (str "ciphertext-nonce-"
+                                                 nonce "-" idx)))
+                                   (range)
+                                   tx-data))))]
                        (p/let [_ (#'sync-apply/flush-pending! repo client)
                                first-wire (first @sent)
                                _ (do
@@ -12808,10 +12863,28 @@
                                first-entry (first (:txs first-wire))
                                second-entry (first (:txs second-wire))]
                          (is (= 2 (count @sent)))
-                         (is (string? (:payload-digest first-entry))
-                             "identified E2EE wire entries carry a server-verifiable digest")
-                         (is (= (:payload-digest first-entry)
-                                (:payload-digest second-entry)))
+                         (is (= 1 @encrypt-call)
+                             "randomized encryption runs once for an ACK-loss retry")
+                         (is (not (contains? first-entry :payload-digest))
+                             "modern wire identity never trusts a client-declared digest")
+                         (is (= #{:tx :tx-id :logical-tx-id :upload-session-id
+                                  :chunk-index :chunk-final? :outliner-op}
+                                (set/intersection
+                                 #{:tx :tx-id :logical-tx-id :upload-session-id
+                                   :chunk-index :chunk-final? :outliner-op}
+                                 (set (keys first-entry))))
+                             "nonfinal E2EE wire chunks carry the complete modern identity")
+                         (is (= tx-id (:logical-tx-id first-entry)))
+                         (is (= 0 (:chunk-index first-entry)))
+                         (is (false? (:chunk-final? first-entry)))
+                         (is (= (expected-upload-session-id
+                                 tx-id :save-block logical-plaintext)
+                                (:upload-session-id first-entry)))
+                         (is (= (expected-nonfinal-chunk-tx-id
+                                 tx-id (:upload-session-id first-entry) 0)
+                                (:tx-id first-entry)))
+                         (is (= first-entry second-entry)
+                             "the complete transmitted entry is byte-stable across retry")
                          (is (= (:tx first-entry) (:tx second-entry))
                              "ACK-loss retry must reuse identical ciphertext bytes")
                          (is (= (:outliner-op first-entry)
@@ -12826,7 +12899,7 @@
                     (done))))))))
 
 (deftest rebase-after-nonfinal-ack-does-not-use-stale-positional-progress-test
-  (testing "a rewritten pending tx cannot skip a datom inserted before the old chunk cursor"
+  (testing "a stale ACK cannot advance a rewritten pending transaction's new session"
     (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
           repo "rewritten-large-upload-progress-repo"
           tx-id (random-uuid)
@@ -12842,55 +12915,94 @@
           first-entry
           (-> (sync-apply/prepare-upload-tx-entries repo conn [pending])
               :tx-entries first)
-          progress (select-keys first-entry
-                                [:large-upload-original-tx-id
-                                 :large-upload-next-index
-                                 :large-upload-final?])
-          server-after-first (d/conn-from-db @conn)
-          _ (d/transact! server-after-first (:tx-data first-entry))
+          progress-keys [:large-upload-original-tx-id
+                         :large-upload-next-index
+                         :large-upload-final?
+                         :logical-tx-id
+                         :upload-session-id
+                         :chunk-index
+                         :chunk-final?]
+          old-progress (select-keys first-entry progress-keys)
+          server-after-remote (d/conn-from-db @conn)
           remote-tx [[:db/add [:block/uuid block-uuid]
                       :block/updated-at 42]]
-          _ (d/transact! server-after-first remote-tx)
-          expected-server (d/conn-from-db @server-after-first)
+          _ (d/transact! server-after-remote remote-tx)
+          expected-server (d/conn-from-db @server-after-remote)
           required-rebased-datom
           [:db/add [:block/uuid block-uuid] :block/updated-at 999999]
           rewritten-tx (into [required-rebased-datom] original-tx)
           rewritten-pending {:tx-id tx-id
                              :tx rewritten-tx
-                             :outliner-op :rebase}]
+                             :outliner-op :rebase}
+          rebased-before-old-ack
+          (-> (sync-apply/prepare-upload-tx-entries
+               repo conn [rewritten-pending])
+              :tx-entries first)]
       (is (false? (:large-upload-final? first-entry)))
+      (is (false? (:chunk-final? first-entry)))
+      (is (= 0 (:chunk-index first-entry)))
+      (is (not= (:upload-session-id first-entry)
+                (:upload-session-id rebased-before-old-ack))
+          "rewriting normalized tx data creates a new content session")
+      (is (= 0 (:chunk-index rebased-before-old-ack))
+          "a new upload session always starts at staged offset zero")
+      (is (some #(= required-rebased-datom %)
+                (:tx-data rebased-before-old-ack)))
       (sync-apply/commit-upload-response!
-       repo {:large-upload-progress [progress]} nil)
-      (let [next-entry
+       repo {:large-upload-progress [old-progress]} nil)
+      (let [rebased-after-old-ack
             (-> (sync-apply/prepare-upload-tx-entries
                  repo conn [rewritten-pending])
-                :tx-entries first)]
-        (is (some #(= required-rebased-datom %) (:tx-data next-entry))
-            "progress must be content/session based, not an old vector offset")
-        (d/transact! expected-server rewritten-tx)
-        (d/transact! server-after-first (:tx-data next-entry))
-        (is (= (sync-checksum/recompute-server-checksum @expected-server)
-               (sync-checksum/recompute-server-checksum @server-after-first))
-            "server must receive every datom from the rebased logical tx")
+                :tx-entries first)
+            new-progress (select-keys rebased-after-old-ack progress-keys)]
+        (is (= (:upload-session-id rebased-before-old-ack)
+               (:upload-session-id rebased-after-old-ack)))
+        (is (= 0 (:chunk-index rebased-after-old-ack))
+            "the old session ACK must not advance the new session")
+        (is (= (:tx-id rebased-before-old-ack)
+               (:tx-id rebased-after-old-ack))
+            "the new session's first chunk remains byte-identical")
+        (is (some #(= required-rebased-datom %) (:tx-data rebased-after-old-ack))
+            "stale positional progress cannot skip a newly inserted first datom")
 
-        (with-datascript-conns
-          conn client-ops-conn
-          (fn []
-            (seed-client-op-txs!
-             repo
-             [{:db-sync/tx-id tx-id
-               :db-sync/pending? true
-               :db-sync/created-at 1
-               :db-sync/outliner-op :rebase
-               :db-sync/normalized-tx-data rewritten-tx}])
-            (sync-apply/commit-upload-response!
-             repo
-             {:large-upload-progress
-              [(select-keys next-entry
-                            [:large-upload-original-tx-id
-                             :large-upload-next-index
-                             :large-upload-final?])]}
-             nil)
-            (sync-apply/mark-pending-txs-false! repo [tx-id])
-            (is (empty? (#'sync-apply/pending-txs repo))
-                "final ACK clears the rewritten pending operation")))))))
+        (sync-apply/commit-upload-response!
+         repo {:large-upload-progress [new-progress]} nil)
+        (let [final-entry
+              (-> (sync-apply/prepare-upload-tx-entries
+                   repo conn [rewritten-pending])
+                  :tx-entries first)]
+          (is (= (count (:tx-data rebased-after-old-ack))
+                 (:chunk-index final-entry))
+              "the next offset equals the number of staged datoms")
+          (is (true? (:chunk-final? final-entry)))
+          (is (= tx-id (:tx-id final-entry))
+              "the logical UUID is reserved for final completion")
+          (is (= (:upload-session-id rebased-after-old-ack)
+                 (:upload-session-id final-entry)))
+
+          ;; Model the server contract: no nonfinal chunk touched the graph;
+          ;; final completion applies the entire rewritten logical tx once.
+          (d/transact! expected-server rewritten-tx)
+          (d/transact! server-after-remote rewritten-tx)
+        (is (= (sync-checksum/recompute-server-checksum @expected-server)
+                 (sync-checksum/recompute-server-checksum @server-after-remote))
+              "final application converges with every rebased datom present")
+
+          (with-datascript-conns
+            conn client-ops-conn
+            (fn []
+              (seed-client-op-txs!
+               repo
+               [{:db-sync/tx-id tx-id
+                 :db-sync/pending? true
+                 :db-sync/created-at 1
+                 :db-sync/outliner-op :rebase
+                 :db-sync/normalized-tx-data rewritten-tx}])
+              (sync-apply/commit-upload-response!
+               repo
+               {:large-upload-progress
+                [(select-keys final-entry progress-keys)]}
+               nil)
+              (sync-apply/mark-pending-txs-false! repo [tx-id])
+              (is (empty? (#'sync-apply/pending-txs repo))
+                  "final ACK clears the rewritten pending operation"))))))))
