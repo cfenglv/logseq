@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 import { loadProjectSigningPolicy } from "../resources/project-updater-signature.mjs";
 import { finalizeMacosProjectUpdate } from "./finalize-macos-project-update-core.mjs";
 import {
-  assertLocalMacosProjectUpdatePublisher,
-  loadProjectUpdateSigningKey,
-} from "./project-update-keychain.mjs";
+  assertGithubProjectUpdateSigningContext,
+  loadGithubProjectUpdateSigningKey,
+} from "./project-update-github-actions.mjs";
 
 const parseArgs = (argv) => {
   const values = new Map();
@@ -32,17 +32,17 @@ const parseArgs = (argv) => {
 };
 
 const main = async () => {
-  assertLocalMacosProjectUpdatePublisher();
   const args = parseArgs(process.argv.slice(2));
+  assertGithubProjectUpdateSigningContext(args);
   const policy = loadProjectSigningPolicy();
-  const signingKey = loadProjectUpdateSigningKey(policy);
+  const signingKey = loadGithubProjectUpdateSigningKey(policy);
   const result = await finalizeMacosProjectUpdate({
     ...args,
     policy,
     signingKey,
   });
   console.log(
-    `[project-update-finalize] OK version=${result.version} keyId=${result.keyId} architectures=${result.architectures.join(",")}`,
+    `[github-project-update-finalize] OK version=${result.version} keyId=${result.keyId} architectures=${result.architectures.join(",")}`,
   );
 };
 
@@ -62,7 +62,7 @@ if (
     await main();
   } catch (error) {
     console.error(
-      `[project-update-finalize] RELEASE BLOCKED: ${
+      `[github-project-update-finalize] RELEASE BLOCKED: ${
         error instanceof Error ? error.message : error
       }`,
     );

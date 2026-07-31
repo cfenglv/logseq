@@ -662,27 +662,27 @@ addCase(
       /(?:process\.env\.)?(?:CI|GITHUB_ACTIONS)[\s\S]{0,240}(?:throw|exit|blocked|forbidden)|(?:throw|exit|blocked|forbidden)[\s\S]{0,240}(?:CI|GITHUB_ACTIONS)/i,
       `${scriptPath} import closure does not reject CI execution`,
     );
-    assert.match(source, /sign-macos-project-update\.mjs/);
-    assert.match(source, /verify-project-signed-macos-update\.mjs/);
-    assert.match(source, /verify-desktop-release-assets\.mjs/);
+    assert.match(closureSource, /sign-macos-project-update\.mjs/);
+    assert.match(closureSource, /verify-project-signed-macos-update\.mjs/);
+    assert.match(closureSource, /verify-desktop-release-assets\.mjs/);
     assert.match(
-      source,
+      closureSource,
       /(?:\[\s*["']x64["']\s*,\s*["']arm64["']\s*\]|\[\s*["']arm64["']\s*,\s*["']x64["']\s*\])/,
       `${scriptPath} does not enumerate both x64 and arm64`,
     );
     assert.match(
-      source,
+      closureSource,
       /(?:execFileSync|spawnSync|spawn)[\s\S]{0,400}(?:status|throw|reject|exit|check|assert)/i,
       `${scriptPath} does not make child verification failures fail closed`,
     );
 
-    const signerReference = source.lastIndexOf(
+    const signerReference = closureSource.lastIndexOf(
       "sign-macos-project-update.mjs",
     );
-    const verifierReference = source.lastIndexOf(
+    const verifierReference = closureSource.lastIndexOf(
       "verify-project-signed-macos-update.mjs",
     );
-    const fullAssetReference = source.lastIndexOf(
+    const fullAssetReference = closureSource.lastIndexOf(
       "verify-desktop-release-assets.mjs",
     );
     assert.ok(

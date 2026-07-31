@@ -133,12 +133,17 @@ for (const relativePath of [
   "scripts/build-project-update-helper.mjs",
   "scripts/run-project-signed-macos-update.mjs",
   "scripts/project-update-keychain.mjs",
+  "scripts/project-update-private-key.mjs",
+  "scripts/project-update-github-actions.mjs",
   "scripts/project-update-signer-core.mjs",
   "scripts/sign-macos-project-update.mjs",
+  "scripts/finalize-macos-project-update-core.mjs",
   "scripts/finalize-local-macos-project-update.mjs",
+  "scripts/finalize-github-macos-project-update.mjs",
   "scripts/test-project-update-helper-e2e.mjs",
   "scripts/verify-unsigned-macos-project-update-candidate.mjs",
   "scripts/verify-project-signed-macos-update.mjs",
+  "scripts/verify-finalized-selfhost-release.mjs",
   "scripts/test-desktop-sidecar-release-contract.mjs",
   "scripts/test-desktop-runtime-packaging-contract.mjs",
   "scripts/test-desktop-preflight-preload-contract.mjs",
@@ -148,6 +153,7 @@ for (const relativePath of [
   "scripts/test-shipit-process-outcome-contract.mjs",
   "scripts/test-updater-private-material-policy-contract.mjs",
   "scripts/test-local-keychain-release-signing-contract.mjs",
+  "scripts/test-github-project-update-signing-provider.mjs",
   "scripts/test-selfhost-macos-updater-release-contract.mjs",
   "scripts/test-updater-install-entry-contract.mjs",
   "scripts/test-selfhost-macos-user-guidance.mjs",
@@ -203,6 +209,7 @@ const requiredDesktopReleaseContracts = [
   "node ./scripts/test-desktop-runtime-packaging-contract.mjs",
   "node ./scripts/test-updater-private-material-policy-contract.mjs",
   "node ./scripts/test-local-keychain-release-signing-contract.mjs",
+  "node ./scripts/test-github-project-update-signing-provider.mjs",
   "node ./scripts/test-desktop-release-contract-gate-drift.mjs",
   "node ./scripts/test-shipit-process-outcome-contract.mjs",
   "node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract",
@@ -286,11 +293,31 @@ if (
   fail("package.json must expose the local project signing contract");
 }
 if (
+  rootPackage.scripts?.["project-update:test-github-signing-provider"] !==
+  "node ./scripts/test-github-project-update-signing-provider.mjs"
+) {
+  fail("package.json must expose the GitHub signing provider contract");
+}
+if (
   rootPackage.scripts?.[
     "project-update:finalize-local-macos-candidates"
   ] !== "node ./scripts/finalize-local-macos-project-update.mjs"
 ) {
   fail("package.json must expose the local project update finalizer");
+}
+if (
+  rootPackage.scripts?.[
+    "project-update:finalize-github-macos-candidates"
+  ] !== "node ./scripts/finalize-github-macos-project-update.mjs"
+) {
+  fail("package.json must expose the protected GitHub project update finalizer");
+}
+if (
+  rootPackage.scripts?.[
+    "project-update:verify-finalized-selfhost-release"
+  ] !== "node ./scripts/verify-finalized-selfhost-release.mjs"
+) {
+  fail("package.json must expose the finalized selfhost release verifier");
 }
 if (
   rootPackage.scripts?.["project-update:test-signer-algorithm-contract"] !==

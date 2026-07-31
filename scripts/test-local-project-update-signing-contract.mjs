@@ -215,12 +215,19 @@ addCase("local finalizer signs and verifies both macOS candidates", () => {
     "node ./scripts/finalize-local-macos-project-update.mjs",
   );
   const finalizer = read("scripts/finalize-local-macos-project-update.mjs");
-  assert.match(finalizer, /for \(const arch of \["arm64", "x64"\]\)/);
-  assert.match(finalizer, /signMacosProjectUpdate/);
-  assert.match(finalizer, /verifyProjectSignedMacosUpdate/);
-  assert.match(finalizer, /verify-desktop-release-assets\.mjs/);
+  const finalizerCore = read(
+    "scripts/finalize-macos-project-update-core.mjs",
+  );
+  const finalizerClosure = `${finalizer}\n${finalizerCore}`;
+  assert.match(
+    finalizerClosure,
+    /for \(const arch of \["arm64", "x64"\]\)/,
+  );
+  assert.match(finalizerClosure, /signMacosProjectUpdate/);
+  assert.match(finalizerClosure, /verifyProjectSignedMacosUpdate/);
+  assert.match(finalizerClosure, /verify-desktop-release-assets\.mjs/);
   assert.doesNotMatch(
-    finalizer,
+    finalizerClosure,
     /PRIVATE_KEY|privateKeyBase64|add-generic-password/,
   );
 });
