@@ -21,7 +21,7 @@ export const assertSourceRevisionAbsent = (dir) => {
 
 export const writeSourceRevision = ({ dir, sourceRevision }) => {
   const normalized = assertSourceRevision(sourceRevision);
-  const destination = sourceRevisionPath(dir);
+  const destination = path.join(dir, selfhostSourceRevisionName);
   const temporary = path.join(
     dir,
     `.${selfhostSourceRevisionName}.${process.pid}.tmp`,
