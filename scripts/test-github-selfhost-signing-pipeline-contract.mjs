@@ -194,6 +194,101 @@ const artifactNamesFor = (jobSource, operation) => {
     .map((name) => name.replace(/^(["'])(.*)\1$/, "$2"));
 };
 
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const declarationExpressionFor = (source, binding) =>
+  source.match(
+    new RegExp(
+      `\\b(?:const|let)\\s+${escapeRegExp(binding)}\\s*=\\s*([\\s\\S]*?);`,
+    ),
+  )?.[1]?.trim();
+
+const findAtomicProvenanceWrite = (source, fileNameConstant) => {
+  const renameCalls = [
+    ...source.matchAll(
+      /\brename(?:Sync)?\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*\)/g,
+    ),
+  ];
+  for (const renameCall of renameCalls) {
+    const temporaryBinding = renameCall[1];
+    const destinationBinding = renameCall[2];
+    if (temporaryBinding === destinationBinding) continue;
+    const temporaryExpression = declarationExpressionFor(
+      source,
+      temporaryBinding,
+    );
+    const destinationExpression = declarationExpressionFor(
+      source,
+      destinationBinding,
+    );
+    if (!temporaryExpression || !destinationExpression) continue;
+    if (
+      !new RegExp(`\\b${escapeRegExp(fileNameConstant)}\\b`).test(
+        destinationExpression,
+      )
+    ) {
+      continue;
+    }
+    const normalizedTemporaryExpression = temporaryExpression
+      .replace(/[()\s]/g, "")
+      .replace(/;$/, "");
+    if (normalizedTemporaryExpression === destinationBinding) continue;
+    const temporaryIsDerivedFromDestination = new RegExp(
+      `\\b${escapeRegExp(destinationBinding)}\\b`,
+    ).test(temporaryExpression);
+    const temporaryHasIndependentPathConstruction =
+      /\b(?:join|resolve|mkdtemp|tmpdir|randomUUID|randomBytes)\b|(?:\.tmp|\.new|\.partial|\.pending|\.staging)/i.test(
+        temporaryExpression,
+      );
+    if (
+      !temporaryIsDerivedFromDestination &&
+      !temporaryHasIndependentPathConstruction
+    ) {
+      continue;
+    }
+    const exclusiveCreate = new RegExp(
+      `(?:writeFile|open)(?:Sync)?\\s*\\(\\s*${escapeRegExp(
+        temporaryBinding,
+      )}[\\s\\S]{0,320}?["']wx["']`,
+      "g",
+    ).exec(source);
+    if (!exclusiveCreate || exclusiveCreate.index > renameCall.index) continue;
+    return { destinationBinding, temporaryBinding };
+  }
+  return undefined;
+};
+
+const assertAtomicProvenanceDetectorCalibration = () => {
+  const fixtures = [
+    `const markerName = "SOURCE_REVISION";
+const finalMarker = path.join(directory, markerName);
+const scratch = \`${"${finalMarker}"}.\${process.pid}.partial\`;
+fs.writeFileSync(scratch, value, { flag: "wx" });
+fs.renameSync(scratch, finalMarker);`,
+    `const provenanceLeaf = "SOURCE_REVISION";
+const destination = resolve(root, provenanceLeaf);
+const candidate = destination + ".new";
+await fs.promises.writeFile(candidate, value, { flag: "wx" });
+await fs.promises.rename(candidate, destination);`,
+    `const immutableLeaf = "SOURCE_REVISION";
+const omega = path.resolve(outputDirectory, immutableLeaf);
+const alpha = path.join(stagingDirectory, randomUUID());
+const descriptor = fs.openSync(alpha, "wx");
+fs.closeSync(descriptor);
+fs.renameSync(alpha, omega);`,
+  ];
+  for (const source of fixtures) {
+    const constant = source.match(
+      /\bconst\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*["']SOURCE_REVISION["']\s*;/,
+    )?.[1];
+    assert.ok(constant);
+    assert.ok(
+      findAtomicProvenanceWrite(source, constant),
+      "atomic provenance detector rejected an equivalent naming-independent fixture",
+    );
+  }
+};
+
 const discoverCiSigningEntry = (signingJobSource) => {
   const candidates = scriptsInvokedByJob(signingJobSource).filter((entry) => {
     const closure = relativeModuleClosure([entry]);
@@ -475,6 +570,7 @@ addCase(
 addCase(
   "E six-platform candidates and both macOS metadata files bind exact VERSION and source SHA",
   () => {
+    assertAtomicProvenanceDetectorCalibration();
     const workflow = read(workflowRelativePath);
     const jobs = workflowJobs(workflow);
     const preflight = jobs.get("release-assets-preflight") ?? "";
@@ -571,41 +667,9 @@ addCase(
       fileNameConstant,
       "SOURCE_REVISION is not held in a fixed constant",
     );
-    const escapedFileNameConstant = fileNameConstant[1].replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&",
-    );
-    assert.match(
-      provenanceSource,
-      new RegExp(
-        `\\bsourceRevisionPath\\b[\\s\\S]{0,240}\\b${escapedFileNameConstant}\\b|\\b${escapedFileNameConstant}\\b[\\s\\S]{0,240}\\bsourceRevisionPath\\b`,
-      ),
-      "sourceRevisionPath does not use the fixed SOURCE_REVISION constant",
-    );
-    const temporaryPath = provenanceSource.match(
-      /\b(?:const|let)\s+([A-Za-z_$][A-Za-z0-9_$]*(?:temp|temporary)[A-Za-z0-9_$]*Path)\b/i,
-    );
     assert.ok(
-      temporaryPath,
-      "provenance helper does not create a distinct temporary path",
-    );
-    const escapedTemporaryPath = temporaryPath[1].replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&",
-    );
-    assert.match(
-      provenanceSource,
-      new RegExp(
-        `(?:writeFile|open)(?:Sync)?\\s*\\(\\s*${escapedTemporaryPath}[\\s\\S]{0,320}["']wx["']`,
-      ),
-      "temporary provenance file is not created exclusively with wx",
-    );
-    assert.match(
-      provenanceSource,
-      new RegExp(
-        `rename(?:Sync)?\\s*\\(\\s*${escapedTemporaryPath}\\s*,\\s*sourceRevisionPath\\s*\\)`,
-      ),
-      "temporary provenance file is not atomically renamed to sourceRevisionPath",
+      findAtomicProvenanceWrite(provenanceSource, fileNameConstant[1]),
+      "provenance helper does not exclusively create a distinct temporary binding and atomically rename it to the fixed SOURCE_REVISION destination",
     );
 
     const finalVerifierMatches = [...jobs].filter(([name, source]) => {
