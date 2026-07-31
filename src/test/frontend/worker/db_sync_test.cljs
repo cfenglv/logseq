@@ -12873,14 +12873,14 @@
                                    :chunk-index :chunk-final? :outliner-op}
                                  (set (keys first-entry))))
                              "nonfinal E2EE wire chunks carry the complete modern identity")
-                         (is (= tx-id (:logical-tx-id first-entry)))
+                         (is (= (str tx-id) (:logical-tx-id first-entry)))
                          (is (= 0 (:chunk-index first-entry)))
                          (is (false? (:chunk-final? first-entry)))
                          (is (= (expected-upload-session-id
                                  tx-id :save-block logical-plaintext)
                                 (:upload-session-id first-entry)))
-                         (is (= (expected-nonfinal-chunk-tx-id
-                                 tx-id (:upload-session-id first-entry) 0)
+                         (is (= (str (expected-nonfinal-chunk-tx-id
+                                     tx-id (:upload-session-id first-entry) 0))
                                 (:tx-id first-entry)))
                          (is (= first-entry second-entry)
                              "the complete transmitted entry is byte-stable across retry")
