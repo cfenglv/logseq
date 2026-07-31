@@ -274,6 +274,29 @@
               {:t 3 :tx "tx-3" :outliner-op nil}]
              result)))))
 
+(deftest tx-log-tx-id-online-migration-keeps-legacy-rows-test
+  (with-memory-sql
+    (fn [sql]
+      ;; Model a Durable Object created before tx-id idempotency existed.
+      (common/sql-exec sql
+                       (str "create table tx_log ("
+                            "t INTEGER primary key,"
+                            "tx TEXT not null,"
+                            "created_at INTEGER"
+                            ")"))
+      (common/sql-exec sql
+                       "insert into tx_log (t, tx, created_at) values (?, ?, ?)"
+                       1 "legacy" 100)
+      (storage/init-schema! sql)
+      (let [tx-id (random-uuid)]
+        (storage/append-tx! sql 2 "idempotent" 200 :save-block tx-id)
+        (storage/append-tx! sql 3 "legacy-v1" 300 :save-block)
+        (is (storage/tx-id-applied? sql tx-id))
+        (is (= [{:t 1 :tx "legacy" :outliner-op nil}
+                {:t 2 :tx "idempotent" :outliner-op :save-block}
+                {:t 3 :tx "legacy-v1" :outliner-op :save-block}]
+               (storage/fetch-tx-since sql 0)))))))
+
 (deftest stale-checksum-no-op-transact-does-not-throw-test
   (testing "a no-op tx should not throw and should keep incremental checksum state"
     (with-memory-sql

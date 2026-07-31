@@ -784,9 +784,11 @@
     (common/sql-exec sql (str "delete from " snapshot-staging-table))))
 
 (defn- apply-client-tx-meta
-  [request-context outliner-op]
+  [request-context outliner-op tx-id]
   (cond-> (merge {:op :apply-client-tx}
                  (request-context->tx-meta request-context))
+    tx-id
+    (assoc :tx-id tx-id)
     outliner-op
     (assoc :outliner-op outliner-op)
     (= outliner-op :db-migrate)
@@ -796,7 +798,7 @@
 (defn- apply-large-tx-entry!
   [self conn tx-data {:keys [tx-id outliner-op]} request-context]
   (let [db-before @conn
-        tx-meta (apply-client-tx-meta request-context outliner-op)
+        tx-meta (apply-client-tx-meta request-context outliner-op nil)
         sql (when self (.-sql ^js self))
         prev-t (when sql (storage/get-t sql))
         prev-checksum (when sql (storage/get-checksum sql))
@@ -835,6 +837,10 @@
             nil
             tx-data)
            (when sql
+             ;; Chunk rows share one logical client tx-id. Bind it to the
+             ;; final row only after every chunk has applied successfully;
+             ;; the surrounding SQL transaction makes that marker atomic.
+             (storage/set-tx-id-for-t! sql (storage/get-t sql) tx-id)
              (storage/set-checksum!
               sql
               (sync-checksum/update-checksum
@@ -898,7 +904,7 @@
 (defn- apply-tx-entry!
   ([conn tx-entry]
    (apply-tx-entry! nil conn tx-entry nil))
-  ([self conn {:keys [outliner-op] :as tx-entry} request-context]
+  ([self conn {:keys [tx-id outliner-op] :as tx-entry} request-context]
    (let [sanitized (sanitize-tx-entry @conn tx-entry)
          input-tx-data (:input-tx-data sanitized)
          tx-data (:tx-data sanitized)
@@ -909,7 +915,8 @@
                   (large-tx? tx-data))
            (apply-large-tx-entry! self conn tx-data sanitized-entry request-context)
            (do
-             (ldb/transact! conn tx-data (apply-client-tx-meta request-context outliner-op))
+             (ldb/transact! conn tx-data
+                            (apply-client-tx-meta request-context outliner-op tx-id))
              true))
          (catch :default e
            ;; Rebase/fix txs are inferred from local history and can become stale
@@ -936,28 +943,55 @@
 (defn- apply-tx! [^js self tx-entries request-context]
   (let [sql (.-sql self)]
     (ensure-conn! self)
-    (let [conn (.-conn self)]
+    (let [conn (.-conn self)
+          preexisting-tx-ids
+          (->> tx-entries
+               (keep :tx-id)
+               distinct
+               (filter (partial storage/tx-id-applied? sql))
+               set)
+          last-index-by-tx-id
+          (reduce-kv (fn [result idx {:keys [tx-id]}]
+                       (cond-> result
+                         tx-id (assoc tx-id idx)))
+                     {}
+                     (vec tx-entries))]
       (loop [remaining tx-entries
+             entry-index 0
              applied? false
              successful-tx-ids []]
         (if-let [tx-entry (first remaining)]
           (let [tx-id (:tx-id tx-entry)
-                applied-entry? (try
-                                 (boolean (apply-tx-entry! self conn tx-entry request-context))
-                                 (catch :default e
-                                   (log/error :db-sync/transact-failed
-                                              (common/error-log-data e))
-                                   (let [missing-block-uuids (missing-block-uuids-from-error e)]
-                                     (throw (ex-info "tx entry apply failed"
-                                                     (cond-> {:type :db-sync/tx-entry-failed
-                                                              :successful-tx-ids successful-tx-ids}
-                                                       tx-id (assoc :failed-tx-id tx-id)
-                                                       (seq missing-block-uuids)
-                                                       (assoc :missing-block-uuids missing-block-uuids))
-                                                     e)))))
+                already-applied? (contains? preexisting-tx-ids tx-id)
+                ;; Some older clients split one logical operation into
+                ;; multiple entries carrying the same tx-id. Apply every
+                ;; entry in this request, but persist the idempotency marker
+                ;; only on its final entry so the unique index remains valid.
+                tx-entry-to-apply
+                (cond-> tx-entry
+                  (and tx-id
+                       (not= entry-index (get last-index-by-tx-id tx-id)))
+                  (dissoc :tx-id))
+                applied-entry? (if already-applied?
+                                 false
+                                 (try
+                                   (boolean (apply-tx-entry!
+                                             self conn tx-entry-to-apply request-context))
+                                   (catch :default e
+                                     (log/error :db-sync/transact-failed
+                                                (common/error-log-data e))
+                                     (let [missing-block-uuids (missing-block-uuids-from-error e)]
+                                       (throw (ex-info "tx entry apply failed"
+                                                       (cond-> {:type :db-sync/tx-entry-failed
+                                                                :successful-tx-ids successful-tx-ids}
+                                                         tx-id (assoc :failed-tx-id tx-id)
+                                                         (seq missing-block-uuids)
+                                                         (assoc :missing-block-uuids missing-block-uuids))
+                                                       e))))))
                 next-successful-tx-ids (cond-> successful-tx-ids
                                          tx-id (conj tx-id))]
             (recur (next remaining)
+                   (inc entry-index)
                    (or applied? applied-entry?)
                    next-successful-tx-ids))
           (let [new-t (storage/get-t sql)]

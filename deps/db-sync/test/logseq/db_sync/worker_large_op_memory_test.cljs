@@ -127,11 +127,14 @@
             t-before (storage/get-t sql)
             {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
             tx-id (random-uuid)
-            tx-entries (mapv (fn [chunk]
-                               {:tx (protocol/tx->transit chunk)
-                                :tx-id tx-id
-                                :outliner-op :insert-blocks})
-                             (partition-all 392 tx-data))
+            chunks (vec (partition-all 392 tx-data))
+            tx-entries (mapv (fn [idx chunk]
+                               (cond-> {:tx (protocol/tx->transit chunk)
+                                        :outliner-op :insert-blocks}
+                                 (= idx (dec (count chunks)))
+                                 (assoc :tx-id tx-id)))
+                             (range)
+                             chunks)
             self #js {:sql sql
                       :conn conn
                       :schema-ready true}

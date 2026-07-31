@@ -13,6 +13,9 @@
 (def ^:private tx-log-outliner-op-migration-sql
   "alter table tx_log add column outliner_op TEXT")
 
+(def ^:private tx-log-tx-id-migration-sql
+  "alter table tx_log add column tx_id TEXT")
+
 (defn- duplicate-column-error?
   [error column-name]
   (let [message (-> (or (ex-message error) (some-> error .-message) (str error))
@@ -26,6 +29,14 @@
     (common/sql-exec sql tx-log-outliner-op-migration-sql)
     (catch :default error
       (when-not (duplicate-column-error? error "outliner_op")
+        (throw error)))))
+
+(defn- ensure-tx-log-tx-id-column!
+  [sql]
+  (try
+    (common/sql-exec sql tx-log-tx-id-migration-sql)
+    (catch :default error
+      (when-not (duplicate-column-error? error "tx_id")
         (throw error)))))
 
 ;; TODO: GC kvs table
@@ -62,6 +73,10 @@
                         "created_at INTEGER"
                         ");"))
   (ensure-tx-log-outliner-op-column! sql)
+  (ensure-tx-log-tx-id-column! sql)
+  (common/sql-exec sql
+                   (str "create unique index if not exists tx_log_tx_id "
+                        "on tx_log(tx_id) where tx_id is not null"))
   (common/sql-exec sql
                    (str "create table if not exists sync_meta ("
                         "key TEXT primary key,"
@@ -219,14 +234,38 @@
   (when (string? value)
     (keyword value)))
 
-(defn append-tx! [sql t tx-str created-at outliner-op]
-  (common/sql-exec sql
-                   (str "insert into tx_log (t, tx, created_at, outliner_op) values (?, ?, ?, ?)"
-                        " on conflict(t) do update set tx = excluded.tx, created_at = excluded.created_at, outliner_op = excluded.outliner_op")
-                   t
-                   tx-str
-                   created-at
-                   (outliner-op->sql outliner-op)))
+(defn append-tx!
+  ([sql t tx-str created-at outliner-op]
+   (append-tx! sql t tx-str created-at outliner-op nil))
+  ([sql t tx-str created-at outliner-op tx-id]
+   (common/sql-exec
+    sql
+    (str "insert into tx_log (t, tx, created_at, outliner_op, tx_id) "
+         "values (?, ?, ?, ?, ?)"
+         " on conflict(t) do update set tx = excluded.tx, "
+         "created_at = excluded.created_at, outliner_op = excluded.outliner_op, "
+         "tx_id = excluded.tx_id")
+    t
+    tx-str
+    created-at
+    (outliner-op->sql outliner-op)
+    (some-> tx-id str))))
+
+(defn tx-id-applied?
+  [sql tx-id]
+  (boolean
+   (and tx-id
+        (select-one sql
+                    "select 1 as applied from tx_log where tx_id = ? limit 1"
+                    (str tx-id)))))
+
+(defn set-tx-id-for-t!
+  [sql t tx-id]
+  (when tx-id
+    (common/sql-exec sql
+                     "update tx_log set tx_id = ? where t = ?"
+                     (str tx-id)
+                     t)))
 
 (defn fetch-tx-since [sql since-t]
   (let [rows (common/get-sql-rows
@@ -293,7 +332,8 @@
                 (or (checksum-metadata-verified? sql prev-t)
                     (and (zero? prev-t)
                          (nil? prev-checksum)))]
-            (append-tx! sql new-t tx-str created-at (:outliner-op tx-meta))
+            (append-tx! sql new-t tx-str created-at
+                        (:outliner-op tx-meta) (:tx-id tx-meta))
             (set-t! sql new-t)
             (when-not (:db-sync/skip-checksum-update? tx-meta)
               (let [checksum (sync-checksum/update-checksum

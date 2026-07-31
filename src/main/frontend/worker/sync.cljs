@@ -411,6 +411,12 @@
         (fn [_]
           (when (identical? ws (:ws @worker-state/*db-sync-client))
             (log/info :db-sync/ws-closed {:repo repo})
+            (when (or (seq (some-> (:inflight client) deref))
+                      (seq (some-> (:upload-request client) deref :tx-ids)))
+              (sync-util/set-last-sync-error!
+               client
+               (ex-info "db-sync/upload-connection-closed"
+                        {:type :db-sync/upload-connection-closed})))
             (invalidate-connection! repo client ws url :close false)))))
 
 (defn- detach-ws-handlers!

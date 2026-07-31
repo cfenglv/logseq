@@ -4469,7 +4469,9 @@
                        :outliner-op :save-block})
                     (range 11))
               whole-graph-validations (atom 0)
-              server-db-v2-valid?* sync-checksum/server-db-v2-valid?
+              server-db-v2-valid?*
+              #_{:clj-kondo/ignore [:private-call]}
+              sync-checksum/server-db-v2-valid?
               response
               (with-redefs
                 [sync-checksum/server-db-v2-valid?
@@ -4518,7 +4520,9 @@
                                tx-id))
                             (range 11)
                             tx-ids)
-              apply-entry* sync-handler/apply-tx-entry!
+              apply-entry*
+              #_{:clj-kondo/ignore [:private-call]}
+              sync-handler/apply-tx-entry!
               apply-attempts (atom 0)
               interrupted-response
               (with-redefs
