@@ -11,6 +11,20 @@ import { projectUpdateKeyId } from "./project-update-signing.mjs";
 export const projectUpdateKeychainService =
   "com.logseq.selfhost.project-update-signing.ed25519-pkcs8-base64";
 
+export const projectUpdateKeychainLookupFailure = ({
+  error,
+  status,
+  stdoutLength,
+}) => {
+  if (!error && status === 44) {
+    return new Error("Keychain signing key missing/not found");
+  }
+  if (error || status !== 0 || stdoutLength === 0) {
+    return new Error("Keychain read failed/unavailable");
+  }
+  return null;
+};
+
 const activeCiEnvironment = () =>
   process.env.GITHUB_ACTIONS === "true" ||
   !["", "0", "false"].includes(
@@ -119,11 +133,14 @@ export const loadProjectUpdateSigningKey = (policy) => {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
-  if (lookup.error || lookup.status !== 0 || !lookup.stdout?.length) {
+  const lookupFailure = projectUpdateKeychainLookupFailure({
+    error: lookup.error,
+    status: lookup.status,
+    stdoutLength: lookup.stdout?.length ?? 0,
+  });
+  if (lookupFailure) {
     lookup.stdout?.fill(0);
-    throw new Error(
-      `login Keychain has no usable project update signing key for account ${policy.keyId}`,
-    );
+    throw lookupFailure;
   }
 
   try {
@@ -136,7 +153,7 @@ export const loadProjectUpdateSigningKey = (policy) => {
       projectUpdateKeyId(rawPublicKey) !== policy.keyId
     ) {
       throw new Error(
-        "login Keychain project update key does not match the fixed public policy",
+        "private key does not match the fixed project update public key/policy",
       );
     }
     return privateKey;

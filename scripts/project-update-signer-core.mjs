@@ -25,7 +25,7 @@ const validatePrivateKey = (privateKey, policy) => {
     projectUpdateKeyId(rawPublicKey) !== policy.keyId
   ) {
     throw new Error(
-      "project update private key does not match the fixed public policy",
+      "private key does not match the fixed project update public key/policy",
     );
   }
 };

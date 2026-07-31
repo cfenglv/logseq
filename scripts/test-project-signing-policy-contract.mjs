@@ -287,6 +287,34 @@ addCase("temporary Ed25519 sign/verify roundtrip rejects tampering", async () =>
   );
 });
 
+addCase("wrong signing key fails without modifying metadata", async () => {
+  const archive = path.join(isolatedRoot, "wrong-key-update.zip");
+  const metadata = path.join(isolatedRoot, "wrong-key-latest-mac.yml");
+  fs.writeFileSync(archive, "wrong key candidate\n");
+  fs.writeFileSync(
+    metadata,
+    "version: 2.0.1-selfhost.6\npath: wrong-key-update.zip\n",
+  );
+  const metadataBefore = fs.readFileSync(metadata);
+  const wrongKeys = generateKeyPairSync("ed25519");
+  await assert.rejects(
+    createProjectUpdateSignature({
+      arch: "arm64",
+      archive,
+      metadata,
+      policy: fixturePolicy,
+      privateKey: wrongKeys.privateKey,
+      version: "2.0.1-selfhost.6",
+    }),
+    /private key does not match the fixed project update public key\/policy/,
+  );
+  assert.deepEqual(
+    fs.readFileSync(metadata),
+    metadataBefore,
+    "wrong signing key modified updater metadata",
+  );
+});
+
 addCase("production signing policy passes the release gate", () => {
   const policyText = fs.readFileSync(productionPolicyPath, "utf8");
   assert.doesNotMatch(

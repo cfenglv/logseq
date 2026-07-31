@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { projectUpdateKeychainLookupFailure } from "./project-update-keychain.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -48,6 +49,42 @@ addCase("production signer uses only the fixed login Keychain identity", () => {
   assert.doesNotMatch(
     keychain,
     /add-generic-password|list-keychains|default-keychain|add-trusted-cert|security\s+import/,
+  );
+  assert.doesNotMatch(
+    keychain,
+    /lookup\.stderr/,
+    "Keychain lookup failures must not echo security stderr",
+  );
+});
+
+addCase("Keychain lookup failures distinguish missing from unreadable", () => {
+  assert.match(
+    projectUpdateKeychainLookupFailure({
+      status: 44,
+      stdoutLength: 0,
+    }).message,
+    /Keychain signing key missing\/not found/,
+  );
+  for (const failure of [
+    { status: 1, stdoutLength: 0 },
+    { status: null, stdoutLength: 0, error: new Error("spawn failed") },
+    { status: 0, stdoutLength: 0 },
+  ]) {
+    assert.match(
+      projectUpdateKeychainLookupFailure(failure).message,
+      /Keychain read failed\/unavailable/,
+    );
+    assert.doesNotMatch(
+      projectUpdateKeychainLookupFailure(failure).message,
+      /spawn failed|stderr|secret/i,
+    );
+  }
+  assert.equal(
+    projectUpdateKeychainLookupFailure({
+      status: 0,
+      stdoutLength: 64,
+    }),
+    null,
   );
 });
 
