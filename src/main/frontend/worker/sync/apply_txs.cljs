@@ -50,7 +50,7 @@
 (def ^:private remote-apply-snapshot-retry-max-delay-ms 1000)
 (def ^:private upload-response-timeout-ms (* 2 60 1000))
 (def ^:private max-upload-request-datoms 5000)
-(defonce ^:private *repo->large-upload-progress (atom {}))
+(defonce ^:private *repo->large-upload-sessions (atom {}))
 
 (defn set-upload-stopped!
   [repo stopped?]
@@ -884,19 +884,108 @@
                            (map #(large-upload-progress-key repo %))
                            seq)]
     (when progress-keys
-      (swap! *repo->large-upload-progress
-             (fn [progress]
-               (apply dissoc progress progress-keys))))))
+      (swap! *repo->large-upload-sessions
+             (fn [sessions]
+               (apply dissoc sessions progress-keys))))))
+
+(defn- large-upload-boundaries
+  [db tx-data]
+  (let [total (count tx-data)]
+    (loop [start 0
+           result []]
+      (if (< start total)
+        (let [{:keys [next-index]} (next-large-upload-request-chunk
+                                    db tx-data start)]
+          (when-not (> next-index start)
+            (fail-fast :db-sync/invalid-large-upload-boundary
+                       {:start start :total total}))
+          (recur next-index (conj result [start next-index])))
+        result))))
+
+(defn- new-large-upload-session
+  [db {:keys [tx-id tx-data outliner-op]}]
+  (let [tx-data (vec tx-data)
+        session-id (sync-protocol/tx-upload-session-id
+                    tx-id outliner-op tx-data)]
+    {:session-id session-id
+     :source-digest session-id
+     :outliner-op outliner-op
+     :tx-data tx-data
+     :boundaries (large-upload-boundaries db tx-data)
+     :next-index 0
+     ;; This freezes randomized E2EE/offload wire content until ACK. A retry is
+     ;; byte-equivalent, so the server can verify it without trusting metadata.
+     :wire-cache {}}))
+
+(defn- large-upload-wire-cache-entry
+  [repo logical-tx-id session-id chunk-index]
+  (let [session (get @*repo->large-upload-sessions
+                     (large-upload-progress-key repo logical-tx-id))]
+    (when (= session-id (:session-id session))
+      (get-in session [:wire-cache chunk-index]))))
+
+(defn- cache-large-upload-wire-entry!
+  [repo logical-tx-id session-id chunk-index wire-entry]
+  (let [session-key (large-upload-progress-key repo logical-tx-id)]
+    (swap! *repo->large-upload-sessions
+           (fn [sessions]
+             (if (= session-id (get-in sessions [session-key :session-id]))
+               (assoc-in sessions [session-key :wire-cache chunk-index] wire-entry)
+               sessions)))))
+
+(defn- large-upload-marker-source-entries
+  "Nonfinal chunks are only staged server-side, so their local large-title
+  markers cannot be committed on ACK yet. The final request carries marker
+  commit metadata for every frozen chunk in the generation."
+  [repo tx-entries]
+  (into []
+        (mapcat
+         (fn [{:keys [logical-tx-id upload-session-id large-upload-final?]
+               :as tx-entry}]
+           (cond
+             (nil? logical-tx-id)
+             [tx-entry]
+
+             (not large-upload-final?)
+             []
+
+             :else
+             (let [session (get @*repo->large-upload-sessions
+                                (large-upload-progress-key repo logical-tx-id))]
+               (when-not (= upload-session-id (:session-id session))
+                 (fail-fast :db-sync/large-upload-session-replaced
+                            {:logical-tx-id logical-tx-id}))
+               (->> (:wire-cache session)
+                    (sort-by key)
+                    (mapv (fn [[_ wire-entry]]
+                            (merge tx-entry
+                                   {:tx-id logical-tx-id}
+                                   wire-entry)))))))
+         tx-entries)))
 
 (defn- large-upload-request-entry
-  [repo db {:keys [tx-id tx-data] :as entry}]
-  (let [total (count tx-data)
-        progress-key (large-upload-progress-key repo tx-id)
-        progress-start (get @*repo->large-upload-progress progress-key 0)
-        start (if (< progress-start total) progress-start 0)
-        {:keys [chunk next-index]} (next-large-upload-request-chunk db tx-data start)
+  [repo db {:keys [tx-id tx-data outliner-op] :as entry}]
+  (let [session-key (large-upload-progress-key repo tx-id)
+        source-digest (sync-protocol/tx-upload-session-id
+                       tx-id outliner-op tx-data)
+        existing (get @*repo->large-upload-sessions session-key)
+        session (if (= source-digest (:source-digest existing))
+                  existing
+                  (let [replacement (new-large-upload-session db entry)]
+                    (swap! *repo->large-upload-sessions assoc session-key replacement)
+                    replacement))
+        tx-data (:tx-data session)
+        total (count tx-data)
+        requested-start (:next-index session)
+        [start next-index]
+        (or (some #(when (= requested-start (first %)) %)
+                  (:boundaries session))
+            (first (:boundaries session)))
+        chunk (subvec tx-data start next-index)
         final? (>= next-index total)
-        chunk-tx-id (sync-protocol/tx-chunk-id tx-id start final?)]
+        session-id (:session-id session)
+        chunk-tx-id (sync-protocol/tx-chunk-id
+                     tx-id session-id start final?)]
     (log/info :db-sync/large-upload-request-chunk
               {:repo repo
                :tx-id tx-id
@@ -908,6 +997,7 @@
            :tx-id chunk-tx-id
            :tx-data chunk
            :logical-tx-id tx-id
+           :upload-session-id session-id
            :chunk-index start
            :chunk-final? final?
            :large-upload-original-tx-id tx-id
@@ -979,22 +1069,33 @@
 (defn- commit-large-upload-progress!
   [repo tx-entries]
   (doseq [{:keys [large-upload-original-tx-id
+                  upload-session-id
                   large-upload-next-index
                   large-upload-final?]} tx-entries]
     (when large-upload-original-tx-id
       (let [progress-key (large-upload-progress-key repo large-upload-original-tx-id)]
-        (if large-upload-final?
-          (swap! *repo->large-upload-progress dissoc progress-key)
-          (swap! *repo->large-upload-progress assoc progress-key large-upload-next-index))))))
+        (swap! *repo->large-upload-sessions
+               (fn [sessions]
+                 (if (= upload-session-id
+                        (get-in sessions [progress-key :session-id]))
+                   (if large-upload-final?
+                     (dissoc sessions progress-key)
+                     (assoc-in sessions [progress-key :next-index]
+                               large-upload-next-index))
+                   ;; A rebase may have started a new content-addressed
+                   ;; generation while an old ACK was in flight.
+                   sessions)))))))
 
 (defn- large-upload-progress
   [tx-entries]
   (->> tx-entries
        (keep (fn [{:keys [large-upload-original-tx-id
+                          upload-session-id
                           large-upload-next-index
                           large-upload-final?]}]
                (when large-upload-original-tx-id
                  {:large-upload-original-tx-id large-upload-original-tx-id
+                  :upload-session-id upload-session-id
                   :large-upload-next-index large-upload-next-index
                   :large-upload-final? large-upload-final?})))
        vec))
@@ -1204,38 +1305,45 @@
                             _ (when (and (seq tx-entries) (sync-crypt/graph-e2ee? repo) (nil? aes-key))
                                 (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
                             tx-entries* (p/all
-                                         (mapv (fn [{:keys [logical-tx-id chunk-final?
-                                                           outliner-op tx-data] :as tx-entry}]
-                                                 (p/let [tx-data* (offload-large-titles
-                                                                   tx-data
-                                                                   {:repo repo
-                                                                    :graph-id (:graph-id client)
-                                                                    :aes-key aes-key})
-                                                         tx-data** (if aes-key
-                                                                     (sync-crypt/<encrypt-tx-data aes-key tx-data*)
-                                                                     tx-data*)]
-                                                   (cond-> (assoc tx-entry
-                                                                  :tx-data tx-data**
-                                                                  :large-title-logical-tx-data
-                                                                  tx-data)
-                                                     logical-tx-id
-                                                     (assoc :payload-digest
-                                                            (sync-protocol/tx-payload-digest
-                                                             outliner-op chunk-final? tx-data)))))
+                                         (mapv (fn [{:keys [logical-tx-id upload-session-id
+                                                           chunk-index tx-data]
+                                                    :as tx-entry}]
+                                                 (if-let [cached
+                                                          (when logical-tx-id
+                                                            (large-upload-wire-cache-entry
+                                                             repo logical-tx-id
+                                                             upload-session-id chunk-index))]
+                                                   (p/resolved (merge tx-entry cached))
+                                                   (p/let [tx-data* (offload-large-titles
+                                                                     tx-data
+                                                                     {:repo repo
+                                                                      :graph-id (:graph-id client)
+                                                                      :aes-key aes-key})
+                                                           tx-data** (if aes-key
+                                                                       (sync-crypt/<encrypt-tx-data aes-key tx-data*)
+                                                                       tx-data*)
+                                                           wire-entry
+                                                           {:tx-data tx-data**
+                                                            :large-title-logical-tx-data tx-data}]
+                                                     (when logical-tx-id
+                                                       (cache-large-upload-wire-entry!
+                                                        repo logical-tx-id upload-session-id
+                                                        chunk-index wire-entry))
+                                                     (merge tx-entry wire-entry))))
                                                tx-entries))
-                            payload (mapv (fn [{:keys [tx-id logical-tx-id chunk-index
-                                                      chunk-final? payload-digest tx-data outliner-op]}]
+                            payload (mapv (fn [{:keys [tx-id logical-tx-id upload-session-id
+                                                      chunk-index chunk-final? tx-data outliner-op]}]
                                             (cond-> {:tx (sqlite-util/write-transit-str tx-data)}
                                               tx-id
                                               (assoc :tx-id (str tx-id))
                                               logical-tx-id
                                               (assoc :logical-tx-id (str logical-tx-id))
+                                              upload-session-id
+                                              (assoc :upload-session-id upload-session-id)
                                               (some? chunk-index)
                                               (assoc :chunk-index chunk-index)
                                               (some? chunk-final?)
                                               (assoc :chunk-final? chunk-final?)
-                                              payload-digest
-                                              (assoc :payload-digest payload-digest)
                                               outliner-op
                                               (assoc :outliner-op outliner-op)))
                                           tx-entries*)
@@ -1246,7 +1354,9 @@
                             tx-entries-to-send (:tx-entries capped)
                             marker-tx-entries
                             (versioned-large-title-marker-tx-entries
-                             @conn tx-entries-to-send)
+                             @conn
+                             (large-upload-marker-source-entries
+                              repo tx-entries-to-send))
                             tx-ids (into [] (keep :tx-id) tx-entries-to-send)]
                       (when (seq tx-entries-to-send)
                         (reset! (:inflight client) tx-ids)

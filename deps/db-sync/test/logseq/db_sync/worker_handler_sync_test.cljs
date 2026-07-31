@@ -4899,3 +4899,124 @@
             (is (= client-revision
                    (:block/title
                     (d/entity @conn [:block/uuid block-uuid]))))))))))
+
+(defn- upload-chunk-entry
+  [logical-tx-id session-id chunk-index final? outliner-op tx-data]
+  {:tx-id (protocol/tx-chunk-id
+           logical-tx-id session-id chunk-index final?)
+   :logical-tx-id logical-tx-id
+   :upload-session-id session-id
+   :chunk-index chunk-index
+   :chunk-final? final?
+   :outliner-op outliner-op
+   :tx (protocol/tx->transit tx-data)})
+
+(deftest staged-upload-binds-actual-wire-content-and-enforces-order-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            logical-tx-id (random-uuid)
+            page-uuid (random-uuid)
+            block-uuid (random-uuid)
+            page {:block/uuid page-uuid
+                  :block/name "ordered-upload"
+                  :block/title "Ordered upload"}
+            block {:block/uuid block-uuid
+                   :block/title "final content"
+                   :block/order "a0"
+                   :block/parent [:block/uuid page-uuid]
+                   :block/page [:block/uuid page-uuid]}
+            full-tx [page block]
+            session-id (protocol/tx-upload-session-id
+                        logical-tx-id :insert-blocks full-tx)
+            first-entry (assoc (upload-chunk-entry
+                                logical-tx-id session-id 0 false
+                                :insert-blocks [page])
+                               ;; Deliberately forged. The server must ignore it.
+                               :payload-digest (apply str (repeat 64 "f")))
+            send! (fn [entry]
+                    (with-redefs [ws/broadcast! (fn [& _] nil)]
+                      (sync-handler/handle-tx-batch!
+                       self nil [entry] (storage/get-t sql))))
+            first-response (send! first-entry)
+            retry-response (send! (assoc first-entry
+                                         :payload-digest
+                                         (apply str (repeat 64 "0"))))
+            conflicting-entry
+            (assoc first-entry
+                   :tx (protocol/tx->transit
+                        [(assoc page :block/title "forged replacement")])
+                   :payload-digest (apply str (repeat 64 "f")))
+            conflict-response (send! conflicting-entry)]
+        (is (= "tx/batch/ok" (:type first-response)))
+        (is (zero? (:t first-response))
+            "nonfinal chunks stage bytes without mutating graph history")
+        (is (nil? (d/entity @conn [:block/uuid page-uuid])))
+        (is (= "tx/batch/ok" (:type retry-response)))
+        (is (zero? (:t retry-response)))
+        (is (= "tx/reject" (:type conflict-response)))
+        (is (= ":db-sync/upload-chunk-payload-conflict"
+               (:error-detail conflict-response))
+            "a forged declared digest cannot authorize different wire data")
+        (is (= 1 (:next-index
+                  (storage/client-tx-upload sql logical-tx-id))))
+        (is (= 1 (count (storage/client-tx-upload-chunks sql session-id))))
+
+        (let [skipped (upload-chunk-entry
+                       logical-tx-id session-id 2 false
+                       :insert-blocks [block])
+              skipped-response (send! skipped)
+              tampered-metadata
+              (upload-chunk-entry logical-tx-id session-id 1 true
+                                  :save-block [block])
+              metadata-response (send! tampered-metadata)
+              final-entry (upload-chunk-entry
+                           logical-tx-id session-id 1 true
+                           :insert-blocks [block])
+              final-response (send! final-entry)
+              t-after-final (storage/get-t sql)
+              final-retry (send! final-entry)
+              post-completion (send! first-entry)]
+          (is (= ":db-sync/upload-session-out-of-order"
+                 (:error-detail skipped-response)))
+          (is (= ":db-sync/upload-session-metadata-conflict"
+                 (:error-detail metadata-response)))
+          (is (= "tx/batch/ok" (:type final-response)))
+          (is (= "final content"
+                 (:block/title (d/entity @conn [:block/uuid block-uuid]))))
+          (is (= "completed"
+                 (:status (storage/client-tx-upload sql logical-tx-id))))
+          (is (empty? (storage/client-tx-upload-chunks sql session-id))
+              "finalization consolidates staged rows immediately")
+          (is (= "tx/batch/ok" (:type final-retry)))
+          (is (= t-after-final (:t final-retry))
+              "lost final ACK retry cannot apply twice")
+          (is (= ":db-sync/upload-session-completed"
+                 (:error-detail post-completion))))))))
+
+(deftest upload-session-rejects-final-first-and-nonzero-first-chunk-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [self #js {:sql sql
+                      :conn (storage/open-conn sql)
+                      :schema-ready true}
+            logical-tx-id (random-uuid)
+            session-id (apply str (repeat 64 "a"))
+            tx-data [{:block/uuid (random-uuid) :block/title "never apply"}]
+            send! (fn [entry]
+                    (with-redefs [ws/broadcast! (fn [& _] nil)]
+                      (sync-handler/handle-tx-batch! self nil [entry] 0)))
+            nonzero-response
+            (send! (upload-chunk-entry logical-tx-id session-id 500 false
+                                       :insert-blocks tx-data))
+            final-response
+            (send! (upload-chunk-entry logical-tx-id session-id 0 true
+                                       :insert-blocks tx-data))]
+        (is (= ":db-sync/upload-session-out-of-order"
+               (:error-detail nonzero-response)))
+        (is (= ":db-sync/upload-session-final-first"
+               (:error-detail final-response)))
+        (is (nil? (storage/client-tx-upload sql logical-tx-id)))))))

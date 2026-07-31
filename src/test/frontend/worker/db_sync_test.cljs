@@ -1613,13 +1613,14 @@
                                      (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                      (is (= 0 (:chunk-index tx-entry)))
                                      (is (false? (:chunk-final? tx-entry)))
-                                     (is (string? (:payload-digest tx-entry)))
+                                     (is (re-matches #"[0-9a-f]{64}"
+                                                     (:upload-session-id tx-entry)))
                                      (is (= 4999 (count uploaded-tx)))
                                      (is (= [chunk-tx-id] @(:inflight client)))
                                      (sync-apply/ack-upload-response! test-repo client)
                                      (reset! (:inflight client) [])
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                                     (client-op/update-local-tx test-repo 0)
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
@@ -1644,6 +1645,7 @@
                                :block/title
                                "large upload retry tail"]]))
                sent (atom [])
+               encrypt-calls (atom 0)
                client {:repo test-repo
                        :graph-id "graph-1"
                        :inflight (atom [])
@@ -1659,7 +1661,13 @@
                  client-ops-conn
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
-                                        sync-crypt/graph-e2ee? (constantly false)]
+                                        sync-crypt/graph-e2ee? (constantly true)
+                                        sync-crypt/<ensure-graph-aes-key
+                                        (fn [& _] (p/resolved :test-aes-key))
+                                        sync-crypt/<encrypt-tx-data
+                                        (fn [_ tx-data]
+                                          (swap! encrypt-calls inc)
+                                          (p/resolved tx-data))]
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1690,8 +1698,12 @@
                                (is (= 5000 (count uploaded-tx)))))
                            (let [retry-entry (-> @sent second :txs first)]
                              (is (= (:tx-id first-entry) (:tx-id retry-entry)))
-                             (is (= (:payload-digest first-entry)
-                                    (:payload-digest retry-entry))))))
+                             (is (= (:upload-session-id first-entry)
+                                    (:upload-session-id retry-entry)))
+                             (is (= (:tx first-entry) (:tx retry-entry))
+                                 "ACK-loss retries must reuse the exact wire payload")
+                             (is (= 1 @encrypt-calls)
+                                 "randomized E2EE preparation must be frozen until ACK"))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1766,8 +1778,8 @@
                                      (is (= parent-tx (subvec first-uploaded-tx 4993 5000)))
                                      (sync-apply/ack-upload-response! test-repo client)
                                      (reset! (:inflight client) [])
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                                     (client-op/update-local-tx test-repo 0)
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
@@ -1828,8 +1840,8 @@
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
                                      (reset! (:inflight client) [])
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                                     (client-op/update-local-tx test-repo 0)
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
@@ -1888,8 +1900,8 @@
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
                                      (reset! (:inflight client) [])
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                                     (client-op/update-local-tx test-repo 0)
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
@@ -12697,3 +12709,45 @@
       (is (= (:tx-id first-entry) (:tx-id retry-entry))
           "retrying before ACK must derive exactly the same chunk identity")
       (is (= (:tx-data first-entry) (:tx-data retry-entry))))))
+
+(deftest rebased-large-upload-starts-new-frozen-session-at-zero-test
+  (testing "rewriting normalized data invalidates positional progress and stale ACKs"
+    (let [{:keys [conn child1]} (setup-parent-child)
+          repo "large-upload-rebase-session-repo"
+          logical-tx-id (random-uuid)
+          base-tx (vec
+                   (map (fn [idx]
+                          [:db/add [:block/uuid (:block/uuid child1)]
+                           :block/title (str "before-rebase-" idx)])
+                        (range 5001)))
+          pending (fn [tx-data]
+                    [{:tx-id logical-tx-id
+                      :tx tx-data
+                      :outliner-op :save-block}])]
+      (try
+        (let [first-entry (-> (sync-apply/prepare-upload-tx-entries
+                               repo conn (pending base-tx))
+                              :tx-entries first)
+              _ (#'sync-apply/commit-large-upload-progress!
+                 repo [first-entry])
+              rebased-tx (assoc base-tx 0
+                                [:db/add [:block/uuid (:block/uuid child1)]
+                                 :block/title "changed-by-rebase"])
+              rebased-entry (-> (sync-apply/prepare-upload-tx-entries
+                                 repo conn (pending rebased-tx))
+                                :tx-entries first)
+              _ (#'sync-apply/commit-large-upload-progress!
+                 repo [first-entry])
+              after-stale-ack (-> (sync-apply/prepare-upload-tx-entries
+                                   repo conn (pending rebased-tx))
+                                  :tx-entries first)]
+          (is (= 0 (:chunk-index rebased-entry)))
+          (is (not= (:upload-session-id first-entry)
+                    (:upload-session-id rebased-entry)))
+          (is (= "changed-by-rebase" (nth (first (:tx-data rebased-entry)) 3)))
+          (is (= 0 (:chunk-index after-stale-ack))
+              "an ACK for the abandoned generation cannot skip rebased data")
+          (is (= (:upload-session-id rebased-entry)
+                 (:upload-session-id after-stale-ack))))
+        (finally
+          (#'sync-apply/clear-large-upload-progress! repo [logical-tx-id]))))))

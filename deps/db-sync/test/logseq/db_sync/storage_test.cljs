@@ -27,7 +27,8 @@
 (defn- with-memory-sql
   [f]
   (let [db (new sqlite ":memory:" nil)
-        sql #js {:exec (fn [sql-str & args]
+        sql #js {:_db db
+                 :exec (fn [sql-str & args]
                          (let [stmt (.prepare db sql-str)]
                            (if (select-sql? sql-str)
                              (all-sql stmt args)
@@ -61,6 +62,35 @@
   [rng coll]
   (when (seq coll)
     (nth coll (rand-int* rng (count coll)))))
+
+(deftest hundred-thousand-idempotency-markers-use-primary-key-lookup-test
+  (testing "safe retention keeps markers until reset without turning replay into a scan"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (common/sql-exec
+         sql
+         (str "with recursive n(x) as ("
+              "select 1 union all select x + 1 from n where x < 100000"
+              ") insert into applied_client_txs(identity, payload_digest, created_at) "
+              "select 'tx/' || x, printf('%064x', x), x from n"))
+        (is (= {"tx/1" (str (apply str (repeat 63 "0")) "1")
+                "tx/100000" (str (apply str (repeat 59 "0")) "186a0")}
+               (storage/applied-client-tx-records
+                sql ["tx/1" "tx/100000"])))
+        (let [^js db (aget sql "_db")
+              plan (.all (.prepare db
+                                   (str "explain query plan select identity, payload_digest "
+                                        "from applied_client_txs where identity in (?, ?)"))
+                         "tx/1" "tx/100000")
+              details (mapv #(aget % "detail") plan)]
+          (is (some #(string/includes? (string/lower-case %) "index") details)
+              (str "marker lookup must use the PK index: " (pr-str details))))
+        (is (= 100000
+               (-> (common/sql-exec
+                    sql "select count(*) as n from applied_client_txs")
+                   common/get-sql-rows first (aget "n")))
+            "markers are not silently expired without snapshot/reset")))))
 
 (deftest versioned-server-checksum-listener-updates-independently-test
   (with-memory-sql

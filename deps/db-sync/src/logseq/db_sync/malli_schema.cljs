@@ -6,6 +6,7 @@
   [:map
    [:tx-id {:optional true} :uuid]
    [:logical-tx-id {:optional true} :uuid]
+   [:upload-session-id {:optional true} :string]
    [:chunk-index {:optional true} :int]
    [:chunk-final? {:optional true} :boolean]
    [:payload-digest {:optional true} :string]
