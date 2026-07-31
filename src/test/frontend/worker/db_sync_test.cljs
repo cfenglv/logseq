@@ -13225,7 +13225,10 @@
                  server-conn (sync-storage/open-conn (:sql server-storage))
                  server-self #js {:sql (:sql server-storage)
                                   :conn server-conn
-                                  :schema-ready true}
+                                  ;; Let the real websocket handler initialize
+                                  ;; every current server schema table, including
+                                  ;; staged-upload durability tables.
+                                  :schema-ready false}
                  server-t0 (sync-handler/t-now server-self)
                  server-response* (atom nil)
                  server-ws (doto (js-obj)
@@ -13294,9 +13297,10 @@
                               (<exchange-one-real-upload!
                                repo first-client first-sent*
                                server-self server-ws server-response* true)
+                              first-entry (-> first-exchange :request :txs first)
                               _ (do
-                                  (is (false? (-> first-exchange :request :txs first
-                                                  :chunk-final?)))
+                                  (is (= 0 (:chunk-index first-entry)))
+                                  (is (false? (:chunk-final? first-entry)))
                                   (is (= "tx/batch/ok"
                                          (-> first-exchange :response :type)))
                                   (is (= server-t0 (sync-handler/t-now server-self))
@@ -13317,9 +13321,14 @@
                                              repo second-client second-sent*
                                              server-self server-ws
                                              server-response* false)
+                              final-entry (-> final-attempt :request :txs first)
                               _ (do
-                                  (is (true? (-> final-attempt :request :txs first
-                                                 :chunk-final?)))
+                                  (is (= (:logical-tx-id first-entry)
+                                         (:logical-tx-id final-entry)))
+                                  (is (= (:upload-session-id first-entry)
+                                         (:upload-session-id final-entry)))
+                                  (is (pos? (:chunk-index final-entry)))
+                                  (is (true? (:chunk-final? final-entry)))
                                   (is (= "tx/batch/ok"
                                          (-> final-attempt :response :type)))
                                   (is (= (inc server-t0)
