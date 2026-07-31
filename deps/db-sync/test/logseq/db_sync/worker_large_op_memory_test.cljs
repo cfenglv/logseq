@@ -1,8 +1,9 @@
 (ns logseq.db-sync.worker-large-op-memory-test
   (:require ["better-sqlite3" :as sqlite3]
+            ["crypto" :as node-crypto]
             [clojure.string :as string]
             [datascript.core :as d]
-            [logseq.db-sync.checksum :as sync-checksum]
+            [logseq.db-sync.checksum :as checksum]
             [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.storage :as storage]
             [logseq.db-sync.worker.handler.sync :as sync-handler]
@@ -70,6 +71,154 @@
   (when-not condition
     (throw (js/Error. message))))
 
+(defn- sha256-hex
+  [value]
+  (-> (.createHash node-crypto "sha256")
+      (.update value "utf8")
+      (.digest "hex")))
+
+(defn- modern-upload-session-id
+  [logical-tx-id outliner-op full-tx-data]
+  (sha256-hex
+   (protocol/tx->transit
+    [:client-tx-upload-session-v1
+     logical-tx-id
+     outliner-op
+     full-tx-data])))
+
+(defn- modern-nonfinal-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index]
+  (let [raw (sha256-hex
+             (str "logseq-tx-chunk-v1/"
+                  logical-tx-id "/"
+                  upload-session-id "/"
+                  chunk-index))
+        versioned (str (subs raw 0 12)
+                       "5"
+                       (subs raw 13 16)
+                       "8"
+                       (subs raw 17 32))]
+    (uuid (str (subs versioned 0 8) "-"
+               (subs versioned 8 12) "-"
+               (subs versioned 12 16) "-"
+               (subs versioned 16 20) "-"
+               (subs versioned 20 32)))))
+
+(defn- modern-session-entry
+  [logical-tx-id upload-session-id outliner-op chunk-index chunk final?]
+  {:tx (protocol/tx->transit chunk)
+   :tx-id (if final?
+            logical-tx-id
+            (modern-nonfinal-chunk-tx-id
+             logical-tx-id upload-session-id chunk-index))
+   :logical-tx-id logical-tx-id
+   :upload-session-id upload-session-id
+   :chunk-index chunk-index
+   :chunk-final? final?
+   :outliner-op outliner-op})
+
+(defn- modern-session-entries
+  [logical-tx-id outliner-op tx-data]
+  (let [upload-session-id
+        (modern-upload-session-id logical-tx-id outliner-op tx-data)
+        chunks (vec (partition-all 1000 tx-data))]
+    (mapv (fn [index chunk]
+            (modern-session-entry
+             logical-tx-id upload-session-id outliner-op
+             (* index 1000) (vec chunk) (= index (dec (count chunks)))))
+          (range (count chunks))
+          chunks)))
+
+(defn- assert-modern-invisible!
+  [sql conn fresh-conn t-before checksum-before block-uuids]
+  (assert! (= t-before (storage/get-t sql))
+           "nonfinal modern chunks must not advance visible t")
+  (assert! (= checksum-before
+              (checksum/recompute-server-checksum @conn))
+           "nonfinal modern chunks must not change the current graph checksum")
+  (assert! (= checksum-before
+              (checksum/recompute-server-checksum @fresh-conn))
+           "nonfinal modern chunks must not change a freshly reopened graph")
+  (assert! (not (sample-blocks-present? @conn block-uuids))
+           "nonfinal modern chunks must remain invisible on current conn")
+  (assert! (not (sample-blocks-present? @fresh-conn block-uuids))
+           "nonfinal modern chunks must remain invisible after reopen"))
+
+(defn- run-modern-staged-memory-test!
+  [rollback?]
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            _ (d/transact! conn [{:block/uuid page-uuid
+                                  :block/name "modern-memory-page"
+                                  :block/title "modern-memory-page"}])
+            t-before (storage/get-t sql)
+            checksum-before (checksum/recompute-server-checksum @conn)
+            {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
+            logical-tx-id (random-uuid)
+            entries (modern-session-entries
+                     logical-tx-id :insert-blocks tx-data)
+            prefix (pop entries)
+            final-entry (peek entries)
+            self #js {:sql sql :conn conn :schema-ready true}]
+        (assert! (= 14000 (count tx-data))
+                 "modern memory fixture must contain exactly 14k datoms")
+        (assert! (> (count entries) 1)
+                 "modern memory fixture must exercise nonfinal staging")
+        (doseq [entry prefix]
+          (let [response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry] t-before))]
+            (assert! (= "tx/batch/ok" (:type response))
+                     (str "nonfinal modern stage rejected: " (pr-str response)))))
+        (let [fresh-before (storage/open-conn sql)]
+          (assert-modern-invisible!
+           sql conn fresh-before t-before checksum-before block-uuids))
+        (if rollback?
+          (let [original-append storage/append-tx!
+                response
+                (with-redefs [storage/append-tx!
+                              (fn [& _]
+                                (throw (js/Error. "injected modern final append failure")))
+                              ws/broadcast! (fn [& _] nil)]
+                  (sync-handler/handle-tx-batch!
+                   self nil [final-entry] t-before))
+                fresh-after (storage/open-conn sql)]
+            ;; Keep an explicit reference so Closure cannot elide the real
+            ;; production var before with-redefs restores it.
+            (assert! (fn? original-append) "append-tx! must be callable")
+            (assert! (= "tx/reject" (:type response))
+                     (str "expected final fault rejection, got " (pr-str response)))
+            (assert-modern-invisible!
+             sql conn fresh-after t-before checksum-before block-uuids)
+            (assert! (empty? (storage/fetch-tx-since sql t-before))
+                     "failed final must leave no visible tx log row"))
+          (let [response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [final-entry] t-before))
+                fresh-after (storage/open-conn sql)
+                recomputed (checksum/recompute-server-checksum @conn)]
+            (assert! (= "tx/batch/ok" (:type response))
+                     (str "expected modern final success, got " (pr-str response)))
+            (assert! (= (inc t-before) (:t response))
+                     "full logical tx advances visible t exactly once")
+            (assert! (= 1 (count (storage/fetch-tx-since sql t-before)))
+                     "full logical tx persists exactly one visible tx row")
+            (assert! (sample-blocks-present? @conn block-uuids)
+                     "final atomically exposes all sampled blocks")
+            (assert! (sample-blocks-present? @fresh-after block-uuids)
+                     "fresh reopen observes the committed full graph")
+            (assert! (= recomputed
+                        (checksum/recompute-server-checksum @fresh-after))
+                     "current and fresh graph checksums converge")
+            (assert! (= recomputed (storage/get-server-checksum sql))
+                     "stored checksum equals full recomputation")
+            (assert! (= (inc t-before)
+                        (storage/get-server-checksum-t sql))
+                     "stored checksum cursor follows the one logical commit")))))))
+
 (defn- run-large-op-memory-test!
   [{:keys [skip-final-store? skip-validation?]}]
   (with-memory-sql
@@ -128,14 +277,11 @@
             t-before (storage/get-t sql)
             {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
             tx-id (random-uuid)
-            chunks (vec (partition-all 392 tx-data))
-            tx-entries (mapv (fn [idx chunk]
-                               (cond-> {:tx (protocol/tx->transit chunk)
-                                        :outliner-op :insert-blocks}
-                                 (= idx (dec (count chunks)))
-                                 (assoc :tx-id tx-id)))
-                             (range)
-                             chunks)
+            tx-entries (mapv (fn [chunk]
+                               {:tx (protocol/tx->transit chunk)
+                                :tx-id tx-id
+                                :outliner-op :insert-blocks})
+                             (partition-all 392 tx-data))
             self #js {:sql sql
                       :conn conn
                       :schema-ready true}
@@ -168,91 +314,6 @@
                  "expected client split tx entries to be persisted as visible tx log entries")
         (assert! (sample-blocks-present? @conn block-uuids)
                  "expected sampled client split blocks to be persisted")))))
-
-(defn- modern-staged-entry
-  [logical-tx-id session-id outliner-op chunk-index final? chunk]
-  {:tx (protocol/tx->transit chunk)
-   :tx-id (protocol/tx-chunk-id logical-tx-id session-id chunk-index final?)
-   :logical-tx-id logical-tx-id
-   :upload-session-id session-id
-   :chunk-index chunk-index
-   :chunk-final? final?
-   :outliner-op outliner-op})
-
-(defn- run-modern-staged-large-op-memory-test!
-  [{:keys [rollback? reopen?]}]
-  (with-memory-sql
-    (fn [sql]
-      (storage/init-schema! sql)
-      (let [conn (storage/open-conn sql)
-            page-uuid (random-uuid)
-            _ (d/transact! conn [{:block/uuid page-uuid
-                                  :block/name "modern-staged-memory-page"
-                                  :block/title "modern-staged-memory-page"}])
-            t-before (storage/get-t sql)
-            {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
-            missing-uuid (random-uuid)
-            full-tx-data (if rollback?
-                           (assoc tx-data (dec (count tx-data))
-                                  [:db/add [:block/uuid missing-uuid]
-                                   :block/title "modern-staged-missing" 0])
-                           tx-data)
-            logical-tx-id (random-uuid)
-            outliner-op :insert-blocks
-            session-id (protocol/tx-upload-session-id
-                        logical-tx-id outliner-op full-tx-data)
-            boundaries [[0 5000] [5000 10000] [10000 14000]]
-            self #js {:sql sql :conn conn :schema-ready true}
-            responses
-            (with-redefs [ws/broadcast! (fn [& _] nil)]
-              (mapv (fn [[start end]]
-                      (sync-handler/handle-tx-batch!
-                       self nil
-                       [(modern-staged-entry
-                         logical-tx-id session-id outliner-op start
-                         (= end (count full-tx-data))
-                         (subvec full-tx-data start end))]
-                       (storage/get-t sql)))
-                    boundaries))
-            final-response (last responses)
-            upload (storage/client-tx-upload sql logical-tx-id)]
-        (assert! (= 14000 (count full-tx-data))
-                 "expected a true 14k-datom modern logical transaction")
-        (doseq [response (butlast responses)]
-          (assert! (= "tx/batch/ok" (:type response))
-                   (str "expected staged chunk ok, got " (pr-str response)))
-          (assert! (= t-before (:t response))
-                   "nonfinal modern chunks must not mutate the graph"))
-        (if rollback?
-          (do
-            (assert! (= "tx/reject" (:type final-response))
-                     (str "expected final rollback, got " (pr-str final-response)))
-            (assert! (= t-before (storage/get-t sql))
-                     "failed final assembly must roll back every graph chunk")
-            (assert! (= "active" (:status upload))
-                     "failed final must leave the acknowledged prefix resumable")
-            (assert! (= 10000 (:next-index upload))
-                     "failed final staging row must roll back atomically")
-            (assert! (not (sample-blocks-present? @conn block-uuids))
-                     "failed final must not expose partially assembled blocks"))
-          (do
-            (assert! (= "tx/batch/ok" (:type final-response))
-                     (str "expected modern final ok, got " (pr-str final-response)))
-            (assert! (> (:t final-response) t-before)
-                     "modern final must publish the assembled logical tx")
-            (assert! (= "completed" (:status upload))
-                     "modern final must retain a bounded completion marker")
-            (assert! (empty? (storage/client-tx-upload-chunks sql session-id))
-                     "modern completion must consolidate staged chunks")
-            (assert! (sample-blocks-present? @conn block-uuids)
-                     "modern final must persist sampled blocks")
-            (when reopen?
-              (let [fresh (storage/open-conn sql)]
-                (assert! (sample-blocks-present? @fresh block-uuids)
-                         "fresh reopen must reconstruct the committed modern tx")
-                (assert! (= (storage/get-checksum sql)
-                            (sync-checksum/recompute-checksum @fresh))
-                         "fresh reopen checksum must match the committed metadata")))))))))
 
 (defn- run-open-sql-memory-test!
   []
@@ -288,9 +349,8 @@
     "apply" (run-large-op-memory-test! nil)
     "apply-client-split" (run-client-split-large-op-memory-test! nil)
     "apply-client-split-serial" (run-client-split-large-op-memory-test! {:serial? true})
-    "apply-modern-staged" (run-modern-staged-large-op-memory-test! nil)
-    "apply-modern-staged-rollback" (run-modern-staged-large-op-memory-test! {:rollback? true})
-    "apply-modern-staged-reopen" (run-modern-staged-large-op-memory-test! {:reopen? true})
+    "apply-modern-staged" (run-modern-staged-memory-test! false)
+    "apply-modern-staged-rollback" (run-modern-staged-memory-test! true)
     "apply-no-store" (run-large-op-memory-test! {:skip-final-store? true})
     "apply-no-validation" (run-large-op-memory-test! {:skip-validation? true})
     "apply-no-store-validation" (run-large-op-memory-test! {:skip-final-store? true

@@ -147,7 +147,10 @@
       (ws-handler/handle-ws-message! self ws raw))
     (is (= "hello" (:type @sent)))
     (is (number? (:t @sent)))
-    (is (string? (:checksum @sent)))))
+    (is (string? (:checksum @sent)))
+    (is (= ["tx-upload-staged-v1"]
+           (:capabilities @sent))
+        "new-server WS hello advertises the staged upload capability")))
 
 (deftest hello-message-omits-nil-checksum-test
   (let [sql (test-sql/make-sql)
@@ -163,6 +166,9 @@
                              (reset! sent msg))]
       (ws-handler/handle-ws-message! self ws raw))
     (is (= "hello" (:type @sent)))
+    (is (= ["tx-upload-staged-v1"]
+           (:capabilities @sent))
+        "capability advertisement does not depend on graph contents")
     (is (false? (contains? @sent :checksum)))))
 
 (deftest tx-batch-message-adds-graph-and-user-context-to-transact-meta-test
@@ -195,6 +201,9 @@
         (finally
           (d/unlisten! conn ::capture-ws-context-tx-meta))))
     (is (= "tx/batch/ok" (:type @sent)))
+    (is (= ["tx-upload-staged-v1"]
+           (:capabilities @sent))
+        "WS tx responses keep capability discovery available")
     (is (some #(= {:op :apply-client-tx
                    :outliner-op :save-block
                    :graph-id "graph-ws"

@@ -2236,6 +2236,9 @@
       (is (nil? (d/entity @conn [:block/uuid missing-uuid])))
       (let [pull-response (sync-handler/pull-response self 0)]
         (is (= "pull/ok" (:type pull-response)))
+        (is (= ["tx-upload-staged-v1"]
+               (:capabilities pull-response))
+            "HTTP/WS pull responses advertise staged upload capability")
         (is (empty? (:txs pull-response)))))))
 
 (deftest tx-batch-adds-request-context-to-transact-meta-test
@@ -4877,8 +4880,10 @@
             (finally
               (set! (.-exec sql) original-exec))))))))
 
-(deftest selfhost-one-through-four-no-tx-id-batches-remain-compatible-test
-  (doseq [client-revision ["2.0.1-selfhost.1" "2.0.1-selfhost.4"]]
+(deftest selfhost-one-four-and-five-no-tx-id-batches-remain-compatible-test
+  (doseq [client-revision ["2.0.1-selfhost.1"
+                           "2.0.1-selfhost.4"
+                           "2.0.1-selfhost.5"]]
     (testing (str client-revision " may use the original no-tx-id tx/batch shape")
       (with-memory-sql
         (fn [sql]
@@ -4896,6 +4901,9 @@
                             0
                             {:client-revision client-revision}))]
             (is (= "tx/batch/ok" (:type response)))
+            (is (= ["tx-upload-staged-v1"]
+                   (:capabilities response))
+                "new server can advertise capability while accepting the old envelope")
             (is (= 1 (:t response)))
             (is (= client-revision
                    (:block/title
@@ -5442,6 +5450,308 @@
           (is (= "tx/batch/ok" (:type final-retry)))
           (is (= (:t response-2) (:t final-retry))
               "an ACK-loss retry of the final chunk does not reapply it"))))))
+
+(defn- modern-session-entries
+  [logical-tx-id outliner-op full-tx-data chunk-size]
+  (let [chunks (if (seq full-tx-data)
+                 (mapv vec (partition-all chunk-size full-tx-data))
+                 [[]])
+        ;; Even a one-chunk or empty logical transaction starts with a
+        ;; nonfinal packet. Completion is a separate final packet.
+        chunks (if (= 1 (count chunks))
+                 [(first chunks) []]
+                 chunks)]
+    (loop [entries []
+           offset 0
+           [chunk & more] chunks]
+      (if chunk
+        (let [final? (empty? more)]
+          (recur
+           (conj entries
+                 (modern-session-entry
+                  {:logical-tx-id logical-tx-id
+                   :full-tx-data full-tx-data
+                   :chunk-tx-data chunk
+                   :chunk-index offset
+                   :chunk-final? final?
+                   :outliner-op outliner-op}))
+           (+ offset (count chunk))
+           more))
+        entries))))
+
+(defn- stage-modern-prefix!
+  [self entries]
+  (let [sql (.-sql ^js self)
+        conn (.-conn ^js self)
+        t-before (storage/get-t sql)
+        checksum-before (storage/get-checksum sql)
+        graph-before (sync-checksum/recompute-server-checksum @conn)]
+    (doseq [entry (butlast entries)]
+      (let [response (apply-identified-entry! self entry)
+            fresh-conn (storage/open-conn sql)]
+        (is (= "tx/batch/ok" (:type response)))
+        (is (= t-before (:t response)))
+        (is (= t-before (storage/get-t sql)))
+        (is (= checksum-before (storage/get-checksum sql)))
+        (is (= graph-before
+               (sync-checksum/recompute-server-checksum @conn)))
+        (is (= graph-before
+               (sync-checksum/recompute-server-checksum @fresh-conn)))))
+    {:t t-before
+     :checksum checksum-before
+     :graph-checksum graph-before}))
+
+(deftest modern-staged-save-sanitizes-once-like-unsplit-transaction-test
+  (testing "migration attrs, ignored KV rows, and add/retract conflicts match unsplit sanitize semantics"
+    (with-memory-sql
+      (fn [ordinary-sql]
+        (with-memory-sql
+          (fn [modern-sql]
+            (storage/init-schema! ordinary-sql)
+            (storage/init-schema! modern-sql)
+            (let [ordinary-conn (storage/open-conn ordinary-sql)
+                  modern-conn (storage/open-conn modern-sql)
+                  block-uuid (random-uuid)
+                  seed [{:block/uuid block-uuid
+                         :block/name "modern-sanitize-equivalence"
+                         :block/title "ciphertext-old"
+                         :block/updated-at 7}
+                        {:db/ident :logseq.kv/graph-backup-folder
+                         :logseq.kv/value "/original-backup"}]
+                  _ (d/transact! ordinary-conn seed)
+                  _ (d/transact! modern-conn seed)
+                  tx-data [[:db/retract [:block/uuid block-uuid]
+                            :block/title "ciphertext-old"]
+                           [:db/add [:block/uuid block-uuid]
+                            :block/title "ciphertext-new"]
+                           [:db/add [:block/uuid block-uuid]
+                            :block/pre-block? true]
+                           [:db/add [:block/uuid block-uuid]
+                            :block/updated-at 7]
+                           [:db/add :logseq.kv/graph-backup-folder
+                            :logseq.kv/value "/must-be-ignored"]
+                           {:db/id "ignored-kv-temp"
+                            :db/ident :logseq.kv/graph-backup-folder
+                            :logseq.kv/value "/also-ignored"}
+                           [:db/retractEntity "ignored-kv-temp"]]
+                  ordinary-self #js {:sql ordinary-sql
+                                     :conn ordinary-conn
+                                     :schema-ready true}
+                  modern-self #js {:sql modern-sql
+                                   :conn modern-conn
+                                   :schema-ready true}
+                  ordinary-response
+                  (with-redefs [ws/broadcast! (fn [& _] nil)]
+                    (sync-handler/handle-tx-batch!
+                     ordinary-self nil
+                     [(ordinary-identified-wire-entry
+                       {:tx-id (random-uuid)
+                        :tx-data tx-data
+                        :outliner-op :save-block})]
+                     (storage/get-t ordinary-sql)))
+                  entries (modern-session-entries
+                           (random-uuid) :save-block tx-data 2)
+                  _ (stage-modern-prefix! modern-self entries)
+                  final-response (apply-identified-entry!
+                                  modern-self (last entries))]
+              (is (= "tx/batch/ok" (:type ordinary-response)))
+              (is (= "tx/batch/ok" (:type final-response)))
+              (is (= (sync-checksum/recompute-server-checksum @ordinary-conn)
+                     (sync-checksum/recompute-server-checksum @modern-conn))
+                  "modern assembly must sanitize the full tx exactly once")
+              (let [ordinary-block (d/entity @ordinary-conn
+                                             [:block/uuid block-uuid])
+                    modern-block (d/entity @modern-conn
+                                           [:block/uuid block-uuid])]
+                (is (= "ciphertext-new"
+                       (:block/title ordinary-block)
+                       (:block/title modern-block)))
+                (is (nil? (:block/pre-block? ordinary-block)))
+                (is (nil? (:block/pre-block? modern-block)))
+                (is (= "/original-backup"
+                       (:logseq.kv/value
+                        (d/entity @ordinary-conn
+                                  :logseq.kv/graph-backup-folder))
+                       (:logseq.kv/value
+                        (d/entity @modern-conn
+                                  :logseq.kv/graph-backup-folder))))))))))))
+
+(defn- seed-modern-delete-tree!
+  [conn {:keys [page-uuid parent-uuid child-uuid property-value-uuid]}]
+  (d/transact!
+   conn
+   [{:db/ident :user.property/modern-delete}
+    {:block/uuid page-uuid
+     :block/name "modern-delete-page"
+     :block/title "modern-delete-page"}
+    {:block/uuid parent-uuid
+     :block/title "parent"
+     :block/parent [:block/uuid page-uuid]
+     :block/page [:block/uuid page-uuid]
+     :block/order "a0"
+     :block/updated-at 10}
+    {:block/uuid child-uuid
+     :block/title "child"
+     :block/parent [:block/uuid parent-uuid]
+     :block/page [:block/uuid page-uuid]
+     :block/order "a1"
+     :block/updated-at 10}
+    {:block/uuid property-value-uuid
+     :block/title "generated property value"
+     :block/parent [:block/uuid child-uuid]
+     :block/page [:block/uuid page-uuid]
+     :block/order "a2"
+     :block/updated-at 10
+     :logseq.property/created-from-property :user.property/modern-delete}]))
+
+(deftest modern-staged-delete-expands-live-tree-like-unsplit-transaction-test
+  (testing "redundant updates cannot preserve current descendants or generated property values"
+    (with-memory-sql
+      (fn [ordinary-sql]
+        (with-memory-sql
+          (fn [modern-sql]
+            (storage/init-schema! ordinary-sql)
+            (storage/init-schema! modern-sql)
+            (let [ids {:page-uuid (random-uuid)
+                       :parent-uuid (random-uuid)
+                       :child-uuid (random-uuid)
+                       :property-value-uuid (random-uuid)}
+                  ordinary-conn (storage/open-conn ordinary-sql)
+                  modern-conn (storage/open-conn modern-sql)
+                  _ (seed-modern-delete-tree! ordinary-conn ids)
+                  _ (seed-modern-delete-tree! modern-conn ids)
+                  {:keys [page-uuid parent-uuid child-uuid property-value-uuid]} ids
+                  tx-data [[:db/add [:block/uuid child-uuid]
+                            :block/parent [:block/uuid page-uuid]]
+                           [:db/add [:block/uuid property-value-uuid]
+                            :block/updated-at 11]
+                           [:db/retractEntity [:block/uuid parent-uuid]]]
+                  ordinary-self #js {:sql ordinary-sql
+                                     :conn ordinary-conn
+                                     :schema-ready true}
+                  modern-self #js {:sql modern-sql
+                                   :conn modern-conn
+                                   :schema-ready true}
+                  ordinary-response
+                  (with-redefs [ws/broadcast! (fn [& _] nil)]
+                    (sync-handler/handle-tx-batch!
+                     ordinary-self nil
+                     [(ordinary-identified-wire-entry
+                       {:tx-id (random-uuid)
+                        :tx-data tx-data
+                        :outliner-op :delete-blocks})]
+                     (storage/get-t ordinary-sql)))
+                  entries (modern-session-entries
+                           (random-uuid) :delete-blocks tx-data 1)
+                  _ (stage-modern-prefix! modern-self entries)
+                  final-response (apply-identified-entry!
+                                  modern-self (last entries))]
+              (is (= "tx/batch/ok" (:type ordinary-response)))
+              (is (= "tx/batch/ok" (:type final-response)))
+              (is (= (sync-checksum/recompute-server-checksum @ordinary-conn)
+                     (sync-checksum/recompute-server-checksum @modern-conn)))
+              (doseq [entity-uuid [parent-uuid child-uuid property-value-uuid]]
+                (is (nil? (d/entity @ordinary-conn
+                                    [:block/uuid entity-uuid])))
+                (is (nil? (d/entity @modern-conn
+                                    [:block/uuid entity-uuid])))))))))))
+
+(deftest modern-staged-stale-rebase-and-fix-remain-noop-test
+  (doseq [outliner-op [:rebase :fix]]
+    (testing (str outliner-op " is sanitized as one full logical no-op")
+      (with-memory-sql
+        (fn [sql]
+          (storage/init-schema! sql)
+          (let [conn (storage/open-conn sql)
+                self #js {:sql sql :conn conn :schema-ready true}
+                page-uuid (random-uuid)
+                existing-uuid (random-uuid)
+                missing-uuid (random-uuid)
+                _ (d/transact! conn [{:block/uuid page-uuid
+                                      :block/name "modern-stale-op-page"
+                                      :block/title "modern-stale-op-page"}
+                                     {:block/uuid existing-uuid
+                                      :block/title "existing"
+                                      :block/parent [:block/uuid page-uuid]
+                                      :block/page [:block/uuid page-uuid]
+                                      :block/order "a0"}])
+                tx-data [[:db/retract [:block/uuid missing-uuid]
+                          :block/order "a9" 100]
+                         [:db/add [:block/uuid missing-uuid]
+                          :block/order "a1" 100]]
+                entries (modern-session-entries
+                         (random-uuid) outliner-op tx-data 10)
+                before (stage-modern-prefix! self entries)
+                response (apply-identified-entry! self (last entries))]
+            (is (= "tx/batch/ok" (:type response)))
+            (is (= (:t before) (:t response)))
+            (is (= (:checksum before) (storage/get-checksum sql)))
+            (is (= (:graph-checksum before)
+                   (sync-checksum/recompute-server-checksum @conn)))))))))
+
+(deftest modern-staged-originally-empty-delete-remains-invalid-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            entries (modern-session-entries
+                     (random-uuid) :delete-blocks [] 1)
+            before (stage-modern-prefix! self entries)
+            response (apply-identified-entry! self (last entries))]
+        (is (= "tx/reject" (:type response)))
+        (is (= (:t before) (:t response) (storage/get-t sql)))
+        (is (= (:checksum before) (storage/get-checksum sql)))
+        (is (= (:graph-checksum before)
+               (sync-checksum/recompute-server-checksum @conn)))))))
+
+(deftest modern-staged-final-failure-rolls-back-current-and-fresh-connections-test
+  (doseq [fault-mode [:semantic-failure :tx-log-failure]]
+    (testing (name fault-mode)
+      (with-memory-sql
+        (fn [sql]
+          (storage/init-schema! sql)
+          (let [conn (storage/open-conn sql)
+                self #js {:sql sql :conn conn :schema-ready true}
+                block-uuid (random-uuid)
+                missing-page-uuid (random-uuid)
+                _ (d/transact! conn [{:block/uuid block-uuid
+                                      :block/name "modern-final-rollback"
+                                      :block/title "before"}])
+                tx-data (if (= :semantic-failure fault-mode)
+                          [[:db/add [:block/uuid block-uuid]
+                            :block/title "must-roll-back"]
+                           [:db/add [:block/uuid block-uuid]
+                            :block/page [:block/uuid missing-page-uuid]]]
+                          [[:db/add [:block/uuid block-uuid]
+                            :block/title "must-roll-back"]
+                           [:db/add [:block/uuid block-uuid]
+                            :block/updated-at 99]])
+                entries (modern-session-entries
+                         (random-uuid) :save-block tx-data 1)
+                before (stage-modern-prefix! self entries)
+                response
+                (if (= :tx-log-failure fault-mode)
+                  (with-redefs [storage/append-tx!
+                                (fn [& _]
+                                  (throw (js/Error.
+                                          "injected modern final tx_log failure")))
+                                ws/broadcast! (fn [& _] nil)]
+                    (sync-handler/handle-tx-batch!
+                     self nil [(last entries)] (storage/get-t sql)))
+                  (apply-identified-entry! self (last entries)))
+                fresh-conn (storage/open-conn sql)]
+            (is (= "tx/reject" (:type response)))
+            (is (= (:t before) (:t response) (storage/get-t sql)))
+            (is (= (:checksum before) (storage/get-checksum sql)))
+            (is (= (:graph-checksum before)
+                   (sync-checksum/recompute-server-checksum @conn)
+                   (sync-checksum/recompute-server-checksum @fresh-conn)))
+            (is (= "before"
+                   (:block/title
+                    (d/entity @conn [:block/uuid block-uuid]))
+                   (:block/title
+                    (d/entity @fresh-conn [:block/uuid block-uuid]))))))))))
 
 (deftest snapshot-reset-clears-incomplete-logical-chunk-session-test
   (with-memory-sql
