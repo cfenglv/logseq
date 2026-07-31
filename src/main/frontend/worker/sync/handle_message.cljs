@@ -16,6 +16,7 @@
             [lambdaisland.glogi :as log]
             [logseq.db :as ldb]
             [logseq.db-sync.checksum :as sync-checksum]
+            [logseq.db-sync.protocol :as sync-protocol]
             [promesa.core :as p]))
 
 (defn- fail-fast
@@ -516,6 +517,14 @@
         (not legacy-match?)
         (report-checksum-mismatch! mismatch-data)))))
 
+(defn- upload-progress-wire-tx-id
+  [{:keys [tx-id logical-tx-id upload-session-id chunk-index chunk-final?]}]
+  (or tx-id
+      (when (and logical-tx-id upload-session-id
+                 (some? chunk-index) (some? chunk-final?))
+        (sync-protocol/tx-chunk-id
+         logical-tx-id upload-session-id chunk-index chunk-final?))))
+
 (defn- wire-tx-ids->completed-pending-tx-ids
   "Map acknowledged wire ids back to durable logical pending-row ids. A
   nonfinal staged ACK advances upload progress only; a final ACK completes the
@@ -523,8 +532,10 @@
   [upload-request wire-tx-ids]
   (let [progress-by-wire-id
         (into {}
-              (keep (fn [{:keys [tx-id] :as progress}]
-                      (when tx-id [tx-id progress])))
+              (keep (fn [progress]
+                      (when-let [wire-tx-id
+                                 (upload-progress-wire-tx-id progress)]
+                        [wire-tx-id progress])))
               (:large-upload-progress upload-request))]
     (into []
           (keep (fn [wire-tx-id]
@@ -538,8 +549,8 @@
 
 (defn- wire-tx-id->rejected-pending-tx-id
   [upload-request wire-tx-id]
-  (or (some (fn [{:keys [tx-id large-upload-original-tx-id]}]
-              (when (= wire-tx-id tx-id)
+  (or (some (fn [{:keys [large-upload-original-tx-id] :as progress}]
+              (when (= wire-tx-id (upload-progress-wire-tx-id progress))
                 large-upload-original-tx-id))
             (:large-upload-progress upload-request))
       wire-tx-id))
