@@ -1,6 +1,9 @@
 (ns logseq.db-sync.worker-large-op-memory-test
   (:require ["better-sqlite3" :as sqlite3]
             ["crypto" :as node-crypto]
+            ["fs" :as node-fs]
+            ["os" :as node-os]
+            ["path" :as node-path]
             ["v8" :as node-v8]
             [clojure.string :as string]
             [datascript.core :as d]
@@ -25,23 +28,114 @@
   [^js stmt args]
   (.apply (.-all stmt) stmt (to-array args)))
 
+(defn- sqlite-adapter
+  [^js db]
+  #js {:_db db
+       :exec (fn [sql-str & args]
+               (let [stmt (.prepare db sql-str)]
+                 (if (select-sql? sql-str)
+                   (all-sql stmt args)
+                   (do
+                     (run-sql stmt args)
+                     nil))))
+       :close (fn []
+                (.close db))})
+
 (defn- with-memory-sql
   [f]
   (let [db (new sqlite ":memory:" nil)
-        sql #js {:_db db
-                 :exec (fn [sql-str & args]
-                         (let [stmt (.prepare db sql-str)]
-                           (if (select-sql? sql-str)
-                             (all-sql stmt args)
-                             (do
-                               (run-sql stmt args)
-                               nil))))
-                 :close (fn []
-                          (.close db))}]
+        sql (sqlite-adapter db)]
     (try
       (f sql)
       (finally
         (.close sql)))))
+
+(def ^:private modern-sqlite-cache-kib 4096)
+
+(declare assert!)
+
+(defn- with-bounded-disk-sql
+  "Models attached durable storage without counting an entire :memory: SQLite
+  database as native resident process memory. SQLite cache is explicitly
+  bounded and temporary data is also disk-backed."
+  [f]
+  (let [dir (.mkdtempSync node-fs
+                          (.join node-path (.tmpdir node-os)
+                                 "logseq-modern-staged-"))
+        db-path (.join node-path dir "graph.sqlite")
+        db (new sqlite db-path nil)
+        sql (sqlite-adapter db)]
+    (try
+      (.pragma db "journal_mode = DELETE")
+      (.pragma db "temp_store = FILE")
+      (.pragma db (str "cache_size = -" modern-sqlite-cache-kib))
+      (.pragma db "mmap_size = 0")
+      (assert! (= (- modern-sqlite-cache-kib)
+                  (.pragma db "cache_size" #js {:simple true}))
+               "disk SQLite cache_size must stay explicitly bounded")
+      (assert! (= 1 (.pragma db "temp_store" #js {:simple true}))
+               "SQLite temporary storage must remain disk-backed")
+      (assert! (= 0 (.pragma db "mmap_size" #js {:simple true}))
+               "SQLite mmap must stay disabled for deterministic native memory")
+      (f sql)
+      (finally
+        (.close sql)
+        (.rmSync node-fs dir #js {:recursive true :force true})))))
+
+(defn- memory-sample
+  [phase]
+  (let [usage (.memoryUsage js/process)
+        old-generation-used
+        (->> (.getHeapSpaceStatistics node-v8)
+             array-seq
+             (filter (fn [^js space]
+                       (contains? #{"old_space"
+                                    "large_object_space"
+                                    "shared_space"
+                                    "shared_large_object_space"}
+                                  (.-space_name space))))
+             (map (fn [^js space] (.-space_used_size space)))
+             (reduce + 0))]
+    {:phase phase
+     :rss (.-rss usage)
+     :heap-used (.-heapUsed usage)
+     :heap-total (.-heapTotal usage)
+     :external (.-external usage)
+     :array-buffers (.-arrayBuffers usage)
+     :old-generation-used old-generation-used}))
+
+(defn- observe-memory!
+  [samples phase]
+  (let [sample (memory-sample phase)]
+    (swap! samples conj sample)
+    sample))
+
+(defn- assert-modern-runtime-memory!
+  [samples]
+  (let [samples @samples
+        heap-limit (.-heap_size_limit (.getHeapStatistics node-v8))
+        max-heap-used (apply max (map :heap-used samples))
+        max-old-generation-used
+        (apply max (map :old-generation-used samples))]
+    (assert! (seq samples) "memory phases must be recorded")
+    (assert! (< max-old-generation-used (* 128 1024 1024))
+             (str "observed V8 old generation reached 128 MiB: "
+                  max-old-generation-used))
+    (assert! (< max-heap-used heap-limit)
+             (str "observed V8 heapUsed reached runtime heap limit: " heap-limit))
+    (doseq [sample samples]
+      (assert! (every? number?
+                       (map sample
+                            [:rss :heap-used :heap-total
+                             :external :array-buffers
+                             :old-generation-used]))
+               (str "incomplete memory sample: " (pr-str sample))))
+    ;; RSS is diagnostic only: Node defines it as the whole native process,
+    ;; while the production limit is Cloudflare V8-isolate memory.
+    (js/console.log
+     (str "modern-staged-memory-phases=" (pr-str samples)
+          " heap-limit=" heap-limit
+          " rss-gate=not-applicable-to-node-process"))))
 
 (defn- large-block-insert-tx
   [page-uuid block-count]
@@ -150,12 +244,13 @@
 
 (defn- run-modern-staged-memory-test!
   [rollback?]
-  (with-memory-sql
+  (with-bounded-disk-sql
     (fn [sql]
       (storage/init-schema! sql)
       (let [max-old-space-flag? (some #{"--max-old-space-size=128"}
                                       (array-seq (.-execArgv js/process)))
-            rss-before (.-rss (.memoryUsage js/process))
+            samples (atom [])
+            _ (observe-memory! samples :baseline)
             conn (storage/open-conn sql)
             page-uuid (random-uuid)
             _ (d/transact! conn [{:block/uuid page-uuid
@@ -169,7 +264,8 @@
                      logical-tx-id :insert-blocks tx-data)
             prefix (pop entries)
             final-entry (peek entries)
-            self #js {:sql sql :conn conn :schema-ready true}]
+            self #js {:sql sql :conn conn :schema-ready true}
+            _ (observe-memory! samples :fixture-ready)]
         (assert! max-old-space-flag?
                  "modern staged memory modes require --max-old-space-size=128")
         (assert! (= 14000 (count tx-data))
@@ -182,9 +278,11 @@
                             self nil [entry] t-before))]
             (assert! (= "tx/batch/ok" (:type response))
                      (str "nonfinal modern stage rejected: " (pr-str response)))))
+        (observe-memory! samples :prefix-staged)
         (let [fresh-before (storage/open-conn sql)]
           (assert-modern-invisible!
-           sql conn fresh-before t-before checksum-before block-uuids))
+           sql conn fresh-before t-before checksum-before block-uuids)
+          (observe-memory! samples :prefix-fresh-reopen))
         (if rollback?
           (let [original-append storage/append-tx!
                 response
@@ -205,7 +303,8 @@
             (assert-modern-invisible!
              sql conn fresh-after t-before checksum-before block-uuids)
             (assert! (empty? (storage/fetch-tx-since sql t-before))
-                     "failed final must leave no visible tx log row"))
+                     "failed final must leave no visible tx log row")
+            (observe-memory! samples :rollback-final))
           (let [response (with-redefs [ws/broadcast! (fn [& _] nil)]
                            (sync-handler/handle-tx-batch!
                             self nil [final-entry] t-before))
@@ -228,18 +327,9 @@
                      "stored checksum equals full recomputation")
             (assert! (= (inc t-before)
                         (storage/get-server-checksum-t sql))
-                     "stored checksum cursor follows the one logical commit")))
-        (let [rss-after (.-rss (.memoryUsage js/process))
-              rss-growth (- rss-after rss-before)]
-          (assert! (number? rss-after) "RSS must be observable")
-          (assert! (< rss-growth (* 128 1024 1024))
-                   (str "modern staged RSS growth exceeded 128 MiB: " rss-growth))
-          (js/console.log
-           (str "modern-staged-rss-before=" rss-before
-                " rss-after=" rss-after
-                " rss-growth=" rss-growth
-                " heap-limit="
-                (.-heap_size_limit (.getHeapStatistics node-v8)))))))))
+                     "stored checksum cursor follows the one logical commit")
+            (observe-memory! samples :success-final)))
+        (assert-modern-runtime-memory! samples)))))
 
 (defn- run-large-op-memory-test!
   [{:keys [skip-final-store? skip-validation?]}]
