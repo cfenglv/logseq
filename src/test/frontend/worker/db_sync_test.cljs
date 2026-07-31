@@ -12802,7 +12802,7 @@
   (testing "randomized encryption is performed once per identity, not once per retry"
     (async done
            (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
-                 repo "e2ee-stable-wire-retry-repo"
+                 repo test-repo
                  tx-id (random-uuid)
                  block-uuid (:block/uuid child1)
                  logical-plaintext
@@ -12900,7 +12900,7 @@
 (deftest rebase-after-nonfinal-ack-does-not-use-stale-positional-progress-test
   (testing "a stale ACK cannot advance a rewritten pending transaction's new session"
     (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
-          repo "rewritten-large-upload-progress-repo"
+          repo test-repo
           tx-id (random-uuid)
           block-uuid (:block/uuid child1)
           original-tx

@@ -5256,18 +5256,18 @@
             block-uuid (random-uuid)
             _ (d/transact! conn [{:block/uuid block-uuid
                                   :block/name "session-first-500"
-                                  :block/title "before"}])]
-        (let [full-tx [[:db/add [:block/uuid block-uuid]
-                        :block/title "bad-500"]]]
-          (assert-rejected-without-graph-change!
-           self conn
-           (modern-session-entry
-            {:logical-tx-id (random-uuid)
-             :full-tx-data full-tx
-             :chunk-tx-data full-tx
-             :chunk-index 500
-             :chunk-final? false})
-           block-uuid "before"))))))
+                                  :block/title "before"}])
+            full-tx [[:db/add [:block/uuid block-uuid]
+                      :block/title "bad-500"]]]
+        (assert-rejected-without-graph-change!
+         self conn
+         (modern-session-entry
+          {:logical-tx-id (random-uuid)
+           :full-tx-data full-tx
+           :chunk-tx-data full-tx
+           :chunk-index 500
+           :chunk-final? false})
+         block-uuid "before")))))
 
 (deftest logical-chunk-session-rejects-index-gap-test
   (with-memory-sql
@@ -5314,18 +5314,18 @@
             block-uuid (random-uuid)
             _ (d/transact! conn [{:block/uuid block-uuid
                                   :block/name "session-final-first"
-                                  :block/title "before"}])]
-        (let [full-tx [[:db/add [:block/uuid block-uuid]
-                        :block/title "bad-final-first"]]]
-          (assert-rejected-without-graph-change!
-           self conn
-           (modern-session-entry
-            {:logical-tx-id (random-uuid)
-             :full-tx-data full-tx
-             :chunk-tx-data full-tx
-             :chunk-index 0
-             :chunk-final? true})
-           block-uuid "before"))))))
+                                  :block/title "before"}])
+            full-tx [[:db/add [:block/uuid block-uuid]
+                      :block/title "bad-final-first"]]]
+        (assert-rejected-without-graph-change!
+         self conn
+         (modern-session-entry
+          {:logical-tx-id (random-uuid)
+           :full-tx-data full-tx
+           :chunk-tx-data full-tx
+           :chunk-index 0
+           :chunk-final? true})
+         block-uuid "before")))))
 
 (deftest logical-chunk-session-rejects-second-final-and-post-completion-chunk-test
   (doseq [post-entry-final? [true false]]
