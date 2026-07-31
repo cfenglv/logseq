@@ -121,7 +121,9 @@
               @sync-apply/*repo->latest-remote-checksum-version})
      (reset! sync-apply/*repo->latest-remote-tx {})
      (reset! sync-apply/*repo->latest-remote-checksum {})
-     (reset! sync-apply/*repo->latest-remote-checksum-version {}))
+     (reset! sync-apply/*repo->latest-remote-checksum-version {})
+     (sync-apply/set-server-capabilities!
+      test-repo ["tx-upload-staged-v1"]))
    :after
    (fn []
      (let [{:keys [latest-remote-tx
@@ -132,6 +134,7 @@
        (reset! sync-apply/*repo->latest-remote-checksum latest-remote-checksum)
        (reset! sync-apply/*repo->latest-remote-checksum-version
                latest-remote-checksum-version)
+       (sync-apply/set-server-capabilities! test-repo [])
        (reset! *db-sync-remote-state nil)))})
 
 (use-fixtures :once (test-noise/mute-console-fixture ::db-sync-test))
@@ -12730,6 +12733,8 @@
           pending [{:tx-id logical-tx-id
                     :tx tx-data
                     :outliner-op :save-block}]
+          _ (sync-apply/set-server-capabilities!
+             repo ["tx-upload-staged-v1"])
           first-entry (-> (sync-apply/prepare-upload-tx-entries
                            repo conn pending)
                           :tx-entries first)
@@ -12771,6 +12776,8 @@
                     [{:tx-id logical-tx-id
                       :tx tx-data
                       :outliner-op :save-block}])]
+      (sync-apply/set-server-capabilities!
+       repo ["tx-upload-staged-v1"])
       (try
         (let [first-entry (-> (sync-apply/prepare-upload-tx-entries
                                repo conn (pending base-tx))
@@ -13005,3 +13012,85 @@
               (sync-apply/mark-pending-txs-false! repo [tx-id])
               (is (empty? (#'sync-apply/pending-txs repo))
                   "final ACK clears the rewritten pending operation"))))))))
+
+(deftest modern-large-upload-cold-restart-restores-progress-and-exact-final-wire-test
+  (testing "client-ops SQLite owns generation, progress, and randomized wire until pending clears"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          repo test-repo
+          tx-id (random-uuid)
+          block-uuid (:block/uuid child1)
+          logical-tx (mapv (fn [idx]
+                             [:db/add [:block/uuid block-uuid]
+                              :block/title (str "restart-logical-" idx)])
+                           (range 5001))
+          pending {:tx-id tx-id :tx logical-tx :outliner-op :save-block}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           repo
+           [{:db-sync/tx-id tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op :save-block
+             :db-sync/normalized-tx-data logical-tx}])
+          (let [first-entry (-> (sync-apply/prepare-upload-tx-entries
+                                 repo conn [pending]) :tx-entries first)
+                first-wire {:tx-data [[:db/add [:block/uuid block-uuid]
+                                       :block/title "cipher-first"]]
+                            :large-title-logical-tx-data (:tx-data first-entry)}]
+            (#'sync-apply/cache-large-upload-wire-entry!
+             repo tx-id (:upload-session-id first-entry)
+             (:chunk-index first-entry) false first-wire)
+            (#'sync-apply/commit-large-upload-progress! repo [first-entry])
+            ;; Model a worker process restart: only the in-memory cache is lost.
+            (reset! @#'sync-apply/*repo->large-upload-sessions {})
+            (let [final-entry (-> (sync-apply/prepare-upload-tx-entries
+                                   repo conn [pending]) :tx-entries first)
+                  final-wire {:tx-data [[:db/add [:block/uuid block-uuid]
+                                         :block/title "random-cipher-final"]]
+                              :large-title-logical-tx-data (:tx-data final-entry)}]
+              (is (true? (:chunk-final? final-entry)))
+              (#'sync-apply/cache-large-upload-wire-entry!
+               repo tx-id (:upload-session-id final-entry)
+               (:chunk-index final-entry) true final-wire)
+              (reset! @#'sync-apply/*repo->large-upload-sessions {})
+              (let [rewritten (assoc logical-tx 0
+                                     [:db/add [:block/uuid block-uuid]
+                                      :block/title "rebased-after-lost-final-ack"])
+                    retry (-> (sync-apply/prepare-upload-tx-entries
+                               repo conn [(assoc pending :tx rewritten)])
+                              :tx-entries first)
+                    restored-wire
+                    (#'sync-apply/large-upload-wire-cache-entry
+                     repo tx-id (:upload-session-id retry) (:chunk-index retry))]
+                (is (= (:upload-session-id final-entry)
+                       (:upload-session-id retry)))
+                (is (= (:chunk-index final-entry) (:chunk-index retry)))
+                (is (true? (:chunk-final? retry)))
+                (is (= final-wire restored-wire)
+                    "lost-final-ACK restart must reuse exact randomized bytes")
+                (sync-apply/mark-pending-txs-false! repo [tx-id])
+                (is (nil? (client-op/get-client-tx-upload-state repo tx-id))
+                    "pending clear and upload-state deletion share one SQLite tx")))))))))
+
+(deftest old-server-capability-gate-never-builds-modern-envelope-test
+  (let [{:keys [conn child1]} (setup-parent-child)
+        repo "old-server-no-modern-capability"
+        tx-id (random-uuid)
+        tx-data (mapv (fn [idx]
+                        [:db/add [:block/uuid (:block/uuid child1)]
+                         :block/title (str "old-server-safe-" idx)])
+                      (range 5001))
+        error (try
+                (sync-apply/set-server-capabilities! repo [])
+                (sync-apply/prepare-upload-tx-entries
+                 repo conn [{:tx-id tx-id
+                             :tx tx-data
+                             :outliner-op :save-block}])
+                nil
+                (catch :default e e))]
+    (is (= :db-sync/staged-tx-upload-unsupported
+           (:type (ex-data error))))
+    (is (nil? (client-op/get-client-tx-upload-state repo tx-id))
+        "capability failure occurs before session creation or server send")))

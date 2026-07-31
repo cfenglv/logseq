@@ -58,6 +58,7 @@
   [:map
    [:type [:= "tx/reject"]]
    [:reason tx-reject-reason-schema]
+   [:capabilities {:optional true} [:sequential :string]]
    [:t {:optional true} :int]
    [:success-tx-ids {:optional true} [:sequential :uuid]]
    [:failed-tx-id {:optional true} :uuid]
@@ -84,6 +85,7 @@
   [:map
    [:type [:= "pull/ok"]]
    [:t :int]
+   [:capabilities {:optional true} [:sequential :string]]
    [:checksum {:optional true} :string]
    [:checksum-version {:optional true} :string]
    [:server-checksum {:optional true} :string]
@@ -93,6 +95,7 @@
   [:map
    [:type [:= "tx/batch/ok"]]
    [:t :int]
+   [:capabilities {:optional true} [:sequential :string]]
    [:checksum {:optional true} :string]
    [:checksum-version {:optional true} :string]
    [:server-checksum {:optional true} :string]])
@@ -103,6 +106,7 @@
     [:map
      [:type [:= "hello"]]
      [:t :int]
+     [:capabilities {:optional true} [:sequential :string]]
      [:checksum {:optional true} :string]
      [:checksum-version {:optional true} :string]
      [:server-checksum {:optional true} :string]]]

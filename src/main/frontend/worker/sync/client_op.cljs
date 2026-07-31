@@ -38,7 +38,7 @@
 
 (defonce *repo->pending-local-tx-count (atom {}))
 
-(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v2")
+(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v3")
 (def ^:private sqlite-mode-key "__logseq_client_ops_sqlite_mode")
 (def ^:private sync-meta-table-sql
   "create table if not exists sync_meta (key text primary key, value text)")
@@ -78,6 +78,12 @@
        ")"))
 (def ^:private sync-conflicts-block-index-sql
   "create index if not exists idx_sync_conflicts_block_uuid on sync_conflicts(block_uuid, created_at)")
+(def ^:private client-tx-upload-state-table-sql
+  (str "create table if not exists client_tx_upload_state ("
+       "logical_tx_id text primary key,"
+       "session_data text not null,"
+       "updated_at integer not null"
+       ")"))
 
 (defn- client-ops-store
   [repo]
@@ -243,6 +249,7 @@
        (fn [tx]
          (sqlite-run! tx sync-meta-table-sql [])
          (sqlite-run! tx client-ops-table-sql [])
+         (sqlite-run! tx client-tx-upload-state-table-sql [])
          (sqlite-run! tx sync-conflicts-table-sql [])
          (sqlite-run! tx pending-index-sql [])
          (sqlite-run! tx asset-index-sql [])
@@ -251,6 +258,35 @@
         (gobj/set db sqlite-schema-ready-key true)
         (catch :default _
           nil)))))
+
+(defn get-client-tx-upload-state
+  [repo logical-tx-id]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (some-> (sqlite-row store
+                        "select session_data from client_tx_upload_state where logical_tx_id = ?"
+                        [(str logical-tx-id)])
+            (aget "session_data")
+            sqlite-util/read-transit-str)))
+
+(defn put-client-tx-upload-state!
+  [repo logical-tx-id session]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-run! store
+                 (str "insert into client_tx_upload_state "
+                      "(logical_tx_id, session_data, updated_at) values (?, ?, ?) "
+                      "on conflict(logical_tx_id) do update set "
+                      "session_data = excluded.session_data, updated_at = excluded.updated_at")
+                 [(str logical-tx-id)
+                  (sqlite-util/write-transit-str session)
+                  (.now js/Date)]))
+  session)
+
+(defn delete-client-tx-upload-state!
+  [repo logical-tx-id]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-run! store
+                 "delete from client_tx_upload_state where logical_tx_id = ?"
+                 [(str logical-tx-id)])))
 
 (defn- sqlite-get-meta
   [db k]
@@ -581,10 +617,16 @@
                                            (pending-tx-id? store tx-id)))
                                  count)]
       (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
+        (sqlite-with-tx!
+         store
+         (fn [tx]
+           (doseq [tx-id tx-ids]
+             (sqlite-run! tx
+                          "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?"
+                          [(str tx-id)])
+             (sqlite-run! tx
+                          "delete from client_tx_upload_state where logical_tx_id = ?"
+                          [(str tx-id)])))))
       pending-to-remove)))
 
 (defn mark-failed-txs!
@@ -596,10 +638,16 @@
                                            (pending-tx-id? store tx-id)))
                                  count)]
       (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
+        (sqlite-with-tx!
+         store
+         (fn [tx]
+           (doseq [tx-id tx-ids]
+             (sqlite-run! tx
+                          "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
+                          [(str tx-id)])
+             (sqlite-run! tx
+                          "delete from client_tx_upload_state where logical_tx_id = ?"
+                          [(str tx-id)])))))
       pending-to-remove)))
 
 (defn history-action-ops-by-tx-id

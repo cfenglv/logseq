@@ -51,6 +51,16 @@
 (def ^:private upload-response-timeout-ms (* 2 60 1000))
 (def ^:private max-upload-request-datoms 5000)
 (defonce ^:private *repo->large-upload-sessions (atom {}))
+(defonce ^:private *repo->server-capabilities (atom {}))
+
+(defn set-server-capabilities!
+  [repo capabilities]
+  (swap! *repo->server-capabilities assoc repo (set capabilities)))
+
+(defn- staged-tx-upload-supported?
+  [repo]
+  (contains? (get @*repo->server-capabilities repo #{})
+             "tx-upload-staged-v1"))
 
 (defn set-upload-stopped!
   [repo stopped?]
@@ -382,8 +392,12 @@
             entries
             (filterv #(contains? accepted? (get % id-key)) entries)))
         upload-progress
-        (select-entry :large-upload-original-tx-id
-                      (:large-upload-progress request))
+        (if (nil? accepted?)
+          (:large-upload-progress request)
+          (filterv (fn [{:keys [tx-id large-upload-original-tx-id]}]
+                     (or (contains? accepted? tx-id)
+                         (contains? accepted? large-upload-original-tx-id)))
+                   (:large-upload-progress request)))
         marker-entries
         (select-entry :tx-id (:large-title-marker-tx-entries request))
         conn (worker-state/get-datascript-conn repo)
@@ -877,6 +891,22 @@
   [repo tx-id]
   [repo tx-id])
 
+(defn- large-upload-session
+  [repo logical-tx-id]
+  (let [session-key (large-upload-progress-key repo logical-tx-id)]
+    (or (get @*repo->large-upload-sessions session-key)
+        (when-let [session (client-op/get-client-tx-upload-state
+                            repo logical-tx-id)]
+          (swap! *repo->large-upload-sessions assoc session-key session)
+          session))))
+
+(defn- persist-large-upload-session!
+  [repo logical-tx-id session]
+  (swap! *repo->large-upload-sessions
+         assoc (large-upload-progress-key repo logical-tx-id) session)
+  (client-op/put-client-tx-upload-state! repo logical-tx-id session)
+  session)
+
 (defn- clear-large-upload-progress!
   [repo tx-ids]
   (let [progress-keys (->> tx-ids
@@ -919,19 +949,18 @@
 
 (defn- large-upload-wire-cache-entry
   [repo logical-tx-id session-id chunk-index]
-  (let [session (get @*repo->large-upload-sessions
-                     (large-upload-progress-key repo logical-tx-id))]
+  (let [session (large-upload-session repo logical-tx-id)]
     (when (= session-id (:session-id session))
       (get-in session [:wire-cache chunk-index]))))
 
 (defn- cache-large-upload-wire-entry!
-  [repo logical-tx-id session-id chunk-index wire-entry]
-  (let [session-key (large-upload-progress-key repo logical-tx-id)]
-    (swap! *repo->large-upload-sessions
-           (fn [sessions]
-             (if (= session-id (get-in sessions [session-key :session-id]))
-               (assoc-in sessions [session-key :wire-cache chunk-index] wire-entry)
-               sessions)))))
+  [repo logical-tx-id session-id chunk-index final? wire-entry]
+  (when-let [session (large-upload-session repo logical-tx-id)]
+    (when (= session-id (:session-id session))
+      (persist-large-upload-session!
+       repo logical-tx-id
+       (cond-> (assoc-in session [:wire-cache chunk-index] wire-entry)
+         final? (assoc :final-wire-frozen? true))))))
 
 (defn- large-upload-marker-source-entries
   "Nonfinal chunks are only staged server-side, so their local large-title
@@ -950,8 +979,7 @@
              []
 
              :else
-             (let [session (get @*repo->large-upload-sessions
-                                (large-upload-progress-key repo logical-tx-id))]
+             (let [session (large-upload-session repo logical-tx-id)]
                (when-not (= upload-session-id (:session-id session))
                  (fail-fast :db-sync/large-upload-session-replaced
                             {:logical-tx-id logical-tx-id}))
@@ -965,15 +993,14 @@
 
 (defn- large-upload-request-entry
   [repo db {:keys [tx-id tx-data outliner-op] :as entry}]
-  (let [session-key (large-upload-progress-key repo tx-id)
-        source-digest (sync-protocol/tx-upload-session-id
+  (let [source-digest (sync-protocol/tx-upload-session-id
                        tx-id outliner-op tx-data)
-        existing (get @*repo->large-upload-sessions session-key)
-        session (if (= source-digest (:source-digest existing))
+        existing (large-upload-session repo tx-id)
+        session (if (or (= source-digest (:source-digest existing))
+                        (:final-wire-frozen? existing))
                   existing
                   (let [replacement (new-large-upload-session db entry)]
-                    (swap! *repo->large-upload-sessions assoc session-key replacement)
-                    replacement))
+                    (persist-large-upload-session! repo tx-id replacement)))
         tx-data (:tx-data session)
         total (count tx-data)
         requested-start (:next-index session)
@@ -1014,7 +1041,17 @@
             next-datom-count (+ datom-count entry-datom-count)]
         (cond
           (and (empty? result) (> entry-datom-count max-upload-request-datoms))
-          [(large-upload-request-entry repo db entry)]
+          (if (staged-tx-upload-supported? repo)
+            [(large-upload-request-entry repo db entry)]
+            ;; An old server would apply an additive modern chunk as an
+            ;; ordinary tx. Fail before building/sending any envelope so the
+            ;; logical pending row remains available for a server-first
+            ;; upgrade.
+            (fail-fast :db-sync/staged-tx-upload-unsupported
+                       {:type :db-sync/staged-tx-upload-unsupported
+                        :repo repo
+                        :tx-id (:tx-id entry)
+                        :datom-count entry-datom-count}))
 
           (> next-datom-count max-upload-request-datoms)
           result
@@ -1074,27 +1111,29 @@
                   large-upload-final?]} tx-entries]
     (when large-upload-original-tx-id
       (let [progress-key (large-upload-progress-key repo large-upload-original-tx-id)]
-        (swap! *repo->large-upload-sessions
-               (fn [sessions]
-                 (if (= upload-session-id
-                        (get-in sessions [progress-key :session-id]))
-                   (if large-upload-final?
-                     (dissoc sessions progress-key)
-                     (assoc-in sessions [progress-key :next-index]
-                               large-upload-next-index))
-                   ;; A rebase may have started a new content-addressed
-                   ;; generation while an old ACK was in flight.
-                   sessions)))))))
+        (when-let [session (large-upload-session
+                            repo large-upload-original-tx-id)]
+          (when (= upload-session-id (:session-id session))
+            (if large-upload-final?
+              ;; Keep the durable final wire until the pending row is cleared
+              ;; in the same SQLite transaction. A crash after server commit
+              ;; but before ACK processing can then resend identical bytes.
+              (swap! *repo->large-upload-sessions dissoc progress-key)
+              (persist-large-upload-session!
+               repo large-upload-original-tx-id
+               (assoc session :next-index large-upload-next-index)))))))))
 
 (defn- large-upload-progress
   [tx-entries]
   (->> tx-entries
        (keep (fn [{:keys [large-upload-original-tx-id
+                          tx-id
                           upload-session-id
                           large-upload-next-index
                           large-upload-final?]}]
                (when large-upload-original-tx-id
                  {:large-upload-original-tx-id large-upload-original-tx-id
+                  :tx-id tx-id
                   :upload-session-id upload-session-id
                   :large-upload-next-index large-upload-next-index
                   :large-upload-final? large-upload-final?})))
@@ -1306,7 +1345,7 @@
                                 (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
                             tx-entries* (p/all
                                          (mapv (fn [{:keys [logical-tx-id upload-session-id
-                                                           chunk-index tx-data]
+                                                           chunk-index chunk-final? tx-data]
                                                     :as tx-entry}]
                                                  (if-let [cached
                                                           (when logical-tx-id
@@ -1328,7 +1367,7 @@
                                                      (when logical-tx-id
                                                        (cache-large-upload-wire-entry!
                                                         repo logical-tx-id upload-session-id
-                                                        chunk-index wire-entry))
+                                                        chunk-index chunk-final? wire-entry))
                                                      (merge tx-entry wire-entry))))
                                                tx-entries))
                             payload (mapv (fn [{:keys [tx-id logical-tx-id upload-session-id

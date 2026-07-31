@@ -520,12 +520,16 @@
   ([^js _self stream reset? import-f]
    (import-snapshot-stream-with! stream reset? import-f)))
 
+(def server-capabilities
+  ["tx-upload-staged-v1"])
+
 (defn pull-response [^js self since]
   (let [sql (.-sql self)
         txs (storage/fetch-tx-since sql since)]
     (merge {:type "pull/ok"
             :t (t-now self)
-            :txs txs}
+            :txs txs
+            :capabilities server-capabilities}
            (checksum-response-fields self))))
 
 (defn- block-uuid-lookup-ref
@@ -1046,6 +1050,8 @@
       :else
       existing)))
 
+(declare apply-tx-entry!)
+
 (defn- apply-upload-chunk!
   [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-final?
                      outliner-op tx] :as tx-entry}
@@ -1103,16 +1109,23 @@
                             outliner-op true full-tx-data)
                            apply-entry (-> tx-entry
                                            (assoc :tx-id logical-tx-id
-                                                  :tx (protocol/tx->transit full-tx-data))
-                                           (dissoc ::identity ::upload?))]
-                       (apply-large-tx-entry!
-                        self conn full-tx-data apply-entry request-context)
-                       (storage/record-applied-client-tx!
-                        sql (str "upload/" logical-tx-id) completed-digest)
-                       (storage/complete-client-tx-upload!
-                        sql logical-tx-id upload-session-id chunk-index
-                        wire-digest completed-digest)
-                       true)))))))))
+                                                  :tx (protocol/tx->transit full-tx-data)
+                                                  ::identity (str "upload/" logical-tx-id)
+                                                  ::payload-digest completed-digest)
+                                           (dissoc ::upload?))]
+                       ;; Final assembly must enter exactly the same sanitize,
+                       ;; no-op, stale rebase/fix, delete, migration, and large
+                       ;; transaction path as an ordinary tx entry. The outer
+                       ;; SQL transaction includes both staged rows and graph
+                       ;; mutation, so any sanitize/apply failure rolls back all
+                       ;; final-chunk effects atomically.
+                       #_{:clj-kondo/ignore [:redundant-let]}
+                       (let [applied? (apply-tx-entry!
+                                       self conn apply-entry request-context)]
+                         (storage/complete-client-tx-upload!
+                          sql logical-tx-id upload-session-id chunk-index
+                          wire-digest completed-digest)
+                         applied?))))))))))
       (catch :default error
         (reset! conn db-before)
         (throw error)))))
@@ -1275,7 +1288,8 @@
                  ;; Broadcast once per processed batch after tx-log/checksum settle.
                  (ws/broadcast! self sender {:type "changed" :t t}))
                (merge {:type "tx/batch/ok"
-                       :t t}
+                       :t t
+                       :capabilities server-capabilities}
                       (checksum-response-fields self))))
            (catch :default e
              (let [new-t (t-now self)
@@ -1295,7 +1309,8 @@
                 (cond-> {:type "tx/reject"
                          :reason "db transact failed"
                          :error-detail error-detail
-                         :t new-t}
+                         :t new-t
+                         :capabilities server-capabilities}
                   (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
                   failed-tx-id (assoc :failed-tx-id failed-tx-id)
                   (seq missing-block-uuids) (assoc :missing-block-uuids missing-block-uuids))

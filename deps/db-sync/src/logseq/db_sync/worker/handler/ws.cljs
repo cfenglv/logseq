@@ -57,7 +57,8 @@
                 (case (:type message)
         "hello"
         (ws/send! ws (merge {:type "hello"
-                             :t (sync-handler/t-now self)}
+                             :t (sync-handler/t-now self)
+                             :capabilities sync-handler/server-capabilities}
                             (sync-handler/checksum-response-fields self)))
 
         "ping"

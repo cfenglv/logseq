@@ -557,8 +557,15 @@
             successful-tx-ids (->> (or success-tx-ids [])
                                    (filter inflight-set)
                                    vec)
-            failed-tx-id (when (and failed-tx-id (contains? inflight-set failed-tx-id))
-                           failed-tx-id)
+            failed-wire-tx-id
+            (when (and failed-tx-id (contains? inflight-set failed-tx-id))
+              failed-tx-id)
+            failed-tx-id
+            (or (some (fn [{:keys [tx-id large-upload-original-tx-id]}]
+                        (when (= failed-wire-tx-id tx-id)
+                          large-upload-original-tx-id))
+                      (:large-upload-progress upload-request))
+                failed-wire-tx-id)
             partial-success? (and (seq successful-tx-ids)
                                   (number? remote-tx))
             next-local-tx (when partial-success?
@@ -638,7 +645,8 @@
              :pending-txs-count (count (sync-apply/pending-txs repo {:limit 50}))}))
 
 (defn- handle-hello!
-  [repo client local-tx remote-tx checksum-fields]
+  [repo client local-tx remote-tx checksum-fields capabilities]
+  (sync-apply/set-server-capabilities! repo capabilities)
   (require-non-negative remote-tx {:repo repo :type "hello"})
   (when (< remote-tx local-tx)
     (fail-fast :db-sync/server-cursor-regressed
@@ -791,7 +799,8 @@
       (validate-local-tx! repo message local-tx)
       (update-latest-remote-state! repo message)
       (case (:type message)
-        "hello" (handle-hello! repo client local-tx remote-tx checksum-fields)
+        "hello" (handle-hello! repo client local-tx remote-tx checksum-fields
+                                (:capabilities message))
         "online-users" (handle-online-users! repo client message)
         "presence" (handle-presence! client message)
         "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx checksum-fields)
