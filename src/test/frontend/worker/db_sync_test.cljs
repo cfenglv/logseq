@@ -12751,3 +12751,146 @@
                  (:upload-session-id after-stale-ack))))
         (finally
           (#'sync-apply/clear-large-upload-progress! repo [logical-tx-id]))))))
++
+(deftest e2ee-ack-loss-retry-reuses-identical-wire-payload-test
+  (testing "randomized encryption is performed once per identity, not once per retry"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 repo "e2ee-stable-wire-retry-repo"
+                 tx-id (random-uuid)
+                 encrypt-call (atom 0)
+                 sent (atom [])
+                 client {:repo repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :last-sync-error (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send"
+                                     (fn [raw]
+                                       (swap! sent conj
+                                              (js->clj (js/JSON.parse raw)
+                                                       :keywordize-keys true)))))}
+                 previous-remote @sync-apply/*repo->latest-remote-tx]
+             (-> (with-datascript-conns
+                   conn client-ops-conn
+                   (fn []
+                     (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                     (client-op/update-local-tx repo 0)
+                     (seed-client-op-txs!
+                      repo
+                      [{:db-sync/tx-id tx-id
+                        :db-sync/pending? true
+                        :db-sync/created-at 1
+                        :db-sync/outliner-op :save-block
+                        :db-sync/normalized-tx-data
+                        [[:db/add [:block/uuid (:block/uuid child1)]
+                          :block/title "logical plaintext"]]}])
+                     (p/with-redefs
+                       [worker-state/online? (constantly true)
+                        sync-crypt/graph-e2ee? (constantly true)
+                        sync-crypt/<ensure-graph-aes-key
+                        (fn [& _] (p/resolved #js {:test-key true}))
+                        sync-crypt/<encrypt-tx-data
+                        (fn [_key _tx-data]
+                          (let [nonce (swap! encrypt-call inc)]
+                            (p/resolved
+                             [[:db/add [:block/uuid (:block/uuid child1)]
+                               :block/title (str "ciphertext-nonce-" nonce)]])))]
+                       (p/let [_ (#'sync-apply/flush-pending! repo client)
+                               first-wire (first @sent)
+                               _ (do
+                                   (sync-apply/clear-upload-response-timeout! client)
+                                   (reset! (:inflight client) []))
+                               _ (#'sync-apply/flush-pending! repo client)
+                               second-wire (second @sent)
+                               first-entry (first (:txs first-wire))
+                               second-entry (first (:txs second-wire))]
+                         (is (= 2 (count @sent)))
+                         (is (string? (:payload-digest first-entry))
+                             "identified E2EE wire entries carry a server-verifiable digest")
+                         (is (= (:payload-digest first-entry)
+                                (:payload-digest second-entry)))
+                         (is (= (:tx first-entry) (:tx second-entry))
+                             "ACK-loss retry must reuse identical ciphertext bytes")
+                         (is (= (:outliner-op first-entry)
+                                (:outliner-op second-entry)))))))
+                 (p/catch (fn [error]
+                            (is false (str error))))
+                 (p/finally
+                  (fn []
+                    (sync-apply/clear-upload-response-timeout! client)
+                    (reset! sync-apply/*repo->latest-remote-tx previous-remote)
+                    (#'sync-apply/set-upload-stopped! repo false)
+                    (done))))))))
+
+(deftest rebase-after-nonfinal-ack-does-not-use-stale-positional-progress-test
+  (testing "a rewritten pending tx cannot skip a datom inserted before the old chunk cursor"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          repo "rewritten-large-upload-progress-repo"
+          tx-id (random-uuid)
+          block-uuid (:block/uuid child1)
+          original-tx
+          (mapv (fn [idx]
+                  [:db/add [:block/uuid block-uuid]
+                   :block/title (str "original-" idx)])
+                (range 5001))
+          pending {:tx-id tx-id
+                   :tx original-tx
+                   :outliner-op :save-block}
+          first-entry
+          (-> (sync-apply/prepare-upload-tx-entries repo conn [pending])
+              :tx-entries first)
+          progress (select-keys first-entry
+                                [:large-upload-original-tx-id
+                                 :large-upload-next-index
+                                 :large-upload-final?])
+          server-after-first (d/conn-from-db @conn)
+          _ (d/transact! server-after-first (:tx-data first-entry))
+          remote-tx [[:db/add [:block/uuid block-uuid]
+                      :block/updated-at 42]]
+          _ (d/transact! server-after-first remote-tx)
+          expected-server (d/conn-from-db @server-after-first)
+          required-rebased-datom
+          [:db/add [:block/uuid block-uuid] :block/updated-at 999999]
+          rewritten-tx (into [required-rebased-datom] original-tx)
+          rewritten-pending {:tx-id tx-id
+                             :tx rewritten-tx
+                             :outliner-op :rebase}]
+      (is (false? (:large-upload-final? first-entry)))
+      (sync-apply/commit-upload-response!
+       repo {:large-upload-progress [progress]} nil)
+      (let [next-entry
+            (-> (sync-apply/prepare-upload-tx-entries
+                 repo conn [rewritten-pending])
+                :tx-entries first)]
+        (is (some #(= required-rebased-datom %) (:tx-data next-entry))
+            "progress must be content/session based, not an old vector offset")
+        (d/transact! expected-server rewritten-tx)
+        (d/transact! server-after-first (:tx-data next-entry))
+        (is (= (sync-checksum/recompute-server-checksum @expected-server)
+               (sync-checksum/recompute-server-checksum @server-after-first))
+            "server must receive every datom from the rebased logical tx")
+
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (seed-client-op-txs!
+             repo
+             [{:db-sync/tx-id tx-id
+               :db-sync/pending? true
+               :db-sync/created-at 1
+               :db-sync/outliner-op :rebase
+               :db-sync/normalized-tx-data rewritten-tx}])
+            (sync-apply/commit-upload-response!
+             repo
+             {:large-upload-progress
+              [(select-keys next-entry
+                            [:large-upload-original-tx-id
+                             :large-upload-next-index
+                             :large-upload-final?])]}
+             nil)
+            (sync-apply/mark-pending-txs-false! repo [tx-id])
+            (is (empty? (#'sync-apply/pending-txs repo))
+                "final ACK clears the rewritten pending operation")))))))
