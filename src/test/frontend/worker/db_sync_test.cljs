@@ -13746,35 +13746,80 @@
                               _ (<observe-real-server-hello!
                                  repo second-client server-self server-ws
                                  server-response*)
-                              pull-raw
-                              (sync-protocol/encode-message
-                               (sync-handler/pull-response server-self server-t0))
-                              _ (p/with-redefs
-                                  [sync-apply/enqueue-flush-pending!
-                                   (fn [& _] nil)
-                                   sync-assets/enqueue-asset-sync!
-                                   (fn [& _] nil)
-                                   shared-service/broadcast-to-clients!
-                                   (fn [& _] nil)]
-                                  (sync-handle-message/handle-message!
-                                   repo second-client pull-raw))
                               _ (reset! second-sent* [])
-                              completed-retry
-                              (<exchange-one-real-upload!
-                               repo second-client second-sent*
-                               server-self server-ws server-response* true)]
-                        (is (= final-entry
-                               (-> completed-retry :request :txs first))
-                            "cold restart retries the identical empty final wire entry")
-                        (is (= "tx/batch/ok"
-                               (-> completed-retry :response :type)))
+                              _ (#'sync-apply/flush-pending!
+                                 repo second-client)
+                              direct-request-raw (first @second-sent*)
+                              resolution
+                              (if direct-request-raw
+                                (p/let [request
+                                        (js->clj
+                                         (js/JSON.parse direct-request-raw)
+                                         :keywordize-keys true)
+                                        response-raw
+                                        (<server-ws-roundtrip!
+                                         server-self server-ws
+                                         server-response* direct-request-raw)
+                                        response
+                                        (js->clj (js/JSON.parse response-raw)
+                                                 :keywordize-keys true)
+                                        _ (p/with-redefs
+                                            [sync-apply/enqueue-flush-pending!
+                                             (fn [& _] nil)
+                                             sync-assets/enqueue-asset-sync!
+                                             (fn [& _] nil)
+                                             shared-service/broadcast-to-clients!
+                                             (fn [& _] nil)]
+                                            (sync-handle-message/handle-message!
+                                             repo second-client response-raw))]
+                                  {:mode :direct-empty-final-retry
+                                   :request request
+                                   :response response})
+                                (p/let [pull-raw
+                                        (sync-protocol/encode-message
+                                         (sync-handler/pull-response
+                                          server-self server-t0))
+                                        _ (p/with-redefs
+                                            [sync-apply/enqueue-flush-pending!
+                                             (fn [& _] nil)
+                                             sync-assets/enqueue-asset-sync!
+                                             (fn [& _] nil)
+                                             shared-service/broadcast-to-clients!
+                                             (fn [& _] nil)]
+                                            (sync-handle-message/handle-message!
+                                             repo second-client pull-raw))
+                                        _ (reset! second-sent* [])
+                                        _ (#'sync-apply/flush-pending!
+                                           repo second-client)]
+                                  {:mode :pull-reconciled
+                                   :post-pull-messages @second-sent*}))]
+                        (case (:mode resolution)
+                          :direct-empty-final-retry
+                          (do
+                            (is (= final-entry
+                                   (-> resolution :request :txs first))
+                                "a schedulable direct retry reuses the identical empty final entry")
+                            (is (= "tx/batch/ok"
+                                   (-> resolution :response :type))))
+
+                          :pull-reconciled
+                          (is (empty? (:post-pull-messages resolution))
+                              "pull reconciliation clears the committed op without another upload"))
                         (is (zero?
                              (client-op/get-pending-local-tx-count repo)))
+                        (is (nil? (read-client-upload-session
+                                  client-ops-conn logical-tx-id))
+                            "either safe completion path clears durable upload state")
                         (is (= (inc server-t0)
                                (sync-handler/t-now server-self)))
                         (is (= expected-checksum
                                (sync-checksum/recompute-server-checksum
-                                @server-conn))))))))
+                                @server-conn)
+                               (sync-storage/get-server-checksum
+                                (:sql server-storage))))
+                        (is (= expected-legacy-checksum
+                               (sync-storage/get-checksum
+                                (:sql server-storage)))))))))
               (p/catch (fn [error]
                          (is false (str error))))
               (p/finally
