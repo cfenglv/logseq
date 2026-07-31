@@ -548,15 +548,64 @@ addCase(
       /(?:!==|===|assert\.(?:equal|strictEqual)|timingSafeEqual)/,
       "signing closure does not compare GitHub's source SHA exactly",
     );
-    assert.match(
-      signingEffectiveSource,
-      /(?:writeFile(?:Sync)?|appendFile(?:Sync)?)[\s\S]{0,280}SOURCE_REVISION|SOURCE_REVISION[\s\S]{0,280}(?:writeFile(?:Sync)?|appendFile(?:Sync)?)/,
-      "signing closure does not write SOURCE_REVISION into the finalized artifact",
+    const signingClosure = relativeModuleClosure(
+      scriptsInvokedByJob(signing.source).filter(
+        (relativePath) => !/^scripts\/test-/.test(relativePath),
+      ),
+    );
+    const provenanceOwners = [...signingClosure]
+      .map((relativePath) => ({ relativePath, source: read(relativePath) }))
+      .filter(({ source }) => /["']SOURCE_REVISION["']/.test(source));
+    assert.equal(
+      provenanceOwners.length,
+      1,
+      `signing closure must define SOURCE_REVISION in exactly one helper; found ${
+        provenanceOwners.map(({ relativePath }) => relativePath).join(", ") || "none"
+      }`,
+    );
+    const provenanceSource = provenanceOwners[0].source;
+    const fileNameConstant = provenanceSource.match(
+      /\bconst\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*["']SOURCE_REVISION["']\s*;/,
+    );
+    assert.ok(
+      fileNameConstant,
+      "SOURCE_REVISION is not held in a fixed constant",
+    );
+    const escapedFileNameConstant = fileNameConstant[1].replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
     );
     assert.match(
-      signingEffectiveSource,
-      /rename(?:Sync)?/,
-      "SOURCE_REVISION is not finalized with an atomic rename",
+      provenanceSource,
+      new RegExp(
+        `\\bsourceRevisionPath\\b[\\s\\S]{0,240}\\b${escapedFileNameConstant}\\b|\\b${escapedFileNameConstant}\\b[\\s\\S]{0,240}\\bsourceRevisionPath\\b`,
+      ),
+      "sourceRevisionPath does not use the fixed SOURCE_REVISION constant",
+    );
+    const temporaryPath = provenanceSource.match(
+      /\b(?:const|let)\s+([A-Za-z_$][A-Za-z0-9_$]*(?:temp|temporary)[A-Za-z0-9_$]*Path)\b/i,
+    );
+    assert.ok(
+      temporaryPath,
+      "provenance helper does not create a distinct temporary path",
+    );
+    const escapedTemporaryPath = temporaryPath[1].replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    );
+    assert.match(
+      provenanceSource,
+      new RegExp(
+        `(?:writeFile|open)(?:Sync)?\\s*\\(\\s*${escapedTemporaryPath}[\\s\\S]{0,320}["']wx["']`,
+      ),
+      "temporary provenance file is not created exclusively with wx",
+    );
+    assert.match(
+      provenanceSource,
+      new RegExp(
+        `rename(?:Sync)?\\s*\\(\\s*${escapedTemporaryPath}\\s*,\\s*sourceRevisionPath\\s*\\)`,
+      ),
+      "temporary provenance file is not atomically renamed to sourceRevisionPath",
     );
 
     const finalVerifierMatches = [...jobs].filter(([name, source]) => {
