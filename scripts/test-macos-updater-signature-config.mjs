@@ -26,13 +26,147 @@ const read = (relativePath) =>
   fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
 
 const workflow = read(".github/workflows/build-desktop-release.yml");
-const workflowJob = (name) => {
-  const marker = `  ${name}:`;
-  const start = workflow.indexOf(marker);
-  assert.notEqual(start, -1, `workflow job ${name} is missing`);
-  const tail = workflow.slice(start + marker.length);
-  const end = tail.search(/^  [a-zA-Z0-9_-]+:/m);
-  return end === -1 ? tail : tail.slice(0, end);
+const workflowJobs = (source) => {
+  const headers = [...source.matchAll(/^  ([a-zA-Z0-9_-]+):\n/gm)];
+  const jobs = new Map();
+  for (let index = 0; index < headers.length; index += 1) {
+    const header = headers[index];
+    jobs.set(
+      header[1],
+      source.slice(header.index, headers[index + 1]?.index ?? source.length),
+    );
+  }
+  return jobs;
+};
+const desktopReleaseJobs = workflowJobs(workflow);
+const unsignedCandidateVerifier =
+  "verify-unsigned-macos-project-update-candidate.mjs";
+const verifierInvocationCount = (source) =>
+  source.match(new RegExp(unsignedCandidateVerifier.replaceAll(".", "\\."), "g"))
+    ?.length ?? 0;
+const workflowStepContaining = (jobSource, needle) => {
+  const index = jobSource.indexOf(needle);
+  assert.notEqual(index, -1, `job does not invoke ${needle}`);
+  const start = jobSource.lastIndexOf("\n      - name:", index);
+  const next = jobSource.indexOf("\n      - name:", index + needle.length);
+  assert.notEqual(start, -1, `cannot resolve workflow step containing ${needle}`);
+  return jobSource.slice(start, next === -1 ? jobSource.length : next);
+};
+const protectedSigningEnvironment = /(?:^    environment:\s*selfhost-release-signing\s*$|^    environment:\s*\n(?:^      [^\n]+\n)*?^      name:\s*selfhost-release-signing\s*$)/m;
+
+const assertUnsignedCandidateVerificationOwnership = () => {
+  const builders = new Map([
+    ["build-macos-x64", "x64"],
+    ["build-macos-arm64", "arm64"],
+  ]);
+  for (const [jobName, architecture] of builders) {
+    const jobSource = desktopReleaseJobs.get(jobName);
+    assert.ok(jobSource, `missing workflow job ${jobName}`);
+    assert.equal(
+      verifierInvocationCount(jobSource),
+      1,
+      `${jobName} must execute exactly one unsigned-candidate verification`,
+    );
+    const verificationStep = workflowStepContaining(
+      jobSource,
+      unsignedCandidateVerifier,
+    );
+    assert.match(
+      verificationStep,
+      new RegExp(`--arch\\s+${architecture}\\b`),
+      `${jobName} does not verify its own ${architecture} candidate`,
+    );
+  }
+
+  const protectedSigners = [...desktopReleaseJobs].filter(([, source]) =>
+    protectedSigningEnvironment.test(source),
+  );
+  assert.equal(
+    protectedSigners.length,
+    1,
+    `expected exactly one protected signing job; found ${
+      protectedSigners.map(([name]) => name).join(", ") || "none"
+    }`,
+  );
+  const [signingJobName, signingJobSource] = protectedSigners[0];
+  assert.equal(
+    verifierInvocationCount(signingJobSource),
+    1,
+    `${signingJobName} must contain one looped pre-signing verifier invocation`,
+  );
+
+  for (const [jobName, jobSource] of desktopReleaseJobs) {
+    if (builders.has(jobName) || jobName === signingJobName) continue;
+    assert.equal(
+      verifierInvocationCount(jobSource),
+      0,
+      `${jobName} is not authorized to invoke the unsigned-candidate verifier`,
+    );
+  }
+  const workflowDirectory = path.join(repoRoot, ".github", "workflows");
+  for (const entry of fs.readdirSync(workflowDirectory)) {
+    if (!/\.ya?ml$/i.test(entry) || entry === "build-desktop-release.yml") {
+      continue;
+    }
+    assert.equal(
+      verifierInvocationCount(
+        fs.readFileSync(path.join(workflowDirectory, entry), "utf8"),
+      ),
+      0,
+      `${entry} is not authorized to invoke the unsigned-candidate verifier`,
+    );
+  }
+
+  const protectedVerificationStep = workflowStepContaining(
+    signingJobSource,
+    unsignedCandidateVerifier,
+  );
+  const architectureLoop = protectedVerificationStep.match(
+    /\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)\s*;\s*do\b/,
+  );
+  assert.ok(
+    architectureLoop,
+    "protected signer does not independently loop over both macOS candidates",
+  );
+  const loopArchitectures = architectureLoop[2]
+    .trim()
+    .split(/\s+/)
+    .map((value) => value.replace(/^(["'])(.*)\1$/, "$2"))
+    .sort();
+  assert.deepEqual(
+    loopArchitectures,
+    ["arm64", "x64"],
+    "protected signer verification loop must cover exactly arm64 and x64",
+  );
+  assert.doesNotMatch(
+    protectedVerificationStep,
+    /\bsecrets\.|LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/,
+    "pre-signing candidate verification step can access signing secrets",
+  );
+  const escapedLoopVariable = architectureLoop[1].replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&",
+  );
+  assert.match(
+    protectedVerificationStep,
+    new RegExp(
+      `--arch\\s+(?:["']\\$\\{?${escapedLoopVariable}\\}?["']|\\$\\{?${escapedLoopVariable}\\}?)`,
+    ),
+    "protected signer verifier invocation is not driven by the two-architecture loop",
+  );
+  const verifierIndex = signingJobSource.indexOf(unsignedCandidateVerifier);
+  const signingSecretIndex = signingJobSource.indexOf(
+    "LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64",
+  );
+  assert.notEqual(
+    signingSecretIndex,
+    -1,
+    "protected signer has no fixed signing-secret injection",
+  );
+  assert.ok(
+    verifierIndex < signingSecretIndex,
+    "protected signer can access the key before both unsigned candidates are reverified",
+  );
 };
 const verifier = read("scripts/verify-macos-updater-signature.mjs");
 const projectUpdaterContract = read(
@@ -241,19 +375,7 @@ const cases = [
       assert.equal(workflow.match(/build-project-update-helper\.mjs/g)?.length, 2);
       assert.equal(workflow.match(/sign-macos-project-update\.mjs/g)?.length, undefined);
       assert.equal(workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length, undefined);
-      for (const jobName of [
-        "build-macos-x64",
-        "build-macos-arm64",
-        "selfhost-release-signing",
-      ]) {
-        assert.equal(
-          workflowJob(jobName).match(
-            /verify-unsigned-macos-project-update-candidate\.mjs/g,
-          )?.length,
-          1,
-          `${jobName} must verify its unsigned candidate set exactly once`,
-        );
-      }
+      assertUnsignedCandidateVerificationOwnership();
       const policy = read("scripts/run-macos-updater-signature-policy.mjs");
       assert.match(policy, /verifyProjectSignedMacosUpdate/);
       assert.doesNotMatch(policy, /requireDeveloperIdBaseline/);
