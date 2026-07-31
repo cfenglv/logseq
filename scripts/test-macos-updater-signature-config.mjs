@@ -26,6 +26,14 @@ const read = (relativePath) =>
   fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
 
 const workflow = read(".github/workflows/build-desktop-release.yml");
+const workflowJob = (name) => {
+  const marker = `  ${name}:`;
+  const start = workflow.indexOf(marker);
+  assert.notEqual(start, -1, `workflow job ${name} is missing`);
+  const tail = workflow.slice(start + marker.length);
+  const end = tail.search(/^  [a-zA-Z0-9_-]+:/m);
+  return end === -1 ? tail : tail.slice(0, end);
+};
 const verifier = read("scripts/verify-macos-updater-signature.mjs");
 const projectUpdaterContract = read(
   "scripts/test-project-signed-macos-updater.mjs",
@@ -233,11 +241,19 @@ const cases = [
       assert.equal(workflow.match(/build-project-update-helper\.mjs/g)?.length, 2);
       assert.equal(workflow.match(/sign-macos-project-update\.mjs/g)?.length, undefined);
       assert.equal(workflow.match(/verify-project-signed-macos-update\.mjs/g)?.length, undefined);
-      assert.equal(
-        workflow.match(/verify-unsigned-macos-project-update-candidate\.mjs/g)
-          ?.length,
-        2,
-      );
+      for (const jobName of [
+        "build-macos-x64",
+        "build-macos-arm64",
+        "selfhost-release-signing",
+      ]) {
+        assert.equal(
+          workflowJob(jobName).match(
+            /verify-unsigned-macos-project-update-candidate\.mjs/g,
+          )?.length,
+          1,
+          `${jobName} must verify its unsigned candidate set exactly once`,
+        );
+      }
       const policy = read("scripts/run-macos-updater-signature-policy.mjs");
       assert.match(policy, /verifyProjectSignedMacosUpdate/);
       assert.doesNotMatch(policy, /requireDeveloperIdBaseline/);
