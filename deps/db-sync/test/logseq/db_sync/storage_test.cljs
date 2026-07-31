@@ -293,6 +293,36 @@
             (is (= stale-checksum
                    (storage/get-checksum sql)))))))))
 
+(deftest verified-checksum-metadata-uses-touched-entity-server-update-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            block-uuid (random-uuid)]
+        (d/transact! conn [{:block/uuid page-uuid
+                            :block/name "verified-update"
+                            :block/title "Verified update"}])
+        (is (storage/checksum-metadata-verified?
+             sql (storage/get-t sql)))
+        (let [original-verified-update
+              sync-checksum/update-verified-server-checksum
+              verified-update-count (atom 0)]
+          (with-redefs [sync-checksum/update-server-checksum
+                        (fn [& _]
+                          (throw (js/Error. "unexpected full-graph update")))
+                        sync-checksum/update-verified-server-checksum
+                        (fn [checksum tx-report]
+                          (swap! verified-update-count inc)
+                          (original-verified-update checksum tx-report))]
+            (d/transact! conn [{:block/uuid block-uuid
+                                :block/title "Child"
+                                :block/parent [:block/uuid page-uuid]
+                                :block/page [:block/uuid page-uuid]}]))
+          (is (= 1 @verified-update-count))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql))))))))
+
 (deftest initial-checksum-does-not-overwrite-existing-checksum-test
   (testing "snapshot checksum initialization must not replace an existing incremental checksum"
     (let [sql (test-sql/make-sql)

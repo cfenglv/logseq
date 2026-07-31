@@ -207,23 +207,31 @@
              (some? (:block/page ent))
              (some? (:block/name ent))))))
 
+(defn- server-db-v2-entity-valid?
+  [db e2ee? eid]
+  (if-not (checksum-eligible-entity? db eid)
+    true
+    (let [ent (d/entity db eid)
+          title (:block/title ent)
+          marker (get ent large-title-object-attr)]
+      (and
+       (or (nil? marker)
+           (large-title-object-v2? marker))
+       (or e2ee?
+           (not (large-title? title))
+           (large-title-object-v2? marker))))))
+
+(defn- server-db-v2-eids-valid?
+  [db eids]
+  (let [e2ee? (ldb/get-graph-rtc-e2ee? db)]
+    (every? (partial server-db-v2-entity-valid? db e2ee?) eids)))
+
 (defn- server-db-v2-valid?
   [db]
   (let [e2ee? (ldb/get-graph-rtc-e2ee? db)]
-    (every?
-     (fn [{:keys [e]}]
-       (if-not (checksum-eligible-entity? db e)
-         true
-         (let [ent (d/entity db e)
-               title (:block/title ent)
-               marker (get ent large-title-object-attr)]
-           (and
-            (or (nil? marker)
-                (large-title-object-v2? marker))
-            (or e2ee?
-                (not (large-title? title))
-                (large-title-object-v2? marker))))))
-     (d/datoms db :avet :block/uuid))))
+    (every? (fn [{:keys [e]}]
+              (server-db-v2-entity-valid? db e2ee? e))
+            (d/datoms db :avet :block/uuid))))
 
 (defn server-large-title-markers
   "Return the complete marker state that contributes to server-db-v2.
@@ -464,6 +472,22 @@
         (recur (dec n) (op state digest))
         state))))
 
+(defn- apply-incremental-delta
+  [checksum db-before db-after e2ee? mode tx-data]
+  (let [{:keys [removed added]}
+        (net-tuple-delta db-before db-after e2ee? mode tx-data)
+        state-after-removals
+        (reduce-kv (fn [checksum-state tuple count]
+                     (apply-digest-n checksum-state tuple count subtract-digest))
+                   (checksum->state checksum)
+                   removed)
+        state-after-additions
+        (reduce-kv (fn [checksum-state tuple count]
+                     (apply-digest-n checksum-state tuple count add-digest))
+                   state-after-removals
+                   added)]
+    (state->checksum state-after-additions)))
+
 (defn- recompute-checksum*
   [db mode]
   (let [e2ee? (ldb/get-graph-rtc-e2ee? db)
@@ -534,19 +558,11 @@
       checksum
 
       :else
-      (let [initial-state (if (valid-checksum? checksum)
-                            (checksum->state checksum)
-                            (checksum->state (recompute-checksum* db-before mode)))
-            {:keys [removed added]} (net-tuple-delta db-before db-after after-e2ee? mode tx-data)
-            state-after-removals (reduce-kv (fn [checksum-state tuple count]
-                                              (apply-digest-n checksum-state tuple count subtract-digest))
-                                            initial-state
-                                            removed)
-            state-after-additions (reduce-kv (fn [checksum-state tuple count]
-                                               (apply-digest-n checksum-state tuple count add-digest))
-                                             state-after-removals
-                                             added)]
-        (state->checksum state-after-additions)))))
+      (apply-incremental-delta
+       (if (valid-checksum? checksum)
+         checksum
+         (recompute-checksum* db-before mode))
+       db-before db-after after-e2ee? mode tx-data))))
 
 (defn update-checksum
   [checksum tx-report]
@@ -555,3 +571,29 @@
 (defn update-server-checksum
   [checksum tx-report]
   (update-checksum* checksum tx-report (keyword server-checksum-version)))
+
+(defn update-verified-server-checksum
+  "Incrementally update a server-db-v2 checksum after its db-before state was
+  verified against persisted checksum metadata. Only tx-touched entities can
+  invalidate that contract, so this path avoids rescanning the entire graph."
+  [checksum {:keys [db-before db-after tx-data] :as tx-report}]
+  (let [before-e2ee? (ldb/get-graph-rtc-e2ee? db-before)
+        after-e2ee? (ldb/get-graph-rtc-e2ee? db-after)
+        tx-data (or tx-data [])]
+    (cond
+      (not (valid-checksum? checksum))
+      (update-server-checksum checksum tx-report)
+
+      (not= before-e2ee? after-e2ee?)
+      (recompute-server-checksum db-after)
+
+      (empty? tx-data)
+      checksum
+
+      :else
+      (let [touched-eids (touched-base-eids db-before db-after tx-data)]
+        (when (server-db-v2-eids-valid? db-after touched-eids)
+          (apply-incremental-delta checksum
+                                   db-before db-after after-e2ee?
+                                   (keyword server-checksum-version)
+                                   tx-data))))))

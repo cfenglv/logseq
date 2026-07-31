@@ -848,7 +848,9 @@
                 sql
                 (if (and (string? prev-server-checksum)
                          (= prev-t prev-server-checksum-t))
-                  (sync-checksum/update-server-checksum
+                  ((if verified-checksum-metadata?
+                     sync-checksum/update-verified-server-checksum
+                     sync-checksum/update-server-checksum)
                    prev-server-checksum
                    {:db-before db-before
                     :db-after @conn

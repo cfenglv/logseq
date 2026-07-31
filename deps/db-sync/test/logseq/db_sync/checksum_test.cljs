@@ -148,6 +148,45 @@
                 (checksum/recompute-server-checksum
                  (:db-after short-title-report)))))))
 
+(deftest verified-incremental-server-checksum-only-validates-touched-entities-test
+  (let [db-before (sample-db)
+        tx-report (d/with db-before
+                          [[:db/add 4 :block/title "Updated child"]])
+        checksum-before (checksum/recompute-server-checksum db-before)
+        expected (checksum/recompute-server-checksum (:db-after tx-report))
+        original-datoms d/datoms
+        full-block-uuid-scans (atom 0)
+        actual
+        (with-redefs [d/datoms
+                      (fn
+                        ([db index]
+                         (original-datoms db index))
+                        ([db index component-1]
+                         (when (and (= :avet index)
+                                    (= :block/uuid component-1))
+                           (swap! full-block-uuid-scans inc))
+                         (original-datoms db index component-1))
+                        ([db index component-1 component-2]
+                         (original-datoms db index component-1 component-2))
+                        ([db index component-1 component-2 component-3]
+                         (original-datoms db index component-1 component-2 component-3))
+                        ([db index component-1 component-2 component-3 component-4]
+                         (original-datoms db index component-1 component-2
+                                         component-3 component-4)))]
+          (checksum/update-verified-server-checksum checksum-before tx-report))]
+    (is (= expected actual))
+    (is (zero? @full-block-uuid-scans))))
+
+(deftest verified-incremental-server-checksum-rejects-invalid-touched-entity-test
+  (let [db-before (sample-db)
+        large-title (apply str (repeat 5000 "x"))
+        tx-report (d/with db-before
+                          [[:db/add 4 :block/title large-title]])
+        checksum-before (checksum/recompute-server-checksum db-before)]
+    (is (nil? (checksum/recompute-server-checksum (:db-after tx-report))))
+    (is (nil? (checksum/update-verified-server-checksum
+               checksum-before tx-report)))))
+
 (deftest checksums-cover-mixed-snapshot-and-incremental-large-title-history-test
   (let [db (sample-db)
         title-a (apply str (repeat 5000 "a"))
