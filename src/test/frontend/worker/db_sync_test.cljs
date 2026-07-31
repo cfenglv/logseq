@@ -13626,16 +13626,22 @@
                                   :conn server-conn
                                   :schema-ready false}
                  server-t0 (sync-handler/t-now server-self)
+                 server-legacy-checksum0
+                 (sync-checksum/recompute-checksum @server-conn)
                  server-checksum0
                  (sync-checksum/recompute-server-checksum @server-conn)
                  _ (sync-storage/set-checksum!
-                    (:sql server-storage) server-checksum0)
+                    (:sql server-storage) server-legacy-checksum0)
+                 _ (sync-storage/set-server-checksum!
+                    (:sql server-storage) server-checksum0 server-t0)
                  server-response* (atom nil)
                  server-ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
                                             (reset! server-response* raw))))
                  _ (d/transact! conn logical-tx)
+                 expected-legacy-checksum
+                 (sync-checksum/recompute-checksum @conn)
                  expected-checksum
                  (sync-checksum/recompute-server-checksum @conn)
                  first-sent* (atom [])
@@ -13732,7 +13738,13 @@
                                   (is (= expected-checksum
                                          (sync-checksum/recompute-server-checksum
                                           @server-conn)
+                                         (sync-storage/get-server-checksum
+                                          (:sql server-storage))))
+                                  (is (= expected-legacy-checksum
                                          (sync-storage/get-checksum
+                                          (:sql server-storage))))
+                                  (is (= (inc server-t0)
+                                         (sync-storage/get-server-checksum-t
                                           (:sql server-storage))))
                                   (let [server-entity
                                         (d/entity @server-conn
