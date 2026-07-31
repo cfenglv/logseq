@@ -239,6 +239,35 @@
        (mapv (fn [{:keys [addr content addresses]}]
                [addr content addresses]))))
 
+(defn- make-real-storage-sql
+  "Creates the same better-sqlite3-backed SQL adapter used by the real worker.
+  Unlike make-storage-sql, this persists every schema table needed to prove a
+  staged upload survives loss of all process-local state."
+  []
+  (let [Database (js/require "better-sqlite3")
+        db (new Database ":memory:")
+        sql (doto (js-obj)
+              (aset "_db" db)
+              (aset "exec"
+                    (fn [sql-str & args]
+                      (let [stmt (.prepare db sql-str)]
+                        (if (aget stmt "reader")
+                          (.apply (.-all stmt) stmt (to-array args))
+                          (do
+                            (.apply (.-run stmt) stmt (to-array args))
+                            nil)))))
+              (aset "close" (fn [] (.close db))))]
+    {:db db
+     :sql sql}))
+
+(defn- real-kvs-rows
+  [sql]
+  (->> (.exec sql "select addr, content, addresses from kvs order by addr")
+       (mapv (fn [row]
+               [(aget row "addr")
+                (aget row "content")
+                (aget row "addresses")]))))
+
 (defn- non-recycle-validation-entities
   [validation]
   (->> (:errors validation)
@@ -13179,22 +13208,25 @@
                     conn
                     [(ldb/kv :logseq.kv/graph-rtc-e2ee? true)]
                     {:persist-op? false})
-                 server-seed-storage (make-storage-sql)
+                 server-seed-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-seed-storage))
                  _ (d/conn-from-datoms
                     (d/datoms @conn :eavt)
                     (d/schema @conn)
                     {:storage
                      (sync-storage/new-sqlite-storage
                       (:sql server-seed-storage))})
-                 server-storage (make-storage-sql)
+                 server-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-storage))
                  _ (#'sync-handler/import-snapshot-rows!
                     (:sql server-storage)
                     "kvs"
-                    (kvs-rows (:state server-seed-storage)))
+                    (real-kvs-rows (:sql server-seed-storage)))
                  server-conn (sync-storage/open-conn (:sql server-storage))
                  server-self #js {:sql (:sql server-storage)
                                   :conn server-conn
                                   :schema-ready true}
+                 server-t0 (sync-handler/t-now server-self)
                  server-response* (atom nil)
                  server-ws (doto (js-obj)
                              (aset "readyState" 1)
@@ -13221,7 +13253,7 @@
                  first-client (manual-modern-client repo first-sent*)
                  fetch-prev js/fetch
                  config-prev @worker-state/*db-sync-config]
-             (sync-storage/set-t! (:sql server-storage) 0)
+             (sync-storage/set-t! (:sql server-storage) server-t0)
              (reset! worker-state/*db-sync-config
                      {:http-base "https://sync.example.test"})
              (set! js/fetch
@@ -13233,7 +13265,7 @@
                   conn client-ops-conn
                   (fn []
                     (client-op/update-graph-uuid repo "graph-1")
-                    (client-op/update-local-tx repo 0)
+                    (client-op/update-local-tx repo server-t0)
                     ;; A real local edit is already visible locally while its
                     ;; one logical pending operation awaits upload.
                     (client-op/update-local-checksum
@@ -13247,7 +13279,7 @@
                        :db-sync/created-at 1
                        :db-sync/outliner-op :save-block
                        :db-sync/normalized-tx-data logical-tx}])
-                    (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                    (reset! sync-apply/*repo->latest-remote-tx {repo server-t0})
                     (p/with-redefs
                       [worker-state/online? (constantly true)
                        sync-crypt/graph-e2ee? (constantly true)
@@ -13267,7 +13299,7 @@
                                                   :chunk-final?)))
                                   (is (= "tx/batch/ok"
                                          (-> first-exchange :response :type)))
-                                  (is (= 0 (sync-handler/t-now server-self))
+                                  (is (= server-t0 (sync-handler/t-now server-self))
                                       "nonfinal ACK has no visible server commit")
                                   (is (= 1 (client-op/get-pending-local-tx-count repo))))
 
@@ -13281,22 +13313,17 @@
                               _ (<observe-real-server-hello!
                                  repo second-client server-self server-ws
                                  server-response*)
-                              restarted-prefix (<exchange-one-real-upload!
-                                                repo second-client second-sent*
-                                                server-self server-ws
-                                                server-response* true)
                               final-attempt (<exchange-one-real-upload!
                                              repo second-client second-sent*
                                              server-self server-ws
                                              server-response* false)
                               _ (do
-                                  (is (= "tx/batch/ok"
-                                         (-> restarted-prefix :response :type)))
                                   (is (true? (-> final-attempt :request :txs first
                                                  :chunk-final?)))
                                   (is (= "tx/batch/ok"
                                          (-> final-attempt :response :type)))
-                                  (is (= 1 (sync-handler/t-now server-self))
+                                  (is (= (inc server-t0)
+                                         (sync-handler/t-now server-self))
                                       "server committed final exactly once")
                                   (is (= 1 (client-op/get-pending-local-tx-count repo))
                                       "lost final ACK keeps original pending durable"))
@@ -13314,7 +13341,7 @@
                                  server-response*)
                               pull-raw
                               (sync-protocol/encode-message
-                               (sync-handler/pull-response server-self 0))
+                               (sync-handler/pull-response server-self server-t0))
                               _ (p/with-redefs
                                   [sync-apply/enqueue-flush-pending!
                                    (fn [& _] nil)
@@ -13324,26 +13351,24 @@
                                    (fn [& _] nil)]
                                   (sync-handle-message/handle-message!
                                    repo third-client pull-raw))
+                              _ (is (= 1 (client-op/get-pending-local-tx-count repo))
+                                    "lost final ACK remains durable after pull")
                               _ (reset! third-sent* [])
-                              completed-prefix
-                              (when (pos? (client-op/get-pending-local-tx-count repo))
-                                (<exchange-one-real-upload!
-                                 repo third-client third-sent*
-                                 server-self server-ws server-response* true))
-                              completed-final
-                              (when (pos? (client-op/get-pending-local-tx-count repo))
-                                (<exchange-one-real-upload!
-                                 repo third-client third-sent*
-                                 server-self server-ws server-response* true))]
-                        (when completed-prefix
-                          (is (= "tx/batch/ok"
-                                 (-> completed-prefix :response :type))))
-                        (when completed-final
-                          (is (= "tx/batch/ok"
-                                 (-> completed-final :response :type))))
+                              completed-retry
+                              (<exchange-one-real-upload!
+                               repo third-client third-sent*
+                               server-self server-ws server-response* true)]
+                        (is (true? (-> completed-retry :request :txs first
+                                        :chunk-final?)))
+                        (is (= (-> final-attempt :request :txs first)
+                               (-> completed-retry :request :txs first))
+                            "lost final is retried with the original wire bytes")
+                        (is (= "tx/batch/ok"
+                               (-> completed-retry :response :type)))
                         (is (zero? (client-op/get-pending-local-tx-count repo))
                             "original logical pending row eventually clears")
-                        (is (= 1 (sync-handler/t-now server-self))
+                        (is (= (inc server-t0)
+                               (sync-handler/t-now server-self))
                             "completed-session retry never double-commits")
                         (is (= large-title
                                (:block/title
@@ -13360,4 +13385,6 @@
                  (set! js/fetch fetch-prev)
                  (reset! worker-state/*db-sync-config config-prev)
                  (clear-all-process-upload-state!)
+                 (.close (:sql server-seed-storage))
+                 (.close (:sql server-storage))
                  (done))))))))
