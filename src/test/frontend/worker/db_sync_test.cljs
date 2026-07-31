@@ -12633,3 +12633,31 @@
            (fn [error]
              (is false (str "unexpected scenario failure: " error))))
           (p/finally done))))
+
+(deftest nonfinal-large-upload-chunk-has-stable-idempotency-id-test
+  (testing "a lost ACK resends the same nonfinal chunk with the same server-visible identity"
+    (let [{:keys [conn child1]} (setup-parent-child)
+          repo "large-chunk-idempotency-repo"
+          logical-tx-id (random-uuid)
+          tx-data (vec
+                   (map (fn [idx]
+                          [:db/add [:block/uuid (:block/uuid child1)]
+                           :block/title (str "large-value-" idx)])
+                        (range 5001)))
+          pending [{:tx-id logical-tx-id
+                    :tx tx-data
+                    :outliner-op :save-block}]
+          first-entry (-> (sync-apply/prepare-upload-tx-entries
+                           repo conn pending)
+                          :tx-entries first)
+          retry-entry (-> (sync-apply/prepare-upload-tx-entries
+                           repo conn pending)
+                          :tx-entries first)]
+      (is (false? (:large-upload-final? first-entry)))
+      (is (uuid? (:tx-id first-entry))
+          "every transmitted nonfinal chunk needs an idempotency identity")
+      (is (not= logical-tx-id (:tx-id first-entry))
+          "the chunk identity must not consume the logical id reserved for final completion")
+      (is (= (:tx-id first-entry) (:tx-id retry-entry))
+          "retrying before ACK must derive exactly the same chunk identity")
+      (is (= (:tx-data first-entry) (:tx-data retry-entry))))))

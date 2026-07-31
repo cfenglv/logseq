@@ -4590,3 +4590,312 @@
           (is (= "after"
                  (:block/title
                   (d/entity @conn [:block/uuid block-uuid])))))))))
+
+(deftest tx-log-failure-rolls-back-datascript-and-persisted-entity-test
+  (testing "a tx_log failure cannot leave an unlogged entity mutation in either connection"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "atomic-log"
+                                    :block/title "before"}])
+              self #js {:sql sql :conn conn :schema-ready true}
+              t-before (storage/get-t sql)
+              checksum-before (storage/get-checksum sql)
+              log-before (storage/fetch-tx-since sql 0)
+              entry {:tx-id (random-uuid)
+                     :tx (protocol/tx->transit
+                          [[:db/add [:block/uuid block-uuid]
+                            :block/title "must-roll-back"]])
+                     :outliner-op :save-block}
+              response
+              (with-redefs
+                [storage/append-tx!
+                 (fn [& _]
+                   (throw (js/Error. "injected tx_log INSERT failure")))
+                 ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch! self nil [entry] t-before))
+              fresh-conn (storage/open-conn sql)]
+          (is (= "tx/reject" (:type response)))
+          (is (= t-before (storage/get-t sql)))
+          (is (= checksum-before (storage/get-checksum sql)))
+          (is (= log-before (storage/fetch-tx-since sql 0)))
+          (is (= "before"
+                 (:block/title (d/entity @conn [:block/uuid block-uuid])))
+              "the current conn must roll back when its tx_log append fails")
+          (is (= "before"
+                 (:block/title
+                  (d/entity @fresh-conn [:block/uuid block-uuid])))
+              "the persisted kvs state must roll back with tx_log"))))))
+
+(deftest same-tx-id-with-different-payload-is-rejected-test
+  (testing "tx identity is permanently bound to the first accepted payload"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              block-uuid (random-uuid)
+              tx-id (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "payload-binding"
+                                    :block/title "before"}])
+              t-before (storage/get-t sql)
+              entry-a {:tx-id tx-id
+                       :tx (protocol/tx->transit
+                            [[:db/add [:block/uuid block-uuid]
+                              :block/title "payload-a"]])
+                       :outliner-op :save-block}
+              response-a (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry-a] t-before))
+              entry-b {:tx-id tx-id
+                       :tx (protocol/tx->transit
+                            [[:db/add [:block/uuid block-uuid]
+                              :block/title "payload-b"]])
+                       :outliner-op :save-block}
+              response-b (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry-b] (:t response-a)))]
+          (is (= "tx/batch/ok" (:type response-a)))
+          (is (= "tx/reject" (:type response-b))
+              "reusing an accepted tx-id for different bytes is a protocol error")
+          (is (= "payload-a"
+                 (:block/title (d/entity @conn [:block/uuid block-uuid])))
+              "the conflicting second payload must never mutate the graph"))))))
+
+(deftest accepted-noop-tx-id-remains-idempotent-after-interleaved-edit-test
+  (testing "an accepted no-op has a durable marker and cannot become effective later"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              missing-uuid (random-uuid)
+              tx-id (random-uuid)
+              noop-entry {:tx-id tx-id
+                          :tx (protocol/tx->transit
+                               [[:db/add [:block/uuid missing-uuid]
+                                 :block/title "stale-local-title"]])
+                          :outliner-op :rebase}
+              t-before (storage/get-t sql)
+              first-response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                               (sync-handler/handle-tx-batch!
+                                self nil [noop-entry] t-before))
+              remote-entry {:tx-id (random-uuid)
+                            :tx (protocol/tx->transit
+                                 [{:block/uuid missing-uuid
+                                   :block/title "newer-remote-title"}])
+                            :outliner-op :save-block}
+              remote-response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                                (sync-handler/handle-tx-batch!
+                                 self nil [remote-entry] (:t first-response)))
+              replay-response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                                (sync-handler/handle-tx-batch!
+                                 self nil [noop-entry] (:t remote-response)))]
+          (is (= "tx/batch/ok" (:type first-response)))
+          (is (= t-before (:t first-response)))
+          (is (= "tx/batch/ok" (:type remote-response)))
+          (is (= "tx/batch/ok" (:type replay-response)))
+          (is (= (:t remote-response) (:t replay-response))
+              "replaying an accepted no-op must not create a new log entry")
+          (is (= "newer-remote-title"
+                 (:block/title
+                  (d/entity @conn [:block/uuid missing-uuid])))
+              "the old accepted no-op must not overwrite an interleaved edit"))))))
+
+(deftest duplicate-id-partial-failure-never-reports-the-id-as-both-success-and-failure-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            duplicate-id (random-uuid)
+            good-uuid (random-uuid)
+            missing-uuid (random-uuid)
+            entries [{:tx-id duplicate-id
+                      :tx (protocol/tx->transit
+                           [{:block/uuid good-uuid
+                             :block/title "first use"}])
+                      :outliner-op :save-block}
+                     {:tx-id duplicate-id
+                      :tx (protocol/tx->transit
+                           [[:db/add [:block/uuid missing-uuid]
+                             :block/title "must fail" 1]])
+                      :outliner-op :save-block}]
+            response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                       (sync-handler/handle-tx-batch!
+                        self nil entries (storage/get-t sql)))
+            success-ids (set (:success-tx-ids response))]
+        (is (= "tx/reject" (:type response)))
+        (is (= duplicate-id (:failed-tx-id response)))
+        (is (not (contains? success-ids (:failed-tx-id response)))
+            "one UUID cannot be both committed and failed in one response")))))
+
+(deftest lost-large-chunk-ack-cannot-overwrite-interleaved-remote-edit-test
+  (testing "replaying an acknowledged logical chunk is harmless after a newer remote tx"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              block-uuid (random-uuid)
+              chunk-id (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "large-chunk-ack"
+                                    :block/title "before"}])
+              chunk-entry {:tx-id chunk-id
+                           :tx (protocol/tx->transit
+                                [[:db/add [:block/uuid block-uuid]
+                                  :block/title "large-local-chunk"]])
+                           :outliner-op :save-block}
+              first-response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                               (sync-handler/handle-tx-batch!
+                                self nil [chunk-entry] (storage/get-t sql)))
+              remote-entry {:tx-id (random-uuid)
+                            :tx (protocol/tx->transit
+                                 [[:db/add [:block/uuid block-uuid]
+                                   :block/title "interleaved-remote"]])
+                            :outliner-op :save-block}
+              remote-response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                                (sync-handler/handle-tx-batch!
+                                 self nil [remote-entry] (:t first-response)))
+              replay-response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                                (sync-handler/handle-tx-batch!
+                                 self nil [chunk-entry] (:t remote-response)))]
+          (is (= "tx/batch/ok" (:type replay-response)))
+          (is (= (:t remote-response) (:t replay-response)))
+          (is (= "interleaved-remote"
+                 (:block/title (d/entity @conn [:block/uuid block-uuid])))
+              "lost ACK replay must not roll graph state back to the old chunk"))))))
+
+(deftest partial-schema-migration-failure-does-not-mark-worker-ready-test
+  (testing "table existence probes cannot hide an incomplete column migration"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (common/sql-exec sql "drop table tx_log")
+        (common/sql-exec
+         sql
+         "create table tx_log (t INTEGER primary key, tx TEXT not null, created_at INTEGER)")
+        (let [self #js {:sql sql :conn nil :schema-ready false}
+              error (with-redefs
+                      [storage/init-schema!
+                       (fn [_]
+                         (throw (js/Error. "injected migration failure")))]
+                      (try
+                        (sync-handler/t-now self)
+                        nil
+                        (catch :default e e)))]
+          (is (some? error)
+              "an incomplete migration must fail readiness even when all tables exist")
+          (is (false? (.-schema-ready self))))))))
+
+(deftest fifty-new-tx-ids-use-a-bounded-number-of-identity-lookups-test
+  (testing "idempotency lookup is batched rather than one SELECT per entry"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "bounded-identity-lookups"
+                                    :block/title "seed"}])
+              entries (mapv
+                       (fn [idx]
+                         {:tx-id (random-uuid)
+                          :tx (protocol/tx->transit
+                               [[:db/add [:block/uuid block-uuid]
+                                 :block/title (str "value-" idx)]])
+                          :outliner-op :save-block})
+                       (range 50))
+              original-exec (.-exec sql)
+              identity-selects (atom [])]
+          (set! (.-exec sql)
+                (fn [sql-str & args]
+                  (let [normalized (string/lower-case sql-str)]
+                    (when (and (string/starts-with? (string/trim normalized) "select")
+                               (or (string/includes? normalized "tx_log")
+                                   (string/includes? normalized "tx_id")
+                                   (string/includes? normalized "idempot")))
+                      (swap! identity-selects conj normalized))
+                    (.apply original-exec sql
+                            (to-array (cons sql-str args))))))
+          (try
+            (let [response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                             (sync-handler/handle-tx-batch!
+                              self nil entries (storage/get-t sql)))]
+              (is (= "tx/batch/ok" (:type response)))
+              (is (= 50 (- (:t response) 1)))
+              (is (<= (count @identity-selects) 2)
+                  (str "50 new ids must use at most two identity SELECTs; observed "
+                       (count @identity-selects))))
+            (finally
+              (set! (.-exec sql) original-exec))))))))
+
+(deftest hundred-thousand-row-legacy-schema-upgrade-avoids-tx-log-scan-or-index-build-test
+  (testing "legacy history upgrades add bounded metadata without scanning all tx_log rows"
+    (with-memory-sql
+      (fn [sql]
+        (common/sql-exec
+         sql
+         "create table tx_log (t INTEGER primary key, tx TEXT not null, created_at INTEGER)")
+        (common/sql-exec
+         sql
+         (str "with recursive n(x) as ("
+              "select 1 union all select x + 1 from n where x < 100000"
+              ") insert into tx_log(t, tx, created_at) "
+              "select x, '[]', x from n"))
+        (let [original-exec (.-exec sql)
+              migration-sql (atom [])]
+          (set! (.-exec sql)
+                (fn [sql-str & args]
+                  (swap! migration-sql conj
+                         (string/lower-case (string/trim sql-str)))
+                  (.apply original-exec sql
+                          (to-array (cons sql-str args)))))
+          (try
+            (storage/init-schema! sql)
+            (let [forbidden (filter
+                             #(or (and (string/includes? % "create")
+                                       (string/includes? % "index")
+                                       (string/includes? % "tx_log"))
+                                  (string/starts-with? % "select")
+                                  (string/starts-with? % "update tx_log"))
+                             @migration-sql)
+                  row-count (-> (common/sql-exec
+                                 sql "select count(*) as n from tx_log")
+                                common/get-sql-rows first (aget "n"))]
+              (is (= 100000 row-count))
+              (is (empty? forbidden)
+                  (str "legacy upgrade must not scan/backfill/index tx_log: "
+                       (pr-str forbidden))))
+            (finally
+              (set! (.-exec sql) original-exec))))))))
+
+(deftest selfhost-one-through-four-no-tx-id-batches-remain-compatible-test
+  (doseq [client-revision ["2.0.1-selfhost.1" "2.0.1-selfhost.4"]]
+    (testing (str client-revision " may use the original no-tx-id tx/batch shape")
+      (with-memory-sql
+        (fn [sql]
+          (storage/init-schema! sql)
+          (let [conn (storage/open-conn sql)
+                self #js {:sql sql :conn conn :schema-ready true}
+                block-uuid (random-uuid)
+                response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil
+                            [{:tx (protocol/tx->transit
+                                   [{:block/uuid block-uuid
+                                     :block/title client-revision}])
+                              :outliner-op :save-block}]
+                            0
+                            {:client-revision client-revision}))]
+            (is (= "tx/batch/ok" (:type response)))
+            (is (= 1 (:t response)))
+            (is (= client-revision
+                   (:block/title
+                    (d/entity @conn [:block/uuid block-uuid]))))))))))

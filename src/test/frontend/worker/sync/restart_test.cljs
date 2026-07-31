@@ -727,6 +727,50 @@
           (reset! worker-state/*db-sync-client prev-client)
           (set! js/setTimeout original-set-timeout))))))
 
+(deftest ws-error-with-unacknowledged-idless-large-chunk-is-visible-test
+  (let [original-set-timeout js/setTimeout
+        prev-client @worker-state/*db-sync-client
+        last-error (atom nil)
+        close-calls (atom 0)
+        logical-tx-id (random-uuid)
+        ws #js {:readyState 1
+                :close (fn [] (swap! close-calls inc))}
+        client {:repo "idless-large-chunk-error-repo"
+                :graph-id "graph-1"
+                :ws ws
+                :ws-state (atom :open)
+                :last-sync-error last-error
+                ;; Historical nonfinal chunks have no :tx-id and therefore an
+                ;; empty :inflight vector. The progress record is the only
+                ;; evidence that an upload was awaiting ACK.
+                :upload-request
+                (atom {:tx-ids []
+                       :large-upload-progress
+                       [{:large-upload-original-tx-id logical-tx-id
+                         :large-upload-next-index 5000
+                         :large-upload-final? false}]
+                       :t-before 2751})
+                :inflight (atom [])
+                :online-users (atom [])
+                :reconnect (atom {:attempt 0 :timer nil})
+                :stale-kill-timer (atom nil)}]
+    (set! js/setTimeout (fn [& _] :retry-timer))
+    (reset! worker-state/*db-sync-client client)
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (#'sync/attach-ws-handlers!
+         (:repo client) client ws
+         "wss://sync.example.test/sync/graph-1")
+        ((.-onerror ws) (js/Error. "large chunk transport failed"))
+        (is (= 1 @close-calls))
+        (is (= :closed @(:ws-state client)))
+        (is (= :retry-timer (:timer @(:reconnect client))))
+        (is (some? @last-error)
+            "a no-id large chunk lost before ACK must be visible to the user")
+        (finally
+          (reset! worker-state/*db-sync-client prev-client)
+          (set! js/setTimeout original-set-timeout))))))
+
 (deftest upload-response-timeout-invalidates-only-the-current-websocket-test
   (let [repo "upload-timeout-repo"
         graph-id "graph-1"
