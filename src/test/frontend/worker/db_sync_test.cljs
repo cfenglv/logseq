@@ -13581,23 +13581,32 @@
                       "legacy positional cursor is discarded, not migrated ambiguously"))))))))))
 
 (defn- shared-tempid-5001-tx
-  [tempid block-uuid]
-  (into [[:db/add tempid :block/uuid block-uuid]]
+  [tempid block-uuid parent-uuid page-uuid]
+  (into [[:db/add tempid :block/uuid block-uuid]
+         [:db/add tempid :block/title "valid shared-tempid block"]
+         [:db/add tempid :block/parent [:block/uuid parent-uuid]]
+         [:db/add tempid :block/page [:block/uuid page-uuid]]
+         [:db/add tempid :block/order "zzzz-shared-tempid"]
+         [:db/add tempid :block/created-at 100]
+         [:db/add tempid :block/updated-at 100]]
         (map (fn [idx]
                [:db/add tempid
                 (keyword "large-upload.group" (str "attr-" idx))
                 idx])
-             (range 5000))))
+             (range 4994))))
 
 (deftest e2e-shared-tempid-group-uses-empty-final-and-retries-it-after-cold-ack-loss-test
   (testing "real client and strict server preserve an indivisible 5001-datom group behind an empty final terminator"
     (async done
-           (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+           (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
                  repo test-repo
                  logical-tx-id (random-uuid)
                  block-uuid (random-uuid)
+                 parent-uuid (:block/uuid parent)
+                 page-uuid (some-> parent :block/page :block/uuid)
                  logical-tx (shared-tempid-5001-tx
-                             "shared-tempid-empty-final" block-uuid)
+                             "shared-tempid-empty-final"
+                             block-uuid parent-uuid page-uuid)
                  server-seed-storage (make-real-storage-sql)
                  _ (sync-storage/init-schema! (:sql server-seed-storage))
                  _ (d/conn-from-datoms
