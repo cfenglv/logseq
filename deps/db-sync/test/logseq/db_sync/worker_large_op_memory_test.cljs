@@ -139,6 +139,10 @@
   (assert! (= checksum-before
               (checksum/recompute-server-checksum @fresh-conn))
            "nonfinal modern chunks must not change a freshly reopened graph")
+  (assert! (= checksum-before (storage/get-server-checksum sql))
+           "nonfinal or rolled-back final must preserve stored server checksum")
+  (assert! (= t-before (storage/get-server-checksum-t sql))
+           "nonfinal or rolled-back final must preserve checksum cursor")
   (assert! (not (sample-blocks-present? @conn block-uuids))
            "nonfinal modern chunks must remain invisible on current conn")
   (assert! (not (sample-blocks-present? @fresh-conn block-uuids))
@@ -196,6 +200,8 @@
             (assert! (fn? original-append) "append-tx! must be callable")
             (assert! (= "tx/reject" (:type response))
                      (str "expected final fault rejection, got " (pr-str response)))
+            (assert! (= t-before (:t response))
+                     "failed final must report the unchanged visible cursor")
             (assert-modern-invisible!
              sql conn fresh-after t-before checksum-before block-uuids)
             (assert! (empty? (storage/fetch-tx-since sql t-before))
