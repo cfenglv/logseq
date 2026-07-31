@@ -376,7 +376,11 @@ const discoverLocalFinalizer = () => {
     scriptPath,
     `${scriptName} must invoke one tracked Node finalizer under scripts/`,
   );
+  const closure = relativeModuleClosure([scriptPath]);
   return {
+    closureSource: [...closure]
+      .map((relativePath) => read(relativePath))
+      .join("\n"),
     command,
     scriptName,
     scriptPath,
@@ -637,6 +641,7 @@ addCase(
   "local finalizer signs and verifies both macOS architectures before full asset validation",
   () => {
     const {
+      closureSource,
       command,
       scriptName,
       scriptPath,
@@ -648,14 +653,14 @@ addCase(
       `${scriptName} is not identified as a publisher-local operation`,
     );
     assert.match(
-      source,
+      closureSource,
       /process\.platform[\s\S]{0,160}(?:darwin|macOS)|(?:darwin|macOS)[\s\S]{0,160}process\.platform/i,
-      `${scriptPath} does not fail closed outside macOS`,
+      `${scriptPath} import closure does not fail closed outside macOS`,
     );
     assert.match(
-      source,
+      closureSource,
       /(?:process\.env\.)?(?:CI|GITHUB_ACTIONS)[\s\S]{0,240}(?:throw|exit|blocked|forbidden)|(?:throw|exit|blocked|forbidden)[\s\S]{0,240}(?:CI|GITHUB_ACTIONS)/i,
-      `${scriptPath} does not reject CI execution`,
+      `${scriptPath} import closure does not reject CI execution`,
     );
     assert.match(source, /sign-macos-project-update\.mjs/);
     assert.match(source, /verify-project-signed-macos-update\.mjs/);
@@ -793,7 +798,7 @@ addCase(
     );
     assert.match(
       combined,
-      /(?:2\.0\.1-selfhost\.)?(?:1|\.1)[\s\S]{0,100}(?:2\.0\.1-selfhost\.)?(?:4|\.4)[\s\S]{0,320}(?:data|graph|sync|RTC|数据|图谱|同步)[\s\S]{0,180}(?:compatible|unchanged|unaffected|兼容|不受影响|保持不变)/i,
+      /(?:2\.0\.1-selfhost\.)?(?:1|\.1)[\s\S]{0,100}(?:2\.0\.1-selfhost\.)?(?:4|\.4)[\s\S]{0,320}(?:data|graph|sync|RTC|数据|图谱|同步)[\s\S]{0,180}(?:compatibility|compatible|unchanged|unaffected|兼容|不受影响|保持不变)/i,
       "docs do not state that .1-.4 data and sync compatibility is unaffected by release signing",
     );
   },
