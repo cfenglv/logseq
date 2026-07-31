@@ -1,6 +1,7 @@
 (ns logseq.db-sync.worker-large-op-memory-test
   (:require ["better-sqlite3" :as sqlite3]
             ["crypto" :as node-crypto]
+            ["v8" :as node-v8]
             [clojure.string :as string]
             [datascript.core :as d]
             [logseq.db-sync.checksum :as checksum]
@@ -86,13 +87,14 @@
      outliner-op
      full-tx-data])))
 
-(defn- modern-nonfinal-chunk-tx-id
-  [logical-tx-id upload-session-id chunk-index]
+(defn- modern-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index chunk-final?]
   (let [raw (sha256-hex
-             (str "logseq-tx-chunk-v1/"
+             (str "logseq-tx-chunk-v2/"
                   logical-tx-id "/"
                   upload-session-id "/"
-                  chunk-index))
+                  chunk-index "/"
+                  (if chunk-final? "final" "more")))
         versioned (str (subs raw 0 12)
                        "5"
                        (subs raw 13 16)
@@ -107,10 +109,8 @@
 (defn- modern-session-entry
   [logical-tx-id upload-session-id outliner-op chunk-index chunk final?]
   {:tx (protocol/tx->transit chunk)
-   :tx-id (if final?
-            logical-tx-id
-            (modern-nonfinal-chunk-tx-id
-             logical-tx-id upload-session-id chunk-index))
+   :tx-id (modern-chunk-tx-id
+           logical-tx-id upload-session-id chunk-index final?)
    :logical-tx-id logical-tx-id
    :upload-session-id upload-session-id
    :chunk-index chunk-index
@@ -125,7 +125,7 @@
     (mapv (fn [index chunk]
             (modern-session-entry
              logical-tx-id upload-session-id outliner-op
-             (* index 1000) (vec chunk) (= index (dec (count chunks)))))
+             index (vec chunk) (= index (dec (count chunks)))))
           (range (count chunks))
           chunks)))
 
@@ -149,7 +149,10 @@
   (with-memory-sql
     (fn [sql]
       (storage/init-schema! sql)
-      (let [conn (storage/open-conn sql)
+      (let [max-old-space-flag? (some #{"--max-old-space-size=128"}
+                                      (array-seq (.-execArgv js/process)))
+            rss-before (.-rss (.memoryUsage js/process))
+            conn (storage/open-conn sql)
             page-uuid (random-uuid)
             _ (d/transact! conn [{:block/uuid page-uuid
                                   :block/name "modern-memory-page"
@@ -163,6 +166,8 @@
             prefix (pop entries)
             final-entry (peek entries)
             self #js {:sql sql :conn conn :schema-ready true}]
+        (assert! max-old-space-flag?
+                 "modern staged memory modes require --max-old-space-size=128")
         (assert! (= 14000 (count tx-data))
                  "modern memory fixture must contain exactly 14k datoms")
         (assert! (> (count entries) 1)
@@ -217,7 +222,18 @@
                      "stored checksum equals full recomputation")
             (assert! (= (inc t-before)
                         (storage/get-server-checksum-t sql))
-                     "stored checksum cursor follows the one logical commit")))))))
+                     "stored checksum cursor follows the one logical commit")))
+        (let [rss-after (.-rss (.memoryUsage js/process))
+              rss-growth (- rss-after rss-before)]
+          (assert! (number? rss-after) "RSS must be observable")
+          (assert! (< rss-growth (* 128 1024 1024))
+                   (str "modern staged RSS growth exceeded 128 MiB: " rss-growth))
+          (js/console.log
+           (str "modern-staged-rss-before=" rss-before
+                " rss-after=" rss-after
+                " rss-growth=" rss-growth
+                " heap-limit="
+                (.-heap_size_limit (.getHeapStatistics node-v8)))))))))
 
 (defn- run-large-op-memory-test!
   [{:keys [skip-final-store? skip-validation?]}]

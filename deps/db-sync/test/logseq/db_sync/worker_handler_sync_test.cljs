@@ -5044,13 +5044,14 @@
      outliner-op
      full-tx-data])))
 
-(defn- modern-nonfinal-chunk-tx-id
-  [logical-tx-id upload-session-id chunk-index]
+(defn- modern-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index chunk-final?]
   (let [raw (sha256-hex
-             (str "logseq-tx-chunk-v1/"
+             (str "logseq-tx-chunk-v2/"
                   logical-tx-id "/"
                   upload-session-id "/"
-                  chunk-index))
+                  chunk-index "/"
+                  (if chunk-final? "final" "more")))
         versioned (str (subs raw 0 12)
                        "5"
                        (subs raw 13 16)
@@ -5070,10 +5071,8 @@
                        (modern-upload-session-id
                         logical-tx-id outliner-op full-tx-data))
         chunk-tx-id (or tx-id
-                        (if chunk-final?
-                          logical-tx-id
-                          (modern-nonfinal-chunk-tx-id
-                           logical-tx-id session-id chunk-index)))]
+                        (modern-chunk-tx-id
+                         logical-tx-id session-id chunk-index chunk-final?))]
     {:tx (protocol/tx->transit chunk-tx-data)
      :tx-id chunk-tx-id
      :logical-tx-id logical-tx-id
@@ -5254,6 +5253,82 @@
                  missing-key)]
             (assert-rejected-without-graph-change!
              self conn incomplete-entry block-uuid "before")))))))
+
+(deftest deprecated-client-span-metadata-is-always-rejected-test
+  (doseq [[label declared-next]
+          [["overlap" 0]
+           ["shrunk span" 1]
+           ["inflated span" 5000]
+           ["negative span" -1]]]
+    (testing (str label " cannot make server trust chunk-next-index")
+      (with-memory-sql
+        (fn [sql]
+          (storage/init-schema! sql)
+          (let [conn (storage/open-conn sql)
+                self #js {:sql sql :conn conn :schema-ready true}
+                logical-id (random-uuid)
+                block-uuid (random-uuid)
+                _ (d/transact! conn [{:block/uuid block-uuid
+                                      :block/name "deprecated-client-span"
+                                      :block/title "before"}])
+                full-tx [[:db/add [:block/uuid block-uuid]
+                          :block/title "one-datom"]]
+                poisoned-first
+                (assoc
+                 (modern-session-entry
+                  {:logical-tx-id logical-id
+                   :full-tx-data full-tx
+                   :chunk-tx-data full-tx
+                   :chunk-index 0
+                   :chunk-final? false})
+                 :chunk-next-index declared-next)
+                final-entry
+                (modern-session-entry
+                 {:logical-tx-id logical-id
+                  :full-tx-data full-tx
+                  :chunk-tx-data []
+                  :chunk-index 1
+                  :chunk-final? true})]
+            (assert-rejected-without-graph-change!
+             self conn poisoned-first block-uuid "before")
+            (assert-rejected-without-graph-change!
+             self conn final-entry block-uuid "before")))))))
+
+(deftest deprecated-client-span-on-later-chunk-is-rejected-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            logical-id (random-uuid)
+            block-uuid (random-uuid)
+            _ (d/transact! conn [{:block/uuid block-uuid
+                                  :block/name "deprecated-later-span"
+                                  :block/title "before"}])
+            full-tx [[:db/add [:block/uuid block-uuid]
+                      :block/title "first"]
+                     [:db/add [:block/uuid block-uuid]
+                      :block/updated-at 2]]
+            first-entry
+            (modern-session-entry
+             {:logical-tx-id logical-id
+              :full-tx-data full-tx
+              :chunk-tx-data [(first full-tx)]
+              :chunk-index 0
+              :chunk-final? false})
+            poisoned-final
+            (assoc
+             (modern-session-entry
+              {:logical-tx-id logical-id
+               :full-tx-data full-tx
+               :chunk-tx-data [(second full-tx)]
+               :chunk-index 1
+               :chunk-final? true})
+             :chunk-next-index 2)]
+        (is (= "tx/batch/ok"
+               (:type (apply-identified-entry! self first-entry))))
+        (assert-rejected-without-graph-change!
+         self conn poisoned-final block-uuid "before")))))
 
 (deftest logical-chunk-session-rejects-first-index-500-test
   (with-memory-sql
@@ -5451,6 +5526,64 @@
           (is (= (:t response-2) (:t final-retry))
               "an ACK-loss retry of the final chunk does not reapply it"))))))
 
+(deftest ordinal-staging-assembles-unequal-received-chunks-without-datom-loss-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            logical-id (random-uuid)
+            block-uuids (mapv (fn [_] (random-uuid)) (range 6))
+            _ (d/transact!
+               conn
+               (mapv (fn [idx block-uuid]
+                       {:block/uuid block-uuid
+                        :block/name (str "ordinal-assembly-" idx)
+                        :block/title (str "before-" idx)})
+                     (range)
+                     block-uuids))
+            full-tx (mapv (fn [idx block-uuid]
+                            [:db/add [:block/uuid block-uuid]
+                             :block/title (str "assembled-" idx)])
+                          (range)
+                          block-uuids)
+            chunks [(subvec full-tx 0 1)
+                    (subvec full-tx 1 5)
+                    (subvec full-tx 5 6)]
+            entries (mapv
+                     (fn [chunk-seq chunk]
+                       (modern-session-entry
+                        {:logical-tx-id logical-id
+                         :full-tx-data full-tx
+                         :chunk-tx-data chunk
+                         :chunk-index chunk-seq
+                         :chunk-final? (= chunk-seq 2)}))
+                     (range 3)
+                     chunks)
+            t-before (storage/get-t sql)
+            graph-before (sync-checksum/recompute-server-checksum @conn)]
+        (doseq [entry (butlast entries)]
+          (let [response (apply-identified-entry! self entry)]
+            (is (= "tx/batch/ok" (:type response)))
+            (is (= t-before (:t response)))
+            (is (= graph-before
+                   (sync-checksum/recompute-server-checksum @conn)))))
+        (let [response (apply-identified-entry! self (last entries))
+              fresh-conn (storage/open-conn sql)]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= (inc t-before) (:t response)))
+          (doseq [[idx block-uuid] (map-indexed vector block-uuids)]
+            (is (= (str "assembled-" idx)
+                   (:block/title
+                    (d/entity @conn [:block/uuid block-uuid]))))
+            (is (= (str "assembled-" idx)
+                   (:block/title
+                    (d/entity @fresh-conn [:block/uuid block-uuid])))))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (sync-checksum/recompute-server-checksum @fresh-conn)))
+          (is (= 1 (count (storage/fetch-tx-since sql t-before)))
+              "unequal ordinal chunks become one visible logical tx"))))))
+
 (defn- modern-session-entries
   [logical-tx-id outliner-op full-tx-data chunk-size]
   (let [chunks (if (seq full-tx-data)
@@ -5462,7 +5595,7 @@
                  [(first chunks) []]
                  chunks)]
     (loop [entries []
-           offset 0
+           chunk-seq 0
            [chunk & more] chunks]
       (if chunk
         (let [final? (empty? more)]
@@ -5472,10 +5605,10 @@
                   {:logical-tx-id logical-tx-id
                    :full-tx-data full-tx-data
                    :chunk-tx-data chunk
-                   :chunk-index offset
+                   :chunk-index chunk-seq
                    :chunk-final? final?
                    :outliner-op outliner-op}))
-           (+ offset (count chunk))
+           (inc chunk-seq)
            more))
         entries))))
 

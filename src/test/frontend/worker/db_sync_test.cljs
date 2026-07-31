@@ -12723,13 +12723,14 @@
      outliner-op
      full-tx-data])))
 
-(defn- expected-nonfinal-chunk-tx-id
-  [logical-tx-id upload-session-id chunk-index]
+(defn- expected-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index chunk-final?]
   (let [raw (test-sha256-hex
-             (str "logseq-tx-chunk-v1/"
+             (str "logseq-tx-chunk-v2/"
                   logical-tx-id "/"
                   upload-session-id "/"
-                  chunk-index))
+                  chunk-index "/"
+                  (if chunk-final? "final" "more")))
         versioned (str (subs raw 0 12)
                        "5"
                        (subs raw 13 16)
@@ -12771,10 +12772,11 @@
       (is (uuid? (:tx-id first-entry))
           "every transmitted nonfinal chunk needs an idempotency identity")
       (is (not= logical-tx-id (:tx-id first-entry))
-          "the chunk identity must not consume the logical id reserved for final completion")
-      (is (= (expected-nonfinal-chunk-tx-id
-              logical-tx-id (:upload-session-id first-entry) 0)
+          "wire identity stays distinct from logical identity")
+      (is (= (expected-chunk-tx-id
+              logical-tx-id (:upload-session-id first-entry) 0 false)
              (:tx-id first-entry)))
+      (is (not (contains? first-entry :chunk-next-index)))
       (is (= (:tx-id first-entry) (:tx-id retry-entry))
           "retrying before ACK must derive exactly the same chunk identity")
       (is (= (:upload-session-id first-entry)
@@ -12864,9 +12866,10 @@
                          (is (= (expected-upload-session-id
                                  tx-id :save-block logical-plaintext)
                                 (:upload-session-id first-entry)))
-                         (is (= (str (expected-nonfinal-chunk-tx-id
-                                     tx-id (:upload-session-id first-entry) 0))
+                         (is (= (str (expected-chunk-tx-id
+                                     tx-id (:upload-session-id first-entry) 0 false))
                                 (:tx-id first-entry)))
+                         (is (not (contains? first-entry :chunk-next-index)))
                          (is (= first-entry second-entry)
                              "the complete transmitted entry is byte-stable across retry")
                          (is (= (:tx first-entry) (:tx second-entry))
@@ -12955,12 +12958,18 @@
               (-> (sync-apply/prepare-upload-tx-entries
                    repo conn [rewritten-pending])
                   :tx-entries first)]
-          (is (= (count (:tx-data rebased-after-old-ack))
-                 (:chunk-index final-entry))
-              "the next offset equals the number of staged datoms")
+          (is (= 1 (:chunk-index final-entry))
+              "the next wire ordinal is independent of the source slice size")
+          (is (= (count rewritten-tx)
+                 (:large-upload-next-index final-entry))
+              "the separate source cursor reaches the full logical tx")
           (is (true? (:chunk-final? final-entry)))
-          (is (= tx-id (:tx-id final-entry))
-              "the logical UUID is reserved for final completion")
+          (is (= (expected-chunk-tx-id
+                  tx-id (:upload-session-id final-entry) 1 true)
+                 (:tx-id final-entry))
+              "final wire identity binds logical/session/ordinal/final")
+          (is (not= tx-id (:tx-id final-entry)))
+          (is (not (contains? final-entry :chunk-next-index)))
           (is (= (:upload-session-id rebased-after-old-ack)
                  (:upload-session-id final-entry)))
 
@@ -13057,6 +13066,7 @@
               (is (= (str logical-tx-id) (:logical-tx-id entry)))
               (is (= 0 (:chunk-index entry)))
               (is (false? (:chunk-final? entry)))
+              (is (not (contains? entry :chunk-next-index)))
               (is (string? (:upload-session-id entry)))
               (is (string? (:tx-id entry))))
             (p/catch (fn [error]
@@ -13289,7 +13299,7 @@
                        (map (fn [idx]
                               [:db/add [:block/uuid block-uuid]
                                :block/updated-at idx])
-                            (range 5000)))
+                            (range 4999)))
                  ;; Apply before installing the db-sync listener below. The
                  ;; durable pending row is seeded explicitly as one logical op.
                  _ (d/transact! conn logical-tx)
@@ -13346,6 +13356,13 @@
                               _ (do
                                   (is (= 0 (:chunk-index first-entry)))
                                   (is (false? (:chunk-final? first-entry)))
+                                  (is (= 5000
+                                         (count
+                                          (sync-protocol/transit->tx
+                                           (:tx first-entry))))
+                                      "offload expands 5000 logical datoms to a full first wire chunk")
+                                  (is (not (contains? first-entry
+                                                      :chunk-next-index)))
                                   (is (= "tx/batch/ok"
                                          (-> first-exchange :response :type)))
                                   (is (= server-t0 (sync-handler/t-now server-self))
@@ -13372,8 +13389,15 @@
                                          (:logical-tx-id final-entry)))
                                   (is (= (:upload-session-id first-entry)
                                          (:upload-session-id final-entry)))
-                                  (is (pos? (:chunk-index final-entry)))
+                                  (is (= 1 (:chunk-index final-entry)))
                                   (is (true? (:chunk-final? final-entry)))
+                                  (is (= 1
+                                         (count
+                                          (sync-protocol/transit->tx
+                                           (:tx final-entry))))
+                                      "the offload marker remainder is final ordinal one")
+                                  (is (not (contains? final-entry
+                                                      :chunk-next-index)))
                                   (is (= "tx/batch/ok"
                                          (-> final-attempt :response :type)))
                                   (is (= (inc server-t0)
