@@ -1,6 +1,19 @@
 (ns logseq.db-sync.protocol
   (:require [clojure.walk :as walk]
+            [goog.crypt :as gcrypt]
+            [goog.crypt.Sha256]
             [logseq.db-sync.common :as common]))
+
+(defn tx-payload-digest
+  [outliner-op chunk-final? tx-data]
+  (let [digest (goog.crypt.Sha256.)
+        canonical (common/write-transit
+                   [:client-tx-payload-v1
+                    outliner-op
+                    (boolean chunk-final?)
+                    tx-data])]
+    (.update digest canonical)
+    (gcrypt/byteArrayToHex (.digest digest))))
 
 (defn- stringify-uuid
   [value]

@@ -52,17 +52,11 @@
     (try
       (storage/init-schema! (.-sql self))
       (catch :default e
-        ;; Schema may already exist. If DDL writes are rejected, probe
-        ;; existing tables before deciding this is a fatal error.
-        (try
-          (common/sql-exec (.-sql self) "select 1 from kvs limit 1")
-          (common/sql-exec (.-sql self) "select 1 from snapshot_kvs_staging limit 1")
-          (common/sql-exec (.-sql self) "select 1 from snapshot_downloads limit 1")
-          (common/sql-exec (.-sql self) "select 1 from snapshot_kvs_exports limit 1")
-          (common/sql-exec (.-sql self) "select 1 from tx_log limit 1")
-          (common/sql-exec (.-sql self) "select 1 from sync_meta limit 1")
-          (catch :default _
-            (throw e)))))
+        ;; Some runtimes reject repeated DDL after a schema is initialized.
+        ;; Accept that only after proving every required table, column and
+        ;; idempotency index exists; a partial migration must remain unready.
+        (when-not (storage/schema-ready? (.-sql self))
+          (throw e))))
     (set! (.-schema-ready self) true)))
 
 (defn- ensure-conn! [^js self]
@@ -181,6 +175,7 @@
   [sql]
   (common/sql-exec sql "delete from kvs")
   (common/sql-exec sql "delete from tx_log")
+  (common/sql-exec sql "delete from applied_client_txs")
   (common/sql-exec sql "delete from sync_meta")
   (storage/set-t! sql 0))
 
@@ -770,6 +765,7 @@
         (str "insert into kvs (addr, content, addresses) "
              "select addr, content, addresses from " snapshot-staging-table))
        (common/sql-exec sql "delete from tx_log")
+       (common/sql-exec sql "delete from applied_client_txs")
        (common/sql-exec sql "delete from sync_meta")
        (storage/set-t! sql 0)
        (when (seq checksum)
@@ -782,6 +778,70 @@
   [sql upload-id]
   (when (= upload-id (:upload-id (snapshot-upload-session sql)))
     (common/sql-exec sql (str "delete from " snapshot-staging-table))))
+
+(defn- tx-entry-identity
+  [{:keys [tx-id logical-tx-id chunk-index chunk-final?] :as tx-entry}]
+  (let [chunk-metadata? (some #(contains? tx-entry %)
+                              [:logical-tx-id :chunk-index :chunk-final?])]
+    (cond
+      chunk-metadata?
+      (do
+        (when-not (and (uuid? logical-tx-id)
+                       (integer? chunk-index)
+                       (not (neg? chunk-index))
+                       (boolean? chunk-final?)
+                       (or chunk-final? (nil? tx-id)))
+          (throw (ex-info "invalid tx chunk identity"
+                          (cond-> {:type :db-sync/invalid-tx-chunk-identity}
+                            tx-id (assoc :failed-tx-id tx-id)))))
+        (str "chunk/" logical-tx-id "/" chunk-index))
+
+      tx-id
+      (str "tx/" tx-id)
+
+      :else
+      nil)))
+
+(defn- tx-entry-payload-digest
+  [{:keys [tx outliner-op chunk-final? payload-digest]}]
+  ;; Decode then re-encode the request so semantically identical Transit
+  ;; payloads use one canonical representation. Bind outliner/chunk semantics
+  ;; as well as datoms to the idempotency identity.
+  (or payload-digest
+      (protocol/tx-payload-digest
+       outliner-op chunk-final? (protocol/transit->tx tx))))
+
+(defn- prepare-tx-batch
+  [sql tx-entries]
+  (let [prepared
+        (mapv (fn [tx-entry]
+                (let [identity (tx-entry-identity tx-entry)]
+                  (cond-> (assoc tx-entry
+                                 ::payload-digest
+                                 (tx-entry-payload-digest tx-entry))
+                    identity (assoc ::identity identity))))
+              tx-entries)
+        identities (into [] (keep ::identity) prepared)
+        duplicate-identity
+        (some (fn [[identity n]]
+                (when (> n 1) identity))
+              (frequencies identities))]
+    (when duplicate-identity
+      (let [entry (some #(when (= duplicate-identity (::identity %)) %) prepared)]
+        (throw (ex-info "duplicate tx identity in batch"
+                        (cond-> {:type :db-sync/duplicate-tx-identity}
+                          (:tx-id entry) (assoc :failed-tx-id (:tx-id entry)))))))
+    (let [persisted (storage/applied-client-tx-records sql identities)]
+      (doseq [{:keys [tx-id] :as entry} prepared
+              :let [identity (::identity entry)
+                    previous-digest (get persisted identity)]
+              :when (and previous-digest
+                         (not= previous-digest (::payload-digest entry)))]
+        (throw (ex-info "tx identity payload conflict"
+                        (cond-> {:type :db-sync/tx-identity-conflict}
+                          tx-id (assoc :failed-tx-id tx-id)))))
+      {:tx-entries prepared
+       :applied-identities (set (keys persisted))})))
 
 (defn- apply-client-tx-meta
   [request-context outliner-op tx-id]
@@ -796,7 +856,7 @@
            :skip-validate-db? true)))
 
 (defn- apply-large-tx-entry!
-  [self conn tx-data {:keys [tx-id outliner-op]} request-context]
+  [self conn tx-data {:keys [tx-id outliner-op] :as tx-entry} request-context]
   (let [db-before @conn
         tx-meta (apply-client-tx-meta request-context outliner-op nil)
         sql (when self (.-sql ^js self))
@@ -866,7 +926,9 @@
              (when verified-checksum-metadata?
                (storage/mark-checksum-metadata-verified!
                 sql
-                (storage/get-t sql))))
+                (storage/get-t sql)))
+             (storage/record-applied-client-tx!
+              sql (::identity tx-entry) (::payload-digest tx-entry)))
            (finally
              (when sql
                (d/unlisten! conn ::large-logical-tx-checksum))))))
@@ -905,78 +967,77 @@
   ([conn tx-entry]
    (apply-tx-entry! nil conn tx-entry nil))
   ([self conn {:keys [tx-id outliner-op] :as tx-entry} request-context]
-   (let [sanitized (sanitize-tx-entry @conn tx-entry)
+   (let [db-before @conn
+         sql (when self (.-sql ^js self))
+         sanitized (sanitize-tx-entry db-before tx-entry)
          input-tx-data (:input-tx-data sanitized)
          tx-data (:tx-data sanitized)
-         sanitized-entry (:tx-entry sanitized)]
-     (if (seq tx-data)
+         sanitized-entry (:tx-entry sanitized)
+         apply-entry
+         (fn []
+           (if (seq tx-data)
+             (try
+               (ldb/transact! conn tx-data
+                              (apply-client-tx-meta request-context outliner-op tx-id))
+               true
+               (catch :default e
+                 ;; Rebase/fix txs are inferred from local history and can become stale
+                 ;; when concurrent remote edits remove referenced entities before upload.
+                 ;; Treat stale :entity-id/missing rebases/fixes as an accepted no-op.
+                 (if (and (contains? #{:rebase :fix} outliner-op)
+                          (= :entity-id/missing (:error (ex-data e))))
+                   (do
+                     (log/warn :db-sync/drop-stale-rebase-tx
+                               {:outliner-op outliner-op
+                                :tx-count (count tx-data)
+                                :error-code (or (:error (ex-data e))
+                                                (:type (ex-data e))
+                                                :stale-rebase)})
+                     false)
+                   (throw e))))
+             (if (and (contains? delete-outliner-ops outliner-op)
+                      (empty? input-tx-data))
+               (throw (ex-info "delete tx input is empty"
+                               {:type :db-sync/empty-delete-tx
+                                :outliner-op outliner-op}))
+               false)))]
+     (if (and (not= outliner-op :db-migrate)
+              (large-tx? tx-data))
+       (apply-large-tx-entry! self conn tx-data sanitized-entry request-context)
        (try
-         (if (and (not= outliner-op :db-migrate)
-                  (large-tx? tx-data))
-           (apply-large-tx-entry! self conn tx-data sanitized-entry request-context)
-           (do
-             (ldb/transact! conn tx-data
-                            (apply-client-tx-meta request-context outliner-op tx-id))
-             true))
-         (catch :default e
-           ;; Rebase/fix txs are inferred from local history and can become stale
-           ;; when concurrent remote edits remove referenced entities before upload.
-           ;; Treat stale :entity-id/missing rebases/fixes as no-op so sync can continue.
-           (if (and (contains? #{:rebase :fix} outliner-op)
-                    (= :entity-id/missing (:error (ex-data e))))
-             (do
-               (log/warn :db-sync/drop-stale-rebase-tx
-                         {:outliner-op outliner-op
-                          :tx-count (count tx-data)
-                          :error-code (or (:error (ex-data e))
-                                          (:type (ex-data e))
-                                          :stale-rebase)})
-               false)
-             (throw e))))
-       (if (and (contains? delete-outliner-ops outliner-op)
-                (empty? input-tx-data))
-         (throw (ex-info "delete tx input is empty"
-                         {:type :db-sync/empty-delete-tx
-                          :outliner-op outliner-op}))
-         false)))))
+         ((if sql
+            #(storage/with-sql-transaction! sql %)
+            (fn [f] (f)))
+          (fn []
+            (let [applied? (apply-entry)]
+              (when sql
+                ;; This explicit marker also covers accepted no-op txs, for
+                ;; which the Datascript listener has no tx_log row to attach.
+                (storage/record-applied-client-tx!
+                 sql (::identity tx-entry) (::payload-digest tx-entry)))
+              applied?)))
+         (catch :default error
+           ;; SQL rollback restores KVS/log/meta. Datascript has already
+           ;; published its in-memory db by the time a listener can fail, so
+           ;; restore that view explicitly to keep current/fresh conns equal.
+           (reset! conn db-before)
+           (throw error)))))))
 
-(defn- apply-tx! [^js self tx-entries request-context]
+(defn- apply-tx! [^js self tx-entries applied-identities request-context]
   (let [sql (.-sql self)]
     (ensure-conn! self)
-    (let [conn (.-conn self)
-          preexisting-tx-ids
-          (->> tx-entries
-               (keep :tx-id)
-               distinct
-               (filter (partial storage/tx-id-applied? sql))
-               set)
-          last-index-by-tx-id
-          (reduce-kv (fn [result idx {:keys [tx-id]}]
-                       (cond-> result
-                         tx-id (assoc tx-id idx)))
-                     {}
-                     (vec tx-entries))]
+    (let [conn (.-conn self)]
       (loop [remaining tx-entries
-             entry-index 0
              applied? false
              successful-tx-ids []]
         (if-let [tx-entry (first remaining)]
           (let [tx-id (:tx-id tx-entry)
-                already-applied? (contains? preexisting-tx-ids tx-id)
-                ;; Some older clients split one logical operation into
-                ;; multiple entries carrying the same tx-id. Apply every
-                ;; entry in this request, but persist the idempotency marker
-                ;; only on its final entry so the unique index remains valid.
-                tx-entry-to-apply
-                (cond-> tx-entry
-                  (and tx-id
-                       (not= entry-index (get last-index-by-tx-id tx-id)))
-                  (dissoc :tx-id))
+                already-applied? (contains? applied-identities (::identity tx-entry))
                 applied-entry? (if already-applied?
                                  false
                                  (try
                                    (boolean (apply-tx-entry!
-                                             self conn tx-entry-to-apply request-context))
+                                             self conn tx-entry request-context))
                                    (catch :default e
                                      (log/error :db-sync/transact-failed
                                                 (common/error-log-data e))
@@ -991,7 +1052,6 @@
                 next-successful-tx-ids (cond-> successful-tx-ids
                                          tx-id (conj tx-id))]
             (recur (next remaining)
-                   (inc entry-index)
                    (or applied? applied-entry?)
                    next-successful-tx-ids))
           (let [new-t (storage/get-t sql)]
@@ -1022,17 +1082,20 @@
        :else
        (if (seq txs)
          (try
-           ;; Migrate persisted checksum metadata before extending it. Older
-           ;; deployed servers did not write the verification watermark, so a
-           ;; first HTTP batch is just as safe as a hello/pull-first session.
-           (verify-current-checksums! self)
-           (let [{:keys [t applied?]} (apply-tx! self txs request-context)]
-             (when applied?
-               ;; Broadcast once per processed batch after tx-log/checksum settle.
-               (ws/broadcast! self sender {:type "changed" :t t}))
-             (merge {:type "tx/batch/ok"
-                     :t t}
-                    (checksum-response-fields self)))
+           (let [{:keys [tx-entries applied-identities]}
+                 (prepare-tx-batch (.-sql self) txs)]
+             ;; Migrate persisted checksum metadata before extending it. Older
+             ;; deployed servers did not write the verification watermark, so a
+             ;; first HTTP batch is just as safe as a hello/pull-first session.
+             (verify-current-checksums! self)
+             (let [{:keys [t applied?]}
+                   (apply-tx! self tx-entries applied-identities request-context)]
+               (when applied?
+                 ;; Broadcast once per processed batch after tx-log/checksum settle.
+                 (ws/broadcast! self sender {:type "changed" :t t}))
+               (merge {:type "tx/batch/ok"
+                       :t t}
+                      (checksum-response-fields self))))
            (catch :default e
              (let [new-t (t-now self)
                    error-data (or (ex-data e) {})
@@ -1245,6 +1308,7 @@
           (common/sql-exec (.-sql self) "drop table if exists snapshot_kvs_exports")
           (common/sql-exec (.-sql self) "drop table if exists snapshot_downloads")
           (common/sql-exec (.-sql self) "drop table if exists tx_log")
+          (common/sql-exec (.-sql self) "drop table if exists applied_client_txs")
           (common/sql-exec (.-sql self) "drop table if exists sync_meta")
           (storage/init-schema! (.-sql self))
           (set! (.-schema-ready self) true)

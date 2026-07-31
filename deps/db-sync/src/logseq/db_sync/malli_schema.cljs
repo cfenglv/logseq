@@ -5,6 +5,10 @@
 (def tx-entry-schema
   [:map
    [:tx-id {:optional true} :uuid]
+   [:logical-tx-id {:optional true} :uuid]
+   [:chunk-index {:optional true} :int]
+   [:chunk-final? {:optional true} :boolean]
+   [:payload-digest {:optional true} :string]
    [:tx :string]
    [:outliner-op {:optional true} [:maybe :keyword]]])
 

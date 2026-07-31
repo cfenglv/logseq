@@ -24,6 +24,7 @@
    [logseq.db :as ldb]
    [logseq.db-sync.checksum :as sync-checksum]
    [logseq.db-sync.order :as sync-order]
+   [logseq.db-sync.protocol :as sync-protocol]
    [logseq.db-sync.tx-sanitize :as tx-sanitize]
    [logseq.db.common.normalize :as db-normalize]
    [logseq.db.sqlite.util :as sqlite-util]
@@ -904,6 +905,9 @@
                :final? final?})
     (cond-> (assoc entry
                    :tx-data chunk
+                   :logical-tx-id tx-id
+                   :chunk-index start
+                   :chunk-final? final?
                    :large-upload-original-tx-id tx-id
                    :large-upload-next-index next-index
                    :large-upload-final? final?)
@@ -1199,7 +1203,8 @@
                             _ (when (and (seq tx-entries) (sync-crypt/graph-e2ee? repo) (nil? aes-key))
                                 (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
                             tx-entries* (p/all
-                                         (mapv (fn [{:keys [tx-data] :as tx-entry}]
+                                         (mapv (fn [{:keys [logical-tx-id chunk-final?
+                                                           outliner-op tx-data] :as tx-entry}]
                                                  (p/let [tx-data* (offload-large-titles
                                                                    tx-data
                                                                    {:repo repo
@@ -1208,15 +1213,28 @@
                                                          tx-data** (if aes-key
                                                                      (sync-crypt/<encrypt-tx-data aes-key tx-data*)
                                                                      tx-data*)]
-                                                   (assoc tx-entry
-                                                          :tx-data tx-data**
-                                                          :large-title-logical-tx-data
-                                                          tx-data)))
+                                                   (cond-> (assoc tx-entry
+                                                                  :tx-data tx-data**
+                                                                  :large-title-logical-tx-data
+                                                                  tx-data)
+                                                     logical-tx-id
+                                                     (assoc :payload-digest
+                                                            (sync-protocol/tx-payload-digest
+                                                             outliner-op chunk-final? tx-data)))))
                                                tx-entries))
-                            payload (mapv (fn [{:keys [tx-id tx-data outliner-op]}]
+                            payload (mapv (fn [{:keys [tx-id logical-tx-id chunk-index
+                                                      chunk-final? payload-digest tx-data outliner-op]}]
                                             (cond-> {:tx (sqlite-util/write-transit-str tx-data)}
                                               tx-id
                                               (assoc :tx-id (str tx-id))
+                                              logical-tx-id
+                                              (assoc :logical-tx-id (str logical-tx-id))
+                                              (some? chunk-index)
+                                              (assoc :chunk-index chunk-index)
+                                              (some? chunk-final?)
+                                              (assoc :chunk-final? chunk-final?)
+                                              payload-digest
+                                              (assoc :payload-digest payload-digest)
                                               outliner-op
                                               (assoc :outliner-op outliner-op)))
                                           tx-entries*)

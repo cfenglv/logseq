@@ -2171,16 +2171,16 @@
         (is (= [(second rows)] (first pending)))
         (is (= [(first rows)] (snapshot/decode-rows payload)))))))
 
-(deftest ensure-schema-fallback-probes-existing-tables-test
+(deftest ensure-schema-fallback-validates-existing-schema-test
   (async done
          (let [self #js {:sql (empty-sql)}
-               schema-probes (atom [])
+               schema-validations (atom 0)
                {:keys [request url]} (request-url "/sync/graph-1/pull?graph-id=graph-1&since=0")]
            (-> (p/with-redefs [storage/init-schema! (fn [_]
                                                       (throw (js/Error. "ddl rejected")))
-                               common/sql-exec (fn [_ sql-str & _args]
-                                                 (swap! schema-probes conj sql-str)
-                                                 #js [])
+                               storage/schema-ready? (fn [_]
+                                                       (swap! schema-validations inc)
+                                                       true)
                                storage/fetch-tx-since (fn [_ _] [])
                                storage/get-t (fn [_] 7)
                                sync-handler/current-checksum (fn [_] "checksum-ok")
@@ -2191,20 +2191,14 @@
                                                     :url url
                                                     :route {:handler :sync/pull}})
                          text (.text resp)
-                         body (js->clj (js/JSON.parse text) :keywordize-keys true)
-                         probe-set (set @schema-probes)]
+                         body (js->clj (js/JSON.parse text) :keywordize-keys true)]
                    (is (= 200 (.-status resp)))
                    (is (= 7 (:t body)))
                    (is (= "checksum-ok" (:checksum body)))
                    (is (= sync-checksum/server-checksum-version
                           (:checksum-version body)))
                    (is (= "server-checksum-ok" (:server-checksum body)))
-                   (is (contains? probe-set "select 1 from kvs limit 1"))
-                   (is (contains? probe-set "select 1 from snapshot_kvs_staging limit 1"))
-                   (is (contains? probe-set "select 1 from snapshot_downloads limit 1"))
-                   (is (contains? probe-set "select 1 from snapshot_kvs_exports limit 1"))
-                   (is (contains? probe-set "select 1 from tx_log limit 1"))
-                   (is (contains? probe-set "select 1 from sync_meta limit 1"))))
+                   (is (= 1 @schema-validations))))
                (p/then (fn []
                          (done)))
                (p/catch (fn [error]

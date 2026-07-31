@@ -74,14 +74,58 @@
                         ");"))
   (ensure-tx-log-outliner-op-column! sql)
   (ensure-tx-log-tx-id-column! sql)
-  (common/sql-exec sql
-                   (str "create unique index if not exists tx_log_tx_id "
-                        "on tx_log(tx_id) where tx_id is not null"))
+  (common/sql-exec
+   sql
+   (str "create table if not exists applied_client_txs ("
+        "identity TEXT primary key,"
+        "payload_digest TEXT not null,"
+        "created_at INTEGER not null"
+        ");"))
+  (common/sql-exec
+   sql
+   (str "create unique index if not exists applied_client_tx_identity "
+        "on applied_client_txs(identity)"))
   (common/sql-exec sql
                    (str "create table if not exists sync_meta ("
                         "key TEXT primary key,"
                         "value TEXT"
                         ");")))
+
+(def ^:private required-schema-columns
+  {"kvs" #{"addr" "content" "addresses"}
+   "snapshot_kvs_staging" #{"addr" "content" "addresses"}
+   "snapshot_downloads" #{"download_id" "t" "checksum" "row_count" "created_at"}
+   "snapshot_kvs_exports" #{"download_id" "addr" "content" "addresses"}
+   "tx_log" #{"t" "tx" "created_at" "outliner_op" "tx_id"}
+   "applied_client_txs" #{"identity" "payload_digest" "created_at"}
+   "sync_meta" #{"key" "value"}})
+
+(declare select-one)
+
+(defn schema-ready?
+  "Return true only when every table/column/index needed by the sync handler is
+  queryable. Used after a rejected idempotent DDL statement; table existence
+  alone is not sufficient evidence that an online migration completed."
+  [sql]
+  (try
+    (and
+     (every?
+      (fn [[table required-columns]]
+        (let [rows (common/get-sql-rows
+                    (common/sql-exec
+                     sql
+                     (str "select name from pragma_table_info('" table "')")))
+              actual-columns (into #{} (map #(aget % "name")) rows)]
+          (every? actual-columns required-columns)))
+      required-schema-columns)
+     (boolean
+      (select-one
+       sql
+       (str "select 1 as present from sqlite_master "
+            "where type = 'index' and name = ? limit 1")
+       "applied_client_tx_identity")))
+    (catch :default _
+      false)))
 
 (defn- select-one [sql sql-str & args]
   (first (common/get-sql-rows (apply common/sql-exec sql sql-str args))))
@@ -266,6 +310,36 @@
                      "update tx_log set tx_id = ? where t = ?"
                      (str tx-id)
                      t)))
+
+(defn applied-client-tx-records
+  "Fetch all requested idempotency identities with one indexed query."
+  [sql identities]
+  (let [identities (->> identities (filter string?) distinct vec)]
+    (if (seq identities)
+      (let [placeholders (string/join "," (repeat (count identities) "?"))
+            rows (common/get-sql-rows
+                  (apply common/sql-exec
+                         sql
+                         (str "select identity, payload_digest "
+                              "from applied_client_txs where identity in ("
+                              placeholders ")")
+                         identities))]
+        (into {}
+              (map (fn [row]
+                     [(aget row "identity") (aget row "payload_digest")]))
+              rows))
+      {})))
+
+(defn record-applied-client-tx!
+  [sql identity payload-digest]
+  (when identity
+    (common/sql-exec
+     sql
+     (str "insert into applied_client_txs "
+          "(identity, payload_digest, created_at) values (?, ?, ?)")
+     identity
+     payload-digest
+     (common/now-ms))))
 
 (defn fetch-tx-since [sql since-t]
   (let [rows (common/get-sql-rows

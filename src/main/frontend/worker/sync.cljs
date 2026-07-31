@@ -406,13 +406,17 @@
         (fn [error]
           (log/error :db-sync/ws-error error)
           (when (identical? ws (:ws @worker-state/*db-sync-client))
+            (sync-util/set-last-sync-error!
+             client
+             (ex-info "db-sync/websocket-error"
+                      {:type :db-sync/websocket-error}))
             (invalidate-connection! repo client ws url :error true))))
   (set! (.-onclose ws)
         (fn [_]
           (when (identical? ws (:ws @worker-state/*db-sync-client))
             (log/info :db-sync/ws-closed {:repo repo})
             (when (or (seq (some-> (:inflight client) deref))
-                      (seq (some-> (:upload-request client) deref :tx-ids)))
+                      (some? (some-> (:upload-request client) deref)))
               (sync-util/set-last-sync-error!
                client
                (ex-info "db-sync/upload-connection-closed"
