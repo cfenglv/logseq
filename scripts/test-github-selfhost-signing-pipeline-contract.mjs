@@ -64,13 +64,15 @@ const singleJobWithEnvironment = (jobs, environmentName) => {
 
 const permissionsFor = (jobSource) => {
   const block = jobSource.match(
-    /^    permissions:\s*\n((?:^      [a-zA-Z0-9_-]+:\s*[a-z]+\s*\n?)+)/m,
+    /^    permissions:[ \t]*\n((?:^      [a-zA-Z0-9_-]+:[ \t]*[a-z]+[ \t]*\n?)+)/m,
   );
   assert.ok(block, "job must declare its permissions explicitly");
   return new Map(
-    [...block[1].matchAll(/^      ([a-zA-Z0-9_-]+):\s*([a-z]+)\s*$/gm)].map(
-      (match) => [match[1], match[2]],
-    ),
+    [
+      ...block[1].matchAll(
+        /^      ([a-zA-Z0-9_-]+):[ \t]*([a-z]+)[ \t]*$/gm,
+      ),
+    ].map((match) => [match[1], match[2]]),
   );
 };
 
@@ -320,13 +322,37 @@ addCase(
     );
     const entry = discoverCiSigningEntry(signing.source);
     const closure = relativeModuleClosure([entry]);
-    const closureSource = [...closure].map((relativePath) => read(relativePath)).join("\n");
+    const closureSources = [...closure].map((relativePath) => ({
+      relativePath,
+      source: read(relativePath),
+    }));
+    const closureSource = closureSources.map(({ source }) => source).join("\n");
+    const literalConsumers = trackedFiles().filter(
+      (relativePath) =>
+        /^scripts\/.*\.mjs$/.test(relativePath) &&
+        !/^scripts\/test-/.test(relativePath) &&
+        read(relativePath).includes(privateKeyEnvironmentName),
+    );
+    assert.equal(
+      literalConsumers.length,
+      1,
+      `canonical signing secret must have one production consumer; found ${
+        literalConsumers.join(", ") || "none"
+      }`,
+    );
+    assert.ok(
+      closure.has(literalConsumers[0]),
+      "the unique canonical-secret consumer is outside the protected signer closure",
+    );
     assert.match(
       closureSource,
-      new RegExp(
-        `process\\.env(?:\\.${privateKeyEnvironmentName}|\\[['\"]${privateKeyEnvironmentName}['\"]\\])`,
-      ),
-      "CI signer does not read the key directly from its fixed environment variable",
+      /process\.env(?:\[[^\]]+\]|\.[A-Z][A-Z0-9_]*)/,
+      "CI signer closure has no environment consumer for its fixed key name",
+    );
+    assert.match(
+      closureSource,
+      /delete\s+process\.env(?:\[[^\]]+\]|\.[A-Z][A-Z0-9_]*)/,
+      "CI signer does not remove the secret from process.env after reading it",
     );
     assert.doesNotMatch(
       closureSource,
@@ -496,8 +522,8 @@ addCase(
     );
     assert.match(
       signing.source,
-      /(?:SOURCE_REVISION|--source-(?:sha|revision))[\s\S]{0,160}(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))|(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))[\s\S]{0,160}(?:SOURCE_REVISION|--source-(?:sha|revision))/,
-      "SOURCE_REVISION is not bound directly to the exact rehearsed SHA",
+      /(?:--(?:expected-)?source-(?:sha|revision)|EXPECTED_SOURCE_(?:SHA|REVISION)|SOURCE_SHA)[\s\S]{0,160}(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))|(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))[\s\S]{0,160}(?:--(?:expected-)?source-(?:sha|revision)|EXPECTED_SOURCE_(?:SHA|REVISION)|SOURCE_SHA)/,
+      "GitHub finalizer is not passed the exact rehearsed source SHA",
     );
     const signingEffectiveSource = `${signing.source}\n${jobProductionScriptClosureSource(
       signing.source,
@@ -509,8 +535,28 @@ addCase(
     );
     assert.match(
       signingEffectiveSource,
+      /GITHUB_SHA/,
+      "signing closure does not validate GitHub's checked-out source SHA",
+    );
+    assert.match(
+      signingEffectiveSource,
+      /GITHUB_ACTIONS|github actions/i,
+      "signing closure does not validate that it is running in GitHub Actions",
+    );
+    assert.match(
+      signingEffectiveSource,
+      /(?:!==|===|assert\.(?:equal|strictEqual)|timingSafeEqual)/,
+      "signing closure does not compare GitHub's source SHA exactly",
+    );
+    assert.match(
+      signingEffectiveSource,
       /(?:writeFile(?:Sync)?|appendFile(?:Sync)?)[\s\S]{0,280}SOURCE_REVISION|SOURCE_REVISION[\s\S]{0,280}(?:writeFile(?:Sync)?|appendFile(?:Sync)?)/,
       "signing closure does not write SOURCE_REVISION into the finalized artifact",
+    );
+    assert.match(
+      signingEffectiveSource,
+      /rename(?:Sync)?/,
+      "SOURCE_REVISION is not finalized with an atomic rename",
     );
 
     const finalVerifierMatches = [...jobs].filter(([name, source]) => {
@@ -536,7 +582,7 @@ addCase(
     );
     assert.match(
       finalVerifier,
-      /(?:SOURCE_REVISION|--source-(?:sha|revision))[\s\S]{0,160}(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))|(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))[\s\S]{0,160}(?:SOURCE_REVISION|--source-(?:sha|revision))/,
+      /(?:--(?:expected-)?source-(?:sha|revision)|EXPECTED_SOURCE_(?:SHA|REVISION)|SOURCE_SHA)[\s\S]{0,160}(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))|(?:needs\.release-rehearsal-gate\.outputs\.(?:sha|source-sha|source_sha))[\s\S]{0,160}(?:--(?:expected-)?source-(?:sha|revision)|EXPECTED_SOURCE_(?:SHA|REVISION)|SOURCE_SHA)/,
       "final verifier is not passed the exact rehearsed SHA",
     );
     const finalVerifierEffectiveSource = `${finalVerifier}\n${jobProductionScriptClosureSource(
@@ -617,10 +663,20 @@ addCase(
       "publishing job has unrelated write permissions",
     );
     assert.doesNotMatch(publishing.source, new RegExp(privateKeyEnvironmentName));
+    const publisherSecretNames = [
+      ...publishing.source.matchAll(/\bsecrets\.([A-Z][A-Z0-9_]*)/g),
+    ].map((match) => match[1]);
+    assert.equal(
+      publisherSecretNames.every((name) => name === "GITHUB_TOKEN"),
+      true,
+      `publisher references nonstandard secrets: ${publisherSecretNames
+        .filter((name) => name !== "GITHUB_TOKEN")
+        .join(", ")}`,
+    );
     assert.doesNotMatch(
       publishing.source,
-      /\bsecrets\./,
-      "publisher references a secret instead of its scoped contents permission",
+      /secrets\.[A-Z][A-Z0-9_]*(?:PROJECT|UPDATER|ED25519|PKCS8|PRIVATE|SIGNING)[A-Z0-9_]*/i,
+      "publisher can access a project-update signing secret",
     );
     assert.doesNotMatch(signing.source, /contents:\s*write/);
     assert.doesNotMatch(verifier, /contents:\s*write/);
