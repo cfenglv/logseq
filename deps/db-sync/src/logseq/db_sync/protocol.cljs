@@ -19,6 +19,16 @@
      (boolean chunk-final?)
      tx-data])))
 
+(defn tx-upload-completed-digest
+  "Bind a completed staged upload to the ordered, server-computed wire
+  digests without serializing the assembled logical transaction again."
+  [outliner-op ordered-wire-digests]
+  (sha256-hex
+   (common/write-transit
+    [:client-tx-upload-completed-v1
+     outliner-op
+     (vec ordered-wire-digests)])))
+
 (defn tx-upload-session-id
   "Stable content-addressed upload generation. A rebase that changes the
   normalized logical transaction necessarily starts a different session."
@@ -32,30 +42,29 @@
 (defn tx-wire-payload-digest
   "Server-verifiable binding for the actual chunk envelope. Never substitute a
   client-declared digest for this value."
-  [{:keys [tx-id logical-tx-id upload-session-id chunk-index chunk-next-index chunk-final?
+  [{:keys [tx-id logical-tx-id upload-session-id chunk-index chunk-final?
            outliner-op tx]}]
   (sha256-hex
    (common/write-transit
-    [:client-tx-wire-v1 tx-id logical-tx-id upload-session-id chunk-index chunk-next-index
+    [:client-tx-wire-v1 tx-id logical-tx-id upload-session-id chunk-index
      (boolean chunk-final?) outliner-op (transit->tx tx)])))
 
 (defn tx-chunk-id
-  "Derive a stable UUID for a nonfinal chunk without consuming the logical tx
-  id that the client uses to mark the complete operation finished."
+  "Derive a stable UUID for every staged wire chunk. The logical transaction
+  id remains a local pending-row identity and never doubles as a wire id."
   [logical-tx-id upload-session-id chunk-index chunk-final?]
-  (if chunk-final?
-    logical-tx-id
-    (let [hex (sha256-hex (str "logseq-tx-chunk-v1/"
-                               logical-tx-id "/" upload-session-id "/"
-                               chunk-index))
-          ;; UUIDv5-compatible version/variant bits over our SHA-256 prefix.
-          uuid-hex (str (subs hex 0 12) "5" (subs hex 13 16)
-                        "8" (subs hex 17 32))]
-      (uuid (str (subs uuid-hex 0 8) "-"
-                 (subs uuid-hex 8 12) "-"
-                 (subs uuid-hex 12 16) "-"
-                 (subs uuid-hex 16 20) "-"
-                 (subs uuid-hex 20 32))))))
+  (let [hex (sha256-hex (str "logseq-tx-chunk-v2/"
+                             logical-tx-id "/" upload-session-id "/"
+                             chunk-index "/"
+                             (if chunk-final? "final" "more")))
+        ;; UUIDv5-compatible version/variant bits over our SHA-256 prefix.
+        uuid-hex (str (subs hex 0 12) "5" (subs hex 13 16)
+                      "8" (subs hex 17 32))]
+    (uuid (str (subs uuid-hex 0 8) "-"
+               (subs uuid-hex 8 12) "-"
+               (subs uuid-hex 12 16) "-"
+               (subs uuid-hex 16 20) "-"
+               (subs uuid-hex 20 32)))))
 
 (defn- stringify-uuid
   [value]

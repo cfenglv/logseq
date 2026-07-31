@@ -790,7 +790,7 @@
     (common/sql-exec sql (str "delete from " snapshot-staging-table))))
 
 (defn- tx-entry-identity
-  [{:keys [tx tx-id logical-tx-id upload-session-id chunk-index chunk-next-index chunk-final?
+  [{:keys [tx tx-id logical-tx-id upload-session-id chunk-index chunk-final?
            outliner-op]
     :as tx-entry}]
   (let [chunk-metadata? (some #(contains? tx-entry %)
@@ -805,9 +805,10 @@
                        (boolean (re-matches #"[0-9a-f]{64}" upload-session-id))
                        (integer? chunk-index)
                        (not (neg? chunk-index))
-                       (or (nil? chunk-next-index)
-                           (and (integer? chunk-next-index)
-                                (> chunk-next-index chunk-index)))
+                       ;; Source slicing progress is client-local state. Even a
+                       ;; numerically plausible span field must be rejected,
+                       ;; never accepted as server authority.
+                       (not (contains? tx-entry :chunk-next-index))
                        (boolean? chunk-final?)
                        (keyword? outliner-op)
                        (= tx-id
@@ -1013,12 +1014,12 @@
   [tx-entry chunks]
   (loop [expected-index 0
          remaining chunks]
-    (if-let [{:keys [chunk-index datom-count]} (first remaining)]
+    (if-let [{:keys [chunk-index]} (first remaining)]
       (if (= expected-index chunk-index)
-        (recur (+ expected-index datom-count) (next remaining))
+        (recur (inc expected-index) (next remaining))
         (throw (upload-state-error
                 :db-sync/upload-session-corrupt tx-entry
-                "stored upload chunks are not contiguous")))
+                "stored upload chunk ordinals are not contiguous")))
       expected-index)))
 
 (defn- ensure-client-upload-session!
@@ -1073,7 +1074,7 @@
 (declare apply-tx-entry!)
 
 (defn- apply-upload-chunk!
-  [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-next-index chunk-final?
+  [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-final?
                      outliner-op tx] :as tx-entry}
    request-context]
   (let [sql (.-sql ^js self)
@@ -1088,9 +1089,6 @@
              (let [wire-digest (::payload-digest tx-entry)
                    tx-data (protocol/transit->tx tx)
                    datom-count (count tx-data)
-                   next-chunk-index (or chunk-next-index
-                                        (+ chunk-index datom-count))
-                   logical-datom-count (- next-chunk-index chunk-index)
                    stored (storage/client-tx-upload-chunk
                            sql upload-session-id chunk-index)]
                (cond
@@ -1114,25 +1112,25 @@
                  :else
                  (do
                    (storage/append-client-tx-upload-chunk!
-                    sql upload-session-id chunk-index tx wire-digest logical-datom-count)
+                    sql upload-session-id chunk-index tx wire-digest datom-count)
                    (if-not chunk-final?
                      false
                      (let [chunks (storage/client-tx-upload-chunks
                                    sql upload-session-id)
                            next-index (require-contiguous-upload! tx-entry chunks)
-                           _ (when-not (= next-index next-chunk-index)
+                           _ (when-not (= next-index (inc chunk-index))
                                (throw (upload-state-error
                                        :db-sync/upload-session-corrupt tx-entry
-                                       "final upload extent does not match stored chunks")))
+                                       "final upload ordinal does not match stored chunks")))
                            full-tx-data (into []
                                               (mapcat (comp protocol/transit->tx :tx))
                                               chunks)
                            completed-digest
-                           (protocol/tx-payload-digest
-                            outliner-op true full-tx-data)
+                           (protocol/tx-upload-completed-digest
+                            outliner-op (mapv :wire-digest chunks))
                            apply-entry (-> tx-entry
                                            (assoc :tx-id logical-tx-id
-                                                  :tx (protocol/tx->transit full-tx-data)
+                                                  ::decoded-tx-data full-tx-data
                                                   ::identity (str "upload/" logical-tx-id)
                                                   ::payload-digest completed-digest
                                                   ::staged-upload-final? true)
@@ -1156,7 +1154,8 @@
 
 (defn- sanitize-tx-entry
   [db {:keys [tx outliner-op] :as tx-entry}]
-  (let [input-tx-data (protocol/transit->tx tx)
+  (let [input-tx-data (or (::decoded-tx-data tx-entry)
+                          (protocol/transit->tx tx))
         tx-data (tx-sanitize/sanitize-tx db
                                          input-tx-data
                                          {:drop-missing-retract-ops? (or (= outliner-op :fix)

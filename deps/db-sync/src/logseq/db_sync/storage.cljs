@@ -463,7 +463,7 @@
      sql
      (str "update client_tx_uploads set next_index = ?, updated_at = ? "
           "where session_id = ? and status = 'active'")
-     (+ chunk-index datom-count) now session-id)))
+     (inc chunk-index) now session-id)))
 
 (defn client-tx-upload-chunks
   [sql session-id]

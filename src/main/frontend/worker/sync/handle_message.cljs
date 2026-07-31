@@ -16,7 +16,6 @@
             [lambdaisland.glogi :as log]
             [logseq.db :as ldb]
             [logseq.db-sync.checksum :as sync-checksum]
-            [logseq.db-sync.protocol :as sync-protocol]
             [promesa.core :as p]))
 
 (defn- fail-fast
@@ -517,6 +516,34 @@
         (not legacy-match?)
         (report-checksum-mismatch! mismatch-data)))))
 
+(defn- wire-tx-ids->completed-pending-tx-ids
+  "Map acknowledged wire ids back to durable logical pending-row ids. A
+  nonfinal staged ACK advances upload progress only; a final ACK completes the
+  logical row. Ordinary envelopes keep their own tx id."
+  [upload-request wire-tx-ids]
+  (let [progress-by-wire-id
+        (into {}
+              (keep (fn [{:keys [tx-id] :as progress}]
+                      (when tx-id [tx-id progress])))
+              (:large-upload-progress upload-request))]
+    (into []
+          (keep (fn [wire-tx-id]
+                  (if-let [{:keys [large-upload-original-tx-id
+                                   large-upload-final?]}
+                           (get progress-by-wire-id wire-tx-id)]
+                    (when large-upload-final?
+                      large-upload-original-tx-id)
+                    wire-tx-id)))
+          wire-tx-ids)))
+
+(defn- wire-tx-id->rejected-pending-tx-id
+  [upload-request wire-tx-id]
+  (or (some (fn [{:keys [tx-id large-upload-original-tx-id]}]
+              (when (= wire-tx-id tx-id)
+                large-upload-original-tx-id))
+            (:large-upload-progress upload-request))
+      wire-tx-id))
+
 (defn- handle-tx-reject!
   [repo client message local-tx]
   (let [upload-request
@@ -561,22 +588,11 @@
             failed-wire-tx-id
             (when (and failed-tx-id (contains? inflight-set failed-tx-id))
               failed-tx-id)
-            failed-tx-id
-            (or (some (fn [{:keys [tx-id large-upload-original-tx-id
-                                   logical-tx-id upload-session-id chunk-index
-                                   chunk-final?]}]
-                        (when (= failed-wire-tx-id
-                                 (or tx-id
-                                     (when (and logical-tx-id
-                                                upload-session-id
-                                                (some? chunk-index)
-                                                (some? chunk-final?))
-                                       (sync-protocol/tx-chunk-id
-                                        logical-tx-id upload-session-id
-                                        chunk-index chunk-final?))))
-                          large-upload-original-tx-id))
-                      (:large-upload-progress upload-request))
-                failed-wire-tx-id)
+            failed-tx-id (wire-tx-id->rejected-pending-tx-id
+                          upload-request failed-wire-tx-id)
+            completed-pending-tx-ids
+            (wire-tx-ids->completed-pending-tx-ids
+             upload-request successful-tx-ids)
             partial-success? (and (seq successful-tx-ids)
                                   (number? remote-tx))
             next-local-tx (when partial-success?
@@ -606,7 +622,8 @@
         (if (or (contains? message :success-tx-ids)
                 (contains? message :failed-tx-id))
           (do
-            (sync-apply/mark-pending-txs-false! repo successful-tx-ids)
+            (sync-apply/mark-pending-txs-false!
+             repo completed-pending-tx-ids)
             (when failed-tx-id
               (sync-apply/rollback-and-mark-failed-txs! repo [failed-tx-id])))
           ;; Backward compatibility for older servers without per-tx reject metadata.
@@ -693,12 +710,15 @@
 (defn- handle-tx-batch-ok!
   [repo client remote-tx checksum-fields]
   (require-non-negative remote-tx {:repo repo :type "tx/batch/ok"})
-  (sync-apply/ack-upload-response! repo client)
-  (let [current-local-tx (client-op/get-local-tx repo)
+  (let [inflight @(:inflight client)
+        upload-request (sync-apply/ack-upload-response! repo client)
+        completed-pending-tx-ids
+        (wire-tx-ids->completed-pending-tx-ids upload-request inflight)
+        current-local-tx (client-op/get-local-tx repo)
         next-local-tx (max current-local-tx remote-tx)]
     (client-op/update-local-tx repo next-local-tx)
     (sync-util/clear-last-sync-error! client)
-    (sync-apply/mark-pending-txs-false! repo @(:inflight client))
+    (sync-apply/mark-pending-txs-false! repo completed-pending-tx-ids)
     (reset! (:inflight client) [])
     (broadcast-rtc-state! client)
     (let [verification

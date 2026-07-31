@@ -942,24 +942,27 @@
      :outliner-op outliner-op
      :tx-data tx-data
      :boundaries (large-upload-boundaries db tx-data)
-     :next-index 0
+     ;; Source slicing and wire ordering are independent. Offload/encryption
+     ;; may change the wire datom count without changing either cursor.
+     :source-next-index 0
+     :next-chunk-seq 0
      ;; This freezes randomized E2EE/offload wire content until ACK. A retry is
      ;; byte-equivalent, so the server can verify it without trusting metadata.
      :wire-cache {}}))
 
 (defn- large-upload-wire-cache-entry
-  [repo logical-tx-id session-id chunk-index]
+  [repo logical-tx-id session-id chunk-seq]
   (let [session (large-upload-session repo logical-tx-id)]
     (when (= session-id (:session-id session))
-      (get-in session [:wire-cache chunk-index]))))
+      (get-in session [:wire-cache chunk-seq]))))
 
 (defn- cache-large-upload-wire-entry!
-  [repo logical-tx-id session-id chunk-index final? wire-entry]
+  [repo logical-tx-id session-id chunk-seq final? wire-entry]
   (when-let [session (large-upload-session repo logical-tx-id)]
     (when (= session-id (:session-id session))
       (persist-large-upload-session!
        repo logical-tx-id
-       (cond-> (assoc-in session [:wire-cache chunk-index] wire-entry)
+       (cond-> (assoc-in session [:wire-cache chunk-seq] wire-entry)
          final? (assoc :final-wire-frozen? true))))))
 
 (defn- large-upload-marker-source-entries
@@ -1003,7 +1006,8 @@
                     (persist-large-upload-session! repo tx-id replacement)))
         tx-data (:tx-data session)
         total (count tx-data)
-        requested-start (:next-index session)
+        requested-start (:source-next-index session)
+        chunk-seq (:next-chunk-seq session)
         [start next-index]
         (or (some #(when (= requested-start (first %)) %)
                   (:boundaries session))
@@ -1012,7 +1016,7 @@
         final? (>= next-index total)
         session-id (:session-id session)
         chunk-tx-id (sync-protocol/tx-chunk-id
-                     tx-id session-id start final?)]
+                     tx-id session-id chunk-seq final?)]
     (log/info :db-sync/large-upload-request-chunk
               {:repo repo
                :tx-id tx-id
@@ -1029,13 +1033,11 @@
            :tx-data chunk
            :logical-tx-id tx-id
            :upload-session-id session-id
-           :chunk-index start
-           ;; Offloading can expand a logical title datom into multiple wire
-           ;; datoms, so the protocol carries the source offset explicitly.
-           :chunk-next-index next-index
+           :chunk-index chunk-seq
            :chunk-final? final?
            :large-upload-original-tx-id tx-id
            :large-upload-next-index next-index
+           :large-upload-next-chunk-seq (inc chunk-seq)
            :large-upload-final? final?)))
 
 (defn- cap-upload-request-tx-entries
@@ -1105,6 +1107,7 @@
   (doseq [{:keys [large-upload-original-tx-id
                   upload-session-id
                   large-upload-next-index
+                  large-upload-next-chunk-seq
                   large-upload-final?]} tx-entries]
     (when large-upload-original-tx-id
       (let [progress-key (large-upload-progress-key repo large-upload-original-tx-id)]
@@ -1118,7 +1121,9 @@
               (swap! *repo->large-upload-sessions dissoc progress-key)
               (persist-large-upload-session!
                repo large-upload-original-tx-id
-               (assoc session :next-index large-upload-next-index)))))))))
+               (assoc session
+                      :source-next-index large-upload-next-index
+                      :next-chunk-seq large-upload-next-chunk-seq)))))))))
 
 (defn- large-upload-progress
   [tx-entries]
@@ -1127,12 +1132,14 @@
                           tx-id
                           upload-session-id
                           large-upload-next-index
+                          large-upload-next-chunk-seq
                           large-upload-final?]}]
                (when large-upload-original-tx-id
                  {:large-upload-original-tx-id large-upload-original-tx-id
                   :tx-id tx-id
                   :upload-session-id upload-session-id
                   :large-upload-next-index large-upload-next-index
+                  :large-upload-next-chunk-seq large-upload-next-chunk-seq
                   :large-upload-final? large-upload-final?})))
        vec))
 
@@ -1395,7 +1402,7 @@
                                                      (merge tx-entry wire-entry))))
                                                tx-entries))
                             payload (mapv (fn [{:keys [tx-id logical-tx-id upload-session-id
-                                                      chunk-index chunk-next-index chunk-final?
+                                                      chunk-index chunk-final?
                                                       tx-data outliner-op]}]
                                             (cond-> {:tx (sqlite-util/write-transit-str tx-data)}
                                               tx-id
@@ -1406,8 +1413,6 @@
                                               (assoc :upload-session-id upload-session-id)
                                               (some? chunk-index)
                                               (assoc :chunk-index chunk-index)
-                                              (some? chunk-next-index)
-                                              (assoc :chunk-next-index chunk-next-index)
                                               (some? chunk-final?)
                                               (assoc :chunk-final? chunk-final?)
                                               outliner-op
