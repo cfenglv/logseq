@@ -147,6 +147,7 @@ for (const relativePath of [
   "scripts/test-project-signed-macos-updater.mjs",
   "scripts/test-shipit-process-outcome-contract.mjs",
   "scripts/test-updater-private-material-policy-contract.mjs",
+  "scripts/test-local-keychain-release-signing-contract.mjs",
   "scripts/test-selfhost-macos-updater-release-contract.mjs",
   "scripts/test-updater-install-entry-contract.mjs",
   "scripts/test-selfhost-macos-user-guidance.mjs",
@@ -198,11 +199,67 @@ if (
 ) {
   fail("package.json must expose the exact rtc:prepush gate");
 }
+const requiredDesktopReleaseContracts = [
+  "node ./scripts/test-desktop-runtime-packaging-contract.mjs",
+  "node ./scripts/test-updater-private-material-policy-contract.mjs",
+  "node ./scripts/test-local-keychain-release-signing-contract.mjs",
+  "node ./scripts/test-shipit-process-outcome-contract.mjs",
+  "node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract",
+  "node ./scripts/test-desktop-preflight-preload-contract.mjs",
+  "node ./scripts/test-project-signed-macos-updater.mjs --isolated-signer-algorithm-contract",
+  "node ./scripts/test-project-signed-macos-updater.mjs --managed-signer-native-key-alignment-contract",
+  "node ./scripts/test-project-signing-policy-contract.mjs",
+  "node ./scripts/test-local-project-update-signing-contract.mjs",
+  "node ./scripts/test-desktop-sidecar-release-contract.mjs",
+  "node ./scripts/test-updater-install-entry-contract.mjs",
+  "node ./scripts/test-selfhost-macos-user-guidance.mjs",
+  "node ./scripts/test-macos-updater-signature-config.mjs",
+  "node ./scripts/test-selfhost-nightly-semver-contract.mjs",
+  "node ./scripts/test-packaged-project-signature-runtime.mjs",
+];
+const desktopReleaseContractGate =
+  rootPackage.scripts?.["desktop:test-release-contracts"];
+const desktopReleaseContractCommands =
+  desktopReleaseContractGate?.split(" && ") ?? [];
+const desktopReleaseContractPattern =
+  /^node \.\/(scripts\/test-[a-z0-9-]+\.mjs)(?: --[a-z0-9-]+)*$/;
+const desktopReleaseContractMatches = desktopReleaseContractCommands.map(
+  (command) => command.match(desktopReleaseContractPattern),
+);
+
 if (
-  rootPackage.scripts?.["desktop:test-release-contracts"] !==
-  "node ./scripts/test-desktop-runtime-packaging-contract.mjs && node ./scripts/test-updater-private-material-policy-contract.mjs && node ./scripts/test-shipit-process-outcome-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract && node ./scripts/test-desktop-preflight-preload-contract.mjs && node ./scripts/test-project-signed-macos-updater.mjs --isolated-signer-algorithm-contract && node ./scripts/test-project-signed-macos-updater.mjs --managed-signer-native-key-alignment-contract && node ./scripts/test-project-signing-policy-contract.mjs && node ./scripts/test-local-project-update-signing-contract.mjs && node ./scripts/test-desktop-sidecar-release-contract.mjs && node ./scripts/test-updater-install-entry-contract.mjs && node ./scripts/test-selfhost-macos-user-guidance.mjs && node ./scripts/test-macos-updater-signature-config.mjs && node ./scripts/test-selfhost-nightly-semver-contract.mjs && node ./scripts/test-packaged-project-signature-runtime.mjs"
+  !desktopReleaseContractGate ||
+  desktopReleaseContractCommands.join(" && ") !== desktopReleaseContractGate ||
+  desktopReleaseContractMatches.some((match) => match === null)
 ) {
-  fail("package.json must expose the exact desktop release contract gate");
+  fail("package.json desktop release contract gate is malformed");
+} else {
+  if (
+    new Set(desktopReleaseContractCommands).size !==
+    desktopReleaseContractCommands.length
+  ) {
+    fail("package.json desktop release contract gate contains duplicates");
+  }
+
+  for (const match of desktopReleaseContractMatches) {
+    assertFile(match[1]);
+  }
+
+  let previousRequiredIndex = -1;
+  for (const requiredContract of requiredDesktopReleaseContracts) {
+    const requiredIndex =
+      desktopReleaseContractCommands.indexOf(requiredContract);
+    if (requiredIndex === -1) {
+      fail(
+        `package.json desktop release contract gate is missing ${requiredContract}`,
+      );
+    } else if (requiredIndex <= previousRequiredIndex) {
+      fail(
+        `package.json desktop release contract gate has ${requiredContract} out of order`,
+      );
+    }
+    previousRequiredIndex = requiredIndex;
+  }
 }
 if (
   rootPackage.scripts?.["desktop:test-preload-contract"] !==
