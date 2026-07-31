@@ -1364,6 +1364,14 @@ const workflowJobSource = (workflow, jobName) => {
   return match[1];
 };
 
+const workflowJobNames = (workflow) =>
+  [...workflow.matchAll(/^  ([a-zA-Z0-9_-]+):\n/g)].map(
+    ([, jobName]) => jobName,
+  );
+
+const workflowJobInvocationCount = (workflow, jobName, invocation) =>
+  workflowJobSource(workflow, jobName).split(invocation).length - 1;
+
 const signingVariableNames = (workflow) => {
   assert.doesNotMatch(
     workflow,
@@ -3564,13 +3572,36 @@ addCase(cases, "local signer stays local while protected CI uses a separate prov
     /sign-macos-project-update\.mjs/,
     "release workflow invokes the local signer",
   );
-  assert.equal(
-    workflow.match(
-      /verify-unsigned-macos-project-update-candidate\.mjs/g,
-    )?.length,
-    2,
-    "CI does not verify both unsigned macOS candidates",
-  );
+  const unsignedCandidateVerifier =
+    "verify-unsigned-macos-project-update-candidate.mjs";
+  const expectedVerificationJobs = new Map([
+    ["build-macos-x64", 1],
+    ["build-macos-arm64", 1],
+    ["selfhost-release-signing", 1],
+  ]);
+  for (const [jobName, expectedCount] of expectedVerificationJobs) {
+    assert.equal(
+      workflowJobInvocationCount(
+        workflow,
+        jobName,
+        unsignedCandidateVerifier,
+      ),
+      expectedCount,
+      `${jobName} must verify unsigned candidates exactly once within its own boundary`,
+    );
+  }
+  for (const jobName of workflowJobNames(workflow)) {
+    if (expectedVerificationJobs.has(jobName)) continue;
+    assert.equal(
+      workflowJobInvocationCount(
+        workflow,
+        jobName,
+        unsignedCandidateVerifier,
+      ),
+      0,
+      `${jobName} must not verify unsigned macOS candidates`,
+    );
+  }
   const protectedSigner = workflowJobSource(
     workflow,
     "selfhost-release-signing",
