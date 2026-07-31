@@ -841,20 +841,37 @@
     [(inc end) (subvec tx-data idx (inc end))]
     [(inc idx) [(nth tx-data idx)]]))
 
+(defn- upload-wire-item-count
+  "Count the datoms an item occupies after large-title offload. The offload
+  replaces one title datom with a placeholder plus one authenticated marker."
+  [item]
+  (if (and (vector? item)
+           (= :db/add (nth item 0 nil))
+           (= :block/title (nth item 2 nil))
+           (string? (nth item 3 nil))
+           (sync-large-title/large-title? (nth item 3 nil)))
+    2
+    1))
+
+(defn- upload-wire-datom-count
+  [tx-data]
+  (transduce (map upload-wire-item-count) + 0 tx-data))
+
 (defn- next-large-upload-request-chunk
   [db tx-data start]
   (let [range-by-start (upload-tempid-range-by-start db tx-data)
         total (count tx-data)]
     (loop [idx start
-           chunk []]
+           chunk []
+           wire-count 0]
       (if (< idx total)
         (let [[next-idx group] (next-upload-tx-group tx-data range-by-start idx)
-              next-count (+ (count chunk) (count group))]
+              next-wire-count (+ wire-count (upload-wire-datom-count group))]
           (if (and (seq chunk)
-                   (> next-count max-upload-request-datoms))
+                   (> next-wire-count max-upload-request-datoms))
             {:chunk chunk
              :next-index idx}
-            (recur next-idx (into chunk group))))
+            (recur next-idx (into chunk group) next-wire-count)))
         {:chunk chunk
          :next-index total}))))
 
@@ -1046,7 +1063,7 @@
          result []
          datom-count 0]
     (if-let [{:keys [tx-data] :as entry} (first remaining)]
-      (let [entry-datom-count (count tx-data)
+      (let [entry-datom-count (upload-wire-datom-count tx-data)
             next-datom-count (+ datom-count entry-datom-count)]
         (cond
           (and (empty? result) (> entry-datom-count max-upload-request-datoms))
@@ -1123,7 +1140,9 @@
                repo large-upload-original-tx-id
                (assoc session
                       :source-next-index large-upload-next-index
-                      :next-chunk-seq large-upload-next-chunk-seq)))))))))
+                      :next-chunk-seq
+                      (or large-upload-next-chunk-seq
+                          (inc (or (:next-chunk-seq session) 0))))))))))))
 
 (defn- large-upload-progress
   [tx-entries]
@@ -1338,7 +1357,7 @@
         (when (and (ws-open? ws) (worker-state/online?) (not (upload-stopped? repo)))
           (let [batch (pending-txs repo {:limit 50})]
             (when (seq batch)
-              (let [oversized-entry (some #(when (> (count (:tx %))
+              (let [oversized-entry (some #(when (> (upload-wire-datom-count (:tx %))
                                                      max-upload-request-datoms)
                                              %)
                                           batch)]
