@@ -203,6 +203,7 @@ const requiredDesktopReleaseContracts = [
   "node ./scripts/test-desktop-runtime-packaging-contract.mjs",
   "node ./scripts/test-updater-private-material-policy-contract.mjs",
   "node ./scripts/test-local-keychain-release-signing-contract.mjs",
+  "node ./scripts/test-desktop-release-contract-gate-drift.mjs",
   "node ./scripts/test-shipit-process-outcome-contract.mjs",
   "node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract",
   "node ./scripts/test-desktop-preflight-preload-contract.mjs",
@@ -245,20 +246,19 @@ if (
     assertFile(match[1]);
   }
 
-  let previousRequiredIndex = -1;
   for (const requiredContract of requiredDesktopReleaseContracts) {
-    const requiredIndex =
-      desktopReleaseContractCommands.indexOf(requiredContract);
-    if (requiredIndex === -1) {
+    const requiredCount = desktopReleaseContractCommands.filter(
+      (command) => command === requiredContract,
+    ).length;
+    if (requiredCount === 0) {
       fail(
         `package.json desktop release contract gate is missing ${requiredContract}`,
       );
-    } else if (requiredIndex <= previousRequiredIndex) {
+    } else if (requiredCount !== 1) {
       fail(
-        `package.json desktop release contract gate has ${requiredContract} out of order`,
+        `package.json desktop release contract gate must include exactly once: ${requiredContract}`,
       );
     }
-    previousRequiredIndex = requiredIndex;
   }
 }
 if (
