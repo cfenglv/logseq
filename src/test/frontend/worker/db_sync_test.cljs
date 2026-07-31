@@ -114,6 +114,7 @@
 (def reset-db-sync-remote-state-fixture
   {:before
    (fn []
+     (sync-apply/set-server-capabilities! test-repo [])
      (reset! *db-sync-remote-state
              {:latest-remote-tx @sync-apply/*repo->latest-remote-tx
               :latest-remote-checksum @sync-apply/*repo->latest-remote-checksum
@@ -124,6 +125,7 @@
      (reset! sync-apply/*repo->latest-remote-checksum-version {}))
    :after
    (fn []
+     (sync-apply/set-server-capabilities! test-repo [])
      (let [{:keys [latest-remote-tx
                    latest-remote-checksum
                    latest-remote-checksum-version]}
@@ -1625,6 +1627,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1639,10 +1643,13 @@
                                          tx-entry (first (:txs payload))
                                          uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                                      (is (= "tx/batch" (:type payload)))
-                                     (is (nil? (:tx-id tx-entry)))
+                                     (is (string? (:tx-id tx-entry)))
+                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                      (is (= 4999 (count uploaded-tx)))
-                                     (is (= [] @(:inflight client)))
+                                     (is (= [(:tx-id tx-entry)]
+                                            (mapv str @(:inflight client))))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -1650,9 +1657,11 @@
                                  tx-entry (first (:txs payload))
                                  uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 2 (count uploaded-tx)))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1685,6 +1694,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1695,13 +1706,20 @@
                             :db-sync/outliner-op :insert-blocks
                             :db-sync/normalized-tx-data tx-data}])
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
+                                 first-payload (first @sent)
+                                 _ (do
+                                     ;; Model a lost response followed by a reconnect.
+                                     (sync-apply/clear-upload-response-timeout! client)
+                                     (reset! (:inflight client) []))
                                  _ (#'sync-apply/flush-pending! test-repo client)]
                            (is (= 2 (count @sent)))
+                           (is (= first-payload (second @sent)))
                            (doseq [payload @sent]
                              (let [tx-entry (first (:txs payload))
                                    uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                                (is (= "tx/batch" (:type payload)))
-                               (is (nil? (:tx-id tx-entry)))
+                               (is (string? (:tx-id tx-entry)))
+                               (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                (is (= 5000 (count uploaded-tx)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
@@ -1752,6 +1770,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1765,12 +1785,15 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id)
+                                                            (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (is (= parent-tx (subvec first-uploaded-tx 4993 5000)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -1778,10 +1801,12 @@
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= child-tx second-uploaded-tx))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1810,6 +1835,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1823,11 +1850,14 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id)
+                                                            (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -1835,10 +1865,12 @@
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 1 (count second-uploaded-tx)))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1865,6 +1897,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1878,11 +1912,14 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id)
+                                                            (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -1890,10 +1927,12 @@
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 1 (count second-uploaded-tx)))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1923,6 +1962,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1938,10 +1979,12 @@
                                  uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= 1 (count @sent)))
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 5001 (count uploaded-tx)))
                              (is (= tx-data uploaded-tx))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -12768,6 +12811,8 @@
              (-> (with-datascript-conns
                    conn client-ops-conn
                    (fn []
+                     (sync-apply/set-server-capabilities!
+                      repo ["tx-upload-staged-v1"])
                      (reset! sync-apply/*repo->latest-remote-tx {repo 0})
                      (client-op/update-local-tx repo 0)
                      (seed-client-op-txs!

@@ -32,11 +32,11 @@
 (defn tx-wire-payload-digest
   "Server-verifiable binding for the actual chunk envelope. Never substitute a
   client-declared digest for this value."
-  [{:keys [tx-id logical-tx-id upload-session-id chunk-index chunk-final?
+  [{:keys [tx-id logical-tx-id upload-session-id chunk-index chunk-next-index chunk-final?
            outliner-op tx]}]
   (sha256-hex
    (common/write-transit
-    [:client-tx-wire-v1 tx-id logical-tx-id upload-session-id chunk-index
+    [:client-tx-wire-v1 tx-id logical-tx-id upload-session-id chunk-index chunk-next-index
      (boolean chunk-final?) outliner-op (transit->tx tx)])))
 
 (defn tx-chunk-id

@@ -790,12 +790,12 @@
     (common/sql-exec sql (str "delete from " snapshot-staging-table))))
 
 (defn- tx-entry-identity
-  [{:keys [tx tx-id logical-tx-id upload-session-id chunk-index chunk-final?
+  [{:keys [tx tx-id logical-tx-id upload-session-id chunk-index chunk-next-index chunk-final?
            outliner-op]
     :as tx-entry}]
   (let [chunk-metadata? (some #(contains? tx-entry %)
                               [:logical-tx-id :upload-session-id
-                               :chunk-index :chunk-final?])]
+                               :chunk-index :chunk-next-index :chunk-final?])]
     (cond
       chunk-metadata?
       (do
@@ -805,6 +805,9 @@
                        (boolean (re-matches #"[0-9a-f]{64}" upload-session-id))
                        (integer? chunk-index)
                        (not (neg? chunk-index))
+                       (or (nil? chunk-next-index)
+                           (and (integer? chunk-next-index)
+                                (> chunk-next-index chunk-index)))
                        (boolean? chunk-final?)
                        (keyword? outliner-op)
                        (= tx-id
@@ -1070,7 +1073,7 @@
 (declare apply-tx-entry!)
 
 (defn- apply-upload-chunk!
-  [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-final?
+  [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-next-index chunk-final?
                      outliner-op tx] :as tx-entry}
    request-context]
   (let [sql (.-sql ^js self)
@@ -1085,6 +1088,9 @@
              (let [wire-digest (::payload-digest tx-entry)
                    tx-data (protocol/transit->tx tx)
                    datom-count (count tx-data)
+                   next-chunk-index (or chunk-next-index
+                                        (+ chunk-index datom-count))
+                   logical-datom-count (- next-chunk-index chunk-index)
                    stored (storage/client-tx-upload-chunk
                            sql upload-session-id chunk-index)]
                (cond
@@ -1108,13 +1114,13 @@
                  :else
                  (do
                    (storage/append-client-tx-upload-chunk!
-                    sql upload-session-id chunk-index tx wire-digest datom-count)
+                    sql upload-session-id chunk-index tx wire-digest logical-datom-count)
                    (if-not chunk-final?
                      false
                      (let [chunks (storage/client-tx-upload-chunks
                                    sql upload-session-id)
                            next-index (require-contiguous-upload! tx-entry chunks)
-                           _ (when-not (= next-index (+ chunk-index datom-count))
+                           _ (when-not (= next-index next-chunk-index)
                                (throw (upload-state-error
                                        :db-sync/upload-session-corrupt tx-entry
                                        "final upload extent does not match stored chunks")))
