@@ -49,6 +49,7 @@
 
 (defn- ensure-schema! [^js self]
   (when-not (true? (.-schema-ready self))
+    (set! (.-schema-ready self) false)
     (try
       (storage/init-schema! (.-sql self))
       (catch :default e
@@ -790,7 +791,9 @@
                        (integer? chunk-index)
                        (not (neg? chunk-index))
                        (boolean? chunk-final?)
-                       (or chunk-final? (nil? tx-id)))
+                       (= tx-id
+                          (protocol/tx-chunk-id
+                           logical-tx-id chunk-index chunk-final?)))
           (throw (ex-info "invalid tx chunk identity"
                           (cond-> {:type :db-sync/invalid-tx-chunk-identity}
                             tx-id (assoc :failed-tx-id tx-id)))))

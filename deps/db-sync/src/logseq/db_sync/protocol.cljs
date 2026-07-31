@@ -4,16 +4,37 @@
             [goog.crypt.Sha256]
             [logseq.db-sync.common :as common]))
 
+(defn- sha256-hex
+  [value]
+  (let [digest (goog.crypt.Sha256.)
+        _ (.update digest value)]
+    (gcrypt/byteArrayToHex (.digest digest))))
+
 (defn tx-payload-digest
   [outliner-op chunk-final? tx-data]
-  (let [digest (goog.crypt.Sha256.)
-        canonical (common/write-transit
-                   [:client-tx-payload-v1
-                    outliner-op
-                    (boolean chunk-final?)
-                    tx-data])]
-    (.update digest canonical)
-    (gcrypt/byteArrayToHex (.digest digest))))
+  (sha256-hex
+   (common/write-transit
+    [:client-tx-payload-v1
+     outliner-op
+     (boolean chunk-final?)
+     tx-data])))
+
+(defn tx-chunk-id
+  "Derive a stable UUID for a nonfinal chunk without consuming the logical tx
+  id that the client uses to mark the complete operation finished."
+  [logical-tx-id chunk-index chunk-final?]
+  (if chunk-final?
+    logical-tx-id
+    (let [hex (sha256-hex (str "logseq-tx-chunk-v1/"
+                               logical-tx-id "/" chunk-index))
+          ;; UUIDv5-compatible version/variant bits over our SHA-256 prefix.
+          uuid-hex (str (subs hex 0 12) "5" (subs hex 13 16)
+                        "8" (subs hex 17 32))]
+      (uuid (str (subs uuid-hex 0 8) "-"
+                 (subs uuid-hex 8 12) "-"
+                 (subs uuid-hex 12 16) "-"
+                 (subs uuid-hex 16 20) "-"
+                 (subs uuid-hex 20 32))))))
 
 (defn- stringify-uuid
   [value]

@@ -117,9 +117,12 @@
                        (update coerced :txs
                                (fn [txs]
                                  (mapv (fn [tx-entry]
-                                         (if-let [tx-id (:tx-id tx-entry)]
-                                           (assoc tx-entry :tx-id (str tx-id))
-                                           tx-entry))
+                                         (cond-> tx-entry
+                                           (:tx-id tx-entry)
+                                           (update :tx-id str)
+
+                                           (:logical-tx-id tx-entry)
+                                           (update :logical-tx-id str)))
                                        txs)))
                        coerced)
             raw (js/JSON.stringify (clj->js message*))

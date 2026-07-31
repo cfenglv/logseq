@@ -1606,12 +1606,18 @@
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
                                  _ (let [payload (first @sent)
                                          tx-entry (first (:txs payload))
-                                         uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
+                                         uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))
+                                         chunk-tx-id (uuid (:tx-id tx-entry))]
                                      (is (= "tx/batch" (:type payload)))
-                                     (is (nil? (:tx-id tx-entry)))
+                                     (is (not= tx-id chunk-tx-id))
+                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
+                                     (is (= 0 (:chunk-index tx-entry)))
+                                     (is (false? (:chunk-final? tx-entry)))
+                                     (is (string? (:payload-digest tx-entry)))
                                      (is (= 4999 (count uploaded-tx)))
-                                     (is (= [] @(:inflight client)))
+                                     (is (= [chunk-tx-id] @(:inflight client)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -1664,14 +1670,28 @@
                             :db-sync/outliner-op :insert-blocks
                             :db-sync/normalized-tx-data tx-data}])
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
+                                 first-entry (-> @sent first :txs first)
+                                 _ (do
+                                     ;; Model connection loss before ACK: the
+                                     ;; request is abandoned without committing
+                                     ;; large-upload progress.
+                                     (sync-apply/clear-upload-response-timeout! client)
+                                     (reset! (:inflight client) []))
                                  _ (#'sync-apply/flush-pending! test-repo client)]
                            (is (= 2 (count @sent)))
                            (doseq [payload @sent]
                              (let [tx-entry (first (:txs payload))
                                    uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                                (is (= "tx/batch" (:type payload)))
-                               (is (nil? (:tx-id tx-entry)))
-                               (is (= 5000 (count uploaded-tx)))))))
+                               (is (uuid? (uuid (:tx-id tx-entry))))
+                               (is (= (str tx-id) (:logical-tx-id tx-entry)))
+                               (is (= 0 (:chunk-index tx-entry)))
+                               (is (false? (:chunk-final? tx-entry)))
+                               (is (= 5000 (count uploaded-tx)))))
+                           (let [retry-entry (-> @sent second :txs first)]
+                             (is (= (:tx-id first-entry) (:tx-id retry-entry)))
+                             (is (= (:payload-digest first-entry)
+                                    (:payload-digest retry-entry))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1732,14 +1752,20 @@
                             :db-sync/normalized-tx-data tx-data}])
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
                                  first-uploaded-tx (let [payload (first @sent)
-                                                         tx-entry (first (:txs payload))]
+                                                         tx-entry (first (:txs payload))
+                                                         chunk-tx-id (uuid (:tx-id tx-entry))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (not= tx-id chunk-tx-id))
+                                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
+                                                     (is (= 0 (:chunk-index tx-entry)))
+                                                     (is (false? (:chunk-final? tx-entry)))
+                                                     (is (= [chunk-tx-id] @(:inflight client)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (is (= parent-tx (subvec first-uploaded-tx 4993 5000)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -1790,13 +1816,18 @@
                             :db-sync/normalized-tx-data tx-data}])
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
                                  first-uploaded-tx (let [payload (first @sent)
-                                                         tx-entry (first (:txs payload))]
+                                                         tx-entry (first (:txs payload))
+                                                         chunk-tx-id (uuid (:tx-id tx-entry))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (not= tx-id chunk-tx-id))
+                                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
+                                                     (is (= 0 (:chunk-index tx-entry)))
+                                                     (is (false? (:chunk-final? tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -1845,13 +1876,18 @@
                             :db-sync/normalized-tx-data tx-data}])
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
                                  first-uploaded-tx (let [payload (first @sent)
-                                                         tx-entry (first (:txs payload))]
+                                                         tx-entry (first (:txs payload))
+                                                         chunk-tx-id (uuid (:tx-id tx-entry))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (not= tx-id chunk-tx-id))
+                                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
+                                                     (is (= 0 (:chunk-index tx-entry)))
+                                                     (is (false? (:chunk-final? tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]

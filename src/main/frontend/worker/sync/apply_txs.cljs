@@ -895,7 +895,8 @@
         progress-start (get @*repo->large-upload-progress progress-key 0)
         start (if (< progress-start total) progress-start 0)
         {:keys [chunk next-index]} (next-large-upload-request-chunk db tx-data start)
-        final? (>= next-index total)]
+        final? (>= next-index total)
+        chunk-tx-id (sync-protocol/tx-chunk-id tx-id start final?)]
     (log/info :db-sync/large-upload-request-chunk
               {:repo repo
                :tx-id tx-id
@@ -903,15 +904,15 @@
                :end next-index
                :total total
                :final? final?})
-    (cond-> (assoc entry
-                   :tx-data chunk
-                   :logical-tx-id tx-id
-                   :chunk-index start
-                   :chunk-final? final?
-                   :large-upload-original-tx-id tx-id
-                   :large-upload-next-index next-index
-                   :large-upload-final? final?)
-      (not final?) (dissoc :tx-id))))
+    (assoc entry
+           :tx-id chunk-tx-id
+           :tx-data chunk
+           :logical-tx-id tx-id
+           :chunk-index start
+           :chunk-final? final?
+           :large-upload-original-tx-id tx-id
+           :large-upload-next-index next-index
+           :large-upload-final? final?)))
 
 (defn- cap-upload-request-tx-entries
   [repo db tx-entries]
