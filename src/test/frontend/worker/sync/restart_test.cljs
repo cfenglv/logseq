@@ -6,6 +6,7 @@
             [frontend.worker.sync :as sync]
             [frontend.worker.sync.apply-txs :as sync-apply]
             [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.transport :as sync-transport]
             [frontend.worker.sync.util :as sync-util]
             [promesa.core :as p]))
 
@@ -619,6 +620,50 @@
         (finally
           (reset! worker-state/*db-sync-client prev-client)
           (set! js/setTimeout original-set-timeout))))))
+
+(deftest ws-close-with-unacknowledged-upload-is-visible-before-retry-test
+  (let [original-set-timeout js/setTimeout
+        prev-client @worker-state/*db-sync-client
+        tx-id (random-uuid)
+        last-error (atom nil)
+        ws #js {:readyState 3
+                :close (fn [] nil)}
+        client {:repo "unacknowledged-upload-repo"
+                :graph-id "graph-1"
+                :ws ws
+                :ws-state (atom :open)
+                :last-sync-error last-error
+                :upload-request (atom {:tx-ids [tx-id]
+                                       :t-before 2751})
+                :inflight (atom [tx-id])
+                :online-users (atom [])
+                :reconnect (atom {:attempt 0 :timer nil})
+                :stale-kill-timer (atom nil)}]
+    (set! js/setTimeout (fn [& _] :retry-timer))
+    (reset! worker-state/*db-sync-client client)
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (try
+        (#'sync/attach-ws-handlers!
+         (:repo client) client ws
+         "wss://sync.example.test/sync/graph-1")
+        ((.-onclose ws) #js {})
+        (is (= :closed @(:ws-state client)))
+        (is (= :retry-timer (:timer @(:reconnect client))))
+        (is (some? @last-error)
+            "a connection lost with tx/batch awaiting ACK must not leave last-error nil")
+        (finally
+          (reset! worker-state/*db-sync-client prev-client)
+          (set! js/setTimeout original-set-timeout))))))
+
+(deftest websocket-reconnect-backoff-has-a-fixed-upper-bound-test
+  (let [config {:base-delay-ms 1000
+                :max-delay-ms 30000
+                :jitter-ms 250}
+        delays (mapv #(sync-transport/reconnect-delay-ms % config)
+                     (range 32))]
+    (is (every? #(<= 1000 % 30249) delays))
+    (is (every? #(>= % 30000) (drop 5 delays))
+        "repeated failures stay on bounded 30s+jitter backoff instead of overflowing")))
 
 (deftest obsolete-websocket-close-does-not-restart-current-connection-test
   (let [original-set-timeout js/setTimeout

@@ -4420,3 +4420,175 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))
+
+(defn- seed-tx-batch-scale-graph!
+  [sql conn block-count]
+  (let [page-uuid (random-uuid)
+        block-uuids (mapv (fn [_] (random-uuid)) (range block-count))
+        tx-data (into [{:block/uuid page-uuid
+                        :block/name "tx-batch-scale"
+                        :block/title "Tx batch scale"}]
+                      (map-indexed
+                       (fn [idx block-uuid]
+                         {:block/uuid block-uuid
+                          :block/title (str "seed-" idx)
+                          :block/order (str "a" idx)
+                          :block/parent [:block/uuid page-uuid]
+                          :block/page [:block/uuid page-uuid]})
+                       block-uuids))]
+    ;; Fixture construction is not part of the measured request. Persist the
+    ;; graph without creating one enormous synthetic client tx, then establish
+    ;; the same verified checksum metadata a healthy Durable Object has before
+    ;; receiving tx/batch.
+    (d/transact! conn tx-data {:db-sync/skip-tx-log? true})
+    (storage/set-t! sql 0)
+    (storage/set-checksum! sql (sync-checksum/recompute-checksum @conn))
+    (storage/set-server-checksum!
+     sql
+     (sync-checksum/recompute-server-checksum @conn)
+     0)
+    (storage/mark-checksum-metadata-verified! sql 0)
+    {:page-uuid page-uuid
+     :block-uuid (first block-uuids)}))
+
+(deftest small-tx-batch-does-not-scan-the-whole-graph-per-entry-test
+  (testing "11 small edits on a large verified graph have request-sized checksum work"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              {:keys [block-uuid]}
+              (seed-tx-batch-scale-graph! sql conn 2048)
+              entries
+              (mapv (fn [idx]
+                      {:tx-id (random-uuid)
+                       :tx (protocol/tx->transit
+                            [[:db/add [:block/uuid block-uuid]
+                              :block/title (str "edit-" idx)]])
+                       :outliner-op :save-block})
+                    (range 11))
+              whole-graph-validations (atom 0)
+              server-db-v2-valid?* sync-checksum/server-db-v2-valid?
+              response
+              (with-redefs
+                [sync-checksum/server-db-v2-valid?
+                 (fn [db]
+                   (swap! whole-graph-validations inc)
+                   (server-db-v2-valid?* db))
+                 ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 self nil entries 0))]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= 11 (:t response)))
+          (is (= "edit-10"
+                 (:block/title
+                  (d/entity @conn [:block/uuid block-uuid]))))
+          (is (zero? @whole-graph-validations)
+              (str "a verified small batch must not enumerate every block; observed "
+                   @whole-graph-validations
+                   " whole-graph versioned-checksum validations (each walks "
+                   ":avet/:block/uuid) for 11 entries")))))))
+
+(defn- cas-title-entry
+  [block-uuid from-title to-title tx-id]
+  {:tx-id tx-id
+   :tx (protocol/tx->transit
+        [[:db.fn/cas [:block/uuid block-uuid]
+          :block/title from-title to-title]])
+   :outliner-op :save-block})
+
+(deftest reset-after-partial-commit-retries-eleven-txs-exactly-once-test
+  (testing "a reset/lost response can replay all stable tx ids without duplicating or rejecting committed work"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "ack-loss"
+                                    :block/title "state-0"}])
+              initial-t (storage/get-t sql)
+              tx-ids (mapv (fn [_] (random-uuid)) (range 11))
+              entries (mapv (fn [idx tx-id]
+                              (cas-title-entry
+                               block-uuid
+                               (str "state-" idx)
+                               (str "state-" (inc idx))
+                               tx-id))
+                            (range 11)
+                            tx-ids)
+              apply-entry* sync-handler/apply-tx-entry!
+              apply-attempts (atom 0)
+              interrupted-response
+              (with-redefs
+                [sync-handler/apply-tx-entry!
+                 (fn
+                   ([conn* entry]
+                    (apply-entry* conn* entry))
+                   ([self* conn* entry context]
+                    (if (= 6 (swap! apply-attempts inc))
+                      (throw (js/Error. "simulated Durable Object reset"))
+                      (apply-entry* self* conn* entry context))))
+                 ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 #js {:sql sql :conn conn :schema-ready true}
+                 nil entries initial-t))]
+          ;; The response is deliberately treated as lost. These assertions
+          ;; only prove the reset point left five durable commits behind.
+          (is (= "tx/reject" (:type interrupted-response)))
+          (is (= (take 5 tx-ids)
+                 (:success-tx-ids interrupted-response)))
+          (is (= (nth tx-ids 5)
+                 (:failed-tx-id interrupted-response)))
+          (is (= "state-5"
+                 (:block/title
+                  (d/entity @conn [:block/uuid block-uuid]))))
+          (is (= (+ initial-t 5) (storage/get-t sql)))
+
+          ;; Model a fresh DO after the reset. The client did not receive an
+          ;; ACK, so it must be safe to send the complete original batch again.
+          (let [retry-t (storage/get-t sql)
+                restarted-self #js {:sql sql :conn nil :schema-ready true}
+                retry-response
+                (with-redefs [ws/broadcast! (fn [& _] nil)]
+                  (sync-handler/handle-tx-batch!
+                   restarted-self nil entries retry-t))
+                restarted-conn (.-conn restarted-self)
+                committed (storage/fetch-tx-since sql initial-t)]
+            (is (= "tx/batch/ok" (:type retry-response)))
+            (is (= (+ initial-t 11) (:t retry-response))
+                "the five pre-reset entries must not advance t twice")
+            (is (= 11 (count committed))
+                "each logical tx must have one durable tx_log row")
+            (is (= "state-11"
+                   (:block/title
+                    (d/entity @restarted-conn
+                              [:block/uuid block-uuid]))))))))))
+
+(deftest legacy-tx-batch-without-tx-id-remains-compatible-test
+  (testing "the unversioned v1 tx/batch shape keeps accepting entries without tx-id"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "legacy-batch"
+                                    :block/title "before"}])
+              t-before (storage/get-t sql)
+              response
+              (with-redefs [ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 self nil
+                 [{:tx (protocol/tx->transit
+                        [[:db/add [:block/uuid block-uuid]
+                          :block/title "after"]])
+                   :outliner-op :save-block}]
+                 t-before))]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= (inc t-before) (:t response)))
+          (is (= "after"
+                 (:block/title
+                  (d/entity @conn [:block/uuid block-uuid])))))))))
