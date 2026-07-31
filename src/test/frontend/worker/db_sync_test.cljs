@@ -13628,6 +13628,8 @@
                  server-t0 (sync-handler/t-now server-self)
                  server-checksum0
                  (sync-checksum/recompute-server-checksum @server-conn)
+                 _ (sync-storage/set-checksum!
+                    (:sql server-storage) server-checksum0)
                  server-response* (atom nil)
                  server-ws (doto (js-obj)
                              (aset "readyState" 1)
