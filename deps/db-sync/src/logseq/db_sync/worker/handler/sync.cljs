@@ -785,7 +785,8 @@
     (common/sql-exec sql (str "delete from " snapshot-staging-table))))
 
 (defn- tx-entry-identity
-  [{:keys [tx-id logical-tx-id upload-session-id chunk-index chunk-final?]
+  [{:keys [tx tx-id logical-tx-id upload-session-id chunk-index chunk-final?
+           outliner-op]
     :as tx-entry}]
   (let [chunk-metadata? (some #(contains? tx-entry %)
                               [:logical-tx-id :upload-session-id
@@ -793,12 +794,14 @@
     (cond
       chunk-metadata?
       (do
-        (when-not (and (uuid? logical-tx-id)
+        (when-not (and (string? tx)
+                       (uuid? logical-tx-id)
                        (string? upload-session-id)
                        (boolean (re-matches #"[0-9a-f]{64}" upload-session-id))
                        (integer? chunk-index)
                        (not (neg? chunk-index))
                        (boolean? chunk-final?)
+                       (keyword? outliner-op)
                        (= tx-id
                           (protocol/tx-chunk-id
                            logical-tx-id upload-session-id

@@ -12798,7 +12798,6 @@
                  (:upload-session-id after-stale-ack))))
         (finally
           (#'sync-apply/clear-large-upload-progress! repo [logical-tx-id]))))))
-+
 (deftest e2ee-ack-loss-retry-reuses-identical-wire-payload-test
   (testing "randomized encryption is performed once per identity, not once per retry"
     (async done

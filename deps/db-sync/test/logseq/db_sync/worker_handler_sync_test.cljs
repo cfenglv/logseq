@@ -5021,7 +5021,6 @@
         (is (= ":db-sync/upload-session-final-first"
                (:error-detail final-response)))
         (is (nil? (storage/client-tx-upload sql logical-tx-id)))))))
-+
 (defn- sha256-hex
   [value]
   (-> (.createHash node-crypto "sha256")
