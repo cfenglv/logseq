@@ -359,7 +359,7 @@ const discoverLocalFinalizer = () => {
   const packageJson = JSON.parse(read("package.json"));
   const candidates = Object.entries(packageJson.scripts ?? {}).filter(
     ([name]) =>
-      /^project-update:.*(?:local.*finali[sz]|finali[sz].*local)$/i.test(name),
+      /^project-update:(?=.*local)(?=.*finali[sz]).+$/i.test(name),
   );
   assert.equal(
     candidates.length,
