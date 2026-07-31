@@ -1,8 +1,8 @@
 {
   "algorithm": "ed25519-sha512-manifest-v1",
   "bundleIdentifier": "com.logseq.logseq",
-  "keyId": "ed25519:88043c73895ef8fdc2902e469b3c9583e44f5a0b9e768d6c3919efc88577b475",
+  "keyId": "ed25519:98a1ba119b8200592f180c8f60385afe0cf2da67e6624f764f260381fb00ac2e",
   "minimumBootstrapRevision": 5,
   "payloadDomain": "logseq-selfhost-macos-update-v1",
-  "publicKeyBase64": "mLwLaBoZ3qbMF5cnee6B3BRJieEL0rhpZGyKpAjqlkE="
+  "publicKeyBase64": "N4ZNW7PG3rCixmGirw8fN3v/kexQm3yZasrbtdwTTPM="
 }
