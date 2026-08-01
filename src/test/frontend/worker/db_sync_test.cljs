@@ -12383,6 +12383,16 @@
      (str "wss://sync.example.test/sync/" graph-id)
      "test-token")))
 
+(defn- stop-production-test-client!
+  [client]
+  ;; The production stop path also broadcasts a presence/status snapshot.
+  ;; These lifecycle tests may finish after their temporary DB stores have
+  ;; been restored, so isolate only that unrelated payload calculation while
+  ;; retaining the real timer, handler, socket, and connection-state cleanup.
+  (with-redefs [sync-presence/rtc-state-payload (fn [& _] {})
+                shared-service/broadcast-to-clients! (fn [& _] nil)]
+    (#'db-sync/stop-client! client)))
+
 (deftest successful-hello-bounds-reconnect-backoff-with-pending-edit-test
   (async done
          (let [{:keys [conn client-ops-conn child2]} (setup-parent-child)
@@ -12450,7 +12460,7 @@
                (is false (str "unexpected production hello test failure: " error))))
             (p/finally
              (fn []
-               (#'db-sync/stop-client! client)
+               (stop-production-test-client! client)
                (reset! worker-state/*db-sync-client previous-client)
                (done)))))))
 
@@ -12502,7 +12512,7 @@
                (is false (str "unexpected coalescing test failure: " error))))
             (p/finally
              (fn []
-               (#'db-sync/stop-client! client)
+               (stop-production-test-client! client)
                (reset! worker-state/*db-sync-client previous-client)
                (done)))))))
 
@@ -13615,7 +13625,7 @@
                  (sync-apply/clear-upload-response-timeout! old-client)
                  (when-let [new-client @new-client*]
                    (sync-apply/clear-upload-response-timeout! new-client)
-                   (#'db-sync/stop-client! new-client))
+                   (stop-production-test-client! new-client))
                  (reset! worker-state/*db-sync-client previous-client)
                  (reset! sync-apply/*repo->latest-remote-tx previous-remote)
                  (sync-apply/set-server-capabilities! repo [])
