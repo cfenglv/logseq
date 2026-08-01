@@ -5224,6 +5224,226 @@
             (d/entity @conn [:block/uuid block-uuid]))))
     response))
 
+(defn- modern-staging-tables
+  [sql]
+  (->> (common/sql-exec
+        sql
+        "select name, sql from sqlite_master where type = 'table'")
+       common/get-sql-rows
+       (keep (fn [row]
+               (let [table-name (aget row "name")
+                     ddl (some-> (aget row "sql") string/lower-case)
+                     kind (cond
+                            (and (string? ddl)
+                                 (string/includes? ddl "next_index"))
+                            :session
+
+                            (and (string? ddl)
+                                 (string/includes? ddl "chunk_index"))
+                            :chunk
+
+                            :else nil)]
+                 (when kind
+                   {:kind kind :table-name table-name}))))
+       vec))
+
+(defn- modern-staging-snapshot
+  [sql]
+  (into {}
+        (map (fn [{:keys [kind table-name]}]
+               [kind
+                {:table-name table-name
+                 :rows
+                 (->> (common/sql-exec sql (str "select * from " table-name))
+                      common/get-sql-rows
+                      (map #(js->clj % :keywordize-keys true))
+                      (sort-by pr-str)
+                      vec)}]))
+        (modern-staging-tables sql)))
+
+(defn- modern-visible-state
+  [sql conn block-uuid]
+  (let [fresh-conn (storage/open-conn sql)]
+    {:t (storage/get-t sql)
+     :checksum (storage/get-checksum sql)
+     :server-checksum (storage/get-server-checksum sql)
+     :server-checksum-t (storage/get-server-checksum-t sql)
+     :current-graph-checksum
+     (sync-checksum/recompute-server-checksum @conn)
+     :fresh-graph-checksum
+     (sync-checksum/recompute-server-checksum @fresh-conn)
+     :current-title
+     (:block/title (d/entity @conn [:block/uuid block-uuid]))
+     :fresh-title
+     (:block/title (d/entity @fresh-conn [:block/uuid block-uuid]))}))
+
+(defn- with-modern-boundary-db
+  [f]
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            block-uuid (random-uuid)
+            _ (d/transact! conn [{:block/uuid block-uuid
+                                  :block/name "empty-modern-boundary"
+                                  :block/title "before"
+                                  :block/updated-at 1}])
+            t-before (storage/get-t sql)
+            legacy-before (sync-checksum/recompute-checksum @conn)
+            server-before (sync-checksum/recompute-server-checksum @conn)
+            _ (storage/set-checksum! sql legacy-before)
+            _ (storage/set-server-checksum! sql server-before t-before)
+            staging-tables (modern-staging-tables sql)
+            initial-staging (modern-staging-snapshot sql)]
+        (is (= #{:session :chunk} (set (map :kind staging-tables)))
+            (str "expected durable session and chunk tables, found "
+                 staging-tables))
+        (is (= {:session 0 :chunk 0}
+               (into {}
+                     (map (fn [[kind {:keys [rows]}]]
+                            [kind (count rows)]))
+                     initial-staging)))
+        (f {:sql sql
+            :conn conn
+            :self self
+            :block-uuid block-uuid
+            :t-before t-before
+            :initial-visible (modern-visible-state sql conn block-uuid)
+            :initial-staging initial-staging})))))
+
+(defn- with-modern-active-session
+  [f]
+  (with-modern-boundary-db
+    (fn [{:keys [sql conn self block-uuid initial-visible] :as context}]
+      (let [logical-id (random-uuid)
+            full-tx [[:db/add [:block/uuid block-uuid]
+                      :block/title "after"]
+                     [:db/add [:block/uuid block-uuid]
+                      :block/updated-at 2]]
+            upload-session-id
+            (modern-upload-session-id logical-id :save-block full-tx)
+            chunk-0
+            (modern-session-entry
+             {:logical-tx-id logical-id
+              :full-tx-data full-tx
+              :chunk-tx-data full-tx
+              :chunk-index 0
+              :chunk-final? false})
+            first-response (apply-identified-entry! self chunk-0)
+            active-visible (modern-visible-state sql conn block-uuid)
+            active-staging (modern-staging-snapshot sql)
+            session-row (-> active-staging :session :rows first)
+            chunk-row (-> active-staging :chunk :rows first)]
+        (is (= "tx/batch/ok" (:type first-response)))
+        (is (= initial-visible active-visible)
+            "a nonempty nonfinal chunk is staged but remains invisible")
+        (is (= 1 (count (-> active-staging :session :rows))))
+        (is (= 1 (count (-> active-staging :chunk :rows))))
+        (is (= 1 (:next_index session-row)))
+        (is (= upload-session-id (:session_id session-row)))
+        (is (= 0 (:chunk_index chunk-row)))
+        (f (assoc context
+                  :logical-id logical-id
+                  :full-tx full-tx
+                  :active-visible active-visible
+                  :active-staging active-staging))))))
+
+(defn- assert-modern-reject-preserves-active!
+  [{:keys [sql conn self block-uuid active-visible active-staging]} entry]
+  (let [response (apply-identified-entry! self entry)]
+    (is (= "tx/reject" (:type response)))
+    (is (= (:tx-id entry) (:failed-tx-id response)))
+    (is (= active-visible (modern-visible-state sql conn block-uuid)))
+    (is (= active-staging (modern-staging-snapshot sql))
+        "rejected empty wire entry cannot replace or advance the active session")))
+
+(deftest empty-modern-nonfinal-never-creates-or-advances-a-staged-session-test
+  (testing "ordinal-zero empty nonfinal is rejected without durable staging writes"
+    (with-modern-boundary-db
+      (fn [{:keys [sql conn self block-uuid initial-visible initial-staging]}]
+        (let [entry (modern-session-entry
+                     {:logical-tx-id (random-uuid)
+                      :full-tx-data []
+                      :chunk-tx-data []
+                      :chunk-index 0
+                      :chunk-final? false})
+              response (apply-identified-entry! self entry)]
+          (is (= "tx/reject" (:type response)))
+          (is (= (:tx-id entry) (:failed-tx-id response)))
+          (is (= initial-visible (modern-visible-state sql conn block-uuid)))
+          (is (= initial-staging (modern-staging-snapshot sql))
+              "ordinal-zero empty nonfinal may not create a session or chunk row")))))
+
+  (testing "expected positive ordinal empty nonfinal cannot advance an active generation"
+    (with-modern-active-session
+      (fn [{:keys [logical-id full-tx] :as context}]
+        (assert-modern-reject-preserves-active!
+         context
+         (modern-session-entry
+          {:logical-tx-id logical-id
+           :full-tx-data full-tx
+           :chunk-tx-data []
+           :chunk-index 1
+           :chunk-final? false})))))
+
+  (testing "a different generation empty nonfinal cannot replace the active generation"
+    (with-modern-active-session
+      (fn [{:keys [logical-id full-tx] :as context}]
+        (assert-modern-reject-preserves-active!
+         context
+         (modern-session-entry
+          {:logical-tx-id logical-id
+           :upload-session-id (apply str (repeat 64 "d"))
+           :full-tx-data full-tx
+           :chunk-tx-data []
+           :chunk-index 0
+           :chunk-final? false})))))
+
+  (testing "empty final-first is rejected without durable staging writes"
+    (with-modern-boundary-db
+      (fn [{:keys [sql conn self block-uuid initial-visible initial-staging]}]
+        (let [entry (modern-session-entry
+                     {:logical-tx-id (random-uuid)
+                      :full-tx-data []
+                      :chunk-tx-data []
+                      :chunk-index 0
+                      :chunk-final? true})
+              response (apply-identified-entry! self entry)]
+          (is (= "tx/reject" (:type response)))
+          (is (= (:tx-id entry) (:failed-tx-id response)))
+          (is (= initial-visible (modern-visible-state sql conn block-uuid)))
+          (is (= initial-staging (modern-staging-snapshot sql)))))))
+
+  (testing "only the expected positive ordinal empty final completes and applies the active generation"
+    (with-modern-active-session
+      (fn [{:keys [sql conn self block-uuid t-before logical-id full-tx]}]
+        (let [entry (modern-session-entry
+                     {:logical-tx-id logical-id
+                      :full-tx-data full-tx
+                      :chunk-tx-data []
+                      :chunk-index 1
+                      :chunk-final? true})
+              response (apply-identified-entry! self entry)
+              final-visible (modern-visible-state sql conn block-uuid)
+              final-staging (modern-staging-snapshot sql)
+              final-session-row (-> final-staging :session :rows first)]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= (inc t-before) (:t response) (:t final-visible)))
+          (is (= "after" (:current-title final-visible)
+                 (:fresh-title final-visible)))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (:checksum final-visible)))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (:server-checksum final-visible)))
+          (is (= (:t final-visible) (:server-checksum-t final-visible)))
+          (is (= (:current-graph-checksum final-visible)
+                 (:fresh-graph-checksum final-visible)))
+          (is (= 1 (count (-> final-staging :session :rows))))
+          (is (= 0 (count (-> final-staging :chunk :rows))))
+          (is (= 2 (:next_index final-session-row)))
+          (is (= "completed" (:status final-session-row))))))))
+
 (deftest partial-modern-chunk-metadata-is-always-rejected-test
   (doseq [missing-key [:tx :tx-id :logical-tx-id :upload-session-id
                        :chunk-index :chunk-final? :outliner-op]]
