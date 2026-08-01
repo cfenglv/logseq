@@ -188,11 +188,24 @@ const createIsolatedSignerFixture = () => {
   const signatureOutput = path.join(root, "project-signature.json");
   const trace = path.join(root, "keychain-invocation.json");
   const probe = path.join(root, "test-keychain-probe.cjs");
+  const forceMacos = path.join(root, "force-macos.cjs");
+  const loginKeychain = path.join(
+    root,
+    "Library",
+    "Keychains",
+    "login.keychain-db",
+  );
   const archiveBytes = Buffer.from("isolated macOS update artifact\n");
   const archiveSha512 = createHash("sha512")
     .update(archiveBytes)
     .digest("base64");
   fs.writeFileSync(archive, archiveBytes);
+  fs.mkdirSync(path.dirname(loginKeychain), { recursive: true });
+  fs.writeFileSync(loginKeychain, "");
+  fs.writeFileSync(
+    forceMacos,
+    'Object.defineProperty(process, "platform", { value: "darwin" });\n',
+  );
   fs.writeFileSync(
     metadata,
     [
@@ -233,6 +246,7 @@ const createIsolatedSignerFixture = () => {
     "--signature-output",
     signatureOutput,
   ];
+  const macosSignerArgs = ["--require", forceMacos, ...signerArgs];
   const verifierArgs = [
     path.join(root, verifierRelativePath),
     "--arch",
@@ -247,6 +261,7 @@ const createIsolatedSignerFixture = () => {
   const cleanEnvironment = () => {
     const env = {
       ...process.env,
+      HOME: root,
       LOGSEQ_TEST_KEYCHAIN_TRACE: trace,
     };
     delete env[privateKeyEnvironmentName];
@@ -258,6 +273,9 @@ const createIsolatedSignerFixture = () => {
   return {
     archive,
     cleanEnvironment,
+    forceMacos,
+    loginKeychain,
+    macosSignerArgs,
     metadata,
     policy,
     privateKeyBase64,
@@ -297,7 +315,11 @@ const assertUnchangedUnsignedMetadata = (
   );
 };
 
-const assertKeychainLookup = (args, expectedKeyId) => {
+const assertKeychainLookup = (
+  args,
+  expectedKeyId,
+  expectedLoginKeychain,
+) => {
   assert.equal(args[0], "find-generic-password");
   const serviceIndex = args.indexOf("-s");
   const accountIndex = args.indexOf("-a");
@@ -317,6 +339,22 @@ const assertKeychainLookup = (args, expectedKeyId) => {
     args.includes("-w"),
     "Keychain lookup must request only the stored secret value",
   );
+  assert.equal(
+    args.at(-1),
+    expectedLoginKeychain,
+    "Keychain lookup escaped the isolated fake login Keychain",
+  );
+};
+
+const readFixtureKeychainLookup = (fixture) => {
+  assert.equal(fs.existsSync(fixture.trace), true);
+  const args = JSON.parse(fs.readFileSync(fixture.trace, "utf8"));
+  assertKeychainLookup(
+    args,
+    fixture.policy.keyId,
+    fixture.loginKeychain,
+  );
+  return args;
 };
 
 const workflowJobSource = (source, jobName) => {
@@ -395,14 +433,12 @@ addCase(
   "local signer reads a matching private key from macOS Keychain and pins policy keyId",
   () =>
     withFixture((fixture) => {
-      const result = run(process.execPath, fixture.signerArgs, {
+      const result = run(process.execPath, fixture.macosSignerArgs, {
         cwd: fixture.root,
         env: fixture.cleanEnvironment(),
       });
       assert.equal(result.status, 0, result.output);
-      assert.equal(fs.existsSync(fixture.trace), true);
-      const keychainArgs = JSON.parse(fs.readFileSync(fixture.trace, "utf8"));
-      assertKeychainLookup(keychainArgs, fixture.policy.keyId);
+      const keychainArgs = readFixtureKeychainLookup(fixture);
       assert.equal(
         keychainArgs.includes(fixture.privateKeyBase64),
         false,
@@ -461,12 +497,13 @@ for (const [label, status, key, errorPattern] of [
         status,
       });
       const metadataBefore = fs.readFileSync(fixture.metadata, "utf8");
-      const result = run(process.execPath, fixture.signerArgs, {
+      const result = run(process.execPath, fixture.macosSignerArgs, {
         cwd: fixture.root,
         env: fixture.cleanEnvironment(),
       });
       assert.notEqual(result.status, 0, `${label} was accepted`);
       assert.match(result.output, errorPattern, result.output);
+      readFixtureKeychainLookup(fixture);
       assertUnchangedUnsignedMetadata(fixture, metadataBefore, label);
     }),
   );
@@ -479,11 +516,12 @@ addCase("wrong Keychain private key is rejected against fixed policy", () =>
       privateKeyBase64: fixture.wrongPrivateKeyBase64,
     });
     const metadataBefore = fs.readFileSync(fixture.metadata, "utf8");
-    const result = run(process.execPath, fixture.signerArgs, {
+    const result = run(process.execPath, fixture.macosSignerArgs, {
       cwd: fixture.root,
       env: fixture.cleanEnvironment(),
     });
     assert.notEqual(result.status, 0, "wrong Keychain key was accepted");
+    readFixtureKeychainLookup(fixture);
     assert.match(
       result.output,
       /private key does not match the fixed project update public key/i,
@@ -507,7 +545,7 @@ for (const [label, environment, nodePrefix, errorPattern] of [
     "CI",
     { CI: "true", GITHUB_ACTIONS: "true" },
     [],
-    /local[\s-]*(?:macOS|release|sign)|(?:CI|GitHub Actions)[\s\S]*(?:blocked|forbidden|unsupported)/i,
+    /refuses CI|(?:CI|GitHub Actions)[\s\S]*(?:blocked|forbidden|unsupported)/i,
   ],
   [
     "non-macOS",
@@ -527,9 +565,14 @@ for (const [label, environment, nodePrefix, errorPattern] of [
       const metadataBefore = fs.readFileSync(fixture.metadata, "utf8");
       const env = { ...fixture.cleanEnvironment(), ...environment };
       fs.rmSync(fixture.trace, { force: true });
-      const absoluteNodePrefix = nodePrefix.map((value) =>
-        value.endsWith(".cjs") ? path.join(fixture.root, value) : value,
-      );
+      const absoluteNodePrefix =
+        label === "CI"
+          ? ["--require", fixture.forceMacos]
+          : nodePrefix.map((value) =>
+              value.endsWith(".cjs")
+                ? path.join(fixture.root, value)
+                : value,
+            );
       const result = run(
         process.execPath,
         [...absoluteNodePrefix, ...fixture.signerArgs],
