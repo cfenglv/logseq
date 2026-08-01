@@ -1427,19 +1427,23 @@
 
 (defn- current-upload-send?
   [repo client ws]
-  (if-let [scheduler (:flush-scheduler client)]
-    (let [current @worker-state/*db-sync-client]
-      (and current
+  (if-let [generation (:connection-generation client)]
+    (let [scheduler (:flush-scheduler client)
+          current @worker-state/*db-sync-client]
+      (and scheduler
+           current
            (= repo (:repo current))
            (identical? scheduler (:flush-scheduler current))
            (not (:stopped? @scheduler))
-           (= (:connection-generation client)
-              (:connection-generation current))
+           (= generation (:connection-generation current))
            (identical? ws (:ws current))
            (ws-open? ws)
            (worker-state/online?)
            (not (upload-stopped? repo))))
-    ;; Compatibility for controlled callers that construct a minimal client.
+    ;; Controlled callers may use ensure-client-state! and therefore have a
+    ;; flush scheduler without ever passing through connect!. The non-nil
+    ;; transport generation is the boundary for the strict stale-send gate;
+    ;; generation-less callers retain the legacy direct-flush contract.
     (and (ws-open? ws)
          (worker-state/online?)
          (not (upload-stopped? repo)))))

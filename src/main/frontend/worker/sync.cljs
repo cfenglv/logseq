@@ -257,7 +257,6 @@
    :reconnect (atom {:attempt 0 :timer nil})
    :stale-kill-timer (atom nil)
    :last-ws-message-ts (atom (common-util/time-ms))
-   :connection-generation (str (random-uuid))
    :online-users (atom [])
    :sync-ready? (atom false)
    :ws-state (atom :closed)})
