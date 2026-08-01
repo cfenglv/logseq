@@ -1073,14 +1073,23 @@
 
 (declare apply-tx-entry!)
 
-(defn- allowed-empty-upload-terminator?
-  [sql {:keys [logical-tx-id upload-session-id chunk-index chunk-final?]}]
+(defn- allowed-empty-upload?
+  [sql {:keys [logical-tx-id upload-session-id chunk-index chunk-final?]
+        :as tx-entry}]
   (let [existing (storage/client-tx-upload sql logical-tx-id)]
-    (and (= "active" (:status existing))
-         (= upload-session-id (:session-id existing))
+    (and (= upload-session-id (:session-id existing))
          chunk-final?
          (pos? chunk-index)
-         (= chunk-index (:next-index existing)))))
+         (or (and (= "active" (:status existing))
+                  (= chunk-index (:next-index existing)))
+             ;; A lost final ACK may replay the exact empty terminator after
+             ;; the session has completed. Let the existing completed-retry
+             ;; path verify the persisted final ordinal and server-derived
+             ;; wire digest; no other completed empty entry is admitted.
+             (and (= "completed" (:status existing))
+                  (= chunk-index (:final-index existing))
+                  (= (::payload-digest tx-entry)
+                     (:final-wire-digest existing)))))))
 
 (defn- apply-upload-chunk!
   [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-final?
@@ -1094,16 +1103,17 @@
        (fn []
          (let [tx-data (protocol/transit->tx tx)
                _ (when (and (empty? tx-data)
-                            (not (allowed-empty-upload-terminator?
+                            (not (allowed-empty-upload?
                                   sql tx-entry)))
                    ;; Validate before ensure/start/replace/append. An empty
                    ;; nonfinal chunk carries no progress and must never create,
                    ;; replace, or advance durable staging state. The sole
                    ;; useful empty payload is the final terminator for an
-                   ;; already-active contiguous generation.
+                   ;; already-active contiguous generation, or its exact
+                   ;; completed-session ACK-loss replay.
                    (throw (upload-state-error
                            :db-sync/invalid-empty-upload-chunk tx-entry
-                           "empty upload chunk is not an active final terminator")))
+                           "empty upload chunk is not an allowed final terminator")))
                session (ensure-client-upload-session! sql tx-entry)]
            (if (:completed-retry? session)
              false

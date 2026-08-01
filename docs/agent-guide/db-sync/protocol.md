@@ -40,13 +40,16 @@
     over `logseq-tx-chunk-v2/<logical-tx-id>/<upload-session-id>/<ordinal>/<final|more>`,
     with UUID version and variant bits set, so an ACK-loss retry reuses the same
     authenticated identity and frozen payload.
-  - An empty staged payload is valid only as an explicit final terminator for
-    the same active session at its expected positive ordinal. This covers an
+  - An empty staged payload is valid as an explicit final terminator for the
+    same active session at its expected positive ordinal. This covers an
     indivisible ordinal-zero source group: send the complete group nonfinal,
-    then finish with an empty ordinal-one final chunk. Empty ordinal-zero,
-    empty nonfinal, final-first, out-of-order, and replacement-generation
-    chunks are rejected before any durable staging write. Ordinary v1 empty-tx
-    handling is unchanged.
+    then finish with an empty ordinal-one final chunk. After completion, only
+    an exact retry of that final entry is accepted as an idempotent no-op: its
+    session ID, final ordinal, v2 wire identity, and server-derived final wire
+    digest must match the completed record. Empty ordinal-zero, empty nonfinal,
+    final-first, out-of-order, replacement-generation, and mutated completed
+    retries are rejected before any durable staging write. Ordinary v1
+    empty-tx handling is unchanged.
 - `{"type":"ping"}`
   - Client keepalive, sent every 30 seconds while the connection is otherwise healthy.
   - Cloudflare Durable Objects reply through `setWebSocketAutoResponse` without waking a hibernating object.
