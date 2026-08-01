@@ -1,6 +1,6 @@
 (ns logseq.db-sync.worker-handler-ws-test
   (:require [cljs-bean.core :as bean]
-            [cljs.test :refer [async deftest is]]
+            [cljs.test :refer [async deftest is testing]]
             [datascript.core :as d]
             [logseq.db-sync.index :as index]
             [logseq.db-sync.protocol :as protocol]
@@ -211,6 +211,52 @@
                    :username "alice"}
                   (select-keys % [:op :outliner-op :graph-id :client-revision :username]))
               @tx-metas))))
+
+(deftest selfhost-one-four-and-five-wire-shapes-remain-compatible-test
+  (testing "the deployed Worker accepts additive client generations without requiring new fields"
+    (doseq [{:keys [label client-revision tx-id]}
+            [{:label "selfhost.1"}
+             {:label "selfhost.4"
+              :client-revision "selfhost.4-runtime"}
+             {:label "selfhost.5"
+              :client-revision "selfhost.5-runtime"
+              :tx-id (random-uuid)}]]
+      (let [sql (test-sql/make-sql)
+            conn (storage/open-conn sql)
+            socket #js {:readyState 1}
+            sent* (atom nil)
+            block-uuid (random-uuid)
+            self #js {:conn conn
+                      :graph-id "compat-graph"
+                      :schema-ready true
+                      :sql sql}
+            _ (d/transact! conn [{:block/uuid block-uuid
+                                  :block/name (str "compat-" label)
+                                  :block/title "before"}])
+            tx-entry (cond->
+                       {:tx (protocol/tx->transit
+                             [[:db/add [:block/uuid block-uuid]
+                               :block/title "after"]])
+                        :outliner-op :save-block}
+                       tx-id (assoc :tx-id tx-id))
+            message (cond-> {:type "tx/batch"
+                             :t-before (storage/get-t sql)
+                             :txs [tx-entry]}
+                      client-revision
+                      (assoc :client-revision client-revision))]
+        (with-redefs [presence/get-user (fn [& _]
+                                          {:user-id "compat-user"
+                                           :username "compat"})
+                      ws/broadcast! (fn [& _] nil)
+                      ws/send! (fn [_target response]
+                                 (reset! sent* response))]
+          (ws-handler/handle-ws-message!
+           self socket (protocol/encode-message message)))
+        (is (= "tx/batch/ok" (:type @sent*)) label)
+        (is (= "after"
+               (:block/title
+                (d/entity @conn [:block/uuid block-uuid])))
+            label)))))
 
 (deftest ws-send-serializes-tx-reject-uuids-as-strings-test
   (let [raw* (atom nil)

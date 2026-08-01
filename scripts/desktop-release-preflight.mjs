@@ -149,6 +149,7 @@ for (const relativePath of [
   "scripts/verify-desktop-archive-source-revision.mjs",
   "scripts/test-desktop-sidecar-release-contract.mjs",
   "scripts/test-desktop-runtime-packaging-contract.mjs",
+  "scripts/test-desktop-release-source-binding-contract.mjs",
   "scripts/test-desktop-preflight-preload-contract.mjs",
   "scripts/test-project-signing-policy-contract.mjs",
   "scripts/test-local-project-update-signing-contract.mjs",
@@ -211,6 +212,7 @@ if (
 }
 const requiredDesktopReleaseContracts = [
   "node ./scripts/test-desktop-runtime-packaging-contract.mjs",
+  "node ./scripts/test-desktop-release-source-binding-contract.mjs",
   "node ./scripts/test-updater-private-material-policy-contract.mjs",
   "node ./scripts/test-local-keychain-release-signing-contract.mjs",
   "node ./scripts/test-github-project-update-signing-provider.mjs",

@@ -12370,6 +12370,201 @@
             "the pending edit still needs to advance through the normal upload path")
         (is (= 1 (client-op/get-pending-local-tx-count test-repo)))))))
 
+(deftest successful-hello-bounds-reconnect-backoff-with-pending-edit-test
+  (testing "a successful protocol handshake resets transport backoff without claiming queue convergence"
+    (let [{:keys [conn client-ops-conn child2]} (setup-parent-child)
+          cursor 2734
+          ready-count* (atom 0)
+          flush-count* (atom 0)
+          reconnect* (atom {:attempt 176 :timer nil})
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :reconnect reconnect*
+                  :ws-state (atom :syncing)
+                  :sync-succeeded-f
+                  (fn [] (swap! ready-count* inc))}
+          raw-message
+          (js/JSON.stringify
+           (clj->js
+            {:type "hello"
+             :t cursor
+             :checksum "server-legacy-before-pending-edit"
+             :checksum-version sync-checksum/server-checksum-version
+             :server-checksum "server-v2-before-pending-edit"}))]
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (client-op/update-local-tx test-repo cursor)
+          (ldb/transact!
+           conn
+           [[:db/add
+             [:block/uuid (:block/uuid child2)]
+             :block/title
+             "pending edit during successful reconnect"]]
+           {:outliner-op :save-block})
+          (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
+          (with-redefs
+            [shared-service/broadcast-to-clients! (fn [& _] nil)
+             sync-apply/enqueue-flush-pending!
+             (fn [& _] (swap! flush-count* inc))
+             sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+            (sync-handle-message/handle-message!
+             test-repo client raw-message))
+          (is (= 0 (:attempt @reconnect*))
+              "a valid server hello must prevent attempts 167..176 from carrying across successful connections")
+          (is (zero? @ready-count*)
+              "transport success is not transaction acknowledgement")
+          (is (= :syncing @(:ws-state client))
+              "the UI remains syncing until the real pending queue converges")
+          (is (= 1 @flush-count*))
+          (is (= 1 (client-op/get-pending-local-tx-count test-repo))))))))
+
+(deftest bursty-edit-flush-scheduling-stays-coalesced-test
+  (async done
+         (let [burst-size 256
+               flush-count* (atom 0)
+               release-first* (atom nil)
+               first-flush
+               (p/create
+                (fn [resolve _reject]
+                  (reset! release-first* resolve)))
+               client {:repo test-repo
+                       :send-queue (atom (p/resolved nil))}]
+           (->
+            (p/with-redefs
+              [sync-apply/flush-pending!
+               (fn [_repo _client]
+                 (let [call (swap! flush-count* inc)]
+                   (if (= 1 call)
+                     first-flush
+                     (p/resolved nil))))]
+              ;; Model the synchronous DB-listener side of sustained typing.
+              ;; The first upload remains unresolved while every later edit
+              ;; requests another flush. Scheduling must remain O(1), not grow
+              ;; one promise task per keystroke/retry.
+              (dotimes [_ burst-size]
+                (sync-apply/enqueue-flush-pending! test-repo client))
+              (is (zero? @flush-count*)
+                  "editing returns before the asynchronous upload path runs")
+              (p/let [_ (p/delay 0)
+                      _ (do
+                          (is (= 1 @flush-count*)
+                              "only one upload may be active while the network is stalled")
+                          (@release-first* nil))
+                      _ @(:send-queue client)]
+                (is (<= @flush-count* 2)
+                    (str "a burst of " burst-size
+                         " edits must coalesce to one active plus one follow-up flush; observed "
+                         @flush-count*))))
+            (p/catch
+             (fn [error]
+               (is false (str "unexpected coalescing test failure: " error))))
+            (p/finally done)))))
+
+(deftest repeated-upload-interruption-keeps-one-durable-copy-and-converges-on-real-ack-test
+  (async done
+         (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               tx-ids (mapv (fn [_] (random-uuid)) (range 11))
+               sent* (atom [])
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :upload-request (atom nil)
+                       :last-sync-error (atom nil)
+                       :online-users (atom [])
+                       :ws-state (atom :syncing)
+                       :ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send"
+                                   (fn [raw]
+                                     (swap! sent* conj
+                                            (js->clj
+                                             (js/JSON.parse raw)
+                                             :keywordize-keys true)))))}]
+           (->
+            (with-datascript-conns
+              conn
+              client-ops-conn
+              (fn []
+                (p/with-redefs
+                  [worker-state/online? (constantly true)
+                   sync-crypt/graph-e2ee? (constantly false)
+                   shared-service/broadcast-to-clients! (fn [& _] nil)
+                   sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                  (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                  (client-op/update-local-tx test-repo 0)
+                  (seed-client-op-txs!
+                   test-repo
+                   (mapv
+                    (fn [index tx-id]
+                      {:db-sync/tx-id tx-id
+                       :db-sync/pending? true
+                       :db-sync/created-at (inc index)
+                       :db-sync/outliner-op :save-block
+                       :db-sync/normalized-tx-data
+                       [[:db/add
+                         [:block/uuid (:block/uuid child1)]
+                         :block/title
+                         (str "retry-edit-" index)]]})
+                    (range 11)
+                    tx-ids))
+                  (p/loop [remaining 4]
+                    (if (zero? remaining)
+                      nil
+                      (p/let [_ (#'sync-apply/flush-pending!
+                                 test-repo client)
+                              _ (do
+                                  (is (= 11
+                                         (client-op/get-pending-local-tx-count
+                                          test-repo))
+                                      "no transport interruption may clear durable work")
+                                  ;; This is the client-side state transition
+                                  ;; performed at a WS close boundary. It does
+                                  ;; not mutate the durable pending table.
+                                  (sync-apply/clear-upload-response-timeout!
+                                   client)
+                                  (reset! (:inflight client) []))]
+                        (p/recur (dec remaining)))))
+                  (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                    (let [payloads @sent*
+                          wire-id-sequences
+                          (mapv (fn [payload]
+                                  (mapv :tx-id (:txs payload)))
+                                payloads)]
+                      (is (= 5 (count payloads)))
+                      (is (apply = payloads)
+                          "every retry before ACK must preserve the exact payload and idempotency identities")
+                      (is (= 11 (count (first wire-id-sequences))))
+                      (is (= 11 (count (distinct (first wire-id-sequences))))
+                          "one retry batch contains one wire identity per logical edit")
+                      (is (= tx-ids
+                             (mapv uuid (first wire-id-sequences))))
+                      (is (= 11
+                             (client-op/get-pending-local-tx-count test-repo)))
+                      ;; Only the production response handler is allowed to
+                      ;; acknowledge and clear the durable queue.
+                      (with-redefs
+                        [sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+                        (sync-handle-message/handle-message!
+                         test-repo
+                         client
+                         (js/JSON.stringify
+                          (clj->js {:type "tx/batch/ok" :t 11}))))
+                      (is (zero?
+                           (client-op/get-pending-local-tx-count test-repo)))
+                      (is (= 11 (client-op/get-local-tx test-repo)))
+                      (is (empty? @(:inflight client))))))))
+            (p/catch
+             (fn [error]
+               (is false (str "unexpected retry convergence failure: " error))))
+            (p/finally
+             (fn []
+               (sync-apply/clear-upload-response-timeout! client)
+               (done)))))))
+
 (deftest tx-batch-ok-awaits-async-checksum-recovery-before-ready-test
   (async done
          (let [{:keys [conn client-ops-conn]} (setup-parent-child)
