@@ -1553,23 +1553,109 @@
                                             (sync-util/error->diagnostic error)
                                             :at)}))))))))))))))
 
+(defn- current-flush-client?
+  [repo client scheduler]
+  (let [current @worker-state/*db-sync-client
+        generation (:connection-generation client)]
+    (and current
+         (= repo (:repo current))
+         (identical? scheduler (:flush-scheduler current))
+         (or (nil? generation)
+             (= generation (:connection-generation current))))))
+
+(defn- log-flush-queue-error!
+  [repo error]
+  (log/error :db-sync/flush-pending-queue-failed
+             {:repo repo
+              :diagnostic
+              (dissoc
+               (sync-util/error->diagnostic error)
+               :at)}))
+
+(declare enqueue-reserved-flush!)
+
+(defn- finish-flush-pass!
+  [repo client scheduler]
+  (let [schedule-follow-up? (atom false)]
+    (swap! scheduler
+           (fn [{:keys [follow-up? stopped?] :as state}]
+             (if (and follow-up?
+                      (not stopped?)
+                      (current-flush-client? repo client scheduler))
+               (do
+                 (reset! schedule-follow-up? true)
+                 (assoc state :active? true :follow-up? false))
+               (assoc state :active? false :follow-up? false))))
+    (when @schedule-follow-up?
+      ;; Append after the current queue promise settles. Any pull/presence task
+      ;; already waiting in the shared send queue keeps its ordering, while the
+      ;; scheduler remains reserved so new edits coalesce into one more pass.
+      (js/queueMicrotask
+       #(enqueue-reserved-flush! repo client scheduler)))))
+
+(defn- run-flush-pass!
+  [repo client scheduler]
+  (let [result (if (and (not (:stopped? @scheduler))
+                        (current-flush-client? repo client scheduler))
+                 (try
+                   (flush-pending! repo client)
+                   (catch :default error
+                     (p/rejected error)))
+                 (p/resolved nil))]
+    (-> (p/resolved result)
+        (p/catch (fn [error]
+                   (log-flush-queue-error! repo error)))
+        (p/finally
+         (fn []
+           (finish-flush-pass! repo client scheduler))))))
+
+(defn- enqueue-reserved-flush!
+  [repo client scheduler]
+  (if (and (not (:stopped? @scheduler))
+           (current-flush-client? repo client scheduler))
+    (if-let [send-queue (:send-queue client)]
+      (swap! send-queue
+             (fn [prev]
+               (-> (or prev (p/resolved nil))
+                   (p/catch (fn [_] nil))
+                   (p/then
+                    (fn [_]
+                      (run-flush-pass! repo client scheduler))))))
+      (run-flush-pass! repo client scheduler))
+    (swap! scheduler assoc
+           :active? false
+           :follow-up? false)))
+
 (defn enqueue-flush-pending!
   [repo client]
-  (if-let [send-queue (:send-queue client)]
-    (swap! send-queue
-           (fn [prev]
-             (-> (or prev (p/resolved nil))
-                 (p/catch (fn [_] nil))
-                 (p/then (fn [_]
-                           (flush-pending! repo client)))
-                 (p/catch (fn [error]
-                            (log/error :db-sync/flush-pending-queue-failed
-                                       {:repo repo
-                                        :diagnostic
-                                        (dissoc
-                                         (sync-util/error->diagnostic error)
-                                         :at)}))))))
-    (flush-pending! repo client)))
+  (if-let [scheduler (:flush-scheduler client)]
+    (let [start? (atom false)]
+      (swap! scheduler
+             (fn [{:keys [active? stopped?] :as state}]
+               (cond
+                 stopped?
+                 state
+
+                 active?
+                 (assoc state :follow-up? true)
+
+                 :else
+                 (do
+                   (reset! start? true)
+                   (assoc state :active? true :follow-up? false)))))
+      (when @start?
+        (enqueue-reserved-flush! repo client scheduler)))
+    ;; Compatibility for controlled callers that construct a minimal client.
+    (if-let [send-queue (:send-queue client)]
+      (swap! send-queue
+             (fn [prev]
+               (-> (or prev (p/resolved nil))
+                   (p/catch (fn [_] nil))
+                   (p/then (fn [_]
+                             (flush-pending! repo client)))
+                   (p/catch (fn [error]
+                              (log-flush-queue-error! repo error))))))
+      (flush-pending! repo client))))
 
 (defn- block-ref?
   [v]

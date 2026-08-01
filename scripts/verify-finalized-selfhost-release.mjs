@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { verifyMacosArchiveDesktopRuntimeRevision } from "../resources/desktop-runtime-provenance.mjs";
 import { parseSelfhostProjectVersion } from "../resources/project-updater-signature.mjs";
 import { macosUpdaterMetadataName } from "../resources/selfhost-updater-version.mjs";
 import { verifyProjectSignedMacosUpdate } from "./verify-project-signed-macos-update.mjs";
@@ -79,9 +80,14 @@ const main = () => {
   verifySourceRevision({ dir, sourceRevision });
   const architectures = ["arm64", "x64"];
   for (const arch of architectures) {
+    const archive = path.join(dir, `Logseq-darwin-${arch}-${version}.zip`);
+    verifyMacosArchiveDesktopRuntimeRevision({
+      archive,
+      sourceRevision,
+    });
     verifyProjectSignedMacosUpdate({
       arch,
-      archive: path.join(dir, `Logseq-darwin-${arch}-${version}.zip`),
+      archive,
       metadata: path.join(dir, macosUpdaterMetadataName(version, arch)),
       version,
     });

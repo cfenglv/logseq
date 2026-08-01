@@ -245,6 +245,9 @@
   [repo]
   {:repo repo
    :send-queue (atom (p/resolved nil))
+   :flush-scheduler (atom {:active? false
+                           :follow-up? false
+                           :stopped? false})
    :receive-queue (atom (p/resolved nil))
    :asset-queue (atom (p/resolved nil))
    :pending-pull-since (atom nil)
@@ -470,6 +473,10 @@
   [client]
   (clear-stale-ws-loop-timer! client)
   (sync-apply/clear-upload-response-timeout! client)
+  (when-let [scheduler (:flush-scheduler client)]
+    (reset! scheduler {:active? false
+                       :follow-up? false
+                       :stopped? true}))
   (when-let [reconnect (:reconnect client)]
     (clear-reconnect-timer! reconnect))
   (when-let [ws (:ws client)]
@@ -544,6 +551,9 @@
                          :ws ws
                          :connection-generation (str (random-uuid))
                          :send-queue (atom (p/resolved nil))
+                         :flush-scheduler (atom {:active? false
+                                                 :follow-up? false
+                                                 :stopped? false})
                          :receive-queue (atom (p/resolved nil))
                          :asset-queue (atom (p/resolved nil))
                          :upload-response-timeout-f
@@ -582,12 +592,27 @@
                                         (identical? ws (:ws current)))
                                (handle-runtime-sync-failure!
                                 repo current ws url error :message-failed))))
+                         :transport-recovered-f
+                         (fn []
+                           (when-let [current @worker-state/*db-sync-client]
+                             (when (and (= repo (:repo current))
+                                        (= (:graph-id client) (:graph-id current))
+                                        (identical? ws (:ws current)))
+                               ;; A verified hello proves that this transport
+                               ;; generation recovered even when durable local
+                               ;; work still needs to upload. Do not let an old
+                               ;; failure streak keep later reconnects pinned at
+                               ;; the maximum backoff.
+                               (reset-reconnect! current))))
                          :sync-succeeded-f
                          (fn []
                            (when-let [current @worker-state/*db-sync-client]
                              (when (and (= repo (:repo current))
                                         (= (:graph-id client) (:graph-id current))
                                         (identical? ws (:ws current)))
+                               ;; Full convergence also implies transport
+                               ;; recovery; keep this idempotent reset for
+                               ;; direct success paths and older callers.
                                (reset-reconnect! current)
                                (sync-util/clear-last-sync-error! current)
                                (set-sync-state! current :open true)))))]

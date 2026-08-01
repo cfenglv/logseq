@@ -182,6 +182,9 @@ jobs:
     needs: [ source-preflight, release-rehearsal-gate ]
     runs-on: ubuntu-22.04
     timeout-minutes: 45
+    outputs:
+      source-ref: ${{ needs.release-rehearsal-gate.outputs.source-ref }}
+      source-sha: ${{ needs.release-rehearsal-gate.outputs.source-sha }}
     steps:
       - name: Check out Git repository
         uses: actions/checkout@v4
@@ -264,6 +267,11 @@ jobs:
   compile-cljs:
     needs: [ rtc-release-gate, rtc-browser-e2e ]
     runs-on: ubuntu-22.04
+    outputs:
+      source-ref: ${{ needs.rtc-release-gate.outputs.source-ref }}
+      source-sha: ${{ needs.rtc-release-gate.outputs.source-sha }}
+    env:
+      LOGSEQ_REVISION: ${{ needs.rtc-release-gate.outputs.source-sha }}
     steps:
       - name: Check build options
         if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
@@ -274,7 +282,7 @@ jobs:
       - name: Check out Git repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          ref: ${{ needs.rtc-release-gate.outputs.source-sha }}
           persist-credentials: false
 
       - name: Install Node.js
@@ -435,6 +443,8 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
+    env:
+      LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -497,6 +507,8 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
+    env:
+      LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -559,6 +571,8 @@ jobs:
   build-windows-x64:
     runs-on: windows-latest
     needs: [ compile-cljs ]
+    env:
+      LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -647,6 +661,8 @@ jobs:
   build-windows-arm64:
     runs-on: windows-latest
     needs: [ compile-cljs ]
+    env:
+      LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -738,6 +754,7 @@ jobs:
     runs-on: macos-15-intel
     env:
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
+      LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -748,7 +765,7 @@ jobs:
       - name: Check out macOS release policy
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          ref: ${{ needs.compile-cljs.outputs.source-sha }}
           path: release-gate-source
           persist-credentials: false
 
@@ -902,6 +919,7 @@ jobs:
     runs-on: macos-14
     env:
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
+      LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -912,7 +930,7 @@ jobs:
       - name: Check out macOS release policy
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          ref: ${{ needs.compile-cljs.outputs.source-sha }}
           path: release-gate-source
           persist-credentials: false
 
@@ -1070,7 +1088,7 @@ jobs:
 
   release-assets-preflight:
     if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event.inputs.desktop-platforms != 'windows-only' }}
-    needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
+    needs: [ compile-cljs, build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     outputs:
@@ -1079,7 +1097,7 @@ jobs:
       - name: Check out release verifier
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          ref: ${{ needs.compile-cljs.outputs.source-sha }}
           persist-credentials: false
 
       - name: Install Node.js
@@ -1103,6 +1121,11 @@ jobs:
             --dir "${RUNNER_TEMP}/desktop-release-assets" \
             --version "$version" \
             --write-checksums
+          for arch in arm64 x64; do
+            node scripts/verify-desktop-archive-source-revision.mjs \
+              --archive "${RUNNER_TEMP}/desktop-release-assets/Logseq-darwin-${arch}-${version}.zip" \
+              --source-revision "${{ needs.compile-cljs.outputs.source-sha }}"
+          done
           cat "${RUNNER_TEMP}/desktop-release-assets/SHA256SUMS.txt"
 
   selfhost-release-signing:

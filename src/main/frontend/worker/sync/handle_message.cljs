@@ -173,6 +173,11 @@
   (when-let [sync-succeeded-f (:sync-succeeded-f client)]
     (sync-succeeded-f)))
 
+(defn- mark-transport-recovered!
+  [client]
+  (when-let [transport-recovered-f (:transport-recovered-f client)]
+    (transport-recovered-f)))
+
 (defn- synced-checksum-ready?
   [repo client local-t remote-t]
   (and (= local-t remote-t)
@@ -660,6 +665,10 @@
 
 (defn- finish-handle-hello!
   [repo client local-tx remote-tx]
+  ;; Reaching this point means hello validation, including any asynchronous
+  ;; checksum/marker recovery, completed successfully. Reset transport backoff
+  ;; independently from the stronger fully-synced/ready transition below.
+  (mark-transport-recovered! client)
   (broadcast-rtc-state! client)
   (if (> remote-tx local-tx)
     ;; Reconnects after a lost upload acknowledgement commonly see the server
