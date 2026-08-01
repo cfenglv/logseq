@@ -424,6 +424,7 @@ const expectedClojure = workflowVersion("CLOJURE_VERSION");
 const expectedBabashka = workflowVersion("BABASHKA_VERSION");
 for (const needle of [
   "push:",
+  "resolve-release-source:",
   "source-preflight:",
   "release-rehearsal-gate:",
   "release-assets-preflight:",
@@ -444,7 +445,9 @@ for (const needle of [
   "electron:make-unsigned --mac dmg zip --arm64",
   "codesign --verify --deep --strict",
   "uses: ./.github/workflows/clj-rtc-e2e.yml",
-  "source-ref: ${{ github.event.inputs.git-ref || github.sha }}",
+  "source-ref: ${{ needs.resolve-release-source.outputs.source-sha }}",
+  "ref: ${{ needs.release-rehearsal-gate.outputs.source-sha }}",
+  "LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}",
   "needs: [ rtc-release-gate, rtc-browser-e2e ]",
 ]) {
   assertContains(workflow, needle, "desktop release workflow");

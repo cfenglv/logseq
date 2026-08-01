@@ -80,14 +80,38 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  resolve-release-source:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      source-ref: ${{ steps.source.outputs.ref }}
+      source-sha: ${{ steps.source.outputs.sha }}
+    permissions:
+      contents: read
+    steps:
+      - name: Resolve requested release source once
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Freeze requested release source
+        id: source
+        run: |
+          echo "ref=${REQUESTED_SOURCE_REF}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          REQUESTED_SOURCE_REF: ${{ github.event.inputs.git-ref || github.ref_name }}
+
   source-preflight:
+    needs: [ resolve-release-source ]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
       - name: Check out Git repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          ref: ${{ needs.resolve-release-source.outputs.source-sha }}
           persist-credentials: false
 
       - name: Install Node.js
@@ -132,7 +156,7 @@ jobs:
           node scripts/test-no-local-trust-mutation-contract.mjs
 
   release-rehearsal-gate:
-    needs: [ source-preflight ]
+    needs: [ resolve-release-source, source-preflight ]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -145,16 +169,19 @@ jobs:
       - name: Check out requested release ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          ref: ${{ needs.resolve-release-source.outputs.source-sha }}
           persist-credentials: false
 
       - name: Resolve requested commit
         id: source
         run: |
-          echo "ref=${REQUESTED_SOURCE_REF}" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SOURCE_SHA"
+          echo "ref=${EXPECTED_SOURCE_REF}" >> "$GITHUB_OUTPUT"
+          echo "sha=$actual_sha" >> "$GITHUB_OUTPUT"
         env:
-          REQUESTED_SOURCE_REF: ${{ github.event.inputs.git-ref || github.ref_name }}
+          EXPECTED_SOURCE_REF: ${{ needs.resolve-release-source.outputs.source-ref }}
+          EXPECTED_SOURCE_SHA: ${{ needs.resolve-release-source.outputs.source-sha }}
 
       - name: Verify successful push rehearsal
         if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
@@ -189,7 +216,7 @@ jobs:
       - name: Check out Git repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          ref: ${{ needs.release-rehearsal-gate.outputs.source-sha }}
           persist-credentials: false
 
       - name: Install Node.js
@@ -260,9 +287,10 @@ jobs:
             static/db-sync-backup-memory-test.js
 
   rtc-browser-e2e:
+    needs: [ resolve-release-source ]
     uses: ./.github/workflows/clj-rtc-e2e.yml
     with:
-      source-ref: ${{ github.event.inputs.git-ref || github.sha }}
+      source-ref: ${{ needs.resolve-release-source.outputs.source-sha }}
 
   compile-cljs:
     needs: [ rtc-release-gate, rtc-browser-e2e ]
@@ -272,6 +300,7 @@ jobs:
       source-sha: ${{ needs.rtc-release-gate.outputs.source-sha }}
     env:
       LOGSEQ_REVISION: ${{ needs.rtc-release-gate.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.rtc-release-gate.outputs.source-sha }}
     steps:
       - name: Check build options
         if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
@@ -445,6 +474,7 @@ jobs:
     needs: [ compile-cljs ]
     env:
       LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -509,6 +539,7 @@ jobs:
     needs: [ compile-cljs ]
     env:
       LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -573,6 +604,7 @@ jobs:
     needs: [ compile-cljs ]
     env:
       LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -663,6 +695,7 @@ jobs:
     needs: [ compile-cljs ]
     env:
       LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -755,6 +788,7 @@ jobs:
     env:
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
       LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -920,6 +954,7 @@ jobs:
     env:
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
       LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4

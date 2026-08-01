@@ -1425,6 +1425,25 @@
     (fail-fast :db-sync/missing-db {:repo repo
                                     :op :apply-history-action})))
 
+(defn- current-upload-send?
+  [repo client ws]
+  (if-let [scheduler (:flush-scheduler client)]
+    (let [current @worker-state/*db-sync-client]
+      (and current
+           (= repo (:repo current))
+           (identical? scheduler (:flush-scheduler current))
+           (not (:stopped? @scheduler))
+           (= (:connection-generation client)
+              (:connection-generation current))
+           (identical? ws (:ws current))
+           (ws-open? ws)
+           (worker-state/online?)
+           (not (upload-stopped? repo))))
+    ;; Compatibility for controlled callers that construct a minimal client.
+    (and (ws-open? ws)
+         (worker-state/online?)
+         (not (upload-stopped? repo)))))
+
 (defn flush-pending!
   [repo client]
   (let [inflight @(:inflight client)
@@ -1474,7 +1493,7 @@
                                 (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
                             tx-entries* (p/all
                                          (mapv (fn [{:keys [logical-tx-id upload-session-id
-                                                           chunk-index chunk-final? tx-data]
+                                                           chunk-index tx-data]
                                                     :as tx-entry}]
                                                  (if-let [cached
                                                           (when logical-tx-id
@@ -1493,10 +1512,6 @@
                                                            wire-entry
                                                            {:tx-data tx-data**
                                                             :large-title-logical-tx-data tx-data}]
-                                                     (when logical-tx-id
-                                                       (cache-large-upload-wire-entry!
-                                                        repo logical-tx-id upload-session-id
-                                                        chunk-index chunk-final? wire-entry))
                                                      (merge tx-entry wire-entry))))
                                                tx-entries))
                             payload (mapv (fn [{:keys [tx-id logical-tx-id upload-session-id
@@ -1521,26 +1536,49 @@
                                           :t-before local-tx}
                             capped (cap-upload-request-bytes message-base tx-entries* payload)
                             tx-entries-to-send (:tx-entries capped)
-                            marker-tx-entries
-                            (versioned-large-title-marker-tx-entries
-                             @conn
-                             (large-upload-marker-source-entries
-                              repo tx-entries-to-send))
                             tx-ids (into [] (keep :tx-id) tx-entries-to-send)]
                       (when (seq tx-entries-to-send)
-                        (reset! (:inflight client) tx-ids)
-                        (p/do!
-                         (send! ws (:message capped))
-                         (start-upload-response-timeout!
-                          client
-                          {:tx-ids tx-ids
-                           :outliner-ops (->> tx-entries-to-send
-                                              (keep :outliner-op)
-                                              distinct
-                                              vec)
-                           :large-upload-progress (large-upload-progress tx-entries-to-send)
-                           :large-title-marker-tx-entries marker-tx-entries
-                           :t-before local-tx}))))
+                        ;; Offload and encryption above are asynchronous. The
+                        ;; connection may have been stopped or replaced while
+                        ;; they ran, so bind both frozen wire state and send! to
+                        ;; the scheduler and transport generation one last time.
+                        ;; A stale pass leaves the durable pending rows intact
+                        ;; for the replacement connection to flush.
+                        (if (current-upload-send? repo client ws)
+                          (do
+                            (doseq [{:keys [logical-tx-id upload-session-id
+                                           chunk-index chunk-final? tx-data
+                                           large-title-logical-tx-data]}
+                                    tx-entries-to-send]
+                              (when logical-tx-id
+                                (cache-large-upload-wire-entry!
+                                 repo logical-tx-id upload-session-id
+                                 chunk-index chunk-final?
+                                 {:tx-data tx-data
+                                  :large-title-logical-tx-data
+                                  large-title-logical-tx-data})))
+                            (let [marker-tx-entries
+                                  (versioned-large-title-marker-tx-entries
+                                   @conn
+                                   (large-upload-marker-source-entries
+                                    repo tx-entries-to-send))]
+                              (reset! (:inflight client) tx-ids)
+                              (p/do!
+                               (send! ws (:message capped))
+                               (start-upload-response-timeout!
+                                client
+                                {:tx-ids tx-ids
+                                 :outliner-ops (->> tx-entries-to-send
+                                                    (keep :outliner-op)
+                                                    distinct
+                                                    vec)
+                                 :large-upload-progress (large-upload-progress tx-entries-to-send)
+                                 :large-title-marker-tx-entries marker-tx-entries
+                                 :t-before local-tx}))))
+                          (log/info :db-sync/stale-flush-send-skipped
+                                    {:repo repo
+                                     :connection-generation
+                                     (:connection-generation client)}))))
                     (p/catch (fn [error]
                                (sync-util/set-last-sync-error! client error)
                                (when (seq @(:inflight client))

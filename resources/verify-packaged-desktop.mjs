@@ -38,13 +38,25 @@ const expectedArch = args.arch;
 const expectedVersion = args.version;
 const expectedElectron =
   args["electron-version"] || require("./package.json").devDependencies.electron;
-const expectedRevision =
+const embeddedRevision =
   process.env.LOGSEQ_REVISION?.trim() ||
   spawnSync("git", ["describe", "--long", "--always", "--dirty"], {
     cwd: repoRoot,
     encoding: "utf8",
     shell: false,
   }).stdout?.trim();
+const releaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim();
+if (releaseSourceSha && !/^[0-9a-f]{40}$/.test(releaseSourceSha)) {
+  throw new Error(
+    "LOGSEQ_RELEASE_SOURCE_SHA must be an exact lowercase 40-hex commit SHA",
+  );
+}
+if (releaseSourceSha && embeddedRevision !== releaseSourceSha) {
+  throw new Error(
+    `LOGSEQ_REVISION ${embeddedRevision} does not match release source SHA ${releaseSourceSha}`,
+  );
+}
+const expectedRevision = releaseSourceSha || embeddedRevision;
 
 if (!["darwin", "linux", "win32"].includes(expectedPlatform)) {
   throw new Error(`unsupported --platform: ${expectedPlatform}`);
