@@ -5358,6 +5358,16 @@
     (is (= active-staging (modern-staging-snapshot sql))
         "rejected empty wire entry cannot replace or advance the active session")))
 
+(defn- modern-direct-server-state
+  [sql conn block-uuid]
+  {:t (storage/get-t sql)
+   :checksum (storage/get-checksum sql)
+   :server-checksum (storage/get-server-checksum sql)
+   :server-checksum-t (storage/get-server-checksum-t sql)
+   :graph-checksum (sync-checksum/recompute-server-checksum @conn)
+   :title (:block/title (d/entity @conn [:block/uuid block-uuid]))
+   :staging (modern-staging-snapshot sql)})
+
 (deftest empty-modern-nonfinal-never-creates-or-advances-a-staged-session-test
   (testing "ordinal-zero empty nonfinal is rejected without durable staging writes"
     (with-modern-boundary-db
@@ -5443,6 +5453,78 @@
           (is (= 0 (count (-> final-staging :chunk :rows))))
           (is (= 2 (:next_index final-session-row)))
           (is (= "completed" (:status final-session-row))))))))
+
+(deftest completed-empty-final-retry-is-exactly-once-and-identity-bound-test
+  (testing "the same server instance ACKs an identical completed empty final without client reconciliation"
+    (with-modern-active-session
+      (fn [{:keys [sql conn self block-uuid t-before logical-id full-tx]}]
+        (let [empty-final (modern-session-entry
+                           {:logical-tx-id logical-id
+                            :full-tx-data full-tx
+                            :chunk-tx-data []
+                            :chunk-index 1
+                            :chunk-final? true})
+              final-response (apply-identified-entry! self empty-final)
+              completed-state (modern-direct-server-state sql conn block-uuid)
+              retry-response (apply-identified-entry! self empty-final)
+              retry-state (modern-direct-server-state sql conn block-uuid)
+              completed-session-row
+              (-> completed-state :staging :session :rows first)]
+          (is (= "tx/batch/ok" (:type final-response)))
+          (is (= (inc t-before) (:t final-response)))
+          (is (= "completed" (:status completed-session-row)))
+          (is (= 2 (:next_index completed-session-row)))
+          (is (= 1 (count (-> completed-state :staging :session :rows))))
+          (is (= 0 (count (-> completed-state :staging :chunk :rows))))
+          (is (= "tx/batch/ok" (:type retry-response)))
+          (is (= (:t final-response) (:t retry-response)))
+          (is (= completed-state retry-state)
+              "direct completed retry cannot change t, checksums, graph, session, or chunk rows")))))
+
+  (doseq [{:keys [label mutate]}
+          [{:label "upload session identity"
+            :mutate #(assoc % :upload-session-id
+                            (apply str (repeat 64 "e")))}
+           {:label "chunk ordinal"
+            :mutate #(assoc % :chunk-index 2)}
+           {:label "chunk tx-id"
+            :mutate #(assoc % :tx-id (random-uuid))}
+           {:label "outliner operation"
+            :mutate #(assoc % :outliner-op :move-blocks)}
+           {:label "actual transaction bytes"
+            :mutate (fn [entry]
+                      (assoc entry :tx
+                             (protocol/tx->transit
+                              [[:db/add [:block/uuid (random-uuid)]
+                                :block/title "forged-completed-retry"]])))}
+           {:label "logical identity and derived wire digest"
+            :mutate #(assoc % :logical-tx-id (random-uuid))}]]
+    (testing (str "a completed empty final with changed " label
+                  " is rejected without writes")
+      (with-modern-active-session
+        (fn [{:keys [sql conn self block-uuid logical-id full-tx]}]
+          (let [empty-final (modern-session-entry
+                             {:logical-tx-id logical-id
+                              :full-tx-data full-tx
+                              :chunk-tx-data []
+                              :chunk-index 1
+                              :chunk-final? true})
+                final-response (apply-identified-entry! self empty-final)
+                completed-state (modern-direct-server-state sql conn block-uuid)
+                changed-entry (mutate empty-final)
+                changed-response (apply-identified-entry! self changed-entry)
+                after-state (modern-direct-server-state sql conn block-uuid)]
+            (is (= "tx/batch/ok" (:type final-response)))
+            (is (= "completed"
+                   (-> completed-state :staging :session :rows first :status)))
+            (is (= 0 (count (-> completed-state :staging :chunk :rows))))
+            (is (not= (modern-wire-digest empty-final)
+                      (modern-wire-digest changed-entry))
+                "every one-field mutation must change the server-derived wire identity")
+            (is (= "tx/reject" (:type changed-response)))
+            (is (= (:tx-id changed-entry) (:failed-tx-id changed-response)))
+            (is (= completed-state after-state)
+                "a non-identical completed empty retry cannot change any durable or visible state")))))))
 
 (deftest partial-modern-chunk-metadata-is-always-rejected-test
   (doseq [missing-key [:tx :tx-id :logical-tx-id :upload-session-id
