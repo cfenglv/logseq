@@ -13445,6 +13445,183 @@
                          "cljs$core$IReset$_reset_BANG_$arity$2"))]
       (reset! candidate {}))))
 
+(deftest stale-connected-upload-generation-cannot-publish-after-reconnect-test
+  (testing "an async upload prepared by a stopped connection cannot mutate or send after a new generation becomes current"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 repo test-repo
+                 logical-tx-id (random-uuid)
+                 block-uuid (:block/uuid child1)
+                 logical-tx
+                 (mapv (fn [index]
+                         [:db/add [:block/uuid block-uuid]
+                          :block/title (str "stale-generation-" index)])
+                       (range 5001))
+                 old-sent* (atom [])
+                 new-sent* (atom [])
+                 offload-call-count* (atom 0)
+                 mark-old-offload-entered* (atom nil)
+                 release-old-offload* (atom nil)
+                 old-offload-entered
+                 (p/create
+                  (fn [resolve _reject]
+                    (reset! mark-old-offload-entered* resolve)))
+                 old-offload-release
+                 (p/create
+                  (fn [resolve _reject]
+                    (reset! release-old-offload* resolve)))
+                 old-ws (doto (js-obj)
+                          (aset "readyState" 1)
+                          (aset "send" (fn [raw]
+                                         (swap! old-sent* conj raw)))
+                          (aset "close" (fn []
+                                          (this-as this
+                                            (aset this "readyState" 3)))))
+                 new-ws (doto (js-obj)
+                          (aset "readyState" 1)
+                          (aset "send" (fn [raw]
+                                         (swap! new-sent* conj raw)))
+                          (aset "close" (fn []
+                                          (this-as this
+                                            (aset this "readyState" 3)))))
+                 previous-client @worker-state/*db-sync-client
+                 old-client (production-connected-sync-client
+                             repo "graph-1" old-ws)
+                 new-client* (atom nil)
+                 previous-remote @sync-apply/*repo->latest-remote-tx]
+             (reset! worker-state/*db-sync-client old-client)
+             (->
+              (with-datascript-conns
+                conn
+                client-ops-conn
+                (fn []
+                  (sync-apply/set-server-capabilities!
+                   repo ["tx-upload-staged-v1"])
+                  (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                  (client-op/update-local-tx repo 0)
+                  (seed-client-op-txs!
+                   repo
+                   [{:db-sync/tx-id logical-tx-id
+                     :db-sync/pending? true
+                     :db-sync/created-at 1
+                     :db-sync/outliner-op :save-block
+                     :db-sync/normalized-tx-data logical-tx}])
+                  (p/with-redefs
+                    [worker-state/online? (constantly true)
+                     sync-crypt/graph-e2ee? (constantly false)
+                     sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                     sync-assets/cancel-remote-asset-downloads! (fn [& _] nil)
+                     sync-assets/enqueue-asset-sync! (fn [& _] nil)
+                     shared-service/broadcast-to-clients! (fn [& _] nil)
+                     sync-apply/offload-large-titles
+                     (fn [tx-data _opts]
+                       (let [call (swap! offload-call-count* inc)]
+                         (if (= 1 call)
+                           (do
+                             (@mark-old-offload-entered* nil)
+                             (p/then old-offload-release
+                                     (fn [_] tx-data)))
+                           (p/resolved tx-data))))]
+                    (let [old-upload
+                          (#'sync-apply/flush-pending! repo old-client)]
+                      (p/let [_ old-offload-entered
+                              old-session-before-stop
+                              (client-op/get-client-tx-upload-state
+                               repo logical-tx-id)
+                              _ (do
+                                  (is (empty? (:wire-cache
+                                               old-session-before-stop))
+                                      "the paused control generation has not frozen wire bytes yet")
+                                  (is (empty? @old-sent*))
+                                  (is (empty? @(:inflight old-client)))
+                                  (is (= 1
+                                         (client-op/get-pending-local-tx-count
+                                          repo))))
+                              _ (db-sync/stop!)
+                              new-client
+                              (production-connected-sync-client
+                               repo "graph-1" new-ws)
+                              _ (do
+                                  (reset! new-client* new-client)
+                                  (reset! worker-state/*db-sync-client
+                                          new-client)
+                                  (is (not=
+                                       (:connection-generation old-client)
+                                       (:connection-generation new-client))))
+                              _ (@release-old-offload* nil)
+                              _ old-upload
+                              stale-session
+                              (client-op/get-client-tx-upload-state
+                               repo logical-tx-id)
+                              _ (do
+                                  (is (zero? (count (:wire-cache stale-session)))
+                                      "the stopped generation must not persist its completed async wire preparation")
+                                  (is (empty? @(:inflight old-client))
+                                      "the stopped generation must not claim work inflight")
+                                  (is (empty? @old-sent*)
+                                      "the stopped generation must never call WebSocket.send")
+                                  (is (= 1
+                                         (client-op/get-pending-local-tx-count
+                                          repo))
+                                      "only a real current-generation ACK may clear durable work"))
+                              _ (#'sync-apply/flush-pending!
+                                 repo new-client)
+                              first-request
+                              (js->clj
+                               (js/JSON.parse (first @new-sent*))
+                               :keywordize-keys true)
+                              first-entry (-> first-request :txs first)
+                              _ (do
+                                  (is (= 2 @offload-call-count*)
+                                      "the current generation performs its own preparation instead of consuming stale cache")
+                                  (is (= 0 (:chunk-index first-entry)))
+                                  (is (false? (:chunk-final? first-entry))))
+                              _ ((.-onmessage new-ws)
+                                 #js {:data
+                                      (js/JSON.stringify
+                                       (clj->js
+                                        {:type "tx/batch/ok" :t 0}))})
+                              _ @(:receive-queue new-client)
+                              _ (#'sync-apply/flush-pending!
+                                 repo new-client)
+                              final-request
+                              (js->clj
+                               (js/JSON.parse (second @new-sent*))
+                               :keywordize-keys true)
+                              final-entry (-> final-request :txs first)
+                              _ (do
+                                  (is (= 1 (:chunk-index final-entry)))
+                                  (is (true? (:chunk-final? final-entry)))
+                                  (is (= 1
+                                         (client-op/get-pending-local-tx-count
+                                          repo))))
+                              _ ((.-onmessage new-ws)
+                                 #js {:data
+                                      (js/JSON.stringify
+                                       (clj->js
+                                        {:type "tx/batch/ok" :t 1}))})
+                              _ @(:receive-queue new-client)]
+                        (is (zero?
+                             (client-op/get-pending-local-tx-count repo))
+                            "the current generation converges through its real final ACK")
+                        (is (= 1 (client-op/get-local-tx repo)))
+                        (is (empty? @(:inflight new-client))))))))
+              (p/catch
+               (fn [error]
+                 (is false
+                     (str "unexpected stale-generation test failure: " error))))
+              (p/finally
+               (fn []
+                 (sync-apply/clear-upload-response-timeout! old-client)
+                 (when-let [new-client @new-client*]
+                   (sync-apply/clear-upload-response-timeout! new-client)
+                   (#'db-sync/stop-client! new-client))
+                 (reset! worker-state/*db-sync-client previous-client)
+                 (reset! sync-apply/*repo->latest-remote-tx previous-remote)
+                 (sync-apply/set-server-capabilities! repo [])
+                 (clear-all-process-upload-state!)
+                 (done))))))))
+
 (defn- manual-modern-client
   [repo sent*]
   (let [ws (doto (js-obj)
