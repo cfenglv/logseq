@@ -62,12 +62,18 @@
   [repo tx-report]
   (when (worker-state/get-client-ops-conn repo)
     (let [current-checksum (client-op/get-local-checksum repo)
-          current-server-checksum
-          (or (client-op/get-local-server-checksum repo)
-              (sync-checksum/recompute-server-checksum (:db-before tx-report)))
+          server-checksum-state
+          (client-op/get-local-server-checksum-state repo)
+          current-server-checksum (:checksum server-checksum-state)
           new-checksum (sync-checksum/update-checksum current-checksum tx-report)
           new-server-checksum
-          (sync-checksum/update-server-checksum current-server-checksum tx-report)]
+          (if (:verified? server-checksum-state)
+            (sync-checksum/update-verified-server-checksum
+             current-server-checksum tx-report)
+            ;; Missing, stale, or old-client metadata gets one safe validation
+            ;; of the resulting DB. Its available/unavailable state is then
+            ;; persisted and future local edits use touched-entity checks.
+            (sync-checksum/recompute-server-checksum (:db-after tx-report)))]
       (when (and (exists? js/process)
                  (= "1" (aget (.-env js/process) "LOGSEQ_CHECKSUM_ASSERT")))
         (let [recomputed-checksum (sync-checksum/recompute-checksum (:db-after tx-report))

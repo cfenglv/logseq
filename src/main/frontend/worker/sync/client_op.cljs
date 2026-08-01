@@ -84,6 +84,8 @@
        "session_data text not null,"
        "updated_at integer not null"
        ")"))
+(def ^:private server-checksum-unavailable-state
+  "server-db-v2-verified-unavailable-v1")
 
 (defn- client-ops-store
   [repo]
@@ -323,6 +325,12 @@
     (when-let [result (sqlite-get-meta store :local-tx)]
       (js/parseInt result 10))))
 
+(defn- versioned-checksum-metadata-present?
+  [store]
+  (or (string? (sqlite-get-meta store :db-sync/server-checksum-v2))
+      (= server-checksum-unavailable-state
+         (sqlite-get-meta store :db-sync/server-checksum-v2-state))))
+
 (defn update-local-tx
   [repo t]
   {:pre [(and (integer? t) (>= t 0))]}
@@ -339,7 +347,7 @@
     ;; checksum remains valid. An old-client local edit changes the maintained
     ;; legacy checksum; in that case do not bless the stale versioned value.
     (when (and
-           (string? (sqlite-get-meta store :db-sync/server-checksum-v2))
+           (versioned-checksum-metadata-present? store)
            (= (sqlite-get-meta
                store
                :db-sync/server-checksum-v2-legacy-checksum)
@@ -353,7 +361,7 @@
     (assert (some? store) repo)
     (sqlite-set-meta! store :local-tx 0)
     (when (and
-           (string? (sqlite-get-meta store :db-sync/server-checksum-v2))
+           (versioned-checksum-metadata-present? store)
            (= (sqlite-get-meta
                store
                :db-sync/server-checksum-v2-legacy-checksum)
@@ -374,6 +382,7 @@
     (if (string? checksum)
       (do
         (sqlite-set-meta! store :db-sync/server-checksum-v2 checksum)
+        (sqlite-delete-meta! store :db-sync/server-checksum-v2-state)
         (sqlite-set-meta! store
                           :db-sync/server-checksum-v2-t
                           (or (get-local-tx repo) 0))
@@ -382,9 +391,18 @@
                           (sqlite-get-meta store :db-sync/checksum)))
       (do
         (sqlite-delete-meta! store :db-sync/server-checksum-v2)
-        (sqlite-delete-meta! store :db-sync/server-checksum-v2-t)
-        (sqlite-delete-meta!
-         store :db-sync/server-checksum-v2-legacy-checksum)))))
+        ;; Persist a verified-absent state instead of forgetting it. Graphs
+        ;; with a legacy large-title marker cannot advertise server-db-v2, but
+        ;; ordinary edits must not rescan every block to rediscover that fact.
+        (sqlite-set-meta! store
+                          :db-sync/server-checksum-v2-state
+                          server-checksum-unavailable-state)
+        (sqlite-set-meta! store
+                          :db-sync/server-checksum-v2-t
+                          (or (get-local-tx repo) 0))
+        (sqlite-set-meta! store
+                          :db-sync/server-checksum-v2-legacy-checksum
+                          (sqlite-get-meta store :db-sync/checksum))))))
 
 (defn- persisted-pending-local-tx-count
   [repo]
@@ -431,11 +449,15 @@
     (assert (some? store) repo)
     (sqlite-get-meta store :db-sync/checksum)))
 
-(defn get-local-server-checksum
+(defn get-local-server-checksum-state
+  "Return persisted server-db-v2 verification state at the current local
+  cursor and legacy checksum. A verified nil checksum means a full validation
+  established that this graph cannot currently advertise server-db-v2."
   [repo]
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
     (let [checksum (sqlite-get-meta store :db-sync/server-checksum-v2)
+          state (sqlite-get-meta store :db-sync/server-checksum-v2-state)
           checksum-t (some-> (sqlite-get-meta
                               store
                               :db-sync/server-checksum-v2-t)
@@ -446,10 +468,16 @@
           local-t (get-local-tx repo)]
       ;; Missing/stale watermarks are expected after a client downgrade. The
       ;; caller recomputes from the current local DB instead of trusting them.
-      (when (and (string? checksum)
+      (when (and (or (string? checksum)
+                     (= server-checksum-unavailable-state state))
                  (= checksum-t local-t)
                  (= checksum-legacy (get-local-checksum repo)))
-        checksum))))
+        {:verified? true
+         :checksum (when (string? checksum) checksum)}))))
+
+(defn get-local-server-checksum
+  [repo]
+  (:checksum (get-local-server-checksum-state repo)))
 
 (defn rtc-db-graph?
   "Is RTC enabled"

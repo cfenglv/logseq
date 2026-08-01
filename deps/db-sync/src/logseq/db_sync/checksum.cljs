@@ -574,14 +574,17 @@
 
 (defn update-verified-server-checksum
   "Incrementally update a server-db-v2 checksum after its db-before state was
-  verified against persisted checksum metadata. Only tx-touched entities can
-  invalidate that contract, so this path avoids rescanning the entire graph."
+  verified against persisted checksum metadata. A nil checksum is a verified
+  unavailable state: the graph contained an incompatible large-title marker.
+  Only tx-touched entities can invalidate either contract, so ordinary edits
+  avoid rescanning the entire graph."
   [checksum {:keys [db-before db-after tx-data] :as tx-report}]
   (let [before-e2ee? (ldb/get-graph-rtc-e2ee? db-before)
         after-e2ee? (ldb/get-graph-rtc-e2ee? db-after)
         tx-data (or tx-data [])]
     (cond
-      (not (valid-checksum? checksum))
+      (and (some? checksum)
+           (not (valid-checksum? checksum)))
       (update-server-checksum checksum tx-report)
 
       (not= before-e2ee? after-e2ee?)
@@ -592,8 +595,19 @@
 
       :else
       (let [touched-eids (touched-base-eids db-before db-after tx-data)]
-        (when (server-db-v2-eids-valid? db-after touched-eids)
-          (apply-incremental-delta checksum
-                                   db-before db-after after-e2ee?
-                                   (keyword server-checksum-version)
-                                   tx-data))))))
+        (if (nil? checksum)
+          ;; A known-invalid untouched entity remains invalid. Recompute only
+          ;; when this transaction repairs/removes an invalid touched entity,
+          ;; because that may make the whole graph eligible for server-db-v2.
+          (when (some (fn [eid]
+                        (and (not (server-db-v2-entity-valid?
+                                   db-before before-e2ee? eid))
+                             (server-db-v2-entity-valid?
+                              db-after after-e2ee? eid)))
+                      touched-eids)
+            (recompute-server-checksum db-after))
+          (when (server-db-v2-eids-valid? db-after touched-eids)
+            (apply-incremental-delta checksum
+                                     db-before db-after after-e2ee?
+                                     (keyword server-checksum-version)
+                                     tx-data)))))))
