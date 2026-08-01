@@ -25,13 +25,38 @@
 - `{"type":"tx/batch","t-before":<t>,"txs":[{"tx":"<tx-transit>","tx-id":"<uuid?>","outliner-op":"<keyword?>"}, ...]}`
   - Upload a batch of txs based on `t-before` (required).
   - `tx-id` is optional but recommended for per-entry ack/reject mapping.
+  - Staged transaction upload is additive and must only be used after a server
+    hello advertises `"tx-upload-staged-v1"` in `capabilities`. A modern staged
+    entry contains all of `tx-id`, `logical-tx-id`, `upload-session-id`,
+    `chunk-index`, `chunk-final?`, and `outliner-op`; partial modern metadata is
+    invalid. `chunk-next-index` is not part of this protocol.
+  - `chunk-index` is a zero-based wire ordinal, independent of the source tx
+    offset and post-offload datom count. A generation starts with ordinal zero
+    nonfinal, then advances contiguously by one. The server stages chunks in
+    ordinal order and applies their assembled transaction only on the final
+    chunk.
+  - Every modern wire chunk, including the final chunk, has a `tx-id` distinct
+    from the logical pending operation. Its v2 identity is derived from SHA-256
+    over `logseq-tx-chunk-v2/<logical-tx-id>/<upload-session-id>/<ordinal>/<final|more>`,
+    with UUID version and variant bits set, so an ACK-loss retry reuses the same
+    authenticated identity and frozen payload.
+  - An empty staged payload is valid only as an explicit final terminator for
+    the same active session at its expected positive ordinal. This covers an
+    indivisible ordinal-zero source group: send the complete group nonfinal,
+    then finish with an empty ordinal-one final chunk. Empty ordinal-zero,
+    empty nonfinal, final-first, out-of-order, and replacement-generation
+    chunks are rejected before any durable staging write. Ordinary v1 empty-tx
+    handling is unchanged.
 - `{"type":"ping"}`
   - Client keepalive, sent every 30 seconds while the connection is otherwise healthy.
   - Cloudflare Durable Objects reply through `setWebSocketAutoResponse` without waking a hibernating object.
 
 ## Server -> Client
-- `{"type":"hello","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}`
+- `{"type":"hello","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?,"capabilities":["tx-upload-staged-v1"]?}`
   - Server hello with current t and entity checksum.
+  - `capabilities` is additive. `tx-upload-staged-v1` opts a new client into
+    the modern staged transaction fields and rules documented above; clients
+    that do not observe it must keep using the ordinary v1 batch shape.
   - `checksum` retains the historical v1 value and meaning for old clients.
     Current servers additionally emit the optional, paired
     `checksum-version` and `server-checksum` fields. A client may compare the

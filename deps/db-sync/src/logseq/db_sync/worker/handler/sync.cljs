@@ -1073,6 +1073,15 @@
 
 (declare apply-tx-entry!)
 
+(defn- allowed-empty-upload-terminator?
+  [sql {:keys [logical-tx-id upload-session-id chunk-index chunk-final?]}]
+  (let [existing (storage/client-tx-upload sql logical-tx-id)]
+    (and (= "active" (:status existing))
+         (= upload-session-id (:session-id existing))
+         chunk-final?
+         (pos? chunk-index)
+         (= chunk-index (:next-index existing)))))
+
 (defn- apply-upload-chunk!
   [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-final?
                      outliner-op tx] :as tx-entry}
@@ -1083,11 +1092,22 @@
       (storage/with-sql-transaction!
        sql
        (fn []
-         (let [session (ensure-client-upload-session! sql tx-entry)]
+         (let [tx-data (protocol/transit->tx tx)
+               _ (when (and (empty? tx-data)
+                            (not (allowed-empty-upload-terminator?
+                                  sql tx-entry)))
+                   ;; Validate before ensure/start/replace/append. An empty
+                   ;; nonfinal chunk carries no progress and must never create,
+                   ;; replace, or advance durable staging state. The sole
+                   ;; useful empty payload is the final terminator for an
+                   ;; already-active contiguous generation.
+                   (throw (upload-state-error
+                           :db-sync/invalid-empty-upload-chunk tx-entry
+                           "empty upload chunk is not an active final terminator")))
+               session (ensure-client-upload-session! sql tx-entry)]
            (if (:completed-retry? session)
              false
              (let [wire-digest (::payload-digest tx-entry)
-                   tx-data (protocol/transit->tx tx)
                    datom-count (count tx-data)
                    stored (storage/client-tx-upload-chunk
                            sql upload-session-id chunk-index)]

@@ -6110,10 +6110,13 @@
       (storage/init-schema! sql)
       (let [conn (storage/open-conn sql)
             self #js {:sql sql :conn conn :schema-ready true}
-            entries (modern-session-entries
-                     (random-uuid) :delete-blocks [] 1)
-            before (stage-modern-prefix! self entries)
-            response (apply-identified-entry! self (last entries))]
+            entry (first (modern-session-entries
+                          (random-uuid) :delete-blocks [] 1))
+            before {:t (storage/get-t sql)
+                    :checksum (storage/get-checksum sql)
+                    :graph-checksum
+                    (sync-checksum/recompute-server-checksum @conn)}
+            response (apply-identified-entry! self entry)]
         (is (= "tx/reject" (:type response)))
         (is (= (:t before) (:t response) (storage/get-t sql)))
         (is (= (:checksum before) (storage/get-checksum sql)))
