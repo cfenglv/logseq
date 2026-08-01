@@ -27,6 +27,7 @@ const runtimeFiles = [
 
 const sourceRevision = "c5820a5ec1a63f505e59ca604476d2bd23df3b70";
 const staleRuntimeRevision = "eaeb51ece7";
+const workflowRevision = "1111111111111111111111111111111111111111";
 
 const withVerifierFixture = (runtimeRevision, f) => {
   const root = fs.mkdtempSync(
@@ -62,7 +63,10 @@ const runVerifier = (root, runtimeRevision) =>
       encoding: "utf8",
       env: {
         ...process.env,
-        GITHUB_SHA: sourceRevision,
+        // The workflow commit can differ from the independently selected
+        // release source. Runtime self-reporting and GITHUB_SHA must not
+        // override LOGSEQ_RELEASE_SOURCE_SHA.
+        GITHUB_SHA: workflowRevision,
         LOGSEQ_RELEASE_SOURCE_SHA: sourceRevision,
         LOGSEQ_REVISION: runtimeRevision,
       },
@@ -80,6 +84,7 @@ test("desktop runtime verification is bound to the exact release source SHA", ()
         "a self-reported stale runtime revision must not override the release source SHA",
         `release source: ${sourceRevision}`,
         `embedded runtime: ${staleRuntimeRevision}`,
+        `workflow revision: ${workflowRevision}`,
         result.stdout,
         result.stderr,
       ].join("\n"),

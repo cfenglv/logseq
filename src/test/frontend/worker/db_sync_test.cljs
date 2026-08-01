@@ -12370,57 +12370,89 @@
             "the pending edit still needs to advance through the normal upload path")
         (is (= 1 (client-op/get-pending-local-tx-count test-repo)))))))
 
+(defn- production-connected-sync-client
+  [repo graph-id ws]
+  ;; Use the same state factory and connection wiring as start!. This keeps
+  ;; tests coupled to any future scheduler/recovery fields added by production
+  ;; initialization instead of silently falling back through an incomplete map.
+  (with-redefs [platform/current
+                (fn [] {:websocket {:connect (fn [_url] ws)}})]
+    (#'db-sync/connect!
+     repo
+     (assoc (#'db-sync/ensure-client-state! repo) :graph-id graph-id)
+     (str "wss://sync.example.test/sync/" graph-id)
+     "test-token")))
+
 (deftest successful-hello-bounds-reconnect-backoff-with-pending-edit-test
-  (testing "a successful protocol handshake resets transport backoff without claiming queue convergence"
-    (let [{:keys [conn client-ops-conn child2]} (setup-parent-child)
-          cursor 2734
-          ready-count* (atom 0)
-          flush-count* (atom 0)
-          reconnect* (atom {:attempt 176 :timer nil})
-          client {:repo test-repo
-                  :graph-id "graph-1"
-                  :inflight (atom [])
-                  :online-users (atom [])
-                  :reconnect reconnect*
-                  :ws-state (atom :syncing)
-                  :sync-succeeded-f
-                  (fn [] (swap! ready-count* inc))}
-          raw-message
-          (js/JSON.stringify
-           (clj->js
-            {:type "hello"
-             :t cursor
-             :checksum "server-legacy-before-pending-edit"
-             :checksum-version sync-checksum/server-checksum-version
-             :server-checksum "server-v2-before-pending-edit"}))]
-      (with-datascript-conns
-        conn
-        client-ops-conn
-        (fn []
-          (client-op/update-local-tx test-repo cursor)
-          (ldb/transact!
-           conn
-           [[:db/add
-             [:block/uuid (:block/uuid child2)]
-             :block/title
-             "pending edit during successful reconnect"]]
-           {:outliner-op :save-block})
-          (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
-          (with-redefs
-            [shared-service/broadcast-to-clients! (fn [& _] nil)
-             sync-apply/enqueue-flush-pending!
-             (fn [& _] (swap! flush-count* inc))
-             sync-assets/enqueue-asset-sync! (fn [& _] nil)]
-            (sync-handle-message/handle-message!
-             test-repo client raw-message))
-          (is (= 0 (:attempt @reconnect*))
-              "a valid server hello must prevent attempts 167..176 from carrying across successful connections")
-          (is (zero? @ready-count*)
-              "transport success is not transaction acknowledgement")
-          (is (= :syncing @(:ws-state client))
-              "the UI remains syncing until the real pending queue converges")
-          (is (= 1 @flush-count*))
-          (is (= 1 (client-op/get-pending-local-tx-count test-repo))))))))
+  (async done
+         (let [{:keys [conn client-ops-conn child2]} (setup-parent-child)
+               cursor 2734
+               flush-count* (atom 0)
+               sent* (atom [])
+               previous-client @worker-state/*db-sync-client
+               ws (doto (js-obj)
+                    (aset "readyState" 1)
+                    (aset "send" (fn [raw] (swap! sent* conj raw)))
+                    (aset "close" (fn [] nil)))
+               client (production-connected-sync-client
+                       test-repo "graph-1" ws)
+               raw-message
+               (js/JSON.stringify
+                (clj->js
+                 {:type "hello"
+                  :t cursor
+                  :checksum "server-legacy-before-pending-edit"
+                  :checksum-version sync-checksum/server-checksum-version
+                  :server-checksum "server-v2-before-pending-edit"}))]
+           (reset! worker-state/*db-sync-client client)
+           (swap! (:reconnect client) assoc :attempt 176)
+           (->
+            (with-datascript-conns
+              conn
+              client-ops-conn
+              (fn []
+                (client-op/update-local-tx test-repo cursor)
+                (ldb/transact!
+                 conn
+                 [[:db/add
+                   [:block/uuid (:block/uuid child2)]
+                   :block/title
+                   "pending edit during successful reconnect"]]
+                 {:outliner-op :save-block})
+                (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
+                (p/with-redefs
+                  [shared-service/broadcast-to-clients! (fn [& _] nil)
+                   sync-apply/enqueue-flush-pending!
+                   (fn [& _] (swap! flush-count* inc))
+                   sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                  ;; Exercise the actual onopen -> onmessage -> receive-queue
+                  ;; path installed by connect!, including its production
+                  ;; sync-succeeded callback and reconnect atom.
+                  ((.-onopen ws) #js {})
+                  (is (= :syncing @(:ws-state client)))
+                  (is (false? @(:sync-ready? client)))
+                  ((.-onmessage ws) #js {:data raw-message})
+                  (p/let [_ @(:receive-queue client)]
+                    (is (= 0 (:attempt @(:reconnect client)))
+                        "a valid server hello must prevent attempts 167..176 from carrying across successful connections")
+                    (is (false? @(:sync-ready? client))
+                        "transport success is not transaction acknowledgement")
+                    (is (= :syncing @(:ws-state client))
+                        "the UI remains syncing until the real pending queue converges")
+                    (is (= 1 @flush-count*))
+                    (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
+                    (is (= "hello"
+                           (:type (js->clj
+                                   (js/JSON.parse (first @sent*))
+                                   :keywordize-keys true))))))))
+            (p/catch
+             (fn [error]
+               (is false (str "unexpected production hello test failure: " error))))
+            (p/finally
+             (fn []
+               (#'db-sync/stop-client! client)
+               (reset! worker-state/*db-sync-client previous-client)
+               (done)))))))
 
 (deftest bursty-edit-flush-scheduling-stays-coalesced-test
   (async done
@@ -12431,8 +12463,14 @@
                (p/create
                 (fn [resolve _reject]
                   (reset! release-first* resolve)))
-               client {:repo test-repo
-                       :send-queue (atom (p/resolved nil))}]
+               previous-client @worker-state/*db-sync-client
+               ws (doto (js-obj)
+                    (aset "readyState" 1)
+                    (aset "send" (fn [& _] nil))
+                    (aset "close" (fn [] nil)))
+               client (production-connected-sync-client
+                       test-repo "graph-1" ws)]
+           (reset! worker-state/*db-sync-client client)
            (->
             (p/with-redefs
               [sync-apply/flush-pending!
@@ -12462,7 +12500,11 @@
             (p/catch
              (fn [error]
                (is false (str "unexpected coalescing test failure: " error))))
-            (p/finally done)))))
+            (p/finally
+             (fn []
+               (#'db-sync/stop-client! client)
+               (reset! worker-state/*db-sync-client previous-client)
+               (done)))))))
 
 (deftest repeated-upload-interruption-keeps-one-durable-copy-and-converges-on-real-ack-test
   (async done
