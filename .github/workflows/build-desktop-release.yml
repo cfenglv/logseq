@@ -209,6 +209,7 @@ jobs:
         uses: DeLaGuardo/setup-clojure@13.5
         with:
           cli: ${{ env.CLOJURE_VERSION }}
+          bb: ${{ env.BABASHKA_VERSION }}
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

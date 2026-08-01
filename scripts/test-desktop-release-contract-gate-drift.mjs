@@ -16,6 +16,12 @@ const quickPreflightRelativePath =
 const formalGateName = "desktop:test-release-contracts";
 const regressionCommand =
   "node ./scripts/test-desktop-release-contract-gate-drift.mjs";
+const desktopReleaseWorkflowPath =
+  ".github/workflows/build-desktop-release.yml";
+const babashkaDependentGateCommands = new Set([
+  "pnpm desktop:release-preflight:quick -- --strict",
+  "pnpm desktop:test-release-contracts",
+]);
 const requiredReleaseContracts = [
   "node ./scripts/test-desktop-runtime-packaging-contract.mjs",
   "node ./scripts/test-updater-private-material-policy-contract.mjs",
@@ -57,6 +63,136 @@ const run = (executable, args, options = {}) => {
     output: `${result.stdout || ""}${result.stderr || ""}`,
     status: result.status,
   };
+};
+
+const workflowSection = (lines, name) => {
+  const start = lines.findIndex((line) => line === `${name}:`);
+  assert.notEqual(start, -1, `desktop release workflow is missing ${name}:`);
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^\S/.test(lines[index]) && !lines[index].startsWith("#")) {
+      end = index;
+      break;
+    }
+  }
+  return { end, start };
+};
+
+const workflowJobs = (source) => {
+  const lines = source.split(/\r?\n/);
+  const jobsSection = workflowSection(lines, "jobs");
+  const jobStarts = [];
+  for (
+    let index = jobsSection.start + 1;
+    index < jobsSection.end;
+    index += 1
+  ) {
+    const match = lines[index].match(/^  ([A-Za-z0-9_-]+):\s*$/);
+    if (match) jobStarts.push({ index, name: match[1] });
+  }
+
+  return jobStarts.map((job, jobIndex) => {
+    const end = jobStarts[jobIndex + 1]?.index ?? jobsSection.end;
+    const stepsStart = lines.findIndex(
+      (line, index) =>
+        index > job.index && index < end && line === "    steps:",
+    );
+    if (stepsStart === -1) return { ...job, end, steps: [] };
+
+    const stepStarts = [];
+    for (let index = stepsStart + 1; index < end; index += 1) {
+      if (/^      -(?:\s|$)/.test(lines[index])) stepStarts.push(index);
+    }
+    const steps = stepStarts.map((start, stepIndex) => {
+      const stepEnd = stepStarts[stepIndex + 1] ?? end;
+      const stepLines = lines.slice(start, stepEnd);
+      const withStart = stepLines.findIndex(
+        (line) => line === "        with:",
+      );
+      let withEnd = stepLines.length;
+      if (withStart !== -1) {
+        const nextStepKey = stepLines.findIndex(
+          (line, index) =>
+            index > withStart && /^ {8}[A-Za-z][A-Za-z0-9_-]*:/.test(line),
+        );
+        if (nextStepKey !== -1) withEnd = nextStepKey;
+      }
+      const withLines =
+        withStart === -1
+          ? []
+          : stepLines.slice(withStart + 1, withEnd);
+      const runs = stepLines.flatMap((line) => {
+        const match = line.match(/^        run:\s*(.*?)\s*$/);
+        return match && match[1] ? [match[1]] : [];
+      });
+      return {
+        end: stepEnd,
+        hasBabashka: withLines.some(
+          (line) => line === "          bb: ${{ env.BABASHKA_VERSION }}",
+        ),
+        isSetupClojure: stepLines.some(
+          (line) =>
+            line.trim() === "uses: DeLaGuardo/setup-clojure@13.5",
+        ),
+        runs,
+        start,
+      };
+    });
+    return { ...job, end, steps };
+  });
+};
+
+const assertBabashkaReleaseGates = (workflow) => {
+  const lines = workflow.split(/\r?\n/);
+  const envSection = workflowSection(lines, "env");
+  const versions = lines
+    .slice(envSection.start + 1, envSection.end)
+    .flatMap((line) => {
+      const match = line.match(
+        /^  BABASHKA_VERSION:\s*['"]?([^'"\s]+)['"]?\s*$/,
+      );
+      return match ? [match[1]] : [];
+    });
+  assert.deepEqual(
+    versions,
+    ["1.12.215"],
+    "desktop release workflow must pin top-level BABASHKA_VERSION to 1.12.215",
+  );
+
+  const gateJobs = workflowJobs(workflow).filter((job) =>
+    job.steps.some((step) =>
+      step.runs.some((command) =>
+        babashkaDependentGateCommands.has(command),
+      ),
+    ),
+  );
+  assert.deepEqual(
+    gateJobs.map((job) => job.name).sort(),
+    ["rtc-release-gate", "source-preflight"],
+    "Babashka-dependent desktop release jobs drifted",
+  );
+
+  for (const job of gateJobs) {
+    const setupSteps = job.steps.filter((step) => step.isSetupClojure);
+    assert.equal(
+      setupSteps.length,
+      1,
+      `${job.name} must contain exactly one DeLaGuardo/setup-clojure@13.5 step`,
+    );
+    assert.ok(
+      setupSteps[0].hasBabashka,
+      `${job.name} setup-clojure step must install bb from BABASHKA_VERSION`,
+    );
+    const firstGateStep = job.steps.find((step) =>
+      step.runs.some((command) =>
+        babashkaDependentGateCommands.has(command),
+      ),
+    );
+    assert.ok(
+      setupSteps[0].start < firstGateStep.start,
+      `${job.name} must install bb before its desktop release gate`,
+    );
+  }
 };
 
 const symlinkRepositoryEntry = (source, destination, directory) => {
@@ -186,6 +322,10 @@ const addCase = (name, test) => cases.push([name, test]);
 const packageJson = JSON.parse(read("package.json"));
 const formalGate = packageJson.scripts?.[formalGateName] ?? "";
 const formalSegments = commandSegments(formalGate);
+
+addCase("Babashka-dependent workflow gates install pinned bb first", () => {
+  assertBabashkaReleaseGates(read(desktopReleaseWorkflowPath));
+});
 
 addCase("formal gate contains every required release contract exactly once", () => {
   assert.equal(
