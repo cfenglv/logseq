@@ -4846,6 +4846,337 @@
             (is (= (client-op/get-local-checksum test-repo)
                    (sync-checksum/recompute-checksum (:db-after tx-report))))))))))
 
+(defn- checksum-scale-conn
+  ([block-count]
+   (checksum-scale-conn block-count nil))
+  ([block-count v2-unavailable-reason]
+   (let [page-uuid (random-uuid)
+         large-title (apply str (repeat 5000 "x"))
+         legacy-marker {:asset-uuid "legacy-large-title"
+                        :asset-type "txt"}
+         page {:db/id 1
+               :block/uuid page-uuid
+               :block/name "checksum-scale"
+               :block/title "Checksum scale"}
+         blocks
+         (mapv (fn [idx]
+                 (cond-> {:db/id (+ idx 2)
+                          :block/uuid (random-uuid)
+                          :block/title (str "block-" idx)
+                          :block/order (str "a" idx)
+                          :block/parent 1
+                          :block/page 1}
+                   (and (zero? idx)
+                        (contains? #{:legacy-marker
+                                     :unmarked-large-title}
+                                   v2-unavailable-reason))
+                   (assoc :block/title large-title)
+
+                   (and (zero? idx)
+                        (= :legacy-marker v2-unavailable-reason))
+                   (assoc sync-large-title/large-title-object-attr
+                          legacy-marker)))
+               (range block-count))]
+     (d/conn-from-db
+      (d/db-with (d/empty-db db-schema/schema)
+                 (into [page] blocks))))))
+
+(defn- observe-full-checksum-passes
+  "Count the two checksum operations that enumerate the complete
+  :avet/:block/uuid index. Incremental point/range lookups remain uncounted,
+  so the assertion is independent of machine speed and graph size."
+  [f]
+  (let [#_{:clj-kondo/ignore [:private-call]}
+        original-valid? sync-checksum/server-db-v2-valid?
+        #_{:clj-kondo/ignore [:private-call]}
+        original-tuples sync-checksum/db-checksum-tuples
+        validations (atom 0)
+        tuple-enumerations (atom 0)]
+    (with-redefs
+      [sync-checksum/server-db-v2-valid?
+       (fn [db]
+         (swap! validations inc)
+         (original-valid? db))
+       sync-checksum/db-checksum-tuples
+       (fn [db e2ee? mode]
+         (swap! tuple-enumerations inc)
+         (original-tuples db e2ee? mode))]
+      (f))
+    {:validations @validations
+     :tuple-enumerations @tuple-enumerations
+     :passes (+ @validations @tuple-enumerations)}))
+
+(defn- initialize-client-checksums!
+  [repo conn]
+  (client-op/update-local-checksum
+   repo (sync-checksum/recompute-checksum @conn))
+  (client-op/update-local-server-checksum
+   repo (sync-checksum/recompute-server-checksum @conn)))
+
+(defn- with-checksum-client-conns
+  "Install only the two stores used by checksum maintenance. Unlike the broad
+  sync fixture this deliberately has no upload listener/scheduler, so running
+  versus stopped state cannot introduce unrelated network work."
+  [db-conn ops-conn f]
+  (let [db-prev @worker-state/*datascript-conns
+        ops-prev @worker-state/*client-ops-conns]
+    (reset! worker-state/*datascript-conns {test-repo db-conn})
+    (reset! worker-state/*client-ops-conns {test-repo ops-conn})
+    (when (nil? (client-op/get-local-tx test-repo))
+      (client-op/update-local-tx test-repo 0))
+    (try
+      (f)
+      (finally
+        (reset! worker-state/*datascript-conns db-prev)
+        (reset! worker-state/*client-ops-conns ops-prev)))))
+
+(defn- transact-and-update-client-checksums!
+  [repo conn tx-data]
+  (let [tx-report (d/transact! conn tx-data {:outliner-op :save-block})]
+    (db-sync/update-local-sync-checksum! repo tx-report)
+    tx-report))
+
+(defn- sqlite-set-sync-meta!
+  [db k value]
+  (.run (.prepare ^js db
+                  (str "insert into sync_meta (key, value) values (?, ?) "
+                       "on conflict(key) do update set value = excluded.value"))
+        (name k)
+        (str value)))
+
+(defn- sqlite-delete-sync-meta!
+  [db k]
+  (.run (.prepare ^js db "delete from sync_meta where key = ?")
+        (name k)))
+
+(defn- sqlite-sync-meta
+  [db k]
+  (some-> (sqlite-get-row db
+                          "select value from sync_meta where key = ?"
+                          (name k))
+          (aget "value")))
+
+(defn- v2-checksum-marker
+  [asset-uuid digest-char]
+  {:asset-uuid asset-uuid
+   :asset-type "txt"
+   :payload-format "utf8-plain-v1"
+   :payload-digest-alg "sha256-v1"
+   :payload-digest (apply str (repeat 64 digest-char))})
+
+(deftest large-graph-small-local-edits-never-enumerate-the-whole-graph-test
+  (testing "single and continuous edits stay request-sized whether RTC is running or stopped"
+    (let [conn (checksum-scale-conn 128)
+          client-ops-conn (new-client-ops-db)
+          previous-client @worker-state/*db-sync-client]
+      (try
+        (with-checksum-client-conns conn client-ops-conn
+          (fn []
+            (initialize-client-checksums! test-repo conn)
+            (doseq [[state client]
+                    [[:stopped nil]
+                     [:running {:repo test-repo
+                                :graph-id "graph-1"
+                                :ws-state (atom :open)}]]]
+              (reset! worker-state/*db-sync-client client)
+              (let [tx-report
+                    (d/transact! conn
+                                 [[:db/add 2 :block/title
+                                   (str "single-" (name state))]]
+                                 {:outliner-op :save-block})
+                    work
+                    (observe-full-checksum-passes
+                     #(db-sync/update-local-sync-checksum!
+                       test-repo tx-report))]
+                (is (zero? (:passes work))
+                    (str state " single edit performed whole-graph passes "
+                         work))))
+            (reset! worker-state/*db-sync-client
+                    {:repo test-repo
+                     :graph-id "graph-1"
+                     :ws-state (atom :open)})
+            (let [work
+                  (observe-full-checksum-passes
+                   (fn []
+                     (doseq [idx (range 4)]
+                       (transact-and-update-client-checksums!
+                        test-repo conn
+                        [[:db/add 2 :block/title (str "burst-" idx)]]))))]
+              (is (zero? (:passes work))
+                  (str "four small edits performed whole-graph passes "
+                       work)))
+            (is (= (sync-checksum/recompute-checksum @conn)
+                   (client-op/get-local-checksum test-repo)))
+            (is (= (sync-checksum/recompute-server-checksum @conn)
+                   (client-op/get-local-server-checksum test-repo)))))
+        (finally
+          (reset! worker-state/*db-sync-client previous-client))))))
+
+(deftest cold-and-rolling-client-checksum-metadata-recovers-once-test
+  (testing "missing, old, corrupt, and expired metadata recover once then stay incremental"
+    (doseq [metadata-shape [:missing-all
+                            :legacy-only-old-client
+                            :corrupt-values
+                            :expired-v2-watermark]]
+      (testing (name metadata-shape)
+        (let [conn (checksum-scale-conn 128)
+              client-ops-conn (new-client-ops-db)]
+          (with-checksum-client-conns conn client-ops-conn
+            (fn []
+              (initialize-client-checksums! test-repo conn)
+              (sqlite-set-sync-meta! client-ops-conn
+                                     :future-rolling-upgrade-key
+                                     "preserve-me")
+              (case metadata-shape
+                :missing-all
+                (doseq [k [:db-sync/checksum
+                            :db-sync/server-checksum-v2
+                            :db-sync/server-checksum-v2-t
+                            :db-sync/server-checksum-v2-legacy-checksum]]
+                  (sqlite-delete-sync-meta! client-ops-conn k))
+
+                :legacy-only-old-client
+                (doseq [k [:db-sync/server-checksum-v2
+                            :db-sync/server-checksum-v2-t
+                            :db-sync/server-checksum-v2-legacy-checksum]]
+                  (sqlite-delete-sync-meta! client-ops-conn k))
+
+                :corrupt-values
+                (do
+                  (sqlite-set-sync-meta! client-ops-conn
+                                         :db-sync/checksum "corrupt")
+                  (sqlite-set-sync-meta! client-ops-conn
+                                         :db-sync/server-checksum-v2 "broken")
+                  (sqlite-set-sync-meta!
+                   client-ops-conn
+                   :db-sync/server-checksum-v2-legacy-checksum
+                   "corrupt"))
+
+                :expired-v2-watermark
+                (sqlite-set-sync-meta! client-ops-conn
+                                       :db-sync/server-checksum-v2-t -1))
+
+              ;; The first post-upgrade edit is allowed to repair cold state.
+              (transact-and-update-client-checksums!
+               test-repo conn
+               [[:db/add 2 :block/title
+                 (str "recovered-" (name metadata-shape))]])
+              (is (= (sync-checksum/recompute-checksum @conn)
+                     (client-op/get-local-checksum test-repo)))
+              (is (= (sync-checksum/recompute-server-checksum @conn)
+                     (client-op/get-local-server-checksum test-repo)))
+
+              ;; Recovery must be persisted: the next edit cannot pay the
+              ;; graph-sized validation cost again.
+              (let [tx-report
+                    (d/transact! conn
+                                 [[:db/add 2 :block/title
+                                   (str "warm-" (name metadata-shape))]]
+                                 {:outliner-op :save-block})
+                    work
+                    (observe-full-checksum-passes
+                     #(db-sync/update-local-sync-checksum!
+                       test-repo tx-report))]
+                (is (zero? (:passes work))
+                    (str metadata-shape
+                         " repeated recovery performed whole-graph passes "
+                         work)))
+              (is (= (sync-checksum/recompute-checksum @conn)
+                     (client-op/get-local-checksum test-repo))
+                  "the legacy checksum remains usable by old clients")
+              (is (= "preserve-me"
+                     (sqlite-sync-meta client-ops-conn
+                                       :future-rolling-upgrade-key))
+                  "additive metadata from a rolling upgrade is preserved"))))))))
+
+(deftest unavailable-server-v2-state-is-not-revalidated-on-every-edit-test
+  (testing "legacy markers and unmarked large titles cache the unavailable-v2 decision"
+    (doseq [reason [:legacy-marker :unmarked-large-title]]
+      (testing (name reason)
+        (let [conn (checksum-scale-conn 128 reason)
+              client-ops-conn (new-client-ops-db)]
+          (with-checksum-client-conns conn client-ops-conn
+            (fn []
+              (is (nil? (sync-checksum/recompute-server-checksum @conn)))
+              (client-op/update-local-checksum
+               test-repo (sync-checksum/recompute-checksum @conn))
+              (client-op/update-local-server-checksum test-repo nil)
+
+              ;; One cold edit may discover that v2 is unavailable.
+              (transact-and-update-client-checksums!
+               test-repo conn
+               [[:db/add 3 :block/title "cold-edit"]])
+              (is (nil? (client-op/get-local-server-checksum test-repo)))
+
+              (let [tx-report
+                    (d/transact! conn
+                                 [[:db/add 3 :block/title "warm-edit"]]
+                                 {:outliner-op :save-block})
+                    work
+                    (observe-full-checksum-passes
+                     #(db-sync/update-local-sync-checksum!
+                       test-repo tx-report))]
+                (is (zero? (:passes work))
+                    (str reason
+                         " repeated unavailable-v2 whole-graph passes "
+                         work)))
+              (is (= (sync-checksum/recompute-checksum @conn)
+                     (client-op/get-local-checksum test-repo)))
+              (is (nil? (client-op/get-local-server-checksum test-repo))))))))))
+
+(deftest client-checksum-complex-mutation-matrix-matches-full-recompute-test
+  (testing "E2EE, markers, referenced UUID changes, and retract/re-add remain exact"
+    (let [conn (checksum-scale-conn 8)
+          client-ops-conn (new-client-ops-db)
+          target-uuid (:block/uuid (d/entity @conn 2))
+          new-page-uuid (random-uuid)
+          large-title-a (apply str (repeat 5000 "a"))
+          large-title-b (apply str (repeat 5000 "b"))
+          marker-a (v2-checksum-marker "matrix-a" "a")
+          marker-b (v2-checksum-marker "matrix-b" "b")
+          mutations
+          [["ordinary title"
+            [[:db/add 2 :block/title "ordinary-edit"]]]
+           ["large-title marker"
+            [[:db/add 2 :block/title large-title-a]
+             [:db/add 2 sync-large-title/large-title-object-attr marker-a]]]
+           ["marker payload change"
+            [[:db/add 2 :block/title large-title-b]
+             [:db/add 2 sync-large-title/large-title-object-attr marker-b]]]
+           ["parent/page UUID change"
+            [[:db/add 1 :block/uuid new-page-uuid]]]
+           ["retract"
+            [[:db/retractEntity [:block/uuid target-uuid]]]]
+           ["re-add"
+            [{:db/id -1
+              :block/uuid target-uuid
+              :block/title large-title-b
+              :block/order "a0"
+              :block/parent 1
+              :block/page 1
+              sync-large-title/large-title-object-attr marker-b}]]
+           ["E2EE on"
+            [{:db/ident :logseq.kv/graph-rtc-e2ee?
+              :kv/value true}]]
+           ["E2EE marker change"
+            [[:db/add [:block/uuid target-uuid]
+              sync-large-title/large-title-object-attr marker-a]]]
+           ["E2EE off"
+            [{:db/ident :logseq.kv/graph-rtc-e2ee?
+              :kv/value false}]]]]
+      (with-checksum-client-conns conn client-ops-conn
+        (fn []
+          (initialize-client-checksums! test-repo conn)
+          (doseq [[label tx-data] mutations]
+            (transact-and-update-client-checksums!
+             test-repo conn tx-data)
+            (is (= (sync-checksum/recompute-checksum @conn)
+                   (client-op/get-local-checksum test-repo))
+                (str label " legacy checksum"))
+            (is (= (sync-checksum/recompute-server-checksum @conn)
+                   (client-op/get-local-server-checksum test-repo))
+                (str label " server-v2 checksum"))))))))
+
 (deftest normalized-local-tx-upserts-referenced-current-user-test
   (testing "an existing local-only current user is recreated on the server before created-by is referenced"
     (let [{:keys [conn parent]} (setup-parent-child)
