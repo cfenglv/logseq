@@ -9,6 +9,7 @@
             [frontend.worker.sync.auth :as sync-auth]
             [frontend.worker.sync.const :as sync-const]
             [frontend.worker.ui-request :as ui-request]
+            [goog.log :as goog-log]
             [lambdaisland.glogi :as log]
             [logseq.db :as ldb]
             [promesa.core :as p]
@@ -21,6 +22,10 @@
 (defonce ^:private e2ee-password-secret-key "logseq-encrypted-password")
 (def ^:private invalid-transit ::invalid-transit)
 (def ^:private native-secret-request-timeout-ms 10000)
+(def ^:private mirror-warning-level
+  ;; glogi aliases :warn to Closure's WARNING level, so its handlers observe
+  ;; :warning. Keep the public diagnostic seam stable as :warn.
+  (log/Level. "WARN" (log/level-value :warn)))
 
 (defn- runtime
   [platform']
@@ -120,6 +125,25 @@
       (ensure-refresh-token! refresh-token)
       refresh-token)))
 
+(defn- <mirror-electron-e2ee-password!
+  [platform' text operation]
+  (-> (p/resolved nil)
+      (p/then
+       (fn [_]
+         (platform/kv-set! platform' e2ee-password-secret-key text)))
+      (p/catch
+       (fn [error]
+         (let [logger (log/logger 'frontend.worker.sync.crypt)
+               record (log/make-log-record
+                       mirror-warning-level
+                       {:db-sync/e2ee-password-mirror-failed
+                        {:operation operation
+                         :error error}}
+                       'frontend.worker.sync.crypt
+                       nil)]
+           (goog-log/publishLogRecord logger record))
+         nil))))
+
 (defn- <save-e2ee-password
   [password]
   (p/let [platform' (platform/current)
@@ -142,7 +166,7 @@
                           false)]
     (if native-saved?
       (when (electron-owned-node-runtime? platform')
-        (platform/kv-set! platform' e2ee-password-secret-key text))
+        (<mirror-electron-e2ee-password! platform' text :save))
       (platform/save-secret-text! platform' e2ee-password-secret-key text))))
 
 (defn- <read-platform-e2ee-password-text
@@ -178,7 +202,7 @@
           _ (when (and (electron-owned-node-runtime? platform')
                        (:supported? native-result)
                        (some? (:encrypted-text native-result)))
-              (platform/kv-set! platform' e2ee-password-secret-key text))]
+              (<mirror-electron-e2ee-password! platform' text :read))]
     text))
 
 (defn- <decrypt-e2ee-password-text
@@ -218,7 +242,7 @@
                             false)
           _ (if native-deleted?
               (when (electron-owned-node-runtime? platform')
-                (platform/kv-set! platform' e2ee-password-secret-key nil))
+                (<mirror-electron-e2ee-password! platform' nil :delete))
               (-> (platform/delete-secret-text! platform' e2ee-password-secret-key)
                   (p/catch (fn [e]
                              (log/warn :db-sync/delete-e2ee-password-secret-failed {:error e})
