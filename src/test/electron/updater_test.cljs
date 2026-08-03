@@ -445,3 +445,154 @@
          (fn [error]
            (is false (str "successful install failed: " error))))
         (p/finally done))))
+
+(deftest project-signed-install-awaits-db-worker-teardown-before-spawn-and-quit
+  (async done
+    (let [events* (atom [])
+          dirty?* (atom true)
+          running?* (atom true)
+          teardown-resolve* (atom nil)
+          teardown-task (js/Promise.
+                         (fn [resolve _reject]
+                           (reset! teardown-resolve* resolve)))
+          child (EventEmitter.)
+          _ (set! (.-unref child)
+                  (fn []
+                    (swap! events* conj :unref)
+                    child))
+          task
+          (updater/run-project-signed-install!
+           {:verify! (fn []
+                       (swap! events* conj :verify)
+                       (p/resolved true))
+            :teardown-db-workers! (fn []
+                                    (swap! events* conj :teardown)
+                                    teardown-task)
+            :teardown-timeout-ms 100
+            :spawn-install! (fn []
+                              (swap! events* conj :spawn)
+                              child)
+            :set-quit-dirty! (fn [value]
+                               (swap! events* conj [:dirty value])
+                               (reset! dirty?* value))
+            :quit-app! (fn []
+                         (swap! events* conj :quit)
+                         (reset! running?* false))
+            :emit-error! (fn [error]
+                           (swap! events* conj [:ui-error error]))})]
+      (->
+       (p/let [_ (p/delay 0)]
+         (is (= [:verify :teardown] @events*)
+             "the install helper must not spawn while db-worker teardown is pending")
+         (is @dirty?*)
+         (is @running?*)
+         (when-let [resolve! @teardown-resolve*]
+           (resolve! true))
+         (p/let [_ (p/delay 0)]
+           (is (= [:verify :teardown :spawn] @events*))
+           (.emit child "spawn")
+           task))
+       (p/then
+        (fn [result]
+          (is (true? result))
+          (is (= [:verify :teardown :spawn :unref [:dirty false] :quit]
+                 @events*))
+          (is (false? @dirty?*))
+          (is (false? @running?*))))
+       (p/catch
+        (fn [error]
+          (is false (str "bounded teardown ordering failed: " error))))
+       (p/finally done)))))
+
+(deftest project-signed-install-teardown-rejection-keeps-app-running-and-dirty
+  (async done
+    (let [events* (atom [])
+          dirty?* (atom true)
+          running?* (atom true)
+          errors* (atom [])
+          child (EventEmitter.)
+          _ (set! (.-unref child) (fn [] child))]
+      (->
+       (updater/run-project-signed-install!
+        {:verify! (fn []
+                    (swap! events* conj :verify)
+                    (p/resolved true))
+         :teardown-db-workers! (fn []
+                                 (swap! events* conj :teardown)
+                                 (p/rejected (updater-error "db-worker teardown rejected"
+                                                            "DB_WORKER_TEARDOWN_FAILED")))
+         :teardown-timeout-ms 100
+         :spawn-install! (fn []
+                           (swap! events* conj :spawn)
+                           (js/setTimeout #(.emit child "spawn") 0)
+                           child)
+         :set-quit-dirty! (fn [value]
+                            (swap! events* conj [:dirty value])
+                            (reset! dirty?* value))
+         :quit-app! (fn []
+                      (swap! events* conj :quit)
+                      (reset! running?* false))
+         :emit-error! (fn [error]
+                        (swap! errors* conj error)
+                        (swap! events* conj :ui-error))})
+       (p/then
+        (fn [result]
+          (is (false? result))
+          (is (= [:verify :teardown [:dirty true] :ui-error] @events*))
+          (is @dirty?*)
+          (is @running?*)
+          (is (= 1 (count @errors*)))
+          (when-let [error (first @errors*)]
+            (is (= "DB_WORKER_TEARDOWN_FAILED" (.-code error))))))
+       (p/catch
+        (fn [error]
+          (is false (str "teardown rejection escaped terminal UI handling: " error))))
+       (p/finally done)))))
+
+(deftest project-signed-install-teardown-timeout-keeps-app-running-and-dirty
+  (async done
+    (let [events* (atom [])
+          dirty?* (atom true)
+          running?* (atom true)
+          errors* (atom [])
+          child (EventEmitter.)
+          _ (set! (.-unref child) (fn [] child))]
+      (->
+       (updater/run-project-signed-install!
+        {:verify! (fn []
+                    (swap! events* conj :verify)
+                    (p/resolved true))
+         :teardown-db-workers! (fn []
+                                 (swap! events* conj :teardown)
+                                 (js/Promise. (fn [_resolve _reject])))
+         :teardown-timeout-ms 10
+         :spawn-install! (fn []
+                           (swap! events* conj :spawn)
+                           (js/setTimeout #(.emit child "spawn") 0)
+                           child)
+         :set-quit-dirty! (fn [value]
+                            (swap! events* conj [:dirty value])
+                            (reset! dirty?* value))
+         :quit-app! (fn []
+                      (swap! events* conj :quit)
+                      (reset! running?* false))
+         :emit-error! (fn [error]
+                        (swap! errors* conj error)
+                        (swap! events* conj :ui-error))})
+       (p/then
+        (fn [result]
+          (is (false? result))
+          (is (= [:verify :teardown [:dirty true] :ui-error] @events*))
+          (is @dirty?*)
+          (is @running?*)
+          (is (= 1 (count @errors*)))
+          (when-let [error (first @errors*)]
+            (let [diagnostic (string/lower-case
+                              (pr-str [(.-message error)
+                                       (ex-data error)]))]
+              (is (string/includes? diagnostic "timeout"))
+              (is (string/includes? diagnostic "db-worker"))))))
+       (p/catch
+        (fn [error]
+          (is false (str "teardown timeout escaped terminal UI handling: " error))))
+       (p/finally done)))))

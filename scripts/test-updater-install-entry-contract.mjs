@@ -25,6 +25,10 @@ const electronUpdater = fs.readFileSync(
   path.join(repoRoot, "src", "electron", "electron", "updater.cljs"),
   "utf8",
 );
+const electronCore = fs.readFileSync(
+  path.join(repoRoot, "src", "electron", "electron", "core.cljs"),
+  "utf8",
+);
 const fullPreflight = fs.readFileSync(
   path.join(repoRoot, "scripts", "run-desktop-release-preflight.mjs"),
   "utf8",
@@ -107,6 +111,31 @@ const delegatedToTimingSeam = oneLayerDelegateNames.some((delegateName) => {
 assert.ok(
   directlyUsesTimingSeam || delegatedToTimingSeam,
   "downloaded-update installer bypasses the mocked project-signed timing seam",
+);
+
+const projectSignedInstall = electronUpdater.match(
+  /\(defn-?\s+<project-signed-install![\s\S]*?(?=\n\(defn|\s*$)/,
+)?.[0];
+assert.ok(projectSignedInstall, "project-signed install implementation is missing");
+assert.match(
+  projectSignedInstall,
+  /teardown-db-workers!|stop-all-db-workers!/,
+  "project-signed install does not wire db-worker teardown into the guarded handoff",
+);
+assert.match(
+  projectSignedInstall,
+  /teardown-timeout-ms|with-timeout|timeout-ms/,
+  "project-signed install db-worker teardown is not bounded",
+);
+
+const setupUpdater = electronCore.match(
+  /\(defn\s+setup-updater![\s\S]*?(?=\n\(defn|\s*$)/,
+)?.[0];
+assert.ok(setupUpdater, "Electron updater setup is missing");
+assert.match(
+  setupUpdater,
+  /stop-all-db-workers!.*|teardown-db-workers!.*stop-all-db-workers!/s,
+  "Electron core does not provide the real db-worker teardown to updater install",
 );
 
 const configureAutoUpdater = electronUpdater.match(
