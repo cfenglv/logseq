@@ -56,6 +56,18 @@
   {:client-id "test-client"
    :local-tx? true})
 
+(defonce ^:private *verify-checksum-redefs-tail
+  (atom (p/resolved nil)))
+
+(defn- <serialize-verify-checksum-redefs
+  [task-f]
+  (let [task (-> @*verify-checksum-redefs-tail
+                 (p/catch (fn [_] nil))
+                 (p/then (fn [_] (task-f))))]
+    (reset! *verify-checksum-redefs-tail
+            (p/catch task (fn [_] nil)))
+    task))
+
 (defn- test-sync-client
   []
   {:repo test-repo
@@ -5565,25 +5577,33 @@
 
 (deftest pull-ok-receive-queue-awaits-checksum-recovery-before-ready-test
   (async done
-         (let [local-t* (atom 0)
+         (let [conn (db-test/create-conn)
+               client-ops-conn (new-client-ops-db)
+               previous-client @worker-state/*db-sync-client
                resolve-recovery* (atom nil)
+               resolve-redefs-entered* (atom nil)
+               redefs-entered
+               (p/create
+                (fn [resolve _reject]
+                  (reset! resolve-redefs-entered* resolve)))
                recovery
                (p/create
                 (fn [resolve _reject]
                   (reset! resolve-recovery* resolve)))
+               resolve-send-gate* (atom nil)
+               send-gate
+               (p/create
+                (fn [resolve _reject]
+                  (reset! resolve-send-gate* resolve)))
                ready-count* (atom 0)
-               flush-count* (atom 0)
                later-message-count* (atom 0)
-               client {:repo test-repo
-                       :graph-id "graph-1"
-                       :receive-queue (atom (p/resolved nil))
-                       :pending-pull-since (atom 0)
-                       :inflight (atom [])
-                       :online-users (atom [])
-                       :ws-state (atom :syncing)
-                       :last-sync-error (atom {:code :pre-existing})
-                       :sync-succeeded-f
-                       (fn [] (swap! ready-count* inc))}
+               client (assoc (#'db-sync/ensure-client-state! test-repo)
+                             :graph-id "graph-1"
+                             :send-queue (atom send-gate)
+                             :ws-state (atom :syncing)
+                             :last-sync-error (atom {:code :pre-existing})
+                             :sync-succeeded-f
+                             (fn [] (swap! ready-count* inc)))
                raw-message
                (js/JSON.stringify
                 (clj->js
@@ -5594,56 +5614,77 @@
                   :server-checksum "server-v2-after-pull"
                   :txs [{:t 1
                          :tx (sqlite-util/write-transit-str [])}]}))]
-           (->
-            (let [_ (#'db-sync/enqueue-receive-message!
+           (with-datascript-conns
+             conn
+             client-ops-conn
+             (fn []
+               (client-op/update-local-tx test-repo 0)
+               (reset! worker-state/*db-sync-client client)
+               (->
+                (let [_ (#'db-sync/enqueue-receive-message!
                      client
                      (fn []
-                       (p/with-redefs
-                         [client-op/get-local-tx (fn [_repo] @local-t*)
-                          client-op/update-local-tx
-                          (fn [_repo t] (reset! local-t* t))
-                          client-op/get-pending-local-tx-count (constantly 0)
-                          sync-crypt/graph-e2ee? (constantly false)
-                          sync-crypt/<ensure-graph-aes-key
-                          (fn [& _] (p/resolved nil))
-                          sync-apply/apply-remote-txs! (fn [& _] nil)
-                          sync-handle-message/verify-sync-checksum!
-                          (fn [& _] recovery)
-                          shared-service/broadcast-to-clients! (fn [& _] nil)
-                          sync-apply/enqueue-flush-pending!
-                          (fn [& _] (swap! flush-count* inc))]
-                         (sync-handle-message/handle-message!
-                          test-repo client raw-message))))
+                       (<serialize-verify-checksum-redefs
+                        (fn []
+                          (p/with-redefs
+                            [sync-handle-message/verify-sync-checksum!
+                             (fn [& _] recovery)]
+                            (let [_ (@resolve-redefs-entered* true)]
+                              (sync-handle-message/handle-message!
+                               test-repo client raw-message)))))))
                   _ (#'db-sync/enqueue-receive-message!
                      client
                      (fn []
                        (swap! later-message-count* inc)))]
-              (p/let [_ (p/delay 0)
+              (p/let [_ redefs-entered
                       _ (do
                           (is (zero? @ready-count*)
                               "ready must wait for checksum recovery")
-                          (is (zero? @flush-count*)
-                              "pending flush must wait for checksum recovery")
+                          (is (false? (:active? @(:flush-scheduler client)))
+                              "the real flush scheduler must wait for checksum recovery")
                           (is (= {:code :pre-existing}
                                  @(:last-sync-error client))
                               "error cleanup must wait for checksum recovery")
                           (is (zero? @later-message-count*)
                               "later receive messages must remain queued behind recovery")
                           (@resolve-recovery* true))
+                      _ (p/delay 0)
+                      _ (do
+                          (is (true? (:active? @(:flush-scheduler client)))
+                              "the real flush scheduler starts only after recovery")
+                          (reset! (:flush-scheduler client)
+                                  {:active? false
+                                   :follow-up? false
+                                   :stopped? true})
+                          (@resolve-send-gate* true))
                       _ @(:receive-queue client)]
                 (is (= 1 @ready-count*))
-                (is (= 1 @flush-count*))
                 (is (nil? @(:last-sync-error client)))
                 (is (= 1 @later-message-count*))))
-            (p/catch
-             (fn [error]
-               (is false (str "unexpected pull recovery failure: " error))))
-            (p/finally done)))))
+                (p/catch
+                 (fn [error]
+                   (is false (str "unexpected pull recovery failure: " error))))
+                (p/finally
+                 (fn []
+                   (reset! (:flush-scheduler client)
+                           {:active? false
+                            :follow-up? false
+                            :stopped? true})
+                   (reset! worker-state/*db-sync-client previous-client)
+                   (@resolve-send-gate* true)
+                   (done)))))))))
 
 (deftest rejected-pull-ok-recovery-reports-pull-failure-once-test
   (async done
-         (let [local-t* (atom 0)
+         (let [conn (db-test/create-conn)
+               client-ops-conn (new-client-ops-db)
+               previous-client @worker-state/*db-sync-client
                reject-recovery* (atom nil)
+               resolve-redefs-entered* (atom nil)
+               redefs-entered
+               (p/create
+                (fn [resolve _reject]
+                  (reset! resolve-redefs-entered* resolve)))
                recovery
                (p/create
                 (fn [_resolve reject]
@@ -5653,24 +5694,19 @@
                (ex-info "checksum recovery rejected"
                         {:type :db-sync/checksum-mismatch})
                ready-count* (atom 0)
-               flush-count* (atom 0)
                pull-failures* (atom [])
                message-failures* (atom [])
                later-message-count* (atom 0)
-               client {:repo test-repo
-                       :graph-id "graph-1"
-                       :receive-queue (atom (p/resolved nil))
-                       :pending-pull-since (atom 0)
-                       :inflight (atom [])
-                       :online-users (atom [])
-                       :ws-state (atom :syncing)
-                       :last-sync-error (atom {:code :pre-existing})
-                       :sync-succeeded-f
-                       (fn [] (swap! ready-count* inc))
-                       :pull-failed-f
-                       (fn [error] (swap! pull-failures* conj error))
-                       :message-failed-f
-                       (fn [error] (swap! message-failures* conj error))}
+               client (assoc (#'db-sync/ensure-client-state! test-repo)
+                             :graph-id "graph-1"
+                             :ws-state (atom :syncing)
+                             :last-sync-error (atom {:code :pre-existing})
+                             :sync-succeeded-f
+                             (fn [] (swap! ready-count* inc))
+                             :pull-failed-f
+                             (fn [error] (swap! pull-failures* conj error))
+                             :message-failed-f
+                             (fn [error] (swap! message-failures* conj error)))
                raw-message
                (js/JSON.stringify
                 (clj->js
@@ -5681,51 +5717,56 @@
                   :server-checksum "server-v2-after-pull"
                   :txs [{:t 1
                          :tx (sqlite-util/write-transit-str [])}]}))]
-           (->
-            (let [_ (#'db-sync/enqueue-receive-message!
+           (with-datascript-conns
+             conn
+             client-ops-conn
+             (fn []
+               (client-op/update-local-tx test-repo 0)
+               (reset! worker-state/*db-sync-client client)
+               (->
+                (let [_ (#'db-sync/enqueue-receive-message!
                      client
                      (fn []
-                       (p/with-redefs
-                         [client-op/get-local-tx (fn [_repo] @local-t*)
-                          client-op/update-local-tx
-                          (fn [_repo t] (reset! local-t* t))
-                          client-op/get-pending-local-tx-count (constantly 0)
-                          sync-crypt/graph-e2ee? (constantly false)
-                          sync-crypt/<ensure-graph-aes-key
-                          (fn [& _] (p/resolved nil))
-                          sync-apply/apply-remote-txs! (fn [& _] nil)
-                          sync-handle-message/verify-sync-checksum!
-                          (fn [& _] recovery)
-                          shared-service/broadcast-to-clients! (fn [& _] nil)
-                          sync-apply/enqueue-flush-pending!
-                          (fn [& _] (swap! flush-count* inc))]
-                         (sync-handle-message/handle-message!
-                          test-repo client raw-message))))
+                       (<serialize-verify-checksum-redefs
+                        (fn []
+                          (p/with-redefs
+                            [sync-handle-message/verify-sync-checksum!
+                             (fn [& _] recovery)]
+                            (let [_ (@resolve-redefs-entered* true)]
+                              (sync-handle-message/handle-message!
+                               test-repo client raw-message)))))))
                   _ (#'db-sync/enqueue-receive-message!
                      client
                      (fn []
                        (swap! later-message-count* inc)))]
-              (p/let [_ (p/delay 0)
+              (p/let [_ redefs-entered
                       _ (do
                           (is (zero? @ready-count*))
-                          (is (zero? @flush-count*))
+                          (is (false? (:active? @(:flush-scheduler client))))
                           (is (= {:code :pre-existing}
                                  @(:last-sync-error client)))
                           (is (zero? @later-message-count*))
                           (@reject-recovery* recovery-error))
                       _ @(:receive-queue client)]
                 (is (zero? @ready-count*))
-                (is (zero? @flush-count*))
+                (is (false? (:active? @(:flush-scheduler client))))
                 (is (= [recovery-error] @pull-failures*)
                     "recovery rejection must use the pull failure path exactly once")
                 (is (empty? @message-failures*)
                     "the receive queue must not report the same pull failure again")
                 (is (= 1 @later-message-count*)
                     "the queue may continue only after the failed pull is reported")))
-            (p/catch
-             (fn [error]
-               (is false (str "unexpected rejected-recovery test failure: " error))))
-            (p/finally done)))))
+                (p/catch
+                 (fn [error]
+                   (is false (str "unexpected rejected-recovery test failure: " error))))
+                (p/finally
+                 (fn []
+                   (reset! (:flush-scheduler client)
+                            {:active? false
+                             :follow-up? false
+                             :stopped? true})
+                   (reset! worker-state/*db-sync-client previous-client)
+                   (done)))))))))
 
 (deftest rename-page-enqueues-canonical-save-block-pending-op-test
   (testing "rename-page is persisted as canonical save-block op"
@@ -13150,24 +13191,26 @@
                   :db-sync/created-at 1
                   :db-sync/pending? true}])
                (->
-                (p/with-redefs
-                  [sync-handle-message/verify-sync-checksum!
-                   (fn [& _] verification)
-                   shared-service/broadcast-to-clients! (fn [& _] nil)
-                   sync-apply/enqueue-flush-pending!
-                   (fn [& _] (swap! flush-count* inc))]
-                  (let [result
-                        (sync-handle-message/handle-message!
-                         test-repo client raw-message)]
-                    (is (p/promise? result)
-                        "receive queue must observe the async recovery")
-                    (is (zero? @success-count*))
-                    (is (zero? @flush-count*))
-                    (is (zero?
-                         (client-op/get-pending-local-tx-count
-                          test-repo)))
-                    (@resolve-verification* true)
-                    result))
+                (<serialize-verify-checksum-redefs
+                 (fn []
+                   (p/with-redefs
+                     [sync-handle-message/verify-sync-checksum!
+                      (fn [& _] verification)
+                      shared-service/broadcast-to-clients! (fn [& _] nil)
+                      sync-apply/enqueue-flush-pending!
+                      (fn [& _] (swap! flush-count* inc))]
+                     (let [result
+                           (sync-handle-message/handle-message!
+                            test-repo client raw-message)]
+                       (is (p/promise? result)
+                           "receive queue must observe the async recovery")
+                       (is (zero? @success-count*))
+                       (is (zero? @flush-count*))
+                       (is (zero?
+                            (client-op/get-pending-local-tx-count
+                             test-repo)))
+                       (@resolve-verification* true)
+                       result))))
                 (p/then
                  (fn [_]
                    (is (= 1 @success-count*))
