@@ -47,6 +47,7 @@
   ;; manual/auto updater
   (init-updater {:repo   "logseq/logseq"
                  :win    win
+                 :teardown-db-workers! handler/stop-all-db-workers!
                  :set-quit-dirty-state! #(vreset! *quit-dirty? %)}))
 
 (defn open-url-handler

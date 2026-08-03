@@ -17,9 +17,11 @@
 (def *project-update (atom nil))
 (def *project-signature-module (atom nil))
 (def *set-quit-dirty-state! (atom nil))
+(def *teardown-db-workers! (atom nil))
 (def *default-is-update-supported (atom nil))
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
+(def ^:private db-worker-teardown-timeout-ms 10000)
 
 (def ^:private <native-import
   ;; Keep import() out of Closure's AST: the Electron main process must load
@@ -297,13 +299,47 @@
                      (.-message error)))))
           (resolve true)))))))
 
+(defn- <bounded-db-worker-teardown!
+  [teardown-db-workers! timeout-ms]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [settled? (atom false)
+           timeout-id* (atom nil)
+           settle! (fn [f value]
+                     (when (compare-and-set! settled? false true)
+                       (when-let [timeout-id @timeout-id*]
+                         (js/clearTimeout timeout-id))
+                       (f value)))]
+       (reset! timeout-id*
+               (js/setTimeout
+                (fn []
+                  (settle!
+                   reject
+                   (ex-info "db-worker teardown timeout before update install"
+                            {:code :db-worker-teardown-timeout
+                             :timeout-ms timeout-ms})))
+                timeout-ms))
+       (-> (js/Promise.resolve)
+           (.then (fn [] (teardown-db-workers!)))
+           (.then
+            (fn [complete?]
+              (if (true? complete?)
+                (settle! resolve true)
+                (settle!
+                 reject
+                 (ex-info "db-worker teardown did not complete before update install"
+                          {:code :db-worker-teardown-incomplete})))))
+           (.catch (fn [error]
+                     (settle! reject error))))))))
+
 (defn run-project-signed-install!
   "Runs the project-signed install handoff through one injectable production
   sequence. Verification must finish before the detached child is created.
   The dirty guard is disabled only after the child emits `spawn`, immediately
   before quitting. Every failure restores the guard and is surfaced exactly
   once through `emit-error!`."
-  ([{:keys [verify! spawn-child! spawn! spawn-install! set-dirty!
+  ([{:keys [verify! spawn-child! spawn! spawn-install! teardown-db-workers!
+            teardown-timeout-ms set-dirty!
             set-quit-dirty-state! set-quit-dirty! quit! quit-app!
             emit-error!]}]
    (let [;; `spawn-install!` is the public role-oriented test seam and is
@@ -324,6 +360,12 @@
                      f)
          verify! (required! "verify!" verify!)
          spawn-child! (required! "spawn-child!" spawn-child!)
+         ;; Preserve the public role-oriented seam for older callers. The real
+         ;; production entry injects Electron's managed db-worker teardown.
+         teardown-db-workers! (or teardown-db-workers!
+                                  (fn [] (js/Promise.resolve true)))
+         teardown-timeout-ms (or teardown-timeout-ms
+                                 db-worker-teardown-timeout-ms)
          set-dirty! (required! "set-dirty!" set-dirty!)
          quit! (required! "quit!" quit!)
          emit-error! (required! "emit-error!" emit-error!)]
@@ -333,27 +375,32 @@
           (fn [verified]
             (if-not verified
               (throw (js/Error. "project updater preflight did not verify"))
-              (js/Promise.
-               (fn [resolve reject]
-                 (try
-                   (let [child (spawn-child! verified)
-                         settled? (atom false)]
-                     (.once child "error"
-                            (fn [error]
-                              (when (compare-and-set! settled? false true)
-                                (reject error))))
-                     (.once child "spawn"
-                            (fn []
-                              (when (compare-and-set! settled? false true)
-                                (try
-                                  (.unref child)
-                                  (set-dirty! false)
-                                  (quit!)
-                                  (resolve true)
-                                  (catch :default error
-                                    (reject error)))))))
-                   (catch :default error
-                     (reject error))))))))
+              (-> (<bounded-db-worker-teardown!
+                   teardown-db-workers! teardown-timeout-ms)
+                  (.then (fn [] verified))))))
+         (.then
+          (fn [verified]
+            (js/Promise.
+             (fn [resolve reject]
+               (try
+                 (let [child (spawn-child! verified)
+                       settled? (atom false)]
+                   (.once child "error"
+                          (fn [error]
+                            (when (compare-and-set! settled? false true)
+                              (reject error))))
+                   (.once child "spawn"
+                          (fn []
+                            (when (compare-and-set! settled? false true)
+                              (try
+                                (.unref child)
+                                (set-dirty! false)
+                                (quit!)
+                                (resolve true)
+                                (catch :default error
+                                  (reject error)))))))
+                 (catch :default error
+                   (reject error)))))))
          (.catch
           (fn [error]
             ;; This function is also the terminal IPC handler. Consume the
@@ -425,6 +472,11 @@
               (bean/->js arguments)
               #js {:detached true
                    :stdio "ignore"}))
+    :teardown-db-workers!
+    (or @*teardown-db-workers!
+        (fn []
+          (throw (js/Error. "updater db-worker teardown is unavailable"))))
+    :teardown-timeout-ms db-worker-teardown-timeout-ms
     :set-dirty!
     (or @*set-quit-dirty-state!
         (fn [_]
@@ -435,6 +487,13 @@
 (defn- <legacy-install!
   []
   (-> (js/Promise.resolve)
+      (.then
+       (fn []
+         (<bounded-db-worker-teardown!
+          (or @*teardown-db-workers!
+              (fn []
+                (throw (js/Error. "updater db-worker teardown is unavailable"))))
+          db-worker-teardown-timeout-ms)))
       (.then
        (fn []
          (if-let [set-quit-dirty-state! @*set-quit-dirty-state!]
@@ -459,9 +518,10 @@
     (<legacy-install!)))
 
 (defn init-updater
-  [{:keys [^js win set-quit-dirty-state!] :as _opts}]
+  [{:keys [^js win set-quit-dirty-state! teardown-db-workers!] :as _opts}]
   (configure-auto-updater!)
   (reset! *set-quit-dirty-state! set-quit-dirty-state!)
+  (reset! *teardown-db-workers! teardown-db-workers!)
   (let [dispose-listeners! (register-auto-updater-listeners! win)
         check-channel "check-for-updates"
         install-channel "install-updates"
@@ -487,4 +547,5 @@
        (.removeHandler ipcMain get-downloaded-channel)
        (reset! *update-pending nil)
        (reset! *project-update nil)
-       (reset! *set-quit-dirty-state! nil))))
+       (reset! *set-quit-dirty-state! nil)
+       (reset! *teardown-db-workers! nil))))
