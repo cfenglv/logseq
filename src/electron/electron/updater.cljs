@@ -1,12 +1,10 @@
 (ns electron.updater
   (:require [cljs-bean.core :as bean]
             [electron.configs :as cfgs]
-            [electron.db-worker :as db-worker]
             [electron.logger :as logger]
             [electron.updater-config :as updater-config]
             [electron.utils :refer [*win prod?]]
             [frontend.version :refer [version]]
-            [promesa.core :as p]
             ["child_process" :as child-process]
             ["electron" :refer [app ipcMain]]
             ["fs" :as fs]
@@ -22,7 +20,6 @@
 (def *default-is-update-supported (atom nil))
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
-(def ^:private db-worker-teardown-timeout-ms 10000)
 
 (def ^:private <native-import
   ;; Keep import() out of Closure's AST: the Electron main process must load
@@ -300,47 +297,15 @@
                      (.-message error)))))
           (resolve true)))))))
 
-(defn- <bounded-db-worker-teardown!
-  [stop-db-workers! timeout-ms]
-  (p/create
-   (fn [resolve reject]
-     (let [settled? (atom false)
-           timeout-id* (atom nil)
-           settle! (fn [f value]
-                     (when (compare-and-set! settled? false true)
-                       (when-let [timeout-id @timeout-id*]
-                         (js/clearTimeout timeout-id))
-                       (f value)))]
-       (reset! timeout-id*
-               (js/setTimeout
-                (fn []
-                  (settle!
-                   reject
-                   (ex-info "db-worker teardown timed out before update install"
-                            {:code :db-worker-teardown-timeout
-                             :timeout-ms timeout-ms})))
-                timeout-ms))
-       (-> (p/resolved nil)
-           (p/then (fn [_] (stop-db-workers!)))
-           (p/then
-            (fn [stopped?]
-              (if (true? stopped?)
-                (settle! resolve true)
-                (settle!
-                 reject
-                 (ex-info "db-worker teardown did not complete before update install"
-                          {:code :db-worker-teardown-incomplete})))))
-           (p/catch #(settle! reject %)))))))
-
 (defn run-project-signed-install!
   "Runs the project-signed install handoff through one injectable production
   sequence. Verification must finish before the detached child is created.
   The dirty guard is disabled only after the child emits `spawn`, immediately
   before quitting. Every failure restores the guard and is surfaced exactly
   once through `emit-error!`."
-  ([{:keys [verify! spawn-child! spawn! spawn-install! stop-db-workers! set-dirty!
+  ([{:keys [verify! spawn-child! spawn! spawn-install! set-dirty!
             set-quit-dirty-state! set-quit-dirty! quit! quit-app!
-            emit-error! teardown-timeout-ms]}]
+            emit-error!]}]
    (let [;; `spawn-install!` is the public role-oriented test seam and is
          ;; intentionally zero-arity. Production `spawn-child!` consumes the
          ;; verified helper payload, so normalize both at this one boundary.
@@ -359,44 +324,36 @@
                      f)
          verify! (required! "verify!" verify!)
          spawn-child! (required! "spawn-child!" spawn-child!)
-         stop-db-workers! (or stop-db-workers! db-worker/stop-all-managed!)
          set-dirty! (required! "set-dirty!" set-dirty!)
          quit! (required! "quit!" quit!)
-         emit-error! (required! "emit-error!" emit-error!)
-         teardown-timeout-ms (or teardown-timeout-ms
-                                 db-worker-teardown-timeout-ms)]
+         emit-error! (required! "emit-error!" emit-error!)]
      (-> (js/Promise.resolve)
          (.then (fn [] (verify!)))
          (.then
           (fn [verified]
             (if-not verified
               (throw (js/Error. "project updater preflight did not verify"))
-              (-> (<bounded-db-worker-teardown!
-                   stop-db-workers! teardown-timeout-ms)
-                  (p/then (fn [_] verified))))))
-         (.then
-          (fn [verified]
-            (js/Promise.
-             (fn [resolve reject]
-               (try
-                 (let [child (spawn-child! verified)
-                       settled? (atom false)]
-                   (.once child "error"
-                          (fn [error]
-                            (when (compare-and-set! settled? false true)
-                              (reject error))))
-                   (.once child "spawn"
-                          (fn []
-                            (when (compare-and-set! settled? false true)
-                              (try
-                                (.unref child)
-                                (set-dirty! false)
-                                (quit!)
-                                (resolve true)
-                                (catch :default error
-                                  (reject error)))))))
-                 (catch :default error
-                   (reject error)))))))
+              (js/Promise.
+               (fn [resolve reject]
+                 (try
+                   (let [child (spawn-child! verified)
+                         settled? (atom false)]
+                     (.once child "error"
+                            (fn [error]
+                              (when (compare-and-set! settled? false true)
+                                (reject error))))
+                     (.once child "spawn"
+                            (fn []
+                              (when (compare-and-set! settled? false true)
+                                (try
+                                  (.unref child)
+                                  (set-dirty! false)
+                                  (quit!)
+                                  (resolve true)
+                                  (catch :default error
+                                    (reject error)))))))
+                   (catch :default error
+                     (reject error))))))))
          (.catch
           (fn [error]
             ;; This function is also the terminal IPC handler. Consume the
@@ -468,7 +425,6 @@
               (bean/->js arguments)
               #js {:detached true
                    :stdio "ignore"}))
-    :stop-db-workers! db-worker/stop-all-managed!
     :set-dirty!
     (or @*set-quit-dirty-state!
         (fn [_]
@@ -479,11 +435,6 @@
 (defn- <legacy-install!
   []
   (-> (js/Promise.resolve)
-      (.then
-       (fn []
-         (<bounded-db-worker-teardown!
-          db-worker/stop-all-managed!
-          db-worker-teardown-timeout-ms)))
       (.then
        (fn []
          (if-let [set-quit-dirty-state! @*set-quit-dirty-state!]
