@@ -873,7 +873,16 @@
     (do
       (sync-util/set-last-sync-error! client error)
       (clear-pending-pull! client)))
-  (p/rejected error))
+  ;; Pull failures are terminally owned by this handler. Returning a rejected
+  ;; promise would make the receive queue report the same failure again through
+  ;; `:message-failed-f` before allowing the next server message to run.
+  nil)
+
+(defn- finish-pull-ok!
+  [repo client local-tx remote-tx]
+  (mark-sync-succeeded-if-ready! repo client local-tx remote-tx)
+  (sync-apply/enqueue-flush-pending! repo client)
+  (sync-util/clear-last-sync-error! client))
 
 (defn- handle-pull-ok!
   [repo client local-tx remote-tx checksum-fields message]
@@ -912,16 +921,15 @@
                        (sync-apply/apply-remote-txs! repo client remote-txs*)
                        (catch :default e
                          (log/error ::apply-remote-tx e)
-                         (throw e)))]
-             (client-op/update-local-tx repo remote-tx)
-             (clear-pending-pull! client)
-             (broadcast-rtc-state! client)
-             (verify-sync-checksum! repo client remote-tx remote-tx checksum-fields {:type "pull/ok"})
-             (mark-sync-succeeded-if-ready!
-              repo client remote-tx remote-tx)
-             (sync-apply/enqueue-flush-pending! repo client))
-           (p/then (fn [_]
-                     (sync-util/clear-last-sync-error! client)))
+                         (throw e)))
+                   _ (do
+                       (client-op/update-local-tx repo remote-tx)
+                       (clear-pending-pull! client)
+                       (broadcast-rtc-state! client))
+                   _ (verify-sync-checksum!
+                      repo client remote-tx remote-tx checksum-fields
+                      {:type "pull/ok"})]
+             (finish-pull-ok! repo client remote-tx remote-tx))
            (p/catch (fn [error]
                       (if (= :db-sync/remote-apply-deferred
                              (:type (ex-data error)))
@@ -939,12 +947,13 @@
                           (p/resolved nil))
                         (handle-pull-failed! client error)))))))
       :else
-      (do
-        (clear-pending-pull! client)
-        (mark-sync-succeeded-if-ready!
-         repo client local-tx remote-tx)
-        (sync-apply/enqueue-flush-pending! repo client)
-        (p/resolved nil)))
+      (->
+       (p/let [_ (verify-sync-checksum!
+                  repo client local-tx remote-tx checksum-fields
+                  {:type "pull/ok"})]
+         (clear-pending-pull! client)
+         (finish-pull-ok! repo client local-tx remote-tx))
+       (p/catch #(handle-pull-failed! client %))))
     (catch :default error
       (handle-pull-failed! client error))))
 
