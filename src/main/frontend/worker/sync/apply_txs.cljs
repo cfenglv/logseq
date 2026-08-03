@@ -2607,8 +2607,7 @@
                                      :diagnostic
                                      (dissoc
                                       (sync-util/error->diagnostic error)
-                                      :at)})
-                         (throw error))))
+                                      :at)}))))
           asset-download
           (download-missing-remote-assets-for-owner!
            repo client remote-asset-tx-data)

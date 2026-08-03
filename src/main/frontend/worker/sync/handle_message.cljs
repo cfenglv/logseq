@@ -869,14 +869,17 @@
 (defn- handle-pull-failed!
   [client error]
   (if-let [pull-failed-f (:pull-failed-f client)]
-    (pull-failed-f error)
+    (do
+      ;; The live RTC client owns pull failures through this callback, so keep
+      ;; the receive queue alive without also invoking :message-failed-f.
+      (pull-failed-f error)
+      nil)
     (do
       (sync-util/set-last-sync-error! client error)
-      (clear-pending-pull! client)))
-  ;; Pull failures are terminally owned by this handler. Returning a rejected
-  ;; promise would make the receive queue report the same failure again through
-  ;; `:message-failed-f` before allowing the next server message to run.
-  nil)
+      (clear-pending-pull! client)
+      ;; Direct callers without the live-client failure callback retain the
+      ;; historical rejected-Promise contract (including stale pull/ok).
+      (p/rejected error))))
 
 (defn- finish-pull-ok!
   [repo client local-tx remote-tx]
