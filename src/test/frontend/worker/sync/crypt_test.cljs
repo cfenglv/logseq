@@ -529,6 +529,91 @@
                           (is false (str e))))
                (p/finally done)))))
 
+(deftest electron-empty-native-secret-recovers-from-encrypted-kv-mirror-test
+  (async done
+         (let [platform-map {:env {:runtime :node
+                                   :owner-source :electron}}
+               encrypted-text (ldb/write-transit-str {:cipher "mirror-payload"})
+               native-read-calls* (atom 0)
+               mirror-read-calls* (atom 0)
+               worker-secret-read-calls* (atom 0)]
+           (->
+            (p/with-redefs
+              [platform/current (fn [] platform-map)
+               ui-request/<request
+               (fn [action payload & _opts]
+                 (swap! native-read-calls* inc)
+                 (is (= :native-get-e2ee-password action))
+                 (is (= {:key "logseq-encrypted-password"} payload))
+                 (p/resolved {:supported? true
+                              :encrypted-text nil}))
+               platform/kv-get
+               (fn [platform' key]
+                 (swap! mirror-read-calls* inc)
+                 (is (= platform-map platform'))
+                 (is (= "logseq-encrypted-password" key))
+                 (p/resolved encrypted-text))
+               platform/read-secret-text
+               (fn [& _]
+                 (swap! worker-secret-read-calls* inc)
+                 (p/rejected
+                  (ex-info "must not re-enter worker Keychain storage" {})))
+               crypt/<decrypt-text-by-text-password
+               (fn [refresh-token encrypted]
+                 (is (= "refresh-token" refresh-token))
+                 (is (= {:cipher "mirror-payload"} encrypted))
+                 (p/resolved "restored-password"))]
+              (#'sync-crypt/<read-e2ee-password "refresh-token"))
+            (p/then
+             (fn [password]
+               (is (= "restored-password" password))
+               (is (= 1 @native-read-calls*))
+               (is (= 1 @mirror-read-calls*))
+               (is (zero? @worker-secret-read-calls*))))
+            (p/catch
+             (fn [error]
+               (is false (str "valid Electron mirror recovery failed: " error))))
+            (p/finally done)))))
+
+(deftest electron-corrupt-kv-mirror-fails-closed-after-empty-native-secret-test
+  (async done
+         (let [platform-map {:env {:runtime :node
+                                   :owner-source :electron}}
+               mirror-read-calls* (atom 0)
+               worker-secret-read-calls* (atom 0)]
+           (->
+            (p/with-redefs
+              [platform/current (fn [] platform-map)
+               ui-request/<request
+               (fn [& _]
+                 (p/resolved {:supported? true
+                              :encrypted-text nil}))
+               platform/kv-get
+               (fn [_platform' key]
+                 (swap! mirror-read-calls* inc)
+                 (is (= "logseq-encrypted-password" key))
+                 (p/resolved "not-a-transit-payload"))
+               platform/read-secret-text
+               (fn [& _]
+                 (swap! worker-secret-read-calls* inc)
+                 (p/resolved nil))
+               crypt/<decrypt-text-by-text-password
+               (fn [& _]
+                 (p/rejected (ex-info "must not decrypt corrupt mirror" {})))]
+              (#'sync-crypt/<read-e2ee-password "refresh-token"))
+            (p/then
+             (fn [_]
+               (is false "corrupt Electron mirror must fail closed")))
+            (p/catch
+             (fn [error]
+               (is (= :db-sync/invalid-e2ee-password-payload
+                      (:type (ex-data error))))
+               (is (= :invalid-transit-payload
+                      (:reason (ex-data error))))
+               (is (= 1 @mirror-read-calls*))
+               (is (zero? @worker-secret-read-calls*))))
+            (p/finally done)))))
+
 (deftest read-e2ee-password-browser-missing-secret-does-not-fallback-to-file-test
   (async done
          (let [platform-map {:env {:runtime :browser}}
@@ -560,6 +645,7 @@
          (let [platform-map {:env {:runtime :browser
                                    :owner-source :capacitor}}
                native-read-calls (atom 0)
+               mirror-read-calls (atom 0)
                secret-read-calls (atom 0)
                file-read-calls (atom 0)]
            (-> (p/with-redefs [platform/current (fn [] platform-map)
@@ -569,6 +655,11 @@
                                                      (is (= {:key "logseq-encrypted-password"} payload))
                                                      (p/resolved {:supported? true
                                                                   :encrypted-text nil}))
+                               platform/kv-get (fn [_platform' _key]
+                                                 (swap! mirror-read-calls inc)
+                                                 (p/resolved
+                                                  (ldb/write-transit-str
+                                                   {:cipher "electron-only-mirror"})))
                                platform/read-secret-text (fn [_platform' _key]
                                                            (swap! secret-read-calls inc)
                                                            (p/resolved (ldb/write-transit-str {:cipher "legacy"})))
@@ -582,6 +673,7 @@
                          (is false "expected missing e2ee password failure")))
                (p/catch (fn [e]
                           (is (= 1 @native-read-calls))
+                          (is (zero? @mirror-read-calls))
                           (is (zero? @secret-read-calls))
                           (is (zero? @file-read-calls))
                           (is (contains? #{:db-sync/missing-e2ee-password
