@@ -164,12 +164,20 @@
                                          (log/warn :db-sync/read-e2ee-password-native-failed {:error e})
                                          {:supported? false})))
                           {:supported? false})
-          text (if (:supported? native-result)
+          text (cond
+                 (and (electron-owned-node-runtime? platform')
+                      (:supported? native-result)
+                      (nil? (:encrypted-text native-result)))
+                 (platform/kv-get platform' e2ee-password-secret-key)
+
+                 (:supported? native-result)
                  (:encrypted-text native-result)
+
+                 :else
                  (<read-platform-e2ee-password-text platform'))
           _ (when (and (electron-owned-node-runtime? platform')
                        (:supported? native-result)
-                       (some? text))
+                       (some? (:encrypted-text native-result)))
               (platform/kv-set! platform' e2ee-password-secret-key text))]
     text))
 
@@ -182,9 +190,11 @@
                  (ldb/read-transit-str text)
                  (catch :default _
                    invalid-transit))]
-      (when (= invalid-transit data)
+      (when (or (= invalid-transit data)
+                (not (or (vector? data) (map? data))))
         (fail-fast :db-sync/invalid-e2ee-password-payload
-                   {:field :e2ee-password
+                   {:type :db-sync/invalid-e2ee-password-payload
+                    :field :e2ee-password
                     :reason :invalid-transit-payload}))
       (crypt/<decrypt-text-by-text-password refresh-token data))))
 
