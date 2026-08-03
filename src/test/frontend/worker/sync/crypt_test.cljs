@@ -10,6 +10,7 @@
             [frontend.worker.sync.crypt :as sync-crypt]
             [frontend.worker.sync.util :as sync-util]
             [frontend.worker.ui-request :as ui-request]
+            [lambdaisland.glogi :as log]
             [logseq.db :as ldb]
             [promesa.core :as p]))
 
@@ -19,6 +20,13 @@
   [aes-key value]
   (p/let [encrypted (crypt/<encrypt-text aes-key (ldb/write-transit-str value))]
     (ldb/write-transit-str encrypted)))
+
+(defn- mirror-warning?
+  [operation record]
+  (let [diagnostic (string/lower-case (pr-str record))]
+    (and (= :warn (:level record))
+         (string/includes? diagnostic "mirror")
+         (string/includes? diagnostic operation))))
 
 (deftest cli-node-auth-token-reads-state-test
   (let [config-prev @worker-state/*db-sync-config
@@ -613,6 +621,189 @@
                (is (= 1 @mirror-read-calls*))
                (is (zero? @worker-secret-read-calls*))))
             (p/finally done)))))
+
+(deftest electron-native-save-succeeds-when-kv-mirror-write-rejects-test
+  (async done
+         (let [platform-map {:env {:runtime :node
+                                   :owner-source :electron}}
+               events* (atom [])
+               warnings* (atom [])
+               log-handler (fn [record]
+                             (when (mirror-warning? "save" record)
+                               (swap! warnings* conj record)))]
+           (log/add-handler log-handler)
+           (->
+            (p/with-redefs
+              [platform/current (fn [] platform-map)
+               platform/read-text! (fn [_platform' _path]
+                                     (p/resolved "{\"refresh-token\":\"refresh-token\"}"))
+               crypt/<encrypt-text-by-text-password
+               (fn [_refresh-token _password]
+                 {:cipher "payload"})
+               ui-request/<request
+               (fn [action _payload & _opts]
+                 (is (= :native-save-e2ee-password action))
+                 (swap! events* conj :native)
+                 (p/resolved {:supported? true}))
+               platform/kv-set!
+               (fn [_platform' _key _text]
+                 (swap! events* conj :mirror)
+                 (p/rejected (ex-info "save mirror rejected" {})))
+               platform/save-secret-text!
+               (fn [& _]
+                 (p/rejected (ex-info "must not fall back after native commit" {})))]
+              (#'sync-crypt/<save-e2ee-password "new-password"))
+            (p/then
+             (fn [result]
+               (is (nil? result))
+               (is (= [:native :mirror] @events*))
+               (is (= 1 (count @warnings*)))))
+            (p/catch
+             (fn [error]
+               (is false (str "native save was reported as failed: " error))))
+            (p/finally
+             (fn []
+               (log/remove-handler log-handler)
+               (done)))))))
+
+(deftest electron-native-read-succeeds-when-kv-mirror-write-rejects-test
+  (async done
+         (let [platform-map {:env {:runtime :node
+                                   :owner-source :electron}}
+               encrypted-text (ldb/write-transit-str {:cipher "native-payload"})
+               warnings* (atom [])
+               log-handler (fn [record]
+                             (when (mirror-warning? "read" record)
+                               (swap! warnings* conj record)))]
+           (log/add-handler log-handler)
+           (->
+            (p/with-redefs
+              [platform/current (fn [] platform-map)
+               ui-request/<request
+               (fn [action _payload & _opts]
+                 (is (= :native-get-e2ee-password action))
+                 (p/resolved {:supported? true
+                              :encrypted-text encrypted-text}))
+               platform/kv-set!
+               (fn [& _]
+                 (p/rejected (ex-info "read mirror rejected" {})))
+               crypt/<decrypt-text-by-text-password
+               (fn [refresh-token encrypted]
+                 (is (= "refresh-token" refresh-token))
+                 (is (= {:cipher "native-payload"} encrypted))
+                 (p/resolved "native-password"))]
+              (#'sync-crypt/<read-e2ee-password "refresh-token"))
+            (p/then
+             (fn [password]
+               (is (= "native-password" password))
+               (is (= 1 (count @warnings*)))))
+            (p/catch
+             (fn [error]
+               (is false (str "native read was reported as failed: " error))))
+            (p/finally
+             (fn []
+               (log/remove-handler log-handler)
+               (done)))))))
+
+(deftest electron-native-delete-succeeds-when-kv-mirror-write-rejects-test
+  (async done
+         (let [platform-map {:env {:runtime :node
+                                   :owner-source :electron}}
+               events* (atom [])
+               warnings* (atom [])
+               log-handler (fn [record]
+                             (when (mirror-warning? "delete" record)
+                               (swap! warnings* conj record)))]
+           (log/add-handler log-handler)
+           (->
+            (p/with-redefs
+              [platform/current (fn [] platform-map)
+               ui-request/<request
+               (fn [action _payload & _opts]
+                 (is (= :native-delete-e2ee-password action))
+                 (swap! events* conj :native)
+                 (p/resolved {:supported? true}))
+               platform/kv-set!
+               (fn [_platform' _key value]
+                 (is (nil? value))
+                 (swap! events* conj :mirror)
+                 (p/rejected (ex-info "delete mirror rejected" {})))
+               platform/delete-secret-text!
+               (fn [& _]
+                 (p/rejected (ex-info "must not fall back after native commit" {})))]
+              (#'sync-crypt/<clear-e2ee-password!))
+            (p/then
+             (fn [result]
+               (is (nil? result))
+               (is (= [:native :mirror] @events*))
+               (is (= 1 (count @warnings*)))))
+            (p/catch
+             (fn [error]
+               (is false (str "native delete was reported as failed: " error))))
+            (p/finally
+             (fn []
+               (log/remove-handler log-handler)
+               (done)))))))
+
+(deftest password-change-does-not-report-failure-after-server-and-native-commit-test
+  (async done
+         (let [platform-map {:env {:runtime :node
+                                   :owner-source :electron}}
+               events* (atom [])
+               warnings* (atom [])
+               log-handler (fn [record]
+                             (when (mirror-warning? "save" record)
+                               (swap! warnings* conj record)))]
+           (log/add-handler log-handler)
+           (->
+            (p/with-redefs
+              [sync-crypt/e2ee-base (fn [] "https://example.com")
+               sync-crypt/<get-user-rsa-key-pair-raw
+               (fn [_base]
+                 (p/resolved {:public-key "public-key"
+                              :encrypted-private-key "old-encrypted-private-key"}))
+               sync-crypt/<re-encrypt-private-key
+               (fn [encrypted old-password new-password]
+                 (is (= ["old-encrypted-private-key" "old-password" "new-password"]
+                        [encrypted old-password new-password]))
+                 (p/resolved "new-encrypted-private-key"))
+               sync-crypt/<upload-user-rsa-key-pair!
+               (fn [_base public-key encrypted-private-key]
+                 (is (= ["public-key" "new-encrypted-private-key"]
+                        [public-key encrypted-private-key]))
+                 (swap! events* conj :server)
+                 (p/resolved nil))
+               platform/current (fn [] platform-map)
+               platform/read-text! (fn [_platform' _path]
+                                     (p/resolved "{\"refresh-token\":\"refresh-token\"}"))
+               crypt/<encrypt-text-by-text-password
+               (fn [_refresh-token _password]
+                 {:cipher "new-password-payload"})
+               ui-request/<request
+               (fn [action _payload & _opts]
+                 (is (= :native-save-e2ee-password action))
+                 (swap! events* conj :native)
+                 (p/resolved {:supported? true}))
+               platform/kv-set!
+               (fn [& _]
+                 (swap! events* conj :mirror)
+                 (p/rejected (ex-info "password-change save mirror rejected" {})))]
+              (sync-crypt/<change-e2ee-password! "refresh-token"
+                                                  "user-1"
+                                                  "old-password"
+                                                  "new-password"))
+            (p/then
+             (fn [result]
+               (is (nil? result))
+               (is (= [:server :native :mirror] @events*))
+               (is (= 1 (count @warnings*)))))
+            (p/catch
+             (fn [error]
+               (is false (str "committed password change was reported as failed: " error))))
+            (p/finally
+             (fn []
+               (log/remove-handler log-handler)
+               (done)))))))
 
 (deftest read-e2ee-password-browser-missing-secret-does-not-fallback-to-file-test
   (async done
