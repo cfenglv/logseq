@@ -5595,46 +5595,46 @@
                   :txs [{:t 1
                          :tx (sqlite-util/write-transit-str [])}]}))]
            (->
-            (p/with-redefs
-              [client-op/get-local-tx (fn [_repo] @local-t*)
-               client-op/update-local-tx
-               (fn [_repo t] (reset! local-t* t))
-               client-op/get-pending-local-tx-count (constantly 0)
-               sync-crypt/graph-e2ee? (constantly false)
-               sync-crypt/<ensure-graph-aes-key
-               (fn [& _] (p/resolved nil))
-               sync-apply/apply-remote-txs! (fn [& _] nil)
-               sync-handle-message/verify-sync-checksum!
-               (fn [& _] recovery)
-               shared-service/broadcast-to-clients! (fn [& _] nil)
-               sync-apply/enqueue-flush-pending!
-               (fn [& _] (swap! flush-count* inc))]
-              (let [_ (#'db-sync/enqueue-receive-message!
-                       client
-                       (fn []
+            (let [_ (#'db-sync/enqueue-receive-message!
+                     client
+                     (fn []
+                       (p/with-redefs
+                         [client-op/get-local-tx (fn [_repo] @local-t*)
+                          client-op/update-local-tx
+                          (fn [_repo t] (reset! local-t* t))
+                          client-op/get-pending-local-tx-count (constantly 0)
+                          sync-crypt/graph-e2ee? (constantly false)
+                          sync-crypt/<ensure-graph-aes-key
+                          (fn [& _] (p/resolved nil))
+                          sync-apply/apply-remote-txs! (fn [& _] nil)
+                          sync-handle-message/verify-sync-checksum!
+                          (fn [& _] recovery)
+                          shared-service/broadcast-to-clients! (fn [& _] nil)
+                          sync-apply/enqueue-flush-pending!
+                          (fn [& _] (swap! flush-count* inc))]
                          (sync-handle-message/handle-message!
-                          test-repo client raw-message)))
-                    _ (#'db-sync/enqueue-receive-message!
-                       client
-                       (fn []
-                         (swap! later-message-count* inc)))]
-                (p/let [_ (p/delay 0)
-                        _ (do
-                            (is (zero? @ready-count*)
-                                "ready must wait for checksum recovery")
-                            (is (zero? @flush-count*)
-                                "pending flush must wait for checksum recovery")
-                            (is (= {:code :pre-existing}
-                                   @(:last-sync-error client))
-                                "error cleanup must wait for checksum recovery")
-                            (is (zero? @later-message-count*)
-                                "later receive messages must remain queued behind recovery")
-                            (@resolve-recovery* true))
-                        _ @(:receive-queue client)]
-                  (is (= 1 @ready-count*))
-                  (is (= 1 @flush-count*))
-                  (is (nil? @(:last-sync-error client)))
-                  (is (= 1 @later-message-count*)))))
+                          test-repo client raw-message))))
+                  _ (#'db-sync/enqueue-receive-message!
+                     client
+                     (fn []
+                       (swap! later-message-count* inc)))]
+              (p/let [_ (p/delay 0)
+                      _ (do
+                          (is (zero? @ready-count*)
+                              "ready must wait for checksum recovery")
+                          (is (zero? @flush-count*)
+                              "pending flush must wait for checksum recovery")
+                          (is (= {:code :pre-existing}
+                                 @(:last-sync-error client))
+                              "error cleanup must wait for checksum recovery")
+                          (is (zero? @later-message-count*)
+                              "later receive messages must remain queued behind recovery")
+                          (@resolve-recovery* true))
+                      _ @(:receive-queue client)]
+                (is (= 1 @ready-count*))
+                (is (= 1 @flush-count*))
+                (is (nil? @(:last-sync-error client)))
+                (is (= 1 @later-message-count*))))
             (p/catch
              (fn [error]
                (is false (str "unexpected pull recovery failure: " error))))
@@ -5682,46 +5682,46 @@
                   :txs [{:t 1
                          :tx (sqlite-util/write-transit-str [])}]}))]
            (->
-            (p/with-redefs
-              [client-op/get-local-tx (fn [_repo] @local-t*)
-               client-op/update-local-tx
-               (fn [_repo t] (reset! local-t* t))
-               client-op/get-pending-local-tx-count (constantly 0)
-               sync-crypt/graph-e2ee? (constantly false)
-               sync-crypt/<ensure-graph-aes-key
-               (fn [& _] (p/resolved nil))
-               sync-apply/apply-remote-txs! (fn [& _] nil)
-               sync-handle-message/verify-sync-checksum!
-               (fn [& _] recovery)
-               shared-service/broadcast-to-clients! (fn [& _] nil)
-               sync-apply/enqueue-flush-pending!
-               (fn [& _] (swap! flush-count* inc))]
-              (let [_ (#'db-sync/enqueue-receive-message!
-                       client
-                       (fn []
+            (let [_ (#'db-sync/enqueue-receive-message!
+                     client
+                     (fn []
+                       (p/with-redefs
+                         [client-op/get-local-tx (fn [_repo] @local-t*)
+                          client-op/update-local-tx
+                          (fn [_repo t] (reset! local-t* t))
+                          client-op/get-pending-local-tx-count (constantly 0)
+                          sync-crypt/graph-e2ee? (constantly false)
+                          sync-crypt/<ensure-graph-aes-key
+                          (fn [& _] (p/resolved nil))
+                          sync-apply/apply-remote-txs! (fn [& _] nil)
+                          sync-handle-message/verify-sync-checksum!
+                          (fn [& _] recovery)
+                          shared-service/broadcast-to-clients! (fn [& _] nil)
+                          sync-apply/enqueue-flush-pending!
+                          (fn [& _] (swap! flush-count* inc))]
                          (sync-handle-message/handle-message!
-                          test-repo client raw-message)))
-                    _ (#'db-sync/enqueue-receive-message!
-                       client
-                       (fn []
-                         (swap! later-message-count* inc)))]
-                (p/let [_ (p/delay 0)
-                        _ (do
-                            (is (zero? @ready-count*))
-                            (is (zero? @flush-count*))
-                            (is (= {:code :pre-existing}
-                                   @(:last-sync-error client)))
-                            (is (zero? @later-message-count*))
-                            (@reject-recovery* recovery-error))
-                        _ @(:receive-queue client)]
-                  (is (zero? @ready-count*))
-                  (is (zero? @flush-count*))
-                  (is (= [recovery-error] @pull-failures*)
-                      "recovery rejection must use the pull failure path exactly once")
-                  (is (empty? @message-failures*)
-                      "the receive queue must not report the same pull failure again")
-                  (is (= 1 @later-message-count*)
-                      "the queue may continue only after the failed pull is reported"))))
+                          test-repo client raw-message))))
+                  _ (#'db-sync/enqueue-receive-message!
+                     client
+                     (fn []
+                       (swap! later-message-count* inc)))]
+              (p/let [_ (p/delay 0)
+                      _ (do
+                          (is (zero? @ready-count*))
+                          (is (zero? @flush-count*))
+                          (is (= {:code :pre-existing}
+                                 @(:last-sync-error client)))
+                          (is (zero? @later-message-count*))
+                          (@reject-recovery* recovery-error))
+                      _ @(:receive-queue client)]
+                (is (zero? @ready-count*))
+                (is (zero? @flush-count*))
+                (is (= [recovery-error] @pull-failures*)
+                    "recovery rejection must use the pull failure path exactly once")
+                (is (empty? @message-failures*)
+                    "the receive queue must not report the same pull failure again")
+                (is (= 1 @later-message-count*)
+                    "the queue may continue only after the failed pull is reported")))
             (p/catch
              (fn [error]
                (is false (str "unexpected rejected-recovery test failure: " error))))
