@@ -120,19 +120,6 @@
       (ensure-refresh-token! refresh-token)
       refresh-token)))
 
-(defn- <mirror-electron-e2ee-password!
-  [platform' text operation]
-  (-> (p/resolved nil)
-      (p/then
-       (fn [_]
-         (platform/kv-set! platform' e2ee-password-secret-key text)))
-      (p/catch
-       (fn [error]
-         (log/warn :db-sync/e2ee-password-mirror-failed
-                   {:operation operation
-                    :error error})
-         nil))))
-
 (defn- <save-e2ee-password
   [password]
   (p/let [platform' (platform/current)
@@ -155,7 +142,7 @@
                           false)]
     (if native-saved?
       (when (electron-owned-node-runtime? platform')
-        (<mirror-electron-e2ee-password! platform' text :save))
+        (platform/kv-set! platform' e2ee-password-secret-key text))
       (platform/save-secret-text! platform' e2ee-password-secret-key text))))
 
 (defn- <read-platform-e2ee-password-text
@@ -190,8 +177,8 @@
                  (<read-platform-e2ee-password-text platform'))
           _ (when (and (electron-owned-node-runtime? platform')
                        (:supported? native-result)
-                       (some? (:encrypted-text native-result)))
-              (<mirror-electron-e2ee-password! platform' text :read))]
+                       (some? text))
+              (platform/kv-set! platform' e2ee-password-secret-key text))]
     text))
 
 (defn- <decrypt-e2ee-password-text
@@ -229,7 +216,7 @@
                             false)
           _ (if native-deleted?
               (when (electron-owned-node-runtime? platform')
-                (<mirror-electron-e2ee-password! platform' nil :delete))
+                (platform/kv-set! platform' e2ee-password-secret-key nil))
               (-> (platform/delete-secret-text! platform' e2ee-password-secret-key)
                   (p/catch (fn [e]
                              (log/warn :db-sync/delete-e2ee-password-secret-failed {:error e})
