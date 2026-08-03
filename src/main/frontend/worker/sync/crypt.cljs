@@ -164,16 +164,8 @@
                                          (log/warn :db-sync/read-e2ee-password-native-failed {:error e})
                                          {:supported? false})))
                           {:supported? false})
-          text (cond
-                 (and (electron-owned-node-runtime? platform')
-                      (:supported? native-result)
-                      (nil? (:encrypted-text native-result)))
-                 (platform/kv-get platform' e2ee-password-secret-key)
-
-                 (:supported? native-result)
+          text (if (:supported? native-result)
                  (:encrypted-text native-result)
-
-                 :else
                  (<read-platform-e2ee-password-text platform'))
           _ (when (and (electron-owned-node-runtime? platform')
                        (:supported? native-result)
