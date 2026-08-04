@@ -166,6 +166,7 @@ const createCleanInstallFixture = (arch) => {
   );
   const staticRoot = path.join(root, "static");
   const electronRoot = path.join(staticRoot, "node_modules", "electron");
+  const electronPackage = path.join(electronRoot, "package.json");
   const electronApp = path.join(electronRoot, "dist", "Electron.app");
   const electronVersion = path.join(electronRoot, "dist", "version");
   const installMarker = path.join(root, "electron-install-invoked.txt");
@@ -187,7 +188,7 @@ const createCleanInstallFixture = (arch) => {
     )}\n`,
   );
   fs.writeFileSync(
-    path.join(electronRoot, "package.json"),
+    electronPackage,
     `${JSON.stringify(
       {
         bin: { "install-electron": "install.js" },
@@ -239,10 +240,13 @@ const createCleanInstallFixture = (arch) => {
     path.join(sevenZipRoot, "index.js"),
     'exports.path7za = require("node:path").join(__dirname, "7za");\n',
   );
-  writeExecutable(
+  fs.writeFileSync(
     sevenZip,
-    '#!/bin/sh\necho "7-Zip 24.09 electron-builder fixture"\n',
+    '#!/bin/sh\n[ "${1:-}" = "i" ] || exit 64\necho "7-Zip 24.09 electron-builder fixture"\n',
+    { mode: 0o644 },
   );
+  fs.chmodSync(sevenZip, 0o644);
+  fs.writeFileSync(`${sevenZip}.arch`, executableArch);
   const electronBuilderRoot = path.join(
     staticRoot,
     "node_modules",
@@ -277,6 +281,17 @@ const createCleanInstallFixture = (arch) => {
     recursive: true,
   });
   fs.symlinkSync(sevenZip, path.join(staticRoot, "node_modules", ".bin", "7za"));
+
+  writeExecutable(
+    path.join(binRoot, "chmod"),
+    [
+      "#!/bin/sh",
+      'if [ "${LOGSEQ_TEST_CHMOD_FAIL:-0}" = "1" ]; then exit 73; fi',
+      'if [ "${LOGSEQ_TEST_CHMOD_NOOP:-0}" = "1" ]; then exit 0; fi',
+      'exec /bin/chmod "$@"',
+      "",
+    ].join("\n"),
+  );
 
   writeExecutable(
     path.join(binRoot, "pnpm"),
@@ -331,6 +346,7 @@ const createCleanInstallFixture = (arch) => {
     binRoot,
     dispose: () => fs.rmSync(root, { force: true, recursive: true }),
     electronApp,
+    electronPackage,
     electronVersion,
     electronBuilderPackage,
     executableArch,
@@ -459,6 +475,8 @@ const executeFixtureStep = (step, fixture, env, outputs) => {
   assert.ok(script, `${step.name ?? "unnamed step"} must have a run script`);
   fs.writeFileSync(fixture.githubOutput, "");
   const expandedScript = expandWorkflowValues(script, fixture.root, outputs)
+    .replaceAll("/usr/bin/chmod", path.join(fixture.binRoot, "chmod"))
+    .replaceAll("/bin/chmod", path.join(fixture.binRoot, "chmod"))
     .replaceAll("/usr/bin/lipo", path.join(fixture.binRoot, "lipo"))
     .replaceAll("/usr/bin/file", path.join(fixture.binRoot, "file"));
   const workingDirectoryValue = setting(step.source, "working-directory");
@@ -589,6 +607,11 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
       false,
       "clean-install fixture unexpectedly started with Electron.app",
     );
+    assert.equal(
+      fs.statSync(fixture.sevenZip).mode & 0o777,
+      0o644,
+      "clean-install fixture must start with recoverable 0644 7zip mode",
+    );
     const env = fixtureEnvironment(fixture, arch);
 
     const outputs = {};
@@ -604,6 +627,9 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
           ),
           0o600,
         );
+      }
+      if (step.index === stages.resolve.index) {
+        env.GITHUB_WORKSPACE = path.join(fixture.root, "decoy-workspace");
       }
       const result = executeFixtureStep(step, fixture, env, outputs);
       if (rejectNonExecutable && step.index === stages.probe.index) {
@@ -626,10 +652,15 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
       "./static",
       `macOS ${arch} resolver must run from the package that owns the locked dependency chain`,
     );
+    assert.doesNotMatch(
+      stages.resolve.source,
+      /GITHUB_WORKSPACE[^\n]*Electron\.app/,
+      `macOS ${arch} resolver must not hard-code Electron.app from GITHUB_WORKSPACE`,
+    );
     assert.match(
       stages.resolve.source,
-      /electron_app="\$GITHUB_WORKSPACE\/static\/node_modules\/electron\/dist\/Electron\.app"/,
-      `macOS ${arch} resolver must bind Electron.app to GITHUB_WORKSPACE`,
+      /require\.resolve\(\s*["']electron\/package\.json["']\s*\)/,
+      `macOS ${arch} resolver must derive Electron.app from the locked Electron package`,
     );
     assert.equal(
       fs.realpathSync(outputs[resolverId]["seven-zip"]),
@@ -639,8 +670,19 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
     assert.equal(
       fs.realpathSync(outputs[resolverId]["electron-app"]),
       fs.realpathSync(fixture.electronApp),
-      `macOS ${arch} resolver output must use GITHUB_WORKSPACE Electron.app`,
+      `macOS ${arch} resolver output must use locked-package Electron.app`,
     );
+    assert.equal(
+      fs.statSync(fixture.sevenZip).mode & 0o777,
+      0o744,
+      `macOS ${arch} resolver must add only the user execute bit to 7zip`,
+    );
+    const sevenZipProbe = spawnSync(fixture.sevenZip, ["i"], {
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(sevenZipProbe.status, 0, sevenZipProbe.stderr);
+    assert.match(sevenZipProbe.stdout, /7-Zip/);
 
     assert.ok(
       fs.existsSync(fixture.installMarker),
@@ -784,7 +826,12 @@ test("clean-install harness resolves 7zip-bin only through app-builder-lib", () 
       fs.realpathSync(resolution.sevenZip),
       fs.realpathSync(fixture.sevenZip),
     );
-    assert.ok(fs.statSync(resolution.sevenZip).mode & 0o111);
+    assert.ok(fs.statSync(resolution.sevenZip).isFile());
+    assert.equal(
+      fs.statSync(resolution.sevenZip).mode & 0o777,
+      0o644,
+      "fresh pnpm 7zip fixture must reproduce the recoverable CI mode",
+    );
     assert.equal(
       fs.existsSync(
         path.join(
@@ -826,6 +873,84 @@ test("clean-install harness resolves 7zip-bin only through app-builder-lib", () 
   }
 });
 
+for (const arch of ["x64", "arm64"]) {
+  test(`macOS ${arch} resolver repairs only the user execute bit and runs locked 7zip`, () => {
+    const context = prepareResolverFixture(arch);
+    try {
+      assert.equal(context.fixture.sevenZip.endsWith("/7za"), true);
+      assert.equal(fs.statSync(context.fixture.sevenZip).mode & 0o777, 0o644);
+      const result = executeFixtureStep(
+        context.stages.resolve,
+        context.fixture,
+        context.env,
+        context.outputs,
+      );
+      assert.equal(
+        result.status,
+        0,
+        `macOS ${arch} resolver did not recover 0644 locked 7zip:\n${result.stdout}\n${result.stderr}`,
+      );
+      assert.equal(fs.statSync(context.fixture.sevenZip).mode & 0o777, 0o744);
+      const invocation = spawnSync(context.fixture.sevenZip, ["i"], {
+        encoding: "utf8",
+        env: context.env,
+      });
+      assert.equal(invocation.status, 0, invocation.stderr);
+      assert.match(invocation.stdout, /7-Zip/);
+      const architecture = spawnSync(
+        path.join(context.fixture.binRoot, "file"),
+        [context.fixture.sevenZip],
+        { encoding: "utf8", env: context.env },
+      );
+      assert.equal(architecture.status, 0, architecture.stderr);
+      assert.match(
+        architecture.stdout,
+        new RegExp(context.fixture.executableArch),
+      );
+    } finally {
+      context.fixture.dispose();
+    }
+  });
+
+  test(`macOS ${arch} resolver derives Electron.app without GITHUB_WORKSPACE`, () => {
+    const context = prepareResolverFixture(arch);
+    try {
+      fs.chmodSync(context.fixture.sevenZip, 0o744);
+      delete context.env.GITHUB_WORKSPACE;
+      assert.match(
+        context.stages.resolve.source,
+        /require\.resolve\(\s*["']electron\/package\.json["']\s*\)/,
+      );
+      assert.doesNotMatch(
+        context.stages.resolve.source,
+        /GITHUB_WORKSPACE[^\n]*Electron\.app/,
+      );
+      const result = executeFixtureStep(
+        context.stages.resolve,
+        context.fixture,
+        context.env,
+        context.outputs,
+      );
+      assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+      const resolverId = setting(context.stages.resolve.source, "id");
+      const expectedElectronApp = path.join(
+        path.dirname(fs.realpathSync(context.fixture.electronPackage)),
+        "dist",
+        "Electron.app",
+      );
+      assert.equal(
+        fs.realpathSync(context.outputs[resolverId]["electron-app"]),
+        fs.realpathSync(expectedElectronApp),
+      );
+    } finally {
+      context.fixture.dispose();
+    }
+  });
+}
+
+const makeSevenZipReachable = ({ fixture }) =>
+  fs.chmodSync(fixture.sevenZip, 0o744);
+
 const resolverFailureCases = [
   {
     expected: [/(?:app-builder-lib|7zip-bin)/i, /(?:resolve|module|dependency|chain)/i],
@@ -833,20 +958,63 @@ const resolverFailureCases = [
     name: "broken locked 7zip dependency chain",
   },
   {
-    expected: [/(?:seven[_ -]?zip|7[- ]?zip)/i, /(?:execut|permission|mode)/i],
-    mutate: ({ fixture }) => fs.chmodSync(fixture.sevenZip, 0o600),
-    name: "non-executable locked 7zip",
+    expected: [/(?:seven[_ -]?zip|7[- ]?zip)/i, /(?:missing|not found|does not exist)/i],
+    mutate: ({ fixture }) =>
+      fs.renameSync(fixture.sevenZip, `${fixture.sevenZip}.missing`),
+    name: "missing locked 7zip file",
+  },
+  {
+    expected: [/(?:seven[_ -]?zip|7[- ]?zip)/i, /(?:not[^\n]*regular|regular[^\n]*file|director|not[^\n]*file)/i],
+    mutate: ({ fixture }) => {
+      fs.unlinkSync(fixture.sevenZip);
+      fs.mkdirSync(fixture.sevenZip);
+    },
+    name: "non-regular locked 7zip path",
+  },
+  {
+    expected: [
+      /(?:seven[_ -]?zip|7[- ]?zip)/i,
+      /(?:(?:chmod|set|restore|add)[^\n]*(?:fail|unable|could not)|(?:fail|unable|could not)[^\n]*(?:chmod|set|restore|add))/i,
+    ],
+    mutate: ({ env }) => {
+      env.LOGSEQ_TEST_CHMOD_FAIL = "1";
+    },
+    name: "chmod failure",
+  },
+  {
+    expected: [
+      /(?:seven[_ -]?zip|7[- ]?zip)/i,
+      /(?:still|remain|after|did not|not)[^\n]*execut/i,
+    ],
+    mutate: ({ env }) => {
+      env.LOGSEQ_TEST_CHMOD_NOOP = "1";
+    },
+    name: "7zip still non-executable after chmod",
+  },
+  {
+    expected: [
+      /(?:electron\/package\.json|electron package)/i,
+      /(?:resolve|module|missing|not found|locate)/i,
+    ],
+    mutate: (context) => {
+      makeSevenZipReachable(context);
+      fs.renameSync(
+        context.fixture.electronPackage,
+        `${context.fixture.electronPackage}.missing`,
+      );
+    },
+    name: "locked Electron package resolution failure",
   },
   {
     expected: [/(?:electron[_ -]?app|Electron\.app)/i, /(?:director|missing|materializ|not found)/i],
-    mutate: ({ fixture }) =>
-      fs.renameSync(fixture.electronApp, `${fixture.electronApp}.missing`),
-    name: "missing workspace Electron.app",
-  },
-  {
-    expected: [/GITHUB_WORKSPACE/, /(?:missing|unset|required|empty)/i],
-    mutate: ({ env }) => delete env.GITHUB_WORKSPACE,
-    name: "missing GITHUB_WORKSPACE",
+    mutate: (context) => {
+      makeSevenZipReachable(context);
+      fs.renameSync(
+        context.fixture.electronApp,
+        `${context.fixture.electronApp}.missing`,
+      );
+    },
+    name: "missing locked-package Electron.app",
   },
 ];
 
