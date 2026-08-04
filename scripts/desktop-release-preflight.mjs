@@ -648,11 +648,15 @@ for (const arch of ["x64", "arm64"]) {
   }
   for (const requirement of [
     'require.resolve("electron/package.json")',
+    'test -e "$seven_zip"',
     'test -f "$seven_zip"',
     'chmod u+x "$seven_zip"',
     'test -x "$seven_zip"',
     'test -d "$electron_app"',
     "Native updater contract tool resolution",
+    "Locked 7-Zip binary is missing",
+    "Locked 7-Zip path is not a regular file",
+    "Unable to add the user execute bit with chmod",
   ]) {
     assertContains(resolver, requirement, `${arch} updater tool resolution`);
   }

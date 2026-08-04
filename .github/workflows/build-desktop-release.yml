@@ -941,10 +941,11 @@ jobs:
           seven_zip="$(node -e 'const { createRequire } = require("node:module"); const builderRequire = createRequire(require.resolve("electron-builder/package.json")); const appBuilderRequire = createRequire(builderRequire.resolve("app-builder-lib/package.json")); process.stdout.write(appBuilderRequire("7zip-bin").path7za);')" || fail "Cannot resolve locked electron-builder -> app-builder-lib -> 7zip-bin dependency chain"
           electron_package_json="$(node -p 'require.resolve("electron/package.json")')" || fail "Cannot resolve the locked Electron package"
           electron_app="$(dirname "$electron_package_json")/dist/Electron.app"
-          test -f "$seven_zip" || fail "Locked 7-Zip binary is missing: $seven_zip"
+          test -e "$seven_zip" || fail "Locked 7-Zip binary is missing: $seven_zip"
+          test -f "$seven_zip" || fail "Locked 7-Zip path is not a regular file: $seven_zip"
           if [ ! -x "$seven_zip" ]; then
             echo "::notice title=Normalize locked 7-Zip executable::Adding the user execute bit to $seven_zip"
-            chmod u+x "$seven_zip" || fail "Cannot make the locked 7-Zip binary executable: $seven_zip"
+            chmod u+x "$seven_zip" || fail "Unable to add the user execute bit with chmod to the locked 7-Zip binary: $seven_zip"
           fi
           test -x "$seven_zip" || fail "Locked 7-Zip binary is not executable after normalization: $seven_zip"
           test -d "$electron_app" || fail "Materialized Electron.app is missing beside the locked package: $electron_app"
@@ -1159,10 +1160,11 @@ jobs:
           seven_zip="$(node -e 'const { createRequire } = require("node:module"); const builderRequire = createRequire(require.resolve("electron-builder/package.json")); const appBuilderRequire = createRequire(builderRequire.resolve("app-builder-lib/package.json")); process.stdout.write(appBuilderRequire("7zip-bin").path7za);')" || fail "Cannot resolve locked electron-builder -> app-builder-lib -> 7zip-bin dependency chain"
           electron_package_json="$(node -p 'require.resolve("electron/package.json")')" || fail "Cannot resolve the locked Electron package"
           electron_app="$(dirname "$electron_package_json")/dist/Electron.app"
-          test -f "$seven_zip" || fail "Locked 7-Zip binary is missing: $seven_zip"
+          test -e "$seven_zip" || fail "Locked 7-Zip binary is missing: $seven_zip"
+          test -f "$seven_zip" || fail "Locked 7-Zip path is not a regular file: $seven_zip"
           if [ ! -x "$seven_zip" ]; then
             echo "::notice title=Normalize locked 7-Zip executable::Adding the user execute bit to $seven_zip"
-            chmod u+x "$seven_zip" || fail "Cannot make the locked 7-Zip binary executable: $seven_zip"
+            chmod u+x "$seven_zip" || fail "Unable to add the user execute bit with chmod to the locked 7-Zip binary: $seven_zip"
           fi
           test -x "$seven_zip" || fail "Locked 7-Zip binary is not executable after normalization: $seven_zip"
           test -d "$electron_app" || fail "Materialized Electron.app is missing beside the locked package: $electron_app"
