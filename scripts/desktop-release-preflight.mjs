@@ -632,6 +632,10 @@ for (const arch of ["x64", "arm64"]) {
   const job = workflowJobSource(`build-macos-${arch}`);
   const materializeStepName = `Materialize locked ${arch} Electron runtime`;
   const materialize = workflowStepSource(job, materializeStepName);
+  const resolver = workflowStepSource(
+    job,
+    `Resolve ${arch} native updater contract tools`,
+  );
   for (const requirement of [
     "pnpm exec install-electron",
     'require("electron/package.json").version',
@@ -642,6 +646,21 @@ for (const arch of ["x64", "arm64"]) {
   ]) {
     assertContains(materialize, requirement, `${arch} Electron materialization`);
   }
+  for (const requirement of [
+    'require.resolve("electron/package.json")',
+    'test -f "$seven_zip"',
+    'chmod u+x "$seven_zip"',
+    'test -x "$seven_zip"',
+    'test -d "$electron_app"',
+    "Native updater contract tool resolution",
+  ]) {
+    assertContains(resolver, requirement, `${arch} updater tool resolution`);
+  }
+  assertNotContains(
+    resolver,
+    "$GITHUB_WORKSPACE/static/node_modules/electron",
+    `${arch} updater tool resolution`,
+  );
   const materializeIndex = job.indexOf(
     `      - name: ${materializeStepName}\n`,
   );

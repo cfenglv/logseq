@@ -335,8 +335,13 @@ for (const arch of ["x64", "arm64"]) {
     );
     assert.match(
       effectiveSource,
-      /static\/node_modules\/electron\/dist\/Electron\.app/,
-      `macOS ${arch} must use the Electron.app installed for the packaged desktop`,
+      /require\.resolve\(["']electron\/package\.json["']\)/,
+      `macOS ${arch} must derive Electron.app from the locked installed package`,
+    );
+    assert.doesNotMatch(
+      effectiveSource,
+      /\$GITHUB_WORKSPACE\/static\/node_modules\/electron/,
+      `macOS ${arch} must not assume a hardcoded package-manager layout`,
     );
     assert.match(
       effectiveSource,

@@ -693,8 +693,13 @@ for (const [jobName, arch] of [
   );
   assert.match(
     job,
-    /static\/node_modules\/electron\/dist\/Electron\.app/,
+    /require\.resolve\(["']electron\/package\.json["']\)/,
     `${jobName} must resolve Electron.app from the locked desktop dependency`,
+  );
+  assert.doesNotMatch(
+    job,
+    /\$GITHUB_WORKSPACE\/static\/node_modules\/electron/,
+    `${jobName} must not hardcode the package-manager layout for Electron.app`,
   );
   assert.match(
     job,
