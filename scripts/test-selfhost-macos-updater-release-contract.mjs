@@ -49,6 +49,44 @@ const builderUtilRuntimePackagePath = updaterRequire.resolve(
 const builderUtilRuntimePackage = JSON.parse(
   fs.readFileSync(builderUtilRuntimePackagePath, 'utf8')
 )
+
+const pinnedUpdaterVersion = '6.8.3'
+const pinnedBuilderUtilRuntimeVersion = '9.5.1'
+
+function requireExactDependencyVersion(label, actual, expected) {
+  if (actual !== expected) {
+    throw new Error(
+      `macOS updater dependency contract violation: ${label} must be ${expected}; received ${String(actual)}`
+    )
+  }
+}
+
+requireExactDependencyVersion(
+  'resources electron-updater pin',
+  resourcesPackage.dependencies?.['electron-updater'],
+  pinnedUpdaterVersion
+)
+if (Object.hasOwn(resourcesPackage.dependencies ?? {}, 'builder-util-runtime')) {
+  throw new Error(
+    'macOS updater dependency contract violation: resources builder-util-runtime must remain transitive'
+  )
+}
+requireExactDependencyVersion(
+  'resolved electron-updater version',
+  updaterPackage.version,
+  pinnedUpdaterVersion
+)
+requireExactDependencyVersion(
+  'electron-updater declared builder-util-runtime version',
+  updaterPackage.dependencies?.['builder-util-runtime'],
+  pinnedBuilderUtilRuntimeVersion
+)
+requireExactDependencyVersion(
+  'resolved builder-util-runtime version',
+  builderUtilRuntimePackage.version,
+  pinnedBuilderUtilRuntimeVersion
+)
+
 const { GitHubProvider } = dependencyRequire(
   'electron-updater/out/providers/GitHubProvider'
 )
@@ -580,16 +618,19 @@ function test(name, run) {
 }
 
 test('runtime dependencies use the pinned electron-updater package boundary', () => {
-  assert.equal(resourcesPackage.dependencies['electron-updater'], '6.8.3')
+  assert.equal(
+    resourcesPackage.dependencies['electron-updater'],
+    pinnedUpdaterVersion
+  )
   assert.equal(
     resourcesPackage.dependencies['builder-util-runtime'],
     undefined,
     'builder-util-runtime must remain transitive instead of being hoisted into the app manifest'
   )
-  assert.equal(updaterPackage.version, '6.8.3')
+  assert.equal(updaterPackage.version, pinnedUpdaterVersion)
   assert.equal(
     updaterPackage.dependencies?.['builder-util-runtime'],
-    '9.5.1',
+    pinnedBuilderUtilRuntimeVersion,
     'electron-updater must retain the exact locked builder-util-runtime dependency'
   )
   assert.equal(
