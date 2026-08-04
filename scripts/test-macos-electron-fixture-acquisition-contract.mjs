@@ -361,6 +361,9 @@ const stepEnvironment = (source, fixtureRoot, outputs) => {
 const escapeRegExp = (value) =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+const resolverFullProbePattern =
+  /(?:ELECTRON_RUN_AS_NODE|(?:^|\s)(?:\/usr\/bin\/)?(?:lipo|file)(?:\s|$)|test:project-signed|project-signed[^\n]*contracts)/m;
+
 const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
   const job = jobSource(`build-macos-${arch}`);
   const steps = workflowSteps(job);
@@ -375,8 +378,8 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
   );
   assert.doesNotMatch(
     resolver,
-    /(?:test\s+-x|\[\s+-x\s+|ELECTRON_RUN_AS_NODE|(?:^|\s)(?:\/usr\/bin\/)?(?:lipo|file)(?:\s|$))/m,
-    `macOS ${arch} resolver must only resolve paths and outputs`,
+    resolverFullProbePattern,
+    `macOS ${arch} resolver may sanity-check resolved paths but must not execute runtime, architecture, or full contract probes`,
   );
   const resolverOutputReference = new RegExp(
     `steps\\.${escapeRegExp(resolverId)}\\.outputs\\.`,
@@ -421,6 +424,11 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
     probe,
     /(?:test\s+-x|\[\s+-x\s+)[^\n]*LOGSEQ_7ZIP/,
     `macOS ${arch} probe must verify LOGSEQ_7ZIP is executable`,
+  );
+  assert.match(
+    probe,
+    /^\s*"?\$\{?LOGSEQ_7ZIP\}?"?(?:\s+|\|)/m,
+    `macOS ${arch} probe must execute LOGSEQ_7ZIP`,
   );
   const fixture = createCleanInstallFixture(arch);
   try {
@@ -562,6 +570,10 @@ test("stage parser proves dependency -> materialize -> resolve -> probe -> contr
         `      - name: Resolve ${arch} native updater contract tools`,
         "        id: native-tools",
         "        run: |",
+        '          seven_zip="$PWD/static/node_modules/7zip-bin/7za"',
+        '          electron_app="$PWD/static/node_modules/electron/dist/Electron.app"',
+        '          test -x "$seven_zip"',
+        '          test -d "$electron_app"',
         '          echo "electron-app=$PWD/static/node_modules/electron/dist/Electron.app" >> "$GITHUB_OUTPUT"',
         '          echo "sevenzip=$PWD/static/node_modules/7zip-bin/7za" >> "$GITHUB_OUTPUT"',
         "        working-directory: .",
@@ -605,6 +617,9 @@ test("stage parser proves dependency -> materialize -> resolve -> probe -> contr
       [0, 1, 2, 3, 4],
     );
     assert.equal(setting(stages.resolve.source, "id"), "native-tools");
+    assert.match(stages.resolve.source, /test -x "\$seven_zip"/);
+    assert.match(stages.resolve.source, /test -d "\$electron_app"/);
+    assert.doesNotMatch(stages.resolve.source, resolverFullProbePattern);
     assert.match(
       stages.probe.source,
       /steps\.native-tools\.outputs\.(?:electron-app|sevenzip)/,
