@@ -34,32 +34,60 @@ const workflowSource = fs.readFileSync(workflowPath, 'utf8')
 const resourcesPackage = JSON.parse(
   fs.readFileSync(resourcesPackagePath, 'utf8')
 )
+const pinnedUpdaterVersion = '6.8.3'
+const pinnedBuilderUtilRuntimeVersion = '9.5.1'
+
+function dependencyContractViolation(detail) {
+  throw new Error(`macOS updater dependency contract violation: ${detail}`)
+}
+
+function requireRegularFileRealPath(label, candidate) {
+  let status
+  try {
+    status = fs.statSync(candidate)
+  } catch {
+    dependencyContractViolation(`${label} must exist as a regular file`)
+  }
+  if (!status.isFile()) {
+    dependencyContractViolation(`${label} must be a regular file`)
+  }
+  try {
+    return fs.realpathSync(candidate)
+  } catch {
+    dependencyContractViolation(`${label} realpath must resolve`)
+  }
+}
+
+function requireResolvedPackageRealPath(requireFrom, label, specifier) {
+  let resolved
+  try {
+    resolved = requireFrom.resolve(specifier)
+  } catch {
+    dependencyContractViolation(`${label} must resolve`)
+  }
+  return requireRegularFileRealPath(label, resolved)
+}
+
+function requireExactDependencyVersion(label, actual, expected) {
+  if (actual !== expected) {
+    dependencyContractViolation(
+      `${label} must be ${expected}; received ${String(actual)}`
+    )
+  }
+}
+
 const packageRoot = process.env.LOGSEQ_UPDATER_TEST_PACKAGE_ROOT
   ? path.resolve(process.env.LOGSEQ_UPDATER_TEST_PACKAGE_ROOT)
   : path.join(repositoryRoot, 'static')
 const dependencyRequire = createRequire(path.join(packageRoot, 'package.json'))
-const updaterPackagePath = dependencyRequire.resolve(
+const updaterPackageRealPath = requireResolvedPackageRealPath(
+  dependencyRequire,
+  'electron-updater package.json',
   'electron-updater/package.json'
 )
-const updaterPackage = JSON.parse(fs.readFileSync(updaterPackagePath, 'utf8'))
-const updaterRequire = createRequire(updaterPackagePath)
-const builderUtilRuntimePackagePath = updaterRequire.resolve(
-  'builder-util-runtime/package.json'
+const updaterPackage = JSON.parse(
+  fs.readFileSync(updaterPackageRealPath, 'utf8')
 )
-const builderUtilRuntimePackage = JSON.parse(
-  fs.readFileSync(builderUtilRuntimePackagePath, 'utf8')
-)
-
-const pinnedUpdaterVersion = '6.8.3'
-const pinnedBuilderUtilRuntimeVersion = '9.5.1'
-
-function requireExactDependencyVersion(label, actual, expected) {
-  if (actual !== expected) {
-    throw new Error(
-      `macOS updater dependency contract violation: ${label} must be ${expected}; received ${String(actual)}`
-    )
-  }
-}
 
 requireExactDependencyVersion(
   'resources electron-updater pin',
@@ -81,16 +109,76 @@ requireExactDependencyVersion(
   updaterPackage.dependencies?.['builder-util-runtime'],
   pinnedBuilderUtilRuntimeVersion
 )
+
+const updaterPackageDirectory = path.dirname(updaterPackageRealPath)
+const updaterPrivateNodeModules = path.dirname(updaterPackageDirectory)
+const updaterVirtualStoreEntry = path.dirname(updaterPrivateNodeModules)
+const pnpmVirtualStoreRoot = path.dirname(updaterVirtualStoreEntry)
+if (
+  path.basename(updaterPackageDirectory) !== 'electron-updater' ||
+  path.basename(updaterPrivateNodeModules) !== 'node_modules' ||
+  path.basename(updaterVirtualStoreEntry) !==
+    `electron-updater@${pinnedUpdaterVersion}` ||
+  path.basename(pnpmVirtualStoreRoot) !== '.pnpm'
+) {
+  dependencyContractViolation(
+    'resolved electron-updater must use its locked physical pnpm package boundary'
+  )
+}
+
+const expectedRuntimePackagePath = path.join(
+  pnpmVirtualStoreRoot,
+  `builder-util-runtime@${pinnedBuilderUtilRuntimeVersion}`,
+  'node_modules',
+  'builder-util-runtime',
+  'package.json'
+)
+const expectedRuntimePackageRealPath = requireRegularFileRealPath(
+  'locked builder-util-runtime package.json',
+  expectedRuntimePackagePath
+)
+const privateRuntimePackagePath = path.join(
+  updaterPrivateNodeModules,
+  'builder-util-runtime',
+  'package.json'
+)
+const privateRuntimePackageRealPath = requireRegularFileRealPath(
+  'electron-updater private builder-util-runtime edge package.json',
+  privateRuntimePackagePath
+)
+if (privateRuntimePackageRealPath !== expectedRuntimePackageRealPath) {
+  dependencyContractViolation(
+    'electron-updater private builder-util-runtime edge must target the locked physical package'
+  )
+}
+
+const updaterRequire = createRequire(updaterPackageRealPath)
+const runtimePackageRealPath = requireResolvedPackageRealPath(
+  updaterRequire,
+  'builder-util-runtime package.json resolved from electron-updater',
+  'builder-util-runtime/package.json'
+)
+if (runtimePackageRealPath !== privateRuntimePackageRealPath) {
+  dependencyContractViolation(
+    'builder-util-runtime resolved from electron-updater must match its private pnpm edge'
+  )
+}
+
+const builderUtilRuntimePackage = JSON.parse(
+  fs.readFileSync(runtimePackageRealPath, 'utf8')
+)
 requireExactDependencyVersion(
   'resolved builder-util-runtime version',
   builderUtilRuntimePackage.version,
   pinnedBuilderUtilRuntimeVersion
 )
 
+const { HttpError } = updaterRequire(
+  path.dirname(expectedRuntimePackageRealPath)
+)
 const { GitHubProvider } = dependencyRequire(
   'electron-updater/out/providers/GitHubProvider'
 )
-const { HttpError } = updaterRequire('builder-util-runtime')
 const semver = dependencyRequire('semver')
 
 const currentLegacyVersion = '2.0.1-selfhost.4'
