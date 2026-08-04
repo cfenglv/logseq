@@ -918,6 +918,18 @@ jobs:
           pnpm rebuild:all
         working-directory: ./static
 
+      - name: Materialize locked x64 Electron runtime
+        run: |
+          expected="$(node -p 'require("./package.json").devDependencies.electron')"
+          installed="$(node -p 'require("electron/package.json").version')"
+          test "$installed" = "$expected"
+          pnpm exec install-electron
+          test "$(sed 's/^v//' node_modules/electron/dist/version)" = "$expected"
+        working-directory: ./static
+        env:
+          ELECTRON_INSTALL_PLATFORM: darwin
+          ELECTRON_INSTALL_ARCH: x64
+
       - name: Resolve x64 native updater contract tools
         id: x64-native-contract-tools
         run: |
@@ -1113,6 +1125,18 @@ jobs:
       - name: Fetch deps
         run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
         working-directory: ./static
+
+      - name: Materialize locked arm64 Electron runtime
+        run: |
+          expected="$(node -p 'require("./package.json").devDependencies.electron')"
+          installed="$(node -p 'require("electron/package.json").version')"
+          test "$installed" = "$expected"
+          pnpm exec install-electron
+          test "$(sed 's/^v//' node_modules/electron/dist/version)" = "$expected"
+        working-directory: ./static
+        env:
+          ELECTRON_INSTALL_PLATFORM: darwin
+          ELECTRON_INSTALL_ARCH: arm64
 
       - name: Resolve arm64 native updater contract tools
         id: arm64-native-contract-tools

@@ -628,6 +628,41 @@ if (
     "both macOS builders must bind native updater contracts to the locked 7-Zip and Electron.app dependencies",
   );
 }
+for (const arch of ["x64", "arm64"]) {
+  const job = workflowJobSource(`build-macos-${arch}`);
+  const materializeStepName = `Materialize locked ${arch} Electron runtime`;
+  const materialize = workflowStepSource(job, materializeStepName);
+  for (const requirement of [
+    "pnpm exec install-electron",
+    'require("electron/package.json").version',
+    "node_modules/electron/dist/version",
+    "working-directory: ./static",
+    "ELECTRON_INSTALL_PLATFORM: darwin",
+    `ELECTRON_INSTALL_ARCH: ${arch}`,
+  ]) {
+    assertContains(materialize, requirement, `${arch} Electron materialization`);
+  }
+  const materializeIndex = job.indexOf(
+    `      - name: ${materializeStepName}\n`,
+  );
+  const resolveIndex = job.indexOf(
+    `      - name: Resolve ${arch} native updater contract tools\n`,
+  );
+  const probeIndex = job.indexOf(
+    `      - name: Probe ${arch} native updater contract tools\n`,
+  );
+  if (
+    materializeIndex === -1 ||
+    resolveIndex === -1 ||
+    probeIndex === -1 ||
+    materializeIndex > resolveIndex ||
+    resolveIndex > probeIndex
+  ) {
+    fail(
+      `${arch} Electron runtime must be materialized before the resolver and native probes`,
+    );
+  }
+}
 const packagedVerificationSteps =
   workflow.match(/- name: Verify packaged desktop/g)?.length || 0;
 if (packagedVerificationSteps !== 6) {
