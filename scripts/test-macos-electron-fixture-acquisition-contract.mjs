@@ -94,18 +94,30 @@ const macContractStages = (steps, arch) => {
   const probe = uniqueStage(
     steps,
     (step) =>
-      step.name ===
-      "Run project-signed updater native and provider contracts",
+      step.name === `Probe ${arch} native updater contract tools`,
     `macOS ${arch} contract probe stage`,
   );
+  const contracts = uniqueStage(
+    steps,
+    (step) =>
+      step.name ===
+      "Run project-signed updater native and provider contracts",
+    `macOS ${arch} full updater contract stage`,
+  );
   assert.deepEqual(
-    [dependency, materialize, resolve, probe]
+    [dependency, materialize, resolve, probe, contracts]
       .map((step) => step.index)
       .sort((left, right) => left - right),
-    [dependency.index, materialize.index, resolve.index, probe.index],
-    `macOS ${arch} stages must remain ordered dependency -> materialize -> resolve -> probe`,
+    [
+      dependency.index,
+      materialize.index,
+      resolve.index,
+      probe.index,
+      contracts.index,
+    ],
+    `macOS ${arch} stages must remain ordered dependency -> materialize -> resolve -> probe -> contracts`,
   );
-  return { dependency, materialize, probe, resolve };
+  return { contracts, dependency, materialize, probe, resolve };
 };
 
 const setting = (source, key) =>
@@ -140,6 +152,7 @@ const createCleanInstallFixture = (arch) => {
   const installMarker = path.join(root, "electron-install-invoked.txt");
   const binRoot = path.join(root, "test-bin");
   const githubEnv = path.join(root, "github-env");
+  const githubOutput = path.join(root, "github-output");
   const executableArch = arch === "x64" ? "x86_64" : "arm64";
 
   fs.mkdirSync(electronRoot, { recursive: true });
@@ -274,6 +287,7 @@ const createCleanInstallFixture = (arch) => {
     electronApp,
     executableArch,
     githubEnv,
+    githubOutput,
     installMarker,
     root,
     staticRoot,
@@ -289,7 +303,45 @@ const readGithubEnv = (file, env) => {
   fs.writeFileSync(file, "");
 };
 
-const stepEnvironment = (source, fixtureRoot) => {
+const workflowOutputExpression =
+  /\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}/g;
+
+const expandWorkflowValues = (value, fixtureRoot, outputs) =>
+  value
+    .replaceAll("${{ github.workspace }}", fixtureRoot)
+    .replace(
+      workflowOutputExpression,
+      (_expression, stepId, outputName) => {
+        assert.ok(
+          Object.hasOwn(outputs[stepId] ?? {}, outputName),
+          `workflow expression references missing output ${stepId}.${outputName}`,
+        );
+        return outputs[stepId][outputName];
+      },
+    );
+
+const readGithubOutput = (file, step, outputs) => {
+  if (!fs.existsSync(file)) return;
+  const entries = fs
+    .readFileSync(file, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean);
+  fs.writeFileSync(file, "");
+  if (entries.length === 0) return;
+  const stepId = setting(step.source, "id");
+  assert.ok(
+    stepId,
+    `${step.name ?? "unnamed step"} emitted outputs without an id`,
+  );
+  outputs[stepId] ??= {};
+  for (const line of entries) {
+    const separator = line.indexOf("=");
+    assert.ok(separator > 0, `unsupported GITHUB_OUTPUT entry: ${line}`);
+    outputs[stepId][line.slice(0, separator)] = line.slice(separator + 1);
+  }
+};
+
+const stepEnvironment = (source, fixtureRoot, outputs) => {
   const lines = source.split("\n");
   const envIndex = lines.findIndex((line) => line === "        env:");
   if (envIndex === -1) return {};
@@ -297,37 +349,78 @@ const stepEnvironment = (source, fixtureRoot) => {
   for (const line of lines.slice(envIndex + 1)) {
     const match = line.match(/^ {10}([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$/);
     if (!match) break;
-    env[match[1]] = match[2]
-      .replaceAll("${{ github.workspace }}", fixtureRoot)
-      .replace(/^['"]|['"]$/g, "");
+    env[match[1]] = expandWorkflowValues(
+      match[2].replace(/^['"]|['"]$/g, ""),
+      fixtureRoot,
+      outputs,
+    );
   }
   return env;
 };
 
-const executeAcquisitionThroughResolver = (arch) => {
+const escapeRegExp = (value) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
   const job = jobSource(`build-macos-${arch}`);
   const steps = workflowSteps(job);
   const stages = macContractStages(steps, arch);
   const resolver = stages.resolve.source;
+  const resolverId = setting(resolver, "id");
+  assert.ok(resolverId, `macOS ${arch} resolver must expose a step id`);
   assert.match(
     resolver,
-    /(?:test\s+-x|\[\s+-x\s+)[^\n]*Contents\/MacOS\/Electron/,
-    `macOS ${arch} resolver must reject a non-executable Electron fixture`,
+    /GITHUB_OUTPUT/,
+    `macOS ${arch} resolver must expose paths through step outputs`,
+  );
+  assert.doesNotMatch(
+    resolver,
+    /(?:test\s+-x|\[\s+-x\s+|ELECTRON_RUN_AS_NODE|(?:^|\s)(?:\/usr\/bin\/)?(?:lipo|file)(?:\s|$))/m,
+    `macOS ${arch} resolver must only resolve paths and outputs`,
+  );
+  const resolverOutputReference = new RegExp(
+    `steps\\.${escapeRegExp(resolverId)}\\.outputs\\.`,
   );
   assert.match(
-    resolver,
-    /ELECTRON_RUN_AS_NODE=1[^\n]*Contents\/MacOS\/Electron/,
-    `macOS ${arch} resolver must execute the acquired Electron runtime`,
+    stages.probe.source,
+    resolverOutputReference,
+    `macOS ${arch} probe must consume resolver outputs`,
+  );
+  const outputConsumers = steps.filter(
+    (step) =>
+      step.index > stages.resolve.index &&
+      resolverOutputReference.test(step.source),
+  );
+  assert.equal(
+    outputConsumers[0]?.index,
+    stages.probe.index,
+    `macOS ${arch} probe must be the first consumer of resolver outputs`,
+  );
+  const probe = stages.probe.source;
+  assert.match(
+    probe,
+    /(?:test\s+-x|\[\s+-x\s+)[^\n]*(?:Contents\/MacOS\/Electron|ELECTRON)/,
+    `macOS ${arch} probe must reject a non-executable Electron fixture`,
   );
   assert.match(
-    resolver,
+    probe,
+    /ELECTRON_RUN_AS_NODE=1[^\n]*(?:Contents\/MacOS\/Electron|ELECTRON)/,
+    `macOS ${arch} probe must execute the acquired Electron runtime`,
+  );
+  assert.match(
+    probe,
     /devDependencies\.electron|package\.json[^\n]*electron|electron[^\n]*package\.json/,
-    `macOS ${arch} resolver must compare against the locked Electron package version`,
+    `macOS ${arch} probe must compare against the locked Electron package version`,
   );
   assert.match(
-    resolver,
-    /(?:lipo|file)[^\n]*Contents\/MacOS\/Electron/,
-    `macOS ${arch} resolver must inspect the acquired executable architecture`,
+    probe,
+    /(?:lipo|file)[^\n]*(?:Contents\/MacOS\/Electron|ELECTRON)/,
+    `macOS ${arch} probe must inspect the acquired executable architecture`,
+  );
+  assert.match(
+    probe,
+    /(?:test\s+-x|\[\s+-x\s+)[^\n]*LOGSEQ_7ZIP/,
+    `macOS ${arch} probe must verify LOGSEQ_7ZIP is executable`,
   );
   const fixture = createCleanInstallFixture(arch);
   try {
@@ -339,6 +432,7 @@ const executeAcquisitionThroughResolver = (arch) => {
     const env = {
       ...process.env,
       GITHUB_ENV: fixture.githubEnv,
+      GITHUB_OUTPUT: fixture.githubOutput,
       GITHUB_WORKSPACE: fixture.root,
       LOGSEQ_TEST_EXPECTED_ARCH: fixture.executableArch,
       LOGSEQ_TEST_INSTALL_MARKER: fixture.installMarker,
@@ -348,15 +442,28 @@ const executeAcquisitionThroughResolver = (arch) => {
     };
     fs.mkdirSync(env.RUNNER_TEMP, { recursive: true });
 
-    const candidateSteps = steps.slice(
-      stages.dependency.index,
-      stages.resolve.index + 1,
-    );
+    const outputs = {};
+    const candidateSteps = [stages.materialize, stages.resolve, stages.probe];
     for (const step of candidateSteps) {
+      if (rejectNonExecutable && step.index === stages.probe.index) {
+        fs.chmodSync(
+          path.join(
+            fixture.electronApp,
+            "Contents",
+            "MacOS",
+            "Electron",
+          ),
+          0o600,
+        );
+      }
       const script = runScript(step);
       if (!script) continue;
-      const expandedScript = script
-        .replaceAll("${{ github.workspace }}", fixture.root)
+      fs.writeFileSync(fixture.githubOutput, "");
+      const expandedScript = expandWorkflowValues(
+        script,
+        fixture.root,
+        outputs,
+      )
         .replaceAll("/usr/bin/lipo", path.join(fixture.binRoot, "lipo"))
         .replaceAll("/usr/bin/file", path.join(fixture.binRoot, "file"));
       const workingDirectoryValue = setting(step.source, "working-directory");
@@ -372,16 +479,28 @@ const executeAcquisitionThroughResolver = (arch) => {
         {
           cwd,
           encoding: "utf8",
-          env: { ...env, ...stepEnvironment(step.source, fixture.root) },
+          env: {
+            ...env,
+            ...stepEnvironment(step.source, fixture.root, outputs),
+          },
           shell: false,
         },
       );
+      if (rejectNonExecutable && step.index === stages.probe.index) {
+        assert.notEqual(
+          result.status,
+          0,
+          `macOS ${arch} real probe accepted a non-executable Electron fixture`,
+        );
+        return;
+      }
       assert.equal(
         result.status,
         0,
         `macOS ${arch} ${step.name ?? "unnamed step"} failed from clean install:\n${result.stdout}\n${result.stderr}`,
       );
       readGithubEnv(fixture.githubEnv, env);
+      readGithubOutput(fixture.githubOutput, step, outputs);
     }
 
     assert.ok(
@@ -428,7 +547,7 @@ const executeAcquisitionThroughResolver = (arch) => {
   }
 };
 
-test("stage parser uniquely identifies both architecture-prefixed resolver boundaries", () => {
+test("stage parser proves dependency -> materialize -> resolve -> probe -> contracts roles", () => {
   for (const arch of ["x64", "arm64"]) {
     const steps = workflowSteps(
       [
@@ -437,13 +556,22 @@ test("stage parser uniquely identifies both architecture-prefixed resolver bound
         "        run: |",
         "          pnpm install --frozen-lockfile",
         "        working-directory: ./static",
-        `      - name: Materialize Electron.app fixture for ${arch}`,
+        `      - name: Electron ${arch} materialize fixture`,
         "        run: pnpm exec install-electron",
         "        working-directory: ./static",
         `      - name: Resolve ${arch} native updater contract tools`,
+        "        id: native-tools",
         "        run: |",
-        "          test -x static/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+        '          echo "electron-app=$PWD/static/node_modules/electron/dist/Electron.app" >> "$GITHUB_OUTPUT"',
+        '          echo "sevenzip=$PWD/static/node_modules/7zip-bin/7za" >> "$GITHUB_OUTPUT"',
         "        working-directory: .",
+        `      - name: Probe ${arch} native updater contract tools`,
+        "        env:",
+        "          ELECTRON_APP: ${{ steps.native-tools.outputs.electron-app }}",
+        "          LOGSEQ_7ZIP: ${{ steps.native-tools.outputs.sevenzip }}",
+        "        run: |",
+        '          test -x "$ELECTRON_APP/Contents/MacOS/Electron"',
+        '          test -x "$LOGSEQ_7ZIP"',
         "      - name: Run project-signed updater native and provider contracts",
         "        run: pnpm test:project-signed-macos-updater",
         "",
@@ -456,7 +584,30 @@ test("stage parser uniquely identifies both architecture-prefixed resolver bound
     );
     assert.equal(
       stages.materialize.name,
-      `Materialize Electron.app fixture for ${arch}`,
+      `Electron ${arch} materialize fixture`,
+    );
+    assert.equal(
+      stages.probe.name,
+      `Probe ${arch} native updater contract tools`,
+    );
+    assert.equal(
+      stages.contracts.name,
+      "Run project-signed updater native and provider contracts",
+    );
+    assert.deepEqual(
+      [
+        stages.dependency.index,
+        stages.materialize.index,
+        stages.resolve.index,
+        stages.probe.index,
+        stages.contracts.index,
+      ],
+      [0, 1, 2, 3, 4],
+    );
+    assert.equal(setting(stages.resolve.source, "id"), "native-tools");
+    assert.match(
+      stages.probe.source,
+      /steps\.native-tools\.outputs\.(?:electron-app|sevenzip)/,
     );
   }
 });
@@ -583,6 +734,7 @@ for (const arch of ["x64", "arm64"]) {
 
 for (const arch of ["x64", "arm64"]) {
   test(`macOS ${arch} explicitly acquires and probes Electron.app after clean install`, () => {
-    executeAcquisitionThroughResolver(arch);
+    executeAcquisitionThroughProbe(arch);
+    executeAcquisitionThroughProbe(arch, true);
   });
 }
