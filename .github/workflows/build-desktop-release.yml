@@ -1642,14 +1642,23 @@ jobs:
 
   publish-linux-snap:
     runs-on: ubuntu-22.04
-    needs: [ release ]
+    needs: [ release, compile-cljs ]
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish-linux-stores == 'true' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
+    env:
+      LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}
+      LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
         with:
           name: static
-          path: static
+          path: .
+
+      - name: Verify desktop runtime verification inputs
+        run: |
+          test -f static/package.json
+          test -f scripts/verify-desktop-runtime-revisions.mjs
+          test -f dist/db-worker-node.js
 
       - name: Install Node.js
         uses: actions/setup-node@v4
