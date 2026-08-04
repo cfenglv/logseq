@@ -465,11 +465,13 @@ for (const jobName of [
 ]) {
   assertContains(workflow, `${jobName}:`, "desktop release workflow");
 }
-const desktopRuntimeVerificationArtifacts =
-  workflow.match(/name: desktop-runtime-verification-inputs/g)?.length || 0;
-if (desktopRuntimeVerificationArtifacts !== 7) {
+if (
+  !/name:\s+static[\s\S]{0,160}?path:\s*\|[\s\S]{0,100}?^\s+static\s*$[\s\S]{0,100}?^\s+scripts\/verify-desktop-runtime-revisions\.mjs\s*$[\s\S]{0,100}?^\s+dist\/db-worker-node\.js\s*$/m.test(
+    workflow,
+  )
+) {
   fail(
-    `desktop release workflow must upload runtime verification inputs once and restore them in all six builders; found ${desktopRuntimeVerificationArtifacts} artifact references`,
+    "desktop release workflow must publish static and its job-root runtime verification inputs in one artifact",
   );
 }
 for (const input of [
@@ -484,9 +486,17 @@ for (const input of [
   );
 }
 if (
+  workflow.match(/- name: Verify desktop runtime verification inputs/g)
+    ?.length !== 6
+) {
+  fail(
+    "all six desktop builders must fail before packaging when runtime verification inputs are absent",
+  );
+}
+if (
   workflow.match(/appBuilderRequire\("7zip-bin"\)\.path7za/g)?.length !== 2 ||
-  workflow.match(/LOGSEQ_7ZIP:/g)?.length !== 2 ||
-  workflow.match(/LOGSEQ_ELECTRON_APP_FIXTURE:/g)?.length !== 2
+  workflow.match(/LOGSEQ_7ZIP:/g)?.length !== 4 ||
+  workflow.match(/LOGSEQ_ELECTRON_APP_FIXTURE:/g)?.length !== 4
 ) {
   fail(
     "both macOS builders must bind native updater contracts to the locked 7-Zip and Electron.app dependencies",

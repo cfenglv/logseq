@@ -659,8 +659,8 @@ for (const sourceContract of [
 }
 assert.match(
   workflowJob(desktopReleaseWorkflow, "compile-cljs"),
-  /name:\s+desktop-runtime-verification-inputs[\s\S]{0,240}?scripts\/verify-desktop-runtime-revisions\.mjs[\s\S]{0,120}?dist\/db-worker-node\.js[\s\S]{0,120}?if-no-files-found:\s+error/,
-  "compile-cljs must upload the canonical runtime verifier and root dist input as required files",
+  /name:\s+static[\s\S]{0,160}?path:\s*\|[\s\S]{0,100}?^\s+static\s*$[\s\S]{0,100}?^\s+scripts\/verify-desktop-runtime-revisions\.mjs\s*$[\s\S]{0,100}?^\s+dist\/db-worker-node\.js\s*$[\s\S]{0,120}?if-no-files-found:\s+error/m,
+  "compile-cljs must publish static with the canonical runtime verifier and root dist input as required files",
 );
 for (const jobName of [
   "build-linux-x64",
@@ -672,8 +672,8 @@ for (const jobName of [
 ]) {
   assert.match(
     workflowJob(desktopReleaseWorkflow, jobName),
-    /uses:\s+actions\/download-artifact@v4[\s\S]{0,160}?name:\s+desktop-runtime-verification-inputs[\s\S]{0,80}?path:\s+\./,
-    `${jobName} must restore the canonical runtime verification inputs at the job root`,
+    /uses:\s+actions\/download-artifact@v4[\s\S]{0,120}?name:\s+static[\s\S]{0,80}?path:\s+\.[\s\S]*?(?:test\s+-f|Test-Path)[^\n]*scripts[\\/]verify-desktop-runtime-revisions\.mjs/i,
+    `${jobName} must restore and check the canonical runtime verification inputs at the job root`,
   );
 }
 for (const [jobName, arch] of [
@@ -693,7 +693,7 @@ for (const [jobName, arch] of [
   );
   assert.match(
     job,
-    /path\.resolve\(path\.dirname\(require\("electron"\)\), "\.\.\/\.\."\)/,
+    /static\/node_modules\/electron\/dist\/Electron\.app/,
     `${jobName} must resolve Electron.app from the locked desktop dependency`,
   );
   assert.match(

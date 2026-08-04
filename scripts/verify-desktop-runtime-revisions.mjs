@@ -7,24 +7,24 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+const releaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim();
+if (!releaseSourceSha || !/^[0-9a-f]{40}$/.test(releaseSourceSha)) {
+  throw new Error(
+    "LOGSEQ_RELEASE_SOURCE_SHA must be an exact lowercase 40-hex commit SHA",
+  );
+}
 const embeddedRevision =
   process.env.LOGSEQ_REVISION?.trim() ||
   execFileSync("git", ["describe", "--long", "--always", "--dirty"], {
     cwd: repoRoot,
     encoding: "utf8",
   }).trim();
-const releaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim();
-if (releaseSourceSha && !/^[0-9a-f]{40}$/.test(releaseSourceSha)) {
-  throw new Error(
-    "LOGSEQ_RELEASE_SOURCE_SHA must be an exact lowercase 40-hex commit SHA",
-  );
-}
-if (releaseSourceSha && embeddedRevision !== releaseSourceSha) {
+if (embeddedRevision !== releaseSourceSha) {
   throw new Error(
     `LOGSEQ_REVISION ${embeddedRevision} does not match release source SHA ${releaseSourceSha}`,
   );
 }
-const expectedRevision = releaseSourceSha || embeddedRevision;
+const expectedRevision = releaseSourceSha;
 
 const runtimeFiles = [
   "static/electron.js",

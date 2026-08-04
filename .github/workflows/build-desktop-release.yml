@@ -467,16 +467,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: static
-          path: static
-          include-hidden-files: true
-
-      - name: Cache desktop runtime verification inputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: desktop-runtime-verification-inputs
           path: |
+            static
             scripts/verify-desktop-runtime-revisions.mjs
             dist/db-worker-node.js
+          include-hidden-files: true
           if-no-files-found: error
 
   build-linux-x64:
@@ -491,13 +486,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: static
-          path: static
-
-      - name: Download desktop runtime verification inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: desktop-runtime-verification-inputs
           path: .
+
+      - name: Verify desktop runtime verification inputs
+        run: |
+          test -f scripts/verify-desktop-runtime-revisions.mjs
+          test -f dist/db-worker-node.js
 
       - name: Retrieve tag version
         id: ref
@@ -562,13 +556,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: static
-          path: static
-
-      - name: Download desktop runtime verification inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: desktop-runtime-verification-inputs
           path: .
+
+      - name: Verify desktop runtime verification inputs
+        run: |
+          test -f scripts/verify-desktop-runtime-revisions.mjs
+          test -f dist/db-worker-node.js
 
       - name: Retrieve tag version
         id: ref
@@ -633,13 +626,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: static
-          path: static
-
-      - name: Download desktop runtime verification inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: desktop-runtime-verification-inputs
           path: .
+
+      - name: Verify desktop runtime verification inputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -PathType Leaf "scripts/verify-desktop-runtime-revisions.mjs")) { throw "missing desktop runtime verifier" }
+          if (-not (Test-Path -PathType Leaf "dist/db-worker-node.js")) { throw "missing root db-worker runtime" }
 
       - name: Retrieve tag version
         id: ref
@@ -730,13 +723,13 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: static
-          path: static
-
-      - name: Download desktop runtime verification inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: desktop-runtime-verification-inputs
           path: .
+
+      - name: Verify desktop runtime verification inputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -PathType Leaf "scripts/verify-desktop-runtime-revisions.mjs")) { throw "missing desktop runtime verifier" }
+          if (-not (Test-Path -PathType Leaf "dist/db-worker-node.js")) { throw "missing root db-worker runtime" }
 
       - name: Retrieve tag version
         id: ref
@@ -829,13 +822,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: static
-          path: static
-
-      - name: Download desktop runtime verification inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: desktop-runtime-verification-inputs
           path: .
+
+      - name: Verify desktop runtime verification inputs
+        run: |
+          test -f scripts/verify-desktop-runtime-revisions.mjs
+          test -f dist/db-worker-node.js
 
       - name: Check out macOS release policy
         uses: actions/checkout@v4
@@ -915,12 +907,26 @@ jobs:
         id: x64-native-contract-tools
         run: |
           seven_zip="$(node -e 'const { createRequire } = require("node:module"); const builderRequire = createRequire(require.resolve("electron-builder/package.json")); const appBuilderRequire = createRequire(builderRequire.resolve("app-builder-lib/package.json")); process.stdout.write(appBuilderRequire("7zip-bin").path7za);')"
-          electron_app="$(node -e 'const path = require("node:path"); process.stdout.write(path.resolve(path.dirname(require("electron")), "../.."));')"
+          electron_app="$GITHUB_WORKSPACE/static/node_modules/electron/dist/Electron.app"
           test -x "$seven_zip"
           test -d "$electron_app"
           echo "seven-zip=$seven_zip" >> "$GITHUB_OUTPUT"
           echo "electron-app=$electron_app" >> "$GITHUB_OUTPUT"
         working-directory: ./static
+
+      - name: Probe x64 native updater contract tools
+        run: |
+          test -x "$LOGSEQ_7ZIP"
+          "$LOGSEQ_7ZIP" i >/dev/null
+          test -f "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/Info.plist"
+          test -x "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/MacOS/Electron"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/MacOS/Electron" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
+          file "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/MacOS/Electron" | grep -E 'x86_64|x64'
+        env:
+          LOGSEQ_7ZIP: ${{ steps.x64-native-contract-tools.outputs.seven-zip }}
+          LOGSEQ_ELECTRON_APP_FIXTURE: ${{ steps.x64-native-contract-tools.outputs.electron-app }}
 
       - name: Verify x64 updater provider contract
         run: pnpm electron:verify-updater-provider
@@ -1014,13 +1020,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: static
-          path: static
-
-      - name: Download desktop runtime verification inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: desktop-runtime-verification-inputs
           path: .
+
+      - name: Verify desktop runtime verification inputs
+        run: |
+          test -f scripts/verify-desktop-runtime-revisions.mjs
+          test -f dist/db-worker-node.js
 
       - name: Check out macOS release policy
         uses: actions/checkout@v4
@@ -1095,12 +1100,26 @@ jobs:
         id: arm64-native-contract-tools
         run: |
           seven_zip="$(node -e 'const { createRequire } = require("node:module"); const builderRequire = createRequire(require.resolve("electron-builder/package.json")); const appBuilderRequire = createRequire(builderRequire.resolve("app-builder-lib/package.json")); process.stdout.write(appBuilderRequire("7zip-bin").path7za);')"
-          electron_app="$(node -e 'const path = require("node:path"); process.stdout.write(path.resolve(path.dirname(require("electron")), "../.."));')"
+          electron_app="$GITHUB_WORKSPACE/static/node_modules/electron/dist/Electron.app"
           test -x "$seven_zip"
           test -d "$electron_app"
           echo "seven-zip=$seven_zip" >> "$GITHUB_OUTPUT"
           echo "electron-app=$electron_app" >> "$GITHUB_OUTPUT"
         working-directory: ./static
+
+      - name: Probe arm64 native updater contract tools
+        run: |
+          test -x "$LOGSEQ_7ZIP"
+          "$LOGSEQ_7ZIP" i >/dev/null
+          test -f "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/Info.plist"
+          test -x "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/MacOS/Electron"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/MacOS/Electron" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
+          file "$LOGSEQ_ELECTRON_APP_FIXTURE/Contents/MacOS/Electron" | grep -F 'arm64'
+        env:
+          LOGSEQ_7ZIP: ${{ steps.arm64-native-contract-tools.outputs.seven-zip }}
+          LOGSEQ_ELECTRON_APP_FIXTURE: ${{ steps.arm64-native-contract-tools.outputs.electron-app }}
 
       - name: Verify arm64 updater provider contract
         run: pnpm electron:verify-updater-provider
