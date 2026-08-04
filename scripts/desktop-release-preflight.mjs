@@ -160,6 +160,7 @@ for (const relativePath of [
   "scripts/test-github-project-update-signing-provider.mjs",
   "scripts/test-protected-selfhost-release-workflow.mjs",
   "scripts/test-selfhost-macos-updater-release-contract.mjs",
+  "scripts/test-selfhost-updater-runtime-dependency-boundary.mjs",
   "scripts/test-updater-install-entry-contract.mjs",
   "scripts/test-selfhost-macos-user-guidance.mjs",
   "scripts/test-macos-updater-signature-config.mjs",
