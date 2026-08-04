@@ -20,13 +20,30 @@ const workflow = fs.readFileSync(
 const desktopPackage = JSON.parse(
   fs.readFileSync(path.join(repoRoot, "resources", "package.json"), "utf8"),
 );
-const lockedElectronVersion = desktopPackage.devDependencies?.electron;
-
-assert.match(
-  lockedElectronVersion ?? "",
-  /^\d+\.\d+\.\d+$/,
-  "desktop Electron must be pinned exactly for the acquisition contract",
+const desktopLock = fs.readFileSync(
+  path.join(repoRoot, "resources", "pnpm-lock.yaml"),
+  "utf8",
 );
+const lockedElectronVersion = desktopPackage.devDependencies?.electron;
+const lockedElectronBuilderVersion =
+  desktopPackage.devDependencies?.["electron-builder"];
+const lockedAppBuilderVersion = desktopLock.match(
+  /^  app-builder-lib@([^:]+):$/m,
+)?.[1];
+const lockedSevenZipVersion = desktopLock.match(/^  7zip-bin@([^:]+):$/m)?.[1];
+
+for (const [name, version] of [
+  ["electron", lockedElectronVersion],
+  ["electron-builder", lockedElectronBuilderVersion],
+  ["app-builder-lib", lockedAppBuilderVersion],
+  ["7zip-bin", lockedSevenZipVersion],
+]) {
+  assert.match(
+    version ?? "",
+    /^\d+\.\d+\.\d+$/,
+    `${name} must be pinned exactly for the acquisition contract`,
+  );
+}
 
 const jobSource = (jobName) => {
   const marker = `  ${jobName}:\n`;
@@ -208,7 +225,7 @@ const createCleanInstallFixture = (arch) => {
     staticRoot,
     "node_modules",
     ".pnpm",
-    "7zip-bin@5.2.0",
+    `7zip-bin@${lockedSevenZipVersion}`,
     "node_modules",
     "7zip-bin",
   );
@@ -216,7 +233,7 @@ const createCleanInstallFixture = (arch) => {
   fs.mkdirSync(sevenZipRoot, { recursive: true });
   fs.writeFileSync(
     path.join(sevenZipRoot, "package.json"),
-    `${JSON.stringify({ main: "index.js", name: "7zip-bin", version: "5.2.0" })}\n`,
+    `${JSON.stringify({ main: "index.js", name: "7zip-bin", version: lockedSevenZipVersion })}\n`,
   );
   fs.writeFileSync(
     path.join(sevenZipRoot, "index.js"),
@@ -249,11 +266,11 @@ const createCleanInstallFixture = (arch) => {
   fs.mkdirSync(path.dirname(appBuilderSevenZip), { recursive: true });
   fs.writeFileSync(
     electronBuilderPackage,
-    `${JSON.stringify({ dependencies: { "app-builder-lib": "26.8.2" }, name: "electron-builder", version: "26.8.2" })}\n`,
+    `${JSON.stringify({ dependencies: { "app-builder-lib": lockedAppBuilderVersion }, name: "electron-builder", version: lockedElectronBuilderVersion })}\n`,
   );
   fs.writeFileSync(
     appBuilderPackage,
-    `${JSON.stringify({ dependencies: { "7zip-bin": "5.2.0" }, name: "app-builder-lib", version: "26.8.2" })}\n`,
+    `${JSON.stringify({ dependencies: { "7zip-bin": lockedSevenZipVersion }, name: "app-builder-lib", version: lockedAppBuilderVersion })}\n`,
   );
   fs.symlinkSync(sevenZipRoot, appBuilderSevenZip, "dir");
   fs.mkdirSync(path.join(staticRoot, "node_modules", ".bin"), {
@@ -421,6 +438,78 @@ const stepEnvironment = (source, fixtureRoot, outputs) => {
   return env;
 };
 
+const fixtureEnvironment = (fixture, arch) => {
+  const env = {
+    ...process.env,
+    GITHUB_ENV: fixture.githubEnv,
+    GITHUB_OUTPUT: fixture.githubOutput,
+    GITHUB_WORKSPACE: fixture.root,
+    LOGSEQ_TEST_EXPECTED_ARCH: fixture.executableArch,
+    LOGSEQ_TEST_INSTALL_MARKER: fixture.installMarker,
+    PATH: `${fixture.binRoot}${path.delimiter}${process.env.PATH ?? ""}`,
+    RUNNER_ARCH: arch === "x64" ? "X64" : "ARM64",
+    RUNNER_TEMP: path.join(fixture.root, "runner-temp"),
+  };
+  fs.mkdirSync(env.RUNNER_TEMP, { recursive: true });
+  return env;
+};
+
+const executeFixtureStep = (step, fixture, env, outputs) => {
+  const script = runScript(step);
+  assert.ok(script, `${step.name ?? "unnamed step"} must have a run script`);
+  fs.writeFileSync(fixture.githubOutput, "");
+  const expandedScript = expandWorkflowValues(script, fixture.root, outputs)
+    .replaceAll("/usr/bin/lipo", path.join(fixture.binRoot, "lipo"))
+    .replaceAll("/usr/bin/file", path.join(fixture.binRoot, "file"));
+  const workingDirectoryValue = setting(step.source, "working-directory");
+  const cwd = workingDirectoryValue
+    ? path.resolve(fixture.root, workingDirectoryValue.replace(/^\.\//, ""))
+    : fixture.root;
+  const result = spawnSync(
+    "/bin/bash",
+    ["-e", "-o", "pipefail", "-c", expandedScript],
+    {
+      cwd,
+      encoding: "utf8",
+      env: {
+        ...env,
+        ...stepEnvironment(step.source, fixture.root, outputs),
+      },
+      shell: false,
+    },
+  );
+  if (result.status === 0) {
+    readGithubEnv(fixture.githubEnv, env);
+    readGithubOutput(fixture.githubOutput, step, outputs);
+  }
+  return result;
+};
+
+const prepareResolverFixture = (arch) => {
+  const steps = workflowSteps(jobSource(`build-macos-${arch}`));
+  const stages = macContractStages(steps, arch);
+  const fixture = createCleanInstallFixture(arch);
+  const env = fixtureEnvironment(fixture, arch);
+  const outputs = {};
+  try {
+    const materialize = executeFixtureStep(
+      stages.materialize,
+      fixture,
+      env,
+      outputs,
+    );
+    assert.equal(
+      materialize.status,
+      0,
+      `macOS ${arch} materialize precondition failed:\n${materialize.stdout}\n${materialize.stderr}`,
+    );
+    return { env, fixture, outputs, stages };
+  } catch (error) {
+    fixture.dispose();
+    throw error;
+  }
+};
+
 const escapeRegExp = (value) =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -500,18 +589,7 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
       false,
       "clean-install fixture unexpectedly started with Electron.app",
     );
-    const env = {
-      ...process.env,
-      GITHUB_ENV: fixture.githubEnv,
-      GITHUB_OUTPUT: fixture.githubOutput,
-      GITHUB_WORKSPACE: fixture.root,
-      LOGSEQ_TEST_EXPECTED_ARCH: fixture.executableArch,
-      LOGSEQ_TEST_INSTALL_MARKER: fixture.installMarker,
-      PATH: `${fixture.binRoot}${path.delimiter}${process.env.PATH ?? ""}`,
-      RUNNER_ARCH: arch === "x64" ? "X64" : "ARM64",
-      RUNNER_TEMP: path.join(fixture.root, "runner-temp"),
-    };
-    fs.mkdirSync(env.RUNNER_TEMP, { recursive: true });
+    const env = fixtureEnvironment(fixture, arch);
 
     const outputs = {};
     const candidateSteps = [stages.materialize, stages.resolve, stages.probe];
@@ -527,36 +605,7 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
           0o600,
         );
       }
-      const script = runScript(step);
-      if (!script) continue;
-      fs.writeFileSync(fixture.githubOutput, "");
-      const expandedScript = expandWorkflowValues(
-        script,
-        fixture.root,
-        outputs,
-      )
-        .replaceAll("/usr/bin/lipo", path.join(fixture.binRoot, "lipo"))
-        .replaceAll("/usr/bin/file", path.join(fixture.binRoot, "file"));
-      const workingDirectoryValue = setting(step.source, "working-directory");
-      const cwd = workingDirectoryValue
-        ? path.resolve(
-            fixture.root,
-            workingDirectoryValue.replace(/^\.\//, ""),
-          )
-        : fixture.root;
-      const result = spawnSync(
-        "/bin/bash",
-        ["-e", "-o", "pipefail", "-c", expandedScript],
-        {
-          cwd,
-          encoding: "utf8",
-          env: {
-            ...env,
-            ...stepEnvironment(step.source, fixture.root, outputs),
-          },
-          shell: false,
-        },
-      );
+      const result = executeFixtureStep(step, fixture, env, outputs);
       if (rejectNonExecutable && step.index === stages.probe.index) {
         assert.notEqual(
           result.status,
@@ -570,9 +619,28 @@ const executeAcquisitionThroughProbe = (arch, rejectNonExecutable = false) => {
         0,
         `macOS ${arch} ${step.name ?? "unnamed step"} failed from clean install:\n${result.stdout}\n${result.stderr}`,
       );
-      readGithubEnv(fixture.githubEnv, env);
-      readGithubOutput(fixture.githubOutput, step, outputs);
     }
+
+    assert.equal(
+      setting(stages.resolve.source, "working-directory"),
+      "./static",
+      `macOS ${arch} resolver must run from the package that owns the locked dependency chain`,
+    );
+    assert.match(
+      stages.resolve.source,
+      /electron_app="\$GITHUB_WORKSPACE\/static\/node_modules\/electron\/dist\/Electron\.app"/,
+      `macOS ${arch} resolver must bind Electron.app to GITHUB_WORKSPACE`,
+    );
+    assert.equal(
+      fs.realpathSync(outputs[resolverId]["seven-zip"]),
+      fs.realpathSync(fixture.sevenZip),
+      `macOS ${arch} resolver output must use locked app-builder-lib 7zip-bin`,
+    );
+    assert.equal(
+      fs.realpathSync(outputs[resolverId]["electron-app"]),
+      fs.realpathSync(fixture.electronApp),
+      `macOS ${arch} resolver output must use GITHUB_WORKSPACE Electron.app`,
+    );
 
     assert.ok(
       fs.existsSync(fixture.installMarker),
@@ -693,6 +761,20 @@ test("stage parser proves dependency -> materialize -> resolve -> probe -> contr
 test("clean-install harness resolves 7zip-bin only through app-builder-lib", () => {
   const fixture = createCleanInstallFixture("x64");
   try {
+    const electronBuilderPackage = JSON.parse(
+      fs.readFileSync(fixture.electronBuilderPackage, "utf8"),
+    );
+    const appBuilderPackage = JSON.parse(
+      fs.readFileSync(fixture.appBuilderPackage, "utf8"),
+    );
+    assert.equal(electronBuilderPackage.version, lockedElectronBuilderVersion);
+    assert.deepEqual(electronBuilderPackage.dependencies, {
+      "app-builder-lib": lockedAppBuilderVersion,
+    });
+    assert.equal(appBuilderPackage.version, lockedAppBuilderVersion);
+    assert.deepEqual(appBuilderPackage.dependencies, {
+      "7zip-bin": lockedSevenZipVersion,
+    });
     const resolution = resolveBuilderSevenZip(fixture);
     assert.equal(
       fs.realpathSync(resolution.appBuilderPackage),
@@ -743,6 +825,67 @@ test("clean-install harness resolves 7zip-bin only through app-builder-lib", () 
     fixture.dispose();
   }
 });
+
+const resolverFailureCases = [
+  {
+    expected: [/(?:app-builder-lib|7zip-bin)/i, /(?:resolve|module|dependency|chain)/i],
+    mutate: ({ fixture }) => fs.unlinkSync(fixture.appBuilderSevenZip),
+    name: "broken locked 7zip dependency chain",
+  },
+  {
+    expected: [/(?:seven[_ -]?zip|7[- ]?zip)/i, /(?:execut|permission|mode)/i],
+    mutate: ({ fixture }) => fs.chmodSync(fixture.sevenZip, 0o600),
+    name: "non-executable locked 7zip",
+  },
+  {
+    expected: [/(?:electron[_ -]?app|Electron\.app)/i, /(?:director|missing|materializ|not found)/i],
+    mutate: ({ fixture }) =>
+      fs.renameSync(fixture.electronApp, `${fixture.electronApp}.missing`),
+    name: "missing workspace Electron.app",
+  },
+  {
+    expected: [/GITHUB_WORKSPACE/, /(?:missing|unset|required|empty)/i],
+    mutate: ({ env }) => delete env.GITHUB_WORKSPACE,
+    name: "missing GITHUB_WORKSPACE",
+  },
+];
+
+for (const arch of ["x64", "arm64"]) {
+  for (const failureCase of resolverFailureCases) {
+    test(`macOS ${arch} resolver fails closed with distinct diagnostics for ${failureCase.name}`, () => {
+      const context = prepareResolverFixture(arch);
+      try {
+        failureCase.mutate(context);
+        const result = executeFixtureStep(
+          context.stages.resolve,
+          context.fixture,
+          context.env,
+          context.outputs,
+        );
+        assert.notEqual(
+          result.status,
+          0,
+          `macOS ${arch} resolver accepted ${failureCase.name}`,
+        );
+        assert.equal(
+          fs.readFileSync(context.fixture.githubOutput, "utf8"),
+          "",
+          `macOS ${arch} resolver published outputs after ${failureCase.name}`,
+        );
+        const diagnostic = `${result.stdout}\n${result.stderr}`;
+        for (const expected of failureCase.expected) {
+          assert.match(
+            diagnostic,
+            expected,
+            `macOS ${arch} resolver did not identify ${failureCase.name}:\n${diagnostic}`,
+          );
+        }
+      } finally {
+        context.fixture.dispose();
+      }
+    });
+  }
+}
 
 test("clean-install harness rejects a path-only Electron fixture resolver", () => {
   const fixture = createCleanInstallFixture("x64");
