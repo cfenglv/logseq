@@ -421,6 +421,28 @@ if (desktopPackage.devDependencies?.["@electron/asar"] !== "3.4.1") {
 const workflow = readText(".github/workflows/build-desktop-release.yml");
 const workflowVersion = (name) =>
   workflow.match(new RegExp(`^  ${name}: ['"]?([^'"\\n]+)`, "m"))?.[1];
+const workflowJobSource = (jobName) => {
+  const marker = `  ${jobName}:\n`;
+  const start = workflow.indexOf(marker);
+  if (start === -1) {
+    fail(`desktop release workflow is missing job ${jobName}`);
+    return "";
+  }
+  const remainder = workflow.slice(start + marker.length);
+  const nextJob = remainder.search(/^  [A-Za-z0-9_-]+:\s*$/m);
+  return nextJob === -1 ? remainder : remainder.slice(0, nextJob);
+};
+const workflowStepSource = (jobSource, stepName) => {
+  const marker = `      - name: ${stepName}\n`;
+  const start = jobSource.indexOf(marker);
+  if (start === -1) {
+    fail(`desktop release workflow job is missing step ${stepName}`);
+    return "";
+  }
+  const remainder = jobSource.slice(start + marker.length);
+  const nextStep = remainder.search(/^      - name:\s/m);
+  return nextStep === -1 ? remainder : remainder.slice(0, nextStep);
+};
 const expectedJavaMajor = Number(workflowVersion("JAVA_VERSION"));
 const expectedClojure = workflowVersion("CLOJURE_VERSION");
 const expectedBabashka = workflowVersion("BABASHKA_VERSION");
@@ -455,15 +477,41 @@ for (const needle of [
   assertContains(workflow, needle, "desktop release workflow");
 }
 
-for (const jobName of [
+const desktopBuilderJobs = [
   "build-linux-x64",
   "build-linux-arm64",
   "build-windows-x64",
   "build-windows-arm64",
   "build-macos-x64",
   "build-macos-arm64",
-]) {
+];
+for (const jobName of desktopBuilderJobs) {
   assertContains(workflow, `${jobName}:`, "desktop release workflow");
+  const job = workflowJobSource(jobName);
+  const download = workflowStepSource(job, "Download The Static Asset");
+  const verification = workflowStepSource(
+    job,
+    "Verify desktop runtime verification inputs",
+  );
+  if (
+    !/uses:\s*actions\/download-artifact@v4/.test(download) ||
+    !/name:\s*static\s*$/m.test(download) ||
+    !/path:\s*(?:\.|\$\{\{\s*github\.workspace\s*\}\})\s*$/m.test(download)
+  ) {
+    fail(`${jobName} must restore the multi-root static artifact at the job root`);
+  }
+  for (const binding of [
+    "LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}",
+    "LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}",
+  ]) {
+    assertContains(job, binding, `${jobName} frozen source binding`);
+  }
+  for (const input of [
+    "verify-desktop-runtime-revisions.mjs",
+    "db-worker-node.js",
+  ]) {
+    assertContains(verification, input, `${jobName} runtime input check`);
+  }
 }
 if (
   !/name:\s+static[\s\S]{0,160}?path:\s*\|[\s\S]{0,100}?^\s+static\s*$[\s\S]{0,100}?^\s+scripts\/verify-desktop-runtime-revisions\.mjs\s*$[\s\S]{0,100}?^\s+dist\/db-worker-node\.js\s*$/m.test(
@@ -485,12 +533,85 @@ for (const input of [
     "desktop runtime verification input artifact",
   );
 }
+const snapJob = workflowJobSource("publish-linux-snap");
+const snapDownload = workflowStepSource(snapJob, "Download The Static Asset");
+const snapVerification = workflowStepSource(
+  snapJob,
+  "Verify desktop runtime verification inputs",
+);
+const snapPublish = workflowStepSource(snapJob, "Publish Snap");
+for (const roleRequirement of [
+  "needs: [ release, compile-cljs ]",
+  "github.event.inputs.publish-linux-stores == 'true'",
+  "pnpm electron:publish-snap",
+]) {
+  assertContains(snapJob, roleRequirement, "Snap publisher role");
+}
 if (
-  workflow.match(/- name: Verify desktop runtime verification inputs/g)
-    ?.length !== 6
+  !/uses:\s*actions\/download-artifact@v4/.test(snapDownload) ||
+  !/name:\s*static\s*$/m.test(snapDownload) ||
+  !/path:\s*(?:\.|\$\{\{\s*github\.workspace\s*\}\})\s*$/m.test(
+    snapDownload,
+  )
+) {
+  fail("Snap publisher must restore the multi-root static artifact at the job root");
+}
+for (const binding of [
+  "LOGSEQ_REVISION: ${{ needs.compile-cljs.outputs.source-sha }}",
+  "LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.compile-cljs.outputs.source-sha }}",
+]) {
+  assertContains(snapJob, binding, "Snap publisher frozen source binding");
+}
+for (const input of [
+  "static/package.json",
+  "scripts/verify-desktop-runtime-revisions.mjs",
+  "dist/db-worker-node.js",
+]) {
+  assertContains(snapVerification, input, "Snap publisher runtime input check");
+}
+assertContains(snapPublish, "working-directory: ./static", "Snap publisher");
+const snapDownloadIndex = snapJob.indexOf(
+  "      - name: Download The Static Asset\n",
+);
+const snapVerificationIndex = snapJob.indexOf(
+  "      - name: Verify desktop runtime verification inputs\n",
+);
+const snapPublishIndex = snapJob.indexOf("      - name: Publish Snap\n");
+if (
+  snapDownloadIndex > snapVerificationIndex ||
+  snapVerificationIndex > snapPublishIndex
+) {
+  fail("Snap publisher must restore and verify the artifact before packaging");
+}
+
+const staticArtifactConsumers = [];
+const jobsStart = workflow.indexOf("jobs:\n");
+const jobsSource = workflow.slice(jobsStart + "jobs:\n".length);
+const jobMarkers = [...jobsSource.matchAll(/^  ([A-Za-z0-9_-]+):\s*$/gm)];
+for (let index = 0; index < jobMarkers.length; index += 1) {
+  const marker = jobMarkers[index];
+  const source = jobsSource.slice(
+    marker.index,
+    jobMarkers[index + 1]?.index ?? jobsSource.length,
+  );
+  if (
+    /uses:\s*actions\/download-artifact@v4[\s\S]{0,180}?name:\s*static\s*$/m.test(
+      source,
+    )
+  ) {
+    staticArtifactConsumers.push(marker[1]);
+  }
+}
+const expectedStaticArtifactConsumers = [
+  ...desktopBuilderJobs,
+  "publish-linux-snap",
+].sort();
+if (
+  staticArtifactConsumers.sort().join("\n") !==
+  expectedStaticArtifactConsumers.join("\n")
 ) {
   fail(
-    "all six desktop builders must fail before packaging when runtime verification inputs are absent",
+    `desktop static artifact consumers must be the six builders plus Snap publisher; found ${staticArtifactConsumers.join(", ")}`,
   );
 }
 if (
