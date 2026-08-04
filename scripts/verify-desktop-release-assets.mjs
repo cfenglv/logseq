@@ -81,7 +81,7 @@ const artifactNames = [
 ].sort();
 
 const releaseFilePattern =
-  /^(?:Logseq-(?:darwin|linux|win)-|latest(?:-|\.yml)|selfhost-macos-v2-(?:arm64|x64)-mac\.yml$|VERSION$)|\.apk$/;
+  /^(?:Logseq-(?:darwin|linux|win)-|latest(?:-|\.yml)|selfhost-macos-v2-(?:nightly-)?(?:arm64|x64)-mac\.yml$|VERSION$)|\.apk$/;
 const actualArtifactNames = fs
   .readdirSync(releaseDir)
   .filter((name) => releaseFilePattern.test(name))

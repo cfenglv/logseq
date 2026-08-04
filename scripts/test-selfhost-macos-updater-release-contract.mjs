@@ -183,6 +183,7 @@ const semver = dependencyRequire('semver')
 
 const currentLegacyVersion = '2.0.1-selfhost.4'
 const firstV2Version = '2.0.1-selfhost.5'
+const firstV2NightlyVersion = '2.0.1-selfhost.5.nightly.20260729'
 const nextV2Version = '2.0.1-selfhost.6'
 const owner = 'logseq'
 const repository = 'logseq'
@@ -377,26 +378,26 @@ function assertNightlyPublicationIsolation() {
   }
 }
 
-function fixtureArtifactNames() {
+function fixtureArtifactNames(version = firstV2Version) {
   return [
-    `Logseq-darwin-arm64-${firstV2Version}.dmg`,
-    `Logseq-darwin-arm64-${firstV2Version}.dmg.blockmap`,
-    `Logseq-darwin-arm64-${firstV2Version}.zip`,
-    `Logseq-darwin-arm64-${firstV2Version}.zip.blockmap`,
-    `Logseq-darwin-x64-${firstV2Version}.dmg`,
-    `Logseq-darwin-x64-${firstV2Version}.dmg.blockmap`,
-    `Logseq-darwin-x64-${firstV2Version}.zip`,
-    `Logseq-darwin-x64-${firstV2Version}.zip.blockmap`,
-    `Logseq-linux-arm64-${firstV2Version}.AppImage`,
-    `Logseq-linux-arm64-${firstV2Version}.zip`,
-    `Logseq-linux-x86_64-${firstV2Version}.AppImage`,
-    `Logseq-linux-x86_64-${firstV2Version}.zip`,
-    `Logseq-win-arm64-${firstV2Version}-nsis.exe`,
-    `Logseq-win-arm64-${firstV2Version}-nsis.exe.blockmap`,
-    `Logseq-win-arm64-${firstV2Version}.zip`,
-    `Logseq-win-x64-${firstV2Version}-nsis.exe`,
-    `Logseq-win-x64-${firstV2Version}-nsis.exe.blockmap`,
-    `Logseq-win-x64-${firstV2Version}.zip`,
+    `Logseq-darwin-arm64-${version}.dmg`,
+    `Logseq-darwin-arm64-${version}.dmg.blockmap`,
+    `Logseq-darwin-arm64-${version}.zip`,
+    `Logseq-darwin-arm64-${version}.zip.blockmap`,
+    `Logseq-darwin-x64-${version}.dmg`,
+    `Logseq-darwin-x64-${version}.dmg.blockmap`,
+    `Logseq-darwin-x64-${version}.zip`,
+    `Logseq-darwin-x64-${version}.zip.blockmap`,
+    `Logseq-linux-arm64-${version}.AppImage`,
+    `Logseq-linux-arm64-${version}.zip`,
+    `Logseq-linux-x86_64-${version}.AppImage`,
+    `Logseq-linux-x86_64-${version}.zip`,
+    `Logseq-win-arm64-${version}-nsis.exe`,
+    `Logseq-win-arm64-${version}-nsis.exe.blockmap`,
+    `Logseq-win-arm64-${version}.zip`,
+    `Logseq-win-x64-${version}-nsis.exe`,
+    `Logseq-win-x64-${version}-nsis.exe.blockmap`,
+    `Logseq-win-x64-${version}.zip`,
   ]
 }
 
@@ -427,44 +428,44 @@ function updaterMetadataForFiles(version, releaseDir, artifactNames) {
   ].join('\n')
 }
 
-function createCompleteReleaseFixture() {
+function createCompleteReleaseFixture(version = firstV2Version) {
   const releaseDir = fs.mkdtempSync(
     path.join(os.tmpdir(), 'logseq-selfhost5-release-contract-')
   )
-  for (const name of fixtureArtifactNames()) {
+  for (const name of fixtureArtifactNames(version)) {
     fs.writeFileSync(path.join(releaseDir, name), `fixture:${name}\n`)
   }
 
   const metadataFiles = {
-    [expectedV2MetadataName('arm64')]: [
-      `Logseq-darwin-arm64-${firstV2Version}.zip`,
-      `Logseq-darwin-arm64-${firstV2Version}.dmg`,
+    [runUpdaterHelper('macos-metadata-name', version, 'arm64')]: [
+      `Logseq-darwin-arm64-${version}.zip`,
+      `Logseq-darwin-arm64-${version}.dmg`,
     ],
-    [expectedV2MetadataName('x64')]: [
-      `Logseq-darwin-x64-${firstV2Version}.zip`,
-      `Logseq-darwin-x64-${firstV2Version}.dmg`,
+    [runUpdaterHelper('macos-metadata-name', version, 'x64')]: [
+      `Logseq-darwin-x64-${version}.zip`,
+      `Logseq-darwin-x64-${version}.dmg`,
     ],
     'latest-arm64.yml': [
-      `Logseq-win-arm64-${firstV2Version}-nsis.exe`,
-      `Logseq-win-arm64-${firstV2Version}.zip`,
+      `Logseq-win-arm64-${version}-nsis.exe`,
+      `Logseq-win-arm64-${version}.zip`,
     ],
     'latest-linux-arm64.yml': [
-      `Logseq-linux-arm64-${firstV2Version}.AppImage`,
-      `Logseq-linux-arm64-${firstV2Version}.zip`,
+      `Logseq-linux-arm64-${version}.AppImage`,
+      `Logseq-linux-arm64-${version}.zip`,
     ],
     'latest-linux.yml': [
-      `Logseq-linux-x86_64-${firstV2Version}.AppImage`,
-      `Logseq-linux-x86_64-${firstV2Version}.zip`,
+      `Logseq-linux-x86_64-${version}.AppImage`,
+      `Logseq-linux-x86_64-${version}.zip`,
     ],
     'latest-x64.yml': [
-      `Logseq-win-x64-${firstV2Version}-nsis.exe`,
-      `Logseq-win-x64-${firstV2Version}.zip`,
+      `Logseq-win-x64-${version}-nsis.exe`,
+      `Logseq-win-x64-${version}.zip`,
     ],
   }
   for (const [name, artifacts] of Object.entries(metadataFiles)) {
     fs.writeFileSync(
       path.join(releaseDir, name),
-      updaterMetadataForFiles(firstV2Version, releaseDir, artifacts)
+      updaterMetadataForFiles(version, releaseDir, artifacts)
     )
   }
   for (const arch of ['x64', 'arm64']) {
@@ -473,14 +474,14 @@ function createCompleteReleaseFixture() {
       pinnedLegacyMetadata(arch)
     )
   }
-  fs.writeFileSync(path.join(releaseDir, 'VERSION'), `${firstV2Version}\n`)
+  fs.writeFileSync(path.join(releaseDir, 'VERSION'), `${version}\n`)
   return releaseDir
 }
 
-function runArtifactVerifier(releaseDir) {
+function runArtifactVerifier(releaseDir, version = firstV2Version) {
   return spawnSync(
     process.execPath,
-    [artifactVerifierPath, '--dir', releaseDir, '--version', firstV2Version],
+    [artifactVerifierPath, '--dir', releaseDir, '--version', version],
     {
       cwd: repositoryRoot,
       encoding: 'utf8',
@@ -492,8 +493,8 @@ function verifierOutput(result) {
   return `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim()
 }
 
-function assertVerifierAccepts(releaseDir) {
-  const result = runArtifactVerifier(releaseDir)
+function assertVerifierAccepts(releaseDir, version = firstV2Version) {
+  const result = runArtifactVerifier(releaseDir, version)
   assert.equal(
     result.status,
     0,
@@ -503,8 +504,12 @@ function assertVerifierAccepts(releaseDir) {
   )
 }
 
-function assertVerifierRejects(releaseDir, description) {
-  const result = runArtifactVerifier(releaseDir)
+function assertVerifierRejects(
+  releaseDir,
+  description,
+  version = firstV2Version
+) {
+  const result = runArtifactVerifier(releaseDir, version)
   assert.notEqual(
     result.status,
     0,
@@ -512,8 +517,8 @@ function assertVerifierRejects(releaseDir, description) {
   )
 }
 
-function withReleaseFixture(run) {
-  const releaseDir = createCompleteReleaseFixture()
+function withReleaseFixture(run, version = firstV2Version) {
+  const releaseDir = createCompleteReleaseFixture(version)
   try {
     return run(releaseDir)
   } finally {
@@ -529,6 +534,33 @@ function assertReleaseAssetVerifierContract() {
       'controlled .5 release fixture must contain its complete dual-channel asset set'
     )
     assertVerifierAccepts(releaseDir)
+  })
+
+  withReleaseFixture((releaseDir) => {
+    assert.equal(
+      fs.readdirSync(releaseDir).length,
+      27,
+      'controlled nightly release fixture must contain its complete dual-channel asset set'
+    )
+    assertVerifierAccepts(releaseDir, firstV2NightlyVersion)
+  }, firstV2NightlyVersion)
+
+  withReleaseFixture((releaseDir) => {
+    const unexpectedNightlyMetadata = runUpdaterHelper(
+      'macos-metadata-name',
+      firstV2NightlyVersion,
+      'arm64'
+    )
+    fs.writeFileSync(
+      path.join(releaseDir, unexpectedNightlyMetadata),
+      updaterMetadataForFiles(firstV2Version, releaseDir, [
+        `Logseq-darwin-arm64-${firstV2Version}.zip`,
+      ])
+    )
+    assertVerifierRejects(
+      releaseDir,
+      `a stable release with unexpected ${unexpectedNightlyMetadata}`
+    )
   })
 
   for (const arch of ['x64', 'arm64']) {
@@ -740,7 +772,7 @@ test('published .4 legacy metadata fixtures have their pinned digests', () => {
   }
 })
 
-test('release asset verifier enforces both pinned legacy channel files', () => {
+test('release asset verifier enforces stable/nightly exact sets and pinned legacy files', () => {
   assertReleaseAssetVerifierContract()
 })
 
