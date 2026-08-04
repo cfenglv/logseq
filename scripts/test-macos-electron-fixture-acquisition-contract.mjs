@@ -149,6 +149,7 @@ const createCleanInstallFixture = (arch) => {
   const staticRoot = path.join(root, "static");
   const electronRoot = path.join(staticRoot, "node_modules", "electron");
   const electronApp = path.join(electronRoot, "dist", "Electron.app");
+  const electronVersion = path.join(electronRoot, "dist", "version");
   const installMarker = path.join(root, "electron-install-invoked.txt");
   const binRoot = path.join(root, "test-bin");
   const githubEnv = path.join(root, "github-env");
@@ -191,6 +192,7 @@ const createCleanInstallFixture = (arch) => {
       'fs.mkdirSync(path.dirname(executable), { recursive: true });',
       'fs.mkdirSync(path.join(app, "Contents", "Resources"), { recursive: true });',
       'fs.writeFileSync(path.join(app, "Contents", "Info.plist"), "fixture");',
+      'fs.writeFileSync(path.join(root, "dist", "version"), `v${pkg.version}\\n`);',
       'fs.writeFileSync(executable, [',
       '  "#!/usr/bin/env node",',
       '  `if (process.argv.includes("-e")) process.stdout.write(${JSON.stringify(pkg.version)});`,',
@@ -285,6 +287,7 @@ const createCleanInstallFixture = (arch) => {
     binRoot,
     dispose: () => fs.rmSync(root, { force: true, recursive: true }),
     electronApp,
+    electronVersion,
     executableArch,
     githubEnv,
     githubOutput,
@@ -302,6 +305,25 @@ const readGithubEnv = (file, env) => {
   }
   fs.writeFileSync(file, "");
 };
+
+const probeArchiveVersion = (fixture, expectedVersion) =>
+  spawnSync(
+    "/bin/bash",
+    [
+      "-e",
+      "-c",
+      'archive_version="$(sed \'s/^v//\' "$ELECTRON_VERSION_FILE")"\n' +
+        'test "$archive_version" = "$EXPECTED_ELECTRON_VERSION"',
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ELECTRON_VERSION_FILE: fixture.electronVersion,
+        EXPECTED_ELECTRON_VERSION: expectedVersion,
+      },
+    },
+  );
 
 const workflowOutputExpression =
   /\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outputs\.([A-Za-z0-9_-]+)\s*\}\}/g;
@@ -717,6 +739,16 @@ for (const arch of ["x64", "arm64"]) {
         fs.readFileSync(fixture.installMarker, "utf8"),
         lockedElectronVersion,
       );
+      assert.equal(
+        fs.readFileSync(fixture.electronVersion, "utf8"),
+        `v${lockedElectronVersion}\n`,
+        "fake installer must reproduce Electron archive dist/version shape",
+      );
+      const archiveVersionProbe = probeArchiveVersion(
+        fixture,
+        lockedElectronVersion,
+      );
+      assert.equal(archiveVersionProbe.status, 0, archiveVersionProbe.stderr);
       const executable = path.join(
         fixture.electronApp,
         "Contents",
@@ -741,6 +773,16 @@ for (const arch of ["x64", "arm64"]) {
       );
       assert.equal(archProbe.status, 0);
       assert.match(archProbe.stdout, new RegExp(fixture.executableArch));
+      fs.writeFileSync(fixture.electronVersion, "v0.0.0\n");
+      const mismatchedArchiveVersionProbe = probeArchiveVersion(
+        fixture,
+        lockedElectronVersion,
+      );
+      assert.notEqual(
+        mismatchedArchiveVersionProbe.status,
+        0,
+        "version mismatch negative control unexpectedly passed",
+      );
     } finally {
       fixture.dispose();
     }
