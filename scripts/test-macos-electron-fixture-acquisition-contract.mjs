@@ -75,10 +75,14 @@ const macContractStages = (steps, arch) => {
   );
   const materialize = uniqueStage(
     steps,
-    (step) =>
-      new RegExp(`^Materialize ${arch} .*Electron`, "i").test(
-        step.name ?? "",
-      ),
+    (step) => {
+      const name = step.name ?? "";
+      return (
+        /materialize/i.test(name) &&
+        /electron/i.test(name) &&
+        new RegExp(`(?:^|\\W)${arch}(?:\\W|$)`, "i").test(name)
+      );
+    },
     `macOS ${arch} materialize/acquisition stage`,
   );
   const resolve = uniqueStage(
@@ -154,8 +158,8 @@ const createCleanInstallFixture = (arch) => {
     path.join(electronRoot, "package.json"),
     `${JSON.stringify(
       {
+        bin: { "install-electron": "install.js" },
         name: "electron",
-        scripts: { postinstall: "node install.js" },
         version: lockedElectronVersion,
       },
       null,
@@ -220,18 +224,30 @@ const createCleanInstallFixture = (arch) => {
   writeExecutable(
     path.join(binRoot, "pnpm"),
     [
-      "#!/bin/sh",
-      'package_root="$PWD"',
-      'if [ "$1" = "--dir" ]; then',
-      '  package_root="$2"',
-      "  shift 2",
-      "fi",
-      'case " $* " in',
-      '  *" rebuild electron "*)',
-      '    exec node "$package_root/node_modules/electron/install.js"',
-      "    ;;",
-      "esac",
-      "exit 0",
+      "#!/usr/bin/env node",
+      'const { spawnSync } = require("node:child_process");',
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'let args = process.argv.slice(2);',
+      'let packageRoot = process.cwd();',
+      'if (args[0] === "--dir" || args[0] === "-C") {',
+      '  packageRoot = path.resolve(args[1]);',
+      '  args = args.slice(2);',
+      '}',
+      'if (args[0] !== "exec") process.exit(0);',
+      'const command = args[1];',
+      'const electronRoot = path.join(packageRoot, "node_modules", "electron");',
+      'const packagePath = path.join(electronRoot, "package.json");',
+      'if (!fs.existsSync(packagePath)) process.exit(127);',
+      'const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));',
+      'const relativeBin = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.[command];',
+      'if (!relativeBin) process.exit(127);',
+      'const result = spawnSync(process.execPath, [path.join(electronRoot, relativeBin), ...args.slice(2)], {',
+      '  env: process.env,',
+      '  stdio: "inherit",',
+      '});',
+      'if (result.error) throw result.error;',
+      'process.exit(result.status ?? 1);',
       "",
     ].join("\n"),
   );
@@ -421,8 +437,8 @@ test("stage parser uniquely identifies both architecture-prefixed resolver bound
         "        run: |",
         "          pnpm install --frozen-lockfile",
         "        working-directory: ./static",
-        `      - name: Materialize ${arch} Electron.app fixture`,
-        "        run: node node_modules/electron/install.js",
+        `      - name: Materialize Electron.app fixture for ${arch}`,
+        "        run: pnpm exec install-electron",
         "        working-directory: ./static",
         `      - name: Resolve ${arch} native updater contract tools`,
         "        run: |",
@@ -440,7 +456,7 @@ test("stage parser uniquely identifies both architecture-prefixed resolver bound
     );
     assert.equal(
       stages.materialize.name,
-      `Materialize ${arch} Electron.app fixture`,
+      `Materialize Electron.app fixture for ${arch}`,
     );
   }
 });
@@ -448,6 +464,25 @@ test("stage parser uniquely identifies both architecture-prefixed resolver bound
 test("clean-install harness rejects a path-only Electron fixture resolver", () => {
   const fixture = createCleanInstallFixture("x64");
   try {
+    const installedElectronPackage = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          fixture.staticRoot,
+          "node_modules",
+          "electron",
+          "package.json",
+        ),
+        "utf8",
+      ),
+    );
+    assert.equal(
+      Object.hasOwn(installedElectronPackage, "scripts"),
+      false,
+      "fixture must not invent an Electron postinstall lifecycle",
+    );
+    assert.deepEqual(installedElectronPackage.bin, {
+      "install-electron": "install.js",
+    });
     const result = spawnSync(
       "/bin/bash",
       ["-c", 'test -d static/node_modules/electron/dist/Electron.app'],
@@ -464,6 +499,35 @@ test("clean-install harness rejects a path-only Electron fixture resolver", () =
   }
 });
 
+for (const command of [
+  ["install", "--frozen-lockfile"],
+  ["rebuild", "electron"],
+]) {
+  test(`clean-install harness does not invent an Electron postinstall for pnpm ${command.join(" ")}`, () => {
+    const fixture = createCleanInstallFixture("x64");
+    try {
+      const result = spawnSync(
+        path.join(fixture.binRoot, "pnpm"),
+        command,
+        {
+          cwd: fixture.staticRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            LOGSEQ_TEST_EXPECTED_ARCH: fixture.executableArch,
+            LOGSEQ_TEST_INSTALL_MARKER: fixture.installMarker,
+          },
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(fs.existsSync(fixture.installMarker), false);
+      assert.equal(fs.existsSync(fixture.electronApp), false);
+    } finally {
+      fixture.dispose();
+    }
+  });
+}
+
 for (const arch of ["x64", "arm64"]) {
   test(`clean-install harness materializes and probes locked ${arch} Electron`, () => {
     const fixture = createCleanInstallFixture(arch);
@@ -475,7 +539,7 @@ for (const arch of ["x64", "arm64"]) {
       };
       const result = spawnSync(
         path.join(fixture.binRoot, "pnpm"),
-        ["rebuild", "electron"],
+        ["exec", "install-electron"],
         {
           cwd: fixture.staticRoot,
           encoding: "utf8",
