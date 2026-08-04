@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -203,7 +204,14 @@ const createCleanInstallFixture = (arch) => {
     ].join("\n"),
   );
 
-  const sevenZipRoot = path.join(staticRoot, "node_modules", "7zip-bin");
+  const sevenZipRoot = path.join(
+    staticRoot,
+    "node_modules",
+    ".pnpm",
+    "7zip-bin@5.2.0",
+    "node_modules",
+    "7zip-bin",
+  );
   const sevenZip = path.join(sevenZipRoot, "7za");
   fs.mkdirSync(sevenZipRoot, { recursive: true });
   fs.writeFileSync(
@@ -218,19 +226,36 @@ const createCleanInstallFixture = (arch) => {
     sevenZip,
     '#!/bin/sh\necho "7-Zip 24.09 electron-builder fixture"\n',
   );
-  const nestedSevenZip = path.join(
+  const electronBuilderRoot = path.join(
     staticRoot,
     "node_modules",
     "electron-builder",
+  );
+  const electronBuilderPackage = path.join(
+    electronBuilderRoot,
+    "package.json",
+  );
+  const appBuilderRoot = path.join(
+    electronBuilderRoot,
+    "node_modules",
+    "app-builder-lib",
+  );
+  const appBuilderPackage = path.join(appBuilderRoot, "package.json");
+  const appBuilderSevenZip = path.join(
+    appBuilderRoot,
     "node_modules",
     "7zip-bin",
   );
-  fs.mkdirSync(path.dirname(nestedSevenZip), { recursive: true });
-  fs.symlinkSync(sevenZipRoot, nestedSevenZip, "dir");
+  fs.mkdirSync(path.dirname(appBuilderSevenZip), { recursive: true });
   fs.writeFileSync(
-    path.join(staticRoot, "node_modules", "electron-builder", "package.json"),
-    `${JSON.stringify({ name: "electron-builder", version: "26.8.2" })}\n`,
+    electronBuilderPackage,
+    `${JSON.stringify({ dependencies: { "app-builder-lib": "26.8.2" }, name: "electron-builder", version: "26.8.2" })}\n`,
   );
+  fs.writeFileSync(
+    appBuilderPackage,
+    `${JSON.stringify({ dependencies: { "7zip-bin": "5.2.0" }, name: "app-builder-lib", version: "26.8.2" })}\n`,
+  );
+  fs.symlinkSync(sevenZipRoot, appBuilderSevenZip, "dir");
   fs.mkdirSync(path.join(staticRoot, "node_modules", ".bin"), {
     recursive: true,
   });
@@ -284,16 +309,32 @@ const createCleanInstallFixture = (arch) => {
   }
 
   return {
+    appBuilderPackage,
+    appBuilderSevenZip,
     binRoot,
     dispose: () => fs.rmSync(root, { force: true, recursive: true }),
     electronApp,
     electronVersion,
+    electronBuilderPackage,
     executableArch,
     githubEnv,
     githubOutput,
     installMarker,
     root,
+    sevenZip,
     staticRoot,
+  };
+};
+
+const resolveBuilderSevenZip = (fixture) => {
+  const electronBuilderRequire = createRequire(fixture.electronBuilderPackage);
+  const appBuilderPackage = electronBuilderRequire.resolve(
+    "app-builder-lib/package.json",
+  );
+  const appBuilderRequire = createRequire(appBuilderPackage);
+  return {
+    appBuilderPackage,
+    sevenZip: appBuilderRequire("7zip-bin").path7za,
   };
 };
 
@@ -592,12 +633,12 @@ test("stage parser proves dependency -> materialize -> resolve -> probe -> contr
         `      - name: Resolve ${arch} native updater contract tools`,
         "        id: native-tools",
         "        run: |",
-        '          seven_zip="$PWD/static/node_modules/7zip-bin/7za"',
+        '          seven_zip="$PWD/static/node_modules/electron-builder/node_modules/app-builder-lib/node_modules/7zip-bin/7za"',
         '          electron_app="$PWD/static/node_modules/electron/dist/Electron.app"',
         '          test -x "$seven_zip"',
         '          test -d "$electron_app"',
         '          echo "electron-app=$PWD/static/node_modules/electron/dist/Electron.app" >> "$GITHUB_OUTPUT"',
-        '          echo "sevenzip=$PWD/static/node_modules/7zip-bin/7za" >> "$GITHUB_OUTPUT"',
+        '          echo "sevenzip=$seven_zip" >> "$GITHUB_OUTPUT"',
         "        working-directory: .",
         `      - name: Probe ${arch} native updater contract tools`,
         "        env:",
@@ -646,6 +687,60 @@ test("stage parser proves dependency -> materialize -> resolve -> probe -> contr
       stages.probe.source,
       /steps\.native-tools\.outputs\.(?:electron-app|sevenzip)/,
     );
+  }
+});
+
+test("clean-install harness resolves 7zip-bin only through app-builder-lib", () => {
+  const fixture = createCleanInstallFixture("x64");
+  try {
+    const resolution = resolveBuilderSevenZip(fixture);
+    assert.equal(
+      fs.realpathSync(resolution.appBuilderPackage),
+      fs.realpathSync(fixture.appBuilderPackage),
+    );
+    assert.equal(
+      fs.realpathSync(resolution.sevenZip),
+      fs.realpathSync(fixture.sevenZip),
+    );
+    assert.ok(fs.statSync(resolution.sevenZip).mode & 0o111);
+    assert.equal(
+      fs.existsSync(
+        path.join(
+          fixture.staticRoot,
+          "node_modules",
+          "electron-builder",
+          "node_modules",
+          "7zip-bin",
+        ),
+      ),
+      false,
+      "fixture must not shortcut app-builder-lib dependency resolution",
+    );
+
+    fs.unlinkSync(fixture.appBuilderSevenZip);
+    const brokenChain = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        [
+          'const { createRequire } = require("node:module");',
+          "const electronBuilderRequire = createRequire(process.argv[1]);",
+          'const appBuilderPackage = electronBuilderRequire.resolve("app-builder-lib/package.json");',
+          "const appBuilderRequire = createRequire(appBuilderPackage);",
+          'appBuilderRequire("7zip-bin");',
+        ].join("\n"),
+        fixture.electronBuilderPackage,
+      ],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(
+      brokenChain.status,
+      0,
+      "broken app-builder-lib -> 7zip-bin chain unexpectedly resolved",
+    );
+    assert.match(brokenChain.stderr, /Cannot find module ['"]7zip-bin['"]/);
+  } finally {
+    fixture.dispose();
   }
 });
 
