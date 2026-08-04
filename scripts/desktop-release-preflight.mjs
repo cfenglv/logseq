@@ -507,6 +507,9 @@ for (const jobName of desktopBuilderJobs) {
     assertContains(job, binding, `${jobName} frozen source binding`);
   }
   for (const input of [
+    "static/package.json",
+    "static/pnpm-lock.yaml",
+    "static/electron-builder.yml",
     "verify-desktop-runtime-revisions.mjs",
     "db-worker-node.js",
   ]) {
@@ -564,6 +567,8 @@ for (const binding of [
 }
 for (const input of [
   "static/package.json",
+  "static/pnpm-lock.yaml",
+  "static/electron-builder.yml",
   "scripts/verify-desktop-runtime-revisions.mjs",
   "dist/db-worker-node.js",
 ]) {

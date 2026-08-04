@@ -490,6 +490,9 @@ jobs:
 
       - name: Verify desktop runtime verification inputs
         run: |
+          test -f static/package.json
+          test -f static/pnpm-lock.yaml
+          test -f static/electron-builder.yml
           test -f scripts/verify-desktop-runtime-revisions.mjs
           test -f dist/db-worker-node.js
 
@@ -560,6 +563,9 @@ jobs:
 
       - name: Verify desktop runtime verification inputs
         run: |
+          test -f static/package.json
+          test -f static/pnpm-lock.yaml
+          test -f static/electron-builder.yml
           test -f scripts/verify-desktop-runtime-revisions.mjs
           test -f dist/db-worker-node.js
 
@@ -631,6 +637,9 @@ jobs:
       - name: Verify desktop runtime verification inputs
         shell: pwsh
         run: |
+          if (-not (Test-Path -PathType Leaf "static/package.json")) { throw "missing desktop package.json" }
+          if (-not (Test-Path -PathType Leaf "static/pnpm-lock.yaml")) { throw "missing desktop lockfile" }
+          if (-not (Test-Path -PathType Leaf "static/electron-builder.yml")) { throw "missing desktop builder config" }
           if (-not (Test-Path -PathType Leaf "scripts/verify-desktop-runtime-revisions.mjs")) { throw "missing desktop runtime verifier" }
           if (-not (Test-Path -PathType Leaf "dist/db-worker-node.js")) { throw "missing root db-worker runtime" }
 
@@ -728,6 +737,9 @@ jobs:
       - name: Verify desktop runtime verification inputs
         shell: pwsh
         run: |
+          if (-not (Test-Path -PathType Leaf "static/package.json")) { throw "missing desktop package.json" }
+          if (-not (Test-Path -PathType Leaf "static/pnpm-lock.yaml")) { throw "missing desktop lockfile" }
+          if (-not (Test-Path -PathType Leaf "static/electron-builder.yml")) { throw "missing desktop builder config" }
           if (-not (Test-Path -PathType Leaf "scripts/verify-desktop-runtime-revisions.mjs")) { throw "missing desktop runtime verifier" }
           if (-not (Test-Path -PathType Leaf "dist/db-worker-node.js")) { throw "missing root db-worker runtime" }
 
@@ -826,6 +838,9 @@ jobs:
 
       - name: Verify desktop runtime verification inputs
         run: |
+          test -f static/package.json
+          test -f static/pnpm-lock.yaml
+          test -f static/electron-builder.yml
           test -f scripts/verify-desktop-runtime-revisions.mjs
           test -f dist/db-worker-node.js
 
@@ -1024,6 +1039,9 @@ jobs:
 
       - name: Verify desktop runtime verification inputs
         run: |
+          test -f static/package.json
+          test -f static/pnpm-lock.yaml
+          test -f static/electron-builder.yml
           test -f scripts/verify-desktop-runtime-revisions.mjs
           test -f dist/db-worker-node.js
 
@@ -1657,6 +1675,8 @@ jobs:
       - name: Verify desktop runtime verification inputs
         run: |
           test -f static/package.json
+          test -f static/pnpm-lock.yaml
+          test -f static/electron-builder.yml
           test -f scripts/verify-desktop-runtime-revisions.mjs
           test -f dist/db-worker-node.js
 
