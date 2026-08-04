@@ -38,10 +38,21 @@ const packageRoot = process.env.LOGSEQ_UPDATER_TEST_PACKAGE_ROOT
   ? path.resolve(process.env.LOGSEQ_UPDATER_TEST_PACKAGE_ROOT)
   : path.join(repositoryRoot, 'static')
 const dependencyRequire = createRequire(path.join(packageRoot, 'package.json'))
+const updaterPackagePath = dependencyRequire.resolve(
+  'electron-updater/package.json'
+)
+const updaterPackage = JSON.parse(fs.readFileSync(updaterPackagePath, 'utf8'))
+const updaterRequire = createRequire(updaterPackagePath)
+const builderUtilRuntimePackagePath = updaterRequire.resolve(
+  'builder-util-runtime/package.json'
+)
+const builderUtilRuntimePackage = JSON.parse(
+  fs.readFileSync(builderUtilRuntimePackagePath, 'utf8')
+)
 const { GitHubProvider } = dependencyRequire(
   'electron-updater/out/providers/GitHubProvider'
 )
-const { HttpError } = dependencyRequire('builder-util-runtime')
+const { HttpError } = updaterRequire('builder-util-runtime')
 const semver = dependencyRequire('semver')
 
 const currentLegacyVersion = '2.0.1-selfhost.4'
@@ -568,8 +579,24 @@ function test(name, run) {
   cases.push({ name, run })
 }
 
-test('runtime dependency is electron-updater 6.8.3', () => {
+test('runtime dependencies use the pinned electron-updater package boundary', () => {
   assert.equal(resourcesPackage.dependencies['electron-updater'], '6.8.3')
+  assert.equal(
+    resourcesPackage.dependencies['builder-util-runtime'],
+    undefined,
+    'builder-util-runtime must remain transitive instead of being hoisted into the app manifest'
+  )
+  assert.equal(updaterPackage.version, '6.8.3')
+  assert.equal(
+    updaterPackage.dependencies?.['builder-util-runtime'],
+    '9.5.1',
+    'electron-updater must retain the exact locked builder-util-runtime dependency'
+  )
+  assert.equal(
+    builderUtilRuntimePackage.version,
+    updaterPackage.dependencies['builder-util-runtime'],
+    'the builder-util-runtime resolved from electron-updater must match its exact dependency version'
+  )
 })
 
 test('published .4 legacy metadata fixtures have their pinned digests', () => {
