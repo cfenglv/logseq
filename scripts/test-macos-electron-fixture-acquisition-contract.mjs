@@ -47,11 +47,61 @@ const workflowSteps = (source) => {
       starts[index + 1] ?? source.length,
     );
     return {
+      index,
       name: stepSource.match(/^      - name:\s*(.+?)\s*$/m)?.[1],
       source: stepSource,
       start,
     };
   });
+};
+
+const uniqueStage = (steps, predicate, label) => {
+  const matches = steps.filter(predicate);
+  assert.equal(
+    matches.length,
+    1,
+    `${label} must resolve to exactly one workflow step; found ${matches.length}`,
+  );
+  return matches[0];
+};
+
+const macContractStages = (steps, arch) => {
+  const dependency = uniqueStage(
+    steps,
+    (step) =>
+      /\bpnpm\s+install\b/.test(step.source) &&
+      /working-directory:\s*\.\/static/.test(step.source),
+    `macOS ${arch} dependency stage`,
+  );
+  const materialize = uniqueStage(
+    steps,
+    (step) =>
+      new RegExp(`^Materialize ${arch} .*Electron`, "i").test(
+        step.name ?? "",
+      ),
+    `macOS ${arch} materialize/acquisition stage`,
+  );
+  const resolve = uniqueStage(
+    steps,
+    (step) =>
+      step.name === `Resolve ${arch} native updater contract tools`,
+    `macOS ${arch} resolver stage`,
+  );
+  const probe = uniqueStage(
+    steps,
+    (step) =>
+      step.name ===
+      "Run project-signed updater native and provider contracts",
+    `macOS ${arch} contract probe stage`,
+  );
+  assert.deepEqual(
+    [dependency, materialize, resolve, probe]
+      .map((step) => step.index)
+      .sort((left, right) => left - right),
+    [dependency.index, materialize.index, resolve.index, probe.index],
+    `macOS ${arch} stages must remain ordered dependency -> materialize -> resolve -> probe`,
+  );
+  return { dependency, materialize, probe, resolve };
 };
 
 const setting = (source, key) =>
@@ -241,15 +291,8 @@ const stepEnvironment = (source, fixtureRoot) => {
 const executeAcquisitionThroughResolver = (arch) => {
   const job = jobSource(`build-macos-${arch}`);
   const steps = workflowSteps(job);
-  const resolverIndex = steps.findIndex(
-    (step) => step.name === "Resolve native updater contract tools",
-  );
-  assert.notEqual(
-    resolverIndex,
-    -1,
-    `macOS ${arch} is missing Resolve native updater contract tools`,
-  );
-  const resolver = steps[resolverIndex].source;
+  const stages = macContractStages(steps, arch);
+  const resolver = stages.resolve.source;
   assert.match(
     resolver,
     /(?:test\s+-x|\[\s+-x\s+)[^\n]*Contents\/MacOS\/Electron/,
@@ -270,18 +313,6 @@ const executeAcquisitionThroughResolver = (arch) => {
     /(?:lipo|file)[^\n]*Contents\/MacOS\/Electron/,
     `macOS ${arch} resolver must inspect the acquired executable architecture`,
   );
-  const dependencyIndex = steps.findLastIndex(
-    (step, index) =>
-      index < resolverIndex &&
-      /\bpnpm\s+install\b/.test(step.source) &&
-      /working-directory:\s*\.\/static/.test(step.source),
-  );
-  assert.notEqual(
-    dependencyIndex,
-    -1,
-    `macOS ${arch} must install the locked desktop package before resolving tools`,
-  );
-
   const fixture = createCleanInstallFixture(arch);
   try {
     assert.equal(
@@ -301,7 +332,10 @@ const executeAcquisitionThroughResolver = (arch) => {
     };
     fs.mkdirSync(env.RUNNER_TEMP, { recursive: true });
 
-    const candidateSteps = steps.slice(dependencyIndex, resolverIndex + 1);
+    const candidateSteps = steps.slice(
+      stages.dependency.index,
+      stages.resolve.index + 1,
+    );
     for (const step of candidateSteps) {
       const script = runScript(step);
       if (!script) continue;
@@ -377,6 +411,39 @@ const executeAcquisitionThroughResolver = (arch) => {
     fixture.dispose();
   }
 };
+
+test("stage parser uniquely identifies both architecture-prefixed resolver boundaries", () => {
+  for (const arch of ["x64", "arm64"]) {
+    const steps = workflowSteps(
+      [
+        "    steps:",
+        `      - name: Prepare ${arch} desktop dependencies`,
+        "        run: |",
+        "          pnpm install --frozen-lockfile",
+        "        working-directory: ./static",
+        `      - name: Materialize ${arch} Electron.app fixture`,
+        "        run: node node_modules/electron/install.js",
+        "        working-directory: ./static",
+        `      - name: Resolve ${arch} native updater contract tools`,
+        "        run: |",
+        "          test -x static/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+        "        working-directory: .",
+        "      - name: Run project-signed updater native and provider contracts",
+        "        run: pnpm test:project-signed-macos-updater",
+        "",
+      ].join("\n"),
+    );
+    const stages = macContractStages(steps, arch);
+    assert.equal(
+      stages.resolve.name,
+      `Resolve ${arch} native updater contract tools`,
+    );
+    assert.equal(
+      stages.materialize.name,
+      `Materialize ${arch} Electron.app fixture`,
+    );
+  }
+});
 
 test("clean-install harness rejects a path-only Electron fixture resolver", () => {
   const fixture = createCleanInstallFixture("x64");
