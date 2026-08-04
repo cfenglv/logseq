@@ -23,6 +23,13 @@ const verifyDesktopRuntimeRevisions = (
     stdio = "inherit",
   } = {},
 ) => {
+  const releaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim();
+  if (!releaseSourceSha || !/^[0-9a-f]{40}$/.test(releaseSourceSha)) {
+    throw new Error(
+      "Electron packaging requires LOGSEQ_RELEASE_SOURCE_SHA as an exact lowercase 40-hex commit SHA",
+    );
+  }
+
   const expectedAppDir = path.join(repoRoot, "static");
   const appDir = context.packager?.projectDir ?? context.appDir;
   if (!appDir || path.resolve(appDir) !== path.resolve(expectedAppDir)) {

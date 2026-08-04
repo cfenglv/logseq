@@ -657,12 +657,58 @@ for (const sourceContract of [
     `source-preflight should execute ${sourceContract}`,
   );
 }
-for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
+assert.match(
+  workflowJob(desktopReleaseWorkflow, "compile-cljs"),
+  /name:\s+desktop-runtime-verification-inputs[\s\S]{0,240}?scripts\/verify-desktop-runtime-revisions\.mjs[\s\S]{0,120}?dist\/db-worker-node\.js[\s\S]{0,120}?if-no-files-found:\s+error/,
+  "compile-cljs must upload the canonical runtime verifier and root dist input as required files",
+);
+for (const jobName of [
+  "build-linux-x64",
+  "build-linux-arm64",
+  "build-windows-x64",
+  "build-windows-arm64",
+  "build-macos-x64",
+  "build-macos-arm64",
+]) {
+  assert.match(
+    workflowJob(desktopReleaseWorkflow, jobName),
+    /uses:\s+actions\/download-artifact@v4[\s\S]{0,160}?name:\s+desktop-runtime-verification-inputs[\s\S]{0,80}?path:\s+\./,
+    `${jobName} must restore the canonical runtime verification inputs at the job root`,
+  );
+}
+for (const [jobName, arch] of [
+  ["build-macos-x64", "x64"],
+  ["build-macos-arm64", "arm64"],
+]) {
   const job = workflowJob(desktopReleaseWorkflow, jobName);
   assert.match(
     job,
     /project-update:test-helper[\s\S]*?test:project-signed-macos-updater[\s\S]*?test-selfhost-macos-updater-release-contract\.mjs/,
     `${jobName} must build the native helper before its updater E2E and then run the real provider/SemVer contract`,
+  );
+  assert.match(
+    job,
+    /appBuilderRequire\("7zip-bin"\)\.path7za/,
+    `${jobName} must resolve 7-Zip from the locked desktop dependency instead of runner PATH`,
+  );
+  assert.match(
+    job,
+    /path\.resolve\(path\.dirname\(require\("electron"\)\), "\.\.\/\.\."\)/,
+    `${jobName} must resolve Electron.app from the locked desktop dependency`,
+  );
+  assert.match(
+    job,
+    new RegExp(
+      `LOGSEQ_7ZIP:\\s+\\$\\{\\{ steps\\.${arch}-native-contract-tools\\.outputs\\.seven-zip \\}\\}`,
+    ),
+    `${jobName} must bind its native updater contract to the resolved 7-Zip binary`,
+  );
+  assert.match(
+    job,
+    new RegExp(
+      `LOGSEQ_ELECTRON_APP_FIXTURE:\\s+\\$\\{\\{ steps\\.${arch}-native-contract-tools\\.outputs\\.electron-app \\}\\}`,
+    ),
+    `${jobName} must bind its native updater contract to the resolved Electron.app fixture`,
   );
 }
 assert.match(

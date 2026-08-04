@@ -27,6 +27,8 @@ assert.equal(
 const fixtureRoot = fs.mkdtempSync(
   path.join(os.tmpdir(), "logseq-desktop-runtime-contract-"),
 );
+const previousRevision = process.env.LOGSEQ_REVISION;
+const previousReleaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA;
 
 try {
   const fixtureStaticDir = path.join(fixtureRoot, "static");
@@ -47,30 +49,47 @@ try {
     ].join("\n"),
   );
 
-  const previousRevision = process.env.LOGSEQ_REVISION;
-  process.env.LOGSEQ_REVISION = "contract-revision";
-  try {
-    verifyDesktopRuntimeRevisions(
-      { packager: { projectDir: fixtureStaticDir } },
-      {
-        repoRoot: fixtureRoot,
-        verifierPath: fixtureVerifier,
-        stdio: "pipe",
-      },
-    );
-  } finally {
-    if (previousRevision === undefined) {
-      delete process.env.LOGSEQ_REVISION;
-    } else {
-      process.env.LOGSEQ_REVISION = previousRevision;
-    }
-  }
+  const releaseSourceSha = "a".repeat(40);
+  process.env.LOGSEQ_REVISION = releaseSourceSha;
+  process.env.LOGSEQ_RELEASE_SOURCE_SHA = releaseSourceSha;
+  verifyDesktopRuntimeRevisions(
+    { packager: { projectDir: fixtureStaticDir } },
+    {
+      repoRoot: fixtureRoot,
+      verifierPath: fixtureVerifier,
+      stdio: "pipe",
+    },
+  );
 
   assert.equal(
     fs.readFileSync(path.join(fixtureRoot, "verified.txt"), "utf8"),
-    "contract-revision",
+    releaseSourceSha,
     "the pre-pack hook should execute the canonical verifier from the repository root with the build environment",
   );
+
+  const currentReleaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA;
+  delete process.env.LOGSEQ_RELEASE_SOURCE_SHA;
+  try {
+    assert.throws(
+      () =>
+        verifyDesktopRuntimeRevisions(
+          { packager: { projectDir: fixtureStaticDir } },
+          {
+            repoRoot: fixtureRoot,
+            verifierPath: fixtureVerifier,
+            stdio: "pipe",
+          },
+        ),
+      /requires LOGSEQ_RELEASE_SOURCE_SHA as an exact lowercase 40-hex commit SHA/,
+      "Electron packaging must fail closed when the exact release source SHA is absent",
+    );
+  } finally {
+    if (currentReleaseSourceSha === undefined) {
+      delete process.env.LOGSEQ_RELEASE_SOURCE_SHA;
+    } else {
+      process.env.LOGSEQ_RELEASE_SOURCE_SHA = currentReleaseSourceSha;
+    }
+  }
 
   fs.writeFileSync(fixtureVerifier, "process.exitCode = 17;\n");
   assert.throws(
@@ -101,6 +120,16 @@ try {
     "the hook should reject an unexpected application directory",
   );
 } finally {
+  if (previousRevision === undefined) {
+    delete process.env.LOGSEQ_REVISION;
+  } else {
+    process.env.LOGSEQ_REVISION = previousRevision;
+  }
+  if (previousReleaseSourceSha === undefined) {
+    delete process.env.LOGSEQ_RELEASE_SOURCE_SHA;
+  } else {
+    process.env.LOGSEQ_RELEASE_SOURCE_SHA = previousReleaseSourceSha;
+  }
   fs.rmSync(fixtureRoot, { recursive: true, force: true });
 }
 

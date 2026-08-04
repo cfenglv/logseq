@@ -360,7 +360,7 @@ const readFixtureKeychainLookup = (fixture) => {
 const workflowJobSource = (source, jobName) => {
   const match = source.match(
     new RegExp(
-      `^  ${jobName}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:\\n|\\Z)`,
+      `^  ${jobName}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:\\n|(?![\\s\\S]))`,
       "m",
     ),
   );

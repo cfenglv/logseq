@@ -1971,6 +1971,8 @@ const sevenZipExecutable = () => {
 };
 
 const archiveApp = ({ app, archive }) => {
+  // The macOS p7zip binary bundled with electron-builder rejects the
+  // -mtc/-mta/-mtm timestamp switches before it writes any archive entries.
   command(
     sevenZipExecutable(),
     [
@@ -1978,9 +1980,6 @@ const archiveApp = ({ app, archive }) => {
       "-bd",
       "-bb0",
       "-tzip",
-      "-mtc=off",
-      "-mta=off",
-      "-mtm=off",
       archive,
       path.basename(app),
     ],
@@ -2216,9 +2215,6 @@ const addMacosxSidecarEntry = ({ archive, root }) => {
       "-bd",
       "-bb0",
       "-tzip",
-      "-mtc=off",
-      "-mta=off",
-      "-mtm=off",
       archive,
       "__MACOSX",
     ],

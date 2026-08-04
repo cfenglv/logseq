@@ -33,7 +33,7 @@ const relativeModuleClosure = (relativePath, seen = new Set()) => {
 const workflowJob = (name) => {
   const match = workflow.match(
     new RegExp(
-      `^  ${name}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:\\n|\\Z)`,
+      `^  ${name}:\\n([\\s\\S]*?)(?=^  [a-zA-Z0-9_-]+:\\n|(?![\\s\\S]))`,
       "m",
     ),
   );
