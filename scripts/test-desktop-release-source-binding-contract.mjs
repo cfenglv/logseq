@@ -54,25 +54,34 @@ const withVerifierFixture = (runtimeRevision, f) => {
   }
 };
 
-const runVerifier = (root, runtimeRevision) =>
-  spawnSync(
+const runVerifier = (
+  root,
+  runtimeRevision,
+  { releaseSourceSha = sourceRevision } = {},
+) => {
+  const env = {
+    ...process.env,
+    // The workflow commit can differ from the independently selected
+    // release source. Runtime self-reporting and GITHUB_SHA must not
+    // override LOGSEQ_RELEASE_SOURCE_SHA.
+    GITHUB_SHA: workflowRevision,
+    LOGSEQ_REVISION: runtimeRevision,
+  };
+  delete env.LOGSEQ_RELEASE_SOURCE_SHA;
+  if (releaseSourceSha !== undefined) {
+    env.LOGSEQ_RELEASE_SOURCE_SHA = releaseSourceSha;
+  }
+  return spawnSync(
     process.execPath,
     [path.join(root, "scripts", "verify-desktop-runtime-revisions.mjs")],
     {
       cwd: root,
       encoding: "utf8",
-      env: {
-        ...process.env,
-        // The workflow commit can differ from the independently selected
-        // release source. Runtime self-reporting and GITHUB_SHA must not
-        // override LOGSEQ_RELEASE_SOURCE_SHA.
-        GITHUB_SHA: workflowRevision,
-        LOGSEQ_RELEASE_SOURCE_SHA: sourceRevision,
-        LOGSEQ_REVISION: runtimeRevision,
-      },
+      env,
       shell: false,
     },
   );
+};
 
 test("desktop runtime verification is bound to the exact release source SHA", () => {
   withVerifierFixture(staleRuntimeRevision, (root) => {
@@ -93,6 +102,43 @@ test("desktop runtime verification is bound to the exact release source SHA", ()
       `${result.stdout}\n${result.stderr}`,
       /source|revision/i,
       "the release gate should identify the source/revision mismatch",
+    );
+  });
+});
+
+test("desktop runtime verification fails closed without an exact release source SHA", () => {
+  withVerifierFixture(sourceRevision, (root) => {
+    const result = runVerifier(root, sourceRevision, {
+      releaseSourceSha: undefined,
+    });
+    assert.notEqual(
+      result.status,
+      0,
+      [
+        "release packaging must not fall back to a self-reported revision or local git state",
+        "LOGSEQ_RELEASE_SOURCE_SHA was intentionally omitted",
+        result.stdout,
+        result.stderr,
+      ].join("\n"),
+    );
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /LOGSEQ_RELEASE_SOURCE_SHA|release source/i,
+      "the closed gate should identify the missing exact release source SHA",
+    );
+  });
+});
+
+test("desktop runtime verification rejects a non-exact release source revision", () => {
+  withVerifierFixture(sourceRevision, (root) => {
+    const result = runVerifier(root, sourceRevision, {
+      releaseSourceSha: sourceRevision.slice(0, 12),
+    });
+    assert.notEqual(result.status, 0, "a short source revision was accepted");
+    assert.match(
+      `${result.stdout}\n${result.stderr}`,
+      /exact lowercase 40-hex commit SHA/,
+      "the release gate should require the exact immutable commit identifier",
     );
   });
 });
