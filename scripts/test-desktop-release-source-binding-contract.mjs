@@ -57,7 +57,10 @@ const withVerifierFixture = (runtimeRevision, f) => {
 const runVerifier = (
   root,
   runtimeRevision,
-  { releaseSourceSha = sourceRevision } = {},
+  {
+    omitReleaseSourceSha = false,
+    releaseSourceSha = sourceRevision,
+  } = {},
 ) => {
   const env = {
     ...process.env,
@@ -68,10 +71,10 @@ const runVerifier = (
     LOGSEQ_REVISION: runtimeRevision,
   };
   delete env.LOGSEQ_RELEASE_SOURCE_SHA;
-  if (releaseSourceSha !== undefined) {
+  if (!omitReleaseSourceSha) {
     env.LOGSEQ_RELEASE_SOURCE_SHA = releaseSourceSha;
   }
-  return spawnSync(
+  const result = spawnSync(
     process.execPath,
     [path.join(root, "scripts", "verify-desktop-runtime-revisions.mjs")],
     {
@@ -81,6 +84,13 @@ const runVerifier = (
       shell: false,
     },
   );
+  return {
+    ...result,
+    releaseSourceShaWasPresent: Object.hasOwn(
+      env,
+      "LOGSEQ_RELEASE_SOURCE_SHA",
+    ),
+  };
 };
 
 test("desktop runtime verification is bound to the exact release source SHA", () => {
@@ -109,8 +119,13 @@ test("desktop runtime verification is bound to the exact release source SHA", ()
 test("desktop runtime verification fails closed without an exact release source SHA", () => {
   withVerifierFixture(sourceRevision, (root) => {
     const result = runVerifier(root, sourceRevision, {
-      releaseSourceSha: undefined,
+      omitReleaseSourceSha: true,
     });
+    assert.equal(
+      result.releaseSourceShaWasPresent,
+      false,
+      "the omission fixture accidentally restored LOGSEQ_RELEASE_SOURCE_SHA",
+    );
     assert.notEqual(
       result.status,
       0,
