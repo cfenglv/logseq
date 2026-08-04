@@ -76,6 +76,25 @@ function writeModule(packageRoot, packageJson, source) {
   fs.writeFileSync(path.join(packageRoot, packageJson.main), source)
 }
 
+function writeRuntimeDecoy(packageRoot, markerPath) {
+  writeModule(
+    packageRoot,
+    {
+      main: 'index.js',
+      name: 'builder-util-runtime',
+      version: lockedRuntimeVersion,
+    },
+    [
+      "const fs = require('node:fs')",
+      `fs.writeFileSync(${JSON.stringify(markerPath)}, 'loaded\\n')`,
+      'class HttpError extends Error {}',
+      `HttpError.runtimeVersion = ${JSON.stringify(lockedRuntimeVersion)}`,
+      'exports.HttpError = HttpError',
+      '',
+    ].join('\n')
+  )
+}
+
 function createStrictPnpmFixture(
   arch,
   { runtimeVersion = lockedRuntimeVersion, updaterVersion = lockedUpdaterVersion } = {}
@@ -163,9 +182,58 @@ function createStrictPnpmFixture(
     nodeModules,
     packageRoot,
     privateRuntimeLink,
+    root,
     runtimeRoot,
     updaterRoot,
   }
+}
+
+function addTopLevelRuntimeDecoy(fixture) {
+  const markerPath = path.join(fixture.root, 'top-level-decoy-loaded')
+  const decoyRoot = path.join(
+    fixture.root,
+    'decoys',
+    'top-level',
+    'builder-util-runtime'
+  )
+  writeRuntimeDecoy(decoyRoot, markerPath)
+  fs.symlinkSync(
+    decoyRoot,
+    path.join(fixture.nodeModules, 'builder-util-runtime'),
+    'dir'
+  )
+  return { decoyRoot, markerPath }
+}
+
+function pointPrivateRuntimeAtWrongPhysicalTarget(fixture) {
+  const markerPath = path.join(fixture.root, 'wrong-private-target-loaded')
+  const decoyRoot = path.join(
+    fixture.root,
+    'decoys',
+    'wrong-private-target',
+    'builder-util-runtime'
+  )
+  writeRuntimeDecoy(decoyRoot, markerPath)
+  fs.unlinkSync(fixture.privateRuntimeLink)
+  fs.symlinkSync(decoyRoot, fixture.privateRuntimeLink, 'dir')
+  return { decoyRoot, markerPath }
+}
+
+function assertContractRejectsPhysicalDecoy(fixture, markerPath, scenario) {
+  const result = runContractDependencyBlock(fixture)
+  assert.notEqual(result.status, 0, `${fixture.arch} accepted ${scenario}`)
+  assert.equal(result.stdout, '', `${fixture.arch} continued after ${scenario}`)
+  assert.match(result.stderr, /builder-util-runtime/i)
+  assert.match(
+    result.stderr,
+    /private(?: dependency)? edge|realpath|boundary/i,
+    `${fixture.arch} did not diagnose the dependency boundary for ${scenario}`
+  )
+  assert.equal(
+    fs.existsSync(markerPath),
+    false,
+    `${fixture.arch} loaded the ${scenario} decoy before failing closed`
+  )
 }
 
 function resolveLockedRuntimeFromUpdater(fixture) {
@@ -298,6 +366,73 @@ for (const arch of ['x64', 'arm64']) {
       assert.equal(result.stdout, '')
       assert.match(result.stderr, /builder-util-runtime/i)
       assert.match(result.stderr, /(?:MODULE_NOT_FOUND|resolve|missing|not found)/i)
+    } finally {
+      fixture.dispose()
+    }
+  })
+
+  test(`${arch} broken private edge cannot fall back to exact-version top-level runtime`, () => {
+    const fixture = createStrictPnpmFixture(arch)
+    try {
+      fs.unlinkSync(fixture.privateRuntimeLink)
+      const { markerPath } = addTopLevelRuntimeDecoy(fixture)
+      assert.deepEqual(topLevelPackageNames(fixture), [
+        'builder-util-runtime',
+        'electron-updater',
+        'semver',
+      ])
+      const updaterRequire = createRequire(
+        path.join(fixture.updaterRoot, 'package.json')
+      )
+      assert.equal(
+        updaterRequire('builder-util-runtime').HttpError.runtimeVersion,
+        lockedRuntimeVersion,
+        'negative control must reproduce updater require falling back to the exact-version top-level decoy'
+      )
+      assert.equal(fs.readFileSync(markerPath, 'utf8'), 'loaded\n')
+      fs.unlinkSync(markerPath)
+      assertContractRejectsPhysicalDecoy(
+        fixture,
+        markerPath,
+        'top-level fallback after a broken private edge'
+      )
+    } finally {
+      fixture.dispose()
+    }
+  })
+
+  test(`${arch} private edge rejects same-version wrong physical target`, () => {
+    const fixture = createStrictPnpmFixture(arch)
+    try {
+      const { decoyRoot, markerPath } =
+        pointPrivateRuntimeAtWrongPhysicalTarget(fixture)
+      assert.equal(
+        fs.realpathSync(fixture.privateRuntimeLink),
+        fs.realpathSync(decoyRoot),
+        'negative control must point the private edge at the wrong target'
+      )
+      assert.equal(
+        JSON.parse(
+          fs.readFileSync(path.join(decoyRoot, 'package.json'), 'utf8')
+        ).version,
+        lockedRuntimeVersion,
+        'wrong physical target must keep the exact locked version'
+      )
+      const updaterRequire = createRequire(
+        path.join(fixture.updaterRoot, 'package.json')
+      )
+      assert.equal(
+        updaterRequire('builder-util-runtime').HttpError.runtimeVersion,
+        lockedRuntimeVersion,
+        'negative control must expose a loadable private edge to the wrong physical target'
+      )
+      assert.equal(fs.readFileSync(markerPath, 'utf8'), 'loaded\n')
+      fs.unlinkSync(markerPath)
+      assertContractRejectsPhysicalDecoy(
+        fixture,
+        markerPath,
+        'same-version wrong physical target'
+      )
     } finally {
       fixture.dispose()
     }
