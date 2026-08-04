@@ -149,6 +149,7 @@ jobs:
           node scripts/test-packaged-project-signature-runtime.mjs
           node scripts/test-desktop-release-source-binding-contract.mjs
           node scripts/test-desktop-release-ci-workspace-contract.mjs
+          node scripts/test-macos-electron-fixture-acquisition-contract.mjs
 
       - name: Test self-host updater source contracts
         run: |
