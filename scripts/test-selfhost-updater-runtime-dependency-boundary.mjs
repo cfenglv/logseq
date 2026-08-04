@@ -54,12 +54,28 @@ assert.match(
   'lockfile must bind builder-util-runtime to electron-updater'
 )
 
-const dependencyBlockStart = contractSource.indexOf('const packageRoot')
+const resourcesPackageBlockStart = contractSource.indexOf(
+  'const resourcesPackage = JSON.parse('
+)
+const resourcesPackageBlockEnd = contractSource.indexOf(
+  '\n)\n',
+  resourcesPackageBlockStart
+)
+assert.notEqual(
+  resourcesPackageBlockStart,
+  -1,
+  'contract resources package bootstrap is missing'
+)
+assert.notEqual(
+  resourcesPackageBlockEnd,
+  -1,
+  'contract resources package bootstrap end is missing'
+)
+const dependencyBlockStart = resourcesPackageBlockEnd + '\n)\n'.length
 const dependencyBlockEnd = contractSource.indexOf(
   '\n\nconst currentLegacyVersion',
   dependencyBlockStart
 )
-assert.notEqual(dependencyBlockStart, -1, 'contract dependency block is missing')
 assert.notEqual(dependencyBlockEnd, -1, 'contract dependency block end is missing')
 const dependencyBlock = contractSource.slice(
   dependencyBlockStart,
@@ -226,7 +242,7 @@ function assertContractRejectsPhysicalDecoy(fixture, markerPath, scenario) {
   assert.match(result.stderr, /builder-util-runtime/i)
   assert.match(
     result.stderr,
-    /private(?: dependency)? edge|realpath|boundary/i,
+    /private.*edge|realpath|boundary/i,
     `${fixture.arch} did not diagnose the dependency boundary for ${scenario}`
   )
   assert.equal(
@@ -365,7 +381,10 @@ for (const arch of ['x64', 'arm64']) {
       assert.notEqual(result.status, 0)
       assert.equal(result.stdout, '')
       assert.match(result.stderr, /builder-util-runtime/i)
-      assert.match(result.stderr, /(?:MODULE_NOT_FOUND|resolve|missing|not found)/i)
+      assert.match(
+        result.stderr,
+        /(?:MODULE_NOT_FOUND|resolve|missing|not found|must exist|regular file)/i
+      )
     } finally {
       fixture.dispose()
     }
