@@ -96,30 +96,61 @@ exit 91
 
 const packagingViolations = (source) => {
   const violations = [];
-  const artifactRootMatch = source.match(
-    /(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*fs\.mkdtempSync\(\s*path\.join\(\s*os\.tmpdir\(\),\s*["'][^"']*(?:artifact|packag)[^"']*["']/i,
-  );
-  if (!artifactRootMatch) {
-    return ["final packaging must create a temporary CI-shaped artifact root"];
-  }
-  const artifactRoot = artifactRootMatch[1];
-  const rootPattern = escapeRegExp(artifactRoot);
-  const artifactStaticMatch = source.match(
-    new RegExp(
-      `(?:const|let)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*path\\.join\\(\\s*${rootPattern}\\s*,\\s*["']static["']\\s*\\)`,
+  const invocationContaining = (index, functionName) => {
+    if (index === -1) return "";
+    const start = source.lastIndexOf(`${functionName}(`, index);
+    if (start === -1) return "";
+    const end = source.indexOf(");", index);
+    return end === -1 ? source.slice(start) : source.slice(start, end + 2);
+  };
+  const labelIndex = (label) => {
+    const match = new RegExp(`["']${escapeRegExp(label)}["']`).exec(source);
+    return match?.index ?? -1;
+  };
+  const commandUsesRoot = (call, root) => {
+    const rootPattern = escapeRegExp(root);
+    return (
+      new RegExp(`["']--dir["']\\s*,\\s*${rootPattern}`).test(call) ||
+      new RegExp(`cwd\\s*:\\s*${rootPattern}`).test(call)
+    );
+  };
+
+  const tempRoots = [
+    ...source.matchAll(
+      /(?:(?:const|let)\s+)?([A-Za-z_$][\w$]*)\s*=\s*fs\.mkdtempSync\(\s*path\.join\(\s*os\.tmpdir\(\),/g,
     ),
+  ].map((match) => ({ index: match.index, name: match[1] }));
+  if (tempRoots.length === 0) {
+    return ["final packaging must create a temporary release workspace"];
+  }
+
+  const installStart = labelIndex("isolated packaging install");
+  if (installStart === -1) return ["isolated packaging install is missing"];
+  const installCall = invocationContaining(installStart, "pnpm");
+  const packageRoots = tempRoots.flatMap((root) => {
+    const rootPattern = escapeRegExp(root.name);
+    const match = new RegExp(
+      `(?:const|let)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*path\\.join\\(\\s*${rootPattern}\\s*,\\s*["']static["']\\s*\\)`,
+    ).exec(source);
+    return match
+      ? [{ index: match.index, root: root.name, static: match[1] }]
+      : [];
+  });
+  const packageRoot = packageRoots.find(({ static: staticRoot }) =>
+    commandUsesRoot(installCall, staticRoot),
   );
-  if (!artifactStaticMatch) {
-    return ["artifact root must expose its own static package root"];
+  if (!packageRoot) {
+    return [
+      "isolated packaging install must run in a temporary workspace static root",
+    ];
   }
-  const artifactStatic = artifactStaticMatch[1];
+  const workspaceRoot = packageRoot.root;
+  const artifactStatic = packageRoot.static;
+  const rootPattern = escapeRegExp(workspaceRoot);
   const staticPattern = escapeRegExp(artifactStatic);
-  const stagingStart = artifactRootMatch.index;
-  const installStart = source.indexOf('"isolated packaging install"', stagingStart);
-  if (installStart === -1) {
-    violations.push("isolated packaging install is missing");
-    return violations;
-  }
+  const stagingStart = tempRoots.find(
+    ({ name }) => name === workspaceRoot,
+  ).index;
   const staging = source.slice(stagingStart, installStart);
   const packaging = source.slice(installStart);
 
@@ -155,42 +186,44 @@ const packagingViolations = (source) => {
   }
 
   const installUsesArtifact = new RegExp(
-    `["']--dir["']\\s*,\\s*${staticPattern}[\\s\\S]{0,220}["']install["'][\\s\\S]{0,300}["']--frozen-lockfile["'][\\s\\S]{0,220}["']--ignore-workspace["']`,
-  ).test(packaging);
+    `["']install["'][\\s\\S]{0,300}["']--frozen-lockfile["'][\\s\\S]{0,220}["']--ignore-workspace["']`,
+  ).test(installCall);
   if (!installUsesArtifact) {
     violations.push("artifact package root needs a frozen isolated install");
   }
+  const rebuildStart = labelIndex("rebuild desktop native modules");
+  const rebuildCall = invocationContaining(rebuildStart, "pnpm");
   if (
-    !new RegExp(
-      `["']--dir["']\\s*,\\s*${staticPattern}[\\s\\S]{0,220}["']rebuild:all["']`,
-    ).test(packaging)
+    !rebuildCall.includes("rebuild:all") ||
+    !commandUsesRoot(rebuildCall, artifactStatic)
   ) {
     violations.push("native rebuild must run inside artifact static");
   }
+  const packageCalls = [...packaging.matchAll(/pnpm\([\s\S]*?\);/g)]
+    .map((match) => match[0])
+    .filter((call) => /electron-builder|electron:make-unsigned/.test(call));
   if (
-    !new RegExp(
-      `["']--dir["']\\s*,\\s*${staticPattern}[\\s\\S]{0,500}(?:electron-builder|electron:make-unsigned)`,
-    ).test(packaging)
+    packageCalls.length === 0 ||
+    packageCalls.some((call) => !commandUsesRoot(call, artifactStatic))
   ) {
     violations.push("host electron-builder must run from artifact static");
   }
-  if (
-    !new RegExp(
+  const verifierStart = labelIndex("verify host packaged application");
+  const verifierCall = invocationContaining(verifierStart, "run");
+  const verifierUsesArtifactStatic =
+    new RegExp(
       `path\\.join\\(\\s*${staticPattern}\\s*,\\s*["']verify-packaged-desktop\\.mjs["']`,
-    ).test(packaging) ||
-    !/verify host packaged application/.test(packaging)
-  ) {
+    ).test(verifierCall) ||
+    (verifierCall.includes("verify-packaged-desktop.mjs") &&
+      commandUsesRoot(verifierCall, artifactStatic));
+  if (!verifierCall || !verifierUsesArtifactStatic) {
     violations.push("real packaged verifier must come from artifact static");
   }
   if (
-    !packaging.includes("LOGSEQ_REVISION") ||
-    !packaging.includes("LOGSEQ_RELEASE_SOURCE_SHA")
-  ) {
-    violations.push("packaging and verifier must receive exact release revisions");
-  }
-  if (
-    /(?:--dir["']?\s*,?\s*["']static["']|staticDir[\s\S]{0,120}(?:rebuild:all|electron-builder|electron:make-unsigned))/.test(
-      packaging,
+    [installCall, rebuildCall, ...packageCalls, verifierCall].some((call) =>
+      /(?:--dir["']?\s*,?\s*["']static["']|cwd\s*:\s*staticDir|staticDir[\s\S]{0,120}(?:rebuild:all|electron-builder|electron:make-unsigned|verify-packaged-desktop))/.test(
+        call,
+      ),
     )
   ) {
     violations.push("final packaging must not reuse source static");
@@ -223,38 +256,48 @@ const packagingViolations = (source) => {
       violations.push(`host packaging verification must retain ${required}`);
     }
   }
-  const finallyIndex = packaging.indexOf("finally {");
+  const finallyIndex = source.lastIndexOf("finally {");
   if (finallyIndex === -1) {
-    violations.push("temporary artifact cleanup must be in finally");
+    violations.push("temporary workspace cleanup must be in finally");
   } else {
-    const cleanup = packaging.slice(finallyIndex);
+    const cleanup = source.slice(finallyIndex);
     if (
       !new RegExp(
         `fs\\.rmSync\\(\\s*${rootPattern}[\\s\\S]{0,180}recursive\\s*:\\s*true`,
       ).test(cleanup)
     ) {
-      violations.push("finally must recursively remove the artifact root");
+      violations.push("finally must recursively remove the temporary workspace");
     }
-    const outputWithinArtifact = new RegExp(
-      `(?:const|let)\\s+[A-Za-z_$][\\w$]*\\s*=\\s*path\\.join\\(\\s*${rootPattern}`,
-    ).test(staging);
-    if (
-      !outputWithinArtifact &&
-      !/fs\.rmSync\(\s*outputDir[\s\S]{0,180}recursive\s*:\s*true/.test(
-        cleanup,
-      )
-    ) {
-      violations.push("finally must remove the temporary packaging output");
+    for (const tempRoot of tempRoots) {
+      if (tempRoot.name === workspaceRoot) continue;
+      const tempPattern = escapeRegExp(tempRoot.name);
+      const retainedOutput =
+        new RegExp(
+          `["']--search-root["'][\\s\\S]{0,180}${tempPattern}`,
+        ).test(packaging) &&
+        new RegExp(`console\\.log[\\s\\S]{0,600}${tempPattern}`).test(
+          source,
+        );
+      if (
+        !retainedOutput &&
+        !new RegExp(
+          `fs\\.rmSync\\(\\s*${tempPattern}[\\s\\S]{0,180}recursive\\s*:\\s*true`,
+        ).test(cleanup)
+      ) {
+        violations.push(
+          `finally must recursively remove temporary helper root ${tempRoot.name}`,
+        );
+      }
     }
   }
   return violations;
 };
 
-const compliantPackagingFixture = `
-const artifactRoot = fs.mkdtempSync(path.join(os.tmpdir(), "release-artifact-"));
-const artifactStatic = path.join(artifactRoot, "static");
-const outputDir = path.join(artifactRoot, "output");
-fs.cpSync(staticDir, artifactStatic, {
+const compliantDirPackagingFixture = `
+const releaseWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "ws-"));
+const releaseStatic = path.join(releaseWorkspace, "static");
+const outputDir = path.join(releaseWorkspace, "output");
+fs.cpSync(staticDir, releaseStatic, {
   recursive: true,
   filter: (source) => path.basename(source) !== "node_modules",
 });
@@ -262,22 +305,57 @@ for (const relativePath of [
   "scripts/verify-desktop-runtime-revisions.mjs",
   "dist/db-worker-node.js",
 ]) {
-  fs.copyFileSync(path.join(repoRoot, relativePath), path.join(artifactRoot, relativePath));
+  fs.copyFileSync(path.join(repoRoot, relativePath), path.join(releaseWorkspace, relativePath));
 }
-const inputStats = fs.lstatSync(path.join(artifactRoot, "dist/db-worker-node.js"));
+const inputStats = fs.lstatSync(path.join(releaseWorkspace, "dist/db-worker-node.js"));
 if (!inputStats.isFile()) throw new Error("artifact input is not a file");
 try {
-  pnpm("isolated packaging install", ["--dir", artifactStatic, "install", "--frozen-lockfile", "--ignore-workspace"], { env: { LOGSEQ_REVISION, LOGSEQ_RELEASE_SOURCE_SHA } });
-  pnpm("rebuild desktop native modules", ["--dir", artifactStatic, "rebuild:all"], { env: { LOGSEQ_REVISION, LOGSEQ_RELEASE_SOURCE_SHA } });
-  if (process.platform === "darwin") pnpm("package", ["--dir", artifactStatic, "electron:make-unsigned"]);
-  else if (process.platform === "win32") pnpm("package", ["--dir", artifactStatic, "exec", "electron-builder"]);
-  else if (process.platform === "linux") pnpm("package", ["--dir", artifactStatic, "exec", "electron-builder"]);
-  run("verify host packaged application", process.execPath, [path.join(artifactStatic, "verify-packaged-desktop.mjs"), "--search-root", outputDir], { env: { LOGSEQ_REVISION, LOGSEQ_RELEASE_SOURCE_SHA } });
+  pnpm("isolated packaging install", ["--dir", releaseStatic, "install", "--frozen-lockfile", "--ignore-workspace"]);
+  pnpm("rebuild desktop native modules", ["--dir", releaseStatic, "rebuild:all"]);
+  if (process.platform === "darwin") pnpm("package", ["--dir", releaseStatic, "electron:make-unsigned"]);
+  else if (process.platform === "win32") pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder"]);
+  else if (process.platform === "linux") pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder"]);
+  run("verify host packaged application", process.execPath, [path.join(releaseStatic, "verify-packaged-desktop.mjs"), "--search-root", outputDir]);
   run("verify macOS bundle signature", "codesign", []);
   run("verify macOS DMG", "hdiutil", []);
 } finally {
-  fs.rmSync(artifactRoot, { recursive: true, force: true });
+  fs.rmSync(releaseWorkspace, { recursive: true, force: true });
 }
+if (result.status !== 0) { throw new Error("child failed"); }
+`;
+
+const compliantCwdPackagingFixture = `
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "x-"));
+const isolatedStatic = path.join(scratch, "static");
+const retainedOutput = fs.mkdtempSync(path.join(os.tmpdir(), "result-"));
+let helperRoot;
+helperRoot = fs.mkdtempSync(path.join(os.tmpdir(), "h-"));
+fs.cpSync(staticDir, isolatedStatic, {
+  recursive: true,
+  filter: (source) => path.basename(source) !== "node_modules",
+});
+for (const relativePath of [
+  "scripts/verify-desktop-runtime-revisions.mjs",
+  "dist/db-worker-node.js",
+]) {
+  fs.copyFileSync(path.join(repoRoot, relativePath), path.join(scratch, relativePath));
+}
+const inputStats = fs.statSync(path.join(scratch, "dist/db-worker-node.js"));
+if (!inputStats.isFile()) throw new Error("artifact input is not a file");
+try {
+  pnpm("isolated packaging install", ["install", "--frozen-lockfile", "--ignore-workspace"], { cwd: isolatedStatic });
+  pnpm("rebuild desktop native modules", ["rebuild:all"], { cwd: isolatedStatic });
+  if (process.platform === "darwin") pnpm("package", ["electron:make-unsigned"], { cwd: isolatedStatic });
+  else if (process.platform === "win32") pnpm("package", ["exec", "electron-builder"], { cwd: isolatedStatic });
+  else if (process.platform === "linux") pnpm("package", ["exec", "electron-builder"], { cwd: isolatedStatic });
+  run("verify host packaged application", process.execPath, ["verify-packaged-desktop.mjs", "--search-root", retainedOutput], { cwd: isolatedStatic });
+  run("verify macOS bundle signature", "codesign", []);
+  run("verify macOS DMG", "hdiutil", []);
+} finally {
+  fs.rmSync(scratch, { recursive: true, force: true });
+  fs.rmSync(helperRoot, { recursive: true, force: true });
+}
+console.log("packaged output retained at " + retainedOutput);
 if (result.status !== 0) { throw new Error("child failed"); }
 `;
 
@@ -333,49 +411,117 @@ test("final local packaging consumes only a CI-shaped artifact root", () => {
   assert.deepEqual(packagingViolations(preflightSource), []);
 });
 
+test("packaging analyzer accepts arbitrary workspace names and --dir", () => {
+  assert.deepEqual(packagingViolations(compliantDirPackagingFixture), []);
+});
+
+test("packaging analyzer accepts cwd, inherited env, and retained output", () => {
+  assert.deepEqual(packagingViolations(compliantCwdPackagingFixture), []);
+});
+
 test("packaging boundary analyzer rejects unsafe and incomplete mutations", () => {
-  assert.deepEqual(packagingViolations(compliantPackagingFixture), []);
   const mutations = [
-    compliantPackagingFixture.replace(
-      'filter: (source) => path.basename(source) !== "node_modules",',
-      "filter: () => true,",
-    ),
-    compliantPackagingFixture.replace(
-      '"scripts/verify-desktop-runtime-revisions.mjs",',
-      "",
-    ),
-    compliantPackagingFixture.replaceAll('"dist/db-worker-node.js"', '"missing-db-worker.js"'),
-    compliantPackagingFixture.replace('"--frozen-lockfile",', ""),
-    compliantPackagingFixture.replaceAll(
-      '["--dir", artifactStatic',
-      '["--dir", "static"',
-    ),
-    compliantPackagingFixture.replace(
-      'path.join(artifactStatic, "verify-packaged-desktop.mjs")',
-      'path.join(staticDir, "verify-packaged-desktop.mjs")',
-    ),
-    compliantPackagingFixture.replaceAll(
-      "LOGSEQ_RELEASE_SOURCE_SHA",
-      "UNBOUND_RELEASE_SOURCE",
-    ),
-    compliantPackagingFixture.replace(
-      'pnpm("package", ["--dir", artifactStatic, "exec", "electron-builder"]);',
-      'pnpm("package", ["--dir", artifactStatic, "exec", "electron-builder", "--unsafe-path"]);',
-    ),
-    compliantPackagingFixture.replace(
-      'if (result.status !== 0) { throw new Error("child failed"); }',
-      "",
-    ),
-    compliantPackagingFixture.replace(
-      "fs.rmSync(artifactRoot, { recursive: true, force: true });",
-      "",
-    ),
+    [
+      "source node_modules copied",
+      compliantDirPackagingFixture.replace(
+        'filter: (source) => path.basename(source) !== "node_modules",',
+        "filter: () => true,",
+      ),
+    ],
+    [
+      "runtime verifier input omitted",
+      compliantDirPackagingFixture.replace(
+        '"scripts/verify-desktop-runtime-revisions.mjs",',
+        "",
+      ),
+    ],
+    [
+      "db worker input omitted",
+      compliantDirPackagingFixture.replaceAll(
+        '"dist/db-worker-node.js"',
+        '"missing-db-worker.js"',
+      ),
+    ],
+    [
+      "frozen install disabled",
+      compliantDirPackagingFixture.replace('"--frozen-lockfile",', ""),
+    ],
+    [
+      "source static reused",
+      compliantDirPackagingFixture.replaceAll(
+        '["--dir", releaseStatic',
+        '["--dir", staticDir',
+      ),
+    ],
+    [
+      "source verifier reused",
+      compliantDirPackagingFixture.replace(
+        'path.join(releaseStatic, "verify-packaged-desktop.mjs")',
+        'path.join(staticDir, "verify-packaged-desktop.mjs")',
+      ),
+    ],
+    [
+      "repository parent node_modules injected",
+      compliantDirPackagingFixture.replace(
+        'pnpm("rebuild desktop native modules",',
+        'const NODE_PATH = path.join(repoRoot, "node_modules");\npnpm("rebuild desktop native modules",',
+      ),
+    ],
+    [
+      "unsafe protection disabled",
+      compliantDirPackagingFixture.replace(
+        'pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder"]);',
+        'pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder", "--unsafe-path"]);',
+      ),
+    ],
+    [
+      "packaged verifier skipped",
+      compliantDirPackagingFixture.replace(
+        '"verify host packaged application"',
+        '"skip packaged verifier"',
+      ),
+    ],
+    [
+      "child failure swallowed",
+      compliantDirPackagingFixture.replace(
+        'if (result.status !== 0) { throw new Error("child failed"); }',
+        "",
+      ),
+    ],
+    [
+      "temporary workspace retained",
+      compliantDirPackagingFixture.replace(
+        "fs.rmSync(releaseWorkspace, { recursive: true, force: true });",
+        "",
+      ),
+    ],
+    [
+      "cwd escapes isolated static",
+      compliantCwdPackagingFixture.replace(
+        "cwd: isolatedStatic",
+        "cwd: staticDir",
+      ),
+    ],
+    [
+      "temporary helper retained",
+      compliantCwdPackagingFixture.replace(
+        "fs.rmSync(helperRoot, { recursive: true, force: true });",
+        "",
+      ),
+    ],
+    [
+      "temporary output retained without reporting its path",
+      compliantCwdPackagingFixture.replace(
+        'console.log("packaged output retained at " + retainedOutput);',
+        "",
+      ),
+    ],
   ];
-  for (const [index, mutation] of mutations.entries()) {
+  for (const [label, mutation] of mutations) {
     assert.notDeepEqual(
       packagingViolations(mutation),
       [],
-      `unsafe packaging mutation ${index + 1} unexpectedly satisfied the boundary`,
+      `${label} unexpectedly satisfied the packaging boundary`,
     );
   }
 });
