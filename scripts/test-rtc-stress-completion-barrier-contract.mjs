@@ -693,6 +693,36 @@ const hasTimedStableWindow = (source) => {
       if (positive) linkedThresholds.push({ ...flow, duration });
     }
   }
+  for (const transition of transitionEvidence) {
+    for (const { name, items } of callFormsInOrder(source)) {
+      if (![">", ">="].includes(name) || items.length !== 3) continue;
+      const elapsed = items[1];
+      const duration = items[2];
+      if (!elapsed?.startsWith("(")) continue;
+      const subtraction = splitTopLevelItems(elapsed);
+      const trustedSampledTime = subtraction[1];
+      const positiveStableDuration =
+        /stable/i.test(duration) &&
+        (positiveDuration(duration, bindings) ||
+          (durationOptions.present &&
+            /^\d+$/.test(durationOptions.stable ?? "") &&
+            Number(durationOptions.stable) > 0));
+      if (
+        subtraction.length === 3 &&
+        subtraction[0] === "-" &&
+        containsTime(trustedSampledTime) &&
+        subtraction[2] === transition.output &&
+        positiveStableDuration
+      ) {
+        linkedThresholds.push({
+          ...transition,
+          duration,
+          elapsed,
+          inline: true,
+        });
+      }
+    }
+  }
   const hasSuccessGuard = linkedThresholds.some((flow) =>
     callFormsInOrder(source).some(({ name, items }) => {
       const pairs = name === "if" && items.length === 4 ?
@@ -706,11 +736,19 @@ const hasTimedStableWindow = (source) => {
           }, []) :
           [];
       return pairs.some(([condition, result]) =>
-        references(condition, flow.elapsed) &&
-        references(result, flow.sampled) &&
-        (references(condition, flow.output) ||
-          (references(condition, flow.accepted) &&
-            references(condition, flow.predicate))),
+        (flow.inline ?
+          callFormsInOrder(condition).some(
+            ({ index }) => formAt(condition, index) === flow.elapsed,
+          ) :
+          references(condition, flow.elapsed)) &&
+        (flow.inline ?
+          result === flow.sampled :
+          references(result, flow.sampled)) &&
+        (flow.inline ?
+          conjunctiveSymbols(condition).includes(flow.output) :
+          (references(condition, flow.output) ||
+            (references(condition, flow.accepted) &&
+              references(condition, flow.predicate)))),
       );
     }),
   );
@@ -724,7 +762,8 @@ const hasTimedStableWindow = (source) => {
   return Boolean(
     stateEqualities.length > 0 &&
     transitionEvidence.length > 0 &&
-    linkedElapsed.length > 0 &&
+    (linkedElapsed.length > 0 ||
+      linkedThresholds.some(({ inline }) => inline)) &&
     linkedThresholds.length > 0 &&
     hasSuccessGuard &&
     hasSafeDurationOptions,
@@ -1294,6 +1333,17 @@ const safePrimedTransitionRtcHelpers = safeInjectedClockRtcHelpers.replaceAll(
   "next-stable-since",
   "next-stable-since'",
 );
+const safeInlineElapsedRtcHelpers = safeInjectedClockRtcHelpers
+  .replace(
+    `            stable-elapsed (if next-stable-since
+                             (- sampled-at next-stable-since)
+                             0)]`,
+    "]",
+  )
+  .replace(
+    "(>= stable-elapsed stable-ms)",
+    "(>= (- sampled-at next-stable-since) stable-ms)",
+  );
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -1509,6 +1559,18 @@ test("contract accepts a primed transition-state binding", () => {
       safeRunner,
       safePrepush,
       safePrimedTransitionRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts an inline elapsed threshold", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInlineElapsedRtcHelpers,
     ),
     [],
   );
@@ -2246,6 +2308,70 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeInjectedClockRtcHelpers.replace(
         "next-stable-since (cond",
         "wrong-output' (cond",
+      ),
+    ],
+    [
+      "inline elapsed subtracts the wrong since value",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInlineElapsedRtcHelpers.replace(
+        "(- sampled-at next-stable-since)",
+        "(- sampled-at stable-since)",
+      ),
+    ],
+    [
+      "inline elapsed reverses the subtraction",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInlineElapsedRtcHelpers.replace(
+        "(- sampled-at next-stable-since)",
+        "(- next-stable-since sampled-at)",
+      ),
+    ],
+    [
+      "inline elapsed lacks a nonnil transition guard",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInlineElapsedRtcHelpers.replace(
+        `(and next-stable-since
+                 (>= (- sampled-at next-stable-since) stable-ms))`,
+        `(and quiet-enough?
+                 (>= (- sampled-at next-stable-since) stable-ms))`,
+      ),
+    ],
+    [
+      "inline elapsed success returns another state",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInlineElapsedRtcHelpers.replace(
+        `(>= (- sampled-at next-stable-since) stable-ms))
+            fresh-view`,
+        `(>= (- sampled-at next-stable-since) stable-ms))
+            prior-view`,
+      ),
+    ],
+    [
+      "inline elapsed uses the timeout threshold",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInlineElapsedRtcHelpers.replace(
+        "(>= (- sampled-at next-stable-since) stable-ms)",
+        "(>= (- sampled-at next-stable-since) timeout-ms)",
+      ),
+    ],
+    [
+      "inline elapsed uses a zero threshold",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInlineElapsedRtcHelpers.replace(
+        "(>= (- sampled-at next-stable-since) stable-ms)",
+        "(>= (- sampled-at next-stable-since) 0)",
       ),
     ],
   ];
