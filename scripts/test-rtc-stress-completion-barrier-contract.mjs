@@ -90,14 +90,123 @@ const calledSymbolsInOrder = (source) =>
     (match) => ({ index: match.index, name: match[1] }),
   );
 
+const splitTopLevelItems = (collection) => {
+  const items = [];
+  let start = null;
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let inComment = false;
+  let inString = false;
+  let escaped = false;
+  const flush = (end) => {
+    if (start !== null) items.push(collection.slice(start, end));
+    start = null;
+  };
+  for (let index = 1; index < collection.length - 1; index += 1) {
+    const char = collection[index];
+    if (inComment) {
+      if (char === "\n") {
+        inComment = false;
+        if (parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+          flush(index);
+        }
+      }
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    const atTopLevel =
+      parenDepth === 0 && bracketDepth === 0 && braceDepth === 0;
+    if (char === ";") {
+      if (atTopLevel) flush(index);
+      inComment = true;
+      continue;
+    }
+    if (atTopLevel && /[\s,]/.test(char)) {
+      flush(index);
+      continue;
+    }
+    if (start === null) start = index;
+    if (char === '"') inString = true;
+    else if (char === "(") parenDepth += 1;
+    else if (char === ")") parenDepth -= 1;
+    else if (char === "[") bracketDepth += 1;
+    else if (char === "]") bracketDepth -= 1;
+    else if (char === "{") braceDepth += 1;
+    else if (char === "}") braceDepth -= 1;
+  }
+  flush(collection.length - 1);
+  return items;
+};
+
+const callFormsInOrder = (source) =>
+  calledSymbolsInOrder(source).map(({ index, name }) => ({
+    name,
+    items: splitTopLevelItems(formAt(source, index)),
+  }));
+
+const definitionParameters = (source) => {
+  const items = splitTopLevelItems(source);
+  const parameterVector = items.find((item) => item.startsWith("["));
+  if (!parameterVector) return [];
+  return splitTopLevelItems(parameterVector).filter((item) => item !== "&");
+};
+
+const bareSymbol = /^[A-Za-z*+!?<>=._/-][A-Za-z0-9*+!?<>=._/-]*$/;
+
+const invokedHigherOrderDefinitions = (source, defs) => {
+  const result = new Set();
+  for (const { name, items } of callFormsInOrder(source)) {
+    if (!defs.has(name)) continue;
+    const parameters = definitionParameters(defs.get(name));
+    const invokedParameters = calledSymbols(defs.get(name));
+    const arguments_ = items.slice(1);
+    for (let index = 0; index < arguments_.length; index += 1) {
+      const argument = arguments_[index];
+      const parameter = parameters[index];
+      if (
+        parameter &&
+        invokedParameters.has(parameter) &&
+        bareSymbol.test(argument) &&
+        defs.has(argument)
+      ) {
+        result.add(argument);
+      }
+    }
+  }
+  return result;
+};
+
 const definitionClosure = (name, defs, seen = new Set()) => {
   if (seen.has(name) || !defs.has(name)) return "";
   seen.add(name);
   const source = defs.get(name);
+  const referencedDefinitions = new Set([
+    ...calledSymbols(source),
+    ...invokedHigherOrderDefinitions(source, defs),
+  ]);
   return [
     source,
-    ...[...calledSymbols(source)].map((called) =>
+    ...[...referencedDefinitions].map((called) =>
       definitionClosure(called, defs, seen),
+    ),
+  ].join("\n");
+};
+
+const definitionClosureFromSource = (source, defs) => {
+  const referencedDefinitions = new Set([
+    ...calledSymbols(source),
+    ...invokedHigherOrderDefinitions(source, defs),
+  ]);
+  return [
+    source,
+    ...[...referencedDefinitions].map((name) =>
+      definitionClosure(name, defs),
     ),
   ].join("\n");
 };
@@ -239,10 +348,10 @@ const completionContractViolations = (
         ),
     ),
   ];
-  const combinedBarrierSource = [
+  const combinedBarrierSource = definitionClosureFromSource(
     barrierEvaluationSurface,
-    ...barrierCandidates.map((name) => definitionClosure(name, defs)),
-  ].join("\n");
+    defs,
+  );
   const barrierAnalyses = [
     {
       name:
@@ -317,13 +426,16 @@ const completionContractViolations = (
   if (runnerChildCalls.length !== 1 || /(?:retry|rerun)/i.test(part2Gate)) {
     violations.push("runner and prepush gate must not retry a failed RTC shard");
   }
+  const assertionArgumentClosure = definitionClosureFromSource(
+    assertionArguments,
+    defs,
+  );
   if (
     /\(catch\s+(?:Throwable|Exception)\b/.test(barrierEvaluationSurface) ||
-    assertionArgumentCandidates.some((name) =>
+    (assertionArgumentCandidates.length > 0 &&
       /\(catch\s+(?:Throwable|Exception)[\s\S]{0,180}\b(?:nil|false|true)\b/.test(
-        definitionClosure(name, defs),
-      ),
-    ) ||
+        assertionArgumentClosure,
+      )) ||
     /\(try[\s\S]{0,1200}\(assert-two-pages-synced![\s\S]{0,500}\(catch\s+(?:Throwable|Exception)/.test(
       stress,
     )
@@ -442,6 +554,56 @@ const safeAssertionArgumentFixture = safeRenamedIndirectFixture
     "  (settle-after-concurrent-ops!)\n  (assert-two-pages-synced!)",
     "  (assert-two-pages-synced! (settle-after-concurrent-ops!))",
   );
+const safeHigherOrderFixture = `
+(def severe-sync-log-patterns
+  ["db-sync/checksum-mismatch"
+   "db-sync/tx-rejected"
+   "db-sync/apply-remote-txs-failed"])
+(defn- page-sync-state [page]
+  {:rtc-tx (rtc/get-rtc-tx) :blocks (get-blocks page)})
+(defn- sample-two-pages []
+  [(w/with-page @*page1 (page-sync-state @*page1))
+   (w/with-page @*page2 (page-sync-state @*page2))])
+(defn- four-tx-and-blocks-converged? [[page1-state page2-state]]
+  (and (= (:blocks page1-state) (:blocks page2-state))
+       (= (:local-tx (:rtc-tx page1-state)) (:remote-tx (:rtc-tx page1-state)))
+       (= (:local-tx (:rtc-tx page2-state)) (:remote-tx (:rtc-tx page2-state)))))
+(defn- sync-by-trigger! []
+  (rtc/with-wait-tx-updated
+    (new-block-safe! "completion-fence")))
+(defn- assert-two-pages-synced! [_settled-state]
+  (let [s1 (page-sync-state @*page1) s2 (page-sync-state @*page2)
+        tx1 (:rtc-tx s1) tx2 (:rtc-tx s2)]
+    (is (= (:blocks s1) (:blocks s2)))
+    (is (= (:local-tx tx1) (:remote-tx tx1)))
+    (is (= (:local-tx tx2) (:remote-tx tx2)))))
+(defn- assert-no-severe-sync-errors! [] severe-sync-log-patterns)
+(deftest online-two-clients-undo-redo-stress-test
+  (run-two-clients-in-parallel!)
+  (sync-by-trigger!)
+  (assert-two-pages-synced!
+    (rtc/wait-for-stable-state!
+      sample-two-pages
+      four-tx-and-blocks-converged?
+      #(Thread/sleep 100)))
+  (assert-no-severe-sync-errors!))
+`;
+const safeHigherOrderRtcHelpers = `
+(defn wait-for-stable-state! [sample acceptable? cadence]
+  (loop [attempts 20 previous nil stable-samples 0]
+    (when (zero? attempts)
+      (throw (ex-info "completion barrier timeout" {:attempts 20})))
+    (let [current (sample)
+          acceptable-state? (acceptable? current)
+          unchanged? (= previous current)
+          stable-samples' (if (and acceptable-state? unchanged?)
+                            (inc stable-samples)
+                            0)]
+      (if (>= stable-samples' 2)
+        current
+        (do (cadence)
+            (recur (dec attempts) current stable-samples'))))))
+`;
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -525,6 +687,18 @@ test("contract evaluates a barrier nested in strict assertion arguments", () => 
       safeAssertionArgumentFixture,
       safeRunner,
       safePrepush,
+    ),
+    [],
+  );
+});
+
+test("contract follows invoked higher-order sampler and predicate symbols", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeHigherOrderFixture,
+      safeRunner,
+      safePrepush,
+      safeHigherOrderRtcHelpers,
     ),
     [],
   );
@@ -695,10 +869,99 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeRunner,
       safePrepush,
     ],
+    [
+      "higher-order call passes a single-page sampler",
+      safeHigherOrderFixture
+        .replace(
+          "(defn- sample-two-pages []",
+          `(defn- sample-one-page []
+  (w/with-page @*page1 (page-sync-state @*page1)))
+(defn- sample-two-pages []`,
+        )
+        .replace(
+          "      sample-two-pages\n      four-tx-and-blocks-converged?",
+          "      sample-one-page\n      four-tx-and-blocks-converged?",
+        ),
+      safeRunner,
+      safePrepush,
+      safeHigherOrderRtcHelpers,
+    ],
+    [
+      "higher-order predicate checks only tx convergence",
+      safeHigherOrderFixture
+        .replace(
+          "(defn- four-tx-and-blocks-converged?",
+          `(defn- tx-only-converged? [[page1-state page2-state]]
+  (and (= (:local-tx (:rtc-tx page1-state)) (:remote-tx (:rtc-tx page1-state)))
+       (= (:local-tx (:rtc-tx page2-state)) (:remote-tx (:rtc-tx page2-state)))))
+(defn- four-tx-and-blocks-converged?`,
+        )
+        .replace(
+          "      four-tx-and-blocks-converged?\n      #(Thread/sleep 100)",
+          "      tx-only-converged?\n      #(Thread/sleep 100)",
+        ),
+      safeRunner,
+      safePrepush,
+      safeHigherOrderRtcHelpers,
+    ],
+    [
+      "higher-order predicate checks only blocks",
+      safeHigherOrderFixture
+        .replace(
+          "(defn- four-tx-and-blocks-converged?",
+          `(defn- blocks-only-converged? [[page1-state page2-state]]
+  (= (:blocks page1-state) (:blocks page2-state)))
+(defn- four-tx-and-blocks-converged?`,
+        )
+        .replace(
+          "      four-tx-and-blocks-converged?\n      #(Thread/sleep 100)",
+          "      blocks-only-converged?\n      #(Thread/sleep 100)",
+        ),
+      safeRunner,
+      safePrepush,
+      safeHigherOrderRtcHelpers,
+    ],
+    [
+      "higher-order stable waiter ignores its predicate",
+      safeHigherOrderFixture,
+      safeRunner,
+      safePrepush,
+      safeHigherOrderRtcHelpers.replace(
+        "          acceptable-state? (acceptable? current)",
+        "          acceptable-state? true",
+      ),
+    ],
+    [
+      "higher-order symbol resolves to a timeout-swallowing wrapper",
+      safeHigherOrderFixture
+        .replace(
+          `(rtc/wait-for-stable-state!
+      sample-two-pages
+      four-tx-and-blocks-converged?
+      #(Thread/sleep 100))`,
+          "(invoke-waiter! swallowing-stable-waiter!)",
+        )
+        .replace(
+          "(deftest online-two-clients-undo-redo-stress-test",
+          `(defn- invoke-waiter! [waiter]
+  (waiter))
+(defn- swallowing-stable-waiter! []
+  (try
+    (rtc/wait-for-stable-state!
+      sample-two-pages
+      four-tx-and-blocks-converged?
+      #(Thread/sleep 100))
+    (catch Throwable _ nil)))
+(deftest online-two-clients-undo-redo-stress-test`,
+        ),
+      safeRunner,
+      safePrepush,
+      safeHigherOrderRtcHelpers,
+    ],
   ];
-  for (const [label, source, runner, prepush] of mutations) {
+  for (const [label, source, runner, prepush, rtcHelpers] of mutations) {
     assert.notDeepEqual(
-      completionContractViolations(source, runner, prepush),
+      completionContractViolations(source, runner, prepush, rtcHelpers),
       [],
       `${label} unexpectedly satisfied the completion barrier contract`,
     );
