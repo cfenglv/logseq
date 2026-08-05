@@ -1341,7 +1341,10 @@ test("full local preflight binds both release revisions to its actual HEAD befor
   }
 
   const cleanCheck = source.indexOf('"source and environment checks"');
-  const bindingCheck = source.indexOf("requireReleaseSourceBinding();");
+  const bindingCheck = source.indexOf(
+    "\nrequireReleaseSourceBinding();",
+    cleanCheck,
+  );
   const firstLongInstall = source.indexOf('"root frozen install"');
   assert.ok(
     cleanCheck !== -1 &&

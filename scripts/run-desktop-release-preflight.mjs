@@ -23,6 +23,8 @@ const electronTestPreloadPath = path.join(
 );
 const electronTestPreloadProbe =
   "--electron-test-preload-contract-probe";
+const releaseSourceBindingProbe =
+  "--release-source-binding-contract-probe";
 const probeIndex = process.argv.indexOf(electronTestPreloadProbe);
 const preloadCandidateIndex = process.argv.indexOf(
   "--electron-test-preload-candidate",
@@ -181,6 +183,54 @@ const run = (label, command, args, options = {}) => {
 
 const pnpm = (label, args, options) => run(label, "pnpm", args, options);
 
+const requireReleaseSourceBinding = () => {
+  const headResult = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (headResult.error) throw headResult.error;
+  if (headResult.signal) {
+    throw new Error(`git rev-parse HEAD terminated by ${headResult.signal}`);
+  }
+  if (headResult.status !== 0) {
+    throw new Error(
+      `could not resolve release source HEAD: ${headResult.stderr.trim()}`,
+    );
+  }
+
+  const exactShaPattern = /^[0-9a-f]{40}$/;
+  const head = headResult.stdout.trim();
+  const releaseSourceSha =
+    process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim() ?? "";
+  const revision = process.env.LOGSEQ_REVISION?.trim() ?? "";
+  for (const [name, value] of [
+    ["git rev-parse HEAD", head],
+    ["LOGSEQ_RELEASE_SOURCE_SHA", releaseSourceSha],
+    ["LOGSEQ_REVISION", revision],
+  ]) {
+    if (!exactShaPattern.test(value)) {
+      throw new Error(`${name} must be an exact lowercase 40-hex SHA`);
+    }
+  }
+  if (releaseSourceSha !== head) {
+    throw new Error(
+      `LOGSEQ_RELEASE_SOURCE_SHA must equal the actual HEAD ${head}`,
+    );
+  }
+  if (revision !== head) {
+    throw new Error(`LOGSEQ_REVISION must equal the actual HEAD ${head}`);
+  }
+  return head;
+};
+
+if (process.argv.includes(releaseSourceBindingProbe)) {
+  const head = requireReleaseSourceBinding();
+  console.log(`RELEASE_SOURCE_BINDING_CONTRACT PASS sha=${head}`);
+  process.exit(0);
+}
+
 const versionSource = fs.readFileSync(
   path.join(repoRoot, "src/main/frontend/version.cljs"),
   "utf8",
@@ -196,6 +246,7 @@ run(
     ...(allowDirty ? [] : ["--strict"]),
   ],
 );
+requireReleaseSourceBinding();
 run(
   "verify repository OCaml switch",
   "opam",
@@ -342,44 +393,80 @@ pnpm("project-signed updater contract", [
   "test:project-signed-macos-updater",
 ]);
 
-pnpm("isolated packaging install", [
-  "--dir",
-  "static",
-  "install",
-  "--frozen-lockfile",
-  "--ignore-workspace",
-]);
 pnpm("self-host updater provider and SemVer contract", [
   "test:selfhost-updater-provider-contract",
 ]);
-pnpm("rebuild desktop native modules", ["--dir", "static", "rebuild:all"]);
+
+const createCiReleaseWorkspace = () => {
+  const releaseWorkspaceRoot = fs.mkdtempSync(
+    path.join(os.tmpdir(), "logseq-desktop-release-workspace-"),
+  );
+  const releaseStaticDir = path.join(releaseWorkspaceRoot, "static");
+  try {
+    fs.cpSync(staticDir, releaseStaticDir, {
+      recursive: true,
+      filter: (source) => {
+        const relativePath = path.relative(staticDir, source);
+        return (
+          relativePath === "" ||
+          !relativePath.split(path.sep).includes("node_modules")
+        );
+      },
+    });
+    for (const relativePath of [
+      "scripts/verify-desktop-runtime-revisions.mjs",
+      "dist/db-worker-node.js",
+    ]) {
+      const source = path.join(repoRoot, relativePath);
+      const sourceStats = fs.lstatSync(source);
+      if (sourceStats.isSymbolicLink() || !sourceStats.isFile()) {
+        throw new Error(
+          `release workspace source must be a regular, non-symlink file: ${relativePath}`,
+        );
+      }
+      const destination = path.join(releaseWorkspaceRoot, relativePath);
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      fs.copyFileSync(source, destination);
+    }
+    return { releaseStaticDir, releaseWorkspaceRoot };
+  } catch (error) {
+    fs.rmSync(releaseWorkspaceRoot, { recursive: true, force: true });
+    throw error;
+  }
+};
 
 const outputDir = fs.mkdtempSync(
   path.join(os.tmpdir(), "logseq-desktop-preflight-"),
 );
 const outputOverride = `-c.directories.output=${outputDir}`;
+const { releaseStaticDir, releaseWorkspaceRoot } =
+  createCiReleaseWorkspace();
 const stagedProjectUpdater = path.join(
-  staticDir,
+  releaseStaticDir,
   "sidecar",
   "logseq-project-updater",
 );
-let previousProjectUpdater;
-if (fs.existsSync(stagedProjectUpdater)) {
-  const stats = fs.lstatSync(stagedProjectUpdater);
-  if (stats.isSymbolicLink() || !stats.isFile()) {
-    throw new Error(
-      `refusing to replace non-regular staged helper: ${stagedProjectUpdater}`,
-    );
-  }
-  previousProjectUpdater = {
-    bytes: fs.readFileSync(stagedProjectUpdater),
-    mode: stats.mode,
-  };
-}
 let temporaryHelperRoot;
 
 try {
+  pnpm(
+    "isolated packaging install",
+    ["install", "--frozen-lockfile", "--ignore-workspace"],
+    { cwd: releaseStaticDir },
+  );
+  pnpm("rebuild desktop native modules", ["rebuild:all"], {
+    cwd: releaseStaticDir,
+  });
+
   if (process.platform === "darwin") {
+    if (fs.existsSync(stagedProjectUpdater)) {
+      const stats = fs.lstatSync(stagedProjectUpdater);
+      if (stats.isSymbolicLink() || !stats.isFile()) {
+        throw new Error(
+          `refusing to replace non-regular staged helper: ${stagedProjectUpdater}`,
+        );
+      }
+    }
     temporaryHelperRoot = fs.mkdtempSync(
       path.join(os.tmpdir(), "logseq-preflight-project-updater-"),
     );
@@ -412,44 +499,50 @@ try {
   }
 
   if (process.platform === "darwin") {
-    pnpm("package host macOS application", [
-      "--dir",
-      "static",
-      "electron:make-unsigned",
-      "--mac",
-      "dmg",
-      "zip",
-      `--${process.arch}`,
-      outputOverride,
-    ]);
+    pnpm(
+      "package host macOS application",
+      [
+        "electron:make-unsigned",
+        "--mac",
+        "dmg",
+        "zip",
+        `--${process.arch}`,
+        outputOverride,
+      ],
+      { cwd: releaseStaticDir },
+    );
   } else if (process.platform === "win32") {
-    pnpm("package host Windows application", [
-      "--dir",
-      "static",
-      "exec",
-      "electron-builder",
-      "--win",
-      "nsis",
-      "zip",
-      `--${process.arch}`,
-      "--publish",
-      "never",
-      outputOverride,
-    ]);
+    pnpm(
+      "package host Windows application",
+      [
+        "exec",
+        "electron-builder",
+        "--win",
+        "nsis",
+        "zip",
+        `--${process.arch}`,
+        "--publish",
+        "never",
+        outputOverride,
+      ],
+      { cwd: releaseStaticDir },
+    );
   } else if (process.platform === "linux") {
-    pnpm("package host Linux application", [
-      "--dir",
-      "static",
-      "exec",
-      "electron-builder",
-      "--linux",
-      "AppImage",
-      "zip",
-      `--${process.arch}`,
-      "--publish",
-      "never",
-      outputOverride,
-    ]);
+    pnpm(
+      "package host Linux application",
+      [
+        "exec",
+        "electron-builder",
+        "--linux",
+        "AppImage",
+        "zip",
+        `--${process.arch}`,
+        "--publish",
+        "never",
+        outputOverride,
+      ],
+      { cwd: releaseStaticDir },
+    );
   } else {
     throw new Error(`unsupported local packaging platform: ${process.platform}`);
   }
@@ -458,7 +551,7 @@ try {
     "verify host packaged application",
     process.execPath,
     [
-      "static/verify-packaged-desktop.mjs",
+      path.join(releaseStaticDir, "verify-packaged-desktop.mjs"),
       "--search-root",
       outputDir,
       "--platform",
@@ -468,6 +561,7 @@ try {
       "--version",
       version,
     ],
+    { cwd: releaseWorkspaceRoot },
   );
 
   if (process.platform === "darwin") {
@@ -493,16 +587,10 @@ try {
     ]);
   }
 } finally {
-  if (previousProjectUpdater) {
-    fs.mkdirSync(path.dirname(stagedProjectUpdater), { recursive: true });
-    fs.writeFileSync(stagedProjectUpdater, previousProjectUpdater.bytes);
-    fs.chmodSync(stagedProjectUpdater, previousProjectUpdater.mode);
-  } else {
-    fs.rmSync(stagedProjectUpdater, { force: true });
-  }
   if (temporaryHelperRoot) {
     fs.rmSync(temporaryHelperRoot, { recursive: true, force: true });
   }
+  fs.rmSync(releaseWorkspaceRoot, { recursive: true, force: true });
 }
 
 console.log(
