@@ -28,6 +28,9 @@
 (def ^:private stress-default-seed-blocks 20)
 (def ^:private stress-default-seed 20260330)
 (def ^:private stress-max-seed-depth 4)
+(def ^:private stress-quiescence-poll-ms 250)
+(def ^:private stress-quiescence-stable-ms 3000)
+(def ^:private stress-quiescence-timeout-ms 30000)
 (def ^:private severe-sync-log-patterns
   ["db-sync/checksum-mismatch"
    "db-sync/tx-rejected"
@@ -65,15 +68,30 @@
 (defn- page-sync-state
   [pw-page]
   (w/with-page pw-page
-    (util/exit-edit)
     {:rtc-tx (rtc/get-rtc-tx)
      :blocks (util/get-page-blocks-contents)}))
 
-(defn- assert-two-pages-synced!
+(defn- two-page-sync-state
   []
-  (let [s1 (page-sync-state @*page1)
-        s2 (page-sync-state @*page2)
-        tx1 (:rtc-tx s1)
+  {:page1 (page-sync-state @*page1)
+   :page2 (page-sync-state @*page2)})
+
+(defn- wait-for-two-pages-quiescent!
+  []
+  (let [state (rtc/wait-for-stable-state!
+               two-page-sync-state
+               rtc/two-client-snapshot-quiescent?
+               {:poll-ms stress-quiescence-poll-ms
+                :stable-ms stress-quiescence-stable-ms
+                :timeout-ms stress-quiescence-timeout-ms})]
+    (prn :two-page-rtc-quiescent
+         {:rtc-tx (mapv (comp :rtc-tx state) [:page1 :page2])
+          :stable-ms stress-quiescence-stable-ms})
+    state))
+
+(defn- assert-two-pages-synced!
+  [{s1 :page1 s2 :page2}]
+  (let [tx1 (:rtc-tx s1)
         tx2 (:rtc-tx s2)]
     (is (= (:blocks s1) (:blocks s2))
         (str "page blocks diverged: "
@@ -84,7 +102,10 @@
     (is (= (:local-tx tx1) (:remote-tx tx1))
         (str "page1 rtc-tx not converged: " (pr-str tx1)))
     (is (= (:local-tx tx2) (:remote-tx tx2))
-        (str "page2 rtc-tx not converged: " (pr-str tx2)))))
+        (str "page2 rtc-tx not converged: " (pr-str tx2)))
+    (is (= tx1 tx2)
+        (str "client rtc-tx watermarks differ: "
+             (pr-str {:page1 tx1 :page2 tx2})))))
 
 (defn- current-editor-layout
   []
@@ -190,10 +211,15 @@
             (new-block-safe! original-title))
           (recur (dec attempt)))))))
 
-(defn- sync-by-trigger!
+(defn- sync-by-barrier!
   ([tag]
-   (sync-by-trigger! tag nil))
+   (sync-by-barrier! tag nil))
   ([tag checkpoints]
+   ;; Exiting edit mode can itself enqueue a transaction. Do it on both pages
+   ;; before creating either half of the causal barrier.
+   (doseq [pw-page [@*page1 @*page2]]
+     (w/with-page pw-page
+       (util/exit-edit)))
    (let [target-tx (some->> checkpoints
                             vals
                             (filter integer?)
@@ -205,14 +231,27 @@
          (rtc/wait-tx-update-to target-tx))
        (w/with-page @*page2
          (rtc/wait-tx-update-to target-tx)))
-     (let [{:keys [remote-tx]}
+     (let [{first-marker-tx :remote-tx}
            (w/with-page @*page1
              (rtc/with-wait-tx-updated
-               (new-block-safe! (str "sync-trigger-" tag))))]
+               (new-block-safe! (str "sync-trigger-" tag))
+               (util/exit-edit)))]
        (w/with-page @*page1
-         (rtc/wait-tx-update-to remote-tx))
+         (rtc/wait-tx-update-to first-marker-tx))
        (w/with-page @*page2
-         (rtc/wait-tx-update-to remote-tx))))))
+         (rtc/wait-tx-update-to first-marker-tx))
+       ;; The second client's acknowledgement is ordered after it observes the
+       ;; first marker and after any of its own pre-barrier queued transactions.
+       (let [{ack-marker-tx :remote-tx}
+             (w/with-page @*page2
+               (rtc/with-wait-tx-updated
+                 (new-block-safe! (str "sync-ack-" tag))
+                 (util/exit-edit)))]
+         (w/with-page @*page1
+           (rtc/wait-tx-update-to ack-marker-tx))
+         (w/with-page @*page2
+           (rtc/wait-tx-update-to ack-marker-tx))
+         ack-marker-tx)))))
 
 (defn- seed-long-nested-page!
   [seed]
@@ -234,7 +273,7 @@
               (do
                 (util/exit-edit)
                 titles))))]
-    (sync-by-trigger! (str "seed-" seed))
+    (sync-by-barrier! (str "seed-" seed))
     titles))
 
 (defn- next-action
@@ -381,13 +420,13 @@
               p2-undo-remote-tx (w/with-page @*page2
                                   (-> (rtc/get-rtc-tx) :local-tx))]
 
-          (sync-by-trigger!
+          (sync-by-barrier!
            round
            {:p1-edit p1-edit-remote-tx
             :p2-edit p2-edit-remote-tx
             :p1-undo p1-undo-remote-tx
             :p2-undo p2-undo-remote-tx})
-          (assert-two-pages-synced!)
+          (assert-two-pages-synced! (wait-for-two-pages-quiescent!))
           (assert-no-severe-sync-errors!))))))
 
 ;;; https://github.com/logseq/db-test/issues/651

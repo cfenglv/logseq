@@ -60,6 +60,75 @@
         current
         (recur (dec i) current)))))
 
+(defn two-client-snapshot-quiescent?
+  [{:keys [page1 page2]}]
+  (let [page1-tx (:rtc-tx page1)
+        page2-tx (:rtc-tx page2)
+        tx-values [(:local-tx page1-tx)
+                   (:remote-tx page1-tx)
+                   (:local-tx page2-tx)
+                   (:remote-tx page2-tx)]]
+    (and (every? #(and (integer? %) (not (neg? %))) tx-values)
+         (apply = tx-values)
+         (some? (:blocks page1))
+         (= (:blocks page1) (:blocks page2)))))
+
+(defn wait-for-stable-state!
+  "Poll `sample-f` until `stable?` accepts the exact same state for a full
+  stable window. Any changing or rejected state resets the window. Timeout and
+  sampler errors are propagated so E2E reporting can preserve diagnostics."
+  [sample-f stable? {:keys [now-ms-f poll-ms stable-ms timeout-ms wait-ms-f]
+                     :or {now-ms-f #(quot (System/nanoTime) 1000000)
+                          poll-ms 250
+                          stable-ms 3000
+                          timeout-ms 30000
+                          wait-ms-f #(Thread/sleep %)}}]
+  (when-not (and (ifn? sample-f)
+                 (ifn? stable?)
+                 (ifn? now-ms-f)
+                 (ifn? wait-ms-f)
+                 (pos-int? poll-ms)
+                 (pos-int? stable-ms)
+                 (pos-int? timeout-ms)
+                 (<= stable-ms timeout-ms))
+    (throw (ex-info "invalid stable-state wait options"
+                    {:poll-ms poll-ms
+                     :stable-ms stable-ms
+                     :timeout-ms timeout-ms})))
+  (let [started-at (now-ms-f)
+        deadline (+ started-at timeout-ms)]
+    (loop [previous-state ::none
+           stable-since nil
+           recent-states []]
+      (let [state (sample-f)
+            sampled-at (now-ms-f)
+            state-stable? (true? (stable? state))
+            same-stable-state? (and state-stable?
+                                    (= previous-state state))
+            stable-since' (cond
+                            same-stable-state? stable-since
+                            state-stable? sampled-at
+                            :else nil)
+            recent-states' (->> (conj recent-states state)
+                                (take-last 6)
+                                vec)]
+        (cond
+          (and stable-since'
+               (>= (- sampled-at stable-since') stable-ms))
+          state
+
+          (>= sampled-at deadline)
+          (throw (ex-info "stable-state wait timed out"
+                          {:last-state state
+                           :recent-states recent-states'
+                           :stable-ms stable-ms
+                           :timeout-ms timeout-ms}))
+
+          :else
+          (do
+            (wait-ms-f (min poll-ms (- deadline sampled-at)))
+            (recur state stable-since' recent-states')))))))
+
 (defn wait-tx-update-to
   [new-tx]
   (assert (int? new-tx))
