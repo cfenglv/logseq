@@ -1,6 +1,18 @@
 (ns logseq.e2e.rtc-quiescence-contract-test
   (:require [clojure.test :refer [deftest is testing]]
-            [logseq.e2e.rtc :as rtc]))
+            [logseq.e2e.block :as block]
+            [logseq.e2e.const :as const]
+            [logseq.e2e.rtc :as rtc]
+            [logseq.e2e.rtc-extra-part2-test]
+            [logseq.e2e.util :as util]
+            [wally.main :as w]))
+
+(def ^:private stress-ns 'logseq.e2e.rtc-extra-part2-test)
+
+(defn- stress-var
+  [symbol]
+  (or (ns-resolve stress-ns symbol)
+      (throw (ex-info "missing stress helper" {:symbol symbol}))))
 
 (defn- synced-client
   [tx blocks]
@@ -103,3 +115,201 @@
       (is (some? thrown))
       (is (= 300 (:timeout-ms (ex-data thrown))))
       (is (= diverged (:last-state (ex-data thrown)))))))
+
+(deftest quiescence-validates-both-clients-and-the-complete-state
+  (let [valid (two-client-state 17 ["a" "b"])
+        tx-paths [[:page1 :rtc-tx :local-tx]
+                  [:page1 :rtc-tx :remote-tx]
+                  [:page2 :rtc-tx :local-tx]
+                  [:page2 :rtc-tx :remote-tx]]]
+    (is (true? (rtc/two-client-snapshot-quiescent? valid)))
+    (doseq [path tx-paths]
+      (is (false? (rtc/two-client-snapshot-quiescent?
+                   (assoc-in valid path 17.0)))
+          (str "non-integer tx accepted at " path))
+      (is (false? (rtc/two-client-snapshot-quiescent?
+                   (assoc-in valid path -1)))
+          (str "negative tx accepted at " path))
+      (is (false? (rtc/two-client-snapshot-quiescent?
+                   (assoc-in valid path 18)))
+          (str "non-converged tx accepted at " path)))
+    (is (false? (rtc/two-client-snapshot-quiescent?
+                 (assoc-in valid [:page1 :blocks] nil))))
+    (is (false? (rtc/two-client-snapshot-quiescent?
+                 (assoc-in valid [:page2 :blocks] nil))))
+    (is (false? (rtc/two-client-snapshot-quiescent?
+                 (assoc-in valid [:page2 :blocks] ["different"]))))))
+
+(deftest stress-sampler-reads-each-client-once
+  (let [events (atom [])
+        original-page1 @const/*page1
+        original-page2 @const/*page2]
+    (try
+      (reset! const/*page1 :client-1)
+      (reset! const/*page2 :client-2)
+      (with-redefs-fn
+        {(stress-var 'page-sync-state)
+         (fn [client]
+           (swap! events conj client)
+           {:client client})}
+        (fn []
+          (is (= {:page1 {:client :client-1}
+                  :page2 {:client :client-2}}
+                 ((deref (stress-var 'two-page-sync-state)))))))
+      (is (= [:client-1 :client-2] @events))
+      (finally
+        (reset! const/*page1 original-page1)
+        (reset! const/*page2 original-page2)))))
+
+(deftest stress-wait-uses-the-production-stability-window
+  (let [captured (atom nil)
+        state (two-client-state 23 ["settled"])]
+    (with-redefs-fn
+      {#'rtc/wait-for-stable-state!
+       (fn [sample-f stable? options]
+         (reset! captured {:sample-f sample-f
+                           :stable? stable?
+                           :options options})
+         state)}
+      (fn []
+        (is (= state
+               ((deref (stress-var 'wait-for-two-pages-quiescent!)))))))
+    (is (identical? rtc/two-client-snapshot-quiescent?
+                    (:stable? @captured)))
+    (is (= {:poll-ms 250
+            :stable-ms 3000
+            :timeout-ms 30000}
+           (:options @captured)))))
+
+(deftest stress-workflow-executes-the-quiescence-wait-before-asserting
+  (let [events (atom [])
+        state (two-client-state 31 ["complete"])
+        original-page1 @const/*page1
+        original-page2 @const/*page2]
+    (try
+      (reset! const/*page1 :client-1)
+      (reset! const/*page2 :client-2)
+      (with-redefs-fn
+        {(stress-var 'env-int) (fn [_ default] default)
+         (stress-var 'seed-long-nested-page!) (fn [_] #{})
+         (stress-var 'run-two-clients-in-parallel!)
+         (fn [client1-f client2-f]
+           [(client1-f) (client2-f)])
+         (stress-var 'local-random-edit-batch!)
+         (fn [& _] 1)
+         (stress-var 'local-undo-redo-batch!) (fn [_])
+         #'rtc/get-rtc-tx (fn [] {:local-tx 31 :remote-tx 31})
+         (stress-var 'sync-by-barrier!)
+         (fn [& _] (swap! events conj :barrier))
+         (stress-var 'wait-for-two-pages-quiescent!)
+         (fn []
+           (swap! events conj :wait)
+           state)
+         (stress-var 'assert-two-pages-synced!)
+         (fn [& [observed]]
+           (swap! events conj [:assert observed]))
+         (stress-var 'assert-no-severe-sync-errors!)
+         (fn [] (swap! events conj :logs))}
+        (fn []
+          ((deref (stress-var 'online-two-clients-undo-redo-stress-test)))))
+      (is (= [:barrier :wait [:assert state] :logs]
+             @events))
+      (finally
+        (reset! const/*page1 original-page1)
+        (reset! const/*page2 original-page2)))))
+
+(deftest stable-window-holds-for-the-exact-configured-duration
+  (let [now (atom 0)
+        samples (atom [])
+        waits (atom [])
+        state (two-client-state 29 ["stable"])
+        result (rtc/wait-for-stable-state!
+                (fn []
+                  (swap! samples conj @now)
+                  state)
+                rtc/two-client-snapshot-quiescent?
+                {:now-ms-f #(deref now)
+                 :poll-ms 100
+                 :stable-ms 300
+                 :timeout-ms 1000
+                 :wait-ms-f (fn [duration]
+                              (swap! waits conj duration)
+                              (swap! now + duration))})]
+    (is (= state result))
+    (is (= [0 100 200 300] @samples))
+    (is (= [100 100 100] @waits))))
+
+(deftest stable-window-propagates-sampler-errors-unchanged
+  (let [failure (ex-info "sample failed" {:phase :sample})
+        thrown (try
+                 (rtc/wait-for-stable-state!
+                  #(throw failure)
+                  rtc/two-client-snapshot-quiescent?
+                  {:now-ms-f (constantly 0)
+                   :poll-ms 100
+                   :stable-ms 300
+                   :timeout-ms 1000
+                   :wait-ms-f (fn [_])})
+                 nil
+                 (catch Throwable error
+                   error))]
+    (is (identical? failure thrown))))
+
+(defn- run-barrier-with-write-failure
+  [failing-title]
+  (let [failure (ex-info "barrier write failed" {:title failing-title})
+        events (atom [])
+        transactions (atom {:client-1 0 :client-2 0})
+        next-tx (atom 0)
+        original-page1 @const/*page1
+        original-page2 @const/*page2]
+    (try
+      (reset! const/*page1 :client-1)
+      (reset! const/*page2 :client-2)
+      {:events events
+       :failure failure
+       :thrown
+       (with-redefs-fn
+         {#'block/new-block
+          (fn [title]
+            (swap! events conj [:write w/*page* title])
+            (if (= title failing-title)
+              (throw failure)
+              (let [tx (swap! next-tx inc)]
+                (swap! transactions assoc w/*page* tx))))
+          (stress-var 'page-has-block-title?) (constantly true)
+          #'block/open-last-block (fn [])
+          #'rtc/get-rtc-tx
+          (fn []
+            (let [tx (get @transactions w/*page* 0)]
+              {:local-tx tx :remote-tx tx}))
+          #'rtc/wait-tx-update-to
+          (fn [target]
+            (swap! events conj [:wait w/*page* target])
+            target)
+          #'util/exit-edit (fn [])
+          #'util/wait-timeout (fn [_])
+          #'w/wait-for (fn [& _])
+          #'clojure.core/prn (fn [& _])}
+         (fn []
+           (try
+             ((deref (stress-var 'sync-by-barrier!)) "contract")
+             nil
+             (catch Throwable error
+               error))))}
+      (finally
+        (reset! const/*page1 original-page1)
+        (reset! const/*page2 original-page2)))))
+
+(deftest marker-and-ack-write-errors-fail-the-barrier-directly
+  (doseq [title ["sync-trigger-contract" "sync-ack-contract"]]
+    (testing title
+      (let [{:keys [events failure thrown]}
+            (run-barrier-with-write-failure title)
+            mismatch (when-not (identical? failure thrown)
+                       {:events @events
+                        :expected (ex-message failure)
+                        :thrown (some-> thrown ex-message)})]
+        (is (nil? mismatch)
+            (str "barrier replaced or swallowed the write failure: "
+                 (pr-str mismatch)))))))
