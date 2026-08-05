@@ -349,6 +349,9 @@ const localProjectUpdateSigningContract = readText(
 const macosUpdaterBaseline = readJson(
   "scripts/fixtures/macos-updater-baseline.json",
 );
+const packagedDesktopVerifier = readText(
+  "resources/verify-packaged-desktop.mjs",
+);
 const desktopRuntimeRevisionBuilderHook = readText(
   "resources/electron-builder-verify-runtime-revisions.cjs",
 );
