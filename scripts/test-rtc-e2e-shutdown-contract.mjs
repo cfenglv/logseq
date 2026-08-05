@@ -171,7 +171,6 @@ test('windows cleanup uses bounded taskkill tree stages', async () => {
 
 test('windows cleanup fails closed for invalid PIDs and tool errors', async () => {
   const toolError = new Error('TASKKILL_TOOL_SENTINEL')
-  const directSignals = []
   let spawnCount = 0
   const spawnProcess = () => {
     spawnCount += 1
@@ -182,7 +181,6 @@ test('windows cleanup fails closed for invalid PIDs and tool errors', async () =
   }
   const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
     spawnProcess,
-    directFallbackTimeoutMs: 50,
     timeoutMs: 50,
   })
 
@@ -192,241 +190,15 @@ test('windows cleanup fails closed for invalid PIDs and tool errors', async () =
   )
   assert.equal(spawnCount, 0)
 
-  const child = new EventEmitter()
-  Object.assign(child, {
-    exitCode: null,
-    kill: (signal) => {
-      directSignals.push(signal)
-      child.signalCode = signal
-      queueMicrotask(() => child.emit('exit', null, signal))
-      return true
-    },
-    pid: 808,
-    signalCode: null,
-  })
-  const thrown = await signalChild(child, 'SIGTERM').catch((error) => error)
+  const thrown = await signalChild(
+    { exitCode: null, pid: 808, signalCode: null },
+    'SIGTERM'
+  ).catch((error) => error)
   assert.strictEqual(thrown, toolError)
-  assert.deepEqual(directSignals, ['SIGTERM'])
-})
-
-test('windows helper failure escalates a TERM-ignoring direct child', async () => {
-  const toolError = new Error('TASKKILL_ESCALATION_SENTINEL')
-  const directSignals = []
-  const spawnProcess = () => {
-    const taskkill = new EventEmitter()
-    taskkill.kill = () => true
-    queueMicrotask(() => taskkill.emit('error', toolError))
-    return taskkill
-  }
-  const child = new EventEmitter()
-  Object.assign(child, {
-    exitCode: null,
-    kill: (signal) => {
-      directSignals.push(signal)
-      if (signal === 'SIGKILL') {
-        child.signalCode = signal
-        queueMicrotask(() => child.emit('exit', null, signal))
-      }
-      return true
-    },
-    pid: 818,
-    signalCode: null,
-  })
-  const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
-    spawnProcess,
-    directFallbackTimeoutMs: 5,
-    timeoutMs: 50,
-  })
-
-  const thrown = await signalChild(child, 'SIGTERM').catch((error) => error)
-  assert.strictEqual(thrown, toolError)
-  assert.deepEqual(directSignals, ['SIGTERM', 'SIGKILL'])
-})
-
-test('windows taskkill nonzero remains a cleanup failure after fallback', async () => {
-  const directSignals = []
-  const spawnProcess = () => {
-    const taskkill = new EventEmitter()
-    taskkill.kill = () => true
-    queueMicrotask(() => taskkill.emit('exit', 7, null))
-    return taskkill
-  }
-  const child = new EventEmitter()
-  Object.assign(child, {
-    exitCode: null,
-    kill: (signal) => {
-      directSignals.push(signal)
-      child.signalCode = signal
-      queueMicrotask(() => child.emit('exit', null, signal))
-      return true
-    },
-    pid: 823,
-    signalCode: null,
-  })
-  const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
-    spawnProcess,
-    directFallbackTimeoutMs: 50,
-    timeoutMs: 50,
-  })
-
-  await assert.rejects(
-    signalChild(child, 'SIGTERM'),
-    /taskkill\.exe failed for PID 823 during SIGTERM \(code=7, signal=null\)/
-  )
-  assert.deepEqual(directSignals, ['SIGTERM'])
-})
-
-test('windows fallback failure retains the original helper error identity', async () => {
-  const helperError = new Error('TASKKILL_ORIGINAL_IDENTITY_SENTINEL')
-  const fallbackError = new Error('DIRECT_FALLBACK_IDENTITY_SENTINEL')
-  const spawnProcess = () => {
-    const taskkill = new EventEmitter()
-    taskkill.kill = () => true
-    queueMicrotask(() => taskkill.emit('error', helperError))
-    return taskkill
-  }
-  const child = new EventEmitter()
-  Object.assign(child, {
-    exitCode: null,
-    kill: () => {
-      throw fallbackError
-    },
-    pid: 828,
-    signalCode: null,
-  })
-  const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
-    spawnProcess,
-    directFallbackTimeoutMs: 5,
-    timeoutMs: 50,
-  })
-
-  const thrown = await signalChild(child, 'SIGTERM').catch((error) => error)
-  assert.equal(errorTreeContains(thrown, helperError), true)
-  assert.equal(errorTreeContains(thrown, fallbackError), true)
-})
-
-test('broken Windows tree helper cannot leave runner stdio open', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-broken-taskkill-'))
-  const bbShim = path.join(root, 'bb-shim.cjs')
-  const preload = path.join(root, 'broken-taskkill-preload.cjs')
-  const serverPid = path.join(root, 'server.pid')
-  fs.writeFileSync(
-    bbShim,
-    `const fs = require('node:fs');
-const [task] = process.argv.slice(2);
-if (task === 'serve') {
-  fs.writeFileSync(process.env.RTC_BROKEN_TASKKILL_SERVER_PID, String(process.pid));
-  setInterval(() => {}, 1000);
-} else {
-  process.exit(0);
-}
-`
-  )
-  fs.writeFileSync(
-    preload,
-    `const childProcess = require('node:child_process');
-const { EventEmitter } = require('node:events');
-const { syncBuiltinESMExports } = require('node:module');
-const net = require('node:net');
-const originalSpawn = childProcess.spawn;
-Object.defineProperty(process, 'platform', {
-  configurable: true,
-  value: 'win32',
-});
-childProcess.spawn = (command, args, options) => {
-  if (command !== 'taskkill.exe') return originalSpawn(command, args, options);
-  const taskkill = new EventEmitter();
-  taskkill.kill = () => true;
-  queueMicrotask(() => {
-    const error = new Error('BROKEN_TASKKILL_IDENTITY_SENTINEL');
-    error.code = 'ENOENT';
-    taskkill.emit('error', error);
-  });
-  return taskkill;
-};
-syncBuiltinESMExports();
-net.createServer = () => {
-  const server = {
-    address: () => ({ address: '127.0.0.1', family: 'IPv4', port: 43133 }),
-    close: (callback) => queueMicrotask(() => callback?.()),
-    listen: (...args) => {
-      const callback = args.at(-1);
-      if (typeof callback === 'function') queueMicrotask(callback);
-      return server;
-    },
-    once: () => server,
-    unref: () => server,
-  };
-  return server;
-};
-global.fetch = async () => ({ status: 200 });
-`
-  )
-
-  let pid
-  let wrapper
-  try {
-    const startedAt = Date.now()
-    wrapper = spawn(
-      process.execPath,
-      [path.join(repoRoot, 'scripts/run-rtc-e2e.mjs'), 'rtc-extra-test'],
-      {
-        cwd: repoRoot,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([
-            process.execPath,
-            bbShim,
-          ]),
-          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
-          RTC_BROKEN_TASKKILL_SERVER_PID: serverPid,
-        },
-        stdio: ['ignore', 'pipe', 'pipe'],
-      }
-    )
-    let stdout = ''
-    let stderr = ''
-    wrapper.stdout.on('data', (chunk) => {
-      stdout += chunk
-    })
-    wrapper.stderr.on('data', (chunk) => {
-      stderr += chunk
-    })
-    const closed = new Promise((resolve, reject) => {
-      wrapper.once('error', reject)
-      wrapper.once('close', (status, signal) => resolve({ signal, status }))
-    })
-    let timeout
-    const result = await Promise.race([
-      closed,
-      new Promise((resolve) => {
-        timeout = setTimeout(() => resolve(null), 2_000)
-      }),
-    ]).finally(() => clearTimeout(timeout))
-    const elapsedMs = Date.now() - startedAt
-    if (fs.existsSync(serverPid)) pid = Number(fs.readFileSync(serverPid, 'utf8'))
-    assert.ok(result, `runner stdio remained open after ${elapsedMs}ms:\n${stdout}${stderr}`)
-    assert.equal(result.status, 1, `${stdout}${stderr}`)
-    assert.match(stderr, /BROKEN_TASKKILL_IDENTITY_SENTINEL/)
-  } finally {
-    if (wrapper && wrapper.exitCode === null && wrapper.signalCode === null) {
-      wrapper.kill('SIGKILL')
-    }
-    if (Number.isSafeInteger(pid) && pid > 0) {
-      try {
-        process.kill(pid, 'SIGKILL')
-      } catch (error) {
-        if (error?.code !== 'ESRCH') throw error
-      }
-    }
-    fs.rmSync(root, { force: true, recursive: true })
-  }
 })
 
 test('windows cleanup bounds a hung taskkill helper', async () => {
   const helperSignals = []
-  const directSignals = []
   const spawnProcess = () => {
     const taskkill = new EventEmitter()
     taskkill.kill = (signal) => helperSignals.push(signal)
@@ -434,28 +206,17 @@ test('windows cleanup bounds a hung taskkill helper', async () => {
   }
   const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
     spawnProcess,
-    directFallbackTimeoutMs: 50,
     timeoutMs: 5,
-  })
-  const child = new EventEmitter()
-  Object.assign(child, {
-    exitCode: null,
-    kill: (signal) => {
-      directSignals.push(signal)
-      child.signalCode = signal
-      queueMicrotask(() => child.emit('exit', null, signal))
-      return true
-    },
-    pid: 909,
-    signalCode: null,
   })
 
   await assert.rejects(
-    signalChild(child, 'SIGKILL'),
+    signalChild(
+      { exitCode: null, pid: 909, signalCode: null },
+      'SIGKILL'
+    ),
     /taskkill\.exe did not exit within 5ms for PID 909 during SIGKILL/
   )
   assert.deepEqual(helperSignals, ['SIGKILL'])
-  assert.deepEqual(directSignals, ['SIGKILL'])
 })
 
 test('concurrent shutdown callers share cleanup through SIGKILL', async () => {

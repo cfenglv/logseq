@@ -99,12 +99,9 @@ const startChild = (command, args) => {
 const signalChild = async (child, signal) => {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   shutdownExpectedChildren.add(child);
-  if (!detached) {
-    await signalWindowsProcessTree(child, signal);
-    return;
-  }
   try {
-    process.kill(-child.pid, signal);
+    if (detached) process.kill(-child.pid, signal);
+    else await signalWindowsProcessTree(child, signal);
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
   }
