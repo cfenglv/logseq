@@ -1267,10 +1267,12 @@ jobs:
 
   # reuse workflow via workflow_call
   build-android:
+    needs: [ resolve-release-source ]
     uses: ./.github/workflows/build-android.yml
     if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
     with:
       build-target: "${{ github.event.inputs.build-target }}"
+      source-sha: "${{ needs.resolve-release-source.outputs.source-sha }}"
       # if scheduled, use production mode
       enable-file-sync-production: "${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}"
     secrets:

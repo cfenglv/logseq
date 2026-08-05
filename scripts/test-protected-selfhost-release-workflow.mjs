@@ -12,6 +12,7 @@ const repoRoot = path.resolve(
 const read = (relativePath) =>
   fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
 const workflow = read(".github/workflows/build-desktop-release.yml");
+const androidWorkflow = read(".github/workflows/build-android.yml");
 
 const relativeModuleClosure = (relativePath, seen = new Set()) => {
   if (seen.has(relativePath)) return seen;
@@ -59,6 +60,27 @@ addCase("release rehearsal binds a successful push run to the exact SHA", () => 
   assert.match(rehearsal, /event:\s*'push'/);
   assert.match(rehearsal, /status:\s*'success'/);
   assert.match(rehearsal, /head_sha:\s*sha/);
+});
+
+addCase("Android workflow_call checks out the same frozen release SHA", () => {
+  const android = workflowJob("build-android");
+  assert.match(android, /needs:\s*\[\s*resolve-release-source\s*\]/);
+  assert.match(
+    android,
+    /source-sha:\s*"\$\{\{ needs\.resolve-release-source\.outputs\.source-sha \}\}"/,
+  );
+  assert.match(
+    androidWorkflow,
+    /workflow_call:[\s\S]{0,240}source-sha:[\s\S]{0,120}type:\s*string[\s\S]{0,80}required:\s*true/,
+  );
+  assert.match(
+    androidWorkflow,
+    /ref:\s*\$\{\{ inputs\.source-sha \|\| github\.event\.inputs\.git-ref \}\}/,
+  );
+  assert.doesNotMatch(
+    androidWorkflow,
+    /^\s*ref:\s*\$\{\{ github\.event\.inputs\.git-ref \}\}\s*$/m,
+  );
 });
 
 addCase("protected signer is exact-ref workflow_dispatch stable/beta only", () => {
