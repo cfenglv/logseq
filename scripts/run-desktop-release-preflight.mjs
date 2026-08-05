@@ -6,6 +6,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  assertReleaseSourceIdentityUnchanged,
+  establishReleaseSourceIdentity,
+} from "./release-source-identity.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -183,51 +187,13 @@ const run = (label, command, args, options = {}) => {
 
 const pnpm = (label, args, options) => run(label, "pnpm", args, options);
 
-const requireReleaseSourceBinding = () => {
-  const headResult = spawnSync("git", ["rev-parse", "HEAD"], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    shell: false,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (headResult.error) throw headResult.error;
-  if (headResult.signal) {
-    throw new Error(`git rev-parse HEAD terminated by ${headResult.signal}`);
-  }
-  if (headResult.status !== 0) {
-    throw new Error(
-      `could not resolve release source HEAD: ${headResult.stderr.trim()}`,
-    );
-  }
-
-  const exactShaPattern = /^[0-9a-f]{40}$/;
-  const head = headResult.stdout.trim();
-  const releaseSourceSha =
-    process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim() ?? "";
-  const revision = process.env.LOGSEQ_REVISION?.trim() ?? "";
-  for (const [name, value] of [
-    ["git rev-parse HEAD", head],
-    ["LOGSEQ_RELEASE_SOURCE_SHA", releaseSourceSha],
-    ["LOGSEQ_REVISION", revision],
-  ]) {
-    if (!exactShaPattern.test(value)) {
-      throw new Error(`${name} must be an exact lowercase 40-hex SHA`);
-    }
-  }
-  if (releaseSourceSha !== head) {
-    throw new Error(
-      `LOGSEQ_RELEASE_SOURCE_SHA must equal the actual HEAD ${head}`,
-    );
-  }
-  if (revision !== head) {
-    throw new Error(`LOGSEQ_REVISION must equal the actual HEAD ${head}`);
-  }
-  return head;
-};
-
 if (process.argv.includes(releaseSourceBindingProbe)) {
-  const head = requireReleaseSourceBinding();
-  console.log(`RELEASE_SOURCE_BINDING_CONTRACT PASS sha=${head}`);
+  const identity = establishReleaseSourceIdentity({
+    allowDirty: true,
+    environment: process.env,
+    repoRoot,
+  });
+  console.log(`RELEASE_SOURCE_BINDING_CONTRACT PASS sha=${identity.head}`);
   process.exit(0);
 }
 
@@ -246,7 +212,11 @@ run(
     ...(allowDirty ? [] : ["--strict"]),
   ],
 );
-requireReleaseSourceBinding();
+const releaseSourceIdentity = establishReleaseSourceIdentity({
+  allowDirty,
+  environment: process.env,
+  repoRoot,
+});
 run(
   "verify repository OCaml switch",
   "opam",
@@ -373,6 +343,11 @@ run("build and stage CLI", "opam", [
 ]);
 pnpm("build desktop webpack assets", ["webpack-app-build"]);
 pnpm("stage desktop runtimes", ["desktop:prepare-runtime-js"]);
+assertReleaseSourceIdentityUnchanged(releaseSourceIdentity, {
+  environment: process.env,
+  phase: "before runtime verification",
+  repoRoot,
+});
 pnpm("verify desktop runtime revisions", [
   "desktop:verify-runtime-revisions",
 ]);
@@ -592,6 +567,12 @@ try {
   }
   fs.rmSync(releaseWorkspaceRoot, { recursive: true, force: true });
 }
+
+assertReleaseSourceIdentityUnchanged(releaseSourceIdentity, {
+  environment: process.env,
+  phase: "before FULL PASS",
+  repoRoot,
+});
 
 console.log(
   `\n[desktop-release-preflight] FULL PASS version=${version} platform=${process.platform}/${process.arch} output=${outputDir}`,

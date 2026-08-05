@@ -25,6 +25,33 @@ export const assertDesktopSourceRevision = (sourceRevision) => {
   return sourceRevision
 }
 
+const asciiHexByte = (value) =>
+  (value >= 0x30 && value <= 0x39) ||
+  (value >= 0x41 && value <= 0x46) ||
+  (value >= 0x61 && value <= 0x66)
+
+export const containsExactDesktopSourceRevision = (payload, sourceRevision) => {
+  const expected = assertDesktopSourceRevision(sourceRevision)
+  const source = Buffer.isBuffer(payload) ? payload : Buffer.from(payload)
+  const token = Buffer.from(expected, 'ascii')
+  let offset = 0
+  while (offset <= source.length - token.length) {
+    const index = source.indexOf(token, offset)
+    if (index === -1) return false
+    const before = index === 0 ? undefined : source[index - 1]
+    const afterIndex = index + token.length
+    const after = afterIndex === source.length ? undefined : source[afterIndex]
+    if (
+      (before === undefined || !asciiHexByte(before)) &&
+      (after === undefined || !asciiHexByte(after))
+    ) {
+      return true
+    }
+    offset = index + 1
+  }
+  return false
+}
+
 const readExactly = (fd, length, position, label) => {
   const payload = Buffer.alloc(length)
   let bytesRead = 0
@@ -109,7 +136,7 @@ export const verifyAsarDesktopRuntimeRevision = ({
         offset,
         `app.asar runtime ${relativePath}`
       )
-      if (!payload.includes(expected)) {
+      if (!containsExactDesktopSourceRevision(payload, expected)) {
         throw new Error(
           `packaged ${relativePath} does not contain source revision ${expected}`
         )

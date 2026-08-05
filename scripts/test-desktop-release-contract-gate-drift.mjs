@@ -24,6 +24,8 @@ const babashkaDependentGateCommands = new Set([
 ]);
 const requiredReleaseContracts = [
   "node ./scripts/test-desktop-runtime-packaging-contract.mjs",
+  "node ./scripts/test-release-source-lifecycle-contract.mjs",
+  "node ./scripts/test-desktop-runtime-revision-exact-token.mjs",
   "node ./scripts/test-desktop-local-preflight-artifact-boundary.mjs",
   "node ./scripts/test-updater-private-material-policy-contract.mjs",
   "node ./scripts/test-local-keychain-release-signing-contract.mjs",

@@ -33,6 +33,36 @@
   (w/fill util/editor-q text)
   (assert/assert-is-visible (loc/filter util/editor-q :has-text text)))
 
+(defn open-last-block-strict!
+  "Open the last block without retrying or swallowing editor failures."
+  []
+  (util/double-esc)
+  (assert/assert-in-normal-mode?)
+  (let [blocks-count (util/page-blocks-count)
+        last-block (-> (if (zero? blocks-count)
+                         (w/query ".ls-page-blocks .block-add-button")
+                         (w/query ".ls-page-blocks .page-blocks-inner .ls-block .block-content"))
+                       last)]
+    (w/click last-block)
+    (assert/assert-editor-mode)))
+
+(defn new-block-strict!
+  "Create and verify a block once, propagating every failure to the caller."
+  [title]
+  (when-not (util/get-editor)
+    (open-last-block-strict!))
+  (let [last-id (.getAttribute (w/-query ".editor-wrapper textarea") "id")]
+    (when-not last-id
+      (throw (ex-info "strict new block has no source editor" {:title title})))
+    (k/press "Control+e")
+    (k/enter)
+    (assert/assert-is-visible
+     (loc/filter ".editor-wrapper"
+                 :has "textarea"
+                 :has-not (str "#" last-id)))
+    (assert/assert-editor-mode)
+    (save-block title)))
+
 (defn new-block
   [title & [in-retry?]]
   (let [editor (util/get-editor)]

@@ -1312,8 +1312,15 @@ test("full local preflight binds both release revisions to its actual HEAD befor
   assert.match(exact.output, /RELEASE_SOURCE_BINDING_CONTRACT PASS/);
 
   for (const [label, env] of [
-    ["missing release source", { revision: head.output }],
-    ["missing embedded revision", { releaseSourceSha: head.output }],
+    ["bare command", {}],
+    ["source only", { releaseSourceSha: head.output }],
+    ["revision only", { revision: head.output }],
+  ]) {
+    const result = probe(env);
+    assert.equal(result.status, 0, `${label} failed:\n${result.output}`);
+  }
+
+  for (const [label, env] of [
     [
       "short release source",
       { releaseSourceSha: head.output.slice(0, 12), revision: head.output },
@@ -1325,6 +1332,10 @@ test("full local preflight binds both release revisions to its actual HEAD befor
     [
       "embedded revision mismatch",
       { releaseSourceSha: head.output, revision: "9".repeat(40) },
+    ],
+    [
+      "release source whitespace",
+      { releaseSourceSha: `${head.output} `, revision: head.output },
     ],
   ]) {
     const result = probe(env);
@@ -1342,7 +1353,7 @@ test("full local preflight binds both release revisions to its actual HEAD befor
 
   const cleanCheck = source.indexOf('"source and environment checks"');
   const bindingCheck = source.indexOf(
-    "\nrequireReleaseSourceBinding();",
+    "\nconst releaseSourceIdentity = establishReleaseSourceIdentity(",
     cleanCheck,
   );
   const firstLongInstall = source.indexOf('"root frozen install"');

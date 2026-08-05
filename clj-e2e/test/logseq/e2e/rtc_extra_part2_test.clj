@@ -234,7 +234,7 @@
      (let [{first-marker-tx :remote-tx}
            (w/with-page @*page1
              (rtc/with-wait-tx-updated
-               (new-block-safe! (str "sync-trigger-" tag))
+               (b/new-block-strict! (str "sync-trigger-" tag))
                (util/exit-edit)))]
        (w/with-page @*page1
          (rtc/wait-tx-update-to first-marker-tx))
@@ -245,7 +245,7 @@
        (let [{ack-marker-tx :remote-tx}
              (w/with-page @*page2
                (rtc/with-wait-tx-updated
-                 (new-block-safe! (str "sync-ack-" tag))
+                 (b/new-block-strict! (str "sync-ack-" tag))
                  (util/exit-edit)))]
          (w/with-page @*page1
            (rtc/wait-tx-update-to ack-marker-tx))

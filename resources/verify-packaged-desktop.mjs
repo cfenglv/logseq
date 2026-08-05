@@ -11,11 +11,11 @@ import {
   assertRegularFile,
   verifyProjectSignatureRuntime,
 } from "./packaged-resource-contract.mjs";
+import { containsExactDesktopSourceRevision } from "./desktop-runtime-provenance.mjs";
 
 const require = createRequire(import.meta.url);
 const asar = require("@electron/asar");
 const stagedResourcesDir = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(stagedResourcesDir, "..");
 
 const parseArgs = (argv) => {
   if (argv[0] === "--") argv = argv.slice(1);
@@ -38,17 +38,16 @@ const expectedArch = args.arch;
 const expectedVersion = args.version;
 const expectedElectron =
   args["electron-version"] || require("./package.json").devDependencies.electron;
-const embeddedRevision =
-  process.env.LOGSEQ_REVISION?.trim() ||
-  spawnSync("git", ["describe", "--long", "--always", "--dirty"], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    shell: false,
-  }).stdout?.trim();
-const releaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim();
+const embeddedRevision = process.env.LOGSEQ_REVISION;
+const releaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA;
 if (!releaseSourceSha || !/^[0-9a-f]{40}$/.test(releaseSourceSha)) {
   throw new Error(
     "LOGSEQ_RELEASE_SOURCE_SHA must be an exact lowercase 40-hex commit SHA",
+  );
+}
+if (!embeddedRevision || !/^[0-9a-f]{40}$/.test(embeddedRevision)) {
+  throw new Error(
+    "LOGSEQ_REVISION must be an exact lowercase 40-hex commit SHA",
   );
 }
 if (embeddedRevision !== releaseSourceSha) {
@@ -256,7 +255,7 @@ for (const relativePath of [
       `packaged ${relativePath} does not exactly match staged runtime ${stagedPath}`,
     );
   }
-  if (!packagedPayload.includes(expectedRevision)) {
+  if (!containsExactDesktopSourceRevision(packagedPayload, expectedRevision)) {
     throw new Error(
       `packaged ${relativePath} does not contain current revision ${expectedRevision}`,
     );

@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createShutdownController } from "./rtc-e2e-shutdown.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -27,6 +28,7 @@ if (!supportedTasks.has(testTask)) {
 
 const children = new Set();
 const detached = process.platform !== "win32";
+let shutdownController;
 
 const getFreePort = () =>
   new Promise((resolve, reject) => {
@@ -45,6 +47,9 @@ const getFreePort = () =>
   });
 
 const startChild = (command, args) => {
+  if (shutdownController?.isShuttingDown()) {
+    throw new Error(`refusing to start ${command} after shutdown began`);
+  }
   const child = spawn(command, args, {
     cwd: e2eDir,
     detached,
@@ -85,15 +90,6 @@ const waitForExit = (child, timeoutMs) =>
     child.once("exit", onExit);
   });
 
-const stopChild = async (child) => {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
-  signalChild(child, "SIGTERM");
-  if (!(await waitForExit(child, 5_000))) {
-    signalChild(child, "SIGKILL");
-    await waitForExit(child, 5_000);
-  }
-};
-
 const runChild = (command, args) =>
   new Promise((resolve, reject) => {
     const child = startChild(command, args);
@@ -133,28 +129,45 @@ const waitForServer = async (server, port) => {
   throw new Error(`asset server did not become ready within 30s: ${url}`);
 };
 
-let shuttingDown = false;
-const shutdown = async () => {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  await Promise.all([...children].map(stopChild));
+shutdownController = createShutdownController({
+  children,
+  signalChild,
+  waitForExit,
+});
+const { shutdown } = shutdownController;
+
+let requestedExitCode;
+let fatalError;
+const requestFatalShutdown = (error, exitCode) => {
+  fatalError ??= error;
+  requestedExitCode ??= exitCode;
+  void shutdown().catch((shutdownError) => {
+    fatalError ??= shutdownError;
+  });
 };
 
 for (const [signal, exitCode] of [
   ["SIGINT", 130],
   ["SIGTERM", 143],
 ]) {
-  process.once(signal, async () => {
-    await shutdown();
-    process.exit(exitCode);
+  process.on(signal, () => {
+    requestFatalShutdown(new Error(`received ${signal}`), exitCode);
   });
 }
+process.on("uncaughtException", (error) => requestFatalShutdown(error, 1));
+process.on("unhandledRejection", (reason) =>
+  requestFatalShutdown(
+    reason instanceof Error ? reason : new Error(String(reason)),
+    1,
+  ),
+);
 
-const port = await getFreePort();
-console.log(`[rtc-e2e] task=${testTask} port=${port}`);
-const server = startChild(bbCommand, ["serve", "--port", String(port)]);
-
+let port;
+let runError;
 try {
+  port = await getFreePort();
+  console.log(`[rtc-e2e] task=${testTask} port=${port}`);
+  const server = startChild(bbCommand, ["serve", "--port", String(port)]);
   await waitForServer(server, port);
   await runChild(bbCommand, [
     testTask,
@@ -162,8 +175,22 @@ try {
     String(port),
     ...testArgs,
   ]);
+} catch (error) {
+  runError = error;
 } finally {
-  await shutdown();
+  try {
+    await shutdown();
+  } catch (error) {
+    fatalError ??= error;
+  }
 }
 
-console.log(`[rtc-e2e] PASS task=${testTask} port=${port}`);
+if (requestedExitCode !== undefined) {
+  process.exitCode = requestedExitCode;
+} else if (fatalError) {
+  throw fatalError;
+} else if (runError) {
+  throw runError;
+} else {
+  console.log(`[rtc-e2e] PASS task=${testTask} port=${port}`);
+}

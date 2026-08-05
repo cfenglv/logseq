@@ -69,6 +69,17 @@ const initialSha = capture("git", ["rev-parse", "HEAD"]);
 assertClean("before tests");
 
 run(
+  "RTC runner shutdown contract",
+  process.execPath,
+  ["--test", "scripts/test-rtc-e2e-shutdown-contract.mjs"],
+);
+run(
+  "RTC marker fail-propagation contract",
+  process.execPath,
+  ["--test", "scripts/test-rtc-marker-fail-propagation-contract.mjs"],
+);
+
+run(
   "RTC stress completion barrier contract",
   process.execPath,
   ["--test", "scripts/test-rtc-stress-completion-barrier-contract.mjs"],

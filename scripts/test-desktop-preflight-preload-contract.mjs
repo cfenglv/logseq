@@ -13,6 +13,8 @@ const repoRoot = path.resolve(
 );
 const preflightRelativePath =
   "scripts/run-desktop-release-preflight.mjs";
+const releaseSourceIdentityRelativePath =
+  "scripts/release-source-identity.mjs";
 const preloadRelativePath =
   "scripts/fixtures/electron-test-preload.cjs";
 const preflightPath = path.join(repoRoot, preflightRelativePath);
@@ -134,6 +136,10 @@ const makeProbeRoot = (name) => {
   fs.copyFileSync(
     preflightPath,
     path.join(root, preflightRelativePath),
+  );
+  fs.copyFileSync(
+    path.join(repoRoot, releaseSourceIdentityRelativePath),
+    path.join(root, releaseSourceIdentityRelativePath),
   );
   const initialized = run("git", ["init", "--quiet"], { cwd: root });
   assert.equal(initialized.status, 0, initialized.output);

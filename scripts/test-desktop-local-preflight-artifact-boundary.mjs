@@ -260,9 +260,9 @@ test("local preflight validates exact source revision before external build comm
           revision: invalidButWellFormedSha,
         },
       ],
-      ["missing release source", { revision: head }],
-      ["missing revision", { releaseSourceSha: head }],
       ["malformed source", { releaseSourceSha: "499b5dcc9cbb", revision: head }],
+      ["source with whitespace", { releaseSourceSha: `${head} `, revision: head }],
+      ["revision with whitespace", { releaseSourceSha: head, revision: ` ${head}` }],
       ["revision differs from HEAD", { releaseSourceSha: head, revision: otherSha }],
       ["source differs from HEAD", { releaseSourceSha: otherSha, revision: head }],
     ];
@@ -281,15 +281,19 @@ test("local preflight validates exact source revision before external build comm
       );
     }
 
-    const matching = probe.run({
-      releaseSourceSha: head,
-      revision: head,
-    });
-    assert.equal(
-      matching.externalCommandReached,
-      true,
-      `exact HEAD binding was rejected before the external-command control:\n${matching.output}`,
-    );
+    for (const [label, environment] of [
+      ["bare command", {}],
+      ["source only", { releaseSourceSha: head }],
+      ["revision only", { revision: head }],
+      ["exact pair", { releaseSourceSha: head, revision: head }],
+    ]) {
+      const matching = probe.run(environment);
+      assert.equal(
+        matching.externalCommandReached,
+        true,
+        `${label} was rejected before the external-command control:\n${matching.output}`,
+      );
+    }
   } finally {
     probe.dispose();
   }
