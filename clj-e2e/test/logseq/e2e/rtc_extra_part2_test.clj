@@ -224,6 +224,21 @@
       (throw (ex-info "barrier marker client write returned no durable block"
                       {:title title
                        :result block})))
+    (let [persisted-block (ls-api-call! :editor.getBlock block-uuid)
+          persisted-uuid (or (get persisted-block "uuid")
+                             (get persisted-block :uuid))
+          persisted-title (or (get persisted-block "title")
+                              (get persisted-block :title)
+                              (get persisted-block :block/title))]
+      (when-not (and (string? persisted-uuid)
+                     (re-matches block-uuid-pattern persisted-uuid)
+                     (= (string/lower-case block-uuid)
+                        (string/lower-case persisted-uuid))
+                     (= title persisted-title))
+        (throw
+         (ex-info "barrier marker client write was not durably readable"
+                  {:expected {:title title :uuid block-uuid}
+                   :result persisted-block}))))
     block))
 
 (defn- sync-by-barrier!

@@ -11,14 +11,14 @@ const repoRoot = path.resolve(
   "..",
 );
 
-test("RTC completion barrier satisfies executable quiescence contracts", () => {
+const runContractNamespace = (namespace) => {
   const result = spawnSync(
     "clojure",
     [
       "-Srepro",
       "-M:test",
       "-n",
-      "logseq.e2e.rtc-quiescence-contract-test",
+      namespace,
     ],
     {
       cwd: path.join(repoRoot, "clj-e2e"),
@@ -33,11 +33,19 @@ test("RTC completion barrier satisfies executable quiescence contracts", () => {
   assert.equal(
     result.signal,
     null,
-    `Clojure RTC contract terminated by ${result.signal}`,
+    `Clojure RTC contract ${namespace} terminated by ${result.signal}`,
   );
   assert.equal(
     result.status,
     0,
-    `Clojure RTC contract failed:\n${result.stdout}\n${result.stderr}`,
+    `Clojure RTC contract ${namespace} failed:\n${result.stdout}\n${result.stderr}`,
   );
+};
+
+test("RTC completion barrier satisfies executable quiescence contracts", () => {
+  runContractNamespace("logseq.e2e.rtc-quiescence-contract-test");
+});
+
+test("RTC marker client writes require durable read-back", () => {
+  runContractNamespace("logseq.e2e.rtc-marker-durability-contract-test");
 });

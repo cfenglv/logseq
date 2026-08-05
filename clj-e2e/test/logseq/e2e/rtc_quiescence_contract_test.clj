@@ -265,6 +265,7 @@
 (defn- run-editorless-barrier-contract
   [barrier-f]
   (let [events (atom [])
+        blocks (atom {})
         transactions (atom {:client-1 0 :client-2 0})
         no-editor (ex-info "no editor wrapper" {:phase :editorless})
         original-page1 @const/*page1
@@ -281,14 +282,24 @@
             (throw no-editor))
           (stress-var 'ls-api-call!)
           (fn [operation & args]
-            (let [title (barrier-marker-title args)]
-              (swap! events conj [:client-write w/*page* operation title])
-              (when-not title
-                (throw (ex-info "client write omitted barrier marker"
-                                {:operation operation
-                                 :args args})))
-              (swap! transactions update w/*page* inc)
-              {:uuid (str (random-uuid))}))
+            (case operation
+              :editor.appendBlockInPage
+              (let [title (barrier-marker-title args)
+                    block-uuid (str (random-uuid))]
+                (swap! events conj [:client-write w/*page* operation title])
+                (when-not title
+                  (throw (ex-info "client write omitted barrier marker"
+                                  {:operation operation
+                                   :args args})))
+                (swap! transactions update w/*page* inc)
+                (swap! blocks assoc block-uuid
+                       {"uuid" block-uuid "title" title})
+                {"uuid" block-uuid})
+
+              :editor.getBlock
+              (let [block-uuid (first args)]
+                (swap! events conj [:client-read w/*page* operation block-uuid])
+                (get @blocks block-uuid))))
           (stress-var 'page-has-block-title?) (constantly false)
           #'block/open-last-block
           (fn [& _]
@@ -600,6 +611,7 @@
   [failing-title]
   (let [failure (ex-info "barrier write failed" {:title failing-title})
         events (atom [])
+        blocks (atom {})
         transactions (atom {:client-1 0 :client-2 0})
         next-tx (atom 0)
         original-page1 @const/*page1
@@ -619,14 +631,22 @@
               (let [tx (swap! next-tx inc)]
                 (swap! transactions assoc w/*page* tx))))
           (stress-var 'ls-api-call!)
-          (fn [_operation & args]
-            (let [title (barrier-marker-title args)]
-              (swap! events conj [:write w/*page* title])
-              (if (= title failing-title)
-                (throw failure)
-                (let [tx (swap! next-tx inc)]
-                  (swap! transactions assoc w/*page* tx)
-                  {:uuid (str (random-uuid))}))))
+          (fn [operation & args]
+            (case operation
+              :editor.appendBlockInPage
+              (let [title (barrier-marker-title args)
+                    block-uuid (str (random-uuid))]
+                (swap! events conj [:write w/*page* title])
+                (if (= title failing-title)
+                  (throw failure)
+                  (let [tx (swap! next-tx inc)]
+                    (swap! transactions assoc w/*page* tx)
+                    (swap! blocks assoc block-uuid
+                           {"uuid" block-uuid "title" title})
+                    {"uuid" block-uuid})))
+
+              :editor.getBlock
+              (get @blocks (first args))))
           (stress-var 'page-has-block-title?) (constantly true)
           #'block/open-last-block (fn [])
           #'rtc/get-rtc-tx
