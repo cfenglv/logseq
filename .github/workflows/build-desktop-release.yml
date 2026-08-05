@@ -1467,12 +1467,13 @@ jobs:
             release-assets/VERSION
             release-assets/SOURCE_REVISION
             release-assets/SHA256SUMS.txt
-            release-assets/{*.zip,*.apk}
+            release-assets/*.zip
             release-assets/*.dmg
             release-assets/*.exe
             release-assets/*.yml
             release-assets/*.blockmap
             release-assets/*.AppImage
+            ${{ github.event.inputs.build-android == 'true' && 'release-assets/*.apk' || '' }}
 
   nightly-release:
     if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}

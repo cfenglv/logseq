@@ -200,7 +200,7 @@ addCase("publisher has separate protected write boundary after verifier", () => 
   assert.match(publisher, /fail_on_unmatched_files:\s*true/);
   assert.match(
     publisher,
-    /release-assets\/\{\*\.zip,\*\.apk\}/,
+    /\$\{\{ github\.event\.inputs\.build-android == 'true' && 'release-assets\/\*\.apk' \|\| '' \}\}/,
   );
   assert.doesNotMatch(publisher, /^\s*release-assets\/\*\.apk\s*$/m);
   assert.doesNotMatch(

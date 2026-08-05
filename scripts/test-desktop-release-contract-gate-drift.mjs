@@ -26,6 +26,7 @@ const requiredReleaseContracts = [
   "node ./scripts/test-desktop-runtime-packaging-contract.mjs",
   "node ./scripts/test-updater-private-material-policy-contract.mjs",
   "node ./scripts/test-local-keychain-release-signing-contract.mjs",
+  "node ./scripts/test-selfhost-optional-android-release-contract.mjs",
   "node ./scripts/test-shipit-process-outcome-contract.mjs",
   "node ./scripts/test-project-signed-macos-updater.mjs --physical-shipit-contract",
   "node ./scripts/test-desktop-preflight-preload-contract.mjs",
