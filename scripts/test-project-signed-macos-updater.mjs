@@ -1365,7 +1365,7 @@ const workflowJobSource = (workflow, jobName) => {
 };
 
 const workflowJobNames = (workflow) =>
-  [...workflow.matchAll(/^  ([a-zA-Z0-9_-]+):\n/g)].map(
+  [...workflow.matchAll(/^  ([a-zA-Z0-9_-]+):\n/gm)].map(
     ([, jobName]) => jobName,
   );
 
