@@ -75,11 +75,19 @@ const definitions = (source) => {
   return result;
 };
 
+const equalityForms = (source) =>
+  [...source.matchAll(/\(=\s/g)].map((match) => formAt(source, match.index));
+
 const calledSymbols = (source) =>
   new Set(
     [...source.matchAll(/\(([A-Za-z0-9*+!?<>=._/-]+)/g)].map(
       (match) => match[1],
     ),
+  );
+
+const calledSymbolsInOrder = (source) =>
+  [...source.matchAll(/\(([A-Za-z0-9*+!?<>=._/-]+)/g)].map(
+    (match) => ({ index: match.index, name: match[1] }),
   );
 
 const definitionClosure = (name, defs, seen = new Set()) => {
@@ -94,22 +102,17 @@ const definitionClosure = (name, defs, seen = new Set()) => {
   ].join("\n");
 };
 
-const orderedBodySlice = (form, firstCall, lastCall) => {
-  const start = form.indexOf(`(${firstCall}`);
-  const end = form.indexOf(`(${lastCall}`, start + 1);
-  return start === -1 || end === -1 ? "" : form.slice(start, end);
-};
-
 const barrierBehaviorViolations = (source) => {
   const violations = [];
+  const equalities = equalityForms(source);
   if (!source.includes("@*page1") || !source.includes("@*page2")) {
     violations.push("completion barrier must sample both RTC clients");
   }
   if (
-    !source.includes("page-sync-state") ||
-    !source.includes(":blocks")
+    !source.includes(":blocks") ||
+    !source.includes(":rtc-tx")
   ) {
-    violations.push("completion barrier must repeatedly sample both page contents");
+    violations.push("completion barrier must sample both page contents and tx state");
   }
   if (!source.includes("(loop") || !source.includes("(recur")) {
     violations.push("completion barrier must poll state instead of sleeping once");
@@ -121,14 +124,28 @@ const barrierBehaviorViolations = (source) => {
   ) {
     violations.push("completion barrier timeout must be bounded and fail closed");
   }
-  if (!source.includes("wait-timeout")) {
-    violations.push("completion barrier polling must yield between observations");
+  if (
+    !/(?:wait-timeout|Thread\/sleep|setTimeout|w\/wait-for|\((?:[A-Za-z0-9*+!?<>=._/-]*(?:wait|sleep|pause|yield|pace|tick|cadence)[A-Za-z0-9*+!?<>=._/-]*)\b)/i.test(
+      source,
+    )
+  ) {
+    violations.push(
+      "completion barrier polling must use a bounded non-busy cadence",
+    );
+  }
+  const hasCausalTrigger =
+    /(?:rtc\/)?with-wait-tx-updated/.test(source) ||
+    (/rtc\/get-rtc-tx/.test(source) &&
+      /rtc\/wait-(?:current-)?tx(?:-update-to|-synced)?/.test(source));
+  if (!hasCausalTrigger) {
+    violations.push("completion barrier must retain a real RTC causal trigger");
   }
   if (
     !source.includes(":local-tx") ||
     !source.includes(":remote-tx") ||
-    (source.match(/:local-tx\b/g) ?? []).length < 2 ||
-    (source.match(/:remote-tx\b/g) ?? []).length < 2
+    equalities.filter(
+      (form) => form.includes(":local-tx") && form.includes(":remote-tx"),
+    ).length < 2
   ) {
     violations.push("completion barrier must require local/remote tx convergence");
   }
@@ -139,11 +156,26 @@ const barrierBehaviorViolations = (source) => {
   ) {
     violations.push("completion barrier must require equal final page contents");
   }
-  if (
-    !/(?:previous|prior|stable)/i.test(source) ||
-    !/\(=\s+(?:previous|prior|last-[^\s)]+)\s+[^)]+\)/i.test(source) ||
-    !/\(>=\s+[^\s)]*stable[^\s)]*\s+[2-9]\d*\)/i.test(source)
-  ) {
+  const stabilityTerms =
+    /(?:previous|prior|last|stable|unchanged|quiescent|consecutive)/i;
+  const hasRepeatedStateEquality = equalities.some(
+    (form) =>
+      stabilityTerms.test(form) &&
+      !form.includes(":local-tx") &&
+      !form.includes(":remote-tx") &&
+      !form.includes(":blocks"),
+  );
+  const hasStableThreshold =
+    /\((?:>=|=|>)\s+[^\s)]*(?:stable|unchanged|quiescent|consecutive)[^\s)]*\s+(?:[2-9]\d*|[^\s)]*(?:stable|unchanged|quiescent|consecutive)[^\s)]*)\)/i.test(
+      source,
+    ) ||
+    (/\(zero\?\s+[^\s)]*(?:stable|unchanged|quiescent|consecutive)[^\s)]*\)/i.test(
+      source,
+    ) &&
+      /[^\s\[]*(?:stable|unchanged|quiescent|consecutive)[^\s\]]*\s+[2-9]\d*/i.test(
+        source,
+      ));
+  if (!hasRepeatedStateEquality || !hasStableThreshold) {
     violations.push(
       "completion barrier must require at least two identical consecutive observations",
     );
@@ -164,19 +196,43 @@ const completionContractViolations = (
     defs.set(`rtc/${name}`, form);
   }
   const stress = defs.get("online-two-clients-undo-redo-stress-test") ?? "";
-  const afterSync = orderedBodySlice(
-    stress,
-    "sync-by-trigger!",
-    "assert-two-pages-synced!",
+  const assertionIndex = stress.indexOf("(assert-two-pages-synced!");
+  const lastParallelIndex = stress.lastIndexOf(
+    "(run-two-clients-in-parallel!",
+    assertionIndex,
   );
-  const barrierCandidates = new Set([
-    "sync-by-trigger!",
-    ...[...calledSymbols(afterSync)].filter((name) => defs.has(name)),
-  ]);
-  const barrierAnalyses = [...barrierCandidates].map((name) => ({
-    name,
-    source: `${afterSync}\n${definitionClosure(name, defs)}`,
-  }));
+  const synchronizationStart =
+    lastParallelIndex === -1
+      ? 0
+      : lastParallelIndex + formAt(stress, lastParallelIndex).length;
+  const synchronizationPhase =
+    assertionIndex === -1
+      ? ""
+      : stress.slice(synchronizationStart, assertionIndex);
+  const barrierCandidates = [
+    ...new Set(
+      calledSymbolsInOrder(synchronizationPhase)
+        .map(({ name }) => name)
+        .filter((name) => defs.has(name)),
+    ),
+  ];
+  const combinedBarrierSource = [
+    synchronizationPhase,
+    ...barrierCandidates.map((name) => definitionClosure(name, defs)),
+  ].join("\n");
+  const barrierAnalyses = [
+    {
+      name:
+        barrierCandidates.length > 0
+          ? barrierCandidates.join(" -> ")
+          : "post-operation synchronization phase",
+      source: combinedBarrierSource,
+    },
+    ...barrierCandidates.map((name) => ({
+      name,
+      source: `${synchronizationPhase}\n${definitionClosure(name, defs)}`,
+    })),
+  ];
   const safeBarrier = barrierAnalyses.find(
     ({ source: barrierSource }) =>
       barrierBehaviorViolations(barrierSource).length === 0,
@@ -198,13 +254,15 @@ const completionContractViolations = (
   }
 
   const contentAssertion = defs.get("assert-two-pages-synced!") ?? "";
+  const assertionTxEqualities = equalityForms(contentAssertion).filter(
+    (form) => form.includes(":local-tx") && form.includes(":remote-tx"),
+  );
   if (
     !stress.includes("(assert-two-pages-synced!") ||
     !/\(is\s+\(=\s+\(:blocks\s+[^)]+\)\s+\(:blocks\s+[^)]+\)\)/.test(
       contentAssertion,
     ) ||
-    (contentAssertion.match(/\(:local-tx\b/g) ?? []).length < 2 ||
-    (contentAssertion.match(/\(:remote-tx\b/g) ?? []).length < 2
+    assertionTxEqualities.length < 2
   ) {
     violations.push("stress test must retain original content and both-client tx assertions");
   }
@@ -217,9 +275,11 @@ const completionContractViolations = (
     violations.push("stress test must retain severe RTC console-log assertions");
   }
   if (
-    !stress.includes("(sync-by-trigger!") ||
-    !source.includes("rtc/get-rtc-tx") ||
-    !runner.includes('"rtc-extra-part2-test"')
+    !runner.includes('"rtc-extra-part2-test"') ||
+    !(runner.match(/await\s+runChild\(/g) ?? []).length ||
+    !prepush.includes(
+      '["scripts/run-rtc-e2e.mjs", "rtc-extra-part2-test"]',
+    )
   ) {
     violations.push("contract must continue through the real RTC E2E path");
   }
@@ -235,7 +295,7 @@ const completionContractViolations = (
     violations.push("runner and prepush gate must not retry a failed RTC shard");
   }
   if (
-    /\(catch\s+(?:Throwable|Exception)\b/.test(afterSync) ||
+    /\(catch\s+(?:Throwable|Exception)\b/.test(synchronizationPhase) ||
     /\(try[\s\S]{0,1200}\(assert-two-pages-synced![\s\S]{0,500}\(catch\s+(?:Throwable|Exception)/.test(
       stress,
     )
@@ -252,7 +312,9 @@ const safeFixture = `
    "db-sync/apply-remote-txs-failed"])
 (defn- page-sync-state [page]
   {:rtc-tx (rtc/get-rtc-tx) :blocks (get-blocks page)})
-(defn- sync-by-trigger! [] (rtc/get-rtc-tx))
+(defn- sync-by-trigger! []
+  (rtc/with-wait-tx-updated
+    (new-block-safe! "completion-fence")))
 (defn- wait-for-two-client-fixpoint! []
   (loop [attempts 20 previous nil stable-samples 0]
     (when (zero? attempts)
@@ -269,7 +331,7 @@ const safeFixture = `
                             0)]
       (if (>= stable-samples' 2)
         current
-        (do (util/wait-timeout 100)
+        (do (Thread/sleep 100)
             (recur (dec attempts) current stable-samples'))))))
 (defn- assert-two-pages-synced! []
   (let [s1 (page-sync-state @*page1) s2 (page-sync-state @*page2)
@@ -300,12 +362,13 @@ const localBarrierForm = definitions(safeFixture).get(
 );
 const safeExternalHelperFixture = safeFixture
   .replace(localBarrierForm, "")
+  .replaceAll("sync-by-trigger!", "establish-causal-watermark!")
   .replace(
     "(wait-for-two-client-fixpoint!)",
-    "(rtc/wait-for-two-client-fixpoint! page-sync-state @*page1 @*page2)",
+    "(rtc/wait-for-two-client-fixpoint! page-sync-state #(Thread/sleep 100) @*page1 @*page2)",
   );
 const safeExternalRtcHelpers = `
-(defn wait-for-two-client-fixpoint! [sample page1 page2]
+(defn wait-for-two-client-fixpoint! [sample cadence page1 page2]
   (loop [attempts 20 previous nil stable-samples 0]
     (when (zero? attempts)
       (throw (ex-info "completion barrier timeout" {:attempts 20})))
@@ -321,9 +384,27 @@ const safeExternalRtcHelpers = `
                             0)]
       (if (>= stable-samples' 2)
         current
-        (do (util/wait-timeout 100)
+        (do (cadence)
             (recur (dec attempts) current stable-samples'))))))
 `;
+const renamedFixture = safeFixture
+  .replaceAll("sync-by-trigger!", "establish-causal-watermark!")
+  .replaceAll(
+    "wait-for-two-client-fixpoint!",
+    "observe-two-client-fixpoint!",
+  );
+const safeRenamedIndirectFixture = renamedFixture
+  .replace(
+    "(deftest online-two-clients-undo-redo-stress-test",
+    `(defn- settle-after-concurrent-ops! []
+  (establish-causal-watermark!)
+  (observe-two-client-fixpoint!))
+(deftest online-two-clients-undo-redo-stress-test`,
+  )
+  .replace(
+    "  (establish-causal-watermark!)\n  (observe-two-client-fixpoint!)",
+    "  (settle-after-concurrent-ops!)",
+  );
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -390,6 +471,17 @@ test("contract accepts an equivalent shared RTC helper barrier", () => {
   );
 });
 
+test("contract discovers renamed causal triggers through helper indirection", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeRenamedIndirectFixture,
+      safeRunner,
+      safePrepush,
+    ),
+    [],
+  );
+});
+
 test("contract rejects unsafe completion and assertion mutations", () => {
   const mutations = [
     [
@@ -436,6 +528,12 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safePrepush,
     ],
     [
+      "canonical real RTC runner path replaced",
+      safeFixture,
+      safeRunner.replace("rtc-extra-part2-test", "synthetic-rtc-test"),
+      safePrepush.replace("rtc-extra-part2-test", "synthetic-rtc-test"),
+    ],
+    [
       "timeout swallowed",
       safeFixture.replace(
         '(throw (ex-info "completion barrier timeout" {:attempts 20}))',
@@ -479,6 +577,25 @@ test("contract rejects unsafe completion and assertion mutations", () => {
     [
       "real RTC trigger removed",
       safeFixture.replace("(sync-by-trigger!)", "nil"),
+      safeRunner,
+      safePrepush,
+    ],
+    [
+      "causal trigger primitive bypassed",
+      safeFixture.replace(
+        `(rtc/with-wait-tx-updated
+    (new-block-safe! "completion-fence"))`,
+        '(new-block-safe! "completion-fence")',
+      ),
+      safeRunner,
+      safePrepush,
+    ],
+    [
+      "renamed causal helper bypassed through indirection",
+      safeRenamedIndirectFixture.replace(
+        "  (establish-causal-watermark!)\n",
+        "",
+      ),
       safeRunner,
       safePrepush,
     ],
