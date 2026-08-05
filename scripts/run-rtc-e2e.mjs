@@ -11,7 +11,30 @@ const repoRoot = path.resolve(
   "..",
 );
 const e2eDir = path.join(repoRoot, "clj-e2e");
-const bbCommand = process.platform === "win32" ? "bb.exe" : "bb";
+const defaultBbCommand = process.platform === "win32" ? "bb.exe" : "bb";
+const bbInvocation = (() => {
+  const encoded = process.env.LOGSEQ_RTC_E2E_BB_COMMAND;
+  if (!encoded) return [defaultBbCommand];
+  let parsed;
+  try {
+    parsed = JSON.parse(encoded);
+  } catch (error) {
+    throw new Error("LOGSEQ_RTC_E2E_BB_COMMAND must be a JSON command array", {
+      cause: error,
+    });
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length === 0 ||
+    !parsed.every((part) => typeof part === "string" && part.length > 0)
+  ) {
+    throw new Error(
+      "LOGSEQ_RTC_E2E_BB_COMMAND must contain non-empty command tokens",
+    );
+  }
+  return parsed;
+})();
+const [bbCommand, ...bbCommandPrefix] = bbInvocation;
 const testTask = process.argv[2];
 const testArgs = process.argv.slice(3);
 const supportedTasks = new Set([
@@ -175,9 +198,15 @@ let runError;
 try {
   port = await getFreePort();
   console.log(`[rtc-e2e] task=${testTask} port=${port}`);
-  const server = startChild(bbCommand, ["serve", "--port", String(port)]);
+  const server = startChild(bbCommand, [
+    ...bbCommandPrefix,
+    "serve",
+    "--port",
+    String(port),
+  ]);
   await waitForServer(server, port);
   await runChild(bbCommand, [
+    ...bbCommandPrefix,
     testTask,
     "--port",
     String(port),

@@ -551,7 +551,7 @@ const assertEntrypointEquivalence = () => {
 
 const createBbShim = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-ci-shim-"));
-  const executable = path.join(root, process.platform === "win32" ? "bb.cmd" : "bb");
+  const executable = path.join(root, "bb-shim.cjs");
   const marker = path.join(root, "calls.log");
   const preload = path.join(root, "no-network-preload.cjs");
   const shutdownMarker = path.join(root, "shutdown.log");
@@ -618,7 +618,10 @@ const runRtcWrapperWithFakeTask = (task, exitCode) => {
       encoding: "utf8",
       env: {
         ...process.env,
-        PATH: `${root}${path.delimiter}${process.env.PATH}`,
+        LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([
+          process.execPath,
+          path.join(root, "bb-shim.cjs"),
+        ]),
         NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${preload}`.trim(),
         RTC_FAKE_MARKER: marker,
         RTC_FAKE_SHUTDOWN_MARKER: shutdownMarker,
@@ -690,9 +693,18 @@ const processExists = (pid) => {
   }
 };
 
+const forceKillProcess = (pid) => {
+  const target = process.platform === "win32" ? pid : -pid;
+  try {
+    process.kill(target, "SIGKILL");
+  } catch (error) {
+    if (error?.code !== "ESRCH") throw error;
+  }
+};
+
 const createTermIgnoringBbShim = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-term-shim-"));
-  const executable = path.join(root, process.platform === "win32" ? "bb.cmd" : "bb");
+  const executable = path.join(root, "bb-shim.cjs");
   const preload = path.join(root, "no-network-preload.cjs");
   const serverPid = path.join(root, "server.pid");
   const serverTerm = path.join(root, "server.term");
@@ -740,13 +752,12 @@ if (task === "serve") {
 }
 `,
   );
-  fs.chmodSync(executable, 0o755);
   return { executable, preload, root, serverPid, serverTerm, testExited };
 };
 
 const createStartupFailureBbShim = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-startup-shim-"));
-  const executable = path.join(root, process.platform === "win32" ? "bb.cmd" : "bb");
+  const executable = path.join(root, "bb-shim.cjs");
   const preload = path.join(root, "startup-failure-preload.cjs");
   const events = path.join(root, "cleanup-events.log");
   const serverPid = path.join(root, "server.pid");
@@ -760,7 +771,7 @@ const net = require("node:net");
 const { syncBuiltinESMExports } = require("node:module");
 const originalSpawn = childProcess.spawn;
 childProcess.spawn = (command, args, options) => {
-  if (args?.[0] === "serve") return originalSpawn(command, args, options);
+  if (args?.includes("serve")) return originalSpawn(command, args, options);
   return originalSpawn(process.env.RTC_MISSING_COMMAND, args, options);
 };
 process.on("uncaughtException", () => {
@@ -809,13 +820,16 @@ process.on("SIGTERM", () => {
 setInterval(() => {}, 1000);
 `,
   );
-  fs.chmodSync(executable, 0o755);
   return { events, executable, missingCommand, preload, root, serverPid };
 };
 
 const runBabashkaWrapperWithFakeRunner = (task, exitCode) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-bb-entrypoint-"));
-  const executable = path.join(root, "node");
+  const executable = path.join(
+    root,
+    process.platform === "win32" ? "node.cmd" : "node",
+  );
+  const nodeShim = path.join(root, "node-shim.cjs");
   const marker = path.join(root, "calls.log");
   const canonicalTask = requiredTasks[babashkaTaskNames.indexOf(task)];
   const bbFixture = path.join(root, "bb.edn");
@@ -824,13 +838,26 @@ const runBabashkaWrapperWithFakeRunner = (task, exitCode) => {
     `{:tasks {${task} {:task (shell "node" "../scripts/run-rtc-e2e.mjs" "${canonicalTask}")}}}`,
   );
   fs.writeFileSync(
-    executable,
-    `#!/bin/sh
-printf '%s\\n' "$*" >> "$RTC_FAKE_MARKER"
-exit "$RTC_FAKE_RUNNER_EXIT"
+    nodeShim,
+    `const fs = require("node:fs");
+fs.appendFileSync(process.env.RTC_FAKE_MARKER, process.argv.slice(2).join(" ") + "\\n");
+process.exit(Number(process.env.RTC_FAKE_RUNNER_EXIT));
 `,
   );
-  fs.chmodSync(executable, 0o755);
+  if (process.platform === "win32") {
+    fs.writeFileSync(
+      executable,
+      `@echo off\r\n"${process.execPath}" "%~dp0node-shim.cjs" %*\r\n`,
+    );
+  } else {
+    fs.writeFileSync(
+      executable,
+      `#!/bin/sh
+exec "${process.execPath}" "${nodeShim}" "$@"
+`,
+    );
+    fs.chmodSync(executable, 0o755);
+  }
   const result = spawnSync("bb", ["-f", bbFixture, task], {
     cwd: repoRoot,
     encoding: "utf8",
@@ -920,7 +947,7 @@ test(
   },
 );
 
-test("SIGTERM waits for KILL escalation of a TERM-ignoring server group", async () => {
+test("runner waits for platform-appropriate server cleanup", async () => {
   const fixture = createTermIgnoringBbShim();
   let serverPid;
   let output = "";
@@ -931,8 +958,11 @@ test("SIGTERM waits for KILL escalation of a TERM-ignoring server group", async 
       cwd: repoRoot,
       env: {
         ...process.env,
+        LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([
+          process.execPath,
+          fixture.executable,
+        ]),
         NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${fixture.preload}`.trim(),
-        PATH: `${fixture.root}${path.delimiter}${process.env.PATH}`,
         RTC_SERVER_PID: fixture.serverPid,
         RTC_SERVER_TERM: fixture.serverTerm,
         RTC_TEST_EXITED: fixture.testExited,
@@ -952,21 +982,21 @@ test("SIGTERM waits for KILL escalation of a TERM-ignoring server group", async 
     wrapper.once("exit", (code, signal) => resolve({ code, signal }));
   });
   try {
+    const ready = () =>
+      fs.existsSync(fixture.testExited) &&
+      (process.platform === "win32" || fs.existsSync(fixture.serverTerm));
     try {
-      await waitFor(
-        () => fs.existsSync(fixture.testExited) && fs.existsSync(fixture.serverTerm),
-        5_000,
-        "test exit and initial server TERM",
-      );
+      await waitFor(ready, 5_000, "test exit and initial server cleanup");
     } catch (error) {
       error.message += ` (testExited=${fs.existsSync(fixture.testExited)}, serverTerm=${fs.existsSync(fixture.serverTerm)}):\n${output}`;
       throw error;
     }
     serverPid = Number(fs.readFileSync(fixture.serverPid, "utf8"));
     assert.ok(Number.isInteger(serverPid) && serverPid > 1);
-    assert.equal(processExists(serverPid), true, "server did not ignore TERM");
-
-    wrapper.kill("SIGTERM");
+    if (process.platform !== "win32") {
+      assert.equal(processExists(serverPid), true, "server did not ignore TERM");
+      wrapper.kill("SIGTERM");
+    }
     let exitTimer;
     const exit = await Promise.race([
       wrapperExit,
@@ -980,18 +1010,14 @@ test("SIGTERM waits for KILL escalation of a TERM-ignoring server group", async 
     assert.equal(
       processExists(serverPid),
       false,
-      `wrapper exited before killing its server process group (${JSON.stringify(exit)}):\n${output}`,
+      `wrapper exited before completing server cleanup (${JSON.stringify(exit)}):\n${output}`,
     );
   } finally {
     if (wrapper.exitCode === null && wrapper.signalCode === null) {
       wrapper.kill("SIGKILL");
     }
     if (serverPid && processExists(serverPid)) {
-      try {
-        process.kill(-serverPid, "SIGKILL");
-      } catch (error) {
-        if (error?.code !== "ESRCH") throw error;
-      }
+      forceKillProcess(serverPid);
     }
     fs.rmSync(fixture.root, { force: true, recursive: true });
   }
@@ -1009,8 +1035,11 @@ test("startup failures preserve diagnostics after awaited cleanup", async () => 
         encoding: "utf8",
         env: {
           ...process.env,
+          LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([
+            process.execPath,
+            fixture.executable,
+          ]),
           NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${fixture.preload}`.trim(),
-          PATH: `${fixture.root}${path.delimiter}${process.env.PATH}`,
           RTC_CLEANUP_EVENTS: fixture.events,
           RTC_MISSING_COMMAND: fixture.missingCommand,
           RTC_SERVER_PID: fixture.serverPid,
@@ -1045,11 +1074,7 @@ test("startup failures preserve diagnostics after awaited cleanup", async () => 
     );
   } finally {
     if (serverPid && processExists(serverPid)) {
-      try {
-        process.kill(-serverPid, "SIGKILL");
-      } catch (error) {
-        if (error?.code !== "ESRCH") throw error;
-      }
+      forceKillProcess(serverPid);
     }
     fs.rmSync(fixture.root, { force: true, recursive: true });
   }
