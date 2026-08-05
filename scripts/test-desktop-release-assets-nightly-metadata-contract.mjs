@@ -207,6 +207,74 @@ const parseChecksumNames = (fixture) =>
     .map((line) => line.match(/^[0-9a-f]{64} {2}(.+)$/)?.[1])
     .sort();
 
+test("Android-disabled release accepts the desktop-only artifact set", () => {
+  const fixture = createFixture(stableVersion);
+  try {
+    const result = runVerifier(
+      fixture,
+      "--android-enabled",
+      "false",
+      "--write-checksums",
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(
+      parseChecksumNames(fixture),
+      expectedArtifactNames(stableVersion),
+    );
+  } finally {
+    fixture.dispose();
+  }
+});
+
+test("Android-enabled release fails closed when its versioned APK is absent", () => {
+  const fixture = createFixture(stableVersion);
+  try {
+    const result = runVerifier(fixture, "--android-enabled", "true");
+    assertFailsClosed(
+      result,
+      /release artifact set mismatch/,
+      /Logseq-android-2\.0\.1-selfhost\.5\.apk/,
+    );
+  } finally {
+    fixture.dispose();
+  }
+});
+
+test("Android-enabled release requires and checksums the exact versioned APK", () => {
+  const fixture = createFixture(stableVersion);
+  const apkName = `Logseq-android-${stableVersion}.apk`;
+  try {
+    fs.writeFileSync(path.join(fixture.root, apkName), "signed APK fixture\n");
+    const result = runVerifier(
+      fixture,
+      "--android-enabled",
+      "true",
+      "--write-checksums",
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(
+      parseChecksumNames(fixture),
+      [...expectedArtifactNames(stableVersion), apkName].sort(),
+    );
+  } finally {
+    fixture.dispose();
+  }
+});
+
+test("Android-disabled release rejects an unexpected APK", () => {
+  const fixture = createFixture(stableVersion);
+  try {
+    fs.writeFileSync(
+      path.join(fixture.root, `Logseq-android-${stableVersion}.apk`),
+      "unexpected APK fixture\n",
+    );
+    const result = runVerifier(fixture, "--android-enabled", "false");
+    assertFailsClosed(result, /release artifact set mismatch/, /unexpected=/);
+  } finally {
+    fixture.dispose();
+  }
+});
+
 test("nightly preflight recognizes both architecture-specific selfhost macOS metadata files", () => {
   const fixture = createFixture(nightlyVersion);
   try {

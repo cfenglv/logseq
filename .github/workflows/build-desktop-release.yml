@@ -1321,8 +1321,8 @@ jobs:
           cat "${RUNNER_TEMP}/desktop-release-assets/SHA256SUMS.txt"
 
   selfhost-release-signing:
-    if: ${{ github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.release-rehearsal-gate.outputs.source-ref && github.sha == needs.release-rehearsal-gate.outputs.source-sha && contains(needs.release-assets-preflight.outputs.version, '-selfhost.') && !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}
-    needs: [ release-assets-preflight, release-rehearsal-gate ]
+    if: ${{ always() && needs.release-assets-preflight.result == 'success' && needs.release-rehearsal-gate.result == 'success' && (github.event.inputs.build-android != 'true' || needs.build-android.result == 'success') && github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.release-rehearsal-gate.outputs.source-ref && github.sha == needs.release-rehearsal-gate.outputs.source-sha && contains(needs.release-assets-preflight.outputs.version, '-selfhost.') && !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}
+    needs: [ release-assets-preflight, release-rehearsal-gate, build-android ]
     runs-on: macos-14
     timeout-minutes: 20
     environment: selfhost-release-signing
@@ -1360,6 +1360,7 @@ jobs:
           node scripts/verify-desktop-release-assets.mjs \
             --dir "${RUNNER_TEMP}/selfhost-release-assets" \
             --version "$version" \
+            --android-enabled "${{ github.event.inputs.build-android }}" \
             --write-checksums
           for arch in arm64 x64; do
             metadata_name="$(node resources/selfhost-updater-version.mjs macos-metadata-name "$version" "$arch")"
@@ -1423,6 +1424,7 @@ jobs:
           node scripts/verify-finalized-selfhost-release.mjs \
             --dir "${RUNNER_TEMP}/selfhost-finalized-release-assets" \
             --source-revision "${{ needs.release-rehearsal-gate.outputs.source-sha }}" \
+            --android-enabled "${{ github.event.inputs.build-android }}" \
             --version "${{ needs.selfhost-release-signing.outputs.version }}"
 
   selfhost-release:
@@ -1465,13 +1467,12 @@ jobs:
             release-assets/VERSION
             release-assets/SOURCE_REVISION
             release-assets/SHA256SUMS.txt
-            release-assets/*.zip
+            release-assets/{*.zip,*.apk}
             release-assets/*.dmg
             release-assets/*.exe
             release-assets/*.yml
             release-assets/*.blockmap
             release-assets/*.AppImage
-            release-assets/*.apk
 
   nightly-release:
     if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}

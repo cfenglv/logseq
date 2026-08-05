@@ -31,16 +31,26 @@ const parseArgs = (argv) => {
     return value;
   };
   return Object.freeze({
+    androidEnabled: values.get("--android-enabled"),
     dir: path.resolve(required("--dir")),
     sourceRevision: required("--source-revision"),
     version: required("--version"),
   });
 };
 
-const verifyCompleteAssets = ({ dir, version }) => {
+const verifyCompleteAssets = ({ androidEnabled, dir, version }) => {
   if (!fs.existsSync(path.join(dir, "SHA256SUMS.txt"))) {
     throw new Error("finalized release artifact is missing SHA256SUMS.txt");
   }
+  if (
+    androidEnabled !== undefined &&
+    androidEnabled !== "true" &&
+    androidEnabled !== "false"
+  ) {
+    throw new Error("--android-enabled must be true or false");
+  }
+  const androidArgs =
+    androidEnabled === undefined ? [] : ["--android-enabled", androidEnabled];
   const result = spawnSync(
     process.execPath,
     [
@@ -52,6 +62,7 @@ const verifyCompleteAssets = ({ dir, version }) => {
       "--require-release-notes",
       "--release-notes-root",
       repoRoot,
+      ...androidArgs,
     ],
     {
       cwd: repoRoot,
@@ -71,12 +82,14 @@ const verifyCompleteAssets = ({ dir, version }) => {
 };
 
 const main = () => {
-  const { dir, sourceRevision, version } = parseArgs(process.argv.slice(2));
+  const { androidEnabled, dir, sourceRevision, version } = parseArgs(
+    process.argv.slice(2),
+  );
   const parsed = parseSelfhostProjectVersion(version);
   if (parsed.nightlyDate !== undefined) {
     throw new Error("finalized stable/beta release cannot be a nightly version");
   }
-  verifyCompleteAssets({ dir, version });
+  verifyCompleteAssets({ androidEnabled, dir, version });
   verifySourceRevision({ dir, sourceRevision });
   const architectures = ["arm64", "x64"];
   for (const arch of architectures) {

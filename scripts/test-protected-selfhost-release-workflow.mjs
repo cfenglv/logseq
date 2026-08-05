@@ -78,7 +78,14 @@ addCase("protected signer is exact-ref workflow_dispatch stable/beta only", () =
   }
   assert.match(
     signer,
-    /needs:\s*\[\s*release-assets-preflight,\s*release-rehearsal-gate\s*\]/,
+    /needs:\s*\[\s*release-assets-preflight,\s*release-rehearsal-gate,\s*build-android\s*\]/,
+  );
+  assert.match(signer, /always\(\)/);
+  assert.match(signer, /needs\.release-assets-preflight\.result == 'success'/);
+  assert.match(signer, /needs\.release-rehearsal-gate\.result == 'success'/);
+  assert.match(
+    signer,
+    /github\.event\.inputs\.build-android != 'true' \|\| needs\.build-android\.result == 'success'/,
   );
   assert.match(signer, /runs-on:\s*macos-/);
   assert.match(signer, /environment:\s*selfhost-release-signing/);
@@ -120,6 +127,10 @@ addCase("signer merges six-platform candidates into one finalized artifact", () 
   assert.match(signer, /pattern:\s*logseq-\*-builds/);
   assert.match(signer, /merge-multiple:\s*true/);
   assert.match(signer, /verify-desktop-release-assets\.mjs/);
+  assert.match(
+    signer,
+    /--android-enabled\s+"\$\{\{ github\.event\.inputs\.build-android \}\}"/,
+  );
   assert.match(signer, /verify-unsigned-macos-project-update-candidate\.mjs/);
   assert.match(signer, /for arch in arm64 x64/);
   assert.equal(
@@ -142,6 +153,10 @@ addCase("secretless verifier rechecks complete assets and signatures", () => {
   assert.doesNotMatch(verifier, /environment:|secrets\./);
   assert.match(verifier, /name:\s*selfhost-finalized-release-assets/);
   assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
+  assert.match(
+    verifier,
+    /--android-enabled\s+"\$\{\{ github\.event\.inputs\.build-android \}\}"/,
+  );
   assert.match(
     verifier,
     /--source-revision[\s\S]{0,160}release-rehearsal-gate\.outputs\.source-sha/,
@@ -182,6 +197,12 @@ addCase("publisher has separate protected write boundary after verifier", () => 
   assert.match(publisher, /uses:\s*softprops\/action-gh-release@v2/);
   assert.match(publisher, /name:\s*selfhost-finalized-release-assets/);
   assert.match(publisher, /release-assets\/SOURCE_REVISION/);
+  assert.match(publisher, /fail_on_unmatched_files:\s*true/);
+  assert.match(
+    publisher,
+    /release-assets\/\{\*\.zip,\*\.apk\}/,
+  );
+  assert.doesNotMatch(publisher, /^\s*release-assets\/\*\.apk\s*$/m);
   assert.doesNotMatch(
     publisher,
     /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64|finalize-github-macos/,

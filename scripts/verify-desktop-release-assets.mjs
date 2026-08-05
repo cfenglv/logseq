@@ -26,6 +26,7 @@ const parseArgs = (argv) => {
 const args = parseArgs(process.argv.slice(2));
 const releaseDir = path.resolve(args.dir || ".");
 const version = args.version?.trim();
+const androidEnabled = args["android-enabled"];
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -33,6 +34,13 @@ const repoRoot = path.resolve(
 
 if (!version) {
   throw new Error("--version is required");
+}
+if (
+  androidEnabled !== undefined &&
+  androidEnabled !== "true" &&
+  androidEnabled !== "false"
+) {
+  throw new Error("--android-enabled must be true or false");
 }
 if (version.includes("+")) {
   throw new Error(
@@ -72,9 +80,15 @@ const desktopArtifactNames = [
   ...macosMetadataNames,
   "VERSION",
 ];
-const androidArtifactNames = fs
+const discoveredAndroidArtifactNames = fs
   .readdirSync(releaseDir)
   .filter((name) => name.endsWith(".apk"));
+const androidArtifactNames =
+  androidEnabled === "true"
+    ? [`Logseq-android-${version}.apk`]
+    : androidEnabled === "false"
+      ? []
+      : discoveredAndroidArtifactNames;
 const artifactNames = [
   ...desktopArtifactNames,
   ...androidArtifactNames,
