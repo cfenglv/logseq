@@ -366,10 +366,30 @@ const hasTimedStableWindow = (source) => {
   const durationOptions = callSiteDurationOptions(source, bindings);
   const sourceDefinitions = definitions(source);
   const invokedFunctionParameters = new Set();
+  const trustedClockParameters = new Set();
   for (const form of sourceDefinitions.values()) {
     const invoked = calledSymbols(form);
-    for (const parameter of definitionParameters(form)) {
+    const parameters = definitionParameters(form);
+    for (const parameter of parameters) {
       if (invoked.has(parameter)) invokedFunctionParameters.add(parameter);
+      if (!parameter.startsWith("{")) continue;
+      const destructuring = splitTopLevelItems(parameter);
+      const defaultsIndex = destructuring.indexOf(":or");
+      const defaults = destructuring[defaultsIndex + 1];
+      if (defaultsIndex === -1 || !defaults?.startsWith("{")) continue;
+      const defaultItems = splitTopLevelItems(defaults);
+      for (let index = 0; index + 1 < defaultItems.length; index += 2) {
+        const name = defaultItems[index];
+        const defaultValue = defaultItems[index + 1];
+        if (!/(?:time|clock|now)/i.test(name) || !invoked.has(name)) continue;
+        const defaultClosure =
+          bareSymbol.test(defaultValue) && sourceDefinitions.has(defaultValue) ?
+            definitionClosure(defaultValue, sourceDefinitions) :
+            definitionClosureFromSource(defaultValue, sourceDefinitions);
+        if (/(?:System\/nanoTime|performance[/.]now)/.test(defaultClosure)) {
+          trustedClockParameters.add(name);
+        }
+      }
     }
   }
   const symbolPattern = (name) =>
@@ -448,9 +468,14 @@ const hasTimedStableWindow = (source) => {
   }
   const timeBindings = new Set(
     [...bindings]
-      .filter(([, value]) =>
-        /(?:monotonic|nanoTime|performance[/.]now)/i.test(value),
-      )
+      .filter(([, value]) => {
+        if (/(?:monotonic|nanoTime|performance[/.]now)/i.test(value)) {
+          return true;
+        }
+        if (!value?.startsWith("(")) return false;
+        const items = splitTopLevelItems(value);
+        return items.length === 1 && trustedClockParameters.has(items[0]);
+      })
       .map(([name]) => name),
   );
   const containsTime = (text) =>
@@ -1144,6 +1169,19 @@ const safeMetadataDurationFixture = safeOptionTimedWindowFixture.replace(
   {:stable-ms stable-window-ms
    :timeout-ms timeout-window-ms})`,
 );
+const safeInjectedClockFixture = safeMetadataDurationFixture.replace(
+  "   :timeout-ms timeout-window-ms})",
+  "   :timeout-ms timeout-window-ms\n   :clock-fn #(System/nanoTime)})",
+);
+const safeInjectedClockRtcHelpers = safeOrderedExhaustiveCondRtcHelpers
+  .replace(
+    "[sample acceptable? cadence options]",
+    `[sample acceptable? cadence
+   {:keys [clock-fn]
+    :or {clock-fn #(quot (System/nanoTime) 1000000)}
+    :as options}]`,
+  )
+  .replaceAll("(util/monotonic-time-ms)", "(clock-fn)");
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -1335,6 +1373,18 @@ test("contract accepts an ordered exhaustive stability cond", () => {
       safeRunner,
       safePrepush,
       safeOrderedExhaustiveCondRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts an injected clock with a monotonic default", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers,
     ),
     [],
   );
@@ -1959,6 +2009,66 @@ test("contract rejects unsafe completion and assertion mutations", () => {
         "matches-prior? (and quiet-enough? (= prior-view fresh-view))",
         "matches-prior? (= prior-view fresh-view)",
       ),
+    ],
+    [
+      "injected clock parameter has no controlled default",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers.replace(
+        `   {:keys [clock-fn]
+    :or {clock-fn #(quot (System/nanoTime) 1000000)}
+    :as options}`,
+        `   {:keys [clock-fn]
+    :as options}`,
+      ),
+    ],
+    [
+      "injected clock parameter defaults to a constant",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers.replace(
+        "{clock-fn #(quot (System/nanoTime) 1000000)}",
+        "{clock-fn 0}",
+      ),
+    ],
+    [
+      "injected clock parameter defaults to wall-clock time",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers.replace(
+        "#(quot (System/nanoTime) 1000000)",
+        "#(System/currentTimeMillis)",
+      ),
+    ],
+    [
+      "time-like default parameter is never invoked",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers
+        .replace(
+          ":keys [clock-fn]",
+          ":keys [clock-fn runtime-fn]",
+        )
+        .replaceAll("(clock-fn)", "(runtime-fn)"),
+    ],
+    [
+      "monotonic default belongs to a different parameter",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers
+        .replace(
+          ":keys [clock-fn]",
+          ":keys [clock-fn fallback-clock-fn]",
+        )
+        .replace(
+          "{clock-fn #(quot (System/nanoTime) 1000000)}",
+          "{fallback-clock-fn #(quot (System/nanoTime) 1000000)}",
+        ),
     ],
   ];
   for (const [label, source, runner, prepush, rtcHelpers] of mutations) {
