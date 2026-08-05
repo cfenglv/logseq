@@ -1,11 +1,69 @@
 import { spawn } from 'node:child_process'
 
 export const createWindowsProcessTreeSignaler = ({
+  directFallbackTimeoutMs = 1_000,
   spawnProcess = spawn,
   timeoutMs = 5_000,
 } = {}) => {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     throw new TypeError('taskkill timeout must be a positive number')
+  }
+  if (
+    !Number.isFinite(directFallbackTimeoutMs) ||
+    directFallbackTimeoutMs <= 0
+  ) {
+    throw new TypeError('direct-child fallback timeout must be a positive number')
+  }
+
+  const waitForDirectChildExit = (child) =>
+    new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve(true)
+        return
+      }
+      if (typeof child.once !== 'function') {
+        resolve(false)
+        return
+      }
+      const timeout = setTimeout(() => {
+        child.removeListener?.('exit', onExit)
+        resolve(false)
+      }, directFallbackTimeoutMs)
+      const onExit = () => {
+        clearTimeout(timeout)
+        resolve(true)
+      }
+      child.once('exit', onExit)
+    })
+
+  const stopDirectChildAfterHelperFailure = async (child, signal) => {
+    const failures = []
+    if (child.exitCode !== null || child.signalCode !== null) return failures
+    const sendDirectSignal = (directSignal) => {
+      try {
+        child.kill(directSignal)
+        return false
+      } catch (error) {
+        if (error?.code === 'ESRCH') return true
+        failures.push(error)
+        return false
+      }
+    }
+
+    let gone = sendDirectSignal(signal)
+    if (!gone) gone = await waitForDirectChildExit(child)
+    if (!gone && signal === 'SIGTERM') {
+      gone = sendDirectSignal('SIGKILL')
+      if (!gone) gone = await waitForDirectChildExit(child)
+    }
+    if (!gone) {
+      failures.push(
+        new Error(
+          `direct child process ${child.pid} survived Windows cleanup fallback`
+        )
+      )
+    }
+    return failures
   }
 
   return async (child, signal) => {
@@ -21,64 +79,72 @@ export const createWindowsProcessTreeSignaler = ({
     const args = ['/PID', String(pid), '/T']
     if (signal === 'SIGKILL') args.push('/F')
 
-    await new Promise((resolve, reject) => {
-      let taskkill
-      let timeout
-      let settled = false
-      const settle = (callback, value) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeout)
-        callback(value)
-      }
+    try {
+      await new Promise((resolve, reject) => {
+        let taskkill
+        let timeout
+        let settled = false
+        const settle = (callback, value) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timeout)
+          callback(value)
+        }
 
-      try {
-        taskkill = spawnProcess('taskkill.exe', args, {
-          shell: false,
-          stdio: 'ignore',
-          windowsHide: true,
-        })
-      } catch (error) {
-        settle(reject, error)
-        return
-      }
-
-      taskkill.once('error', (error) => settle(reject, error))
-      taskkill.once('exit', (code, exitSignal) => {
-        if (
-          code === 0 ||
-          child.exitCode !== null ||
-          child.signalCode !== null
-        ) {
-          settle(resolve)
+        try {
+          taskkill = spawnProcess('taskkill.exe', args, {
+            shell: false,
+            stdio: 'ignore',
+            windowsHide: true,
+          })
+        } catch (error) {
+          settle(reject, error)
           return
         }
-        settle(
-          reject,
-          new Error(
-            `taskkill.exe failed for PID ${pid} during ${signal} ` +
-              `(code=${code}, signal=${exitSignal})`
-          )
-        )
-      })
-      timeout = setTimeout(() => {
-        const timeoutError = new Error(
-          `taskkill.exe did not exit within ${timeoutMs}ms for PID ${pid} during ${signal}`
-        )
-        try {
-          taskkill.kill('SIGKILL')
-          settle(reject, timeoutError)
-        } catch (killError) {
+
+        taskkill.once('error', (error) => settle(reject, error))
+        taskkill.once('exit', (code, exitSignal) => {
+          if (code === 0) {
+            settle(resolve)
+            return
+          }
           settle(
             reject,
-            new AggregateError(
-              [timeoutError, killError],
-              `failed to stop timed-out taskkill.exe for PID ${pid}`
+            new Error(
+              `taskkill.exe failed for PID ${pid} during ${signal} ` +
+                `(code=${code}, signal=${exitSignal})`
             )
           )
-        }
-      }, timeoutMs)
-    })
+        })
+        timeout = setTimeout(() => {
+          const timeoutError = new Error(
+            `taskkill.exe did not exit within ${timeoutMs}ms for PID ${pid} during ${signal}`
+          )
+          try {
+            taskkill.kill('SIGKILL')
+            settle(reject, timeoutError)
+          } catch (killError) {
+            settle(
+              reject,
+              new AggregateError(
+                [timeoutError, killError],
+                `failed to stop timed-out taskkill.exe for PID ${pid}`
+              )
+            )
+          }
+        }, timeoutMs)
+      })
+    } catch (helperError) {
+      const fallbackFailures = await stopDirectChildAfterHelperFailure(
+        child,
+        signal
+      )
+      if (fallbackFailures.length === 0) throw helperError
+      throw new AggregateError(
+        [helperError, ...fallbackFailures],
+        `Windows process-tree cleanup and direct-child fallback failed for PID ${pid}`
+      )
+    }
   }
 }
 
