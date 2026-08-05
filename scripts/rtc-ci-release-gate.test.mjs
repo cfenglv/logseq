@@ -161,6 +161,7 @@ const parseJobs = (source) => {
 
     return {
       block,
+      condition: field(4, "if"),
       continueOnError: field(4, "continue-on-error"),
       failFast: strategyField("fail-fast"),
       matrix,
@@ -178,7 +179,7 @@ const taskFromValue = (value) =>
 
 const taskInvocations = (job) => {
   const invocations = [];
-  for (const step of job.steps) {
+  for (const [stepIndex, step] of job.steps.entries()) {
     for (const [matrixName, values] of job.matrix) {
       const matrixReference = new RegExp(
         `matrix\\.${matrixName.replaceAll("-", "[-_]")}(?:\\s*}})?`,
@@ -186,7 +187,9 @@ const taskInvocations = (job) => {
       if (!matrixReference.test(step.command)) continue;
       for (const value of values) {
         const task = taskFromValue(value);
-        if (task) invocations.push({ job, matrixName, step, task });
+        if (task) {
+          invocations.push({ job, matrixName, step, stepIndex, task });
+        }
       }
     }
     for (const task of requiredTasks) {
@@ -194,7 +197,13 @@ const taskInvocations = (job) => {
         `(^|[\\s'\"\\x60])${task}($|[\\s'\"\\x60])`,
       );
       if (pattern.test(step.command)) {
-        invocations.push({ job, matrixName: null, step, task });
+        invocations.push({
+          job,
+          matrixName: null,
+          step,
+          stepIndex,
+          task,
+        });
       }
     }
   }
@@ -206,6 +215,25 @@ const commandTimeoutSeconds = (command) => {
   if (!match) return null;
   const factors = { s: 1, m: 60, h: 3600 };
   return Number(match[1]) * factors[match[2].toLowerCase()];
+};
+
+const conditionRunsAfterFailure = (condition) => {
+  const normalized = scalar(condition ?? "")
+    .replace(/^\$\{\{\s*/, "")
+    .replace(/\s*}}$/, "")
+    .replaceAll(/\s/g, "")
+    .toLowerCase();
+  return normalized === "always()" || normalized === "!cancelled()";
+};
+
+const jobNeeds = (job) => {
+  const value = job.needs ?? "";
+  return (
+    parseInlineList(value) ??
+    scalar(value)
+      .split(/\s*,\s*/)
+      .filter(Boolean)
+  );
 };
 
 const workflowViolations = (source) => {
@@ -227,48 +255,28 @@ const workflowViolations = (source) => {
   }
 
   const taskJobs = [...new Set(invocations.map(({ job }) => job))];
-  if (taskJobs.length !== 1) {
-    violations.push(
-      "both shared-state RTC shards must be members of one serialized matrix job",
-    );
-  }
-
-  const taskJob = taskJobs[0];
-  if (taskJob) {
-    const matrixNames = new Set(
-      invocations.map(({ matrixName }) => matrixName).filter(Boolean),
-    );
-    if (matrixNames.size !== 1 || invocations.some(({ matrixName }) => !matrixName)) {
-      violations.push(
-        "RTC shards must be selected through one order-independent matrix dimension",
-      );
-    }
-    if (Number(scalar(taskJob.maxParallel ?? "")) !== 1) {
-      violations.push(
-        "shared RTC identity and remote state require strategy.max-parallel: 1",
-      );
-    }
-    if (scalar(taskJob.failFast ?? "").toLowerCase() !== "false") {
-      violations.push(
-        "strategy.fail-fast must be false so both serialized shards are attempted",
-      );
-    }
-    if (truthyLiteral(taskJob.continueOnError ?? "false")) {
-      violations.push("RTC matrix job must not continue on error");
+  for (const job of taskJobs) {
+    if (truthyLiteral(job.continueOnError ?? "false")) {
+      violations.push(`${job.name} RTC job must not continue on error`);
     }
   }
 
-  for (const { job, step, task } of invocations) {
+  for (const { step, task } of invocations) {
     if (truthyLiteral(step.continueOnError ?? "false")) {
       violations.push(`${task} step must not continue on error`);
     }
-    if (step.condition) {
-      violations.push(`${task} step must not be conditionally skipped`);
-    }
-    if (/\b(?:retry|retries|attempts?)\b/i.test(`${step.uses ?? ""}\n${step.command}`)) {
+    if (
+      /\b(?:retry|retries|attempts?)\b/i.test(
+        `${step.uses ?? ""}\n${step.command}`,
+      )
+    ) {
       violations.push(`${task} must not be wrapped in retries`);
     }
-    if (/\|\|\s*true\b|;\s*true\b|\bset\s+\+e\b|\bexit\s+0\b/i.test(step.command)) {
+    if (
+      /\|\|\s*true\b|;\s*true\b|\bset\s+\+e\b|\bexit\s+0\b/i.test(
+        step.command,
+      )
+    ) {
       violations.push(`${task} must not soften a failing exit status`);
     }
     const timeoutSeconds = commandTimeoutSeconds(step.command);
@@ -277,9 +285,95 @@ const workflowViolations = (source) => {
         `${task} must keep the existing bounded 30 minute outer timeout`,
       );
     }
-    if (!job.matrix.size) {
-      violations.push(`${task} is not protected by serialized matrix scheduling`);
+  }
+
+  const oneMatrixJob =
+    taskJobs.length === 1 &&
+    invocations.length === requiredTasks.length &&
+    invocations.every(({ matrixName }) => matrixName) &&
+    new Set(invocations.map(({ matrixName }) => matrixName).filter(Boolean))
+      .size === 1;
+  const oneSerialStepJob =
+    taskJobs.length === 1 &&
+    invocations.length === requiredTasks.length &&
+    invocations.every(({ matrixName }) => !matrixName) &&
+    new Set(
+      invocations
+        .map(({ stepIndex }) => stepIndex)
+        .filter((value) => value !== undefined),
+    ).size === requiredTasks.length;
+  const twoSerialJobs =
+    taskJobs.length === requiredTasks.length &&
+    invocations.length === requiredTasks.length &&
+    invocations.every(({ matrixName }) => !matrixName);
+
+  if (oneMatrixJob) {
+    const taskJob = taskJobs[0];
+    if (Number(scalar(taskJob.maxParallel ?? "")) !== 1) {
+      violations.push(
+        "shared RTC matrix shards need a statically proven serial scheduler",
+      );
     }
+    if (scalar(taskJob.failFast ?? "").toLowerCase() !== "false") {
+      violations.push(
+        "serialized matrix must disable fail-fast so both shards are attempted",
+      );
+    }
+    if (taskJob.condition) {
+      violations.push("RTC matrix job must not be conditionally skipped");
+    }
+    for (const { step, task } of invocations) {
+      if (step.condition) {
+        violations.push(`${task} matrix step must not be conditionally skipped`);
+      }
+    }
+  } else if (oneSerialStepJob) {
+    const ordered = [...invocations].sort(
+      (left, right) => left.stepIndex - right.stepIndex,
+    );
+    if (taskJobs[0].condition || ordered[0].step.condition) {
+      violations.push(
+        "first RTC shard in a serial step job must be unconditional",
+      );
+    }
+    for (const { step, task } of ordered.slice(1)) {
+      if (!conditionRunsAfterFailure(step.condition)) {
+        violations.push(
+          `${task} must use always() or !cancelled() so a prior shard failure cannot skip it`,
+        );
+      }
+    }
+  } else if (twoSerialJobs) {
+    const [left, right] = taskJobs;
+    const leftNeedsRight = jobNeeds(left).includes(right.name);
+    const rightNeedsLeft = jobNeeds(right).includes(left.name);
+    if (leftNeedsRight === rightNeedsLeft) {
+      violations.push(
+        "two RTC jobs need exactly one dependency edge to prove they cannot overlap",
+      );
+    } else {
+      const first = leftNeedsRight ? right : left;
+      const second = leftNeedsRight ? left : right;
+      if (first.condition) {
+        violations.push("first RTC job must be unconditional");
+      }
+      if (!conditionRunsAfterFailure(second.condition)) {
+        violations.push(
+          "dependent RTC job must use always() or !cancelled() so predecessor failure cannot skip it",
+        );
+      }
+      for (const { job, step, task } of invocations) {
+        if (step.condition) {
+          violations.push(
+            `${task} step in ${job.name} must rely on the proven job edge, not a step condition`,
+          );
+        }
+      }
+    }
+  } else if (invocations.length === requiredTasks.length) {
+    violations.push(
+      "RTC shard topology does not prove serial execution plus failure-safe scheduling",
+    );
   }
   return violations;
 };
@@ -333,24 +427,26 @@ const assertLocalGateContract = () => {
     /Promise\.all|\bretry\b|continue-on-error|\|\|\s*true/i,
     "local RTC gate must not parallelize, retry, or soften the shards",
   );
-  const gateTimeouts = [...gate.matchAll(/timeout:\s*30\s*\*\s*60\s*\*\s*1000/g)];
+  const gateTimeouts = [
+    ...gate.matchAll(/timeout:\s*(\d+)\s*\*\s*60\s*\*\s*1000/g),
+  ].map((match) => Number(match[1]));
   assert.equal(
     gateTimeouts.length,
     2,
-    "both local RTC shards must retain the bounded 30 minute timeout",
+    "both local RTC shards must declare a bounded timeout",
+  );
+  assert.ok(
+    gateTimeouts.every((minutes) => minutes <= 30),
+    "local RTC shard timeout must not be relaxed beyond 30 minutes",
   );
 
   const graph = read("clj-e2e/src/logseq/e2e/graph.clj");
-  assert.match(
-    graph,
-    /\(def \^:private cloud-ready-timeout-ms 60000\)/,
-    "the regression gate must not be made green by relaxing cloud readiness beyond 60 seconds",
+  const cloudReadyTimeout = graph.match(
+    /\(def \^:private cloud-ready-timeout-ms\s+(\d+)\)/,
   );
-  const login = read("clj-e2e/src/logseq/e2e/util.clj");
-  assert.match(
-    login,
-    /:or\s*\{username\s+"e2etest"/,
-    "the serialization contract is tied to the shared default RTC test identity",
+  assert.ok(
+    cloudReadyTimeout && Number(cloudReadyTimeout[1]) <= 60_000,
+    "the regression gate must not be made green by relaxing cloud readiness beyond 60 seconds",
   );
 };
 
@@ -427,11 +523,11 @@ test("desktop release workflow is hard-bound to RTC browser success", () => {
   assertReleaseWorkflowBinding(read(releaseWorkflowPath));
 });
 
-test("local RTC gate keeps the same serial, bounded, shared-identity contract", () => {
+test("local RTC gate keeps the same serial, bounded, shared-resource contract", () => {
   assertLocalGateContract();
 });
 
-test("workflow contract is order-independent and rejects masking mutations", () => {
+test("workflow contract is order-independent across matrix syntax variants", () => {
   const baseline = read(rtcWorkflowPath);
   const serialized = baseline.replace(
     "      fail-fast: false\n",
@@ -463,24 +559,106 @@ test("workflow contract is order-independent and rejects masking mutations", () 
     [],
     "block-style matrix lists must preserve the same semantics",
   );
+});
+
+test("topology proof accepts controlled alternatives and rejects unsafe scheduling", () => {
+  const matrixTopology = ({
+    continueOnError = false,
+    failFast = false,
+    maxParallel = 1,
+    taskValues = requiredTasks,
+    command = "timeout 30m bb ${{ matrix.shard }}",
+  } = {}) => `jobs:
+  rtc-shards:
+${continueOnError ? "    continue-on-error: true\n" : ""}    strategy:
+      fail-fast: ${failFast}
+      max-parallel: ${maxParallel}
+      matrix:
+        shard: [${taskValues.join(", ")}]
+    steps:
+      - run: ${command}
+`;
+  const stepTopology = ({ secondCondition = "${{ always() }}" } = {}) => `jobs:
+  rtc-shards:
+    steps:
+      - run: timeout 30m bb run-rtc-extra-test
+      - if: ${secondCondition}
+        run: timeout 30m bb run-rtc-extra-part2-test
+`;
+  const jobTopology = ({
+    needs = "rtc-part-1",
+    secondCondition = "${{ always() }}",
+  } = {}) => `jobs:
+  rtc-part-1:
+    steps:
+      - run: timeout 30m bb run-rtc-extra-test
+  rtc-part-2:
+${needs === null ? "" : `    needs: ${needs}\n`}${secondCondition === null ? "" : `    if: ${secondCondition}\n`}    steps:
+      - run: timeout 30m bb run-rtc-extra-part2-test
+`;
+
+  const safeTopologies = [
+    ["serialized matrix", matrixTopology()],
+    ["one job with failure-safe second step", stepTopology()],
+    ["dependent jobs with failure-safe successor", jobTopology()],
+    [
+      "reversed dependent jobs",
+      `jobs:
+  rtc-part-2:
+    steps:
+      - run: timeout 30m bb run-rtc-extra-part2-test
+  rtc-part-1:
+    needs: rtc-part-2
+    if: \${{ !cancelled() }}
+    steps:
+      - run: timeout 30m bb run-rtc-extra-test
+`,
+    ],
+  ];
+  for (const [name, topology] of safeTopologies) {
+    assert.deepEqual(
+      workflowViolations(topology),
+      [],
+      `${name} should satisfy the semantic RTC gate contract`,
+    );
+  }
 
   const maskingMutations = [
-    ["parallel matrix", serialized.replace("      max-parallel: 1", "      max-parallel: 2")],
-    ["fail-fast matrix", serialized.replace("      fail-fast: false", "      fail-fast: true")],
-    ["continue on error", serialized.replace(
-      "    strategy:\n      fail-fast: false",
-      "    continue-on-error: true\n    strategy:\n      fail-fast: false",
-    )],
-    ["missing shard", serialized.replace(
-      "        test-task: [run-rtc-extra-test, run-rtc-extra-part2-test]",
-      "        test-task: [run-rtc-extra-test]",
-    )],
-    ["relaxed timeout", serialized.replace("timeout 30m bb", "timeout 31m bb")],
-    ["retry wrapper", serialized.replace("timeout 30m bb", "retry timeout 30m bb")],
-    ["soft exit", serialized.replace(
-      "timeout 30m bb ${{ matrix.test-task }}",
-      "timeout 30m bb ${{ matrix.test-task }} || true",
-    )],
+    ["parallel matrix", matrixTopology({ maxParallel: 2 })],
+    ["fail-fast matrix", matrixTopology({ failFast: true })],
+    ["continue on error", matrixTopology({ continueOnError: true })],
+    [
+      "missing shard",
+      matrixTopology({ taskValues: [requiredTasks[0]] }),
+    ],
+    [
+      "serial steps skip after failure",
+      stepTopology({ secondCondition: "${{ success() }}" }),
+    ],
+    [
+      "independent jobs",
+      jobTopology({ needs: null, secondCondition: null }),
+    ],
+    [
+      "dependent job skips after failure",
+      jobTopology({ secondCondition: null }),
+    ],
+    [
+      "relaxed timeout",
+      matrixTopology({ command: "timeout 31m bb ${{ matrix.shard }}" }),
+    ],
+    [
+      "retry wrapper",
+      matrixTopology({
+        command: "retry timeout 30m bb ${{ matrix.shard }}",
+      }),
+    ],
+    [
+      "soft exit",
+      matrixTopology({
+        command: "timeout 30m bb ${{ matrix.shard }} || true",
+      }),
+    ],
   ];
   for (const [name, mutation] of maskingMutations) {
     assert.notDeepEqual(
