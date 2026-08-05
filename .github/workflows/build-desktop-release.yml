@@ -1479,8 +1479,8 @@ jobs:
             ${{ github.event.inputs.build-android == 'true' && 'release-assets/*.apk' || '' }}
 
   selfhost-release-terminal-audit:
-    if: ${{ always() && github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && contains(needs.release-assets-preflight.outputs.version, '-selfhost.') && !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}
-    needs: [ release-assets-preflight, selfhost-release-signing, selfhost-release-verifier, selfhost-release ]
+    if: ${{ always() && github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.release-rehearsal-gate.outputs.source-ref && github.sha == needs.release-rehearsal-gate.outputs.source-sha && contains(needs.release-assets-preflight.outputs.version, '-selfhost.') && !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}
+    needs: [ release-assets-preflight, release-rehearsal-gate, selfhost-release-signing, selfhost-release-verifier, selfhost-release ]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:
