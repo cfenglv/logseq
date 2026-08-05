@@ -197,6 +197,14 @@ const completionContractViolations = (
   }
   const stress = defs.get("online-two-clients-undo-redo-stress-test") ?? "";
   const assertionIndex = stress.indexOf("(assert-two-pages-synced!");
+  const assertionCall =
+    assertionIndex === -1 ? "" : formAt(stress, assertionIndex);
+  const assertionHeadEnd = assertionCall.indexOf(
+    "assert-two-pages-synced!",
+  ) + "assert-two-pages-synced!".length;
+  const assertionArguments = assertionCall
+    .slice(assertionHeadEnd, -1)
+    .trim();
   const lastParallelIndex = stress.lastIndexOf(
     "(run-two-clients-in-parallel!",
     assertionIndex,
@@ -209,15 +217,30 @@ const completionContractViolations = (
     assertionIndex === -1
       ? ""
       : stress.slice(synchronizationStart, assertionIndex);
+  const barrierEvaluationSurface = [
+    synchronizationPhase,
+    assertionArguments,
+  ].join("\n");
+  const assertionArgumentCandidates = [
+    ...new Set(
+      calledSymbolsInOrder(assertionArguments)
+        .map(({ name }) => name)
+        .filter(
+          (name) => name !== "assert-two-pages-synced!" && defs.has(name),
+        ),
+    ),
+  ];
   const barrierCandidates = [
     ...new Set(
-      calledSymbolsInOrder(synchronizationPhase)
+      calledSymbolsInOrder(barrierEvaluationSurface)
         .map(({ name }) => name)
-        .filter((name) => defs.has(name)),
+        .filter(
+          (name) => name !== "assert-two-pages-synced!" && defs.has(name),
+        ),
     ),
   ];
   const combinedBarrierSource = [
-    synchronizationPhase,
+    barrierEvaluationSurface,
     ...barrierCandidates.map((name) => definitionClosure(name, defs)),
   ].join("\n");
   const barrierAnalyses = [
@@ -230,7 +253,7 @@ const completionContractViolations = (
     },
     ...barrierCandidates.map((name) => ({
       name,
-      source: `${synchronizationPhase}\n${definitionClosure(name, defs)}`,
+      source: `${barrierEvaluationSurface}\n${definitionClosure(name, defs)}`,
     })),
   ];
   const safeBarrier = barrierAnalyses.find(
@@ -295,7 +318,12 @@ const completionContractViolations = (
     violations.push("runner and prepush gate must not retry a failed RTC shard");
   }
   if (
-    /\(catch\s+(?:Throwable|Exception)\b/.test(synchronizationPhase) ||
+    /\(catch\s+(?:Throwable|Exception)\b/.test(barrierEvaluationSurface) ||
+    assertionArgumentCandidates.some((name) =>
+      /\(catch\s+(?:Throwable|Exception)[\s\S]{0,180}\b(?:nil|false|true)\b/.test(
+        definitionClosure(name, defs),
+      ),
+    ) ||
     /\(try[\s\S]{0,1200}\(assert-two-pages-synced![\s\S]{0,500}\(catch\s+(?:Throwable|Exception)/.test(
       stress,
     )
@@ -395,15 +423,24 @@ const renamedFixture = safeFixture
   );
 const safeRenamedIndirectFixture = renamedFixture
   .replace(
+    "  (establish-causal-watermark!)\n  (observe-two-client-fixpoint!)\n  (assert-two-pages-synced!)",
+    "  (settle-after-concurrent-ops!)\n  (assert-two-pages-synced!)",
+  )
+  .replace(
     "(deftest online-two-clients-undo-redo-stress-test",
     `(defn- settle-after-concurrent-ops! []
   (establish-causal-watermark!)
   (observe-two-client-fixpoint!))
 (deftest online-two-clients-undo-redo-stress-test`,
+  );
+const safeAssertionArgumentFixture = safeRenamedIndirectFixture
+  .replace(
+    "(defn- assert-two-pages-synced! []",
+    "(defn- assert-two-pages-synced! [_settled-state]",
   )
   .replace(
-    "  (establish-causal-watermark!)\n  (observe-two-client-fixpoint!)",
-    "  (settle-after-concurrent-ops!)",
+    "  (settle-after-concurrent-ops!)\n  (assert-two-pages-synced!)",
+    "  (assert-two-pages-synced! (settle-after-concurrent-ops!))",
   );
 
 const converged = (tx, blocks) => ({
@@ -475,6 +512,17 @@ test("contract discovers renamed causal triggers through helper indirection", ()
   assert.deepEqual(
     completionContractViolations(
       safeRenamedIndirectFixture,
+      safeRunner,
+      safePrepush,
+    ),
+    [],
+  );
+});
+
+test("contract evaluates a barrier nested in strict assertion arguments", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeAssertionArgumentFixture,
       safeRunner,
       safePrepush,
     ),
@@ -596,6 +644,54 @@ test("contract rejects unsafe completion and assertion mutations", () => {
         "  (establish-causal-watermark!)\n",
         "",
       ),
+      safeRunner,
+      safePrepush,
+    ],
+    [
+      "assertion argument is only one two-client snapshot",
+      safeAssertionArgumentFixture.replace(
+        "(assert-two-pages-synced! (settle-after-concurrent-ops!))",
+        "(assert-two-pages-synced! [(page-sync-state @*page1) (page-sync-state @*page2)])",
+      ),
+      safeRunner,
+      safePrepush,
+    ],
+    [
+      "assertion argument helper swallows timeout",
+      safeAssertionArgumentFixture.replace(
+        `(defn- settle-after-concurrent-ops! []
+  (establish-causal-watermark!)
+  (observe-two-client-fixpoint!))`,
+        `(defn- settle-after-concurrent-ops! []
+  (try
+    (establish-causal-watermark!)
+    (observe-two-client-fixpoint!)
+    (catch Throwable _ nil)))`,
+      ),
+      safeRunner,
+      safePrepush,
+    ],
+    [
+      "assertion argument bypasses causal primitive",
+      safeAssertionArgumentFixture.replace(
+        `(rtc/with-wait-tx-updated
+    (new-block-safe! "completion-fence"))`,
+        '(new-block-safe! "completion-fence")',
+      ),
+      safeRunner,
+      safePrepush,
+    ],
+    [
+      "assertion body helper is not an evaluated completion barrier",
+      safeAssertionArgumentFixture
+        .replace(
+          "(assert-two-pages-synced! (settle-after-concurrent-ops!))",
+          "(assert-two-pages-synced! [(page-sync-state @*page1) (page-sync-state @*page2)])",
+        )
+        .replace(
+          "(defn- assert-two-pages-synced! [_settled-state]",
+          "(defn- assert-two-pages-synced! [_settled-state]\n  (settle-after-concurrent-ops!)",
+        ),
       safeRunner,
       safePrepush,
     ],
