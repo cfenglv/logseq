@@ -1523,6 +1523,18 @@ const evaluateJobCondition = (condition, scenario) => {
         ? scenario.buildAndroid
         : !scenario.buildAndroid;
     }
+    const contextComparison = expression.match(
+      /^(github\.(?:repository|event_name|event\.inputs\.[a-zA-Z0-9_-]+))\s*(==|!=)\s*'([^']+)'$/,
+    );
+    if (
+      contextComparison &&
+      Object.hasOwn(scenario.context ?? {}, contextComparison[1])
+    ) {
+      const actual = scenario.context[contextComparison[1]];
+      return contextComparison[2] === "=="
+        ? actual === contextComparison[3]
+        : actual !== contextComparison[3];
+    }
     // Release eligibility is held valid in these dependency-gate scenarios.
     return true;
   };
@@ -1530,6 +1542,7 @@ const evaluateJobCondition = (condition, scenario) => {
     unwrappedCondition,
   );
   if (
+    scenario.implicitNeedsSuccess !== false &&
     !hasStatusOverride &&
     Object.values(schedulerResults).some((result) => result !== "success")
   ) {
@@ -1786,6 +1799,199 @@ const assertProtectedReleaseDag = (workflow) => {
   assert.match(signer, /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/);
   assert.doesNotMatch(verifier, /environment:|\bsecrets\./);
   assert.match(publisher, /environment:\s*selfhost-production/);
+};
+
+const workflowJobSteps = (jobSource) =>
+  jobSource.match(/^      - [\s\S]*?(?=^      - |(?![\s\S]))/gm) ?? [];
+
+const workflowStepCondition = (stepSource) => {
+  const scalar = stepSource.match(/^        if:\s*(\S.*)$/m)?.[1];
+  if (scalar && !/^[>|][-+]?\s*$/.test(scalar)) return scalar.trim();
+  const block = stepSource.match(
+    /^        if:\s*[>|][-+]?\s*\n((?:^          [^\n]*\n?)+)/m,
+  )?.[1];
+  return block
+    ? block
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join(" ")
+    : undefined;
+};
+
+const terminalAuditNeeds = [
+  "selfhost-release",
+  "selfhost-release-signing",
+  "selfhost-release-verifier",
+];
+
+const discoverTerminalReleaseAudit = (workflow) => {
+  const candidates = workflowJobNames(workflow)
+    .filter((name) => !terminalAuditNeeds.includes(name))
+    .map((name) => [name, workflowJobSource(workflow, name)])
+    .filter(([, source]) => {
+      const needs = new Set(workflowJobNeeds(source));
+      return terminalAuditNeeds.every(
+        (name) =>
+          needs.has(name) && source.includes(`needs.${name}.result`),
+      );
+    });
+  assert.equal(
+    candidates.length,
+    1,
+    `expected one terminal selfhost release outcome audit; found ${
+      candidates.map(([name]) => name).join(", ") || "none"
+    }`,
+  );
+  return { name: candidates[0][0], source: candidates[0][1] };
+};
+
+const explicitTerminalPermissions = (jobSource) => {
+  if (/^    permissions:\s*\{\s*\}\s*$/m.test(jobSource)) return new Map();
+  return workflowJobPermissions(jobSource);
+};
+
+const terminalFailureSteps = (jobSource) =>
+  workflowJobSteps(jobSource).filter((step) =>
+    /(?:^|\s)(?:exit\s+[1-9][0-9]*|false)(?:\s|$)|core\.setFailed\s*\(|throw\s+new\s+Error\s*\(/m.test(
+      step,
+    ),
+  );
+
+const terminalAuditOutcome = (jobSource, needs) => {
+  const failureTriggered = terminalFailureSteps(jobSource).some((step) => {
+    const condition = workflowStepCondition(step);
+    return condition
+      ? evaluateJobCondition(condition, {
+          implicitNeedsSuccess: false,
+          needs,
+        })
+      : true;
+  });
+  return failureTriggered ? "failure" : "success";
+};
+
+const assertTerminalReleaseAudit = (jobSource) => {
+  assert.deepEqual(
+    [...workflowJobNeeds(jobSource)].sort(),
+    [...terminalAuditNeeds].sort(),
+    "terminal audit must directly observe signer, verifier, and publisher",
+  );
+  const condition = workflowJobCondition(jobSource);
+  assert.match(condition, /\balways\(\)/);
+  assert.doesNotMatch(
+    condition,
+    /needs\.(?:selfhost-release(?:-signing|-verifier)?)\.result/,
+    "terminal job condition must not skip the audit based on release outcomes",
+  );
+
+  const eligibleContexts = [
+    {
+      "github.repository": "cfenglv/logseq",
+      "github.event_name": "workflow_dispatch",
+      "github.event.inputs.build-target": "stable",
+      "github.event.inputs.desktop-platforms": "all",
+    },
+    {
+      "github.repository": "cfenglv/logseq",
+      "github.event_name": "workflow_dispatch",
+      "github.event.inputs.build-target": "beta",
+      "github.event.inputs.desktop-platforms": "all",
+    },
+  ];
+  const allSuccess = Object.fromEntries(
+    terminalAuditNeeds.map((name) => [name, "success"]),
+  );
+  const outcomeScenarios = [
+    ["all protected stages succeeded", allSuccess, "success"],
+    [
+      "observed incident: signer succeeded while verifier and publisher skipped",
+      {
+        ...allSuccess,
+        "selfhost-release": "skipped",
+        "selfhost-release-verifier": "skipped",
+      },
+      "failure",
+    ],
+  ];
+  for (const jobName of terminalAuditNeeds) {
+    for (const result of ["failure", "skipped", "cancelled"]) {
+      outcomeScenarios.push([
+        `${jobName} ${result}`,
+        { ...allSuccess, [jobName]: result },
+        "failure",
+      ]);
+    }
+  }
+
+  for (const context of eligibleContexts) {
+    for (const [label, needs, expectedOutcome] of outcomeScenarios) {
+      assert.equal(
+        evaluateJobCondition(condition, { context, needs }),
+        true,
+        `eligible terminal audit was skipped: ${label}`,
+      );
+      assert.equal(
+        terminalAuditOutcome(jobSource, needs),
+        expectedOutcome,
+        `terminal audit outcome mismatch: ${label}`,
+      );
+    }
+  }
+
+  const nonReleaseContexts = [
+    {
+      "github.repository": "cfenglv/logseq",
+      "github.event_name": "push",
+      "github.event.inputs.build-target": "stable",
+      "github.event.inputs.desktop-platforms": "all",
+    },
+    {
+      "github.repository": "cfenglv/logseq",
+      "github.event_name": "workflow_dispatch",
+      "github.event.inputs.build-target": "nightly",
+      "github.event.inputs.desktop-platforms": "all",
+    },
+    {
+      "github.repository": "cfenglv/logseq",
+      "github.event_name": "workflow_dispatch",
+      "github.event.inputs.build-target": "non-release",
+      "github.event.inputs.desktop-platforms": "all",
+    },
+    {
+      "github.repository": "another-owner/logseq",
+      "github.event_name": "workflow_dispatch",
+      "github.event.inputs.build-target": "stable",
+      "github.event.inputs.desktop-platforms": "all",
+    },
+    {
+      "github.repository": "cfenglv/logseq",
+      "github.event_name": "workflow_dispatch",
+      "github.event.inputs.build-target": "stable",
+      "github.event.inputs.desktop-platforms": "windows-only",
+    },
+  ];
+  for (const context of nonReleaseContexts) {
+    assert.equal(
+      evaluateJobCondition(condition, { context, needs: allSuccess }),
+      false,
+      `non-release mode triggers the terminal publication audit: ${JSON.stringify(context)}`,
+    );
+  }
+
+  const permissions = explicitTerminalPermissions(jobSource);
+  assert.equal(
+    [...permissions.values()].some((access) => access === "write"),
+    false,
+    "terminal audit has write permission",
+  );
+  assert.doesNotMatch(jobSource, /^    environment:/m);
+  assert.doesNotMatch(jobSource, /\bsecrets\./);
+  assert.doesNotMatch(jobSource, /continue-on-error:\s*true/);
+  assert.ok(
+    terminalFailureSteps(jobSource).length > 0,
+    "terminal audit has no fail-closed outcome step",
+  );
 };
 
 const workflowJobInvocationCount = (workflow, jobName, invocation) =>
@@ -4264,6 +4470,76 @@ addCase(cases, "publisher runs only after successful secretless verification", (
     publisher,
     /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64|finalize-github-macos/,
   );
+});
+
+addCase(cases, "terminal release audit model is fail-closed and mode-scoped", () => {
+  const auditFixture = [
+    "    if: >-",
+    "      ${{ always() &&",
+    "      github.repository == 'cfenglv/logseq' &&",
+    "      github.event_name == 'workflow_dispatch' &&",
+    "      (github.event.inputs.build-target == 'stable' || github.event.inputs.build-target == 'beta') &&",
+    "      github.event.inputs.desktop-platforms == 'all' }}",
+    "    needs:",
+    "      - selfhost-release-verifier",
+    "      - selfhost-release",
+    "      - selfhost-release-signing",
+    "    runs-on: ubuntu-22.04",
+    "    permissions:",
+    "      contents: read",
+    "    steps:",
+    "      - name: Fail incomplete protected release",
+    "        if: >-",
+    "          ${{ needs.selfhost-release-signing.result != 'success' ||",
+    "          needs.selfhost-release-verifier.result != 'success' ||",
+    "          needs.selfhost-release.result != 'success' }}",
+    "        run: exit 1",
+  ].join("\n");
+  assertTerminalReleaseAudit(auditFixture);
+
+  assert.throws(
+    () =>
+      assertTerminalReleaseAudit(
+        auditFixture.replace("always() &&", ""),
+      ),
+    /always/,
+  );
+  assert.throws(
+    () =>
+      assertTerminalReleaseAudit(
+        auditFixture.replace(
+          "      github.event_name == 'workflow_dispatch' &&\n",
+          "",
+        ),
+      ),
+    /non-release mode triggers/,
+  );
+  assert.throws(
+    () =>
+      assertTerminalReleaseAudit(
+        auditFixture.replace(
+          [
+            "          needs.selfhost-release-verifier.result != 'success' ||",
+            "          needs.selfhost-release.result != 'success' }}",
+          ].join("\n"),
+          "          needs.selfhost-release-verifier.result != 'success' }}",
+        ),
+      ),
+    /selfhost-release failure/,
+  );
+  assert.throws(
+    () =>
+      assertTerminalReleaseAudit(
+        auditFixture.replace("contents: read", "contents: write"),
+      ),
+    /terminal audit has write permission/,
+  );
+});
+
+addCase(cases, "eligible selfhost publication has a terminal outcome audit", () => {
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const audit = discoverTerminalReleaseAudit(workflow);
+  assertTerminalReleaseAudit(audit.source);
 });
 
 addCase(cases, "selfhost CI candidates reach publication only through protected verification", () => {
