@@ -255,6 +255,139 @@
                    error))]
     (is (identical? failure thrown))))
 
+(defn- barrier-marker-title
+  [values]
+  (some #(when (and (string? %)
+                    (re-matches #"sync-(?:trigger|ack)-.+" %))
+           %)
+        (tree-seq coll? seq values)))
+
+(defn- run-editorless-barrier-contract
+  [barrier-f]
+  (let [events (atom [])
+        transactions (atom {:client-1 0 :client-2 0})
+        no-editor (ex-info "no editor wrapper" {:phase :editorless})
+        original-page1 @const/*page1
+        original-page2 @const/*page2]
+    (try
+      (reset! const/*page1 :client-1)
+      (reset! const/*page2 :client-2)
+      {:events events
+       :thrown
+       (with-redefs-fn
+         {#'block/new-block
+          (fn [title & _]
+            (swap! events conj [:dom-write w/*page* title])
+            (throw no-editor))
+          (stress-var 'ls-api-call!)
+          (fn [operation & args]
+            (let [title (barrier-marker-title args)]
+              (swap! events conj [:client-write w/*page* operation title])
+              (when-not title
+                (throw (ex-info "client write omitted barrier marker"
+                                {:operation operation
+                                 :args args})))
+              (swap! transactions update w/*page* inc)
+              {:uuid (str (name w/*page*) "-" title)}))
+          (stress-var 'page-has-block-title?) (constantly false)
+          #'block/open-last-block
+          (fn [& _]
+            (swap! events conj [:editor-retry w/*page*]))
+          #'rtc/get-rtc-tx
+          (fn []
+            (let [tx (get @transactions w/*page* 0)]
+              {:local-tx tx :remote-tx tx}))
+          #'rtc/wait-tx-update-to
+          (fn [target]
+            (swap! events conj [:observe w/*page* target])
+            (swap! transactions assoc w/*page* target)
+            target)
+          #'util/exit-edit
+          (fn []
+            (swap! events conj [:exit-edit w/*page*]))
+          #'util/wait-timeout (fn [_])
+          #'w/wait-for (fn [& _])
+          #'clojure.core/prn (fn [& _])}
+         (fn []
+           (try
+             (barrier-f)
+             nil
+             (catch Throwable error
+               error))))}
+      (finally
+        (reset! const/*page1 original-page1)
+        (reset! const/*page2 original-page2)))))
+
+(deftest editorless-client-write-event-log-control
+  (let [{:keys [events thrown]}
+        (run-editorless-barrier-contract
+         (fn []
+           (w/with-page @const/*page1
+             ((deref (stress-var 'ls-api-call!))
+              :editor.appendBlockInPage
+              "contract-page"
+              "sync-trigger-control"))
+           (doseq [page [@const/*page1 @const/*page2]]
+             (w/with-page page
+               (rtc/wait-tx-update-to 1)))
+           (w/with-page @const/*page2
+             ((deref (stress-var 'ls-api-call!))
+              :editor.appendBlockInPage
+              "contract-page"
+              "sync-ack-control"))
+           (doseq [page [@const/*page1 @const/*page2]]
+             (w/with-page page
+               (rtc/wait-tx-update-to 2)))))]
+    (is (nil? thrown))
+    (is (= [[:client-write :client-1
+             :editor.appendBlockInPage "sync-trigger-control"]
+            [:observe :client-1 1]
+            [:observe :client-2 1]
+            [:client-write :client-2
+             :editor.appendBlockInPage "sync-ack-control"]
+            [:observe :client-1 2]
+            [:observe :client-2 2]]
+           @events))))
+
+(deftest editorless-barrier-uses-one-client-transaction-per-marker
+  (let [{:keys [events thrown]}
+        (run-editorless-barrier-contract
+         #((deref (stress-var 'sync-by-barrier!)) "editorless"))
+        client-writes (filterv #(= :client-write (first %)) @events)
+        dom-writes (filterv #(= :dom-write (first %)) @events)
+        observations (filterv #(= :observe (first %)) @events)
+        expected-writes [[:client-1 "sync-trigger-editorless"]
+                         [:client-2 "sync-ack-editorless"]]
+        actual-writes (mapv (fn [[_ page _operation title]]
+                              [page title])
+                            client-writes)
+        operations (mapv #(nth % 2) client-writes)
+        mismatch (cond-> {}
+                   (some? thrown)
+                   (assoc :thrown (ex-message thrown))
+
+                   (not= expected-writes actual-writes)
+                   (assoc :client-writes client-writes)
+
+                   (not (every? #{:editor.appendBlockInPage
+                                  :editor.insertBlock}
+                                operations))
+                   (assoc :operations operations)
+
+                   (seq dom-writes)
+                   (assoc :dom-writes dom-writes)
+
+                   (not= [[:observe :client-1 1]
+                          [:observe :client-2 1]
+                          [:observe :client-1 2]
+                          [:observe :client-2 2]]
+                         observations)
+                   (assoc :observations observations))]
+    (is (empty? mismatch)
+        (str "editorless barrier did not use one durable client write per marker: "
+             (pr-str mismatch)
+             " events=" (pr-str @events)))))
+
 (defn- run-barrier-with-write-failure
   [failing-title]
   (let [failure (ex-info "barrier write failed" {:title failing-title})
@@ -271,12 +404,20 @@
        :thrown
        (with-redefs-fn
          {#'block/new-block
-          (fn [title]
+          (fn [title & _]
             (swap! events conj [:write w/*page* title])
             (if (= title failing-title)
               (throw failure)
               (let [tx (swap! next-tx inc)]
                 (swap! transactions assoc w/*page* tx))))
+          (stress-var 'ls-api-call!)
+          (fn [_operation & args]
+            (let [title (barrier-marker-title args)]
+              (swap! events conj [:write w/*page* title])
+              (if (= title failing-title)
+                (throw failure)
+                (let [tx (swap! next-tx inc)]
+                  (swap! transactions assoc w/*page* tx)))))
           (stress-var 'page-has-block-title?) (constantly true)
           #'block/open-last-block (fn [])
           #'rtc/get-rtc-tx
