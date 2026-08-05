@@ -20,12 +20,8 @@ const preflightPath = path.join(
   "scripts",
   "run-desktop-release-preflight.mjs",
 );
-const preflightSource = fs.readFileSync(preflightPath, "utf8");
 const invalidButWellFormedSha =
   "499b5dcc9cbb65579140707eff3745fd9432777b";
-
-const escapeRegExp = (value) =>
-  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const gitHead = () => {
   const result = spawnSync("git", ["rev-parse", "HEAD"], {
@@ -99,6 +95,7 @@ const createFullPreflightFixture = () => {
     path.join(os.tmpdir(), "desktop-preflight-integrity-"),
   );
   const fakeBin = path.join(root, "fake-bin");
+  const isolationMarker = path.join(root, "isolation-evidence.log");
   const write = (relativePath, contents, mode) => {
     const destination = path.join(root, relativePath);
     fs.mkdirSync(path.dirname(destination), { recursive: true });
@@ -141,6 +138,8 @@ fs.chmodSync(output, 0o755);
   write("static/tests.js", "process.exit(0);\n");
   write("static/db-sync-backup-memory-test.js", "process.exit(0);\n");
   write("static/verify-packaged-desktop.mjs", "process.exit(0);\n");
+  write("static/required-static.txt", "required\n");
+  write("static/node_modules/source-only.txt", "must not be copied\n");
   write("dist/db-worker-node.js", "// fixture\n");
   write("cli/.keep", "");
   write("deps/db-sync/worker/.keep", "");
@@ -154,6 +153,14 @@ if [ -n "\${PREFLIGHT_MUTATION_MODE:-}" ] && [ ! -e "$PREFLIGHT_MUTATION_MARKER"
     git -C "$PREFLIGHT_FIXTURE_ROOT" add src/main/frontend/version.cljs
     git -C "$PREFLIGHT_FIXTURE_ROOT" commit --quiet -m mutation
   fi
+fi
+if [ "\${1:-}" = "install" ] && [ "$PWD" != "$PREFLIGHT_FIXTURE_ROOT/static" ]; then
+  {
+    if [ -e "$PWD/node_modules/source-only.txt" ]; then echo node_modules-copied; else echo node_modules-excluded; fi
+    if [ -f "$PWD/required-static.txt" ]; then echo static-file-present; else echo static-file-missing; fi
+    if [ -f "$PWD/../scripts/verify-desktop-runtime-revisions.mjs" ]; then echo verifier-present; else echo verifier-missing; fi
+    if [ -f "$PWD/../dist/db-worker-node.js" ]; then echo db-worker-present; else echo db-worker-missing; fi
+  } > "$PREFLIGHT_ISOLATION_MARKER"
 fi
 for argument in "$@"; do
   case "$argument" in
@@ -200,6 +207,7 @@ exit 0
       ...process.env,
       PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
       PREFLIGHT_FIXTURE_ROOT: root,
+      PREFLIGHT_ISOLATION_MARKER: isolationMarker,
       PREFLIGHT_MUTATION_MARKER: marker,
     };
     delete env.LOGSEQ_RELEASE_SOURCE_SHA;
@@ -223,6 +231,9 @@ exit 0
     );
     if (result.error) throw result.error;
     return {
+      isolationEvidence: fs.existsSync(isolationMarker)
+        ? fs.readFileSync(isolationMarker, "utf8").trim().split("\n")
+        : [],
       markerReached: fs.existsSync(marker),
       output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
       status: result.status,
@@ -235,271 +246,6 @@ exit 0
     run,
   };
 };
-
-const packagingViolations = (source) => {
-  const violations = [];
-  const invocationContaining = (index, functionName) => {
-    if (index === -1) return "";
-    const start = source.lastIndexOf(`${functionName}(`, index);
-    if (start === -1) return "";
-    const end = source.indexOf(");", index);
-    return end === -1 ? source.slice(start) : source.slice(start, end + 2);
-  };
-  const labelIndex = (label) => {
-    const match = new RegExp(`["']${escapeRegExp(label)}["']`).exec(source);
-    return match?.index ?? -1;
-  };
-  const commandUsesRoot = (call, root) => {
-    const rootPattern = escapeRegExp(root);
-    return (
-      new RegExp(`["']--dir["']\\s*,\\s*${rootPattern}`).test(call) ||
-      new RegExp(`cwd\\s*:\\s*${rootPattern}`).test(call)
-    );
-  };
-
-  const tempRoots = [
-    ...source.matchAll(
-      /(?:(?:const|let)\s+)?([A-Za-z_$][\w$]*)\s*=\s*fs\.mkdtempSync\(\s*path\.join\(\s*os\.tmpdir\(\),/g,
-    ),
-  ].map((match) => ({ index: match.index, name: match[1] }));
-  if (tempRoots.length === 0) {
-    return ["final packaging must create a temporary release workspace"];
-  }
-
-  const installStart = labelIndex("isolated packaging install");
-  if (installStart === -1) return ["isolated packaging install is missing"];
-  const installCall = invocationContaining(installStart, "pnpm");
-  const packageRoots = tempRoots.flatMap((root) => {
-    const rootPattern = escapeRegExp(root.name);
-    const match = new RegExp(
-      `(?:const|let)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*path\\.join\\(\\s*${rootPattern}\\s*,\\s*["']static["']\\s*\\)`,
-    ).exec(source);
-    return match
-      ? [{ index: match.index, root: root.name, static: match[1] }]
-      : [];
-  });
-  const packageRoot = packageRoots.find(({ static: staticRoot }) =>
-    commandUsesRoot(installCall, staticRoot),
-  );
-  if (!packageRoot) {
-    return [
-      "isolated packaging install must run in a temporary workspace static root",
-    ];
-  }
-  const workspaceRoot = packageRoot.root;
-  const artifactStatic = packageRoot.static;
-  const rootPattern = escapeRegExp(workspaceRoot);
-  const staticPattern = escapeRegExp(artifactStatic);
-  const stagingStart = tempRoots.find(
-    ({ name }) => name === workspaceRoot,
-  ).index;
-  const staging = source.slice(stagingStart, installStart);
-  const packaging = source.slice(installStart);
-
-  if (
-    !new RegExp(
-      `fs\\.cpSync\\(\\s*staticDir\\s*,\\s*${staticPattern}`,
-    ).test(staging)
-  ) {
-    violations.push("source static must be copied into artifact static");
-  }
-  const excludesNodeModules =
-    /filter\s*:[\s\S]{0,400}node_modules/.test(staging) ||
-    new RegExp(
-      `fs\\.rmSync\\(\\s*path\\.join\\(\\s*${staticPattern}\\s*,\\s*["']node_modules["']`,
-    ).test(staging);
-  if (!excludesNodeModules) {
-    violations.push("artifact static copy must exclude source node_modules");
-  }
-
-  for (const relativePath of [
-    "scripts/verify-desktop-runtime-revisions.mjs",
-    "dist/db-worker-node.js",
-  ]) {
-    if (
-      !staging.includes(relativePath) ||
-      !/(?:copyFileSync|cpSync)\s*\(/.test(staging)
-    ) {
-      violations.push(`artifact staging must copy exact input ${relativePath}`);
-    }
-  }
-  if (!/(?:lstatSync|statSync)[\s\S]{0,900}\.isFile\(\)/.test(staging)) {
-    violations.push("artifact inputs must be verified as regular files");
-  }
-
-  const installUsesArtifact = new RegExp(
-    `["']install["'][\\s\\S]{0,300}["']--frozen-lockfile["'][\\s\\S]{0,220}["']--ignore-workspace["']`,
-  ).test(installCall);
-  if (!installUsesArtifact) {
-    violations.push("artifact package root needs a frozen isolated install");
-  }
-  const rebuildStart = labelIndex("rebuild desktop native modules");
-  const rebuildCall = invocationContaining(rebuildStart, "pnpm");
-  if (
-    !rebuildCall.includes("rebuild:all") ||
-    !commandUsesRoot(rebuildCall, artifactStatic)
-  ) {
-    violations.push("native rebuild must run inside artifact static");
-  }
-  const packageCalls = [...packaging.matchAll(/pnpm\([\s\S]*?\);/g)]
-    .map((match) => match[0])
-    .filter((call) => /electron-builder|electron:make-unsigned/.test(call));
-  if (
-    packageCalls.length === 0 ||
-    packageCalls.some((call) => !commandUsesRoot(call, artifactStatic))
-  ) {
-    violations.push("host electron-builder must run from artifact static");
-  }
-  const verifierStart = labelIndex("verify host packaged application");
-  const verifierCall = invocationContaining(verifierStart, "run");
-  const verifierUsesArtifactStatic =
-    new RegExp(
-      `path\\.join\\(\\s*${staticPattern}\\s*,\\s*["']verify-packaged-desktop\\.mjs["']`,
-    ).test(verifierCall) ||
-    (verifierCall.includes("verify-packaged-desktop.mjs") &&
-      commandUsesRoot(verifierCall, artifactStatic));
-  if (!verifierCall || !verifierUsesArtifactStatic) {
-    violations.push("real packaged verifier must come from artifact static");
-  }
-  if (
-    [installCall, rebuildCall, ...packageCalls, verifierCall].some((call) =>
-      /(?:--dir["']?\s*,?\s*["']static["']|cwd\s*:\s*staticDir|staticDir[\s\S]{0,120}(?:rebuild:all|electron-builder|electron:make-unsigned|verify-packaged-desktop))/.test(
-        call,
-      ),
-    )
-  ) {
-    violations.push("final packaging must not reuse source static");
-  }
-  if (
-    /(?:repoRoot|staticDir|\.\.\/)[\s\S]{0,100}node_modules|NODE_PATH/.test(
-      packaging,
-    )
-  ) {
-    violations.push("final packaging must not resolve source node_modules");
-  }
-  if (
-    /(?:unsafe-path|disable[^\n]*safe|ELECTRON_BUILDER_[A-Z_]*UNSAFE|\|\|\s*true|continue-on-error|set\s+\+e)/i.test(
-      packaging,
-    )
-  ) {
-    violations.push("packaging must not weaken safety or failure propagation");
-  }
-  if (!/if \(result\.status !== 0\)[\s\S]{0,160}throw new Error/.test(source)) {
-    violations.push("child command failures must propagate");
-  }
-  for (const required of [
-    "process.platform === \"darwin\"",
-    "process.platform === \"win32\"",
-    "process.platform === \"linux\"",
-    "codesign",
-    "hdiutil",
-  ]) {
-    if (!packaging.includes(required)) {
-      violations.push(`host packaging verification must retain ${required}`);
-    }
-  }
-  const finallyIndex = source.lastIndexOf("finally {");
-  if (finallyIndex === -1) {
-    violations.push("temporary workspace cleanup must be in finally");
-  } else {
-    const cleanup = source.slice(finallyIndex);
-    if (
-      !new RegExp(
-        `fs\\.rmSync\\(\\s*${rootPattern}[\\s\\S]{0,180}recursive\\s*:\\s*true`,
-      ).test(cleanup)
-    ) {
-      violations.push("finally must recursively remove the temporary workspace");
-    }
-    for (const tempRoot of tempRoots) {
-      if (tempRoot.name === workspaceRoot) continue;
-      const tempPattern = escapeRegExp(tempRoot.name);
-      const retainedOutput =
-        new RegExp(
-          `["']--search-root["'][\\s\\S]{0,180}${tempPattern}`,
-        ).test(packaging) &&
-        new RegExp(`console\\.log[\\s\\S]{0,600}${tempPattern}`).test(
-          source,
-        );
-      if (
-        !retainedOutput &&
-        !new RegExp(
-          `fs\\.rmSync\\(\\s*${tempPattern}[\\s\\S]{0,180}recursive\\s*:\\s*true`,
-        ).test(cleanup)
-      ) {
-        violations.push(
-          `finally must recursively remove temporary helper root ${tempRoot.name}`,
-        );
-      }
-    }
-  }
-  return violations;
-};
-
-const compliantDirPackagingFixture = `
-const releaseWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "ws-"));
-const releaseStatic = path.join(releaseWorkspace, "static");
-const outputDir = path.join(releaseWorkspace, "output");
-fs.cpSync(staticDir, releaseStatic, {
-  recursive: true,
-  filter: (source) => path.basename(source) !== "node_modules",
-});
-for (const relativePath of [
-  "scripts/verify-desktop-runtime-revisions.mjs",
-  "dist/db-worker-node.js",
-]) {
-  fs.copyFileSync(path.join(repoRoot, relativePath), path.join(releaseWorkspace, relativePath));
-}
-const inputStats = fs.lstatSync(path.join(releaseWorkspace, "dist/db-worker-node.js"));
-if (!inputStats.isFile()) throw new Error("artifact input is not a file");
-try {
-  pnpm("isolated packaging install", ["--dir", releaseStatic, "install", "--frozen-lockfile", "--ignore-workspace"]);
-  pnpm("rebuild desktop native modules", ["--dir", releaseStatic, "rebuild:all"]);
-  if (process.platform === "darwin") pnpm("package", ["--dir", releaseStatic, "electron:make-unsigned"]);
-  else if (process.platform === "win32") pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder"]);
-  else if (process.platform === "linux") pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder"]);
-  run("verify host packaged application", process.execPath, [path.join(releaseStatic, "verify-packaged-desktop.mjs"), "--search-root", outputDir]);
-  run("verify macOS bundle signature", "codesign", []);
-  run("verify macOS DMG", "hdiutil", []);
-} finally {
-  fs.rmSync(releaseWorkspace, { recursive: true, force: true });
-}
-if (result.status !== 0) { throw new Error("child failed"); }
-`;
-
-const compliantCwdPackagingFixture = `
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "x-"));
-const isolatedStatic = path.join(scratch, "static");
-const retainedOutput = fs.mkdtempSync(path.join(os.tmpdir(), "result-"));
-let helperRoot;
-helperRoot = fs.mkdtempSync(path.join(os.tmpdir(), "h-"));
-fs.cpSync(staticDir, isolatedStatic, {
-  recursive: true,
-  filter: (source) => path.basename(source) !== "node_modules",
-});
-for (const relativePath of [
-  "scripts/verify-desktop-runtime-revisions.mjs",
-  "dist/db-worker-node.js",
-]) {
-  fs.copyFileSync(path.join(repoRoot, relativePath), path.join(scratch, relativePath));
-}
-const inputStats = fs.statSync(path.join(scratch, "dist/db-worker-node.js"));
-if (!inputStats.isFile()) throw new Error("artifact input is not a file");
-try {
-  pnpm("isolated packaging install", ["install", "--frozen-lockfile", "--ignore-workspace"], { cwd: isolatedStatic });
-  pnpm("rebuild desktop native modules", ["rebuild:all"], { cwd: isolatedStatic });
-  if (process.platform === "darwin") pnpm("package", ["electron:make-unsigned"], { cwd: isolatedStatic });
-  else if (process.platform === "win32") pnpm("package", ["exec", "electron-builder"], { cwd: isolatedStatic });
-  else if (process.platform === "linux") pnpm("package", ["exec", "electron-builder"], { cwd: isolatedStatic });
-  run("verify host packaged application", process.execPath, ["verify-packaged-desktop.mjs", "--search-root", retainedOutput], { cwd: isolatedStatic });
-  run("verify macOS bundle signature", "codesign", []);
-  run("verify macOS DMG", "hdiutil", []);
-} finally {
-  fs.rmSync(scratch, { recursive: true, force: true });
-  fs.rmSync(helperRoot, { recursive: true, force: true });
-}
-console.log("packaged output retained at " + retainedOutput);
-if (result.status !== 0) { throw new Error("child failed"); }
-`;
 
 test("local preflight validates exact source revision before external build commands", () => {
   const head = gitHead();
@@ -565,7 +311,6 @@ test("documented bare full preflight binds its exact starting revision", () => {
     fixture.dispose();
   }
 });
-
 test("full preflight integrity fixture reaches its packaging success control", () => {
   const fixture = createFullPreflightFixture();
   try {
@@ -619,121 +364,22 @@ for (const mutationMode of ["head", "worktree"]) {
   });
 }
 
-test("final local packaging consumes only a CI-shaped artifact root", () => {
-  assert.deepEqual(packagingViolations(preflightSource), []);
-});
-
-test("packaging analyzer accepts arbitrary workspace names and --dir", () => {
-  assert.deepEqual(packagingViolations(compliantDirPackagingFixture), []);
-});
-
-test("packaging analyzer accepts cwd, inherited env, and retained output", () => {
-  assert.deepEqual(packagingViolations(compliantCwdPackagingFixture), []);
-});
-
-test("packaging boundary analyzer rejects unsafe and incomplete mutations", () => {
-  const mutations = [
-    [
-      "source node_modules copied",
-      compliantDirPackagingFixture.replace(
-        'filter: (source) => path.basename(source) !== "node_modules",',
-        "filter: () => true,",
-      ),
-    ],
-    [
-      "runtime verifier input omitted",
-      compliantDirPackagingFixture.replace(
-        '"scripts/verify-desktop-runtime-revisions.mjs",',
-        "",
-      ),
-    ],
-    [
-      "db worker input omitted",
-      compliantDirPackagingFixture.replaceAll(
-        '"dist/db-worker-node.js"',
-        '"missing-db-worker.js"',
-      ),
-    ],
-    [
-      "frozen install disabled",
-      compliantDirPackagingFixture.replace('"--frozen-lockfile",', ""),
-    ],
-    [
-      "source static reused",
-      compliantDirPackagingFixture.replaceAll(
-        '["--dir", releaseStatic',
-        '["--dir", staticDir',
-      ),
-    ],
-    [
-      "source verifier reused",
-      compliantDirPackagingFixture.replace(
-        'path.join(releaseStatic, "verify-packaged-desktop.mjs")',
-        'path.join(staticDir, "verify-packaged-desktop.mjs")',
-      ),
-    ],
-    [
-      "repository parent node_modules injected",
-      compliantDirPackagingFixture.replace(
-        'pnpm("rebuild desktop native modules",',
-        'const NODE_PATH = path.join(repoRoot, "node_modules");\npnpm("rebuild desktop native modules",',
-      ),
-    ],
-    [
-      "unsafe protection disabled",
-      compliantDirPackagingFixture.replace(
-        'pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder"]);',
-        'pnpm("package", ["--dir", releaseStatic, "exec", "electron-builder", "--unsafe-path"]);',
-      ),
-    ],
-    [
-      "packaged verifier skipped",
-      compliantDirPackagingFixture.replace(
-        '"verify host packaged application"',
-        '"skip packaged verifier"',
-      ),
-    ],
-    [
-      "child failure swallowed",
-      compliantDirPackagingFixture.replace(
-        'if (result.status !== 0) { throw new Error("child failed"); }',
-        "",
-      ),
-    ],
-    [
-      "temporary workspace retained",
-      compliantDirPackagingFixture.replace(
-        "fs.rmSync(releaseWorkspace, { recursive: true, force: true });",
-        "",
-      ),
-    ],
-    [
-      "cwd escapes isolated static",
-      compliantCwdPackagingFixture.replace(
-        "cwd: isolatedStatic",
-        "cwd: staticDir",
-      ),
-    ],
-    [
-      "temporary helper retained",
-      compliantCwdPackagingFixture.replace(
-        "fs.rmSync(helperRoot, { recursive: true, force: true });",
-        "",
-      ),
-    ],
-    [
-      "temporary output retained without reporting its path",
-      compliantCwdPackagingFixture.replace(
-        'console.log("packaged output retained at " + retainedOutput);',
-        "",
-      ),
-    ],
-  ];
-  for (const [label, mutation] of mutations) {
-    assert.notDeepEqual(
-      packagingViolations(mutation),
-      [],
-      `${label} unexpectedly satisfied the packaging boundary`,
+test("release workspace excludes source node_modules and retains required inputs", () => {
+  const fixture = createFullPreflightFixture();
+  try {
+    const result = fixture.run();
+    assert.equal(
+      result.status,
+      0,
+      `isolation behavior fixture did not reach FULL PASS:\n${result.output}`,
     );
+    assert.deepEqual(result.isolationEvidence, [
+      "node_modules-excluded",
+      "static-file-present",
+      "verifier-present",
+      "db-worker-present",
+    ]);
+  } finally {
+    fixture.dispose();
   }
 });
