@@ -35,6 +35,8 @@
   ["db-sync/checksum-mismatch"
    "db-sync/tx-rejected"
    "db-sync/apply-remote-txs-failed"])
+(def ^:private block-uuid-pattern
+  #"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 (def ^:private random-edit-actions
   [:new :save :indent-outdent :delete-existing :undo :redo])
 
@@ -215,7 +217,14 @@
   [title]
   ;; Execute the marker transaction in the active RTC client without relying
   ;; on transient editor DOM or focus state left by the stress operations.
-  (ls-api-call! :editor.appendBlockInPage title))
+  (let [block (ls-api-call! :editor.appendBlockInPage title)
+        block-uuid (or (get block "uuid") (get block :uuid))]
+    (when-not (and (string? block-uuid)
+                   (re-matches block-uuid-pattern block-uuid))
+      (throw (ex-info "barrier marker client write returned no durable block"
+                      {:title title
+                       :result block})))
+    block))
 
 (defn- sync-by-barrier!
   ([tag]

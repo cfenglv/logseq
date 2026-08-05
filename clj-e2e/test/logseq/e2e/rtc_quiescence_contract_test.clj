@@ -288,7 +288,7 @@
                                 {:operation operation
                                  :args args})))
               (swap! transactions update w/*page* inc)
-              {:uuid (str (name w/*page*) "-" title)}))
+              {:uuid (str (random-uuid))}))
           (stress-var 'page-has-block-title?) (constantly false)
           #'block/open-last-block
           (fn [& _]
@@ -549,6 +549,52 @@
                           :invalid-phase invalid-phase
                           :mismatch mismatch
                           :events @events})))))))
+(deftest barrier-rejects-malformed-client-write-results
+  (doseq [write-result [nil
+                        {}
+                        {"uuid" nil}
+                        {:uuid ""}
+                        {"uuid" "not-a-uuid"}
+                        []
+                        "not-a-block"]]
+    (let [transactions (atom {:client-1 0 :client-2 0})
+          original-page1 @const/*page1
+          original-page2 @const/*page2]
+      (try
+        (reset! const/*page1 :client-1)
+        (reset! const/*page2 :client-2)
+        (let [thrown
+              (with-redefs-fn
+                {(stress-var 'ls-api-call!)
+                 (fn [& _]
+                   ;; A transaction watermark can move for an unrelated
+                   ;; reason; the client API result must prove the marker write.
+                   (swap! transactions update w/*page* inc)
+                   write-result)
+                 #'rtc/get-rtc-tx
+                 (fn []
+                   (let [tx (get @transactions w/*page* 0)]
+                     {:local-tx tx :remote-tx tx}))
+                 #'rtc/wait-tx-update-to
+                 (fn [target]
+                   (swap! transactions assoc w/*page* target)
+                   target)
+                 #'util/exit-edit (fn [])
+                 #'util/wait-timeout (fn [_])
+                 #'w/wait-for (fn [& _])
+                 #'clojure.core/prn (fn [& _])}
+                (fn []
+                  (try
+                    ((deref (stress-var 'sync-by-barrier!)) "malformed")
+                    nil
+                    (catch Throwable error
+                      error))))]
+          (is (some? thrown)
+              (str "barrier accepted malformed client write result "
+                   (pr-str write-result))))
+        (finally
+          (reset! const/*page1 original-page1)
+          (reset! const/*page2 original-page2))))))
 
 (defn- run-barrier-with-write-failure
   [failing-title]
@@ -579,7 +625,8 @@
               (if (= title failing-title)
                 (throw failure)
                 (let [tx (swap! next-tx inc)]
-                  (swap! transactions assoc w/*page* tx)))))
+                  (swap! transactions assoc w/*page* tx)
+                  {:uuid (str (random-uuid))}))))
           (stress-var 'page-has-block-title?) (constantly true)
           #'block/open-last-block (fn [])
           #'rtc/get-rtc-tx
