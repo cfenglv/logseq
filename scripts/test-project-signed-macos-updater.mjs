@@ -1476,6 +1476,27 @@ const splitTopLevel = (expression, operator) => {
   return parts;
 };
 
+const resolveConditionReference = (reference, scenario) => {
+  if (Object.hasOwn(scenario.context ?? {}, reference)) {
+    return scenario.context[reference];
+  }
+  if (
+    reference === "github.event.inputs.build-android" &&
+    typeof scenario.buildAndroid === "boolean"
+  ) {
+    return scenario.buildAndroid ? "true" : "false";
+  }
+  const needResult = reference.match(
+    /^needs\.([a-zA-Z0-9_-]+)\.result$/,
+  );
+  if (needResult && Object.hasOwn(scenario.needs, needResult[1])) {
+    return scenario.needs[needResult[1]];
+  }
+  throw new Error(
+    `unsupported or unbound release condition reference: ${reference}`,
+  );
+};
+
 const evaluateJobCondition = (condition, scenario) => {
   const unwrappedCondition = stripExpressionEnvelope(condition);
   // Actions' implicit success() propagates a skipped transitive ancestor unless
@@ -1490,7 +1511,6 @@ const evaluateJobCondition = (condition, scenario) => {
     if (disjunction.length > 1) return disjunction.some(evaluate);
     const conjunction = splitTopLevel(expression, "&&");
     if (conjunction.length > 1) return conjunction.every(evaluate);
-    if (/^!contains\(/.test(expression)) return true;
     if (expression.startsWith("!") && !expression.startsWith("!=")) {
       return !evaluate(expression.slice(1));
     }
@@ -1510,33 +1530,36 @@ const evaluateJobCondition = (condition, scenario) => {
       /^needs\.([a-zA-Z0-9_-]+)\.result\s*(==|!=)\s*'([^']+)'$/,
     );
     if (needResult) {
-      const actual = scenario.needs[needResult[1]];
+      const actual = resolveConditionReference(
+        `needs.${needResult[1]}.result`,
+        scenario,
+      );
       return needResult[2] === "=="
         ? actual === needResult[3]
         : actual !== needResult[3];
     }
-    const androidInput = expression.match(
-      /^github\.event\.inputs\.build-android\s*(==|!=)\s*'true'$/,
+    const contains = expression.match(
+      /^contains\(\s*((?:github|needs)\.[a-zA-Z0-9_.-]+)\s*,\s*'([^']*)'\s*\)$/,
     );
-    if (androidInput) {
-      return androidInput[1] === "=="
-        ? scenario.buildAndroid
-        : !scenario.buildAndroid;
+    if (contains) {
+      return String(resolveConditionReference(contains[1], scenario)).includes(
+        contains[2],
+      );
     }
-    const contextComparison = expression.match(
-      /^(github\.(?:repository|event_name|event\.inputs\.[a-zA-Z0-9_-]+))\s*(==|!=)\s*'([^']+)'$/,
+    const comparison = expression.match(
+      /^((?:github|needs)\.[a-zA-Z0-9_.-]+)\s*(==|!=)\s*(?:'([^']*)'|((?:github|needs)\.[a-zA-Z0-9_.-]+))$/,
     );
-    if (
-      contextComparison &&
-      Object.hasOwn(scenario.context ?? {}, contextComparison[1])
-    ) {
-      const actual = scenario.context[contextComparison[1]];
-      return contextComparison[2] === "=="
-        ? actual === contextComparison[3]
-        : actual !== contextComparison[3];
+    if (comparison) {
+      const actual = resolveConditionReference(comparison[1], scenario);
+      const expected = comparison[3] ?? resolveConditionReference(
+        comparison[4],
+        scenario,
+      );
+      return comparison[2] === "=="
+        ? actual === expected
+        : actual !== expected;
     }
-    // Release eligibility is held valid in these dependency-gate scenarios.
-    return true;
+    throw new Error(`unsupported release condition atom: ${expression}`);
   };
   const hasStatusOverride = /\b(?:always|cancelled|failure)\(\)/.test(
     unwrappedCondition,
@@ -1549,6 +1572,24 @@ const evaluateJobCondition = (condition, scenario) => {
     return false;
   }
   return evaluate(unwrappedCondition);
+};
+
+const eligibleReleaseContext = {
+  "github.repository": "cfenglv/logseq",
+  "github.event_name": "workflow_dispatch",
+  "github.event.inputs.build-target": "stable",
+  "github.event.inputs.desktop-platforms": "all",
+  "github.ref_name": "selfhost/cloudflare-rtc",
+  "github.sha": "0123456789abcdef0123456789abcdef01234567",
+  "needs.release-rehearsal-gate.outputs.source-ref": "selfhost/cloudflare-rtc",
+  "needs.release-rehearsal-gate.outputs.source-sha":
+    "0123456789abcdef0123456789abcdef01234567",
+  "needs.release-assets-preflight.outputs.version": "2.0.1-selfhost.5",
+  "needs.selfhost-release-verifier.outputs.source-ref":
+    "selfhost/cloudflare-rtc",
+  "needs.selfhost-release-verifier.outputs.source-sha":
+    "0123456789abcdef0123456789abcdef01234567",
+  "needs.selfhost-release-verifier.outputs.version": "2.0.1-selfhost.5",
 };
 
 const workflowDependencyPath = (workflow, start, target, visited = new Set()) => {
@@ -1599,7 +1640,11 @@ const assertSignerDependencyGate = (needs, condition) => {
   ];
   for (const [label, buildAndroid, needs, expected] of scenarios) {
     assert.equal(
-      evaluateJobCondition(condition, { buildAndroid, needs }),
+      evaluateJobCondition(condition, {
+        buildAndroid,
+        context: eligibleReleaseContext,
+        needs,
+      }),
       expected,
       `signer dependency gate violates scenario: ${label}`,
     );
@@ -1682,7 +1727,10 @@ const assertVerifierSchedulingGate = (needs, condition) => {
   ];
   for (const [label, scenario, expected] of scenarios) {
     assert.equal(
-      evaluateJobCondition(condition, scenario),
+      evaluateJobCondition(condition, {
+        ...scenario,
+        context: eligibleReleaseContext,
+      }),
       expected,
       `verifier scheduling gate violates scenario: ${label}`,
     );
@@ -1740,7 +1788,10 @@ const assertPublisherSchedulingGate = (needs, condition) => {
   ];
   for (const [label, scenario, expected] of scenarios) {
     assert.equal(
-      evaluateJobCondition(condition, scenario),
+      evaluateJobCondition(condition, {
+        ...scenario,
+        context: eligibleReleaseContext,
+      }),
       expected,
       `publisher scheduling gate violates scenario: ${label}`,
     );
@@ -1819,19 +1870,24 @@ const workflowStepCondition = (stepSource) => {
     : undefined;
 };
 
-const terminalAuditNeeds = [
+const terminalOutcomeNeeds = [
   "selfhost-release",
   "selfhost-release-signing",
   "selfhost-release-verifier",
 ];
 
+const terminalAuditNeeds = [
+  "release-assets-preflight",
+  ...terminalOutcomeNeeds,
+];
+
 const discoverTerminalReleaseAudit = (workflow) => {
   const candidates = workflowJobNames(workflow)
-    .filter((name) => !terminalAuditNeeds.includes(name))
+    .filter((name) => !terminalOutcomeNeeds.includes(name))
     .map((name) => [name, workflowJobSource(workflow, name)])
     .filter(([, source]) => {
       const needs = new Set(workflowJobNeeds(source));
-      return terminalAuditNeeds.every(
+      return terminalOutcomeNeeds.every(
         (name) =>
           needs.has(name) && source.includes(`needs.${name}.result`),
       );
@@ -1875,7 +1931,7 @@ const assertTerminalReleaseAudit = (jobSource) => {
   assert.deepEqual(
     [...workflowJobNeeds(jobSource)].sort(),
     [...terminalAuditNeeds].sort(),
-    "terminal audit must directly observe signer, verifier, and publisher",
+    "terminal audit must bind preflight eligibility and directly observe signer, verifier, and publisher",
   );
   const condition = workflowJobCondition(jobSource);
   assert.match(condition, /\balways\(\)/);
@@ -1887,20 +1943,45 @@ const assertTerminalReleaseAudit = (jobSource) => {
 
   const eligibleContexts = [
     {
-      "github.repository": "cfenglv/logseq",
-      "github.event_name": "workflow_dispatch",
+      ...eligibleReleaseContext,
       "github.event.inputs.build-target": "stable",
-      "github.event.inputs.desktop-platforms": "all",
     },
     {
-      "github.repository": "cfenglv/logseq",
-      "github.event_name": "workflow_dispatch",
+      ...eligibleReleaseContext,
       "github.event.inputs.build-target": "beta",
-      "github.event.inputs.desktop-platforms": "all",
     },
   ];
   const allSuccess = Object.fromEntries(
     terminalAuditNeeds.map((name) => [name, "success"]),
+  );
+  assert.equal(
+    eligibleReleaseContext["github.ref_name"],
+    "selfhost/cloudflare-rtc",
+    "eligible audit coverage must include a selfhost branch without a -selfhost. name",
+  );
+  assert.equal(
+    evaluateJobCondition(
+      "${{ always() && contains(github.ref_name, '-selfhost.') }}",
+      { context: eligibleReleaseContext, needs: allSuccess },
+    ),
+    false,
+    "branch naming is not a valid proxy for selfhost release eligibility",
+  );
+  assert.throws(
+    () =>
+      evaluateJobCondition(
+        "${{ always() && contains(github.release_scope, 'selfhost') }}",
+        { context: eligibleReleaseContext, needs: allSuccess },
+      ),
+    /unsupported or unbound release condition reference/,
+  );
+  assert.throws(
+    () =>
+      evaluateJobCondition(
+        "${{ always() && needs.selfhost-release.conclusion == 'success' }}",
+        { context: eligibleReleaseContext, needs: allSuccess },
+      ),
+    /unsupported or unbound release condition reference/,
   );
   const outcomeScenarios = [
     ["all protected stages succeeded", allSuccess, "success"],
@@ -1914,7 +1995,7 @@ const assertTerminalReleaseAudit = (jobSource) => {
       "failure",
     ],
   ];
-  for (const jobName of terminalAuditNeeds) {
+  for (const jobName of terminalOutcomeNeeds) {
     for (const result of ["failure", "skipped", "cancelled"]) {
       outcomeScenarios.push([
         `${jobName} ${result}`,
@@ -1941,34 +2022,33 @@ const assertTerminalReleaseAudit = (jobSource) => {
 
   const nonReleaseContexts = [
     {
-      "github.repository": "cfenglv/logseq",
+      ...eligibleReleaseContext,
       "github.event_name": "push",
-      "github.event.inputs.build-target": "stable",
-      "github.event.inputs.desktop-platforms": "all",
     },
     {
-      "github.repository": "cfenglv/logseq",
-      "github.event_name": "workflow_dispatch",
+      ...eligibleReleaseContext,
       "github.event.inputs.build-target": "nightly",
-      "github.event.inputs.desktop-platforms": "all",
     },
     {
-      "github.repository": "cfenglv/logseq",
-      "github.event_name": "workflow_dispatch",
+      ...eligibleReleaseContext,
       "github.event.inputs.build-target": "non-release",
-      "github.event.inputs.desktop-platforms": "all",
     },
     {
+      ...eligibleReleaseContext,
       "github.repository": "another-owner/logseq",
-      "github.event_name": "workflow_dispatch",
-      "github.event.inputs.build-target": "stable",
-      "github.event.inputs.desktop-platforms": "all",
     },
     {
-      "github.repository": "cfenglv/logseq",
-      "github.event_name": "workflow_dispatch",
-      "github.event.inputs.build-target": "stable",
+      ...eligibleReleaseContext,
       "github.event.inputs.desktop-platforms": "windows-only",
+    },
+    {
+      ...eligibleReleaseContext,
+      "needs.release-assets-preflight.outputs.version": "0.10.9",
+    },
+    {
+      ...eligibleReleaseContext,
+      "needs.release-assets-preflight.outputs.version":
+        "2.0.1-selfhost.5.nightly.20260805",
     },
   ];
   for (const context of nonReleaseContexts) {
@@ -4479,8 +4559,11 @@ addCase(cases, "terminal release audit model is fail-closed and mode-scoped", ()
     "      github.repository == 'cfenglv/logseq' &&",
     "      github.event_name == 'workflow_dispatch' &&",
     "      (github.event.inputs.build-target == 'stable' || github.event.inputs.build-target == 'beta') &&",
-    "      github.event.inputs.desktop-platforms == 'all' }}",
+    "      github.event.inputs.desktop-platforms == 'all' &&",
+    "      contains(needs.release-assets-preflight.outputs.version, '-selfhost.') &&",
+    "      !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}",
     "    needs:",
+    "      - release-assets-preflight",
     "      - selfhost-release-verifier",
     "      - selfhost-release",
     "      - selfhost-release-signing",
@@ -4509,6 +4592,26 @@ addCase(cases, "terminal release audit model is fail-closed and mode-scoped", ()
       assertTerminalReleaseAudit(
         auditFixture.replace(
           "      github.event_name == 'workflow_dispatch' &&\n",
+          "",
+        ),
+      ),
+    /non-release mode triggers/,
+  );
+  assert.throws(
+    () =>
+      assertTerminalReleaseAudit(
+        auditFixture.replace(
+          "contains(needs.release-assets-preflight.outputs.version, '-selfhost.')",
+          "contains(github.ref_name, '-selfhost.')",
+        ),
+      ),
+    /eligible terminal audit was skipped/,
+  );
+  assert.throws(
+    () =>
+      assertTerminalReleaseAudit(
+        auditFixture.replace(
+          "      contains(needs.release-assets-preflight.outputs.version, '-selfhost.') &&\n",
           "",
         ),
       ),
