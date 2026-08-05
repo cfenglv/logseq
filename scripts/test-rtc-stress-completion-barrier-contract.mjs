@@ -295,8 +295,50 @@ const positiveDuration = (value, bindings) => {
   return /^\d+$/.test(resolved) && Number(resolved) > 0;
 };
 
+const callSiteDurationOptions = (source, bindings) => {
+  const maps = [];
+  for (const { items } of callFormsInOrder(source)) {
+    for (const item of items.slice(1)) {
+      const resolved = resolveBinding(item, bindings);
+      if (resolved.startsWith("{") && resolved.endsWith("}")) {
+        maps.push(resolved);
+      }
+    }
+  }
+  for (const value of bindings.values()) {
+    const resolved = resolveBinding(value, bindings);
+    if (resolved.startsWith("{") && resolved.endsWith("}")) {
+      maps.push(resolved);
+    }
+  }
+  const relevant = maps
+    .map((map) => splitTopLevelItems(map))
+    .map((items) => {
+      const options = new Map();
+      for (let index = 0; index + 1 < items.length; index += 2) {
+        options.set(items[index], items[index + 1]);
+      }
+      const stableKey = [...options.keys()].find((key) =>
+        /:.*stable.*(?:ms|millis)/i.test(key),
+      );
+      const timeoutKey = [...options.keys()].find((key) =>
+        /:.*timeout.*(?:ms|millis)/i.test(key),
+      );
+      return {
+        present: Boolean(stableKey || timeoutKey),
+        stable: stableKey ? resolveBinding(options.get(stableKey), bindings) : null,
+        timeout: timeoutKey ? resolveBinding(options.get(timeoutKey), bindings) : null,
+      };
+    })
+    .filter(({ present }) => present);
+  return relevant.find(({ stable, timeout }) => stable && timeout) ??
+    relevant[0] ??
+    { present: false, stable: null, timeout: null };
+};
+
 const hasTimedStableWindow = (source, equalities) => {
   const bindings = bindingValues(source);
+  const durationOptions = callSiteDurationOptions(source, bindings);
   const hasCompleteStateEquality = equalities.some(
     (form) =>
       /(?:previous|prior|last)[-\w]*state/i.test(form) &&
@@ -306,21 +348,77 @@ const hasTimedStableWindow = (source, equalities) => {
     /current[-\w]*state\s+\((?:sample|observe|snapshot)[-\w!?]*/i.test(
       source,
     );
-  const stableUpdate = callFormsInOrder(source).find(({ name, items }) => {
-    if (name !== "if" || items.length !== 4) return false;
-    const condition = items[1];
-    const preserved = items[2];
-    const reset = items[3];
-    const requiresAcceptedSameState =
-      /(?:accept|converg|valid)/i.test(condition) &&
-      /(?:same|unchanged|equal)/i.test(condition);
-    const preservesStart =
-      /stable[-\w]*since/i.test(preserved) &&
-      /(?:now|clock|time)/i.test(preserved);
-    const resetsStart =
-      !/stable[-\w]*since/i.test(reset) &&
-      /(?:nil|now|clock|time)/i.test(reset);
-    return requiresAcceptedSameState && preservesStart && resetsStart;
+  const transitionForms = callFormsInOrder(source).filter(({ name }) =>
+    ["cond", "if", "when"].includes(name),
+  );
+  const preservesOnSameState = transitionForms.some(({ name, items }) => {
+    if (name === "if") {
+      return (
+        /(?:same|unchanged|equal)/i.test(items[1] ?? "") &&
+        /stable[-\w]*since/i.test(items[2] ?? "")
+      );
+    }
+    if (name !== "cond") return false;
+    for (let index = 1; index + 1 < items.length; index += 2) {
+      if (
+        /(?:same|unchanged|equal)/i.test(items[index]) &&
+        /stable[-\w]*since/i.test(items[index + 1])
+      ) {
+        return true;
+      }
+    }
+    return false;
+  });
+  const restartsOnChangedState = transitionForms.some(({ name, items }) => {
+    if (name === "if") {
+      const condition = items[1] ?? "";
+      const reset = items[3] ?? "";
+      return (
+        /(?:same|unchanged|equal)/i.test(condition) &&
+        !/stable[-\w]*since/i.test(reset) &&
+        /(?:sampled-at|now|clock|time)/i.test(reset)
+      ) || (
+        /(?:accept|converg|valid)/i.test(condition) &&
+        /(?:same|unchanged|equal)/i.test(condition) &&
+        /^\(when\s+[^\s)]*(?:accept|converg|valid)[^\s)]*\s+[^)]*(?:sampled-at|now|clock|time)/i.test(
+          reset,
+        )
+      );
+    }
+    if (name !== "cond") return false;
+    const sameIndex = items.findIndex((item, index) =>
+      index % 2 === 1 && /(?:same|unchanged|equal)/i.test(item),
+    );
+    const elseIndex = items.indexOf(":else");
+    return (
+      sameIndex !== -1 &&
+      elseIndex !== -1 &&
+      !/stable[-\w]*since/i.test(items[elseIndex + 1] ?? "") &&
+      /(?:sampled-at|now|clock|time)/i.test(items[elseIndex + 1] ?? "")
+    );
+  });
+  const clearsRejectedState = transitionForms.some(({ name, items }) => {
+    if (name === "when") {
+      return (
+        /(?:accept|converg|valid)/i.test(items[1] ?? "") &&
+        /(?:sampled-at|now|clock|time)/i.test(items[2] ?? "")
+      );
+    }
+    if (name === "if") {
+      return (
+        /(?:accept|converg|valid)/i.test(items[1] ?? "") &&
+        items[3] === "nil"
+      );
+    }
+    for (let index = 1; index + 1 < items.length; index += 2) {
+      if (
+        /\bnot\b[\s\S]*(?:accept|converg|valid)/i.test(items[index]) &&
+        items[index + 1] === "nil"
+      ) {
+        return true;
+      }
+    }
+    return false;
   });
   const hasSuccessGuard = callFormsInOrder(source).some(({ name, items }) =>
     name === "if" &&
@@ -333,23 +431,41 @@ const hasTimedStableWindow = (source, equalities) => {
       if (![">", ">="].includes(name) || items.length !== 3) return false;
       const [left, right] = items.slice(1);
       if (/(?:elapsed|duration)/i.test(left)) {
-        return positiveDuration(right, bindings);
+        return positiveDuration(right, bindings) ||
+          (durationOptions.present &&
+            /stable/i.test(right) &&
+            /^\d+$/.test(durationOptions.stable ?? "") &&
+            Number(durationOptions.stable) > 0);
       }
       if (/(?:elapsed|duration)/i.test(right)) {
-        return positiveDuration(left, bindings);
+        return positiveDuration(left, bindings) ||
+          (durationOptions.present &&
+            /stable/i.test(left) &&
+            /^\d+$/.test(durationOptions.stable ?? "") &&
+            Number(durationOptions.stable) > 0);
       }
       return false;
     },
   );
+  const hasSafeDurationOptions =
+    !durationOptions.present ||
+    (/^\d+$/.test(durationOptions.stable ?? "") &&
+      /^\d+$/.test(durationOptions.timeout ?? "") &&
+      Number(durationOptions.stable) > 0 &&
+      Number(durationOptions.timeout) > 0 &&
+      Number(durationOptions.stable) <= Number(durationOptions.timeout));
   const hasMonotonicElapsed =
     /(?:monotonic|nanoTime|performance[/.]now)/i.test(source) &&
     /\(-\s+[^\s)]+\s+[^\s)]*stable[-\w]*since/i.test(source);
   return Boolean(
     hasCompleteStateEquality &&
     hasSampledCurrentState &&
-    stableUpdate &&
+    preservesOnSameState &&
+    restartsOnChangedState &&
+    clearsRejectedState &&
     hasSuccessGuard &&
     hasPositiveElapsedThreshold &&
+    hasSafeDurationOptions &&
     hasMonotonicElapsed,
   );
 };
@@ -812,6 +928,47 @@ const safeTimedWindowRtcHelpers = `
                        current-state
                        next-stable-since))))))))
 `;
+const safeOptionTimedWindowFixture = safeTimedWindowFixture
+  .replace(
+    "(defn- sync-by-trigger! []",
+    `(defn- completion-window-options []
+  (let [stable-window-ms 300
+        timeout-window-ms 5000]
+    {:stable-ms stable-window-ms
+     :timeout-ms timeout-window-ms}))
+(defn- sync-by-trigger! []`,
+  )
+  .replace(
+    "      #(Thread/sleep 100)))",
+    "      #(Thread/sleep 100)\n      (completion-window-options)))",
+  );
+const safeOptionTimedWindowRtcHelpers = `
+(defn wait-for-stable-window! [sample acceptable? cadence options]
+  (let [stable-ms (or (:stable-ms options) 0)
+        timeout-ms (or (:timeout-ms options) 0)]
+    (loop [previous-state nil
+           stable-since nil
+           started-at (util/monotonic-time-ms)]
+      (let [current-state (sample)
+            acceptable-state? (acceptable? current-state)
+            same-state? (= previous-state current-state)
+            sampled-at (util/monotonic-time-ms)
+            next-stable-since (cond
+                                (not acceptable-state?) nil
+                                same-state? (or stable-since sampled-at)
+                                :else sampled-at)
+            stable-elapsed (if next-stable-since
+                             (- sampled-at next-stable-since)
+                             0)]
+        (if (>= (- sampled-at started-at) timeout-ms)
+          (throw (ex-info "completion barrier timeout" {:timeout-ms timeout-ms}))
+          (if (and acceptable-state?
+                   same-state?
+                   (>= stable-elapsed stable-ms))
+            current-state
+            (do (cadence)
+                (recur current-state next-stable-since started-at))))))))
+`;
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -919,6 +1076,18 @@ test("contract accepts four-value tx equality and timed state stability", () => 
       safeRunner,
       safePrepush,
       safeTimedWindowRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts restart timestamps and call-site duration options", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeOptionTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers,
     ),
     [],
   );
@@ -1255,6 +1424,75 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeRunner,
       safePrepush,
       safeTimedWindowRtcHelpers.replace("stable-ms 300", "stable-ms 0"),
+    ],
+    [
+      "changed state incorrectly preserves the old start timestamp",
+      safeOptionTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers.replace(
+        ":else sampled-at",
+        ":else stable-since",
+      ),
+    ],
+    [
+      "rejected state incorrectly restarts the stability timestamp",
+      safeOptionTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers.replace(
+        "(not acceptable-state?) nil",
+        "(not acceptable-state?) sampled-at",
+      ),
+    ],
+    [
+      "call-site swaps stable and timeout durations",
+      safeOptionTimedWindowFixture
+        .replace(":stable-ms stable-window-ms", ":stable-ms timeout-window-ms")
+        .replace(":timeout-ms timeout-window-ms", ":timeout-ms stable-window-ms"),
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers,
+    ],
+    [
+      "call-site stability duration exceeds timeout",
+      safeOptionTimedWindowFixture.replace(
+        "stable-window-ms 300",
+        "stable-window-ms 6000",
+      ),
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers,
+    ],
+    [
+      "call-site stability duration is zero",
+      safeOptionTimedWindowFixture.replace(
+        "stable-window-ms 300",
+        "stable-window-ms 0",
+      ),
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers,
+    ],
+    [
+      "call-site timeout duration is negative",
+      safeOptionTimedWindowFixture.replace(
+        "timeout-window-ms 5000",
+        "timeout-window-ms -1",
+      ),
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers,
+    ],
+    [
+      "missing call-site stable option falls back to zero",
+      safeOptionTimedWindowFixture.replace(
+        "    {:stable-ms stable-window-ms\n     :timeout-ms timeout-window-ms}",
+        "    {:timeout-ms timeout-window-ms}",
+      ),
+      safeRunner,
+      safePrepush,
+      safeOptionTimedWindowRtcHelpers,
     ],
   ];
   for (const [label, source, runner, prepush, rtcHelpers] of mutations) {
