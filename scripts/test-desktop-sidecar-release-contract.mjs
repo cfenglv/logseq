@@ -32,7 +32,7 @@ const preflightPath = path.join(
 );
 const version = "2.0.1-selfhost.5";
 const electronVersion = "42.4.1";
-const packagedRevision = "packaged-runtime-fixture-revision";
+const packagedRevision = "5".repeat(40);
 const formalReleaseRevision = "6".repeat(40);
 const differentReleaseRevision = "7".repeat(40);
 const cliRuntimeRelativePaths = [
@@ -644,6 +644,7 @@ const verifierInvocation = ({
     ],
     {
       env: {
+        LOGSEQ_RELEASE_SOURCE_SHA: packagedRevision,
         LOGSEQ_REVISION: packagedRevision,
         NODE_PATH: asarNodePath,
       },

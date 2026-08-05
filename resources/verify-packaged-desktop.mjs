@@ -46,17 +46,17 @@ const embeddedRevision =
     shell: false,
   }).stdout?.trim();
 const releaseSourceSha = process.env.LOGSEQ_RELEASE_SOURCE_SHA?.trim();
-if (releaseSourceSha && !/^[0-9a-f]{40}$/.test(releaseSourceSha)) {
+if (!releaseSourceSha || !/^[0-9a-f]{40}$/.test(releaseSourceSha)) {
   throw new Error(
     "LOGSEQ_RELEASE_SOURCE_SHA must be an exact lowercase 40-hex commit SHA",
   );
 }
-if (releaseSourceSha && embeddedRevision !== releaseSourceSha) {
+if (embeddedRevision !== releaseSourceSha) {
   throw new Error(
     `LOGSEQ_REVISION ${embeddedRevision} does not match release source SHA ${releaseSourceSha}`,
   );
 }
-const expectedRevision = releaseSourceSha || embeddedRevision;
+const expectedRevision = releaseSourceSha;
 
 if (!["darwin", "linux", "win32"].includes(expectedPlatform)) {
   throw new Error(`unsupported --platform: ${expectedPlatform}`);
@@ -67,12 +67,6 @@ if (!["x64", "arm64"].includes(expectedArch)) {
 if (!expectedVersion) {
   throw new Error("--version is required");
 }
-if (!expectedRevision) {
-  throw new Error(
-    "could not determine the expected desktop runtime revision",
-  );
-}
-
 const findFiles = (directory, fileName, results = []) => {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
     const entryPath = path.join(directory, entry.name);
