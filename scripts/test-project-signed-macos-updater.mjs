@@ -1476,8 +1476,14 @@ const splitTopLevel = (expression, operator) => {
   return parts;
 };
 
-const evaluateSignerCondition = (condition, scenario) => {
+const evaluateJobCondition = (condition, scenario) => {
   const unwrappedCondition = stripExpressionEnvelope(condition);
+  // Actions' implicit success() propagates a skipped transitive ancestor unless
+  // the downstream job declares an explicit status-function condition.
+  const schedulerResults = {
+    ...(scenario.ancestors ?? {}),
+    ...scenario.needs,
+  };
   const evaluate = (rawExpression) => {
     const expression = stripOuterParentheses(rawExpression.trim());
     const disjunction = splitTopLevel(expression, "||");
@@ -1490,13 +1496,15 @@ const evaluateSignerCondition = (condition, scenario) => {
     }
     if (expression === "always()") return true;
     if (expression === "cancelled()") {
-      return Object.values(scenario.needs).includes("cancelled");
+      return Object.values(schedulerResults).includes("cancelled");
     }
     if (expression === "failure()") {
-      return Object.values(scenario.needs).includes("failure");
+      return Object.values(schedulerResults).includes("failure");
     }
     if (expression === "success()") {
-      return Object.values(scenario.needs).every((result) => result === "success");
+      return Object.values(schedulerResults).every(
+        (result) => result === "success",
+      );
     }
     const needResult = expression.match(
       /^needs\.([a-zA-Z0-9_-]+)\.result\s*(==|!=)\s*'([^']+)'$/,
@@ -1523,7 +1531,7 @@ const evaluateSignerCondition = (condition, scenario) => {
   );
   if (
     !hasStatusOverride &&
-    Object.values(scenario.needs).some((result) => result !== "success")
+    Object.values(schedulerResults).some((result) => result !== "success")
   ) {
     return false;
   }
@@ -1578,42 +1586,151 @@ const assertSignerDependencyGate = (needs, condition) => {
   ];
   for (const [label, buildAndroid, needs, expected] of scenarios) {
     assert.equal(
-      evaluateSignerCondition(condition, { buildAndroid, needs }),
+      evaluateJobCondition(condition, { buildAndroid, needs }),
       expected,
       `signer dependency gate violates scenario: ${label}`,
     );
   }
 };
 
-const assertDirectSuccessGate = (label, needs, condition) => {
-  const expression = stripExpressionEnvelope(condition);
-  assert.match(
-    expression,
-    /\balways\(\)/,
-    `${label} must override transitive skipped-ancestor propagation`,
+const assertVerifierSchedulingGate = (needs, condition) => {
+  assert.deepEqual(
+    [...needs].sort(),
+    ["release-rehearsal-gate", "selfhost-release-signing"].sort(),
+    "verifier dependencies must be exactly the protected signer and rehearsal",
   );
-  const allSuccess = Object.fromEntries(
-    needs.map((name) => [name, "success"]),
+  const scenarios = [
+    [
+      "Android disabled leaves a skipped transitive ancestor",
+      {
+        ancestors: { "build-android": "skipped" },
+        needs: {
+          "release-rehearsal-gate": "success",
+          "selfhost-release-signing": "success",
+        },
+      },
+      true,
+    ],
+    [
+      "Android enabled success path",
+      {
+        ancestors: { "build-android": "success" },
+        needs: {
+          "release-rehearsal-gate": "success",
+          "selfhost-release-signing": "success",
+        },
+      },
+      true,
+    ],
+    [
+      "signer failed",
+      {
+        ancestors: { "build-android": "success" },
+        needs: {
+          "release-rehearsal-gate": "success",
+          "selfhost-release-signing": "failure",
+        },
+      },
+      false,
+    ],
+    [
+      "signer skipped",
+      {
+        ancestors: { "build-android": "failure" },
+        needs: {
+          "release-rehearsal-gate": "success",
+          "selfhost-release-signing": "skipped",
+        },
+      },
+      false,
+    ],
+    [
+      "rehearsal failed",
+      {
+        ancestors: { "build-android": "skipped" },
+        needs: {
+          "release-rehearsal-gate": "failure",
+          "selfhost-release-signing": "success",
+        },
+      },
+      false,
+    ],
+    [
+      "rehearsal skipped",
+      {
+        ancestors: { "build-android": "skipped" },
+        needs: {
+          "release-rehearsal-gate": "skipped",
+          "selfhost-release-signing": "success",
+        },
+      },
+      false,
+    ],
+  ];
+  for (const [label, scenario, expected] of scenarios) {
+    assert.equal(
+      evaluateJobCondition(condition, scenario),
+      expected,
+      `verifier scheduling gate violates scenario: ${label}`,
+    );
+  }
+};
+
+const assertPublisherSchedulingGate = (needs, condition) => {
+  assert.deepEqual(
+    [...needs].sort(),
+    ["selfhost-release-verifier"],
+    "publisher must depend only on the secretless verifier",
   );
-  assert.equal(
-    evaluateSignerCondition(condition, {
-      buildAndroid: false,
-      needs: allSuccess,
-    }),
-    true,
-    `${label} must run when every direct dependency succeeds`,
-  );
-  for (const name of needs) {
-    for (const result of ["failure", "skipped", "cancelled"]) {
-      assert.equal(
-        evaluateSignerCondition(condition, {
-          buildAndroid: false,
-          needs: { ...allSuccess, [name]: result },
-        }),
-        false,
-        `${label} must fail closed when ${name} is ${result}`,
-      );
-    }
+  const scenarios = [
+    [
+      "Android disabled verified release",
+      {
+        ancestors: {
+          "build-android": "skipped",
+          "selfhost-release-signing": "success",
+        },
+        needs: { "selfhost-release-verifier": "success" },
+      },
+      true,
+    ],
+    [
+      "Android enabled verified release",
+      {
+        ancestors: {
+          "build-android": "success",
+          "selfhost-release-signing": "success",
+        },
+        needs: { "selfhost-release-verifier": "success" },
+      },
+      true,
+    ],
+    [
+      "verifier failed",
+      {
+        ancestors: { "selfhost-release-signing": "success" },
+        needs: { "selfhost-release-verifier": "failure" },
+      },
+      false,
+    ],
+    [
+      "verifier skipped after Android failure",
+      {
+        ancestors: {
+          "build-android": "failure",
+          "selfhost-release-signing": "skipped",
+        },
+        needs: { "selfhost-release-verifier": "skipped" },
+      },
+      false,
+    ],
+  ];
+  for (const [label, scenario, expected] of scenarios) {
+    assert.equal(
+      evaluateJobCondition(condition, scenario),
+      expected,
+      `publisher scheduling gate violates scenario: ${label}`,
+    );
   }
 };
 
@@ -1644,23 +1761,11 @@ const assertProtectedReleaseDag = (workflow) => {
     workflowJobNeeds(publisher).includes("selfhost-release-verifier"),
     "publisher does not depend on the secretless verifier",
   );
-  assert.deepEqual(
-    workflowJobNeeds(verifier),
-    ["selfhost-release-signing", "release-rehearsal-gate"],
-    "secretless verifier dependencies drifted",
-  );
-  assertDirectSuccessGate(
-    "secretless verifier",
+  assertVerifierSchedulingGate(
     workflowJobNeeds(verifier),
     workflowJobCondition(verifier),
   );
-  assert.deepEqual(
-    workflowJobNeeds(publisher),
-    ["selfhost-release-verifier"],
-    "publisher dependencies drifted",
-  );
-  assertDirectSuccessGate(
-    "protected publisher",
+  assertPublisherSchedulingGate(
     workflowJobNeeds(publisher),
     workflowJobCondition(publisher),
   );
@@ -4063,6 +4168,101 @@ addCase(cases, "protected release DAG contract is structural and fail-closed", (
   assert.throws(
     () => assertSignerDependencyGate(expectedNeeds, missingAndroidSuccessGate),
     /Android enabled but skipped/,
+  );
+});
+
+addCase(cases, "downstream scheduler model is format-tolerant and fail-closed", () => {
+  const verifierFixture = [
+    "    if: >-",
+    "      ${{ always() &&",
+    "      needs.selfhost-release-signing.result == 'success' &&",
+    "      needs.release-rehearsal-gate.result == 'success' }}",
+  ].join("\n");
+  const verifierCondition = workflowJobCondition(verifierFixture);
+  const verifierNeeds = [
+    "selfhost-release-signing",
+    "release-rehearsal-gate",
+  ];
+  assertVerifierSchedulingGate(verifierNeeds, verifierCondition);
+  assert.throws(
+    () =>
+      assertVerifierSchedulingGate(
+        verifierNeeds,
+        verifierCondition.replace("always() && ", ""),
+      ),
+    /Android disabled leaves a skipped transitive ancestor/,
+  );
+  assert.throws(
+    () =>
+      assertVerifierSchedulingGate(
+        verifierNeeds,
+        verifierCondition.replace(
+          "needs.selfhost-release-signing.result == 'success' && ",
+          "",
+        ),
+      ),
+    /signer failed/,
+  );
+
+  const publisherCondition = [
+    "${{ always()",
+    "needs.selfhost-release-verifier.result == 'success'",
+    "github.event_name == 'workflow_dispatch' }}",
+  ].join(" && ");
+  const publisherNeeds = ["selfhost-release-verifier"];
+  assertPublisherSchedulingGate(publisherNeeds, publisherCondition);
+  assert.throws(
+    () =>
+      assertPublisherSchedulingGate(
+        publisherNeeds,
+        publisherCondition.replace("always() && ", ""),
+      ),
+    /Android disabled verified release/,
+  );
+  assert.throws(
+    () =>
+      assertPublisherSchedulingGate(
+        publisherNeeds,
+        publisherCondition.replace(
+          "needs.selfhost-release-verifier.result == 'success' && ",
+          "",
+        ),
+      ),
+    /verifier failed/,
+  );
+});
+
+addCase(cases, "secretless verifier survives optional skip and fails closed", () => {
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const verifier = workflowJobSource(workflow, "selfhost-release-verifier");
+  assertVerifierSchedulingGate(
+    workflowJobNeeds(verifier),
+    workflowJobCondition(verifier),
+  );
+  assert.deepEqual(workflowJobPermissions(verifier), new Map([
+    ["actions", "read"],
+    ["contents", "read"],
+  ]));
+  assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
+  assert.doesNotMatch(verifier, /environment:|\bsecrets\./);
+});
+
+addCase(cases, "publisher runs only after successful secretless verification", () => {
+  const workflow = fs.readFileSync(workflowPath, "utf8");
+  const publisher = workflowJobSource(workflow, "selfhost-release");
+  assertPublisherSchedulingGate(
+    workflowJobNeeds(publisher),
+    workflowJobCondition(publisher),
+  );
+  assert.deepEqual(workflowJobPermissions(publisher), new Map([
+    ["actions", "read"],
+    ["contents", "write"],
+  ]));
+  assert.match(publisher, /environment:\s*selfhost-production/);
+  assert.match(publisher, /softprops\/action-gh-release@v2/);
+  assert.doesNotMatch(
+    publisher,
+    /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64|finalize-github-macos/,
   );
 });
 
