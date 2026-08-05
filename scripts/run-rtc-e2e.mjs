@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 import {
   createShutdownController,
   createWindowsProcessTreeSignaler,
-  releaseChildProcessHandles,
   reportRtcE2eErrors,
 } from "./rtc-e2e-shutdown.mjs";
 
@@ -90,12 +89,8 @@ const startChild = (command, args) => {
     detached,
     env: process.env,
     shell: false,
-    stdio: detached ? "inherit" : ["inherit", "pipe", "pipe"],
+    stdio: "inherit",
   });
-  if (!detached) {
-    child.stdout?.pipe(process.stdout, { end: false });
-    child.stderr?.pipe(process.stderr, { end: false });
-  }
   children.add(child);
   child.once("exit", () => children.delete(child));
   return child;
@@ -104,12 +99,9 @@ const startChild = (command, args) => {
 const signalChild = async (child, signal) => {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   shutdownExpectedChildren.add(child);
-  if (!detached) {
-    await signalWindowsProcessTree(child, signal);
-    return;
-  }
   try {
-    process.kill(-child.pid, signal);
+    if (detached) process.kill(-child.pid, signal);
+    else await signalWindowsProcessTree(child, signal);
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
   }
@@ -185,7 +177,6 @@ const waitForServer = async (server, port) => {
 
 shutdownController = createShutdownController({
   children,
-  releaseChild: detached ? undefined : releaseChildProcessHandles,
   signalChild,
   waitForExit,
 });
