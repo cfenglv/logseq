@@ -555,40 +555,11 @@ const createBbShim = () => {
   const marker = path.join(root, "calls.log");
   const preload = path.join(root, "no-network-preload.cjs");
   const shutdownMarker = path.join(root, "shutdown.log");
-  const taskkillShim = path.join(root, "taskkill-shim.cjs");
-  fs.writeFileSync(
-    taskkillShim,
-    `const args = process.argv.slice(2);
-const pidIndex = args.indexOf("/PID");
-const pid = Number(args[pidIndex + 1]);
-const signal = args.includes("/F") ? "SIGKILL" : "SIGTERM";
-try {
-  process.kill(pid, signal);
-  process.exit(0);
-} catch (error) {
-  if (error?.code === "ESRCH") process.exit(0);
-  throw error;
-}
-`,
-  );
   fs.writeFileSync(
     preload,
     `const fs = require("node:fs");
-const childProcess = require("node:child_process");
 const net = require("node:net");
-const { syncBuiltinESMExports } = require("node:module");
-const originalSpawn = childProcess.spawn;
 const originalProcessKill = process.kill.bind(process);
-childProcess.spawn = (command, args, options) => {
-  if (command === "taskkill.exe") {
-    return originalSpawn(
-      process.execPath,
-      [process.env.RTC_TASKKILL_SHIM, ...args],
-      options,
-    );
-  }
-  return originalSpawn(command, args, options);
-};
 process.kill = (pid, signal) => {
   if (process.platform === "win32" && pid < 0) {
     fs.appendFileSync(process.env.RTC_FAKE_SHUTDOWN_MARKER,
@@ -597,7 +568,6 @@ process.kill = (pid, signal) => {
   }
   return originalProcessKill(pid, signal);
 };
-syncBuiltinESMExports();
 net.createServer = () => {
   const server = {
     address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43127 }),
@@ -635,11 +605,11 @@ if (args[0] === "serve") {
 `;
   fs.writeFileSync(executable, shim);
   fs.chmodSync(executable, 0o755);
-  return { marker, preload, root, shutdownMarker, taskkillShim };
+  return { marker, preload, root, shutdownMarker };
 };
 
 const runRtcWrapperWithFakeTask = (task, exitCode) => {
-  const { marker, preload, root, shutdownMarker, taskkillShim } = createBbShim();
+  const { marker, preload, root, shutdownMarker } = createBbShim();
   const result = spawnSync(
     process.execPath,
     [path.join(repoRoot, "scripts/run-rtc-e2e.mjs"), task],
@@ -656,7 +626,6 @@ const runRtcWrapperWithFakeTask = (task, exitCode) => {
         RTC_FAKE_MARKER: marker,
         RTC_FAKE_SHUTDOWN_MARKER: shutdownMarker,
         RTC_FAKE_TASK_EXIT: String(exitCode),
-        RTC_TASKKILL_SHIM: taskkillShim,
       },
       timeout: 15_000,
     },

@@ -6,7 +6,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createShutdownController,
-  createWindowsProcessTreeSignaler,
   reportRtcE2eErrors,
 } from "./rtc-e2e-shutdown.mjs";
 
@@ -55,7 +54,6 @@ if (!supportedTasks.has(testTask)) {
 
 const children = new Set();
 const detached = process.platform !== "win32";
-const signalWindowsProcessTree = createWindowsProcessTreeSignaler();
 let shutdownController;
 
 const getFreePort = () =>
@@ -90,11 +88,11 @@ const startChild = (command, args) => {
   return child;
 };
 
-const signalChild = async (child, signal) => {
+const signalChild = (child, signal) => {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   try {
     if (detached) process.kill(-child.pid, signal);
-    else await signalWindowsProcessTree(child, signal);
+    else child.kill(signal);
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
   }
