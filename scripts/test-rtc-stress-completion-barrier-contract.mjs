@@ -377,29 +377,62 @@ const hasTimedStableWindow = (source) => {
       `(^|[^A-Za-z0-9*+!?<>=._/-])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9*+!?<>=._/-]|$)`,
     );
   const references = (text, name) => symbolPattern(name).test(text);
+  const conjunctiveEqualityForms = (expression) => {
+    if (!expression?.startsWith("(")) return [];
+    const items = splitTopLevelItems(expression);
+    if (items[0] === "=" && items.length === 3) return [expression];
+    if (items[0] !== "and") return [];
+    return items.slice(1).flatMap(conjunctiveEqualityForms);
+  };
+  const conjunctiveSymbols = (expression) => {
+    if (bareSymbol.test(expression)) return [expression];
+    if (!expression?.startsWith("(")) return [];
+    const items = splitTopLevelItems(expression);
+    if (items[0] !== "and") return [];
+    return items.slice(1).flatMap(conjunctiveSymbols);
+  };
+  const acceptedPredicatesFor = (sampled) =>
+    [...bindings]
+      .filter(([, value]) => {
+        if (!value?.startsWith("(")) return false;
+        const items = splitTopLevelItems(value);
+        return (
+          items.length === 2 &&
+          items[0] !== "=" &&
+          items[1] === sampled
+        );
+      })
+      .map(([name]) => name);
   const stateEqualities = [];
   for (const [predicate, value] of bindings) {
     if (!value?.startsWith("(")) continue;
-    const items = splitTopLevelItems(value);
-    if (items[0] !== "=" || items.length !== 3) continue;
-    for (const [sampled, previous] of [
-      [items[1], items[2]],
-      [items[2], items[1]],
-    ]) {
-      const sampledValue = resolveBinding(sampled, bindings);
-      if (!sampledValue.startsWith("(")) continue;
-      const sampledCall = splitTopLevelItems(sampledValue);
-      if (
-        !bareSymbol.test(sampled) ||
-        !bareSymbol.test(previous) ||
-        sampledCall.length !== 1 ||
-        (!invokedFunctionParameters.has(sampledCall[0]) &&
-          !sourceDefinitions.has(sampledCall[0])) ||
-        /(?:monotonic|nanoTime|performance[/.]now)/i.test(sampledCall[0])
-      ) {
-        continue;
+    const outerItems = splitTopLevelItems(value);
+    const nestedConjunction = outerItems[0] === "and";
+    for (const equality of conjunctiveEqualityForms(value)) {
+      const items = splitTopLevelItems(equality);
+      for (const [sampled, previous] of [
+        [items[1], items[2]],
+        [items[2], items[1]],
+      ]) {
+        const sampledValue = resolveBinding(sampled, bindings);
+        if (!sampledValue.startsWith("(")) continue;
+        const sampledCall = splitTopLevelItems(sampledValue);
+        if (
+          !bareSymbol.test(sampled) ||
+          !bareSymbol.test(previous) ||
+          sampledCall.length !== 1 ||
+          (!invokedFunctionParameters.has(sampledCall[0]) &&
+            !sourceDefinitions.has(sampledCall[0])) ||
+          /(?:monotonic|nanoTime|performance[/.]now)/i.test(sampledCall[0])
+        ) {
+          continue;
+        }
+        const accepted = acceptedPredicatesFor(sampled).find((name) =>
+          conjunctiveSymbols(value).includes(name),
+        );
+        if (nestedConjunction && !accepted) continue;
+        stateEqualities.push({ predicate, sampled, previous, accepted });
       }
-      stateEqualities.push({ predicate, sampled, previous });
     }
   }
   const timeBindings = new Set(
@@ -414,17 +447,9 @@ const hasTimedStableWindow = (source) => {
     [...timeBindings].some((name) => references(text, name));
   const transitionEvidence = [];
   for (const state of stateEqualities) {
-    const acceptedPredicates = [...bindings]
-      .filter(([, value]) => {
-        if (!value?.startsWith("(")) return false;
-        const items = splitTopLevelItems(value);
-        return (
-          items.length === 2 &&
-          items[0] !== "=" &&
-          items[1] === state.sampled
-        );
-      })
-      .map(([name]) => name);
+    const acceptedPredicates = state.accepted ?
+      [state.accepted] :
+      acceptedPredicatesFor(state.sampled);
     for (const [output, value] of bindings) {
       if (!value?.startsWith("(")) continue;
       const items = splitTopLevelItems(value);
@@ -1068,6 +1093,10 @@ const safeStagedGuardRtcHelpers = safeArbitraryStateRtcHelpers.replace(
             :else
             (do`,
 );
+const safeNestedAndStateRtcHelpers = safeStagedGuardRtcHelpers.replace(
+  "matches-prior? (= prior-view fresh-view)",
+  "matches-prior? (and quiet-enough? (= prior-view fresh-view))",
+);
 const completionOptionsForm = definitions(safeOptionTimedWindowFixture).get(
   "completion-window-options",
 );
@@ -1234,6 +1263,18 @@ test("contract resolves metadata-bearing duration definitions", () => {
       safeRunner,
       safePrepush,
       safeStagedGuardRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts conjunctive nested state equality", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeNestedAndStateRtcHelpers,
     ),
     [],
   );
@@ -1702,6 +1743,56 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeRunner,
       safePrepush,
       safeStagedGuardRtcHelpers,
+    ],
+    [
+      "nested state equality is disjoined from acceptance",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeNestedAndStateRtcHelpers.replace(
+        "matches-prior? (and quiet-enough? (= prior-view fresh-view))",
+        "matches-prior? (or quiet-enough? (= prior-view fresh-view))",
+      ),
+    ],
+    [
+      "nested state predicate has equality without acceptance",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeNestedAndStateRtcHelpers.replace(
+        "matches-prior? (and quiet-enough? (= prior-view fresh-view))",
+        "matches-prior? (and (= prior-view fresh-view))",
+      ),
+    ],
+    [
+      "nested state predicate uses constant true acceptance",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeNestedAndStateRtcHelpers.replace(
+        "quiet-enough? (acceptable? fresh-view)",
+        "quiet-enough? true",
+      ),
+    ],
+    [
+      "nested equality compares the wrong state binding",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeNestedAndStateRtcHelpers.replace(
+        "(= prior-view fresh-view)",
+        "(= prior-view stable-since)",
+      ),
+    ],
+    [
+      "nested state equality is negated",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeNestedAndStateRtcHelpers.replace(
+        "(= prior-view fresh-view)",
+        "(not (= prior-view fresh-view))",
+      ),
     ],
   ];
   for (const [label, source, runner, prepush, rtcHelpers] of mutations) {
