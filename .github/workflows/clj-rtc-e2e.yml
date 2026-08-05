@@ -112,13 +112,9 @@ jobs:
           retention-days: 1
 
   test:
-    name: Test ${{ matrix.test-task }}
+    name: Test RTC E2E
     needs: build
     runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        test-task: [run-rtc-extra-test, run-rtc-extra-part2-test]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -171,13 +167,22 @@ jobs:
         working-directory: clj-e2e
         run: clojure -Srepro -P -M:test
 
-      - name: Run e2e tests
-        run: cd clj-e2e && timeout 30m bb ${{ matrix.test-task }}
+      # Both shards use the fixture's default e2etest account. Keep their
+      # execution order aligned with the local rtc:prepush gate so one shard
+      # cannot mutate the account while the other is preparing its RTC graph.
+      - name: Run RTC E2E part 1
+        run: timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-test
+
+      - name: Run RTC E2E part 2
+        # A part 1 failure must not silently skip coverage for part 2. The job
+        # still remains failed because neither step ignores its exit status.
+        if: ${{ !cancelled() }}
+        run: timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-part2-test
 
       - name: Collect screenshots
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-screenshots-${{ matrix.test-task }}
+          name: e2e-screenshots-rtc
           path: clj-e2e/e2e-dump/*
           retention-days: 1

@@ -382,8 +382,29 @@ for (const needle of [
   "Fetch E2E Clojure deps",
   "clojure -Srepro -P -M:test",
   "clojure-e2e-deps-v2-",
+  "name: Run RTC E2E part 1",
+  "timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-test",
+  "name: Run RTC E2E part 2",
+  "if: ${{ !cancelled() }}",
+  "timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-part2-test",
 ]) {
   assertContains(rtcE2eWorkflow, needle, "RTC E2E workflow");
+}
+for (const forbidden of ["matrix.test-task", "continue-on-error:"]) {
+  assertNotContains(rtcE2eWorkflow, forbidden, "RTC E2E workflow");
+}
+const rtcE2eCommands = [
+  ...rtcE2eWorkflow.matchAll(
+    /^\s+run: timeout 30m node scripts\/run-rtc-e2e\.mjs (rtc-extra(?:-part2)?-test)\s*$/gm,
+  ),
+].map((match) => match[1]);
+if (
+  JSON.stringify(rtcE2eCommands) !==
+  JSON.stringify(["rtc-extra-test", "rtc-extra-part2-test"])
+) {
+  fail(
+    `RTC E2E workflow must run both shards exactly once in local-gate order, got ${JSON.stringify(rtcE2eCommands)}`,
+  );
 }
 
 const requiredDesktopBuildDependencies = [
