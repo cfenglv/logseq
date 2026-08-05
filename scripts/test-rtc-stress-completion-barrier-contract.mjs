@@ -396,10 +396,21 @@ const hasTimedStableWindow = (source) => {
       .filter(([, value]) => {
         if (!value?.startsWith("(")) return false;
         const items = splitTopLevelItems(value);
-        return (
+        const directPredicate =
           items.length === 2 &&
-          items[0] !== "=" &&
-          items[1] === sampled
+          items[1] === sampled &&
+          (invokedFunctionParameters.has(items[0]) ||
+            sourceDefinitions.has(items[0]));
+        if (directPredicate) return true;
+        if (items[0] !== "true?" || items.length !== 2) return false;
+        const inner = items[1];
+        if (!inner.startsWith("(")) return false;
+        const innerItems = splitTopLevelItems(inner);
+        return (
+          innerItems.length === 2 &&
+          innerItems[1] === sampled &&
+          (invokedFunctionParameters.has(innerItems[0]) ||
+            sourceDefinitions.has(innerItems[0]))
         );
       })
       .map(([name]) => name);
@@ -1097,6 +1108,10 @@ const safeNestedAndStateRtcHelpers = safeStagedGuardRtcHelpers.replace(
   "matches-prior? (= prior-view fresh-view)",
   "matches-prior? (and quiet-enough? (= prior-view fresh-view))",
 );
+const safeTrueWrappedPredicateRtcHelpers = safeNestedAndStateRtcHelpers.replace(
+  "quiet-enough? (acceptable? fresh-view)",
+  "quiet-enough? (true? (acceptable? fresh-view))",
+);
 const completionOptionsForm = definitions(safeOptionTimedWindowFixture).get(
   "completion-window-options",
 );
@@ -1275,6 +1290,18 @@ test("contract accepts conjunctive nested state equality", () => {
       safeRunner,
       safePrepush,
       safeNestedAndStateRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts one true?-normalized state predicate", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeTrueWrappedPredicateRtcHelpers,
     ),
     [],
   );
@@ -1792,6 +1819,56 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeNestedAndStateRtcHelpers.replace(
         "(= prior-view fresh-view)",
         "(not (= prior-view fresh-view))",
+      ),
+    ],
+    [
+      "state predicate uses false? normalization",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeTrueWrappedPredicateRtcHelpers.replace(
+        "(true? (acceptable? fresh-view))",
+        "(false? (acceptable? fresh-view))",
+      ),
+    ],
+    [
+      "state predicate negates the accepted predicate",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeTrueWrappedPredicateRtcHelpers.replace(
+        "(true? (acceptable? fresh-view))",
+        "(not (acceptable? fresh-view))",
+      ),
+    ],
+    [
+      "true? normalization wraps a constant",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeTrueWrappedPredicateRtcHelpers.replace(
+        "(true? (acceptable? fresh-view))",
+        "(true? true)",
+      ),
+    ],
+    [
+      "true? predicate observes a different state",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeTrueWrappedPredicateRtcHelpers.replace(
+        "(true? (acceptable? fresh-view))",
+        "(true? (acceptable? prior-view))",
+      ),
+    ],
+    [
+      "true? predicate has a second arbitrary wrapper",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeTrueWrappedPredicateRtcHelpers.replace(
+        "(true? (acceptable? fresh-view))",
+        "(true? (boolean (acceptable? fresh-view)))",
       ),
     ],
   ];
