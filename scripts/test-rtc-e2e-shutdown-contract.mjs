@@ -241,11 +241,18 @@ global.fetch = async () => ({ status: 200 });
   }
 })
 
-test('win32 runner cleanup terminates the complete bb descendant process tree', () => {
+test('win32 runner cleanup terminates the complete bb descendant process tree', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-win32-tree-'))
   const preload = path.join(root, 'win32-tree-preload.cjs')
   const bbShim = path.join(root, 'bb-tree-shim.cjs')
+  const treeKillShim = path.join(root, 'taskkill.exe')
+  const treeKillAlias = path.join(root, 'taskkill')
+  const treeKillLog = path.join(root, 'tree-kill.log')
+  const serverPidPath = path.join(root, 'server.pid')
   const descendantPidPath = path.join(root, 'descendant.pid')
+  let runner
+  let runnerExit
+  let serverPid
   let descendantPid
 
   fs.writeFileSync(
@@ -284,6 +291,7 @@ global.fetch = async () => {
 const { spawn } = require('node:child_process');
 const [task] = process.argv.slice(2);
 if (task === 'serve') {
+  fs.writeFileSync(process.env.RTC_WIN32_SERVER_PID, String(process.pid));
   const descendant = spawn(
     process.execPath,
     ['-e', 'setInterval(() => {}, 1000)'],
@@ -297,34 +305,84 @@ if (task === 'serve') {
 }
 `
   )
+  const treeKillSource = `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.RTC_WIN32_TREE_KILL_LOG, args.join(' ') + '\\n');
+const pidIndex = args.findIndex((arg) => arg.toUpperCase() === '/PID');
+const requestedPid = Number(args[pidIndex + 1]);
+const readPid = (target) =>
+  fs.existsSync(target) ? Number(fs.readFileSync(target, 'utf8')) : undefined;
+const serverPid = readPid(process.env.RTC_WIN32_SERVER_PID);
+const descendantPid = readPid(process.env.RTC_WIN32_DESCENDANT_PID);
+const targets = requestedPid === serverPid
+  ? [descendantPid, serverPid]
+  : [requestedPid];
+for (const pid of targets) {
+  if (!Number.isInteger(pid) || pid <= 1) continue;
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error;
+  }
+}
+`
+  fs.writeFileSync(treeKillShim, treeKillSource)
+  fs.writeFileSync(treeKillAlias, treeKillSource)
+  fs.chmodSync(treeKillShim, 0o755)
+  fs.chmodSync(treeKillAlias, 0o755)
 
   const env = {
     ...process.env,
     LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([process.execPath, bbShim]),
     NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
+    PATH: `${root}${path.delimiter}${process.env.PATH ?? ''}`,
     RTC_WIN32_DESCENDANT_PID: descendantPidPath,
+    RTC_WIN32_SERVER_PID: serverPidPath,
+    RTC_WIN32_TREE_KILL_LOG: treeKillLog,
     TEMP: os.tmpdir(),
     TMP: os.tmpdir(),
   }
   delete env.NODE_TEST_CONTEXT
 
   try {
-    const result = spawnSync(
+    runner = spawn(
       process.execPath,
       [path.join(repoRoot, 'scripts/run-rtc-e2e.mjs'), 'rtc-extra-test'],
       {
         cwd: repoRoot,
-        encoding: 'utf8',
         env,
-        timeout: 10_000,
+        stdio: 'ignore',
       }
     )
+    runnerExit = new Promise((resolve, reject) => {
+      runner.once('error', reject)
+      runner.once('exit', (code, signal) => resolve({ code, signal }))
+    })
+    let timeout
+    const result = await Promise.race([
+      runnerExit,
+      new Promise((resolve) => {
+        timeout = setTimeout(() => resolve({ timedOut: true }), 3_000)
+      }),
+    ]).finally(() => clearTimeout(timeout))
+    serverPid = fs.existsSync(serverPidPath)
+      ? Number(fs.readFileSync(serverPidPath, 'utf8'))
+      : undefined
     descendantPid = Number(fs.readFileSync(descendantPidPath, 'utf8'))
     assert.equal(
-      result.status,
-      0,
-      `win32 runner did not complete normally:\n${result.stdout}${result.stderr}`
+      result.timedOut,
+      undefined,
+      `win32 runner did not settle within 3s (tree adapter calls: ${
+        fs.existsSync(treeKillLog) ? fs.readFileSync(treeKillLog, 'utf8') : 'none'
+      })`
     )
+    assert.equal(
+      result.code,
+      0,
+      `win32 runner did not complete normally: ${JSON.stringify(result)}`
+    )
+    assert.ok(Number.isInteger(serverPid) && serverPid > 1)
     assert.ok(Number.isInteger(descendantPid) && descendantPid > 1)
     assert.throws(
       () => process.kill(descendantPid, 0),
@@ -332,9 +390,25 @@ if (task === 'serve') {
       `win32 runner left descendant ${descendantPid} alive after shutdown`
     )
   } finally {
-    if (Number.isInteger(descendantPid) && descendantPid > 1) {
+    if (runner && runner.exitCode === null && runner.signalCode === null) {
+      runner.kill('SIGKILL')
+      await Promise.race([
+        runnerExit?.catch(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, 500)),
+      ])
+    }
+    for (const [knownPid, pidPath] of [
+      [serverPid, serverPidPath],
+      [descendantPid, descendantPidPath],
+    ]) {
+      const pid = Number.isInteger(knownPid)
+        ? knownPid
+        : fs.existsSync(pidPath)
+          ? Number(fs.readFileSync(pidPath, 'utf8'))
+          : undefined
+      if (!Number.isInteger(pid) || pid <= 1) continue
       try {
-        process.kill(descendantPid, 'SIGKILL')
+        process.kill(pid, 'SIGKILL')
       } catch (error) {
         if (error?.code !== 'ESRCH') throw error
       }
