@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import os from "node:os";
 import fs from "node:fs";
@@ -166,6 +166,151 @@ const assertContains = (text, needle, label) => {
   assert.ok(text.includes(needle), `${label} should contain ${needle}`);
 };
 
+const assertPackagedRuntimeRevisionBoundary = () => {
+  const fixtureRoot = mkdtempSync(
+    path.join(os.tmpdir(), "packaged-revision-contract-"),
+  );
+  const stagedResources = path.join(fixtureRoot, "resources");
+  const searchRoot = path.join(fixtureRoot, "dist");
+  const appRoot = path.join(searchRoot, "Logseq-win32-x64");
+  const packagedResources = path.join(appRoot, "resources");
+  const fakeAsarRoot = path.join(fixtureRoot, "asar-contents");
+  const expectedRevision = "0123456789abcdef0123456789abcdef01234567";
+  const version = "2.0.1-selfhost.5";
+
+  const writeFixture = (filePath, payload) => {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, payload);
+  };
+  const peX64 = () => {
+    const payload = Buffer.alloc(128);
+    payload[0] = 0x4d;
+    payload[1] = 0x5a;
+    payload.writeUInt32LE(0x40, 0x3c);
+    payload.writeUInt16LE(0x8664, 0x44);
+    return payload;
+  };
+
+  try {
+    fs.cpSync(path.join(repoRoot, "resources"), stagedResources, {
+      filter: (source) => path.basename(source) !== "node_modules",
+      recursive: true,
+    });
+    writeFixture(
+      path.join(stagedResources, "node_modules", "@electron", "asar", "package.json"),
+      JSON.stringify({ main: "index.cjs", name: "@electron/asar" }),
+    );
+    writeFixture(
+      path.join(stagedResources, "node_modules", "@electron", "asar", "index.cjs"),
+      `const fs = require("node:fs");
+const path = require("node:path");
+module.exports.extractFile = (_archive, relativePath) =>
+  fs.readFileSync(path.join(process.env.LOGSEQ_FAKE_ASAR_ROOT, relativePath));
+`,
+    );
+
+    writeFixture(path.join(packagedResources, "app.asar"), "fixture\n");
+    writeFixture(path.join(appRoot, "Logseq.exe"), peX64());
+    writeFixture(
+      path.join(
+        packagedResources,
+        "app.asar.unpacked",
+        "node_modules",
+        "keytar",
+        "build",
+        "Release",
+        "keytar.node",
+      ),
+      peX64(),
+    );
+    writeFixture(
+      path.join(packagedResources, "app-update.yml"),
+      "provider: github\nowner: cfenglv\nrepo: logseq\n",
+    );
+    for (const relativePath of [
+      "sidecar/embedding_server.py",
+      "project-updater-signature.mjs",
+    ]) {
+      const stagedPath = path.join(stagedResources, relativePath);
+      if (!fs.existsSync(stagedPath)) {
+        writeFixture(stagedPath, `fixture ${relativePath}\n`);
+      }
+      writeFixture(
+        path.join(packagedResources, relativePath),
+        fs.readFileSync(stagedPath),
+      );
+    }
+    writeFixture(
+      path.join(fakeAsarRoot, "package.json"),
+      JSON.stringify({ main: "electron.js", version }),
+    );
+
+    const runVerifier = (runtimePayload) => {
+      for (const relativePath of [
+        "js/logseq-cli.js",
+        "js/db-worker-node.js",
+      ]) {
+        writeFixture(path.join(stagedResources, relativePath), runtimePayload);
+        writeFixture(path.join(fakeAsarRoot, relativePath), runtimePayload);
+      }
+      return spawnSync(
+        process.execPath,
+        [
+          path.join(stagedResources, "verify-packaged-desktop.mjs"),
+          "--search-root",
+          searchRoot,
+          "--platform",
+          "win32",
+          "--arch",
+          "x64",
+          "--version",
+          version,
+          "--electron-version",
+          "42.4.1",
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            LOGSEQ_FAKE_ASAR_ROOT: fakeAsarRoot,
+            LOGSEQ_RELEASE_SOURCE_SHA: expectedRevision,
+            LOGSEQ_REVISION: expectedRevision,
+          },
+          timeout: 15_000,
+        },
+      );
+    };
+
+    const exactToken = runVerifier(
+      `globalThis.LOGSEQ_REVISION = "${expectedRevision}";\n`,
+    );
+    assert.equal(
+      exactToken.status,
+      0,
+      `packaged verifier rejected an exact revision token:\n${exactToken.stdout}${exactToken.stderr}`,
+    );
+    console.log(
+      "[cli-release-config] PASS packaged exact revision token control",
+    );
+
+    const substringOnly = runVerifier(
+      `globalThis.LOGSEQ_REVISION = "0${expectedRevision}f";\n`,
+    );
+    assert.notEqual(
+      substringOnly.status,
+      0,
+      "packaged verifier accepted the expected SHA only as a substring of a longer hexadecimal token",
+    );
+    assert.match(
+      `${substringOnly.stdout}${substringOnly.stderr}`,
+      /revision/i,
+      "packaged verifier should diagnose the unsafe revision token",
+    );
+  } finally {
+    fs.rmSync(fixtureRoot, { force: true, recursive: true });
+  }
+};
+
 const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
 const dbSyncPackage = readJson("deps/db-sync/package.json");
@@ -203,9 +348,6 @@ const localProjectUpdateSigningContract = readText(
 );
 const macosUpdaterBaseline = readJson(
   "scripts/fixtures/macos-updater-baseline.json",
-);
-const packagedDesktopVerifier = readText(
-  "resources/verify-packaged-desktop.mjs",
 );
 const desktopRuntimeRevisionBuilderHook = readText(
   "resources/electron-builder-verify-runtime-revisions.cjs",
@@ -441,26 +583,7 @@ assert.match(
   /spawnSync\(process\.execPath/,
   "the Electron builder hook should execute the verifier without a shell",
 );
-for (const relativePath of [
-  "js/logseq-cli.js",
-  "js/db-worker-node.js",
-]) {
-  assert.match(
-    packagedDesktopVerifier,
-    new RegExp(relativePath.replaceAll("/", "[\\\\/]")),
-    `package verification should inspect the CLI runtime ${relativePath}`,
-  );
-}
-assert.match(
-  packagedDesktopVerifier,
-  /packagedPayload\.equals\(stagedPayload\)/,
-  "package verification should compare CLI runtime bytes with the staged files",
-);
-assert.match(
-  packagedDesktopVerifier,
-  /packagedPayload\.includes\(expectedRevision\)/,
-  "package verification should require the current revision in CLI runtimes",
-);
+assertPackagedRuntimeRevisionBoundary();
 
 assert.match(
   rootPackage.scripts["desktop:verify-runtime-revisions"],
