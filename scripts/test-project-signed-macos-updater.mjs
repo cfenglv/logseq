@@ -1369,6 +1369,268 @@ const workflowJobNames = (workflow) =>
     ([, jobName]) => jobName,
   );
 
+const workflowJobNeeds = (jobSource) => {
+  const inline = jobSource.match(/^    needs:\s*\[([^\]]*)\]/m)?.[1];
+  if (inline !== undefined) {
+    return inline
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean);
+  }
+  const block = jobSource.match(
+    /^    needs:\s*\n((?:^      -\s*[^\n]+\n?)+)/m,
+  )?.[1];
+  return block
+    ? [...block.matchAll(/^      -\s*([^\s#]+)/gm)].map((match) => match[1])
+    : [];
+};
+
+const workflowJobCondition = (jobSource) => {
+  const scalar = jobSource.match(/^    if:\s*(\S.*)$/m)?.[1];
+  if (scalar && !/^[>|][-+]?\s*$/.test(scalar)) return scalar.trim();
+  const block = jobSource.match(
+    /^    if:\s*[>|][-+]?\s*\n((?:^      [^\n]*\n?)+)/m,
+  )?.[1];
+  assert.ok(block, "workflow job is missing an auditable if condition");
+  return block
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(" ");
+};
+
+const workflowJobPermissions = (jobSource) => {
+  const block = jobSource.match(
+    /^    permissions:\s*\n((?:^      [a-z-]+:\s*[^\n]+\n?)+)/m,
+  )?.[1];
+  assert.ok(block, "workflow job must declare explicit permissions");
+  return new Map(
+    [...block.matchAll(/^      ([a-z-]+):\s*([^\s#]+)/gm)].map((match) => [
+      match[1],
+      match[2],
+    ]),
+  );
+};
+
+const stripExpressionEnvelope = (expression) =>
+  expression
+    .trim()
+    .replace(/^\$\{\{\s*/, "")
+    .replace(/\s*\}\}$/, "")
+    .trim();
+
+const hasBalancedOuterParentheses = (expression) => {
+  if (!expression.startsWith("(") || !expression.endsWith(")")) return false;
+  let depth = 0;
+  let quote = null;
+  for (let index = 0; index < expression.length; index += 1) {
+    const character = expression[index];
+    if (quote) {
+      if (character === quote && expression[index - 1] !== "\\") quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "(") depth += 1;
+    if (character === ")") depth -= 1;
+    if (depth === 0 && index < expression.length - 1) return false;
+  }
+  return depth === 0;
+};
+
+const stripOuterParentheses = (expression) => {
+  let result = expression.trim();
+  while (hasBalancedOuterParentheses(result)) {
+    result = result.slice(1, -1).trim();
+  }
+  return result;
+};
+
+const splitTopLevel = (expression, operator) => {
+  const parts = [];
+  let depth = 0;
+  let quote = null;
+  let start = 0;
+  for (let index = 0; index < expression.length; index += 1) {
+    const character = expression[index];
+    if (quote) {
+      if (character === quote && expression[index - 1] !== "\\") quote = null;
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "(") depth += 1;
+    if (character === ")") depth -= 1;
+    if (depth === 0 && expression.startsWith(operator, index)) {
+      parts.push(expression.slice(start, index).trim());
+      start = index + operator.length;
+      index += operator.length - 1;
+    }
+  }
+  if (parts.length === 0) return [expression.trim()];
+  parts.push(expression.slice(start).trim());
+  return parts;
+};
+
+const evaluateSignerCondition = (condition, scenario) => {
+  const unwrappedCondition = stripExpressionEnvelope(condition);
+  const evaluate = (rawExpression) => {
+    const expression = stripOuterParentheses(rawExpression.trim());
+    const disjunction = splitTopLevel(expression, "||");
+    if (disjunction.length > 1) return disjunction.some(evaluate);
+    const conjunction = splitTopLevel(expression, "&&");
+    if (conjunction.length > 1) return conjunction.every(evaluate);
+    if (/^!contains\(/.test(expression)) return true;
+    if (expression.startsWith("!") && !expression.startsWith("!=")) {
+      return !evaluate(expression.slice(1));
+    }
+    if (expression === "always()") return true;
+    if (expression === "cancelled()") {
+      return Object.values(scenario.needs).includes("cancelled");
+    }
+    if (expression === "failure()") {
+      return Object.values(scenario.needs).includes("failure");
+    }
+    if (expression === "success()") {
+      return Object.values(scenario.needs).every((result) => result === "success");
+    }
+    const needResult = expression.match(
+      /^needs\.([a-zA-Z0-9_-]+)\.result\s*(==|!=)\s*'([^']+)'$/,
+    );
+    if (needResult) {
+      const actual = scenario.needs[needResult[1]];
+      return needResult[2] === "=="
+        ? actual === needResult[3]
+        : actual !== needResult[3];
+    }
+    const androidInput = expression.match(
+      /^github\.event\.inputs\.build-android\s*(==|!=)\s*'true'$/,
+    );
+    if (androidInput) {
+      return androidInput[1] === "=="
+        ? scenario.buildAndroid
+        : !scenario.buildAndroid;
+    }
+    // Release eligibility is held valid in these dependency-gate scenarios.
+    return true;
+  };
+  const hasStatusOverride = /\b(?:always|cancelled|failure)\(\)/.test(
+    unwrappedCondition,
+  );
+  if (
+    !hasStatusOverride &&
+    Object.values(scenario.needs).some((result) => result !== "success")
+  ) {
+    return false;
+  }
+  return evaluate(unwrappedCondition);
+};
+
+const workflowDependencyPath = (workflow, start, target, visited = new Set()) => {
+  if (start === target) return [start];
+  if (visited.has(start)) return undefined;
+  const nextVisited = new Set(visited).add(start);
+  for (const dependency of workflowJobNeeds(workflowJobSource(workflow, start))) {
+    const suffix = workflowDependencyPath(
+      workflow,
+      dependency,
+      target,
+      nextVisited,
+    );
+    if (suffix) return [start, ...suffix];
+  }
+  return undefined;
+};
+
+const assertSignerDependencyGate = (needs, condition) => {
+  assert.deepEqual(
+    [...needs].sort(),
+    ["build-android", "release-assets-preflight", "release-rehearsal-gate"].sort(),
+    "signer dependencies must be exactly desktop preflight, rehearsal, and optional Android",
+  );
+
+  const baseNeeds = {
+    "build-android": "skipped",
+    "release-assets-preflight": "success",
+    "release-rehearsal-gate": "success",
+  };
+  const scenarios = [
+    ["Android disabled after successful desktop rehearsal", false, baseNeeds, true],
+    ["Android enabled and successful", true, { ...baseNeeds, "build-android": "success" }, true],
+    ["Android enabled but skipped", true, baseNeeds, false],
+    ["Android enabled but failed", true, { ...baseNeeds, "build-android": "failure" }, false],
+    [
+      "desktop preflight failed",
+      false,
+      { ...baseNeeds, "release-assets-preflight": "failure" },
+      false,
+    ],
+    [
+      "release rehearsal failed",
+      false,
+      { ...baseNeeds, "release-rehearsal-gate": "failure" },
+      false,
+    ],
+  ];
+  for (const [label, buildAndroid, needs, expected] of scenarios) {
+    assert.equal(
+      evaluateSignerCondition(condition, { buildAndroid, needs }),
+      expected,
+      `signer dependency gate violates scenario: ${label}`,
+    );
+  }
+};
+
+const assertProtectedReleaseDag = (workflow) => {
+  const signer = workflowJobSource(workflow, "selfhost-release-signing");
+  assertSignerDependencyGate(
+    workflowJobNeeds(signer),
+    workflowJobCondition(signer),
+  );
+
+  const verifier = workflowJobSource(workflow, "selfhost-release-verifier");
+  const publisher = workflowJobSource(workflow, "selfhost-release");
+  for (const required of [
+    "build-android",
+    "release-assets-preflight",
+    "release-rehearsal-gate",
+  ]) {
+    assert.ok(
+      workflowDependencyPath(workflow, "selfhost-release", required),
+      `protected publication DAG has no path through ${required}`,
+    );
+  }
+  assert.ok(
+    workflowJobNeeds(verifier).includes("selfhost-release-signing"),
+    "secretless verifier does not depend on the signer",
+  );
+  assert.ok(
+    workflowJobNeeds(publisher).includes("selfhost-release-verifier"),
+    "publisher does not depend on the secretless verifier",
+  );
+
+  assert.deepEqual(workflowJobPermissions(signer), new Map([
+    ["actions", "read"],
+    ["contents", "read"],
+  ]));
+  assert.deepEqual(workflowJobPermissions(verifier), new Map([
+    ["actions", "read"],
+    ["contents", "read"],
+  ]));
+  assert.deepEqual(workflowJobPermissions(publisher), new Map([
+    ["actions", "read"],
+    ["contents", "write"],
+  ]));
+  assert.match(signer, /environment:\s*selfhost-release-signing/);
+  assert.match(signer, /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/);
+  assert.doesNotMatch(verifier, /environment:|\bsecrets\./);
+  assert.match(publisher, /environment:\s*selfhost-production/);
+};
+
 const workflowJobInvocationCount = (workflow, jobName, invocation) =>
   workflowJobSource(workflow, jobName).split(invocation).length - 1;
 
@@ -3685,6 +3947,73 @@ addCase(cases, "local signer stays local while protected CI uses a separate prov
   }
 });
 
+addCase(cases, "protected release DAG contract is structural and fail-closed", () => {
+  const inlineFixture = [
+    "    needs: [ build-android, release-rehearsal-gate, release-assets-preflight ]",
+    "    runs-on: macos-14",
+  ].join("\n");
+  const blockFixture = [
+    "    needs:",
+    "      - release-assets-preflight",
+    "      - build-android",
+    "      - release-rehearsal-gate",
+    "    runs-on: macos-14",
+  ].join("\n");
+  const expectedNeeds = [
+    "build-android",
+    "release-assets-preflight",
+    "release-rehearsal-gate",
+  ];
+  assert.deepEqual(workflowJobNeeds(inlineFixture).sort(), expectedNeeds.sort());
+  assert.deepEqual(workflowJobNeeds(blockFixture).sort(), expectedNeeds.sort());
+
+  const validCondition = [
+    "${{ always()",
+    "needs.release-assets-preflight.result == 'success'",
+    "needs.release-rehearsal-gate.result == 'success'",
+    "(github.event.inputs.build-android != 'true' || needs.build-android.result == 'success') }}",
+  ].join(" && ");
+  assertSignerDependencyGate(expectedNeeds, validCondition);
+
+  assert.throws(
+    () => assertSignerDependencyGate(expectedNeeds.slice(1), validCondition),
+    /dependencies must be exactly/,
+  );
+
+  const missingSkippedOverride = validCondition.replace("always() && ", "");
+  assert.throws(
+    () => assertSignerDependencyGate(expectedNeeds, missingSkippedOverride),
+    /Android disabled after successful desktop rehearsal/,
+  );
+
+  const missingPreflightGate = validCondition.replace(
+    "needs.release-assets-preflight.result == 'success' && ",
+    "",
+  );
+  assert.throws(
+    () => assertSignerDependencyGate(expectedNeeds, missingPreflightGate),
+    /desktop preflight failed/,
+  );
+
+  const missingRehearsalGate = validCondition.replace(
+    "needs.release-rehearsal-gate.result == 'success' && ",
+    "",
+  );
+  assert.throws(
+    () => assertSignerDependencyGate(expectedNeeds, missingRehearsalGate),
+    /release rehearsal failed/,
+  );
+
+  const missingAndroidSuccessGate = validCondition.replace(
+    "(github.event.inputs.build-android != 'true' || needs.build-android.result == 'success')",
+    "(github.event.inputs.build-android == 'true' || github.event.inputs.build-android != 'true')",
+  );
+  assert.throws(
+    () => assertSignerDependencyGate(expectedNeeds, missingAndroidSuccessGate),
+    /Android enabled but skipped/,
+  );
+});
+
 addCase(cases, "selfhost CI candidates reach publication only through protected verification", () => {
   const workflow = fs.readFileSync(workflowPath, "utf8");
   for (const [jobName, arch] of [
@@ -3716,16 +4045,7 @@ addCase(cases, "selfhost CI candidates reach publication only through protected 
     );
   }
   const signer = workflowJobSource(workflow, "selfhost-release-signing");
-  assert.match(
-    signer,
-    /needs:\s*\[\s*release-assets-preflight,\s*release-rehearsal-gate,\s*build-android\s*\]/,
-  );
-  assert.match(signer, /if:\s*\$\{\{\s*always\(\)/);
-  assert.match(
-    signer,
-    /github\.event\.inputs\.build-android != 'true' \|\| needs\.build-android\.result == 'success'/,
-    "signer must survive a skipped disabled Android job and require success when Android is enabled",
-  );
+  assertProtectedReleaseDag(workflow);
   assert.match(signer, /github\.event_name == 'workflow_dispatch'/);
   const verifier = workflowJobSource(workflow, "selfhost-release-verifier");
   assert.match(verifier, /verify-finalized-selfhost-release\.mjs/);
