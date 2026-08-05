@@ -7,7 +7,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as shutdownModule from './rtc-e2e-shutdown.mjs'
 
 const { createShutdownController } = shutdownModule
@@ -190,10 +190,18 @@ test('windows cleanup fails closed for invalid PIDs and tool errors', async () =
   )
   assert.equal(spawnCount, 0)
 
-  const thrown = await signalChild(
-    { exitCode: null, pid: 808, signalCode: null },
-    'SIGTERM'
-  ).catch((error) => error)
+  const child = new EventEmitter()
+  Object.assign(child, {
+    exitCode: null,
+    kill: (signal) => {
+      child.signalCode = signal
+      queueMicrotask(() => child.emit('exit', null, signal))
+      return true
+    },
+    pid: 808,
+    signalCode: null,
+  })
+  const thrown = await signalChild(child, 'SIGTERM').catch((error) => error)
   assert.strictEqual(thrown, toolError)
 })
 
@@ -205,18 +213,231 @@ test('windows cleanup bounds a hung taskkill helper', async () => {
     return taskkill
   }
   const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
+    directKillTimeoutMs: 50,
+    helperKillTimeoutMs: 5,
     spawnProcess,
     timeoutMs: 5,
   })
+  const child = new EventEmitter()
+  Object.assign(child, {
+    exitCode: null,
+    kill: (signal) => {
+      child.signalCode = signal
+      queueMicrotask(() => child.emit('exit', null, signal))
+      return true
+    },
+    pid: 909,
+    signalCode: null,
+  })
 
   await assert.rejects(
-    signalChild(
-      { exitCode: null, pid: 909, signalCode: null },
-      'SIGKILL'
-    ),
-    /taskkill\.exe did not exit within 5ms for PID 909 during SIGKILL/
+    signalChild(child, 'SIGKILL'),
+    (error) =>
+      errorTreeContains(
+        error,
+        error.errors?.find((candidate) =>
+          /taskkill\.exe did not exit within 5ms/.test(candidate.message)
+        )
+      ) || /taskkill\.exe did not exit within 5ms/.test(error.message)
   )
   assert.deepEqual(helperSignals, ['SIGKILL'])
+})
+
+const runRealHandleProbe = async ({ label, mode, source }) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `rtc-${label}-`))
+  const probePath = path.join(root, 'probe.mjs')
+  const helperPidPath = path.join(root, 'helper.pid')
+  const directPidPath = path.join(root, 'direct.pid')
+  fs.writeFileSync(probePath, source)
+  let output = ''
+  let probe
+  let helperPid
+  let directPid
+  try {
+    probe = spawn(process.execPath, [probePath], {
+      env: {
+        ...process.env,
+        RTC_DIRECT_PID: directPidPath,
+        RTC_HANDLE_MODE: mode ?? '',
+        RTC_HELPER_PID: helperPidPath,
+        RTC_SHUTDOWN_MODULE: pathToFileURL(
+          path.join(repoRoot, 'scripts/rtc-e2e-shutdown.mjs')
+        ).href,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    probe.stdout.on('data', (chunk) => {
+      output += chunk
+    })
+    probe.stderr.on('data', (chunk) => {
+      output += chunk
+    })
+    const closed = new Promise((resolve, reject) => {
+      probe.once('error', reject)
+      probe.once('close', (code, signal) => resolve({ code, signal }))
+    })
+    let timeout
+    const result = await Promise.race([
+      closed,
+      new Promise((resolve) => {
+        timeout = setTimeout(() => resolve({ timedOut: true }), 750)
+      }),
+    ]).finally(() => clearTimeout(timeout))
+    helperPid = fs.existsSync(helperPidPath)
+      ? Number(fs.readFileSync(helperPidPath, 'utf8'))
+      : undefined
+    directPid = fs.existsSync(directPidPath)
+      ? Number(fs.readFileSync(directPidPath, 'utf8'))
+      : undefined
+    return { ...result, output }
+  } finally {
+    if (probe && probe.exitCode === null && probe.signalCode === null) {
+      probe.kill('SIGKILL')
+    }
+    for (const pid of [helperPid, directPid]) {
+      if (!Number.isSafeInteger(pid) || pid <= 1) continue
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch (error) {
+        if (error?.code !== 'ESRCH') throw error
+      }
+    }
+    fs.rmSync(root, { force: true, recursive: true })
+  }
+}
+
+const errorProbePrelude = `
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+const shutdown = await import(process.env.RTC_SHUTDOWN_MODULE);
+const errorTree = (root, seen = new Set()) => {
+  if (!root || typeof root !== 'object' || seen.has(root)) return [];
+  seen.add(root);
+  const errors = [root];
+  if (root.cause) errors.push(...errorTree(root.cause, seen));
+  if (root.errors && Symbol.iterator in Object(root.errors)) {
+    for (const error of root.errors) errors.push(...errorTree(error, seen));
+  }
+  return errors;
+};
+`
+
+for (const mode of ['false', 'true']) {
+  test(`real hung helper with kill ${mode} cannot retain the probe handle`, async () => {
+    const result = await runRealHandleProbe({
+      label: `real-helper-${mode}`,
+      mode,
+      source: `${errorProbePrelude}
+const helper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  stdio: 'ignore',
+});
+const direct = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  stdio: 'ignore',
+});
+fs.writeFileSync(process.env.RTC_HELPER_PID, String(helper.pid));
+fs.writeFileSync(process.env.RTC_DIRECT_PID, String(direct.pid));
+helper.kill = () => process.env.RTC_HANDLE_MODE === 'true';
+const signalChild = shutdown.createWindowsProcessTreeSignaler({
+  directKillTimeoutMs: 20,
+  directTermTimeoutMs: 20,
+  helperKillTimeoutMs: 20,
+  spawnProcess: () => helper,
+  timeoutMs: 20,
+  totalTimeoutMs: 100,
+});
+const thrown = await signalChild(direct, 'SIGTERM').catch((error) => error);
+const messages = errorTree(thrown).map((error) => error.message);
+process.stdout.write(JSON.stringify({ messages }) + '\\n');
+process.exitCode = 1;
+`,
+    })
+    assert.equal(
+      result.timedOut,
+      undefined,
+      `real helper retained the probe handle for kill=${mode}:\n${result.output}`
+    )
+    assert.equal(result.code, 1, result.output)
+    assert.match(result.output, /taskkill\.exe did not exit within 20ms/)
+    assert.match(result.output, /survived helper SIGKILL/)
+    if (mode === 'false') assert.match(result.output, /kill returned false/)
+  })
+}
+
+for (const mode of ['false', 'true']) {
+  test(`real surviving direct child with kill ${mode} releases owned handles`, async () => {
+    const result = await runRealHandleProbe({
+      label: `real-direct-${mode}`,
+      mode,
+      source: `${errorProbePrelude}
+const helperError = new Error('REAL_HELPER_IDENTITY_SENTINEL');
+const direct = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+fs.writeFileSync(process.env.RTC_DIRECT_PID, String(direct.pid));
+direct.kill = () => process.env.RTC_HANDLE_MODE === 'true';
+const signalChild = shutdown.createWindowsProcessTreeSignaler({
+  directKillTimeoutMs: 20,
+  directTermTimeoutMs: 20,
+  helperKillTimeoutMs: 20,
+  spawnProcess: () => { throw helperError; },
+  timeoutMs: 20,
+  totalTimeoutMs: 100,
+});
+const controller = shutdown.createShutdownController({
+  children: new Set([direct]),
+  releaseChild: shutdown.releaseChildProcessHandles,
+  signalChild,
+  waitForExit: async () => false,
+});
+const thrown = await controller.shutdown().catch((error) => error);
+const errors = errorTree(thrown);
+process.stdout.write(JSON.stringify({
+  directStdoutDestroyed: direct.stdout.destroyed,
+  helperIdentity: errors.includes(helperError),
+  messages: errors.map((error) => error.message),
+}) + '\\n');
+process.exitCode = 1;
+`,
+    })
+    assert.equal(
+      result.timedOut,
+      undefined,
+      `real direct child retained probe handles for kill=${mode}:\n${result.output}`
+    )
+    assert.equal(result.code, 1, result.output)
+    assert.match(result.output, /"helperIdentity":true/)
+    assert.match(result.output, /"directStdoutDestroyed":true/)
+    if (mode === 'false') assert.match(result.output, /kill returned false/)
+    else assert.match(result.output, /survived direct SIGKILL/)
+  })
+}
+
+test('Windows fallback preserves helper and direct signal error identities', async () => {
+  const helperError = new Error('HELPER_IDENTITY_SENTINEL')
+  const directError = new Error('DIRECT_IDENTITY_SENTINEL')
+  const child = new EventEmitter()
+  Object.assign(child, {
+    exitCode: null,
+    kill: () => {
+      throw directError
+    },
+    pid: 919,
+    signalCode: null,
+  })
+  const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
+    directKillTimeoutMs: 5,
+    directTermTimeoutMs: 5,
+    helperKillTimeoutMs: 5,
+    spawnProcess: () => {
+      throw helperError
+    },
+    timeoutMs: 5,
+    totalTimeoutMs: 25,
+  })
+
+  const thrown = await signalChild(child, 'SIGTERM').catch((error) => error)
+  assert.equal(errorTreeContains(thrown, helperError), true)
+  assert.equal(errorTreeContains(thrown, directError), true)
 })
 
 test('concurrent shutdown callers share cleanup through SIGKILL', async () => {
