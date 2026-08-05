@@ -15,10 +15,17 @@ const repoRoot = path.resolve(
 const rtcWorkflowPath = ".github/workflows/clj-rtc-e2e.yml";
 const releaseWorkflowPath =
   ".github/workflows/build-desktop-release.yml";
-const requiredTasks = [
+const requiredTasks = ["rtc-extra-test", "rtc-extra-part2-test"];
+const babashkaTaskNames = [
   "run-rtc-extra-test",
   "run-rtc-extra-part2-test",
 ];
+const taskAliases = new Map([
+  ["run-rtc-extra-test", "rtc-extra-test"],
+  ["rtc-extra-test", "rtc-extra-test"],
+  ["run-rtc-extra-part2-test", "rtc-extra-part2-test"],
+  ["rtc-extra-part2-test", "rtc-extra-part2-test"],
+]);
 
 const read = (relativePath) =>
   fs.readFileSync(path.join(repoRoot, relativePath), "utf8");
@@ -174,37 +181,79 @@ const parseJobs = (source) => {
   });
 };
 
-const taskFromValue = (value) =>
-  requiredTasks.includes(value) ? value : null;
+const taskFromValue = (value) => taskAliases.get(value) ?? null;
+
+const shellTokens = (segment) =>
+  (segment.match(/"[^"]*"|'[^']*'|[^\s]+/g) ?? []).map((token) =>
+    scalar(token),
+  );
+
+const commandTasks = (command) => {
+  const tasks = [];
+  for (const segment of command.split(/\r?\n|&&|;|\|\|/)) {
+    const tokens = shellTokens(segment.trim());
+    while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? "")) {
+      tokens.shift();
+    }
+    if (tokens[0] === "env") {
+      tokens.shift();
+      while (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? "")) {
+        tokens.shift();
+      }
+    }
+    if (tokens[0] === "timeout" && /^\d+[smh]$/i.test(tokens[1] ?? "")) {
+      tokens.splice(0, 2);
+    }
+
+    if (/^bb(?:\.exe)?$/i.test(tokens[0] ?? "")) {
+      const task = babashkaTaskNames.includes(tokens[1])
+        ? taskFromValue(tokens[1])
+        : null;
+      if (task) tasks.push(task);
+      continue;
+    }
+
+    if (/^node(?:\.exe)?$/i.test(tokens[0] ?? "")) {
+      const runnerIndex = tokens.findIndex((token, index) =>
+        index > 0 && /(?:^|\/)scripts\/run-rtc-e2e\.mjs$/.test(token),
+      );
+      if (runnerIndex === -1) continue;
+      const runnerTask = tokens[runnerIndex + 1];
+      if (!requiredTasks.includes(runnerTask)) continue;
+      tasks.push(runnerTask);
+    }
+  }
+  return tasks;
+};
 
 const taskInvocations = (job) => {
   const invocations = [];
   for (const [stepIndex, step] of job.steps.entries()) {
     for (const [matrixName, values] of job.matrix) {
       const matrixReference = new RegExp(
-        `matrix\\.${matrixName.replaceAll("-", "[-_]")}(?:\\s*}})?`,
+        `\\$\\{\\{\\s*matrix\\.${matrixName.replaceAll("-", "[-_]")}\\s*}}`,
+        "g",
       );
       if (!matrixReference.test(step.command)) continue;
       for (const value of values) {
-        const task = taskFromValue(value);
-        if (task) {
-          invocations.push({ job, matrixName, step, stepIndex, task });
+        const expectedTask = taskFromValue(value);
+        if (!expectedTask) continue;
+        const substituted = step.command.replace(matrixReference, value);
+        for (const task of commandTasks(substituted)) {
+          if (task === expectedTask) {
+            invocations.push({ job, matrixName, step, stepIndex, task });
+          }
         }
       }
     }
-    for (const task of requiredTasks) {
-      const pattern = new RegExp(
-        `(^|[\\s'\"\\x60])${task}($|[\\s'\"\\x60])`,
-      );
-      if (pattern.test(step.command)) {
-        invocations.push({
-          job,
-          matrixName: null,
-          step,
-          stepIndex,
-          task,
-        });
-      }
+    for (const task of commandTasks(step.command)) {
+      invocations.push({
+        job,
+        matrixName: null,
+        step,
+        stepIndex,
+        task,
+      });
     }
   }
   return invocations;
@@ -243,7 +292,7 @@ const workflowViolations = (source) => {
   const tasks = invocations.map(({ task }) => task).sort();
   assert.deepEqual(
     [...requiredTasks].sort(),
-    ["run-rtc-extra-part2-test", "run-rtc-extra-test"],
+    ["rtc-extra-part2-test", "rtc-extra-test"],
   );
   if (
     tasks.length !== requiredTasks.length ||
@@ -450,6 +499,42 @@ const assertLocalGateContract = () => {
   );
 };
 
+const assertEntrypointEquivalence = () => {
+  const bbTasks = read("clj-e2e/bb.edn");
+  const runner = read("scripts/run-rtc-e2e.mjs");
+  const prepush = read("scripts/run-rtc-prepush.mjs");
+  for (const [index, babashkaTask] of babashkaTaskNames.entries()) {
+    const runnerTask = requiredTasks[index];
+    const bbTaskContract = new RegExp(
+      `${babashkaTask.replaceAll("-", "\\-")}\\s*\\n\\s*\\{:task \\(shell "node" "\\.\\./scripts/run-rtc-e2e\\.mjs" "${runnerTask.replaceAll("-", "\\-")}"\\)}`,
+    );
+    assert.match(
+      bbTasks,
+      bbTaskContract,
+      `${babashkaTask} must delegate exactly once to ${runnerTask}`,
+    );
+    assert.match(
+      prepush,
+      new RegExp(
+        `\\["scripts/run-rtc-e2e\\.mjs", "${runnerTask.replaceAll("-", "\\-")}"\\]`,
+      ),
+      `local gate must invoke the canonical ${runnerTask} runner`,
+    );
+  }
+  const supportedTaskBlock = runner.match(
+    /const supportedTasks = new Set\(\[([\s\S]*?)\]\);/,
+  );
+  assert.ok(supportedTaskBlock, "RTC runner must declare supported tasks");
+  const supportedTasks = [
+    ...supportedTaskBlock[1].matchAll(/["']([^"']+)["']/g),
+  ].map((match) => match[1]);
+  assert.deepEqual(
+    supportedTasks.sort(),
+    [...requiredTasks].sort(),
+    "low-level runner task set must exactly match the canonical RTC shards",
+  );
+};
+
 const createBbShim = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-ci-shim-"));
   const executable = path.join(root, process.platform === "win32" ? "bb.cmd" : "bb");
@@ -515,6 +600,40 @@ const runRtcWrapperWithFakeTask = (task, exitCode) => {
   return { ...result, calls, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
 };
 
+const runBabashkaWrapperWithFakeRunner = (task, exitCode) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-bb-entrypoint-"));
+  const executable = path.join(root, "node");
+  const marker = path.join(root, "calls.log");
+  const canonicalTask = requiredTasks[babashkaTaskNames.indexOf(task)];
+  const bbFixture = path.join(root, "bb.edn");
+  fs.writeFileSync(
+    bbFixture,
+    `{:tasks {${task} {:task (shell "node" "../scripts/run-rtc-e2e.mjs" "${canonicalTask}")}}}`,
+  );
+  fs.writeFileSync(
+    executable,
+    `#!/bin/sh
+printf '%s\\n' "$*" >> "$RTC_FAKE_MARKER"
+exit "$RTC_FAKE_RUNNER_EXIT"
+`,
+  );
+  fs.chmodSync(executable, 0o755);
+  const result = spawnSync("bb", ["-f", bbFixture, task], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${root}${path.delimiter}${process.env.PATH}`,
+      RTC_FAKE_MARKER: marker,
+      RTC_FAKE_RUNNER_EXIT: String(exitCode),
+    },
+    timeout: 15_000,
+  });
+  const calls = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : "";
+  fs.rmSync(root, { force: true, recursive: true });
+  return { ...result, calls, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+};
+
 test("RTC GitHub job serializes both shared-state shards and preserves failures", () => {
   assert.deepEqual(workflowViolations(read(rtcWorkflowPath)), []);
 });
@@ -525,6 +644,39 @@ test("desktop release workflow is hard-bound to RTC browser success", () => {
 
 test("local RTC gate keeps the same serial, bounded, shared-resource contract", () => {
   assertLocalGateContract();
+});
+
+test("Babashka and Node RTC entrypoints name the same two shards", () => {
+  assertEntrypointEquivalence();
+});
+
+test("entrypoint canonicalization requires exact executable and task tokens", () => {
+  const validCommands = [
+    ["timeout 30m bb run-rtc-extra-test", ["rtc-extra-test"]],
+    [
+      "timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-part2-test",
+      ["rtc-extra-part2-test"],
+    ],
+    [
+      "env RTC_PROBE=1 timeout 30m node ../scripts/run-rtc-e2e.mjs rtc-extra-test",
+      ["rtc-extra-test"],
+    ],
+  ];
+  for (const [command, expected] of validCommands) {
+    assert.deepEqual(commandTasks(command), expected, command);
+  }
+
+  const lookalikes = [
+    "echo node scripts/run-rtc-e2e.mjs rtc-extra-test",
+    "timeout 30m node scripts/not-run-rtc-e2e.mjs rtc-extra-test",
+    "timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-test-copy",
+    "timeout 30m node scripts/run-rtc-e2e.mjs run-rtc-extra-test",
+    "timeout 30m bb rtc-extra-test",
+    "timeout 30m bb run-rtc-extra-test-copy",
+  ];
+  for (const command of lookalikes) {
+    assert.deepEqual(commandTasks(command), [], command);
+  }
 });
 
 test("workflow contract is order-independent across matrix syntax variants", () => {
@@ -566,7 +718,7 @@ test("topology proof accepts controlled alternatives and rejects unsafe scheduli
     continueOnError = false,
     failFast = false,
     maxParallel = 1,
-    taskValues = requiredTasks,
+    taskValues = babashkaTaskNames,
     command = "timeout 30m bb ${{ matrix.shard }}",
   } = {}) => `jobs:
   rtc-shards:
@@ -599,7 +751,25 @@ ${needs === null ? "" : `    needs: ${needs}\n`}${secondCondition === null ? "" 
 
   const safeTopologies = [
     ["serialized matrix", matrixTopology()],
+    [
+      "serialized low-level runner matrix",
+      matrixTopology({
+        command:
+          "timeout 30m node scripts/run-rtc-e2e.mjs ${{ matrix.shard }}",
+        taskValues: requiredTasks,
+      }),
+    ],
     ["one job with failure-safe second step", stepTopology()],
+    [
+      "one job with equivalent low-level runner steps",
+      `jobs:
+  rtc-shards:
+    steps:
+      - run: timeout 30m node ./scripts/run-rtc-e2e.mjs rtc-extra-test
+      - if: \${{ always() }}
+        run: timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-part2-test
+`,
+    ],
     ["dependent jobs with failure-safe successor", jobTopology()],
     [
       "reversed dependent jobs",
@@ -629,7 +799,7 @@ ${needs === null ? "" : `    needs: ${needs}\n`}${secondCondition === null ? "" 
     ["continue on error", matrixTopology({ continueOnError: true })],
     [
       "missing shard",
-      matrixTopology({ taskValues: [requiredTasks[0]] }),
+      matrixTopology({ taskValues: [babashkaTaskNames[0]] }),
     ],
     [
       "serial steps skip after failure",
@@ -659,6 +829,46 @@ ${needs === null ? "" : `    needs: ${needs}\n`}${secondCondition === null ? "" 
         command: "timeout 30m bb ${{ matrix.shard }} || true",
       }),
     ],
+    [
+      "similar low-level task suffix",
+      stepTopology({}).replace(
+        "run-rtc-extra-part2-test",
+        "node scripts/run-rtc-e2e.mjs rtc-extra-part2-test-copy",
+      ),
+    ],
+    [
+      "similar runner filename",
+      stepTopology({}).replace(
+        "bb run-rtc-extra-part2-test",
+        "node scripts/not-run-rtc-e2e.mjs rtc-extra-part2-test",
+      ),
+    ],
+    [
+      "echoed runner command",
+      stepTopology({}).replace(
+        "bb run-rtc-extra-part2-test",
+        "echo node scripts/run-rtc-e2e.mjs rtc-extra-part2-test",
+      ),
+    ],
+    [
+      "low-level task passed to bb instead of runner",
+      stepTopology({}).replace(
+        "run-rtc-extra-part2-test",
+        "rtc-extra-part2-test",
+      ),
+    ],
+    [
+      "duplicate aliases for one shard",
+      `jobs:
+  rtc-shards:
+    steps:
+      - run: timeout 30m bb run-rtc-extra-test
+      - if: \${{ always() }}
+        run: timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-test
+      - if: \${{ always() }}
+        run: timeout 30m bb run-rtc-extra-part2-test
+`,
+    ],
   ];
   for (const [name, mutation] of maskingMutations) {
     assert.notDeepEqual(
@@ -684,5 +894,26 @@ for (const task of ["rtc-extra-test", "rtc-extra-part2-test"]) {
     assert.equal(passed.status, 0, passed.output);
     assert.match(passed.calls, new RegExp(`^${task}(?:\\s|$)`));
     assert.match(passed.output, /\[rtc-e2e\] PASS/);
+  });
+}
+
+for (const [index, task] of babashkaTaskNames.entries()) {
+  test(`${task} delegates to the canonical runner and preserves failure`, () => {
+    const canonicalTask = requiredTasks[index];
+    const failed = runBabashkaWrapperWithFakeRunner(task, 23);
+    assert.notEqual(failed.status, 0, failed.output);
+    assert.equal(
+      failed.calls.trim(),
+      `../scripts/run-rtc-e2e.mjs ${canonicalTask}`,
+      failed.output,
+    );
+
+    const passed = runBabashkaWrapperWithFakeRunner(task, 0);
+    assert.equal(passed.status, 0, passed.output);
+    assert.equal(
+      passed.calls.trim(),
+      `../scripts/run-rtc-e2e.mjs ${canonicalTask}`,
+      passed.output,
+    );
   });
 }
