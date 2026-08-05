@@ -1,8 +1,39 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { createShutdownController } from './rtc-e2e-shutdown.mjs'
+
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..'
+)
+
+const deferred = () => {
+  let resolve
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
+const errorTreeContains = (root, target, seen = new Set()) => {
+  if (root === target) return true
+  if (!root || typeof root !== 'object' || seen.has(root)) return false
+  seen.add(root)
+  if (errorTreeContains(root.cause, target, seen)) return true
+  if (root.errors && Symbol.iterator in Object(root.errors)) {
+    for (const error of root.errors) {
+      if (errorTreeContains(error, target, seen)) return true
+    }
+  }
+  return false
+}
 
 test('concurrent shutdown callers share cleanup through SIGKILL', async () => {
   const child = { exitCode: null, pid: 101, signalCode: null }
@@ -27,4 +58,185 @@ test('shutdown fails closed when a child survives SIGKILL', async () => {
     waitForExit: async () => false,
   })
   await assert.rejects(controller.shutdown(), /survived SIGKILL/)
+})
+
+test('one signal failure cannot settle shutdown before every child cleanup', async () => {
+  const signalFailure = new Error('SIGNAL_FAILURE_SENTINEL')
+  const badChild = { exitCode: null, pid: 301, signalCode: null }
+  const slowChild = { exitCode: null, pid: 302, signalCode: null }
+  const slowExit = deferred()
+  const events = []
+  const controller = createShutdownController({
+    children: new Set([badChild, slowChild]),
+    signalChild: (child, signal) => {
+      events.push(['signal', child.pid, signal])
+      if (child === badChild) throw signalFailure
+    },
+    waitForExit: async (child) => {
+      events.push(['wait', child.pid])
+      return child === slowChild ? slowExit.promise : false
+    },
+  })
+
+  const shutdown = controller.shutdown()
+  const settledBeforeSlowChild = await Promise.race([
+    shutdown.then(
+      () => true,
+      () => true
+    ),
+    new Promise((resolve) => setTimeout(() => resolve(false), 25)),
+  ])
+  slowExit.resolve(true)
+  const thrown = await shutdown.catch((error) => error)
+
+  assert.equal(
+    settledBeforeSlowChild,
+    false,
+    `shutdown settled before slow cleanup: ${JSON.stringify(events)}`
+  )
+  assert.deepEqual(events, [
+    ['signal', 301, 'SIGTERM'],
+    ['signal', 302, 'SIGTERM'],
+    ['wait', 302],
+  ])
+  assert.equal(errorTreeContains(thrown, signalFailure), true)
+})
+
+test('shutdown reports every independent child cleanup failure', async () => {
+  const firstFailure = new Error('FIRST_CLEANUP_SENTINEL')
+  const secondFailure = new Error('SECOND_CLEANUP_SENTINEL')
+  const firstChild = { exitCode: null, pid: 401, signalCode: null }
+  const secondChild = { exitCode: null, pid: 402, signalCode: null }
+  const signaled = []
+  const controller = createShutdownController({
+    children: new Set([firstChild, secondChild]),
+    signalChild: (child) => {
+      signaled.push(child.pid)
+      throw child === firstChild ? firstFailure : secondFailure
+    },
+    waitForExit: async () => true,
+  })
+
+  const thrown = await controller.shutdown().catch((error) => error)
+  assert.deepEqual(signaled, [401, 402])
+  assert.equal(errorTreeContains(thrown, firstFailure), true)
+  assert.equal(errorTreeContains(thrown, secondFailure), true)
+})
+
+test('runner preserves its primary run error and reports cleanup failure', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-dual-error-'))
+  const preload = path.join(root, 'dual-error-preload.cjs')
+  const eventsPath = path.join(root, 'events.log')
+  fs.writeFileSync(
+    preload,
+    `const fs = require('node:fs');
+const childProcess = require('node:child_process');
+const net = require('node:net');
+const { EventEmitter } = require('node:events');
+const { syncBuiltinESMExports } = require('node:module');
+let nextPid = 501;
+class FakeChild extends EventEmitter {
+  constructor(args) {
+    super();
+    this.args = args;
+    this.exitCode = null;
+    this.pid = nextPid++;
+    this.signalCode = null;
+  }
+  kill(signal) {
+    fs.appendFileSync(process.env.RTC_DUAL_ERROR_EVENTS,
+      'cleanup-child:' + this.pid + ':' + signal + '\\n');
+    throw new Error('CLEANUP_SIGNAL_SENTINEL');
+  }
+}
+childProcess.spawn = (command, args, options) => {
+  fs.appendFileSync(process.env.RTC_DUAL_ERROR_EVENTS,
+    'spawn:' + command + ':' + args.join(' ') + ':' + options.detached + '\\n');
+  const child = new FakeChild(args);
+  if (args[0] !== 'serve') {
+    queueMicrotask(() => {
+      child.exitCode = 23;
+      child.emit('exit', 23, null);
+    });
+  }
+  return child;
+};
+syncBuiltinESMExports();
+process.kill = (pid, signal) => {
+  fs.appendFileSync(process.env.RTC_DUAL_ERROR_EVENTS,
+    'cleanup-signal:' + pid + ':' + signal + '\\n');
+  throw new Error('CLEANUP_SIGNAL_SENTINEL');
+};
+net.createServer = () => {
+  const server = {
+    address: () => ({ address: '127.0.0.1', family: 'IPv4', port: 43131 }),
+    close: (callback) => queueMicrotask(() => callback?.()),
+    listen: (...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === 'function') queueMicrotask(callback);
+      return server;
+    },
+    once: () => server,
+    unref: () => server,
+  };
+  return server;
+};
+global.fetch = async () => ({ status: 200 });
+`
+  )
+  const env = {
+    ...process.env,
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
+    RTC_DUAL_ERROR_EVENTS: eventsPath,
+  }
+  delete env.NODE_TEST_CONTEXT
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(repoRoot, 'scripts/run-rtc-e2e.mjs'), 'rtc-extra-test'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        env,
+        timeout: 10_000,
+      }
+    )
+    const events = fs.existsSync(eventsPath)
+      ? fs.readFileSync(eventsPath, 'utf8')
+      : ''
+    const expectedCommand = process.platform === 'win32' ? 'bb.exe' : 'bb'
+    const expectedDetached = process.platform !== 'win32'
+    assert.notEqual(result.status, 0, `${result.stdout}${result.stderr}`)
+    assert.match(
+      events,
+      new RegExp(`spawn:${expectedCommand}:serve --port 43131:${expectedDetached}`)
+    )
+    assert.match(
+      events,
+      new RegExp(
+        `spawn:${expectedCommand}:rtc-extra-test --port 43131:${expectedDetached}`
+      )
+    )
+    assert.match(
+      events,
+      process.platform === 'win32'
+        ? /cleanup-child:501:SIGTERM/
+        : /cleanup-signal:-501:SIGTERM/
+    )
+    assert.match(
+      result.stderr,
+      new RegExp(
+        `${expectedCommand.replace('.', '\\.')} rtc-extra-test --port 43131 exited with 23`
+      ),
+      `primary run error was lost:\n${result.stderr}`
+    )
+    assert.match(
+      result.stderr,
+      /CLEANUP_SIGNAL_SENTINEL/,
+      `cleanup error was lost:\n${result.stderr}`
+    )
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true })
+  }
 })
