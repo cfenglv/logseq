@@ -138,13 +138,21 @@ const { shutdown } = shutdownController;
 
 let requestedExitCode;
 let fatalError;
-const requestFatalShutdown = (error, exitCode) => {
-  fatalError ??= error;
-  requestedExitCode ??= exitCode;
-  process.exitCode ??= exitCode;
+const awaitSharedShutdown = () => {
   void shutdown().catch((shutdownError) => {
     fatalError ??= shutdownError;
+    process.exitCode = 1;
   });
+};
+const requestErrorShutdown = (error) => {
+  fatalError ??= error;
+  process.exitCode = 1;
+  awaitSharedShutdown();
+};
+const requestSignalShutdown = (exitCode) => {
+  requestedExitCode ??= exitCode;
+  process.exitCode ??= exitCode;
+  awaitSharedShutdown();
 };
 
 for (const [signal, exitCode] of [
@@ -152,14 +160,13 @@ for (const [signal, exitCode] of [
   ["SIGTERM", 143],
 ]) {
   process.on(signal, () => {
-    requestFatalShutdown(new Error(`received ${signal}`), exitCode);
+    requestSignalShutdown(exitCode);
   });
 }
-process.on("uncaughtException", (error) => requestFatalShutdown(error, 1));
+process.on("uncaughtException", requestErrorShutdown);
 process.on("unhandledRejection", (reason) =>
-  requestFatalShutdown(
+  requestErrorShutdown(
     reason instanceof Error ? reason : new Error(String(reason)),
-    1,
   ),
 );
 
@@ -187,11 +194,15 @@ try {
 }
 
 if (requestedExitCode !== undefined) {
-  process.exitCode = requestedExitCode;
-} else if (fatalError) {
-  throw fatalError;
-} else if (runError) {
-  throw runError;
+  if (fatalError) {
+    console.error(fatalError);
+    process.exitCode = 1;
+  } else {
+    process.exitCode = requestedExitCode;
+  }
+} else if (fatalError || runError) {
+  console.error(fatalError ?? runError);
+  process.exitCode = 1;
 } else {
   console.log(`[rtc-e2e] PASS task=${testTask} port=${port}`);
 }
