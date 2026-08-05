@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -612,6 +612,79 @@ const runRtcWrapperWithFakeTask = (task, exitCode) => {
   return { ...result, calls, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
 };
 
+const waitFor = async (predicate, timeoutMs, label) => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+};
+
+const processExists = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === "ESRCH") return false;
+    throw error;
+  }
+};
+
+const createTermIgnoringBbShim = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-term-shim-"));
+  const executable = path.join(root, process.platform === "win32" ? "bb.cmd" : "bb");
+  const preload = path.join(root, "no-network-preload.cjs");
+  const serverPid = path.join(root, "server.pid");
+  const serverTerm = path.join(root, "server.term");
+  const testExited = path.join(root, "test.exited");
+  fs.writeFileSync(
+    preload,
+    `const fs = require("node:fs");
+const net = require("node:net");
+net.createServer = () => {
+  const server = {
+    address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43128 }),
+    close: (callback) => queueMicrotask(() => callback?.()),
+    listen: (...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === "function") queueMicrotask(callback);
+      return server;
+    },
+    once: () => server,
+    unref: () => server,
+  };
+  return server;
+};
+global.fetch = async () => {
+  while (!fs.existsSync(process.env.RTC_SERVER_PID)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return { status: 200 };
+};
+`,
+  );
+  fs.writeFileSync(
+    executable,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const [task] = process.argv.slice(2);
+if (task === "serve") {
+  process.on("SIGTERM", () => {
+    fs.appendFileSync(process.env.RTC_SERVER_TERM, "TERM\\n");
+  });
+  fs.writeFileSync(process.env.RTC_SERVER_PID, String(process.pid));
+  setInterval(() => {}, 1000);
+} else {
+  process.on("exit", () => fs.writeFileSync(process.env.RTC_TEST_EXITED, "yes\\n"));
+  process.exit(0);
+}
+`,
+  );
+  fs.chmodSync(executable, 0o755);
+  return { executable, preload, root, serverPid, serverTerm, testExited };
+};
+
 const runBabashkaWrapperWithFakeRunner = (task, exitCode) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-bb-entrypoint-"));
   const executable = path.join(root, "node");
@@ -660,6 +733,83 @@ test("local RTC gate keeps the same serial, bounded, shared-resource contract", 
 
 test("Babashka and Node RTC entrypoints name the same two shards", () => {
   assertEntrypointEquivalence();
+});
+
+test("SIGTERM waits for KILL escalation of a TERM-ignoring server group", async () => {
+  const fixture = createTermIgnoringBbShim();
+  let serverPid;
+  let output = "";
+  const wrapper = spawn(
+    process.execPath,
+    [path.join(repoRoot, "scripts/run-rtc-e2e.mjs"), "rtc-extra-test"],
+    {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${fixture.preload}`.trim(),
+        PATH: `${fixture.root}${path.delimiter}${process.env.PATH}`,
+        RTC_SERVER_PID: fixture.serverPid,
+        RTC_SERVER_TERM: fixture.serverTerm,
+        RTC_TEST_EXITED: fixture.testExited,
+      },
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  wrapper.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  wrapper.stderr.on("data", (chunk) => {
+    output += chunk;
+  });
+  const wrapperExit = new Promise((resolve, reject) => {
+    wrapper.once("error", reject);
+    wrapper.once("exit", (code, signal) => resolve({ code, signal }));
+  });
+  try {
+    try {
+      await waitFor(
+        () => fs.existsSync(fixture.testExited) && fs.existsSync(fixture.serverTerm),
+        5_000,
+        "test exit and initial server TERM",
+      );
+    } catch (error) {
+      error.message += ` (testExited=${fs.existsSync(fixture.testExited)}, serverTerm=${fs.existsSync(fixture.serverTerm)}):\n${output}`;
+      throw error;
+    }
+    serverPid = Number(fs.readFileSync(fixture.serverPid, "utf8"));
+    assert.ok(Number.isInteger(serverPid) && serverPid > 1);
+    assert.equal(processExists(serverPid), true, "server did not ignore TERM");
+
+    wrapper.kill("SIGTERM");
+    let exitTimer;
+    const exit = await Promise.race([
+      wrapperExit,
+      new Promise((_, reject) => {
+        exitTimer = setTimeout(
+          () => reject(new Error("wrapper did not finish shutdown")),
+          8_000,
+        );
+      }),
+    ]).finally(() => clearTimeout(exitTimer));
+    assert.equal(
+      processExists(serverPid),
+      false,
+      `wrapper exited before killing its server process group (${JSON.stringify(exit)}):\n${output}`,
+    );
+  } finally {
+    if (wrapper.exitCode === null && wrapper.signalCode === null) {
+      wrapper.kill("SIGKILL");
+    }
+    if (serverPid && processExists(serverPid)) {
+      try {
+        process.kill(-serverPid, "SIGKILL");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+    }
+    fs.rmSync(fixture.root, { force: true, recursive: true });
+  }
 });
 
 test("entrypoint canonicalization requires exact executable and task tokens", () => {
