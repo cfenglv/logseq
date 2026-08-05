@@ -388,6 +388,168 @@
              (pr-str mismatch)
              " events=" (pr-str @events)))))
 
+(def ^:private durable-marker-uuids
+  {:trigger "11111111-1111-1111-1111-111111111111"
+   :ack "22222222-2222-2222-2222-222222222222"})
+
+(defn- marker-phase
+  [title]
+  (cond
+    (some-> title (.startsWith "sync-trigger-")) :trigger
+    (some-> title (.startsWith "sync-ack-")) :ack))
+
+(defn- durable-marker-result
+  [phase title]
+  {"uuid" (get durable-marker-uuids phase)
+   "title" title})
+
+(defn- run-marker-result-contract
+  [phase->result]
+  (let [events (atom [])
+        transactions (atom {:client-1 0 :client-2 0})
+        last-write (atom {})
+        no-editor (ex-info "marker contract must not use editor DOM"
+                           {:phase :editorless})
+        original-page1 @const/*page1
+        original-page2 @const/*page2]
+    (try
+      (reset! const/*page1 :client-1)
+      (reset! const/*page2 :client-2)
+      {:events events
+       :thrown
+       (with-redefs-fn
+         {#'block/new-block
+          (fn [title & _]
+            (swap! events conj [:dom-write w/*page* title])
+            (throw no-editor))
+          (stress-var 'ls-api-call!)
+          (fn [operation & args]
+            (if-let [title (barrier-marker-title args)]
+              (let [phase (marker-phase title)
+                    scenario (get phase->result phase)
+                    tx (get (swap! transactions update w/*page* inc)
+                            w/*page*)]
+                (swap! last-write assoc w/*page*
+                       {:phase phase
+                        :scenario scenario
+                        :title title})
+                (swap! events conj
+                       [:client-write w/*page* operation title]
+                       [:unrelated-tx w/*page* tx])
+                (:append-result scenario))
+              (let [{:keys [phase scenario title]} (get @last-write w/*page*)
+                    durable (durable-marker-result phase title)
+                    result (when (:durable? scenario)
+                             (if (= operation :editor.getPageBlocksTree)
+                               [durable]
+                               durable))]
+                (swap! events conj [:client-read w/*page* operation result])
+                result)))
+          (stress-var 'page-has-block-title?) (constantly false)
+          #'block/open-last-block
+          (fn [& _]
+            (swap! events conj [:editor-retry w/*page*]))
+          #'rtc/get-rtc-tx
+          (fn []
+            (let [tx (get @transactions w/*page* 0)]
+              {:local-tx tx :remote-tx tx}))
+          #'rtc/wait-tx-update-to
+          (fn [target]
+            (swap! events conj [:observe w/*page* target])
+            (swap! transactions assoc w/*page* target)
+            target)
+          #'util/exit-edit (fn [])
+          #'util/wait-timeout (fn [_])
+          #'w/wait-for (fn [& _])
+          #'clojure.core/prn (fn [& _])}
+         (fn []
+           (try
+             ((deref (stress-var 'sync-by-barrier!)) "result-contract")
+             nil
+             (catch Throwable error
+               error))))}
+      (finally
+        (reset! const/*page1 original-page1)
+        (reset! const/*page2 original-page2)))))
+
+(defn- valid-marker-scenario
+  [phase]
+  {:append-result (durable-marker-result
+                   phase
+                   (str "sync-" (name phase) "-result-contract"))
+   :durable? true})
+
+(deftest durable-marker-result-control
+  (let [{:keys [events thrown]}
+        (run-marker-result-contract
+         {:trigger (valid-marker-scenario :trigger)
+          :ack (valid-marker-scenario :ack)})]
+    (is (nil? thrown))
+    (is (= [[:client-write :client-1 :editor.appendBlockInPage
+             "sync-trigger-result-contract"]
+            [:client-write :client-2 :editor.appendBlockInPage
+             "sync-ack-result-contract"]]
+           (filterv #(= :client-write (first %)) @events)))
+    (is (= [[:observe :client-1 1]
+            [:observe :client-2 1]
+            [:observe :client-1 2]
+            [:observe :client-2 2]]
+           (filterv #(= :observe (first %)) @events)))
+    (is (empty? (filter #(contains? #{:dom-write :editor-retry} (first %))
+                        @events)))))
+
+(deftest invalid-marker-results-fail-before-observation
+  (doseq [[invalid-kind invalid-scenario]
+          [[:nil-result {:append-result nil :durable? false}]
+           [:malformed-result {:append-result {"uuid" 17}
+                               :durable? false}]
+           [:non-durable-result
+            {:append-result {"uuid" (get durable-marker-uuids :trigger)}
+             :durable? false}]]
+          invalid-phase [:trigger :ack]]
+    (testing (str (name invalid-phase) " " (name invalid-kind))
+      (let [phase->result
+            {:trigger (valid-marker-scenario :trigger)
+             :ack (valid-marker-scenario :ack)}
+            phase->result
+            (assoc phase->result invalid-phase
+                   (if (and (= invalid-kind :non-durable-result)
+                            (= invalid-phase :ack))
+                     (assoc invalid-scenario
+                            :append-result
+                            {"uuid" (get durable-marker-uuids :ack)})
+                     invalid-scenario))
+            {:keys [events thrown]}
+            (run-marker-result-contract phase->result)
+            writes (filterv #(= :client-write (first %)) @events)
+            observations (filterv #(= :observe (first %)) @events)
+            forbidden (filterv #(contains? #{:dom-write :editor-retry}
+                                           (first %))
+                               @events)
+            expected-write-count (if (= invalid-phase :trigger) 1 2)
+            expected-observations (if (= invalid-phase :trigger)
+                                    []
+                                    [[:observe :client-1 1]
+                                     [:observe :client-2 1]])
+            mismatch (cond-> {}
+                       (nil? thrown)
+                       (assoc :thrown nil)
+
+                       (not= expected-write-count (count writes))
+                       (assoc :writes writes)
+
+                       (not= expected-observations observations)
+                       (assoc :observations observations)
+
+                       (seq forbidden)
+                       (assoc :forbidden forbidden))]
+        (is (empty? mismatch)
+            (str "invalid marker result did not fail closed: "
+                 (pr-str {:invalid-kind invalid-kind
+                          :invalid-phase invalid-phase
+                          :mismatch mismatch
+                          :events @events})))))))
+
 (defn- run-barrier-with-write-failure
   [failing-title]
   (let [failure (ex-info "barrier write failed" {:title failing-title})
