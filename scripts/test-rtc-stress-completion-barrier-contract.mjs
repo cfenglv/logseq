@@ -511,8 +511,19 @@ const hasTimedStableWindow = (source) => {
           restartsChanged &&
           elsePair &&
           /stable[-\w]*since/i.test(elsePair[1]);
+        const orderedExhaustiveTransition =
+          pairs.length === 3 &&
+          state.accepted === accepted &&
+          pairs[0][0] === state.predicate &&
+          /stable[-\w]*since/i.test(pairs[0][1]) &&
+          pairs[1][0] === accepted &&
+          !/stable[-\w]*since/i.test(pairs[1][1]) &&
+          containsTime(pairs[1][1]) &&
+          pairs[2][0] === ":else" &&
+          pairs[2][1] === "nil";
         safeTransition = Boolean(
-          clearsRejected && (elseRestarts || elsePreserves),
+          (clearsRejected && (elseRestarts || elsePreserves)) ||
+          orderedExhaustiveTransition,
         );
       }
       if (safeTransition) {
@@ -1112,6 +1123,16 @@ const safeTrueWrappedPredicateRtcHelpers = safeNestedAndStateRtcHelpers.replace(
   "quiet-enough? (acceptable? fresh-view)",
   "quiet-enough? (true? (acceptable? fresh-view))",
 );
+const safeOrderedExhaustiveCondRtcHelpers = safeTrueWrappedPredicateRtcHelpers.replace(
+  `(cond
+                                (not quiet-enough?) nil
+                                matches-prior? (or stable-since sampled-at)
+                                :else sampled-at)`,
+  `(cond
+                                matches-prior? (or stable-since sampled-at)
+                                quiet-enough? sampled-at
+                                :else nil)`,
+);
 const completionOptionsForm = definitions(safeOptionTimedWindowFixture).get(
   "completion-window-options",
 );
@@ -1302,6 +1323,18 @@ test("contract accepts one true?-normalized state predicate", () => {
       safeRunner,
       safePrepush,
       safeTrueWrappedPredicateRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts an ordered exhaustive stability cond", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeOrderedExhaustiveCondRtcHelpers,
     ),
     [],
   );
@@ -1869,6 +1902,62 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeTrueWrappedPredicateRtcHelpers.replace(
         "(true? (acceptable? fresh-view))",
         "(true? (boolean (acceptable? fresh-view)))",
+      ),
+    ],
+    [
+      "ordered cond tests accepted before same state",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeOrderedExhaustiveCondRtcHelpers.replace(
+        `(cond
+                                matches-prior? (or stable-since sampled-at)
+                                quiet-enough? sampled-at
+                                :else nil)`,
+        `(cond
+                                quiet-enough? sampled-at
+                                matches-prior? (or stable-since sampled-at)
+                                :else nil)`,
+      ),
+    ],
+    [
+      "ordered cond restarts rejected state at sampled time",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeOrderedExhaustiveCondRtcHelpers.replace(
+        ":else nil",
+        ":else sampled-at",
+      ),
+    ],
+    [
+      "ordered cond preserves since for rejected state",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeOrderedExhaustiveCondRtcHelpers.replace(
+        ":else nil",
+        ":else stable-since",
+      ),
+    ],
+    [
+      "ordered cond second branch lacks acceptance",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeOrderedExhaustiveCondRtcHelpers.replace(
+        "quiet-enough? sampled-at",
+        "true sampled-at",
+      ),
+    ],
+    [
+      "ordered cond first predicate has equality without acceptance",
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeOrderedExhaustiveCondRtcHelpers.replace(
+        "matches-prior? (and quiet-enough? (= prior-view fresh-view))",
+        "matches-prior? (= prior-view fresh-view)",
       ),
     ],
   ];
