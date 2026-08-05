@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 import {
   createShutdownController,
   createWindowsProcessTreeSignaler,
+  releaseOwnedChildHandles,
   reportRtcE2eErrors,
+  trackOwnedChild,
 } from "./rtc-e2e-shutdown.mjs";
 
 const repoRoot = path.resolve(
@@ -55,7 +57,10 @@ if (!supportedTasks.has(testTask)) {
 
 const children = new Set();
 const detached = process.platform !== "win32";
-const signalWindowsProcessTree = createWindowsProcessTreeSignaler();
+const ownedChildren = new Set();
+const signalWindowsProcessTree = createWindowsProcessTreeSignaler({
+  ownedChildren,
+});
 const shutdownExpectedChildren = new WeakSet();
 const requestedSignalShutdown = Object.freeze({ requestedSignalShutdown: true });
 let shutdownController;
@@ -84,13 +89,20 @@ const startChild = (command, args) => {
     if (requestedExitCode !== undefined) throw requestedSignalShutdown;
     throw new Error(`refusing to start ${command} after shutdown began`);
   }
-  const child = spawn(command, args, {
-    cwd: e2eDir,
-    detached,
-    env: process.env,
-    shell: false,
-    stdio: "inherit",
-  });
+  const child = trackOwnedChild(
+    detached ? undefined : ownedChildren,
+    spawn(command, args, {
+      cwd: e2eDir,
+      detached,
+      env: process.env,
+      shell: false,
+      stdio: detached ? "inherit" : ["inherit", "pipe", "pipe"],
+    }),
+  );
+  if (!detached) {
+    child.stdout?.pipe(process.stdout, { end: false });
+    child.stderr?.pipe(process.stderr, { end: false });
+  }
   children.add(child);
   child.once("exit", () => children.delete(child));
   return child;
@@ -99,9 +111,12 @@ const startChild = (command, args) => {
 const signalChild = async (child, signal) => {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   shutdownExpectedChildren.add(child);
+  if (!detached) {
+    await signalWindowsProcessTree(child, signal);
+    return;
+  }
   try {
-    if (detached) process.kill(-child.pid, signal);
-    else await signalWindowsProcessTree(child, signal);
+    process.kill(-child.pid, signal);
   } catch (error) {
     if (error?.code !== "ESRCH") throw error;
   }
@@ -177,6 +192,9 @@ const waitForServer = async (server, port) => {
 
 shutdownController = createShutdownController({
   children,
+  releaseOwnedChildren: detached
+    ? undefined
+    : () => releaseOwnedChildHandles(ownedChildren),
   signalChild,
   waitForExit,
 });

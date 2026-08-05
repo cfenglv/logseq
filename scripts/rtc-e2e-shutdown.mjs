@@ -1,6 +1,78 @@
 import { spawn } from 'node:child_process'
 
+const flattenCollectedErrors = (errors) =>
+  errors.flatMap((error) =>
+    error instanceof AggregateError ? flattenCollectedErrors(error.errors) : error
+  )
+
+const throwCollectedErrors = (errors, message) => {
+  const flattened = flattenCollectedErrors(errors)
+  if (flattened.length === 1) throw flattened[0]
+  if (flattened.length > 1) throw new AggregateError(flattened, message)
+}
+
+const waitForProcessOutcome = (child, timeoutMs) =>
+  new Promise((resolve) => {
+    if (child?.exitCode != null || child?.signalCode != null) {
+      resolve({ code: child.exitCode, signal: child.signalCode, type: 'exit' })
+      return
+    }
+    if (typeof child?.once !== 'function') {
+      resolve({ type: 'timeout' })
+      return
+    }
+    let settled = false
+    let timeout
+    const settle = (outcome) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      child.removeListener?.('error', onError)
+      child.removeListener?.('exit', onExit)
+      resolve(outcome)
+    }
+    const onError = (error) => settle({ error, type: 'error' })
+    const onExit = (code, signal) => settle({ code, signal, type: 'exit' })
+    child.once('error', onError)
+    child.once('exit', onExit)
+    timeout = setTimeout(() => settle({ type: 'timeout' }), timeoutMs)
+  })
+
+export const trackOwnedChild = (ownedChildren, child) => {
+  if (!ownedChildren || !child) return child
+  ownedChildren.add(child)
+  child.once?.('close', () => ownedChildren.delete(child))
+  return child
+}
+
+export const releaseOwnedChildHandles = (ownedChildren) => {
+  const failures = []
+  for (const child of [...(ownedChildren ?? [])]) {
+    for (const stream of [child?.stdin, child?.stdout, child?.stderr]) {
+      if (!stream) continue
+      try {
+        stream.unpipe?.()
+      } catch (error) {
+        failures.push(error)
+      }
+      try {
+        stream.destroy?.()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    try {
+      child?.unref?.()
+    } catch (error) {
+      failures.push(error)
+    }
+    ownedChildren?.delete(child)
+  }
+  throwCollectedErrors(failures, 'failed to release RTC child handles')
+}
+
 export const createWindowsProcessTreeSignaler = ({
+  ownedChildren,
   spawnProcess = spawn,
   timeoutMs = 5_000,
 } = {}) => {
@@ -21,69 +93,115 @@ export const createWindowsProcessTreeSignaler = ({
     const args = ['/PID', String(pid), '/T']
     if (signal === 'SIGKILL') args.push('/F')
 
-    await new Promise((resolve, reject) => {
+    const runTaskkill = async () => {
       let taskkill
-      let timeout
-      let settled = false
-      const settle = (callback, value) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timeout)
-        callback(value)
-      }
-
       try {
-        taskkill = spawnProcess('taskkill.exe', args, {
-          shell: false,
-          stdio: 'ignore',
-          windowsHide: true,
-        })
+        taskkill = trackOwnedChild(
+          ownedChildren,
+          spawnProcess('taskkill.exe', args, {
+            shell: false,
+            stdio: 'ignore',
+            windowsHide: true,
+          })
+        )
       } catch (error) {
-        settle(reject, error)
-        return
+        throw error
       }
 
-      taskkill.once('error', (error) => settle(reject, error))
-      taskkill.once('exit', (code, exitSignal) => {
+      const outcome = await waitForProcessOutcome(taskkill, timeoutMs)
+      if (outcome.type === 'error') throw outcome.error
+      if (outcome.type === 'exit') {
         if (
-          code === 0 ||
+          outcome.code === 0 ||
           child.exitCode !== null ||
           child.signalCode !== null
         ) {
-          settle(resolve)
           return
         }
-        settle(
-          reject,
-          new Error(
-            `taskkill.exe failed for PID ${pid} during ${signal} ` +
-              `(code=${code}, signal=${exitSignal})`
-          )
+        throw new Error(
+          `taskkill.exe failed for PID ${pid} during ${signal} ` +
+            `(code=${outcome.code}, signal=${outcome.signal})`
         )
-      })
-      timeout = setTimeout(() => {
-        const timeoutError = new Error(
+      }
+
+      const failures = [
+        new Error(
           `taskkill.exe did not exit within ${timeoutMs}ms for PID ${pid} during ${signal}`
-        )
-        try {
-          taskkill.kill('SIGKILL')
-          settle(reject, timeoutError)
-        } catch (killError) {
-          settle(
-            reject,
-            new AggregateError(
-              [timeoutError, killError],
-              `failed to stop timed-out taskkill.exe for PID ${pid}`
-            )
+        ),
+      ]
+      let helperKillAccepted = false
+      try {
+        helperKillAccepted = taskkill.kill('SIGKILL') === true
+      } catch (error) {
+        failures.push(error)
+      }
+      const killOutcome = helperKillAccepted
+        ? await waitForProcessOutcome(taskkill, timeoutMs)
+        : { type: 'timeout' }
+      if (killOutcome.type === 'error') failures.push(killOutcome.error)
+      if (helperKillAccepted && killOutcome.type !== 'exit') {
+        failures.push(
+          new Error(
+            `taskkill.exe survived helper SIGKILL for PID ${pid} during ${signal}`
           )
+        )
+      }
+      throwCollectedErrors(
+        failures,
+        `taskkill.exe cleanup failed for PID ${pid} during ${signal}`
+      )
+    }
+
+    const stopDirectChild = async () => {
+      if (child.exitCode !== null || child.signalCode !== null) return []
+      if (typeof child.kill !== 'function') return []
+      const failures = []
+      const runStage = async (directSignal) => {
+        let accepted = false
+        try {
+          accepted = child.kill(directSignal) === true
+          if (!accepted) {
+            failures.push(
+              new Error(
+                `direct child ${pid} kill returned false for ${directSignal}`
+              )
+            )
+          }
+        } catch (error) {
+          if (error?.code === 'ESRCH') return true
+          failures.push(error)
         }
-      }, timeoutMs)
-    })
+        if (!accepted) return false
+        const outcome = await waitForProcessOutcome(child, timeoutMs)
+        if (outcome.type === 'error') failures.push(outcome.error)
+        return outcome.type === 'exit'
+      }
+
+      let exited = await runStage(signal)
+      if (!exited && signal === 'SIGTERM') exited = await runStage('SIGKILL')
+      if (!exited) {
+        failures.push(
+          new Error(`child process ${pid} survived direct SIGKILL fallback`)
+        )
+      }
+      return failures
+    }
+
+    try {
+      await runTaskkill()
+    } catch (helperError) {
+      const directFailures = await stopDirectChild()
+      throwCollectedErrors(
+        [helperError, ...directFailures],
+        `Windows cleanup failed for child process ${pid}`
+      )
+    }
   }
 }
 
 export const createShutdownController = ({
   children,
+  releaseOwnedChildren = () => {},
   signalChild,
   waitForExit,
   termTimeoutMs = 5_000,
@@ -110,6 +228,11 @@ export const createShutdownController = ({
           const failures = results
             .filter((result) => result.status === 'rejected')
             .map((result) => result.reason)
+          try {
+            releaseOwnedChildren()
+          } catch (error) {
+            failures.push(error)
+          }
           if (failures.length === 1) throw failures[0]
           if (failures.length > 1) {
             throw new AggregateError(failures, 'multiple RTC child cleanups failed')
