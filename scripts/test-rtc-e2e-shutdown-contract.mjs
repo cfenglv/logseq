@@ -810,3 +810,279 @@ test('a cleanup failure during signal shutdown remains observable', async () => 
   assert.match(result.output, /\[rtc-e2e\] cleanup failed:/)
   assert.match(result.output, /SIGNAL_CLEANUP_FAILURE_SENTINEL/)
 })
+
+const fixtureProcessIsAlive = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 1) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false
+    throw error
+  }
+}
+
+const readFixturePids = (targetPath) => {
+  if (!fs.existsSync(targetPath)) return []
+  return fs
+    .readFileSync(targetPath, 'utf8')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map(Number)
+    .filter((pid) => Number.isInteger(pid) && pid > 1)
+}
+
+const runWindowsHandleFailureScenario = async ({
+  directKillMode,
+  helperKillMode,
+}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-win32-handles-'))
+  const runnerPath = path.join(repoRoot, 'scripts/run-rtc-e2e.mjs')
+  const preload = path.join(root, 'handle-failure-preload.cjs')
+  const bbShim = path.join(root, 'bb-handle-shim.cjs')
+  const taskkillShim = path.join(root, 'taskkill.exe')
+  const outputPath = path.join(root, 'runner-output.log')
+  const eventsPath = path.join(root, 'events.log')
+  const handlesPath = path.join(root, 'active-handles.json')
+  const helperPidsPath = path.join(root, 'helper-pids.log')
+  const serverPidPath = path.join(root, 'server.pid')
+  const serverReadyPath = path.join(root, 'server.ready')
+  const taskPidPath = path.join(root, 'task.pid')
+  let runner
+  let runnerExit
+
+  fs.writeFileSync(
+    bbShim,
+    `const fs = require('node:fs');
+const [task] = process.argv.slice(2);
+if (task === 'serve') {
+  fs.writeFileSync(process.env.RTC_HANDLE_SERVER_PID, String(process.pid));
+  fs.writeFileSync(process.env.RTC_HANDLE_SERVER_READY, 'ready\\n');
+  setInterval(() => {}, 1000);
+} else {
+  fs.writeFileSync(process.env.RTC_HANDLE_TASK_PID, String(process.pid));
+  process.exit(0);
+}
+`
+  )
+  fs.writeFileSync(
+    taskkillShim,
+    `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.appendFileSync(process.env.RTC_HANDLE_HELPER_PIDS, String(process.pid) + '\\n');
+setInterval(() => {}, 1000);
+`
+  )
+  fs.chmodSync(taskkillShim, 0o755)
+  fs.writeFileSync(
+    preload,
+    `const childProcess = require('node:child_process');
+const fs = require('node:fs');
+const net = require('node:net');
+const path = require('node:path');
+const { syncBuiltinESMExports } = require('node:module');
+Object.defineProperty(process, 'platform', {
+  configurable: true,
+  value: 'win32',
+});
+net.createServer = () => {
+  const server = {
+    address: () => ({ address: '127.0.0.1', family: 'IPv4', port: 43134 }),
+    close: (callback) => queueMicrotask(() => callback?.()),
+    listen: (...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === 'function') queueMicrotask(callback);
+      return server;
+    },
+    once: () => server,
+    unref: () => server,
+  };
+  return server;
+};
+global.fetch = async () => {
+  while (!fs.existsSync(process.env.RTC_HANDLE_SERVER_READY)) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return { status: 200 };
+};
+if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_RUNNER)) {
+  const originalSpawn = childProcess.spawn;
+  childProcess.spawn = (command, args, options) => {
+    const child = originalSpawn(command, args, options);
+    const base = path.basename(String(command)).toLowerCase();
+    if (base === 'taskkill.exe' || base === 'taskkill') {
+      child.kill = (signal) => {
+        fs.appendFileSync(
+          process.env.RTC_HANDLE_EVENTS,
+          'helper-kill:' + process.env.RTC_HANDLE_HELPER_KILL_MODE + ':' + signal + '\\n'
+        );
+        if (process.env.RTC_HANDLE_HELPER_KILL_MODE === 'false') return false;
+        if (process.env.RTC_HANDLE_HELPER_KILL_MODE === 'true') return true;
+        throw new Error('HELPER_KILL_FAILURE_SENTINEL');
+      };
+    } else if (args?.[0] === 'serve') {
+      child.kill = (signal) => {
+        fs.appendFileSync(
+          process.env.RTC_HANDLE_EVENTS,
+          'direct-kill:' + process.env.RTC_HANDLE_DIRECT_KILL_MODE + ':' + signal + '\\n'
+        );
+        if (process.env.RTC_HANDLE_DIRECT_KILL_MODE === 'false') return false;
+        if (process.env.RTC_HANDLE_DIRECT_KILL_MODE === 'true') return true;
+        throw new Error('DIRECT_KILL_FAILURE_SENTINEL');
+      };
+    }
+    return child;
+  };
+  syncBuiltinESMExports();
+
+  const originalSetTimeout = global.setTimeout;
+  global.setTimeout = (callback, timeout, ...args) =>
+    originalSetTimeout(callback, timeout === 5000 ? 80 : timeout, ...args);
+  const snapshot = originalSetTimeout(() => {
+    const handles = process._getActiveHandles()
+      .filter((handle) => Number.isInteger(handle?.pid))
+      .map((handle) => ({
+        exitCode: handle.exitCode,
+        killed: handle.killed,
+        pid: handle.pid,
+        signalCode: handle.signalCode,
+        type: handle.constructor?.name,
+      }));
+    fs.writeFileSync(process.env.RTC_HANDLE_SNAPSHOT, JSON.stringify(handles));
+  }, 250);
+  snapshot.unref();
+}
+`
+  )
+
+  const env = {
+    ...process.env,
+    LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([process.execPath, bbShim]),
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
+    PATH: `${root}${path.delimiter}${process.env.PATH ?? ''}`,
+    RTC_HANDLE_DIRECT_KILL_MODE: directKillMode,
+    RTC_HANDLE_EVENTS: eventsPath,
+    RTC_HANDLE_HELPER_KILL_MODE: helperKillMode,
+    RTC_HANDLE_HELPER_PIDS: helperPidsPath,
+    RTC_HANDLE_RUNNER: runnerPath,
+    RTC_HANDLE_SERVER_PID: serverPidPath,
+    RTC_HANDLE_SERVER_READY: serverReadyPath,
+    RTC_HANDLE_SNAPSHOT: handlesPath,
+    RTC_HANDLE_TASK_PID: taskPidPath,
+    TEMP: os.tmpdir(),
+    TMP: os.tmpdir(),
+  }
+  delete env.NODE_TEST_CONTEXT
+
+  try {
+    const outputFd = fs.openSync(outputPath, 'a')
+    try {
+      runner = spawn(process.execPath, [runnerPath, 'rtc-extra-test'], {
+        cwd: repoRoot,
+        env,
+        shell: false,
+        stdio: ['ignore', outputFd, outputFd],
+      })
+    } finally {
+      fs.closeSync(outputFd)
+    }
+    runnerExit = new Promise((resolve, reject) => {
+      runner.once('error', reject)
+      runner.once('exit', (code, signal) => resolve({ code, signal }))
+    })
+
+    let deadline
+    const exit = await Promise.race([
+      runnerExit,
+      new Promise((resolve) => {
+        deadline = setTimeout(() => resolve({ timedOut: true }), 1_200)
+      }),
+    ]).finally(() => clearTimeout(deadline))
+    const helperPids = readFixturePids(helperPidsPath)
+    const serverPids = readFixturePids(serverPidPath)
+    const taskPids = readFixturePids(taskPidPath)
+    return {
+      ...exit,
+      activeHandles: fs.existsSync(handlesPath)
+        ? JSON.parse(fs.readFileSync(handlesPath, 'utf8'))
+        : [],
+      events: fs.existsSync(eventsPath)
+        ? fs.readFileSync(eventsPath, 'utf8')
+        : '',
+      helperAlive: helperPids.map(fixtureProcessIsAlive),
+      helperPids,
+      output: fs.existsSync(outputPath)
+        ? fs.readFileSync(outputPath, 'utf8')
+        : '',
+      serverAlive: serverPids.map(fixtureProcessIsAlive),
+      serverPids,
+      taskPids,
+    }
+  } finally {
+    if (runner && runner.exitCode === null && runner.signalCode === null) {
+      runner.kill('SIGKILL')
+      await Promise.race([
+        runnerExit?.catch(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, 300)),
+      ])
+    }
+    for (const pidPath of [helperPidsPath, serverPidPath, taskPidPath]) {
+      for (const pid of readFixturePids(pidPath)) killFixtureProcess(pid)
+    }
+    fs.rmSync(root, { force: true, recursive: true })
+  }
+}
+
+for (const scenario of [
+  {
+    directKillMode: 'false',
+    helperKillMode: 'false',
+    label: 'helper and direct kill return false',
+  },
+  {
+    directKillMode: 'true',
+    helperKillMode: 'false',
+    label: 'direct kill reports success while both processes remain alive',
+  },
+  {
+    directKillMode: 'throw',
+    helperKillMode: 'throw',
+    label: 'helper and direct kill errors retain both identities',
+  },
+]) {
+  test(`win32 runner releases failed cleanup handles when ${scenario.label}`, async () => {
+    const result = await runWindowsHandleFailureScenario(scenario)
+    const evidence = JSON.stringify({
+      activeHandles: result.activeHandles,
+      events: result.events,
+      helperAlive: result.helperAlive,
+      helperPids: result.helperPids,
+      output: result.output,
+      serverAlive: result.serverAlive,
+      serverPids: result.serverPids,
+    })
+    assert.equal(
+      result.timedOut,
+      undefined,
+      `runner exceeded the 1200ms cleanup boundary: ${evidence}`
+    )
+    assert.equal(result.signal, null, evidence)
+    assert.equal(result.code, 1, evidence)
+    assert.ok(result.helperPids.length > 0, evidence)
+    assert.ok(result.serverPids.length > 0, evidence)
+    assert.ok(result.helperAlive.every(Boolean), evidence)
+    assert.ok(result.serverAlive.every(Boolean), evidence)
+    assert.match(result.events, new RegExp(`helper-kill:${scenario.helperKillMode}:SIGKILL`))
+    assert.match(
+      result.events,
+      new RegExp(`direct-kill:${scenario.directKillMode}:SIG(?:TERM|KILL)`)
+    )
+    assert.match(result.output, /\[rtc-e2e\] cleanup failed:/)
+    if (scenario.helperKillMode === 'throw') {
+      assert.match(result.output, /HELPER_KILL_FAILURE_SENTINEL/)
+      assert.match(result.output, /DIRECT_KILL_FAILURE_SENTINEL/)
+    } else {
+      assert.match(result.output, /taskkill\.exe did not exit/)
+    }
+  })
+}
