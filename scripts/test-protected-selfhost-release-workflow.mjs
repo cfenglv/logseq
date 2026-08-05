@@ -243,7 +243,7 @@ addCase("formal selfhost release has a fail-closed terminal audit", () => {
   const audit = workflowJob("selfhost-release-terminal-audit");
   assert.match(
     audit,
-    /needs:\s*\[\s*release-assets-preflight,\s*selfhost-release-signing,\s*selfhost-release-verifier,\s*selfhost-release\s*\]/,
+    /needs:\s*\[\s*selfhost-release-signing,\s*selfhost-release-verifier,\s*selfhost-release\s*\]/,
   );
   assert.match(audit, /if:\s*\$\{\{\s*always\(\)/);
   for (const eligibility of [
@@ -252,8 +252,7 @@ addCase("formal selfhost release has a fail-closed terminal audit", () => {
     "github.event.inputs.build-target == 'beta'",
     "github.event.inputs.build-target == 'stable'",
     "github.event.inputs.desktop-platforms == 'all'",
-    "contains(needs.release-assets-preflight.outputs.version, '-selfhost.')",
-    "!contains(needs.release-assets-preflight.outputs.version, '.nightly.')",
+    "contains(github.ref_name, '-selfhost.')",
   ]) {
     assert.ok(audit.includes(eligibility), `audit is missing ${eligibility}`);
   }
@@ -270,8 +269,15 @@ addCase("formal selfhost release has a fail-closed terminal audit", () => {
     audit,
     /PUBLISHER_RESULT:\s*\$\{\{ needs\.selfhost-release\.result \}\}/,
   );
-  for (const result of ["SIGNER_RESULT", "VERIFIER_RESULT", "PUBLISHER_RESULT"]) {
-    assert.match(audit, new RegExp(`\\[ "\\$${result}" = success \\]`));
+  for (const result of [
+    "selfhost-release-signing",
+    "selfhost-release-verifier",
+    "selfhost-release",
+  ]) {
+    assert.match(
+      audit,
+      new RegExp(`needs\\.${result}\\.result != 'success'`),
+    );
   }
   assert.match(audit, /exit 1/);
   assert.doesNotMatch(
