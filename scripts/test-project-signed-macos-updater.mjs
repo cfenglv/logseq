@@ -3718,7 +3718,13 @@ addCase(cases, "selfhost CI candidates reach publication only through protected 
   const signer = workflowJobSource(workflow, "selfhost-release-signing");
   assert.match(
     signer,
-    /needs:\s*\[\s*release-assets-preflight,\s*release-rehearsal-gate\s*\]/,
+    /needs:\s*\[\s*release-assets-preflight,\s*release-rehearsal-gate,\s*build-android\s*\]/,
+  );
+  assert.match(signer, /if:\s*\$\{\{\s*always\(\)/);
+  assert.match(
+    signer,
+    /github\.event\.inputs\.build-android != 'true' \|\| needs\.build-android\.result == 'success'/,
+    "signer must survive a skipped disabled Android job and require success when Android is enabled",
   );
   assert.match(signer, /github\.event_name == 'workflow_dispatch'/);
   const verifier = workflowJobSource(workflow, "selfhost-release-verifier");
