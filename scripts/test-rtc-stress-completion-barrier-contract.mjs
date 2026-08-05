@@ -68,17 +68,12 @@ const formAt = (source, start) => {
 
 const definitions = (source) => {
   const result = new Map();
-  const pattern = /\((?:defn-?|deftest)\s+([^\s()[\]{}]+)/g;
-  for (const match of source.matchAll(pattern)) {
-    result.set(match[1], formAt(source, match.index));
-  }
-  for (const match of source.matchAll(/\(def\s/g)) {
-    const form = formAt(source, match.index);
-    const items = splitTopLevelItems(form);
+  for (const { index, name, items } of callFormsInOrder(source)) {
+    if (!["def", "defn", "defn-", "deftest"].includes(name)) continue;
     let nameIndex = 1;
     while (items[nameIndex]?.startsWith("^")) nameIndex += 1;
     if (bareSymbol.test(items[nameIndex] ?? "")) {
-      result.set(items[nameIndex], form);
+      result.set(items[nameIndex], formAt(source, index));
     }
   }
   return result;
@@ -87,17 +82,132 @@ const definitions = (source) => {
 const equalityForms = (source) =>
   [...source.matchAll(/\(=\s/g)].map((match) => formAt(source, match.index));
 
-const calledSymbols = (source) =>
-  new Set(
-    [...source.matchAll(/\(([A-Za-z0-9*+!?<>=._/-]+)/g)].map(
-      (match) => match[1],
-    ),
-  );
+const symbolStart = /[A-Za-z*+!?<>=._/-]/;
+const symbolPart = /[A-Za-z0-9*+!?<>=._/'-]/;
+const collectionCloser = new Map([
+  ["(", ")"],
+  ["[", "]"],
+  ["{", "}"],
+]);
+
+const readerFormEnd = (source, start) => {
+  let index = start;
+  while (index < source.length) {
+    if (/[\s,]/.test(source[index])) {
+      index += 1;
+      continue;
+    }
+    if (source[index] !== ";") break;
+    while (index < source.length && source[index] !== "\n") index += 1;
+  }
+  if (source[index] === "'") return readerFormEnd(source, index + 1);
+  if (source[index] === '"') {
+    let escaped = false;
+    for (index += 1; index < source.length; index += 1) {
+      if (escaped) escaped = false;
+      else if (source[index] === "\\") escaped = true;
+      else if (source[index] === '"') return index + 1;
+    }
+    return source.length;
+  }
+  const closer = collectionCloser.get(source[index]);
+  if (!closer) {
+    while (
+      index < source.length &&
+      !/[\s,()[\]{};]/.test(source[index])
+    ) {
+      index += 1;
+    }
+    return index;
+  }
+  const stack = [closer];
+  let inComment = false;
+  let inString = false;
+  let escaped = false;
+  for (index += 1; index < source.length; index += 1) {
+    const char = source[index];
+    if (inComment) {
+      if (char === "\n") inComment = false;
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === ";") {
+      inComment = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (collectionCloser.has(char)) {
+      stack.push(collectionCloser.get(char));
+      continue;
+    }
+    if (char !== stack.at(-1)) continue;
+    stack.pop();
+    if (stack.length === 0) return index + 1;
+  }
+  return source.length;
+};
+
+const symbolsInOrder = (source) => {
+  const result = [];
+  let inComment = false;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    if (inComment) {
+      if (char === "\n") inComment = false;
+      continue;
+    }
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (char === ";") {
+      inComment = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      continue;
+    }
+    if (char === "'") {
+      index = readerFormEnd(source, index + 1) - 1;
+      continue;
+    }
+    if (!symbolStart.test(char)) continue;
+    const start = index;
+    while (index + 1 < source.length && symbolPart.test(source[index + 1])) {
+      index += 1;
+    }
+    const keyword = start > 0 && source[start - 1] === ":";
+    if (!keyword) {
+      result.push({ index: start, name: source.slice(start, index + 1) });
+    }
+  }
+  return result;
+};
 
 const calledSymbolsInOrder = (source) =>
-  [...source.matchAll(/\(([A-Za-z0-9*+!?<>=._/-]+)/g)].map(
-    (match) => ({ index: match.index, name: match[1] }),
-  );
+  symbolsInOrder(source)
+    .map(({ index, name }) => {
+      let openIndex = index - 1;
+      while (openIndex >= 0 && /[\s,]/.test(source[openIndex])) openIndex -= 1;
+      return { index: openIndex, name };
+    })
+    .filter(({ index }) => index >= 0 && source[index] === "(");
+
+const calledSymbols = (source) =>
+  new Set(calledSymbolsInOrder(source).map(({ name }) => name));
 
 const splitTopLevelItems = (collection) => {
   const items = [];
@@ -155,6 +265,7 @@ const splitTopLevelItems = (collection) => {
 
 const callFormsInOrder = (source) =>
   calledSymbolsInOrder(source).map(({ index, name }) => ({
+    index,
     name,
     items: splitTopLevelItems(formAt(source, index)),
   }));
@@ -166,7 +277,7 @@ const definitionParameters = (source) => {
   return splitTopLevelItems(parameterVector).filter((item) => item !== "&");
 };
 
-const bareSymbol = /^[A-Za-z*+!?<>=._/-][A-Za-z0-9*+!?<>=._/-]*$/;
+const bareSymbol = /^[A-Za-z*+!?<>=._/-][A-Za-z0-9*+!?<>=._/'-]*$/;
 
 const invokedHigherOrderDefinitions = (source, defs) => {
   const result = new Set();
@@ -193,8 +304,8 @@ const invokedHigherOrderDefinitions = (source, defs) => {
 
 const referencedConstantDefinitions = (source, defs) =>
   new Set(
-    [...source.matchAll(/[A-Za-z*+!?<>=._/-][A-Za-z0-9*+!?<>=._/-]*/g)]
-      .map((match) => match[0])
+    symbolsInOrder(source)
+      .map(({ name }) => name)
       .filter(
         (name) =>
           defs.has(name) && /^\(def\s/.test(defs.get(name)),
@@ -392,11 +503,8 @@ const hasTimedStableWindow = (source) => {
       }
     }
   }
-  const symbolPattern = (name) =>
-    new RegExp(
-      `(^|[^A-Za-z0-9*+!?<>=._/-])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9*+!?<>=._/-]|$)`,
-    );
-  const references = (text, name) => symbolPattern(name).test(text);
+  const references = (text, name) =>
+    symbolsInOrder(text).some((symbol) => symbol.name === name);
   const conjunctiveEqualityForms = (expression) => {
     if (!expression?.startsWith("(")) return [];
     const items = splitTopLevelItems(expression);
@@ -1182,6 +1290,10 @@ const safeInjectedClockRtcHelpers = safeOrderedExhaustiveCondRtcHelpers
     :as options}]`,
   )
   .replaceAll("(util/monotonic-time-ms)", "(clock-fn)");
+const safePrimedTransitionRtcHelpers = safeInjectedClockRtcHelpers.replaceAll(
+  "next-stable-since",
+  "next-stable-since'",
+);
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -1385,6 +1497,18 @@ test("contract accepts an injected clock with a monotonic default", () => {
       safeRunner,
       safePrepush,
       safeInjectedClockRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts a primed transition-state binding", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safePrimedTransitionRtcHelpers,
     ),
     [],
   );
@@ -2069,6 +2193,60 @@ test("contract rejects unsafe completion and assertion mutations", () => {
           "{clock-fn #(quot (System/nanoTime) 1000000)}",
           "{fallback-clock-fn #(quot (System/nanoTime) 1000000)}",
         ),
+    ],
+    [
+      "primed transition name appears only in a string",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers.replace(
+        "next-stable-since (cond",
+        `next-stable-since nil
+            primed-name-decoy "next-stable-since'"
+            discarded-transition (cond`,
+      ),
+    ],
+    [
+      "primed transition name appears only in a comment",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers.replace(
+        "next-stable-since (cond",
+        `next-stable-since nil
+            ; next-stable-since' (cond fake-state sampled-at)
+            discarded-transition (cond`,
+      ),
+    ],
+    [
+      "primed transition uses a quoted form instead of a binding value",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safePrimedTransitionRtcHelpers.replace(
+        "next-stable-since' (cond",
+        "next-stable-since' '(cond",
+      ),
+    ],
+    [
+      "primed transition reference is undefined",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safePrimedTransitionRtcHelpers.replace(
+        "next-stable-since' (cond",
+        "next-stable-since (cond",
+      ),
+    ],
+    [
+      "prime is attached to the wrong transition output",
+      safeInjectedClockFixture,
+      safeRunner,
+      safePrepush,
+      safeInjectedClockRtcHelpers.replace(
+        "next-stable-since (cond",
+        "wrong-output' (cond",
+      ),
     ],
   ];
   for (const [label, source, runner, prepush, rtcHelpers] of mutations) {
