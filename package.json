@@ -139,6 +139,7 @@
     "project-update:finalize-github-macos-candidates": "node ./scripts/finalize-github-macos-project-update.mjs",
     "project-update:verify-finalized-selfhost-release": "node ./scripts/verify-finalized-selfhost-release.mjs",
     "rtc:prepush": "node ./scripts/run-rtc-prepush.mjs",
+    "test:rtc-ci-release-gate": "node --test ./scripts/rtc-ci-release-gate.test.mjs",
     "cli:e2e": "bb dev:cli-e2e",
     "cli:e2e:skip-build": "bb dev:cli-e2e --skip-build",
     "cljs:dev-release-app": "clojure -M:cljs release app db-worker db-worker-node --config-merge \"{:closure-defines {frontend.config/DEV-RELEASE true}}\"",
