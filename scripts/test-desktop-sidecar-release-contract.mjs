@@ -1270,6 +1270,127 @@ test("full local preflight invokes the explicit macOS test-helper gate", () => {
   );
 });
 
+test("full local preflight binds both release revisions to its actual HEAD before builds", () => {
+  const source = fs.readFileSync(preflightPath, "utf8");
+  const probeFlag = "--release-source-binding-contract-probe";
+  assert.match(
+    source,
+    new RegExp(probeFlag),
+    "full preflight exposes no bounded source-binding contract probe",
+  );
+
+  const head = run("git", ["rev-parse", "HEAD"]);
+  assert.equal(head.status, 0, head.output);
+  assert.match(head.output, /^[0-9a-f]{40}$/);
+  const probe = ({ releaseSourceSha, revision }) => {
+    const env = { ...process.env };
+    delete env.LOGSEQ_RELEASE_SOURCE_SHA;
+    delete env.LOGSEQ_REVISION;
+    if (releaseSourceSha !== undefined) {
+      env.LOGSEQ_RELEASE_SOURCE_SHA = releaseSourceSha;
+    }
+    if (revision !== undefined) env.LOGSEQ_REVISION = revision;
+    const result = spawnSync(process.execPath, [preflightPath, probeFlag], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (result.error) throw result.error;
+    return {
+      output: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim(),
+      status: result.status,
+    };
+  };
+
+  const exact = probe({
+    releaseSourceSha: head.output,
+    revision: head.output,
+  });
+  assert.equal(exact.status, 0, exact.output);
+  assert.match(exact.output, /RELEASE_SOURCE_BINDING_CONTRACT PASS/);
+
+  for (const [label, env] of [
+    ["missing release source", { revision: head.output }],
+    ["missing embedded revision", { releaseSourceSha: head.output }],
+    [
+      "short release source",
+      { releaseSourceSha: head.output.slice(0, 12), revision: head.output },
+    ],
+    [
+      "self-consistent wrong source",
+      { releaseSourceSha: "8".repeat(40), revision: "8".repeat(40) },
+    ],
+    [
+      "embedded revision mismatch",
+      { releaseSourceSha: head.output, revision: "9".repeat(40) },
+    ],
+  ]) {
+    const result = probe(env);
+    assert.notEqual(
+      result.status,
+      0,
+      `${label} passed the source-binding gate:\n${result.output}`,
+    );
+    assert.match(
+      result.output,
+      /LOGSEQ_RELEASE_SOURCE_SHA|LOGSEQ_REVISION|HEAD|release source/i,
+      `${label} failure did not identify the binding: ${result.output}`,
+    );
+  }
+
+  const cleanCheck = source.indexOf('"source and environment checks"');
+  const bindingCheck = source.indexOf("requireReleaseSourceBinding();");
+  const firstLongInstall = source.indexOf('"root frozen install"');
+  assert.ok(
+    cleanCheck !== -1 &&
+      bindingCheck > cleanCheck &&
+      firstLongInstall > bindingCheck,
+    "clean and exact source binding must precede the first long install",
+  );
+});
+
+test("full local preflight packages from a disposable CI-shaped workspace", () => {
+  const source = fs.readFileSync(preflightPath, "utf8");
+  for (const required of [
+    "logseq-desktop-release-workspace-",
+    "releaseStaticDir",
+    "scripts/verify-desktop-runtime-revisions.mjs",
+    "dist/db-worker-node.js",
+    "node_modules",
+  ]) {
+    assert.match(
+      source,
+      new RegExp(required.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      `isolated packaging workspace is missing ${required}`,
+    );
+  }
+  assert.match(
+    source,
+    /fs\.cpSync\(\s*staticDir,\s*releaseStaticDir,[\s\S]{0,600}node_modules/,
+    "CI-shaped workspace does not copy static while excluding node_modules",
+  );
+  assert.match(
+    source,
+    /finally\s*\{[\s\S]*fs\.rmSync\(releaseWorkspaceRoot,[\s\S]{0,120}recursive:\s*true/,
+    "isolated release workspace is not removed in finally",
+  );
+  const workspaceCreated = source.indexOf("createCiReleaseWorkspace");
+  const isolatedInstall = source.indexOf('"isolated packaging install"');
+  const rebuild = source.indexOf('"rebuild desktop native modules"');
+  const packageHost = source.indexOf('"package host macOS application"');
+  const verifyHost = source.indexOf('"verify host packaged application"');
+  assert.ok(
+    workspaceCreated !== -1 &&
+      isolatedInstall > workspaceCreated &&
+      rebuild > isolatedInstall &&
+      packageHost > rebuild &&
+      verifyHost > packageHost,
+    "install, rebuild, package, and verify must remain ordered inside the isolated workspace",
+  );
+});
+
 test("full local preflight resolves the Electron test preload independent of cwd", () => {
   const source = fs.readFileSync(preflightPath, "utf8");
   assert.match(
