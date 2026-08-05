@@ -832,6 +832,15 @@ const readFixturePids = (targetPath) => {
     .filter((pid) => Number.isInteger(pid) && pid > 1)
 }
 
+const waitForFixtureProcessExit = async (pid, timeoutMs = 1_000) => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (!fixtureProcessIsAlive(pid)) return true
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  return !fixtureProcessIsAlive(pid)
+}
+
 const runWindowsHandleFailureScenario = async ({
   directKillMode,
   helperKillMode,
@@ -844,12 +853,14 @@ const runWindowsHandleFailureScenario = async ({
   const outputPath = path.join(root, 'runner-output.log')
   const eventsPath = path.join(root, 'events.log')
   const handlesPath = path.join(root, 'active-handles.json')
+  const directPidsPath = path.join(root, 'direct-pids.log')
   const helperPidsPath = path.join(root, 'helper-pids.log')
   const serverPidPath = path.join(root, 'server.pid')
   const serverReadyPath = path.join(root, 'server.ready')
   const taskPidPath = path.join(root, 'task.pid')
   let runner
   let runnerExit
+  let scenarioResult
 
   fs.writeFileSync(
     bbShim,
@@ -913,6 +924,11 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
         process.env.RTC_HANDLE_HELPER_PIDS,
         String(child.pid) + '\\n'
       );
+      fs.appendFileSync(
+        process.env.RTC_HANDLE_EVENTS,
+        'helper-spawn:' + child.pid + '\\n'
+      );
+      const originalKill = child.kill.bind(child);
       child.kill = (signal) => {
         fs.appendFileSync(
           process.env.RTC_HANDLE_EVENTS,
@@ -920,9 +936,26 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
         );
         if (process.env.RTC_HANDLE_HELPER_KILL_MODE === 'false') return false;
         if (process.env.RTC_HANDLE_HELPER_KILL_MODE === 'true') return true;
+        if (process.env.RTC_HANDLE_HELPER_KILL_MODE === 'passthrough') {
+          return originalKill(signal);
+        }
         throw new Error('HELPER_KILL_FAILURE_SENTINEL');
       };
-    } else if (args?.[0] === 'serve') {
+    } else if (
+      command === process.execPath &&
+      Array.isArray(args) &&
+      args.some((token) => token === process.env.RTC_HANDLE_BB_SHIM) &&
+      args.some((token) => token === 'serve')
+    ) {
+      fs.appendFileSync(
+        process.env.RTC_HANDLE_DIRECT_PIDS,
+        String(child.pid) + '\\n'
+      );
+      fs.appendFileSync(
+        process.env.RTC_HANDLE_EVENTS,
+        'direct-spawn:' + child.pid + '\\n'
+      );
+      const originalKill = child.kill.bind(child);
       child.kill = (signal) => {
         fs.appendFileSync(
           process.env.RTC_HANDLE_EVENTS,
@@ -930,6 +963,9 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
         );
         if (process.env.RTC_HANDLE_DIRECT_KILL_MODE === 'false') return false;
         if (process.env.RTC_HANDLE_DIRECT_KILL_MODE === 'true') return true;
+        if (process.env.RTC_HANDLE_DIRECT_KILL_MODE === 'passthrough') {
+          return originalKill(signal);
+        }
         throw new Error('DIRECT_KILL_FAILURE_SENTINEL');
       };
     }
@@ -963,6 +999,8 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
     LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([process.execPath, bbShim]),
     NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
     PATH: `${root}${path.delimiter}${process.env.PATH ?? ''}`,
+    RTC_HANDLE_BB_SHIM: bbShim,
+    RTC_HANDLE_DIRECT_PIDS: directPidsPath,
     RTC_HANDLE_DIRECT_KILL_MODE: directKillMode,
     RTC_HANDLE_EVENTS: eventsPath,
     RTC_HANDLE_HELPER_KILL_MODE: helperKillMode,
@@ -1002,7 +1040,7 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
       const output = fs.existsSync(outputPath)
         ? fs.readFileSync(outputPath, 'utf8')
         : ''
-      if (/\[rtc-e2e\] cleanup failed:/.test(output)) {
+      if (/^\[rtc-e2e\] cleanup failed:/m.test(output)) {
         cleanupFailedObserved = true
         cleanupFailedObservedAt = Date.now()
         break
@@ -1026,9 +1064,10 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
         ? await runnerExit
         : { cleanupReportTimedOut: true }
     const helperPids = readFixturePids(helperPidsPath)
+    const directPids = readFixturePids(directPidsPath)
     const serverPids = readFixturePids(serverPidPath)
     const taskPids = readFixturePids(taskPidPath)
-    return {
+    scenarioResult = {
       ...exit,
       cleanupFailedObserved,
       cleanupToCloseMs: cleanupFailedObservedAt
@@ -1040,6 +1079,8 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
       events: fs.existsSync(eventsPath)
         ? fs.readFileSync(eventsPath, 'utf8')
         : '',
+      directAlive: directPids.map(fixtureProcessIsAlive),
+      directPids,
       helperAlive: helperPids.map(fixtureProcessIsAlive),
       helperPids,
       output: fs.existsSync(outputPath)
@@ -1057,37 +1098,133 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
         new Promise((resolve) => setTimeout(resolve, 300)),
       ])
     }
-    for (const pidPath of [helperPidsPath, serverPidPath, taskPidPath]) {
-      for (const pid of readFixturePids(pidPath)) killFixtureProcess(pid)
+    const ownedPids = [
+      ...new Set(
+        [directPidsPath, helperPidsPath, serverPidPath, taskPidPath].flatMap(
+          readFixturePids
+        )
+      ),
+    ]
+    for (const pid of ownedPids) killFixtureProcess(pid)
+    const fixtureCleanup = await Promise.all(
+      ownedPids.map(async (pid) => ({
+        exited: await waitForFixtureProcessExit(pid),
+        pid,
+      }))
+    )
+    if (scenarioResult) {
+      scenarioResult.fixtureCleanup = fixtureCleanup
     }
     fs.rmSync(root, { force: true, recursive: true })
   }
+  return scenarioResult
 }
+
+const assertWindowsHandleFixtureEvidence = (
+  result,
+  scenario,
+  { requireKillEvents = true } = {}
+) => {
+  const evidence = JSON.stringify({
+    activeHandles: result.activeHandles,
+    directAlive: result.directAlive,
+    directPids: result.directPids,
+    events: result.events,
+    fixtureCleanup: result.fixtureCleanup,
+    helperAlive: result.helperAlive,
+    helperPids: result.helperPids,
+    serverAlive: result.serverAlive,
+    serverPids: result.serverPids,
+  })
+  const eventLines = result.events.split(/\r?\n/).filter(Boolean)
+
+  assert.equal(result.helperPids.length, 1, evidence)
+  assert.equal(result.directPids.length, 1, evidence)
+  assert.deepEqual(result.directPids, result.serverPids, evidence)
+  assert.notEqual(result.helperPids[0], result.directPids[0], evidence)
+  assert.ok(eventLines.includes(`helper-spawn:${result.helperPids[0]}`), evidence)
+  assert.ok(eventLines.includes(`direct-spawn:${result.directPids[0]}`), evidence)
+  if (scenario.expectHelperAlive !== undefined) {
+    assert.deepEqual(result.helperAlive, [scenario.expectHelperAlive], evidence)
+  }
+  if (scenario.expectDirectAlive !== undefined) {
+    assert.deepEqual(result.directAlive, [scenario.expectDirectAlive], evidence)
+    assert.deepEqual(result.serverAlive, [scenario.expectDirectAlive], evidence)
+  }
+  if (requireKillEvents) {
+    assert.ok(
+      eventLines.includes(`helper-kill:${scenario.helperKillMode}:SIGKILL`),
+      evidence
+    )
+    for (const signal of scenario.expectedDirectSignals) {
+      assert.ok(
+        eventLines.includes(`direct-kill:${scenario.directKillMode}:${signal}`),
+        evidence
+      )
+    }
+  }
+  assert.ok(result.fixtureCleanup.length >= 2, evidence)
+  assert.ok(result.fixtureCleanup.every(({ exited }) => exited), evidence)
+}
+
+test('win32 retained-handle fixture control reaps every owned real process', async () => {
+  const scenario = {
+    directKillMode: 'false',
+    expectDirectAlive: true,
+    expectHelperAlive: true,
+    helperKillMode: 'false',
+  }
+  const result = await runWindowsHandleFailureScenario(scenario)
+  assertWindowsHandleFixtureEvidence(result, scenario, {
+    requireKillEvents: false,
+  })
+})
 
 for (const scenario of [
   {
-    directKillMode: 'false',
+    directKillMode: 'passthrough',
+    expectDirectAlive: false,
+    expectHelperAlive: true,
+    expectedDirectSignals: ['SIGTERM'],
     helperKillMode: 'false',
-    label: 'helper and direct kill return false',
+    label: 'helper kill returns false after direct-child fallback exits',
+  },
+  {
+    directKillMode: 'false',
+    expectDirectAlive: true,
+    expectHelperAlive: false,
+    expectedDirectSignals: ['SIGTERM', 'SIGKILL'],
+    helperKillMode: 'passthrough',
+    label: 'direct kill returns false after the helper exits',
   },
   {
     directKillMode: 'true',
-    helperKillMode: 'false',
-    label: 'direct kill reports success while both processes remain alive',
+    expectDirectAlive: true,
+    expectHelperAlive: false,
+    expectedDirectSignals: ['SIGTERM', 'SIGKILL'],
+    helperKillMode: 'passthrough',
+    label: 'direct kill reports success while the child remains alive',
   },
   {
     directKillMode: 'throw',
-    helperKillMode: 'throw',
-    label: 'helper and direct kill errors retain both identities',
+    expectDirectAlive: true,
+    expectHelperAlive: false,
+    expectedDirectSignals: ['SIGTERM', 'SIGKILL'],
+    helperKillMode: 'passthrough',
+    label: 'direct kill throws after the helper exits',
   },
 ]) {
   test(`win32 runner releases failed cleanup handles when ${scenario.label}`, async () => {
     const result = await runWindowsHandleFailureScenario(scenario)
+    assertWindowsHandleFixtureEvidence(result, scenario)
     const evidence = JSON.stringify({
       activeHandles: result.activeHandles,
       cleanupFailedObserved: result.cleanupFailedObserved,
       cleanupToCloseMs: result.cleanupToCloseMs,
+      directAlive: result.directAlive,
+      directPids: result.directPids,
       events: result.events,
+      fixtureCleanup: result.fixtureCleanup,
       helperAlive: result.helperAlive,
       helperPids: result.helperPids,
       output: result.output,
@@ -1107,18 +1244,8 @@ for (const scenario of [
     )
     assert.equal(result.signal, null, evidence)
     assert.equal(result.code, 1, evidence)
-    assert.ok(result.helperPids.length > 0, evidence)
-    assert.ok(result.serverPids.length > 0, evidence)
-    assert.ok(result.helperAlive.every(Boolean), evidence)
-    assert.ok(result.serverAlive.every(Boolean), evidence)
-    assert.match(result.events, new RegExp(`helper-kill:${scenario.helperKillMode}:SIGKILL`))
-    assert.match(
-      result.events,
-      new RegExp(`direct-kill:${scenario.directKillMode}:SIG(?:TERM|KILL)`)
-    )
     assert.match(result.output, /\[rtc-e2e\] cleanup failed:/)
-    if (scenario.helperKillMode === 'throw') {
-      assert.match(result.output, /HELPER_KILL_FAILURE_SENTINEL/)
+    if (scenario.directKillMode === 'throw') {
       assert.match(result.output, /DIRECT_KILL_FAILURE_SENTINEL/)
     } else {
       assert.match(result.output, /taskkill\.exe did not exit/)
