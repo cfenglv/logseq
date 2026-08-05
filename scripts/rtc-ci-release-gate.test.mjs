@@ -8,10 +8,12 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-const repoRoot = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-);
+const currentTestFile = fileURLToPath(import.meta.url);
+const repoRoot = path.resolve(path.dirname(currentTestFile), "..");
+const win32LifecycleChildName =
+  "simulated win32 runner executes bb.exe and child-level shutdown";
+const isWin32LifecycleChild =
+  process.env.RTC_WIN32_LIFECYCLE_CHILD === "1";
 const rtcWorkflowPath = ".github/workflows/clj-rtc-e2e.yml";
 const releaseWorkflowPath =
   ".github/workflows/build-desktop-release.yml";
@@ -552,9 +554,20 @@ const createBbShim = () => {
   const executable = path.join(root, process.platform === "win32" ? "bb.cmd" : "bb");
   const marker = path.join(root, "calls.log");
   const preload = path.join(root, "no-network-preload.cjs");
+  const shutdownMarker = path.join(root, "shutdown.log");
   fs.writeFileSync(
     preload,
-    `const net = require("node:net");
+    `const fs = require("node:fs");
+const net = require("node:net");
+const originalProcessKill = process.kill.bind(process);
+process.kill = (pid, signal) => {
+  if (process.platform === "win32" && pid < 0) {
+    fs.appendFileSync(process.env.RTC_FAKE_SHUTDOWN_MARKER,
+      "forbidden-process-kill:" + pid + ":" + signal + "\\n");
+    throw new Error("win32 shutdown used a negative process group");
+  }
+  return originalProcessKill(pid, signal);
+};
 net.createServer = () => {
   const server = {
     address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43127 }),
@@ -576,8 +589,14 @@ global.fetch = async () => ({ status: 200 });
 const fs = require("node:fs");
 const args = process.argv.slice(2);
 if (args[0] === "serve") {
-  process.on("SIGTERM", () => process.exit(0));
-  process.on("SIGINT", () => process.exit(0));
+  process.on("SIGTERM", () => {
+    fs.appendFileSync(process.env.RTC_FAKE_SHUTDOWN_MARKER, "server:SIGTERM\\n");
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    fs.appendFileSync(process.env.RTC_FAKE_SHUTDOWN_MARKER, "server:SIGINT\\n");
+    process.exit(0);
+  });
   setInterval(() => {}, 1000);
 } else {
   fs.appendFileSync(process.env.RTC_FAKE_MARKER, args.join(" ") + "\\n");
@@ -586,11 +605,11 @@ if (args[0] === "serve") {
 `;
   fs.writeFileSync(executable, shim);
   fs.chmodSync(executable, 0o755);
-  return { marker, preload, root };
+  return { marker, preload, root, shutdownMarker };
 };
 
 const runRtcWrapperWithFakeTask = (task, exitCode) => {
-  const { marker, preload, root } = createBbShim();
+  const { marker, preload, root, shutdownMarker } = createBbShim();
   const result = spawnSync(
     process.execPath,
     [path.join(repoRoot, "scripts/run-rtc-e2e.mjs"), task],
@@ -602,14 +621,54 @@ const runRtcWrapperWithFakeTask = (task, exitCode) => {
         PATH: `${root}${path.delimiter}${process.env.PATH}`,
         NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${preload}`.trim(),
         RTC_FAKE_MARKER: marker,
+        RTC_FAKE_SHUTDOWN_MARKER: shutdownMarker,
         RTC_FAKE_TASK_EXIT: String(exitCode),
       },
       timeout: 15_000,
     },
   );
   const calls = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : "";
+  const shutdown = fs.existsSync(shutdownMarker)
+    ? fs.readFileSync(shutdownMarker, "utf8")
+    : "";
   fs.rmSync(root, { force: true, recursive: true });
-  return { ...result, calls, output: `${result.stdout ?? ""}${result.stderr ?? ""}` };
+  return {
+    ...result,
+    calls,
+    output: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+    shutdown,
+  };
+};
+
+const runNodeUnderSimulatedWin32 = (args, extraEnv = {}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-win32-platform-"));
+  const preload = path.join(root, "win32-platform.cjs");
+  fs.writeFileSync(
+    preload,
+    `Object.defineProperty(process, "platform", {
+  configurable: true,
+  value: "win32",
+});
+`,
+  );
+  try {
+    const env = {
+      ...process.env,
+      ...extraEnv,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${preload}`.trim(),
+      TEMP: os.tmpdir(),
+      TMP: os.tmpdir(),
+    };
+    delete env.NODE_TEST_CONTEXT;
+    return spawnSync(process.execPath, ["--require", preload, ...args], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env,
+      timeout: 20_000,
+    });
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true });
+  }
 };
 
 const waitFor = async (predicate, timeoutMs, label) => {
@@ -803,6 +862,63 @@ test("local RTC gate keeps the same serial, bounded, shared-resource contract", 
 test("Babashka and Node RTC entrypoints name the same two shards", () => {
   assertEntrypointEquivalence();
 });
+
+test(
+  "win32 platform simulation control",
+  { skip: isWin32LifecycleChild },
+  () => {
+    const result = runNodeUnderSimulatedWin32([
+      "--eval",
+      "process.stdout.write(process.platform)",
+    ]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "win32");
+  },
+);
+
+test(
+  win32LifecycleChildName,
+  { skip: !isWin32LifecycleChild },
+  () => {
+    assert.equal(process.platform, "win32");
+    const passed = runRtcWrapperWithFakeTask("rtc-extra-test", 0);
+    assert.equal(passed.status, 0, passed.output);
+    assert.match(passed.calls, /^rtc-extra-test(?:\s|$)/, passed.output);
+    assert.equal(passed.shutdown, "server:SIGTERM\n", passed.output);
+    assert.doesNotMatch(passed.shutdown, /forbidden-process-kill/);
+  },
+);
+
+test(
+  "lifecycle suite executes its win32 command and shutdown branch",
+  { skip: isWin32LifecycleChild },
+  () => {
+    const result = runNodeUnderSimulatedWin32(
+      [
+        "--test",
+        `--test-name-pattern=^${win32LifecycleChildName}$`,
+        path.relative(repoRoot, currentTestFile),
+      ],
+      { RTC_WIN32_LIFECYCLE_CHILD: "1" },
+    );
+    assert.equal(
+      result.status,
+      0,
+      `simulated win32 lifecycle failed:\n${result.stdout}${result.stderr}`,
+    );
+    assert.match(
+      result.stdout,
+      /\bpass 1\b/,
+      JSON.stringify({
+        error: result.error?.message,
+        signal: result.signal,
+        status: result.status,
+        stderr: result.stderr,
+        stdout: result.stdout,
+      }),
+    );
+  },
+);
 
 test("SIGTERM waits for KILL escalation of a TERM-ignoring server group", async () => {
   const fixture = createTermIgnoringBbShim();
