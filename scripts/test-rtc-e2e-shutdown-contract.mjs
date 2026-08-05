@@ -868,8 +868,6 @@ if (task === 'serve') {
   fs.writeFileSync(
     taskkillShim,
     `#!/usr/bin/env node
-const fs = require('node:fs');
-fs.appendFileSync(process.env.RTC_HANDLE_HELPER_PIDS, String(process.pid) + '\\n');
 setInterval(() => {}, 1000);
 `
   )
@@ -911,6 +909,10 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
     const child = originalSpawn(command, args, options);
     const base = path.basename(String(command)).toLowerCase();
     if (base === 'taskkill.exe' || base === 'taskkill') {
+      fs.appendFileSync(
+        process.env.RTC_HANDLE_HELPER_PIDS,
+        String(child.pid) + '\\n'
+      );
       child.kill = (signal) => {
         fs.appendFileSync(
           process.env.RTC_HANDLE_EVENTS,
@@ -936,8 +938,9 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
   syncBuiltinESMExports();
 
   const originalSetTimeout = global.setTimeout;
+  const timeoutCapMs = Number(process.env.RTC_HANDLE_TIMEOUT_CAP_MS);
   global.setTimeout = (callback, timeout, ...args) =>
-    originalSetTimeout(callback, timeout === 5000 ? 80 : timeout, ...args);
+    originalSetTimeout(callback, Math.min(timeout, timeoutCapMs), ...args);
   const snapshot = originalSetTimeout(() => {
     const handles = process._getActiveHandles()
       .filter((handle) => Number.isInteger(handle?.pid))
@@ -969,6 +972,7 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
     RTC_HANDLE_SERVER_READY: serverReadyPath,
     RTC_HANDLE_SNAPSHOT: handlesPath,
     RTC_HANDLE_TASK_PID: taskPidPath,
+    RTC_HANDLE_TIMEOUT_CAP_MS: '80',
     TEMP: os.tmpdir(),
     TMP: os.tmpdir(),
   }
@@ -991,18 +995,45 @@ if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_HANDLE_
       runner.once('exit', (code, signal) => resolve({ code, signal }))
     })
 
-    let deadline
-    const exit = await Promise.race([
-      runnerExit,
-      new Promise((resolve) => {
-        deadline = setTimeout(() => resolve({ timedOut: true }), 1_200)
-      }),
-    ]).finally(() => clearTimeout(deadline))
+    const reportDeadline = Date.now() + 3_000
+    let cleanupFailedObserved = false
+    let cleanupFailedObservedAt
+    while (Date.now() < reportDeadline) {
+      const output = fs.existsSync(outputPath)
+        ? fs.readFileSync(outputPath, 'utf8')
+        : ''
+      if (/\[rtc-e2e\] cleanup failed:/.test(output)) {
+        cleanupFailedObserved = true
+        cleanupFailedObservedAt = Date.now()
+        break
+      }
+      if (runner.exitCode !== null || runner.signalCode !== null) break
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+
+    let closeDeadline
+    const exit = cleanupFailedObserved
+      ? await Promise.race([
+          runnerExit,
+          new Promise((resolve) => {
+            closeDeadline = setTimeout(
+              () => resolve({ closeTimedOut: true }),
+              300
+            )
+          }),
+        ]).finally(() => clearTimeout(closeDeadline))
+      : runner.exitCode !== null || runner.signalCode !== null
+        ? await runnerExit
+        : { cleanupReportTimedOut: true }
     const helperPids = readFixturePids(helperPidsPath)
     const serverPids = readFixturePids(serverPidPath)
     const taskPids = readFixturePids(taskPidPath)
     return {
       ...exit,
+      cleanupFailedObserved,
+      cleanupToCloseMs: cleanupFailedObservedAt
+        ? Date.now() - cleanupFailedObservedAt
+        : undefined,
       activeHandles: fs.existsSync(handlesPath)
         ? JSON.parse(fs.readFileSync(handlesPath, 'utf8'))
         : [],
@@ -1054,6 +1085,8 @@ for (const scenario of [
     const result = await runWindowsHandleFailureScenario(scenario)
     const evidence = JSON.stringify({
       activeHandles: result.activeHandles,
+      cleanupFailedObserved: result.cleanupFailedObserved,
+      cleanupToCloseMs: result.cleanupToCloseMs,
       events: result.events,
       helperAlive: result.helperAlive,
       helperPids: result.helperPids,
@@ -1062,9 +1095,15 @@ for (const scenario of [
       serverPids: result.serverPids,
     })
     assert.equal(
-      result.timedOut,
+      result.cleanupReportTimedOut,
       undefined,
-      `runner exceeded the 1200ms cleanup boundary: ${evidence}`
+      `runner did not report cleanup failure within the 3000ms total fixture bound: ${evidence}`
+    )
+    assert.equal(result.cleanupFailedObserved, true, evidence)
+    assert.equal(
+      result.closeTimedOut,
+      undefined,
+      `cleanup failure was reported but active handles kept the runner alive beyond the 300ms close grace: ${evidence}`
     )
     assert.equal(result.signal, null, evidence)
     assert.equal(result.code, 1, evidence)
