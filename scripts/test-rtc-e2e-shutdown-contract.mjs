@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -341,4 +341,213 @@ if (task === 'serve') {
     }
     fs.rmSync(root, { force: true, recursive: true })
   }
+})
+
+const waitForPath = async (targetPath, timeoutMs, label) => {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (fs.existsSync(targetPath)) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error(`timed out waiting for ${label}`)
+}
+
+const killFixtureProcess = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 1) return
+  try {
+    process.kill(pid, 'SIGKILL')
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error
+  }
+}
+
+const runSignalScenario = async ({
+  cleanupFailure = false,
+  serverTermDelayMs = 0,
+  signal,
+  taskMode = 'active',
+}) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-runner-signal-'))
+  const preload = path.join(root, 'signal-preload.cjs')
+  const bbShim = path.join(root, 'signal-bb-shim.cjs')
+  const serverPidPath = path.join(root, 'server.pid')
+  const serverReadyPath = path.join(root, 'server.ready')
+  const serverCleanupPath = path.join(root, 'server.cleanup')
+  const taskPidPath = path.join(root, 'task.pid')
+  const taskReadyPath = path.join(root, 'task.ready')
+  let output = ''
+  let runner
+
+  fs.writeFileSync(
+    preload,
+    `const fs = require('node:fs');
+const net = require('node:net');
+const originalKill = process.kill.bind(process);
+net.createServer = () => {
+  const server = {
+    address: () => ({ address: '127.0.0.1', family: 'IPv4', port: 43133 }),
+    close: (callback) => queueMicrotask(() => callback?.()),
+    listen: (...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === 'function') queueMicrotask(callback);
+      return server;
+    },
+    once: () => server,
+    unref: () => server,
+  };
+  return server;
+};
+global.fetch = async () => {
+  while (!fs.existsSync(process.env.RTC_SIGNAL_SERVER_READY)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return { status: 200 };
+};
+if (
+  process.env.RTC_SIGNAL_CLEANUP_FAILURE === '1' &&
+  process.argv[1]?.endsWith('run-rtc-e2e.mjs')
+) {
+  process.kill = (pid, signal) => {
+    originalKill(Math.abs(pid), signal);
+    throw new Error('SIGNAL_CLEANUP_FAILURE_SENTINEL');
+  };
+}
+`
+  )
+  fs.writeFileSync(
+    bbShim,
+    `const fs = require('node:fs');
+const [task] = process.argv.slice(2);
+if (task === 'serve') {
+  fs.writeFileSync(process.env.RTC_SIGNAL_SERVER_PID, String(process.pid));
+  fs.writeFileSync(process.env.RTC_SIGNAL_SERVER_READY, 'ready\\n');
+  process.on('SIGTERM', () => {
+    fs.writeFileSync(process.env.RTC_SIGNAL_SERVER_CLEANUP, 'started\\n');
+    setTimeout(
+      () => process.exit(0),
+      Number(process.env.RTC_SIGNAL_SERVER_TERM_DELAY)
+    );
+  });
+  setInterval(() => {}, 1000);
+} else {
+  fs.writeFileSync(process.env.RTC_SIGNAL_TASK_PID, String(process.pid));
+  fs.writeFileSync(process.env.RTC_SIGNAL_TASK_READY, 'ready\\n');
+  if (process.env.RTC_SIGNAL_TASK_MODE === 'run-failure') {
+    setTimeout(() => process.exit(23), 100);
+  } else {
+    setInterval(() => {}, 1000);
+  }
+}
+`
+  )
+
+  const env = {
+    ...process.env,
+    LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([process.execPath, bbShim]),
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
+    RTC_SIGNAL_CLEANUP_FAILURE: cleanupFailure ? '1' : '0',
+    RTC_SIGNAL_SERVER_CLEANUP: serverCleanupPath,
+    RTC_SIGNAL_SERVER_PID: serverPidPath,
+    RTC_SIGNAL_SERVER_READY: serverReadyPath,
+    RTC_SIGNAL_SERVER_TERM_DELAY: String(serverTermDelayMs),
+    RTC_SIGNAL_TASK_MODE: taskMode,
+    RTC_SIGNAL_TASK_PID: taskPidPath,
+    RTC_SIGNAL_TASK_READY: taskReadyPath,
+  }
+  delete env.NODE_TEST_CONTEXT
+
+  try {
+    runner = spawn(
+      process.execPath,
+      [path.join(repoRoot, 'scripts/run-rtc-e2e.mjs'), 'rtc-extra-test'],
+      {
+        cwd: repoRoot,
+        env,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    )
+    runner.stdout.on('data', (chunk) => {
+      output += chunk
+    })
+    runner.stderr.on('data', (chunk) => {
+      output += chunk
+    })
+    const exit = new Promise((resolve, reject) => {
+      runner.once('error', reject)
+      runner.once('exit', (code, exitSignal) => resolve({ code, signal: exitSignal }))
+    })
+
+    try {
+      await waitForPath(serverReadyPath, 5_000, 'active RTC server')
+      await waitForPath(taskReadyPath, 5_000, 'active RTC task')
+    } catch (error) {
+      error.message += `:\n${output}`
+      throw error
+    }
+    if (taskMode === 'run-failure') {
+      await waitForPath(serverCleanupPath, 5_000, 'cleanup after task failure')
+    }
+    runner.kill(signal)
+
+    let timer
+    const result = await Promise.race([
+      exit,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`runner did not exit after ${signal}:\n${output}`)),
+          8_000
+        )
+      }),
+    ]).finally(() => clearTimeout(timer))
+    return { ...result, output }
+  } finally {
+    if (runner && runner.exitCode === null && runner.signalCode === null) {
+      runner.kill('SIGKILL')
+    }
+    for (const pidPath of [serverPidPath, taskPidPath]) {
+      if (fs.existsSync(pidPath)) {
+        killFixtureProcess(Number(fs.readFileSync(pidPath, 'utf8')))
+      }
+    }
+    fs.rmSync(root, { force: true, recursive: true })
+  }
+}
+
+for (const [signal, expectedExitCode] of [
+  ['SIGINT', 130],
+  ['SIGTERM', 143],
+]) {
+  test(`runner exits ${expectedExitCode} when ${signal} initiates active child cleanup`, async () => {
+    const result = await runSignalScenario({ signal })
+    assert.equal(result.signal, null, result.output)
+    assert.equal(result.code, expectedExitCode, result.output)
+    assert.doesNotMatch(
+      result.output,
+      /terminated by SIGTERM/,
+      `shutdown-generated child termination was reported as a run failure:\n${result.output}`
+    )
+  })
+}
+
+test('a run failure that predates SIGTERM remains the primary failure', async () => {
+  const result = await runSignalScenario({
+    serverTermDelayMs: 500,
+    signal: 'SIGTERM',
+    taskMode: 'run-failure',
+  })
+  assert.equal(result.signal, null, result.output)
+  assert.equal(result.code, 1, result.output)
+  assert.match(result.output, /rtc-extra-test --port 43133 exited with 23/)
+})
+
+test('a cleanup failure during signal shutdown remains observable', async () => {
+  const result = await runSignalScenario({
+    cleanupFailure: true,
+    signal: 'SIGTERM',
+  })
+  assert.equal(result.signal, null, result.output)
+  assert.equal(result.code, 1, result.output)
+  assert.match(result.output, /\[rtc-e2e\] cleanup failed:/)
+  assert.match(result.output, /SIGNAL_CLEANUP_FAILURE_SENTINEL/)
 })
