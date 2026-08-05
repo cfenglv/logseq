@@ -168,3 +168,14 @@ test("desktop runtime verification accepts runtimes built from the exact release
     );
   });
 });
+
+test("desktop runtime verification rejects revision substrings", () => {
+  withVerifierFixture(`prefix-${sourceRevision}-suffix`, (root) => {
+    const result = runVerifier(root, sourceRevision);
+    assert.notEqual(
+      result.status,
+      0,
+      `runtime revision substring was accepted:\n${result.stdout}\n${result.stderr}`,
+    );
+  });
+});
