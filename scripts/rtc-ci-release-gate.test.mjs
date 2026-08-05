@@ -685,6 +685,75 @@ if (task === "serve") {
   return { executable, preload, root, serverPid, serverTerm, testExited };
 };
 
+const createStartupFailureBbShim = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-startup-shim-"));
+  const executable = path.join(root, process.platform === "win32" ? "bb.cmd" : "bb");
+  const preload = path.join(root, "startup-failure-preload.cjs");
+  const events = path.join(root, "cleanup-events.log");
+  const serverPid = path.join(root, "server.pid");
+  const missingCommand = path.join(root, "rtc-startup-sentinel-not-found");
+
+  fs.writeFileSync(
+    preload,
+    `const fs = require("node:fs");
+const childProcess = require("node:child_process");
+const net = require("node:net");
+const { syncBuiltinESMExports } = require("node:module");
+const originalSpawn = childProcess.spawn;
+childProcess.spawn = (command, args, options) => {
+  if (args?.[0] === "serve") return originalSpawn(command, args, options);
+  return originalSpawn(process.env.RTC_MISSING_COMMAND, args, options);
+};
+process.on("uncaughtException", () => {
+  process.exitCode = 1;
+});
+process.on("unhandledRejection", () => {
+  process.exitCode = 1;
+});
+net.createServer = () => {
+  const server = {
+    address: () => ({ address: "127.0.0.1", family: "IPv4", port: 43129 }),
+    close: (callback) => queueMicrotask(() => callback?.()),
+    listen: (...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === "function") queueMicrotask(callback);
+      return server;
+    },
+    once: () => server,
+    unref: () => server,
+  };
+  return server;
+};
+syncBuiltinESMExports();
+global.fetch = async () => {
+  while (!fs.existsSync(process.env.RTC_SERVER_PID)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return { status: 200 };
+};
+`,
+  );
+  fs.writeFileSync(
+    executable,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const [task] = process.argv.slice(2);
+if (task !== "serve") process.exit(97);
+fs.writeFileSync(process.env.RTC_SERVER_PID, String(process.pid));
+process.on("SIGTERM", () => {
+  fs.appendFileSync(process.env.RTC_CLEANUP_EVENTS, "cleanup-started\\n");
+  setTimeout(() => {
+    fs.appendFileSync(process.env.RTC_CLEANUP_EVENTS, "cleanup-finished\\n");
+    process.exit(0);
+  }, 1000);
+});
+setInterval(() => {}, 1000);
+`,
+  );
+  fs.chmodSync(executable, 0o755);
+  return { events, executable, missingCommand, preload, root, serverPid };
+};
+
 const runBabashkaWrapperWithFakeRunner = (task, exitCode) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "rtc-bb-entrypoint-"));
   const executable = path.join(root, "node");
@@ -801,6 +870,64 @@ test("SIGTERM waits for KILL escalation of a TERM-ignoring server group", async 
     if (wrapper.exitCode === null && wrapper.signalCode === null) {
       wrapper.kill("SIGKILL");
     }
+    if (serverPid && processExists(serverPid)) {
+      try {
+        process.kill(-serverPid, "SIGKILL");
+      } catch (error) {
+        if (error?.code !== "ESRCH") throw error;
+      }
+    }
+    fs.rmSync(fixture.root, { force: true, recursive: true });
+  }
+});
+
+test("startup failures preserve diagnostics after awaited cleanup", async () => {
+  const fixture = createStartupFailureBbShim();
+  let serverPid;
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(repoRoot, "scripts/run-rtc-e2e.mjs"), "rtc-extra-test"],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${fixture.preload}`.trim(),
+          PATH: `${fixture.root}${path.delimiter}${process.env.PATH}`,
+          RTC_CLEANUP_EVENTS: fixture.events,
+          RTC_MISSING_COMMAND: fixture.missingCommand,
+          RTC_SERVER_PID: fixture.serverPid,
+        },
+        timeout: 10_000,
+      },
+    );
+
+    if (fs.existsSync(fixture.serverPid)) {
+      serverPid = Number(fs.readFileSync(fixture.serverPid, "utf8"));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const events = fs.existsSync(fixture.events)
+      ? fs.readFileSync(fixture.events, "utf8").trim().split(/\r?\n/)
+      : [];
+    const violations = [];
+    if (!Number.isInteger(result.status) || result.status === 0) {
+      violations.push(
+        `runner did not return a concrete nonzero status: status=${result.status} signal=${result.signal}`,
+      );
+    }
+    if (!(result.stderr ?? "").includes("rtc-startup-sentinel-not-found")) {
+      violations.push("stderr omitted the original startup failure diagnostic");
+    }
+    if (!events.includes("cleanup-finished")) {
+      violations.push(`runner exited before cleanup finished: ${JSON.stringify(events)}`);
+    }
+    assert.deepEqual(
+      violations,
+      [],
+      `startup failure contract violated:\nstatus=${result.status} signal=${result.signal}\nevents=${JSON.stringify(events)}\nstdout=${JSON.stringify(result.stdout)}\nstderr=${JSON.stringify(result.stderr)}`,
+    );
+  } finally {
     if (serverPid && processExists(serverPid)) {
       try {
         process.kill(-serverPid, "SIGKILL");
