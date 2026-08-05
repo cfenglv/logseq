@@ -1393,6 +1393,7 @@ jobs:
           retention-days: 7
 
   selfhost-release-verifier:
+    if: ${{ always() && needs.selfhost-release-signing.result == 'success' && needs.release-rehearsal-gate.result == 'success' }}
     needs: [ selfhost-release-signing, release-rehearsal-gate ]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -1430,7 +1431,7 @@ jobs:
             --version "${{ needs.selfhost-release-signing.outputs.version }}"
 
   selfhost-release:
-    if: ${{ github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.selfhost-release-verifier.outputs.source-ref && github.sha == needs.selfhost-release-verifier.outputs.source-sha && contains(needs.selfhost-release-verifier.outputs.version, '-selfhost.') && !contains(needs.selfhost-release-verifier.outputs.version, '.nightly.') }}
+    if: ${{ always() && needs.selfhost-release-verifier.result == 'success' && github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.selfhost-release-verifier.outputs.source-ref && github.sha == needs.selfhost-release-verifier.outputs.source-sha && contains(needs.selfhost-release-verifier.outputs.version, '-selfhost.') && !contains(needs.selfhost-release-verifier.outputs.version, '.nightly.') }}
     needs: [ selfhost-release-verifier ]
     runs-on: ubuntu-22.04
     timeout-minutes: 15

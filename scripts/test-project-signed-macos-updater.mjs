@@ -1585,6 +1585,38 @@ const assertSignerDependencyGate = (needs, condition) => {
   }
 };
 
+const assertDirectSuccessGate = (label, needs, condition) => {
+  const expression = stripExpressionEnvelope(condition);
+  assert.match(
+    expression,
+    /\balways\(\)/,
+    `${label} must override transitive skipped-ancestor propagation`,
+  );
+  const allSuccess = Object.fromEntries(
+    needs.map((name) => [name, "success"]),
+  );
+  assert.equal(
+    evaluateSignerCondition(condition, {
+      buildAndroid: false,
+      needs: allSuccess,
+    }),
+    true,
+    `${label} must run when every direct dependency succeeds`,
+  );
+  for (const name of needs) {
+    for (const result of ["failure", "skipped", "cancelled"]) {
+      assert.equal(
+        evaluateSignerCondition(condition, {
+          buildAndroid: false,
+          needs: { ...allSuccess, [name]: result },
+        }),
+        false,
+        `${label} must fail closed when ${name} is ${result}`,
+      );
+    }
+  }
+};
+
 const assertProtectedReleaseDag = (workflow) => {
   const signer = workflowJobSource(workflow, "selfhost-release-signing");
   assertSignerDependencyGate(
@@ -1611,6 +1643,26 @@ const assertProtectedReleaseDag = (workflow) => {
   assert.ok(
     workflowJobNeeds(publisher).includes("selfhost-release-verifier"),
     "publisher does not depend on the secretless verifier",
+  );
+  assert.deepEqual(
+    workflowJobNeeds(verifier),
+    ["selfhost-release-signing", "release-rehearsal-gate"],
+    "secretless verifier dependencies drifted",
+  );
+  assertDirectSuccessGate(
+    "secretless verifier",
+    workflowJobNeeds(verifier),
+    workflowJobCondition(verifier),
+  );
+  assert.deepEqual(
+    workflowJobNeeds(publisher),
+    ["selfhost-release-verifier"],
+    "publisher dependencies drifted",
+  );
+  assertDirectSuccessGate(
+    "protected publisher",
+    workflowJobNeeds(publisher),
+    workflowJobCondition(publisher),
   );
 
   assert.deepEqual(workflowJobPermissions(signer), new Map([

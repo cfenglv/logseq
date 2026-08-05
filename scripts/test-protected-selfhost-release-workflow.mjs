@@ -171,6 +171,10 @@ addCase("secretless verifier rechecks complete assets and signatures", () => {
     verifier,
     /needs:\s*\[\s*selfhost-release-signing,\s*release-rehearsal-gate\s*\]/,
   );
+  assert.match(
+    verifier,
+    /if:\s*\$\{\{\s*always\(\) && needs\.selfhost-release-signing\.result == 'success' && needs\.release-rehearsal-gate\.result == 'success'\s*\}\}/,
+  );
   assert.match(verifier, /permissions:\s*\n\s+actions:\s*read\s*\n\s+contents:\s*read/);
   assert.doesNotMatch(verifier, /environment:|secrets\./);
   assert.match(verifier, /name:\s*selfhost-finalized-release-assets/);
@@ -213,6 +217,10 @@ addCase("secretless verifier rechecks complete assets and signatures", () => {
 addCase("publisher has separate protected write boundary after verifier", () => {
   const publisher = workflowJob("selfhost-release");
   assert.match(publisher, /needs:\s*\[\s*selfhost-release-verifier\s*\]/);
+  assert.match(
+    publisher,
+    /if:\s*\$\{\{\s*always\(\) && needs\.selfhost-release-verifier\.result == 'success'/,
+  );
   assert.match(publisher, /environment:\s*selfhost-production/);
   assert.match(publisher, /permissions:[\s\S]{0,100}actions:\s*read/);
   assert.match(publisher, /permissions:[\s\S]{0,100}contents:\s*write/);
