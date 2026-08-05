@@ -4,7 +4,10 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createShutdownController } from "./rtc-e2e-shutdown.mjs";
+import {
+  createShutdownController,
+  reportRtcE2eErrors,
+} from "./rtc-e2e-shutdown.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -160,15 +163,16 @@ shutdownController = createShutdownController({
 const { shutdown } = shutdownController;
 
 let requestedExitCode;
-let fatalError;
+let primaryError;
+let cleanupError;
 const awaitSharedShutdown = () => {
   void shutdown().catch((shutdownError) => {
-    fatalError ??= shutdownError;
+    cleanupError ??= shutdownError;
     process.exitCode = 1;
   });
 };
 const requestErrorShutdown = (error) => {
-  fatalError ??= error;
+  primaryError ??= error;
   process.exitCode = 1;
   awaitSharedShutdown();
 };
@@ -218,19 +222,22 @@ try {
   try {
     await shutdown();
   } catch (error) {
-    fatalError ??= error;
+    cleanupError ??= error;
   }
 }
 
+const runFailure = primaryError ?? runError;
+const failed = reportRtcE2eErrors({
+  primaryError: runFailure,
+  cleanupError,
+});
 if (requestedExitCode !== undefined) {
-  if (fatalError) {
-    console.error(fatalError);
+  if (failed) {
     process.exitCode = 1;
   } else {
     process.exitCode = requestedExitCode;
   }
-} else if (fatalError || runError) {
-  console.error(fatalError ?? runError);
+} else if (failed) {
   process.exitCode = 1;
 } else {
   console.log(`[rtc-e2e] PASS task=${testTask} port=${port}`);

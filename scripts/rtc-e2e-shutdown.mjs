@@ -21,8 +21,16 @@ export const createShutdownController = ({
 
   const shutdown = () => {
     if (!cleanupPromise) {
-      cleanupPromise = Promise.all([...children].map(stopChild)).then(
-        () => undefined
+      cleanupPromise = Promise.allSettled([...children].map(stopChild)).then(
+        (results) => {
+          const failures = results
+            .filter((result) => result.status === 'rejected')
+            .map((result) => result.reason)
+          if (failures.length === 1) throw failures[0]
+          if (failures.length > 1) {
+            throw new AggregateError(failures, 'multiple RTC child cleanups failed')
+          }
+        }
       )
     }
     return cleanupPromise
@@ -32,4 +40,14 @@ export const createShutdownController = ({
     isShuttingDown: () => cleanupPromise !== undefined,
     shutdown,
   })
+}
+
+export const reportRtcE2eErrors = ({
+  primaryError,
+  cleanupError,
+  logError = console.error,
+}) => {
+  if (primaryError) logError(primaryError)
+  if (cleanupError) logError('[rtc-e2e] cleanup failed:', cleanupError)
+  return Boolean(primaryError || cleanupError)
 }
