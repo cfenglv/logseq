@@ -211,6 +211,12 @@
             (new-block-safe! original-title))
           (recur (dec attempt)))))))
 
+(defn- append-barrier-marker!
+  [title]
+  ;; Execute the marker transaction in the active RTC client without relying
+  ;; on transient editor DOM or focus state left by the stress operations.
+  (ls-api-call! :editor.appendBlockInPage title))
+
 (defn- sync-by-barrier!
   ([tag]
    (sync-by-barrier! tag nil))
@@ -234,8 +240,7 @@
      (let [{first-marker-tx :remote-tx}
            (w/with-page @*page1
              (rtc/with-wait-tx-updated
-               (b/new-block (str "sync-trigger-" tag))
-               (util/exit-edit)))]
+               (append-barrier-marker! (str "sync-trigger-" tag))))]
        (w/with-page @*page1
          (rtc/wait-tx-update-to first-marker-tx))
        (w/with-page @*page2
@@ -245,8 +250,7 @@
        (let [{ack-marker-tx :remote-tx}
              (w/with-page @*page2
                (rtc/with-wait-tx-updated
-                 (b/new-block (str "sync-ack-" tag))
-                 (util/exit-edit)))]
+                 (append-barrier-marker! (str "sync-ack-" tag))))]
          (w/with-page @*page1
            (rtc/wait-tx-update-to ack-marker-tx))
          (w/with-page @*page2

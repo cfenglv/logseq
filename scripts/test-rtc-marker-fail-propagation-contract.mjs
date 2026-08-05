@@ -13,14 +13,20 @@ const repoRoot = path.resolve(
 const read = (relativePath) =>
   fs.readFileSync(path.join(repoRoot, relativePath), 'utf8')
 
-test('RTC barrier markers use the direct fail-propagating block path', () => {
+test('RTC barrier markers use the direct fail-propagating client API path', () => {
   const source = read('clj-e2e/test/logseq/e2e/rtc_extra_part2_test.clj')
+  const helperStart = source.indexOf('(defn- append-barrier-marker!')
   const start = source.indexOf('(defn- sync-by-barrier!')
   const end = source.indexOf('(defn- seed-long-nested-page!', start)
+  assert.notEqual(helperStart, -1)
   assert.notEqual(start, -1)
   assert.notEqual(end, -1)
+  const helper = source.slice(helperStart, start)
   const barrier = source.slice(start, end)
-  assert.equal((barrier.match(/b\/new-block\b/g) ?? []).length, 2)
+  assert.match(helper, /ls-api-call!\s+:editor\.appendBlockInPage\s+title/)
+  assert.doesNotMatch(helper, /editor-wrapper|textarea|new-block|\btry\b|\bcatch\b|\brecur\b/)
+  assert.equal((barrier.match(/append-barrier-marker!/g) ?? []).length, 2)
+  assert.doesNotMatch(barrier, /b\/new-block\b|editor-wrapper|textarea/)
   assert.doesNotMatch(barrier, /new-block-safe!|\btry\b|\bcatch\b|\brecur\b/)
 })
 
