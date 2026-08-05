@@ -258,6 +258,12 @@ jobs:
           cp resources/package.json resources/pnpm-lock.yaml static/
           pnpm --dir static install --frozen-lockfile --ignore-workspace
 
+      - name: Run RTC quiescence contracts
+        run: pnpm test:rtc-stress-completion-barrier
+
+      - name: Run RTC CI and runner lifecycle contracts
+        run: pnpm test:rtc-ci-release-gate
+
       - name: Run complete desktop release contracts
         run: pnpm desktop:test-release-contracts
 

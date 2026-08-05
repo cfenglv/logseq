@@ -24,14 +24,15 @@ if (embeddedRevision !== releaseSourceSha) {
 const expectedRevision = releaseSourceSha;
 
 const containsExactRevision = (source, revision) => {
-  const asciiHex = (character) => character !== undefined && /[0-9a-f]/i.test(character);
+  const tokenCharacter = (character) =>
+    character !== undefined && /[0-9A-Za-z_-]/.test(character);
   let offset = 0;
   while (offset <= source.length - revision.length) {
     const index = source.indexOf(revision, offset);
     if (index === -1) return false;
     if (
-      !asciiHex(source[index - 1]) &&
-      !asciiHex(source[index + revision.length])
+      !tokenCharacter(source[index - 1]) &&
+      !tokenCharacter(source[index + revision.length])
     ) {
       return true;
     }

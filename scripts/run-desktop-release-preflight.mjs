@@ -6,15 +6,97 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  assertReleaseSourceIdentityUnchanged,
-  establishReleaseSourceIdentity,
-} from "./release-source-identity.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
 );
+const exactShaPattern = /^[0-9a-f]{40}$/;
+const identityGit = (args, label) => {
+  const result = spawnSync("git", args, {
+    cwd: repoRoot,
+    encoding: "utf8",
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.error) throw result.error;
+  if (result.signal) throw new Error(`${label} terminated by ${result.signal}`);
+  if (result.status !== 0) {
+    throw new Error(`${label} failed: ${result.stderr.trim()}`);
+  }
+  return result.stdout;
+};
+const resolveIdentityHead = () => {
+  const head = identityGit(["rev-parse", "HEAD"], "git rev-parse HEAD").trim();
+  if (!exactShaPattern.test(head)) {
+    throw new Error("git rev-parse HEAD must be an exact lowercase 40-hex SHA");
+  }
+  return head;
+};
+const identityWorktreeStatus = ({ includeUntracked = true } = {}) =>
+  identityGit(
+    [
+      "status",
+      "--porcelain=v1",
+      includeUntracked ? "--untracked-files=all" : "--untracked-files=no",
+      "--",
+      ".",
+      ":(exclude)static/package.json",
+      ":(exclude)static/pnpm-lock.yaml",
+    ],
+    "git status",
+  );
+const resolveProvidedIdentity = (name, head) => {
+  const value = process.env[name];
+  if (value === undefined) return head;
+  if (!exactShaPattern.test(value)) {
+    throw new Error(`${name} must be an exact lowercase 40-hex SHA`);
+  }
+  if (value !== head) {
+    throw new Error(`${name} must equal the actual HEAD ${head}`);
+  }
+  return value;
+};
+const establishReleaseSourceIdentity = ({ allowDirty = false }) => {
+  const head = resolveIdentityHead();
+  const sourceSha = resolveProvidedIdentity("LOGSEQ_RELEASE_SOURCE_SHA", head);
+  const revision = resolveProvidedIdentity("LOGSEQ_REVISION", head);
+  const worktreeStatus = identityWorktreeStatus({
+    includeUntracked: !allowDirty,
+  });
+  if (!allowDirty && worktreeStatus !== "") {
+    throw new Error("release source worktree must be clean");
+  }
+  process.env.LOGSEQ_RELEASE_SOURCE_SHA = sourceSha;
+  process.env.LOGSEQ_REVISION = revision;
+  return Object.freeze({ allowDirty, head, revision, sourceSha, worktreeStatus });
+};
+const assertReleaseSourceIdentityUnchanged = (identity, { phase }) => {
+  for (const [name, expected] of [
+    ["LOGSEQ_RELEASE_SOURCE_SHA", identity.sourceSha],
+    ["LOGSEQ_REVISION", identity.revision],
+  ]) {
+    const actual = process.env[name];
+    if (!exactShaPattern.test(actual ?? "") || actual !== expected) {
+      throw new Error(`${name} changed during ${phase}`);
+    }
+  }
+  const head = resolveIdentityHead();
+  if (head !== identity.head) {
+    throw new Error(`release source HEAD changed during ${phase}`);
+  }
+  const status = identityWorktreeStatus({
+    includeUntracked: !identity.allowDirty,
+  });
+  if (status !== identity.worktreeStatus) {
+    throw new Error(
+      `release source worktree changed during ${phase}: ` +
+        `baseline=${JSON.stringify(identity.worktreeStatus)} ` +
+        `current=${JSON.stringify(status)}`,
+    );
+  }
+  return identity;
+};
 const allowDirty = process.argv.includes("--allow-dirty");
 const cliDir = path.join(repoRoot, "cli");
 const electronTestPreloadRelativePath =
@@ -190,8 +272,6 @@ const pnpm = (label, args, options) => run(label, "pnpm", args, options);
 if (process.argv.includes(releaseSourceBindingProbe)) {
   const identity = establishReleaseSourceIdentity({
     allowDirty: true,
-    environment: process.env,
-    repoRoot,
   });
   console.log(`RELEASE_SOURCE_BINDING_CONTRACT PASS sha=${identity.head}`);
   process.exit(0);
@@ -214,8 +294,6 @@ run(
 );
 const releaseSourceIdentity = establishReleaseSourceIdentity({
   allowDirty,
-  environment: process.env,
-  repoRoot,
 });
 run(
   "verify repository OCaml switch",
@@ -344,9 +422,7 @@ run("build and stage CLI", "opam", [
 pnpm("build desktop webpack assets", ["webpack-app-build"]);
 pnpm("stage desktop runtimes", ["desktop:prepare-runtime-js"]);
 assertReleaseSourceIdentityUnchanged(releaseSourceIdentity, {
-  environment: process.env,
   phase: "before runtime verification",
-  repoRoot,
 });
 pnpm("verify desktop runtime revisions", [
   "desktop:verify-runtime-revisions",
@@ -569,9 +645,7 @@ try {
 }
 
 assertReleaseSourceIdentityUnchanged(releaseSourceIdentity, {
-  environment: process.env,
   phase: "before FULL PASS",
-  repoRoot,
 });
 
 console.log(

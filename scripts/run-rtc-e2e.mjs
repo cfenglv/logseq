@@ -141,6 +141,7 @@ let fatalError;
 const requestFatalShutdown = (error, exitCode) => {
   fatalError ??= error;
   requestedExitCode ??= exitCode;
+  process.exitCode ??= exitCode;
   void shutdown().catch((shutdownError) => {
     fatalError ??= shutdownError;
   });

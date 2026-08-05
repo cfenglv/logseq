@@ -140,7 +140,7 @@
     "project-update:finalize-github-macos-candidates": "node ./scripts/finalize-github-macos-project-update.mjs",
     "project-update:verify-finalized-selfhost-release": "node ./scripts/verify-finalized-selfhost-release.mjs",
     "rtc:prepush": "node ./scripts/run-rtc-prepush.mjs",
-    "test:rtc-ci-release-gate": "node --test ./scripts/rtc-ci-release-gate.test.mjs",
+    "test:rtc-ci-release-gate": "node --test ./scripts/rtc-ci-release-gate.test.mjs ./scripts/test-rtc-e2e-shutdown-contract.mjs ./scripts/test-rtc-marker-fail-propagation-contract.mjs",
     "test:rtc-stress-completion-barrier": "node --test ./scripts/test-rtc-stress-completion-barrier-contract.mjs",
     "cli:e2e": "bb dev:cli-e2e",
     "cli:e2e:skip-build": "bb dev:cli-e2e --skip-build",

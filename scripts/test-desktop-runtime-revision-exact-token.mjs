@@ -82,6 +82,7 @@ test('packaged-runtime matcher requires hexadecimal token boundaries', () => {
     `f${sourceRevision}`,
     `${sourceRevision}0`,
     `A${sourceRevision}F`,
+    `prefix-${sourceRevision}-suffix`,
   ]) {
     assert.equal(
       containsExactDesktopSourceRevision(payload, sourceRevision),

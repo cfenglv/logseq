@@ -25,10 +25,12 @@ export const assertDesktopSourceRevision = (sourceRevision) => {
   return sourceRevision
 }
 
-const asciiHexByte = (value) =>
+const asciiRevisionTokenByte = (value) =>
   (value >= 0x30 && value <= 0x39) ||
-  (value >= 0x41 && value <= 0x46) ||
-  (value >= 0x61 && value <= 0x66)
+  (value >= 0x41 && value <= 0x5a) ||
+  value === 0x5f ||
+  (value >= 0x61 && value <= 0x7a) ||
+  value === 0x2d
 
 export const containsExactDesktopSourceRevision = (payload, sourceRevision) => {
   const expected = assertDesktopSourceRevision(sourceRevision)
@@ -42,8 +44,8 @@ export const containsExactDesktopSourceRevision = (payload, sourceRevision) => {
     const afterIndex = index + token.length
     const after = afterIndex === source.length ? undefined : source[afterIndex]
     if (
-      (before === undefined || !asciiHexByte(before)) &&
-      (after === undefined || !asciiHexByte(after))
+      (before === undefined || !asciiRevisionTokenByte(before)) &&
+      (after === undefined || !asciiRevisionTokenByte(after))
     ) {
       return true
     }

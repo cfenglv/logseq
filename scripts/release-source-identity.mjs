@@ -25,10 +25,18 @@ const resolveHead = (repoRoot) => {
   return head
 }
 
-const worktreeStatus = (repoRoot) =>
+const worktreeStatus = (repoRoot, { includeUntracked = true } = {}) =>
   git(
     repoRoot,
-    ['status', '--porcelain=v1', '--untracked-files=all'],
+    [
+      'status',
+      '--porcelain=v1',
+      includeUntracked ? '--untracked-files=all' : '--untracked-files=no',
+      '--',
+      '.',
+      ':(exclude)static/package.json',
+      ':(exclude)static/pnpm-lock.yaml',
+    ],
     'git status'
   )
 
@@ -56,7 +64,7 @@ export const establishReleaseSourceIdentity = ({
     head
   )
   const revision = resolveProvidedIdentity(environment, 'LOGSEQ_REVISION', head)
-  const status = worktreeStatus(repoRoot)
+  const status = worktreeStatus(repoRoot, { includeUntracked: !allowDirty })
   if (!allowDirty && status !== '') {
     throw new Error('release source worktree must be clean')
   }
@@ -88,9 +96,15 @@ export const assertReleaseSourceIdentityUnchanged = (
   if (head !== identity.head) {
     throw new Error(`release source HEAD changed during ${phase}`)
   }
-  const status = worktreeStatus(repoRoot)
+  const status = worktreeStatus(repoRoot, {
+    includeUntracked: !identity.allowDirty,
+  })
   if (status !== identity.worktreeStatus) {
-    throw new Error(`release source worktree changed during ${phase}`)
+    throw new Error(
+      `release source worktree changed during ${phase}: ` +
+        `baseline=${JSON.stringify(identity.worktreeStatus)} ` +
+        `current=${JSON.stringify(status)}`
+    )
   }
   return identity
 }
