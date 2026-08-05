@@ -145,6 +145,78 @@ test("workflow_dispatch declares Android as a required false-by-default boolean"
   assert.match(declaration, /^        default:\s*false$/m);
 });
 
+test("desktop caller passes the frozen full source SHA to reusable Android", () => {
+  const android = job("build-android");
+  assert.deepEqual(
+    jobNeeds(android),
+    ["resolve-release-source"],
+    "optional Android should depend only on the existing source resolver",
+  );
+  assert.match(
+    android,
+    /^      source-sha:\s*["']?\$\{\{\s*needs\.resolve-release-source\.outputs\.source-sha\s*\}\}["']?$/m,
+    "reusable Android caller is not pinned to resolve-release-source's full SHA",
+  );
+});
+
+test("reusable Android checkout uses the caller SHA with dispatch git-ref fallback", () => {
+  const workflowCall = androidWorkflow.match(
+    /^  workflow_call:\n([\s\S]*?)(?=^env:)/m,
+  )?.[0];
+  assert.ok(workflowCall, "Android workflow lost its workflow_call trigger");
+  const workflowCallSourceSha = workflowCall.match(
+    /^      source-sha:\n((?:        [^\n]+\n?)*)/m,
+  )?.[0];
+  assert.ok(
+    workflowCallSourceSha,
+    "Android workflow_call must declare a source-sha input",
+  );
+  assert.match(workflowCallSourceSha, /^        type:\s*string$/m);
+  assert.match(workflowCallSourceSha, /^        required:\s*true$/m);
+
+  const checkout = actionStep(
+    workflowJobs(androidWorkflow).get("build-apk") ?? "",
+    /uses:\s*actions\/checkout@v4/,
+  );
+  const checkoutRef = checkout.match(/^          ref:\s*(.+)$/m)?.[1] ?? "";
+  assert.match(
+    checkoutRef,
+    /inputs\.source-sha[\s\S]*\|\|[\s\S]*github\.event\.inputs\.git-ref/,
+    "workflow_call must prefer source-sha while direct dispatch falls back to git-ref",
+  );
+
+  const dispatchGitRef = androidWorkflow.match(
+    /^      git-ref:\n([\s\S]*?)(?=^      [a-zA-Z0-9_-]+:\n)/m,
+  )?.[0];
+  assert.ok(dispatchGitRef, "standalone Android dispatch lost its git-ref input");
+  assert.match(dispatchGitRef, /^        required:\s*true$/m);
+  assert.match(dispatchGitRef, /^        default:\s*["']master["']$/m);
+});
+
+test("disabled Android adds no dependency to compilation or desktop builds", () => {
+  const android = job("build-android");
+  assert.match(
+    android,
+    /^    if:\s*\$\{\{\s*github\.event_name == 'schedule' \|\| github\.event\.inputs\.build-android == 'true'\s*\}\}$/m,
+    "optional Android job must stay skipped when build-android=false",
+  );
+  for (const jobName of [
+    "compile-cljs",
+    "build-linux-x64",
+    "build-linux-arm64",
+    "build-windows-x64",
+    "build-windows-arm64",
+    "build-macos-x64",
+    "build-macos-arm64",
+  ]) {
+    assert.equal(
+      jobNeeds(job(jobName)).includes("build-android"),
+      false,
+      `${jobName} unnecessarily waits for optional Android`,
+    );
+  }
+});
+
 test("build-android=false gives the protected release action no APK input", () => {
   const files = resolvePublishedFiles(filesInputLines(releaseStep), false);
   assert.equal(
