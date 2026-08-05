@@ -1478,6 +1478,28 @@ jobs:
             release-assets/*.AppImage
             ${{ github.event.inputs.build-android == 'true' && 'release-assets/*.apk' || '' }}
 
+  selfhost-release-terminal-audit:
+    if: ${{ always() && github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && contains(needs.release-assets-preflight.outputs.version, '-selfhost.') && !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}
+    needs: [ release-assets-preflight, selfhost-release-signing, selfhost-release-verifier, selfhost-release ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require the complete protected release chain
+        env:
+          SIGNER_RESULT: ${{ needs.selfhost-release-signing.result }}
+          VERIFIER_RESULT: ${{ needs.selfhost-release-verifier.result }}
+          PUBLISHER_RESULT: ${{ needs.selfhost-release.result }}
+        run: |
+          if [ "$SIGNER_RESULT" = success ] && \
+             [ "$VERIFIER_RESULT" = success ] && \
+             [ "$PUBLISHER_RESULT" = success ]; then
+            exit 0
+          fi
+          echo "::error::Protected selfhost release incomplete: signer=$SIGNER_RESULT verifier=$VERIFIER_RESULT publisher=$PUBLISHER_RESULT"
+          exit 1
+
   nightly-release:
     if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
     needs: [ release-assets-preflight ]

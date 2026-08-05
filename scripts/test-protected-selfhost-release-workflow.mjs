@@ -239,6 +239,47 @@ addCase("publisher has separate protected write boundary after verifier", () => 
   );
 });
 
+addCase("formal selfhost release has a fail-closed terminal audit", () => {
+  const audit = workflowJob("selfhost-release-terminal-audit");
+  assert.match(
+    audit,
+    /needs:\s*\[\s*release-assets-preflight,\s*selfhost-release-signing,\s*selfhost-release-verifier,\s*selfhost-release\s*\]/,
+  );
+  assert.match(audit, /if:\s*\$\{\{\s*always\(\)/);
+  for (const eligibility of [
+    "github.repository == 'cfenglv/logseq'",
+    "github.event_name == 'workflow_dispatch'",
+    "github.event.inputs.build-target == 'beta'",
+    "github.event.inputs.build-target == 'stable'",
+    "github.event.inputs.desktop-platforms == 'all'",
+    "contains(needs.release-assets-preflight.outputs.version, '-selfhost.')",
+    "!contains(needs.release-assets-preflight.outputs.version, '.nightly.')",
+  ]) {
+    assert.ok(audit.includes(eligibility), `audit is missing ${eligibility}`);
+  }
+  assert.match(audit, /permissions:\s*\n\s+contents:\s*read/);
+  assert.match(
+    audit,
+    /SIGNER_RESULT:\s*\$\{\{ needs\.selfhost-release-signing\.result \}\}/,
+  );
+  assert.match(
+    audit,
+    /VERIFIER_RESULT:\s*\$\{\{ needs\.selfhost-release-verifier\.result \}\}/,
+  );
+  assert.match(
+    audit,
+    /PUBLISHER_RESULT:\s*\$\{\{ needs\.selfhost-release\.result \}\}/,
+  );
+  for (const result of ["SIGNER_RESULT", "VERIFIER_RESULT", "PUBLISHER_RESULT"]) {
+    assert.match(audit, new RegExp(`\\[ "\\$${result}" = success \\]`));
+  }
+  assert.match(audit, /exit 1/);
+  assert.doesNotMatch(
+    audit,
+    /environment:|\bsecrets\.|contents:\s*write|action-gh-release|finalize-github-macos/,
+  );
+});
+
 addCase("push and generic publishers cannot sign or publish selfhost", () => {
   for (const name of ["selfhost-release-signing", "selfhost-release"]) {
     assert.match(workflowJob(name), /github\.event_name == 'workflow_dispatch'/);
