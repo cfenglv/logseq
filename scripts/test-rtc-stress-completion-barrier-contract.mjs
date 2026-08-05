@@ -72,6 +72,15 @@ const definitions = (source) => {
   for (const match of source.matchAll(pattern)) {
     result.set(match[1], formAt(source, match.index));
   }
+  for (const match of source.matchAll(/\(def\s/g)) {
+    const form = formAt(source, match.index);
+    const items = splitTopLevelItems(form);
+    let nameIndex = 1;
+    while (items[nameIndex]?.startsWith("^")) nameIndex += 1;
+    if (bareSymbol.test(items[nameIndex] ?? "")) {
+      result.set(items[nameIndex], form);
+    }
+  }
   return result;
 };
 
@@ -182,6 +191,16 @@ const invokedHigherOrderDefinitions = (source, defs) => {
   return result;
 };
 
+const referencedConstantDefinitions = (source, defs) =>
+  new Set(
+    [...source.matchAll(/[A-Za-z*+!?<>=._/-][A-Za-z0-9*+!?<>=._/-]*/g)]
+      .map((match) => match[0])
+      .filter(
+        (name) =>
+          defs.has(name) && /^\(def\s/.test(defs.get(name)),
+      ),
+  );
+
 const definitionClosure = (name, defs, seen = new Set()) => {
   if (seen.has(name) || !defs.has(name)) return "";
   seen.add(name);
@@ -189,6 +208,7 @@ const definitionClosure = (name, defs, seen = new Set()) => {
   const referencedDefinitions = new Set([
     ...calledSymbols(source),
     ...invokedHigherOrderDefinitions(source, defs),
+    ...referencedConstantDefinitions(source, defs),
   ]);
   return [
     source,
@@ -202,6 +222,7 @@ const definitionClosureFromSource = (source, defs) => {
   const referencedDefinitions = new Set([
     ...calledSymbols(source),
     ...invokedHigherOrderDefinitions(source, defs),
+    ...referencedConstantDefinitions(source, defs),
   ]);
   return [
     source,
@@ -214,8 +235,12 @@ const definitionClosureFromSource = (source, defs) => {
 const bindingValues = (source) => {
   const result = new Map();
   for (const { name, items } of callFormsInOrder(source)) {
-    if (name === "def" && bareSymbol.test(items[1] ?? "")) {
-      result.set(items[1], items[2]);
+    if (name === "def") {
+      let nameIndex = 1;
+      while (items[nameIndex]?.startsWith("^")) nameIndex += 1;
+      if (bareSymbol.test(items[nameIndex] ?? "")) {
+        result.set(items[nameIndex], items[nameIndex + 1]);
+      }
       continue;
     }
     if (!["binding", "let", "loop"].includes(name)) continue;
@@ -336,116 +361,178 @@ const callSiteDurationOptions = (source, bindings) => {
     { present: false, stable: null, timeout: null };
 };
 
-const hasTimedStableWindow = (source, equalities) => {
+const hasTimedStableWindow = (source) => {
   const bindings = bindingValues(source);
   const durationOptions = callSiteDurationOptions(source, bindings);
-  const hasCompleteStateEquality = equalities.some(
-    (form) =>
-      /(?:previous|prior|last)[-\w]*state/i.test(form) &&
-      /current[-\w]*state/i.test(form),
-  );
-  const hasSampledCurrentState =
-    /current[-\w]*state\s+\((?:sample|observe|snapshot)[-\w!?]*/i.test(
-      source,
-    );
-  const transitionForms = callFormsInOrder(source).filter(({ name }) =>
-    ["cond", "if", "when"].includes(name),
-  );
-  const preservesOnSameState = transitionForms.some(({ name, items }) => {
-    if (name === "if") {
-      return (
-        /(?:same|unchanged|equal)/i.test(items[1] ?? "") &&
-        /stable[-\w]*since/i.test(items[2] ?? "")
-      );
+  const sourceDefinitions = definitions(source);
+  const invokedFunctionParameters = new Set();
+  for (const form of sourceDefinitions.values()) {
+    const invoked = calledSymbols(form);
+    for (const parameter of definitionParameters(form)) {
+      if (invoked.has(parameter)) invokedFunctionParameters.add(parameter);
     }
-    if (name !== "cond") return false;
-    for (let index = 1; index + 1 < items.length; index += 2) {
+  }
+  const symbolPattern = (name) =>
+    new RegExp(
+      `(^|[^A-Za-z0-9*+!?<>=._/-])${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^A-Za-z0-9*+!?<>=._/-]|$)`,
+    );
+  const references = (text, name) => symbolPattern(name).test(text);
+  const stateEqualities = [];
+  for (const [predicate, value] of bindings) {
+    if (!value?.startsWith("(")) continue;
+    const items = splitTopLevelItems(value);
+    if (items[0] !== "=" || items.length !== 3) continue;
+    for (const [sampled, previous] of [
+      [items[1], items[2]],
+      [items[2], items[1]],
+    ]) {
+      const sampledValue = resolveBinding(sampled, bindings);
+      if (!sampledValue.startsWith("(")) continue;
+      const sampledCall = splitTopLevelItems(sampledValue);
       if (
-        /(?:same|unchanged|equal)/i.test(items[index]) &&
-        /stable[-\w]*since/i.test(items[index + 1])
+        !bareSymbol.test(sampled) ||
+        !bareSymbol.test(previous) ||
+        sampledCall.length !== 1 ||
+        (!invokedFunctionParameters.has(sampledCall[0]) &&
+          !sourceDefinitions.has(sampledCall[0])) ||
+        /(?:monotonic|nanoTime|performance[/.]now)/i.test(sampledCall[0])
       ) {
-        return true;
+        continue;
+      }
+      stateEqualities.push({ predicate, sampled, previous });
+    }
+  }
+  const timeBindings = new Set(
+    [...bindings]
+      .filter(([, value]) =>
+        /(?:monotonic|nanoTime|performance[/.]now)/i.test(value),
+      )
+      .map(([name]) => name),
+  );
+  const containsTime = (text) =>
+    /(?:monotonic|nanoTime|performance[/.]now)/i.test(text) ||
+    [...timeBindings].some((name) => references(text, name));
+  const transitionEvidence = [];
+  for (const state of stateEqualities) {
+    const acceptedPredicates = [...bindings]
+      .filter(([, value]) => {
+        if (!value?.startsWith("(")) return false;
+        const items = splitTopLevelItems(value);
+        return (
+          items.length === 2 &&
+          items[0] !== "=" &&
+          items[1] === state.sampled
+        );
+      })
+      .map(([name]) => name);
+    for (const [output, value] of bindings) {
+      if (!value?.startsWith("(")) continue;
+      const items = splitTopLevelItems(value);
+      const accepted = acceptedPredicates.find((name) => references(value, name));
+      if (!accepted || !references(value, state.predicate)) continue;
+      let safeTransition = false;
+      if (items[0] === "if" && items.length === 4) {
+        const condition = items[1];
+        const preserved = items[2];
+        const reset = items[3];
+        safeTransition =
+          references(condition, accepted) &&
+          references(condition, state.predicate) &&
+          /stable[-\w]*since/i.test(preserved) &&
+          containsTime(preserved) &&
+          !/stable[-\w]*since/i.test(reset) &&
+          (reset === "nil" || containsTime(reset));
+      } else if (items[0] === "cond") {
+        const pairs = [];
+        for (let index = 1; index + 1 < items.length; index += 2) {
+          pairs.push([items[index], items[index + 1]]);
+        }
+        const clearsRejected = pairs.some(
+          ([condition, result]) =>
+            /\bnot\b/.test(condition) &&
+            references(condition, accepted) &&
+            result === "nil",
+        );
+        const preservesSame = pairs.some(
+          ([condition, result]) =>
+            !/\bnot\b/.test(condition) &&
+            references(condition, state.predicate) &&
+            /stable[-\w]*since/i.test(result),
+        );
+        const restartsChanged = pairs.some(
+          ([condition, result]) =>
+            /\bnot\b/.test(condition) &&
+            references(condition, state.predicate) &&
+            containsTime(result),
+        );
+        const elsePair = pairs.find(([condition]) => condition === ":else");
+        const elseRestarts =
+          preservesSame &&
+          elsePair &&
+          !/stable[-\w]*since/i.test(elsePair[1]) &&
+          containsTime(elsePair[1]);
+        const elsePreserves =
+          restartsChanged &&
+          elsePair &&
+          /stable[-\w]*since/i.test(elsePair[1]);
+        safeTransition = Boolean(
+          clearsRejected && (elseRestarts || elsePreserves),
+        );
+      }
+      if (safeTransition) {
+        transitionEvidence.push({ ...state, accepted, output });
       }
     }
-    return false;
-  });
-  const restartsOnChangedState = transitionForms.some(({ name, items }) => {
-    if (name === "if") {
-      const condition = items[1] ?? "";
-      const reset = items[3] ?? "";
-      return (
-        /(?:same|unchanged|equal)/i.test(condition) &&
-        !/stable[-\w]*since/i.test(reset) &&
-        /(?:sampled-at|now|clock|time)/i.test(reset)
-      ) || (
-        /(?:accept|converg|valid)/i.test(condition) &&
-        /(?:same|unchanged|equal)/i.test(condition) &&
-        /^\(when\s+[^\s)]*(?:accept|converg|valid)[^\s)]*\s+[^)]*(?:sampled-at|now|clock|time)/i.test(
-          reset,
-        )
-      );
-    }
-    if (name !== "cond") return false;
-    const sameIndex = items.findIndex((item, index) =>
-      index % 2 === 1 && /(?:same|unchanged|equal)/i.test(item),
-    );
-    const elseIndex = items.indexOf(":else");
-    return (
-      sameIndex !== -1 &&
-      elseIndex !== -1 &&
-      !/stable[-\w]*since/i.test(items[elseIndex + 1] ?? "") &&
-      /(?:sampled-at|now|clock|time)/i.test(items[elseIndex + 1] ?? "")
-    );
-  });
-  const clearsRejectedState = transitionForms.some(({ name, items }) => {
-    if (name === "when") {
-      return (
-        /(?:accept|converg|valid)/i.test(items[1] ?? "") &&
-        /(?:sampled-at|now|clock|time)/i.test(items[2] ?? "")
-      );
-    }
-    if (name === "if") {
-      return (
-        /(?:accept|converg|valid)/i.test(items[1] ?? "") &&
-        items[3] === "nil"
-      );
-    }
-    for (let index = 1; index + 1 < items.length; index += 2) {
+  }
+  const linkedElapsed = [];
+  for (const transition of transitionEvidence) {
+    for (const [elapsed, value] of bindings) {
       if (
-        /\bnot\b[\s\S]*(?:accept|converg|valid)/i.test(items[index]) &&
-        items[index + 1] === "nil"
+        value?.includes("(-") &&
+        references(value, transition.output) &&
+        containsTime(value)
       ) {
-        return true;
+        linkedElapsed.push({ ...transition, elapsed });
       }
     }
-    return false;
-  });
-  const hasSuccessGuard = callFormsInOrder(source).some(({ name, items }) =>
-    name === "if" &&
-    /(?:accept|converg|valid)/i.test(items[1] ?? "") &&
-    /(?:same|unchanged|equal)/i.test(items[1] ?? "") &&
-    /(?:elapsed|duration)/i.test(items[1] ?? ""),
-  );
-  const hasPositiveElapsedThreshold = callFormsInOrder(source).some(
-    ({ name, items }) => {
-      if (![">", ">="].includes(name) || items.length !== 3) return false;
+  }
+  const linkedThresholds = [];
+  for (const flow of linkedElapsed) {
+    for (const { name, items } of callFormsInOrder(source)) {
+      if (![">", ">="].includes(name) || items.length !== 3) continue;
       const [left, right] = items.slice(1);
-      if (/(?:elapsed|duration)/i.test(left)) {
-        return positiveDuration(right, bindings) ||
-          (durationOptions.present &&
-            /stable/i.test(right) &&
-            /^\d+$/.test(durationOptions.stable ?? "") &&
-            Number(durationOptions.stable) > 0);
-      }
-      if (/(?:elapsed|duration)/i.test(right)) {
-        return positiveDuration(left, bindings) ||
-          (durationOptions.present &&
-            /stable/i.test(left) &&
-            /^\d+$/.test(durationOptions.stable ?? "") &&
-            Number(durationOptions.stable) > 0);
-      }
-      return false;
-    },
+      const duration = left === flow.elapsed ? right :
+        right === flow.elapsed ? left : null;
+      if (!duration) continue;
+      const positive =
+        positiveDuration(duration, bindings) ||
+        (durationOptions.present &&
+          /stable/i.test(duration) &&
+          /^\d+$/.test(durationOptions.stable ?? "") &&
+          Number(durationOptions.stable) > 0);
+      if (positive) linkedThresholds.push({ ...flow, duration });
+    }
+  }
+  const hasSuccessGuard = linkedThresholds.some((flow) =>
+    callFormsInOrder(source).some(({ name, items }) => {
+      const pairs = name === "if" && items.length === 4 ?
+        [[items[1], items[2]]] :
+        name === "cond" ?
+          items.slice(1).reduce((result, item, index, all) => {
+            if (index % 2 === 0 && index + 1 < all.length) {
+              result.push([item, all[index + 1]]);
+            }
+            return result;
+          }, []) :
+          [];
+      return pairs.some(([condition, result]) =>
+        references(condition, flow.elapsed) &&
+        references(result, flow.sampled) &&
+        (references(condition, flow.output) ||
+          (references(condition, flow.accepted) &&
+            references(condition, flow.predicate))),
+      );
+    }),
   );
   const hasSafeDurationOptions =
     !durationOptions.present ||
@@ -454,19 +541,13 @@ const hasTimedStableWindow = (source, equalities) => {
       Number(durationOptions.stable) > 0 &&
       Number(durationOptions.timeout) > 0 &&
       Number(durationOptions.stable) <= Number(durationOptions.timeout));
-  const hasMonotonicElapsed =
-    /(?:monotonic|nanoTime|performance[/.]now)/i.test(source) &&
-    /\(-\s+[^\s)]+\s+[^\s)]*stable[-\w]*since/i.test(source);
   return Boolean(
-    hasCompleteStateEquality &&
-    hasSampledCurrentState &&
-    preservesOnSameState &&
-    restartsOnChangedState &&
-    clearsRejectedState &&
+    stateEqualities.length > 0 &&
+    transitionEvidence.length > 0 &&
+    linkedElapsed.length > 0 &&
+    linkedThresholds.length > 0 &&
     hasSuccessGuard &&
-    hasPositiveElapsedThreshold &&
-    hasSafeDurationOptions &&
-    hasMonotonicElapsed,
+    hasSafeDurationOptions,
   );
 };
 
@@ -562,7 +643,7 @@ const barrierBehaviorViolations = (source) => {
       ));
   if (
     !(hasRepeatedStateEquality && hasStableThreshold) &&
-    !hasTimedStableWindow(source, equalities)
+    !hasTimedStableWindow(source)
   ) {
     violations.push(
       "completion barrier must require at least two identical consecutive observations",
@@ -969,6 +1050,35 @@ const safeOptionTimedWindowRtcHelpers = `
             (do (cadence)
                 (recur current-state next-stable-since started-at))))))))
 `;
+const safeArbitraryStateRtcHelpers = safeOptionTimedWindowRtcHelpers
+  .replaceAll("previous-state", "prior-view")
+  .replaceAll("current-state", "fresh-view")
+  .replaceAll("acceptable-state?", "quiet-enough?")
+  .replaceAll("same-state?", "matches-prior?");
+const safeStagedGuardRtcHelpers = safeArbitraryStateRtcHelpers.replace(
+  `(if (and quiet-enough?
+                   matches-prior?
+                   (>= stable-elapsed stable-ms))
+            fresh-view
+            (do`,
+  `(cond
+            (and next-stable-since
+                 (>= stable-elapsed stable-ms))
+            fresh-view
+            :else
+            (do`,
+);
+const completionOptionsForm = definitions(safeOptionTimedWindowFixture).get(
+  "completion-window-options",
+);
+const safeMetadataDurationFixture = safeOptionTimedWindowFixture.replace(
+  completionOptionsForm,
+  `(def ^:private stable-window-ms 300)
+(def ^{:private true} timeout-window-ms 5000)
+(defn- completion-window-options []
+  {:stable-ms stable-window-ms
+   :timeout-ms timeout-window-ms})`,
+);
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -1088,6 +1198,42 @@ test("contract accepts restart timestamps and call-site duration options", () =>
       safeRunner,
       safePrepush,
       safeOptionTimedWindowRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract follows an arbitrarily named sampled-state binding", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeOptionTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeArbitraryStateRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts a staged stable-since success guard", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeOptionTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeStagedGuardRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract resolves metadata-bearing duration definitions", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeMetadataDurationFixture,
+      safeRunner,
+      safePrepush,
+      safeStagedGuardRtcHelpers,
     ),
     [],
   );
@@ -1493,6 +1639,69 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeRunner,
       safePrepush,
       safeOptionTimedWindowRtcHelpers,
+    ],
+    [
+      "state comparison ignores the actual sampler result binding",
+      safeOptionTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeArbitraryStateRtcHelpers.replace(
+        "matches-prior? (= prior-view fresh-view)",
+        "matches-prior? (= prior-view unrelated-view)",
+      ),
+    ],
+    [
+      "unrelated since and elapsed values control staged success",
+      safeOptionTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeStagedGuardRtcHelpers
+        .replace(
+          `            stable-elapsed (if next-stable-since
+                             (- sampled-at next-stable-since)
+                             0)]`,
+          `            stable-elapsed (if next-stable-since
+                             (- sampled-at next-stable-since)
+                             0)
+            unrelated-since sampled-at
+            unrelated-elapsed (- sampled-at unrelated-since)]`,
+        )
+        .replace(
+          `(and next-stable-since
+                 (>= stable-elapsed stable-ms))`,
+          `(and unrelated-since
+                 (>= unrelated-elapsed stable-ms))`,
+        ),
+    ],
+    [
+      "metadata-bearing stable duration is zero",
+      safeMetadataDurationFixture.replace(
+        "(def ^:private stable-window-ms 300)",
+        "(def ^:private stable-window-ms 0)",
+      ),
+      safeRunner,
+      safePrepush,
+      safeStagedGuardRtcHelpers,
+    ],
+    [
+      "metadata-bearing timeout duration is negative",
+      safeMetadataDurationFixture.replace(
+        "(def ^{:private true} timeout-window-ms 5000)",
+        "(def ^{:private true} timeout-window-ms -1)",
+      ),
+      safeRunner,
+      safePrepush,
+      safeStagedGuardRtcHelpers,
+    ],
+    [
+      "metadata-bearing stable duration is nonnumeric",
+      safeMetadataDurationFixture.replace(
+        "(def ^:private stable-window-ms 300)",
+        '(def ^:private stable-window-ms "fast")',
+      ),
+      safeRunner,
+      safePrepush,
+      safeStagedGuardRtcHelpers,
     ],
   ];
   for (const [label, source, runner, prepush, rtcHelpers] of mutations) {
