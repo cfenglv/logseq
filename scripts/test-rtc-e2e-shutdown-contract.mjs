@@ -240,3 +240,105 @@ global.fetch = async () => ({ status: 200 });
     fs.rmSync(root, { force: true, recursive: true })
   }
 })
+
+test('win32 runner cleanup terminates the complete bb descendant process tree', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-win32-tree-'))
+  const preload = path.join(root, 'win32-tree-preload.cjs')
+  const bbShim = path.join(root, 'bb-tree-shim.cjs')
+  const descendantPidPath = path.join(root, 'descendant.pid')
+  let descendantPid
+
+  fs.writeFileSync(
+    preload,
+    `const fs = require('node:fs');
+const net = require('node:net');
+Object.defineProperty(process, 'platform', {
+  configurable: true,
+  value: 'win32',
+});
+net.createServer = () => {
+  const server = {
+    address: () => ({ address: '127.0.0.1', family: 'IPv4', port: 43132 }),
+    close: (callback) => queueMicrotask(() => callback?.()),
+    listen: (...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === 'function') queueMicrotask(callback);
+      return server;
+    },
+    once: () => server,
+    unref: () => server,
+  };
+  return server;
+};
+global.fetch = async () => {
+  while (!fs.existsSync(process.env.RTC_WIN32_DESCENDANT_PID)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return { status: 200 };
+};
+`
+  )
+  fs.writeFileSync(
+    bbShim,
+    `const fs = require('node:fs');
+const { spawn } = require('node:child_process');
+const [task] = process.argv.slice(2);
+if (task === 'serve') {
+  const descendant = spawn(
+    process.execPath,
+    ['-e', 'setInterval(() => {}, 1000)'],
+    { detached: true, stdio: 'ignore' }
+  );
+  descendant.unref();
+  fs.writeFileSync(process.env.RTC_WIN32_DESCENDANT_PID, String(descendant.pid));
+  setInterval(() => {}, 1000);
+} else {
+  process.exit(0);
+}
+`
+  )
+
+  const env = {
+    ...process.env,
+    LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([process.execPath, bbShim]),
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
+    RTC_WIN32_DESCENDANT_PID: descendantPidPath,
+    TEMP: os.tmpdir(),
+    TMP: os.tmpdir(),
+  }
+  delete env.NODE_TEST_CONTEXT
+
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [path.join(repoRoot, 'scripts/run-rtc-e2e.mjs'), 'rtc-extra-test'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        env,
+        timeout: 10_000,
+      }
+    )
+    descendantPid = Number(fs.readFileSync(descendantPidPath, 'utf8'))
+    assert.equal(
+      result.status,
+      0,
+      `win32 runner did not complete normally:\n${result.stdout}${result.stderr}`
+    )
+    assert.ok(Number.isInteger(descendantPid) && descendantPid > 1)
+    assert.throws(
+      () => process.kill(descendantPid, 0),
+      (error) => error?.code === 'ESRCH',
+      `win32 runner left descendant ${descendantPid} alive after shutdown`
+    )
+  } finally {
+    if (Number.isInteger(descendantPid) && descendantPid > 1) {
+      try {
+        process.kill(descendantPid, 'SIGKILL')
+      } catch (error) {
+        if (error?.code !== 'ESRCH') throw error
+      }
+    }
+    fs.rmSync(root, { force: true, recursive: true })
+  }
+})
