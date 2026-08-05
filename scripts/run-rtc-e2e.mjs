@@ -56,7 +56,12 @@ if (!supportedTasks.has(testTask)) {
 const children = new Set();
 const detached = process.platform !== "win32";
 const signalWindowsProcessTree = createWindowsProcessTreeSignaler();
+const shutdownExpectedChildren = new WeakSet();
+const requestedSignalShutdown = Object.freeze({ requestedSignalShutdown: true });
 let shutdownController;
+let requestedExitCode;
+let primaryError;
+let cleanupError;
 
 const getFreePort = () =>
   new Promise((resolve, reject) => {
@@ -76,6 +81,7 @@ const getFreePort = () =>
 
 const startChild = (command, args) => {
   if (shutdownController?.isShuttingDown()) {
+    if (requestedExitCode !== undefined) throw requestedSignalShutdown;
     throw new Error(`refusing to start ${command} after shutdown began`);
   }
   const child = spawn(command, args, {
@@ -92,6 +98,7 @@ const startChild = (command, args) => {
 
 const signalChild = async (child, signal) => {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  shutdownExpectedChildren.add(child);
   try {
     if (detached) process.kill(-child.pid, signal);
     else await signalWindowsProcessTree(child, signal);
@@ -123,7 +130,12 @@ const runChild = (command, args) =>
     const child = startChild(command, args);
     child.once("error", reject);
     child.once("exit", (code, signal) => {
-      if (signal) reject(new Error(`${command} terminated by ${signal}`));
+      if (
+        requestedExitCode !== undefined &&
+        shutdownExpectedChildren.has(child)
+      ) {
+        resolve();
+      } else if (signal) reject(new Error(`${command} terminated by ${signal}`));
       else if (code !== 0) {
         reject(new Error(`${command} ${args.join(" ")} exited with ${code}`));
       } else resolve();
@@ -140,6 +152,12 @@ const waitForServer = async (server, port) => {
   while (Date.now() < deadline) {
     if (spawnError) throw spawnError;
     if (server.exitCode !== null || server.signalCode !== null) {
+      if (
+        requestedExitCode !== undefined &&
+        shutdownExpectedChildren.has(server)
+      ) {
+        throw requestedSignalShutdown;
+      }
       throw new Error(
         `asset server exited before becoming ready (code=${server.exitCode}, signal=${server.signalCode})`,
       );
@@ -164,9 +182,6 @@ shutdownController = createShutdownController({
 });
 const { shutdown } = shutdownController;
 
-let requestedExitCode;
-let primaryError;
-let cleanupError;
 const awaitSharedShutdown = () => {
   void shutdown().catch((shutdownError) => {
     cleanupError ??= shutdownError;
@@ -219,7 +234,7 @@ try {
     ...testArgs,
   ]);
 } catch (error) {
-  runError = error;
+  if (error !== requestedSignalShutdown) runError = error;
 } finally {
   try {
     await shutdown();

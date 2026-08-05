@@ -38,6 +38,92 @@ const errorTreeContains = (root, target, seen = new Set()) => {
   return false
 }
 
+const runRunnerWithRequestedSignal = (signal) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-requested-signal-'))
+  const bbShim = path.join(root, 'bb-shim.cjs')
+  const preload = path.join(root, 'signal-preload.cjs')
+  const ready = path.join(root, 'test.ready')
+  const runner = path.join(repoRoot, 'scripts/run-rtc-e2e.mjs')
+  fs.writeFileSync(
+    bbShim,
+    `const fs = require('node:fs');
+const [task] = process.argv.slice(2);
+if (task !== 'serve') fs.writeFileSync(process.env.RTC_SIGNAL_READY, 'ready\\n');
+setInterval(() => {}, 1000);
+`
+  )
+  fs.writeFileSync(
+    preload,
+    `const fs = require('node:fs');
+const net = require('node:net');
+const path = require('node:path');
+net.createServer = () => {
+  const server = {
+    address: () => ({ address: '127.0.0.1', family: 'IPv4', port: 43132 }),
+    close: (callback) => queueMicrotask(() => callback?.()),
+    listen: (...args) => {
+      const callback = args.at(-1);
+      if (typeof callback === 'function') queueMicrotask(callback);
+      return server;
+    },
+    once: () => server,
+    unref: () => server,
+  };
+  return server;
+};
+global.fetch = async () => ({ status: 200 });
+if (path.resolve(process.argv[1] ?? '') === path.resolve(process.env.RTC_RUNNER_PATH)) {
+  const timer = setInterval(() => {
+    if (!fs.existsSync(process.env.RTC_SIGNAL_READY)) return;
+    clearInterval(timer);
+    process.emit(process.env.RTC_REQUEST_SIGNAL);
+  }, 5);
+}
+`
+  )
+
+  try {
+    return spawnSync(process.execPath, [runner, 'rtc-extra-test'], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        LOGSEQ_RTC_E2E_BB_COMMAND: JSON.stringify([
+          process.execPath,
+          bbShim,
+        ]),
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${preload}`.trim(),
+        RTC_REQUEST_SIGNAL: signal,
+        RTC_RUNNER_PATH: runner,
+        RTC_SIGNAL_READY: ready,
+      },
+      timeout: 10_000,
+    })
+  } finally {
+    fs.rmSync(root, { force: true, recursive: true })
+  }
+}
+
+test('requested signals retain their conventional exit statuses', () => {
+  for (const [signal, expectedStatus] of [
+    ['SIGINT', 130],
+    ['SIGTERM', 143],
+  ]) {
+    const result = runRunnerWithRequestedSignal(signal)
+    assert.equal(
+      result.status,
+      expectedStatus,
+      `${signal} status was not preserved:\n${result.stdout}${result.stderr}`
+    )
+    assert.equal(result.signal, null)
+    assert.doesNotMatch(
+      result.stderr,
+      /terminated by SIGTERM/,
+      `${signal} cleanup was misreported as a run failure`
+    )
+  }
+})
+
 test('windows cleanup uses bounded taskkill tree stages', async () => {
   assert.equal(
     typeof shutdownModule.createWindowsProcessTreeSignaler,
@@ -221,7 +307,7 @@ test('shutdown reports every independent child cleanup failure', async () => {
   assert.equal(errorTreeContains(thrown, secondFailure), true)
 })
 
-test('runner preserves its primary run error and reports cleanup failure', () => {
+test('requested signal cannot mask existing run and cleanup failures', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rtc-dual-error-'))
   const preload = path.join(root, 'dual-error-preload.cjs')
   const eventsPath = path.join(root, 'events.log')
@@ -255,6 +341,7 @@ childProcess.spawn = (command, args, options) => {
     queueMicrotask(() => {
       child.exitCode = 23;
       child.emit('exit', 23, null);
+      process.emit('SIGTERM');
     });
   }
   return child;
@@ -305,7 +392,7 @@ global.fetch = async () => ({ status: 200 });
       : ''
     const expectedCommand = process.platform === 'win32' ? 'bb.exe' : 'bb'
     const expectedDetached = process.platform !== 'win32'
-    assert.notEqual(result.status, 0, `${result.stdout}${result.stderr}`)
+    assert.equal(result.status, 1, `${result.stdout}${result.stderr}`)
     assert.match(
       events,
       new RegExp(`spawn:${expectedCommand}:serve --port 43131:${expectedDetached}`)
