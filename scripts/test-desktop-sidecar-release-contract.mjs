@@ -33,6 +33,8 @@ const preflightPath = path.join(
 const version = "2.0.1-selfhost.5";
 const electronVersion = "42.4.1";
 const packagedRevision = "packaged-runtime-fixture-revision";
+const formalReleaseRevision = "6".repeat(40);
+const differentReleaseRevision = "7".repeat(40);
 const cliRuntimeRelativePaths = [
   path.join("js", "logseq-cli.js"),
   path.join("js", "db-worker-node.js"),
@@ -479,7 +481,12 @@ const writePolicyCompanion = (
   fs.writeFileSync(destination, publicKeyPem);
 };
 
-const createPackagedFixture = ({ arch, platform, root }) => {
+const createPackagedFixture = ({
+  arch,
+  platform,
+  root,
+  runtimeRevision = packagedRevision,
+}) => {
   const layout = fixtureLayout(root, platform, arch);
   writeMainExecutable(layout.mainExecutable, platform, arch);
   fs.mkdirSync(layout.resourcesDir, { recursive: true });
@@ -496,7 +503,7 @@ const createPackagedFixture = ({ arch, platform, root }) => {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(
       filePath,
-      `console.log(${JSON.stringify(`${relativePath} ${packagedRevision}`)});\n`,
+      `console.log(${JSON.stringify(`${relativePath} ${runtimeRevision}`)});\n`,
     );
   }
   writeExecutable(
@@ -643,13 +650,94 @@ const verifierInvocation = ({
     },
   );
 
-const withPackagedFixture = ({ arch, platform }, callback) => {
+const isolatedReleaseVerifierInvocation = (
+  {
+    arch,
+    asarNodePath,
+    platform,
+    runtimeRevision,
+    searchRoot,
+    verifierPath: stagedVerifierPath,
+  },
+  { omitReleaseSourceSha = false, releaseSourceSha = runtimeRevision } = {},
+) => {
+  const env = {
+    ...process.env,
+    LOGSEQ_REVISION: runtimeRevision,
+    NODE_PATH: asarNodePath,
+  };
+  delete env.LOGSEQ_RELEASE_SOURCE_SHA;
+  if (!omitReleaseSourceSha) {
+    env.LOGSEQ_RELEASE_SOURCE_SHA = releaseSourceSha;
+  }
+  const result = spawnSync(
+    process.execPath,
+    [
+      stagedVerifierPath,
+      "--search-root",
+      searchRoot,
+      "--platform",
+      platform,
+      "--arch",
+      arch,
+      "--version",
+      version,
+      "--electron-version",
+      electronVersion,
+    ],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.error) throw result.error;
+  return {
+    output: `${result.stdout ?? ""}${result.stderr ?? ""}`.trim(),
+    status: result.status,
+  };
+};
+
+const withEnvironment = (overrides, callback) => {
+  const previous = new Map(
+    Object.keys(overrides).map((key) => [
+      key,
+      {
+        present: Object.hasOwn(process.env, key),
+        value: process.env[key],
+      },
+    ]),
+  );
+  try {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return callback();
+  } finally {
+    for (const [key, prior] of previous) {
+      if (prior.present) process.env[key] = prior.value;
+      else delete process.env[key];
+    }
+  }
+};
+
+const withPackagedFixture = (
+  { arch, platform, runtimeRevision = packagedRevision },
+  callback,
+) => {
   const root = fs.mkdtempSync(
     path.join(os.tmpdir(), `logseq-packaged-${platform}-${arch}-`),
   );
   try {
     const asarNodePath = createAsarShim(path.join(root, "asar-shim"));
-    const layout = createPackagedFixture({ arch, platform, root });
+    const layout = createPackagedFixture({
+      arch,
+      platform,
+      root,
+      runtimeRevision,
+    });
     const stagedVerifier = createStagedVerifier(root, layout.resourcesDir);
     return callback({
       arch,
@@ -657,6 +745,7 @@ const withPackagedFixture = ({ arch, platform }, callback) => {
       layout,
       platform,
       root,
+      runtimeRevision,
       searchRoot: path.join(root, "dist"),
       ...stagedVerifier,
     });
@@ -771,6 +860,132 @@ test("macOS x64 and arm64 jobs append the helper to static/sidecar", () => {
     );
   }
 });
+
+test("complete sidecar fixture succeeds with a clean outer release environment", () =>
+  withEnvironment(
+    {
+      LOGSEQ_RELEASE_SOURCE_SHA: undefined,
+      LOGSEQ_REVISION: undefined,
+    },
+    () =>
+      withPackagedFixture(
+        { arch: "x64", platform: "linux" },
+        (fixture) => {
+          const result = verifierInvocation(fixture);
+          assert.equal(result.status, 0, result.output);
+        },
+      ),
+  ));
+
+test("complete sidecar fixture isolates a formal outer release binding", () =>
+  withEnvironment(
+    {
+      LOGSEQ_RELEASE_SOURCE_SHA: formalReleaseRevision,
+      LOGSEQ_REVISION: formalReleaseRevision,
+    },
+    () =>
+      withPackagedFixture(
+        { arch: "x64", platform: "linux" },
+        (fixture) => {
+          const result = verifierInvocation(fixture);
+          assert.equal(
+            result.status,
+            0,
+            [
+              "complete synthetic sidecar fixture inherited the formal release binding",
+              `outer release SHA: ${formalReleaseRevision}`,
+              `fixture revision: ${fixture.runtimeRevision}`,
+              result.output,
+            ].join("\n"),
+          );
+        },
+      ),
+  ));
+
+test("packaged verifier accepts an exact matching release source SHA", () =>
+  withPackagedFixture(
+    {
+      arch: "x64",
+      platform: "linux",
+      runtimeRevision: formalReleaseRevision,
+    },
+    (fixture) => {
+      const result = isolatedReleaseVerifierInvocation(fixture);
+      assert.equal(result.status, 0, result.output);
+    },
+  ));
+
+test("packaged verifier fails closed when release source SHA is omitted", () =>
+  withPackagedFixture(
+    {
+      arch: "x64",
+      platform: "linux",
+      runtimeRevision: formalReleaseRevision,
+    },
+    (fixture) => {
+      const result = isolatedReleaseVerifierInvocation(fixture, {
+        omitReleaseSourceSha: true,
+      });
+      assert.notEqual(
+        result.status,
+        0,
+        `packaged verifier accepted an omitted release source SHA:\n${result.output}`,
+      );
+      assert.match(
+        result.output,
+        /LOGSEQ_RELEASE_SOURCE_SHA|release source/i,
+        "omission failure must identify the missing release source binding",
+      );
+    },
+  ));
+
+test("packaged verifier rejects a malformed release source SHA", () =>
+  withPackagedFixture(
+    {
+      arch: "x64",
+      platform: "linux",
+      runtimeRevision: formalReleaseRevision,
+    },
+    (fixture) => {
+      const result = isolatedReleaseVerifierInvocation(fixture, {
+        releaseSourceSha: formalReleaseRevision.slice(0, 12),
+      });
+      assert.notEqual(
+        result.status,
+        0,
+        `packaged verifier accepted a short release source SHA:\n${result.output}`,
+      );
+      assert.match(
+        result.output,
+        /exact lowercase 40-hex commit SHA/i,
+        "malformed release source failure must retain the exact-SHA contract",
+      );
+    },
+  ));
+
+test("packaged verifier rejects a release source SHA mismatch", () =>
+  withPackagedFixture(
+    {
+      arch: "x64",
+      platform: "linux",
+      runtimeRevision: formalReleaseRevision,
+    },
+    (fixture) => {
+      const result = isolatedReleaseVerifierInvocation(fixture, {
+        releaseSourceSha: differentReleaseRevision,
+      });
+      assert.notEqual(
+        result.status,
+        0,
+        `packaged verifier accepted a release source mismatch:\n${result.output}`,
+      );
+      assert.match(
+        result.output,
+        /does not match release source SHA|revision.*mismatch/i,
+        "mismatch failure must identify the release-source disagreement",
+      );
+    },
+  ));
 
 for (const platform of ["linux", "win32", "darwin"]) {
   for (const arch of ["x64", "arm64"]) {
