@@ -175,6 +175,7 @@ for (const relativePath of [
   "src/test/electron/updater_test.cljs",
   "scripts/run-rtc-e2e.mjs",
   "scripts/run-rtc-prepush.mjs",
+  "scripts/test-rtc-stress-completion-barrier-contract.mjs",
   "sidecar/embedding_server.py",
   "deps/db-sync/pnpm-lock.yaml",
   "deps/db-sync/pnpm-workspace.yaml",

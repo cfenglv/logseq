@@ -459,9 +459,21 @@ const assertReleaseWorkflowBinding = (source) => {
 
 const assertLocalGateContract = () => {
   const gate = read("scripts/run-rtc-prepush.mjs");
+  const completionContract = gate.indexOf(
+    '["--test", "scripts/test-rtc-stress-completion-barrier-contract.mjs"]',
+  );
+  const build = gate.indexOf('"build application assets"');
   const part1 = gate.indexOf('["scripts/run-rtc-e2e.mjs", "rtc-extra-test"]');
   const part2 = gate.indexOf(
     '["scripts/run-rtc-e2e.mjs", "rtc-extra-part2-test"]',
+  );
+  assert.ok(
+    completionContract !== -1,
+    "local RTC gate must run the stress completion-barrier contract",
+  );
+  assert.ok(
+    completionContract < build,
+    "stress completion-barrier contract must fail before long RTC builds",
   );
   assert.ok(part1 !== -1, "local RTC gate must run part 1");
   assert.ok(part2 !== -1, "local RTC gate must run part 2");

@@ -69,6 +69,11 @@ const initialSha = capture("git", ["rev-parse", "HEAD"]);
 assertClean("before tests");
 
 run(
+  "RTC stress completion barrier contract",
+  process.execPath,
+  ["--test", "scripts/test-rtc-stress-completion-barrier-contract.mjs"],
+);
+run(
   "strict source and toolchain preflight",
   process.execPath,
   ["scripts/desktop-release-preflight.mjs", "--strict"],
