@@ -211,6 +211,149 @@ const definitionClosureFromSource = (source, defs) => {
   ].join("\n");
 };
 
+const bindingValues = (source) => {
+  const result = new Map();
+  for (const { name, items } of callFormsInOrder(source)) {
+    if (name === "def" && bareSymbol.test(items[1] ?? "")) {
+      result.set(items[1], items[2]);
+      continue;
+    }
+    if (!["binding", "let", "loop"].includes(name)) continue;
+    const bindings = items[1];
+    if (!bindings?.startsWith("[")) continue;
+    const bindingItems = splitTopLevelItems(bindings);
+    for (let index = 0; index + 1 < bindingItems.length; index += 2) {
+      if (bareSymbol.test(bindingItems[index])) {
+        result.set(bindingItems[index], bindingItems[index + 1]);
+      }
+    }
+  }
+  return result;
+};
+
+const resolveBinding = (value, bindings, seen = new Set()) => {
+  if (!bareSymbol.test(value) || !bindings.has(value) || seen.has(value)) {
+    return value;
+  }
+  seen.add(value);
+  return resolveBinding(bindings.get(value), bindings, seen);
+};
+
+const collectionItems = (value) => {
+  if (value.startsWith("#{") && value.endsWith("}")) {
+    return splitTopLevelItems(value.slice(1));
+  }
+  if (
+    (value.startsWith("[") && value.endsWith("]")) ||
+    (value.startsWith("(") && value.endsWith(")"))
+  ) {
+    const items = splitTopLevelItems(value);
+    return items[0] === "vector" ? items.slice(1) : items;
+  }
+  return [];
+};
+
+const txAccessor = (value, bindings) => {
+  const resolved = resolveBinding(value, bindings);
+  if (!resolved.startsWith("(")) return null;
+  const items = splitTopLevelItems(resolved);
+  if (![":local-tx", ":remote-tx"].includes(items[0]) || items.length !== 2) {
+    return null;
+  }
+  return {
+    side: items[0],
+    owner: resolveBinding(items[1], bindings),
+  };
+};
+
+const hasFourClientTxApplyEquality = (source) => {
+  const bindings = bindingValues(source);
+  return callFormsInOrder(source).some(({ name, items }) => {
+    if (name !== "apply" || items[1] !== "=" || items.length !== 3) {
+      return false;
+    }
+    const values = collectionItems(resolveBinding(items[2], bindings));
+    if (values.length !== 4) return false;
+    const accesses = values.map((value) => txAccessor(value, bindings));
+    if (accesses.some((access) => access === null)) return false;
+    const sidesByOwner = new Map();
+    for (const { owner, side } of accesses) {
+      if (!sidesByOwner.has(owner)) sidesByOwner.set(owner, new Set());
+      sidesByOwner.get(owner).add(side);
+    }
+    return (
+      sidesByOwner.size === 2 &&
+      [...sidesByOwner.values()].every(
+        (sides) => sides.has(":local-tx") && sides.has(":remote-tx"),
+      )
+    );
+  });
+};
+
+const positiveDuration = (value, bindings) => {
+  const resolved = resolveBinding(value, bindings);
+  return /^\d+$/.test(resolved) && Number(resolved) > 0;
+};
+
+const hasTimedStableWindow = (source, equalities) => {
+  const bindings = bindingValues(source);
+  const hasCompleteStateEquality = equalities.some(
+    (form) =>
+      /(?:previous|prior|last)[-\w]*state/i.test(form) &&
+      /current[-\w]*state/i.test(form),
+  );
+  const hasSampledCurrentState =
+    /current[-\w]*state\s+\((?:sample|observe|snapshot)[-\w!?]*/i.test(
+      source,
+    );
+  const stableUpdate = callFormsInOrder(source).find(({ name, items }) => {
+    if (name !== "if" || items.length !== 4) return false;
+    const condition = items[1];
+    const preserved = items[2];
+    const reset = items[3];
+    const requiresAcceptedSameState =
+      /(?:accept|converg|valid)/i.test(condition) &&
+      /(?:same|unchanged|equal)/i.test(condition);
+    const preservesStart =
+      /stable[-\w]*since/i.test(preserved) &&
+      /(?:now|clock|time)/i.test(preserved);
+    const resetsStart =
+      !/stable[-\w]*since/i.test(reset) &&
+      /(?:nil|now|clock|time)/i.test(reset);
+    return requiresAcceptedSameState && preservesStart && resetsStart;
+  });
+  const hasSuccessGuard = callFormsInOrder(source).some(({ name, items }) =>
+    name === "if" &&
+    /(?:accept|converg|valid)/i.test(items[1] ?? "") &&
+    /(?:same|unchanged|equal)/i.test(items[1] ?? "") &&
+    /(?:elapsed|duration)/i.test(items[1] ?? ""),
+  );
+  const hasPositiveElapsedThreshold = callFormsInOrder(source).some(
+    ({ name, items }) => {
+      if (![">", ">="].includes(name) || items.length !== 3) return false;
+      const [left, right] = items.slice(1);
+      if (/(?:elapsed|duration)/i.test(left)) {
+        return positiveDuration(right, bindings);
+      }
+      if (/(?:elapsed|duration)/i.test(right)) {
+        return positiveDuration(left, bindings);
+      }
+      return false;
+    },
+  );
+  const hasMonotonicElapsed =
+    /(?:monotonic|nanoTime|performance[/.]now)/i.test(source) &&
+    /\(-\s+[^\s)]+\s+[^\s)]*stable[-\w]*since/i.test(source);
+  return Boolean(
+    hasCompleteStateEquality &&
+    hasSampledCurrentState &&
+    stableUpdate &&
+    hasSuccessGuard &&
+    hasPositiveElapsedThreshold &&
+    hasMonotonicElapsed,
+  );
+};
+
 const barrierBehaviorViolations = (source) => {
   const violations = [];
   const equalities = equalityForms(source);
@@ -249,12 +392,15 @@ const barrierBehaviorViolations = (source) => {
   if (!hasCausalTrigger) {
     violations.push("completion barrier must retain a real RTC causal trigger");
   }
-  if (
-    !source.includes(":local-tx") ||
-    !source.includes(":remote-tx") ||
+  const hasPairwiseClientTxEquality =
+    source.includes(":local-tx") &&
+    source.includes(":remote-tx") &&
     equalities.filter(
       (form) => form.includes(":local-tx") && form.includes(":remote-tx"),
-    ).length < 2
+    ).length >= 2;
+  if (
+    !hasPairwiseClientTxEquality &&
+    !hasFourClientTxApplyEquality(source)
   ) {
     violations.push("completion barrier must require local/remote tx convergence");
   }
@@ -275,16 +421,33 @@ const barrierBehaviorViolations = (source) => {
       !form.includes(":blocks"),
   );
   const hasStableThreshold =
-    /\((?:>=|=|>)\s+[^\s)]*(?:stable|unchanged|quiescent|consecutive)[^\s)]*\s+(?:[2-9]\d*|[^\s)]*(?:stable|unchanged|quiescent|consecutive)[^\s)]*)\)/i.test(
-      source,
-    ) ||
+    callFormsInOrder(source).some(({ name, items }) => {
+      if (![">", ">=", "="].includes(name) || items.length !== 3) {
+        return false;
+      }
+      const operands = items.slice(1);
+      const expression = operands.join(" ");
+      if (
+        !stabilityTerms.test(expression) ||
+        /(?:elapsed|duration|since|millis|[-_]ms\b|time)/i.test(expression)
+      ) {
+        return false;
+      }
+      return (
+        operands.some((operand) => /^[2-9]\d*$/.test(operand)) ||
+        operands.every((operand) => stabilityTerms.test(operand))
+      );
+    }) ||
     (/\(zero\?\s+[^\s)]*(?:stable|unchanged|quiescent|consecutive)[^\s)]*\)/i.test(
       source,
     ) &&
       /[^\s\[]*(?:stable|unchanged|quiescent|consecutive)[^\s\]]*\s+[2-9]\d*/i.test(
         source,
       ));
-  if (!hasRepeatedStateEquality || !hasStableThreshold) {
+  if (
+    !(hasRepeatedStateEquality && hasStableThreshold) &&
+    !hasTimedStableWindow(source, equalities)
+  ) {
     violations.push(
       "completion barrier must require at least two identical consecutive observations",
     );
@@ -604,6 +767,51 @@ const safeHigherOrderRtcHelpers = `
         (do (cadence)
             (recur (dec attempts) current stable-samples'))))))
 `;
+const higherOrderPredicateForm = definitions(safeHigherOrderFixture).get(
+  "four-tx-and-blocks-converged?",
+);
+const safeTimedWindowFixture = safeHigherOrderFixture
+  .replace(
+    higherOrderPredicateForm,
+    `(defn- four-tx-and-blocks-converged? [[page1-state page2-state]]
+  (let [tx-values [(:local-tx (:rtc-tx page1-state))
+                   (:remote-tx (:rtc-tx page1-state))
+                   (:local-tx (:rtc-tx page2-state))
+                   (:remote-tx (:rtc-tx page2-state))]]
+    (and (= (:blocks page1-state) (:blocks page2-state))
+         (apply = tx-values))))`,
+  )
+  .replace(
+    "rtc/wait-for-stable-state!",
+    "rtc/wait-for-stable-window!",
+  );
+const safeTimedWindowRtcHelpers = `
+(defn wait-for-stable-window! [sample acceptable? cadence]
+  (let [stable-ms 300]
+    (loop [attempts 100
+           previous-state nil
+           stable-since nil]
+      (if (zero? attempts)
+        (throw (ex-info "completion barrier timeout" {:attempts 100}))
+        (let [current-state (sample)
+              acceptable-state? (acceptable? current-state)
+              same-state? (= previous-state current-state)
+              now (util/monotonic-time-ms)
+              next-stable-since (if (and acceptable-state? same-state?)
+                                  (or stable-since now)
+                                  (when acceptable-state? now))
+              stable-elapsed (if next-stable-since
+                               (- now next-stable-since)
+                               0)]
+          (if (and acceptable-state?
+                   same-state?
+                   (>= stable-elapsed stable-ms))
+            current-state
+            (do (cadence)
+                (recur (dec attempts)
+                       current-state
+                       next-stable-since))))))))
+`;
 
 const converged = (tx, blocks) => ({
   blocks,
@@ -699,6 +907,18 @@ test("contract follows invoked higher-order sampler and predicate symbols", () =
       safeRunner,
       safePrepush,
       safeHigherOrderRtcHelpers,
+    ),
+    [],
+  );
+});
+
+test("contract accepts four-value tx equality and timed state stability", () => {
+  assert.deepEqual(
+    completionContractViolations(
+      safeTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers,
     ),
     [],
   );
@@ -957,6 +1177,84 @@ test("contract rejects unsafe completion and assertion mutations", () => {
       safeRunner,
       safePrepush,
       safeHigherOrderRtcHelpers,
+    ],
+    [
+      "apply equality receives only one client's two tx values",
+      safeTimedWindowFixture.replace(
+        `                   (:local-tx (:rtc-tx page2-state))
+                   (:remote-tx (:rtc-tx page2-state))`,
+        "",
+      ),
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers,
+    ],
+    [
+      "apply equality receives only three tx values",
+      safeTimedWindowFixture.replace(
+        "                   (:remote-tx (:rtc-tx page2-state))",
+        "",
+      ),
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers,
+    ],
+    [
+      "apply equality pads a missing tx value with a constant",
+      safeTimedWindowFixture.replace(
+        "                   (:remote-tx (:rtc-tx page2-state))",
+        "                   0",
+      ),
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers,
+    ],
+    [
+      "four tx values are only checked as nonnegative",
+      safeTimedWindowFixture.replace(
+        "(apply = tx-values)",
+        "(every? #(>= % 0) tx-values)",
+      ),
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers,
+    ],
+    [
+      "timed barrier only sleeps for the stability duration",
+      safeTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      `(defn wait-for-stable-window! [sample acceptable? cadence]
+  (let [stable-ms 300]
+    (Thread/sleep stable-ms)
+    (sample)))`,
+    ],
+    [
+      "timed barrier does not reset after a different state",
+      safeTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers.replace(
+        "                                  (when acceptable-state? now)",
+        "                                  stable-since",
+      ),
+    ],
+    [
+      "timed barrier treats timeout as successful completion",
+      safeTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers.replace(
+        '(throw (ex-info "completion barrier timeout" {:attempts 100}))',
+        "previous-state",
+      ),
+    ],
+    [
+      "timed barrier uses a zero stability window",
+      safeTimedWindowFixture,
+      safeRunner,
+      safePrepush,
+      safeTimedWindowRtcHelpers.replace("stable-ms 300", "stable-ms 0"),
     ],
   ];
   for (const [label, source, runner, prepush, rtcHelpers] of mutations) {
