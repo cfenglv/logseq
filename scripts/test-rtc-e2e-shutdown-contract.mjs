@@ -2,12 +2,15 @@
 
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { createShutdownController } from './rtc-e2e-shutdown.mjs'
+import * as shutdownModule from './rtc-e2e-shutdown.mjs'
+
+const { createShutdownController } = shutdownModule
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -34,6 +37,101 @@ const errorTreeContains = (root, target, seen = new Set()) => {
   }
   return false
 }
+
+test('windows cleanup uses bounded taskkill tree stages', async () => {
+  assert.equal(
+    typeof shutdownModule.createWindowsProcessTreeSignaler,
+    'function',
+    'Windows cleanup must expose a process-tree signaler'
+  )
+
+  const calls = []
+  const spawnProcess = (command, args, options) => {
+    const taskkill = new EventEmitter()
+    taskkill.kill = (signal) => calls.push(['helper-kill', signal])
+    calls.push(['spawn', command, args, options])
+    queueMicrotask(() => taskkill.emit('exit', 0, null))
+    return taskkill
+  }
+  const child = { exitCode: null, pid: 707, signalCode: null }
+  const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
+    spawnProcess,
+    timeoutMs: 50,
+  })
+  let waitCount = 0
+  const controller = createShutdownController({
+    children: new Set([child]),
+    signalChild,
+    waitForExit: async () => ++waitCount === 2,
+  })
+
+  await controller.shutdown()
+
+  assert.deepEqual(
+    calls.map((call) => call.slice(0, 3)),
+    [
+      ['spawn', 'taskkill.exe', ['/PID', '707', '/T']],
+      ['spawn', 'taskkill.exe', ['/PID', '707', '/T', '/F']],
+    ]
+  )
+  for (const [, , , options] of calls) {
+    assert.deepEqual(options, {
+      shell: false,
+      stdio: 'ignore',
+      windowsHide: true,
+    })
+  }
+})
+
+test('windows cleanup fails closed for invalid PIDs and tool errors', async () => {
+  const toolError = new Error('TASKKILL_TOOL_SENTINEL')
+  let spawnCount = 0
+  const spawnProcess = () => {
+    spawnCount += 1
+    const taskkill = new EventEmitter()
+    taskkill.kill = () => true
+    queueMicrotask(() => taskkill.emit('error', toolError))
+    return taskkill
+  }
+  const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
+    spawnProcess,
+    timeoutMs: 50,
+  })
+
+  await assert.rejects(
+    signalChild({ exitCode: null, pid: 0, signalCode: null }, 'SIGTERM'),
+    /valid positive integer PID/
+  )
+  assert.equal(spawnCount, 0)
+
+  const thrown = await signalChild(
+    { exitCode: null, pid: 808, signalCode: null },
+    'SIGTERM'
+  ).catch((error) => error)
+  assert.strictEqual(thrown, toolError)
+})
+
+test('windows cleanup bounds a hung taskkill helper', async () => {
+  const helperSignals = []
+  const spawnProcess = () => {
+    const taskkill = new EventEmitter()
+    taskkill.kill = (signal) => helperSignals.push(signal)
+    return taskkill
+  }
+  const signalChild = shutdownModule.createWindowsProcessTreeSignaler({
+    spawnProcess,
+    timeoutMs: 5,
+  })
+
+  await assert.rejects(
+    signalChild(
+      { exitCode: null, pid: 909, signalCode: null },
+      'SIGKILL'
+    ),
+    /taskkill\.exe did not exit within 5ms for PID 909 during SIGKILL/
+  )
+  assert.deepEqual(helperSignals, ['SIGKILL'])
+})
 
 test('concurrent shutdown callers share cleanup through SIGKILL', async () => {
   const child = { exitCode: null, pid: 101, signalCode: null }
