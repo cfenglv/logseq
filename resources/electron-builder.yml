@@ -53,6 +53,10 @@ extraResources:
     to: updater/selfhost-release-policy.json
   - from: updater/target-build-manifest.mjs
     to: updater/target-build-manifest.mjs
+  - from: updater/project-update-signature.mjs
+    to: updater/project-update-signature.mjs
+  - from: updater/project-signing-policy.json
+    to: updater/project-signing-policy.json
   - from: .agents/skills/logseq-cli/SKILL.md
     to: .agents/skills/logseq-cli/SKILL.md
   - from: ../sidecar

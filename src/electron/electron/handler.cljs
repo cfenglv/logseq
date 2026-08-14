@@ -5,7 +5,6 @@
             ["abort-controller" :as AbortController]
             ["buffer" :as buffer]
             ["electron" :refer [app dialog ipcMain shell]]
-            ["electron-updater" :refer [autoUpdater]]
             ["electron-window-state" :as windowStateKeeper]
             ["fs" :as fs]
             ["fs-extra" :as fs-extra]
@@ -493,11 +492,6 @@
 (defmethod handle :httpRequestAbort [_ [_ req-id]]
   (when-let [^js controller (get @*request-abort-signals req-id)]
     (.abort controller)))
-
-(defmethod handle :quitAndInstall []
-  (logger/info ::quick-and-install)
-  ;; https://www.electron.build/electron-updater.class.appupdater#quitandinstall
-  (.quitAndInstall autoUpdater false true))
 
 ;; The graphHas* events are not used but maybe useful later?
 (defmethod handle :graphHasOtherWindow [^js win [_ graph]]
