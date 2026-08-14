@@ -2338,6 +2338,109 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest snapshot-reset-clears-exact-once-state-atomically-test
+  (testing "replace clears ordinary receipts and incomplete upload state with the graph"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              logical-tx-id (random-uuid)
+              session-id (apply str (repeat 64 "a"))]
+          (d/transact! conn [{:block/uuid (random-uuid)
+                              :block/name "snapshot-reset-old"
+                              :block/title "snapshot-reset-old"}])
+          (storage/record-applied-client-tx! sql "tx/accepted" "digest")
+          (storage/start-client-tx-upload!
+           sql logical-tx-id session-id :save-block)
+          (storage/append-client-tx-upload-chunk!
+           sql session-id 0 (protocol/tx->transit [[:db/add -1 :block/title "pending"]])
+           "wire-digest" 1)
+          (#'sync-handler/import-snapshot! self [] true)
+          (is (empty? (storage/applied-client-tx-records
+                       sql ["tx/accepted"])))
+          (is (nil? (storage/client-tx-upload sql logical-tx-id)))
+          (is (empty? (storage/client-tx-upload-chunks sql session-id)))
+          (is (zero? (storage/get-t sql)))
+          (is (= "true"
+                 (storage/get-meta sql :snapshot-uploading?)))))))
+
+  (testing "a failed first replacement batch restores graph and receipt state"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              logical-tx-id (random-uuid)
+              session-id (apply str (repeat 64 "b"))]
+          (d/transact! conn [{:block/uuid (random-uuid)
+                              :block/name "snapshot-reset-rollback"
+                              :block/title "snapshot-reset-rollback"}])
+          (storage/record-applied-client-tx! sql "tx/rollback" "digest")
+          (storage/start-client-tx-upload!
+           sql logical-tx-id session-id :save-block)
+          (storage/append-client-tx-upload-chunk!
+           sql session-id 0 (protocol/tx->transit [[:db/add -1 :block/title "pending"]])
+           "wire-digest" 1)
+          (let [t-before (storage/get-t sql)
+                failure (try
+                          (with-redefs [sync-handler/import-snapshot-rows!
+                                        (fn [& _]
+                                          (throw (js/Error. "injected snapshot import failure")))]
+                            (#'sync-handler/import-snapshot!
+                             self [[42 "replacement" nil]] true))
+                          nil
+                          (catch :default error error))]
+            (is (some? failure))
+            (is (= t-before (storage/get-t sql)))
+            (is (= {"tx/rollback" "digest"}
+                   (storage/applied-client-tx-records
+                    sql ["tx/rollback"])))
+            (is (= session-id
+                   (:session-id
+                    (storage/client-tx-upload sql logical-tx-id))))
+            (is (= 1 (count (storage/client-tx-upload-chunks
+                             sql session-id))))))))))
+
+(deftest admin-reset-fallback-clears-exact-once-tables-test
+  (async done
+    (with-memory-sql-async
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              logical-tx-id (random-uuid)
+              session-id (apply str (repeat 64 "c"))
+              closed (atom [])
+              socket #js {:close (fn [code reason]
+                                   (swap! closed conj [code reason]))}
+              state #js {:storage #js {}
+                         :getWebSockets (fn [] #js [socket])}
+              self #js {:sql sql
+                        :conn conn
+                        :state state
+                        :schema-ready true}]
+          (storage/record-applied-client-tx! sql "tx/admin-reset" "digest")
+          (storage/start-client-tx-upload!
+           sql logical-tx-id session-id :save-block)
+          (storage/append-client-tx-upload-chunk!
+           sql session-id 0 (protocol/tx->transit [[:db/add -1 :block/title "pending"]])
+           "wire-digest" 1)
+          (-> (p/let [response (#'sync-handler/handle-sync-admin-reset self)
+                      body (json-body response)]
+                (is (= 200 (.-status response)))
+                (is (= {:ok true} body))
+                (is (storage/schema-ready? sql))
+                (is (empty? (storage/applied-client-tx-records
+                             sql ["tx/admin-reset"])))
+                (is (nil? (storage/client-tx-upload sql logical-tx-id)))
+                (is (empty? (storage/client-tx-upload-chunks sql session-id)))
+                (is (nil? (.-conn self)))
+                (is (= [[1000 "graph deleted"]] @closed)))
+              (p/then (fn [] (done)))
+              (p/catch (fn [error]
+                         (is false (str error))
+                         (done)))))))))
+
 (deftest tx-batch-rejects-when-a-tx-entry-fails-test
   (testing "db transact failure rejects the batch"
     (let [sql (test-sql/make-sql)

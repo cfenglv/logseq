@@ -114,10 +114,14 @@
 
 (defn- reset-import!
   [sql]
+  (common/sql-exec sql "delete from client_tx_upload_chunks")
+  (common/sql-exec sql "delete from client_tx_uploads")
+  (common/sql-exec sql "delete from applied_client_txs")
   (common/sql-exec sql "delete from kvs")
   (common/sql-exec sql "delete from tx_log")
   (common/sql-exec sql "delete from sync_meta")
-  (storage/set-t! sql 0))
+  (storage/set-t! sql 0)
+  (storage/set-meta! sql snapshot-uploading-meta-key true))
 
 (defn- graph-id-from-sync-path
   [^js url]
@@ -446,9 +450,13 @@
   (let [sql (.-sql self)]
     (ensure-schema! self)
     (when reset?
-      (set! (.-conn self) nil)
-      (reset-import! sql))
-    (import-snapshot-rows! sql "kvs" rows)))
+      (set! (.-conn self) nil))
+    (storage/with-sql-transaction!
+     sql
+     (fn []
+       (when reset?
+         (reset-import! sql))
+       (import-snapshot-rows! sql "kvs" rows)))))
 
 (defn- apply-client-tx-meta
   [request-context outliner-op]
@@ -1026,24 +1034,30 @@
   (let [^js state (.-state self)
         ^js storage (.-storage state)
         delete-all (.-deleteAll storage)
-        delete-alarm (.-deleteAlarm storage)]
-    (doseq [^js ws (.getWebSockets state)]
-      (.close ws 1000 "graph deleted"))
+        delete-alarm (.-deleteAlarm storage)
+        finish-reset! (fn [schema-ready?]
+                        (set! (.-schema-ready self) schema-ready?)
+                        (set! (.-conn self) nil)
+                        (doseq [^js ws (.getWebSockets state)]
+                          (.close ws 1000 "graph deleted"))
+                        (http/json-response :sync/admin-reset {:ok true}))]
     (p/let [_ (when (fn? delete-alarm)
                 (.deleteAlarm storage))]
       (if (fn? delete-all)
         (p/let [_ (.deleteAll storage)]
-          (set! (.-schema-ready self) false)
-          (set! (.-conn self) nil)
-          (http/json-response :sync/admin-reset {:ok true}))
+          (finish-reset! false))
         (do
-          (common/sql-exec (.-sql self) "drop table if exists kvs")
-          (common/sql-exec (.-sql self) "drop table if exists tx_log")
-          (common/sql-exec (.-sql self) "drop table if exists sync_meta")
-          (storage/init-schema! (.-sql self))
-          (set! (.-schema-ready self) true)
-          (set! (.-conn self) nil)
-          (http/json-response :sync/admin-reset {:ok true}))))))
+          (storage/with-sql-transaction!
+           (.-sql self)
+           (fn []
+             (common/sql-exec (.-sql self) "drop table if exists kvs")
+             (common/sql-exec (.-sql self) "drop table if exists tx_log")
+             (common/sql-exec (.-sql self) "drop table if exists applied_client_txs")
+             (common/sql-exec (.-sql self) "drop table if exists client_tx_upload_chunks")
+             (common/sql-exec (.-sql self) "drop table if exists client_tx_uploads")
+             (common/sql-exec (.-sql self) "drop table if exists sync_meta")
+             (storage/init-schema! (.-sql self))))
+          (finish-reset! true))))))
 
 (defn- handle-sync-tx-batch
   [^js self request]
