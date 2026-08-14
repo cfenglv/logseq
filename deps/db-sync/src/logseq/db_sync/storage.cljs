@@ -232,6 +232,119 @@
      payload-digest
      (common/now-ms))))
 
+(defn client-tx-upload
+  [sql logical-tx-id]
+  (when-let [row (select-one
+                  sql
+                  (str "select logical_tx_id, session_id, outliner_op, "
+                       "next_index, status, final_index, final_wire_digest, "
+                       "completed_digest, created_at, updated_at "
+                       "from client_tx_uploads where logical_tx_id = ?")
+                  (str logical-tx-id))]
+    {:logical-tx-id (aget row "logical_tx_id")
+     :session-id (aget row "session_id")
+     :outliner-op (some-> (aget row "outliner_op") keyword)
+     :next-index (aget row "next_index")
+     :status (aget row "status")
+     :final-index (aget row "final_index")
+     :final-wire-digest (aget row "final_wire_digest")
+     :completed-digest (aget row "completed_digest")
+     :created-at (aget row "created_at")
+     :updated-at (aget row "updated_at")}))
+
+(defn start-client-tx-upload!
+  [sql logical-tx-id session-id outliner-op]
+  (let [now (common/now-ms)]
+    (common/sql-exec
+     sql
+     (str "insert into client_tx_uploads "
+          "(logical_tx_id, session_id, outliner_op, next_index, status, "
+          "created_at, updated_at) values (?, ?, ?, 0, 'active', ?, ?)")
+     (str logical-tx-id)
+     session-id
+     (some-> outliner-op name)
+     now
+     now)))
+
+(defn replace-client-tx-upload!
+  [sql logical-tx-id old-session-id new-session-id outliner-op]
+  (common/sql-exec sql
+                   "delete from client_tx_upload_chunks where session_id = ?"
+                   old-session-id)
+  (let [now (common/now-ms)]
+    (common/sql-exec
+     sql
+     (str "update client_tx_uploads set session_id = ?, outliner_op = ?, "
+          "next_index = 0, status = 'active', final_index = null, "
+          "final_wire_digest = null, completed_digest = null, "
+          "created_at = ?, updated_at = ? where logical_tx_id = ?")
+     new-session-id
+     (some-> outliner-op name)
+     now
+     now
+     (str logical-tx-id))))
+
+(defn client-tx-upload-chunk
+  [sql session-id chunk-index]
+  (when-let [row (select-one
+                  sql
+                  (str "select session_id, chunk_index, tx, wire_digest, "
+                       "datom_count, created_at from client_tx_upload_chunks "
+                       "where session_id = ? and chunk_index = ?")
+                  session-id
+                  chunk-index)]
+    {:session-id (aget row "session_id")
+     :chunk-index (aget row "chunk_index")
+     :tx (aget row "tx")
+     :wire-digest (aget row "wire_digest")
+     :datom-count (aget row "datom_count")
+     :created-at (aget row "created_at")}))
+
+(defn append-client-tx-upload-chunk!
+  [sql session-id chunk-index tx wire-digest datom-count]
+  (let [now (common/now-ms)]
+    (common/sql-exec
+     sql
+     (str "insert into client_tx_upload_chunks "
+          "(session_id, chunk_index, tx, wire_digest, datom_count, created_at) "
+          "values (?, ?, ?, ?, ?, ?)")
+     session-id chunk-index tx wire-digest datom-count now)
+    (common/sql-exec
+     sql
+     (str "update client_tx_uploads set next_index = ?, updated_at = ? "
+          "where session_id = ? and status = 'active'")
+     (inc chunk-index) now session-id)))
+
+(defn client-tx-upload-chunks
+  [sql session-id]
+  (let [rows (common/get-sql-rows
+              (common/sql-exec
+               sql
+               (str "select chunk_index, tx, wire_digest, datom_count "
+                    "from client_tx_upload_chunks where session_id = ? "
+                    "order by chunk_index asc")
+               session-id))]
+    (mapv (fn [row]
+            {:chunk-index (aget row "chunk_index")
+             :tx (aget row "tx")
+             :wire-digest (aget row "wire_digest")
+             :datom-count (aget row "datom_count")})
+          rows)))
+
+(defn complete-client-tx-upload!
+  [sql logical-tx-id session-id final-index final-wire-digest completed-digest]
+  (common/sql-exec
+   sql
+   (str "update client_tx_uploads set status = 'completed', "
+        "final_index = ?, final_wire_digest = ?, completed_digest = ?, "
+        "updated_at = ? where logical_tx_id = ? and session_id = ? "
+        "and status = 'active'")
+   final-index final-wire-digest completed-digest (common/now-ms)
+   (str logical-tx-id) session-id)
+  (common/sql-exec sql
+                   "delete from client_tx_upload_chunks where session_id = ?"
+                   session-id))
+
 (defn fetch-tx-since [sql since-t]
   (let [rows (common/get-sql-rows
               (common/sql-exec sql

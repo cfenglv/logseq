@@ -16,6 +16,7 @@
             [logseq.db-sync.worker.routes.semantic :as semantic-routes]
             [logseq.db-sync.worker.routes.sync :as sync-routes]
             [logseq.db-sync.worker.ws :as ws]
+            [logseq.db.common.normalize :as db-normalize]
             [promesa.core :as p]))
 
 (def ^:private snapshot-download-batch-size 10000)
@@ -25,6 +26,7 @@
 (def ^:private snapshot-uploading-meta-key :snapshot-uploading?)
 (def ^:private large-tx-min-items 500)
 (def ^:private large-tx-max-chunk-items 500)
+(def server-capabilities ["tx-upload-staged-v1"])
 ;; 10m
 ;; (def ^:private snapshot-multipart-part-size (* 10 1024 1024))
 
@@ -304,6 +306,7 @@
         checksum (current-checksum self)]
     (cond-> {:type "pull/ok"
              :t (t-now self)
+             :capabilities server-capabilities
              :txs txs}
       (string? checksum) (assoc :checksum checksum))))
 
@@ -458,27 +461,74 @@
            :skip-validate-db? true)))
 
 (defn- tx-entry-identity
-  [{:keys [tx-id]}]
-  (when tx-id
-    (str "tx/" tx-id)))
+  [{:keys [tx tx-id logical-tx-id upload-session-id chunk-index chunk-final?
+           outliner-op]
+    :as tx-entry}]
+  (let [chunk-metadata? (some #(contains? tx-entry %)
+                              [:logical-tx-id :upload-session-id
+                               :chunk-index :chunk-next-index :chunk-final?])]
+    (cond
+      chunk-metadata?
+      (do
+        (when-not (and (string? tx)
+                       (uuid? logical-tx-id)
+                       (string? upload-session-id)
+                       (boolean (re-matches #"[0-9a-f]{64}" upload-session-id))
+                       (integer? chunk-index)
+                       (not (neg? chunk-index))
+                       (not (contains? tx-entry :chunk-next-index))
+                       (boolean? chunk-final?)
+                       (keyword? outliner-op)
+                       (= tx-id
+                          (protocol/tx-chunk-id
+                           logical-tx-id upload-session-id
+                           chunk-index chunk-final?)))
+          (throw (ex-info "invalid tx chunk identity"
+                          (cond-> {:type :db-sync/invalid-tx-chunk-identity}
+                            tx-id (assoc :failed-tx-id tx-id)))))
+        (str "chunk/" logical-tx-id "/" upload-session-id "/" chunk-index))
+
+      tx-id
+      (str "tx/" tx-id)
+
+      :else
+      nil)))
 
 (defn- tx-entry-payload-digest
-  [{:keys [outliner-op tx]}]
-  (protocol/tx-payload-digest outliner-op (protocol/transit->tx tx)))
+  [{:keys [outliner-op tx] :as tx-entry}]
+  (if (:logical-tx-id tx-entry)
+    (protocol/tx-wire-payload-digest tx-entry)
+    (protocol/tx-payload-digest outliner-op (protocol/transit->tx tx))))
 
 (defn- prepare-tx-batch
   [sql tx-entries]
   (let [prepared (mapv (fn [tx-entry]
-                         (assoc tx-entry
-                                ::identity (tx-entry-identity tx-entry)
-                                ::payload-digest (tx-entry-payload-digest tx-entry)))
+                         (let [identity (tx-entry-identity tx-entry)
+                               upload? (contains? tx-entry :logical-tx-id)]
+                           (cond-> (assoc tx-entry
+                                          ::payload-digest (tx-entry-payload-digest tx-entry)
+                                          ::batch-identity identity
+                                          ::upload? upload?)
+                             (and identity (not upload?))
+                             (assoc ::identity identity))))
                        tx-entries)
+        batch-identities (into [] (keep ::batch-identity) prepared)
         identities (into [] (keep ::identity) prepared)
+        duplicate-upload-logical
+        (some (fn [[logical-tx-id n]]
+                (when (> n 1) logical-tx-id))
+              (frequencies (keep #(when (::upload? %)
+                                    (:logical-tx-id %))
+                                 prepared)))
         duplicate-identity (some (fn [[identity n]]
                                    (when (> n 1) identity))
-                                 (frequencies identities))]
-    (when duplicate-identity
-      (let [entry (some #(when (= duplicate-identity (::identity %)) %) prepared)]
+                                 (frequencies batch-identities))]
+    (when (or duplicate-identity duplicate-upload-logical)
+      (let [entry (some #(when (if duplicate-identity
+                                 (= duplicate-identity (::batch-identity %))
+                                 (= duplicate-upload-logical (:logical-tx-id %)))
+                           %)
+                        prepared)]
         (throw (ex-info "duplicate tx identity in batch"
                         (cond-> {:type :db-sync/duplicate-tx-identity}
                           (:tx-id entry) (assoc :failed-tx-id (:tx-id entry)))))))
@@ -499,7 +549,9 @@
   (let [db-before @conn
         tx-meta (apply-client-tx-meta request-context outliner-op)
         sql (when self (.-sql ^js self))
+        prev-t (when sql (storage/get-t sql))
         prev-checksum (when sql (storage/get-checksum sql))
+        staged-upload-final? (::staged-upload-final? tx-entry)
         logical-tx-data (volatile! [])
         chunk-count (volatile! 0)]
     (log/info :db-sync/apply-large-tx-entry-start
@@ -513,11 +565,11 @@
         (d/listen! conn ::large-logical-tx-checksum
                    (fn [{:keys [tx-data]}]
                      (vswap! logical-tx-data into tx-data))))
-      ((if sql
-         #(storage/with-sql-transaction! sql %)
-         (fn [f] (f)))
-       (fn []
-         (try
+      (try
+        ((if sql
+           #(storage/with-sql-transaction! sql %)
+           (fn [f] (f)))
+         (fn []
            (reduce-ordered-tx-chunks
             db-before
             (fn [_ chunk]
@@ -526,23 +578,35 @@
                              chunk
                              (cond-> tx-meta
                                sql
-                               (assoc :db-sync/skip-checksum-update? true)))
+                               (assoc :db-sync/skip-checksum-update? true)
+                               (and sql staged-upload-final?)
+                               (assoc :db-sync/skip-tx-log? true)))
               nil)
             nil
             tx-data)
            (when sql
+             (when staged-upload-final?
+               (let [new-t (inc prev-t)
+                     normalized-data (->> @logical-tx-data
+                                          (db-normalize/normalize-tx-data
+                                           @conn db-before)
+                                          vec)]
+                 (storage/append-tx! sql new-t
+                                     (common/write-transit normalized-data)
+                                     (common/now-ms) outliner-op)
+                 (storage/set-t! sql new-t)))
              (storage/set-checksum!
               sql
               (sync-checksum/update-checksum
                prev-checksum
                {:db-before db-before
                 :db-after @conn
-                :tx-data @logical-tx-data})))
+                :tx-data @logical-tx-data}))
              (storage/record-applied-client-tx!
-              sql (::identity tx-entry) (::payload-digest tx-entry))
-           (finally
-             (when sql
-               (d/unlisten! conn ::large-logical-tx-checksum))))))
+              sql (::identity tx-entry) (::payload-digest tx-entry)))))
+        (finally
+          (when sql
+            (d/unlisten! conn ::large-logical-tx-checksum))))
       (log/info :db-sync/apply-large-tx-entry-done
                 {:graph-id (:graph-id request-context)
                  :tx-id tx-id
@@ -560,9 +624,167 @@
         (reset! conn db-before)
         (throw error)))))
 
+(defn- upload-state-error
+  [type tx-entry message]
+  (ex-info message
+           (cond-> {:type type}
+             (:tx-id tx-entry) (assoc :failed-tx-id (:tx-id tx-entry)))))
+
+(defn- require-contiguous-upload!
+  [tx-entry chunks]
+  (loop [expected-index 0
+         remaining chunks]
+    (if-let [{:keys [chunk-index]} (first remaining)]
+      (if (= expected-index chunk-index)
+        (recur (inc expected-index) (next remaining))
+        (throw (upload-state-error
+                :db-sync/upload-session-corrupt tx-entry
+                "stored upload chunk ordinals are not contiguous")))
+      expected-index)))
+
+(defn- ensure-client-upload-session!
+  [sql {:keys [logical-tx-id upload-session-id chunk-index chunk-final?
+               outliner-op] :as tx-entry}]
+  (let [existing (storage/client-tx-upload sql logical-tx-id)]
+    (cond
+      (nil? existing)
+      (do
+        (when (or (not (zero? chunk-index)) chunk-final?)
+          (throw (upload-state-error
+                  (if chunk-final?
+                    :db-sync/upload-session-final-first
+                    :db-sync/upload-session-out-of-order)
+                  tx-entry
+                  "upload session must start with a nonfinal chunk at index zero")))
+        (storage/start-client-tx-upload!
+         sql logical-tx-id upload-session-id outliner-op)
+        (storage/client-tx-upload sql logical-tx-id))
+
+      (= "completed" (:status existing))
+      (if (and (= upload-session-id (:session-id existing))
+               chunk-final?
+               (= chunk-index (:final-index existing))
+               (= (::payload-digest tx-entry) (:final-wire-digest existing)))
+        (assoc existing :completed-retry? true)
+        (throw (upload-state-error
+                :db-sync/upload-session-completed tx-entry
+                "logical upload is already completed")))
+
+      (not= upload-session-id (:session-id existing))
+      (do
+        (when (or (not (zero? chunk-index)) chunk-final?)
+          (throw (upload-state-error
+                  :db-sync/upload-session-mismatch tx-entry
+                  "replacement upload session must restart at index zero")))
+        (storage/replace-client-tx-upload!
+         sql logical-tx-id (:session-id existing) upload-session-id outliner-op)
+        (storage/client-tx-upload sql logical-tx-id))
+
+      (not= outliner-op (:outliner-op existing))
+      (throw (upload-state-error
+              :db-sync/upload-session-metadata-conflict tx-entry
+              "upload outliner operation changed within one session"))
+
+      :else
+      existing)))
+
+(defn- allowed-empty-upload?
+  [sql {:keys [logical-tx-id upload-session-id chunk-index chunk-final?]
+        :as tx-entry}]
+  (let [existing (storage/client-tx-upload sql logical-tx-id)]
+    (and (= upload-session-id (:session-id existing))
+         chunk-final?
+         (pos? chunk-index)
+         (or (and (= "active" (:status existing))
+                  (= chunk-index (:next-index existing)))
+             (and (= "completed" (:status existing))
+                  (= chunk-index (:final-index existing))
+                  (= (::payload-digest tx-entry)
+                     (:final-wire-digest existing)))))))
+
+(declare apply-tx-entry!)
+
+(defn- apply-upload-chunk!
+  [self conn {:keys [logical-tx-id upload-session-id chunk-index chunk-final?
+                     outliner-op tx] :as tx-entry}
+   request-context]
+  (let [sql (.-sql ^js self)
+        db-before @conn]
+    (try
+      (storage/with-sql-transaction!
+       sql
+       (fn []
+         (let [tx-data (protocol/transit->tx tx)
+               _ (when (and (empty? tx-data)
+                            (not (allowed-empty-upload? sql tx-entry)))
+                   (throw (upload-state-error
+                           :db-sync/invalid-empty-upload-chunk tx-entry
+                           "empty upload chunk is not an allowed final terminator")))
+               session (ensure-client-upload-session! sql tx-entry)]
+           (if (:completed-retry? session)
+             false
+             (let [wire-digest (::payload-digest tx-entry)
+                   stored (storage/client-tx-upload-chunk
+                           sql upload-session-id chunk-index)]
+               (cond
+                 stored
+                 (if (= wire-digest (:wire-digest stored))
+                   false
+                   (throw (upload-state-error
+                           :db-sync/upload-chunk-payload-conflict tx-entry
+                           "upload chunk identity was reused with different wire content")))
+
+                 (not= chunk-index (:next-index session))
+                 (throw (upload-state-error
+                         :db-sync/upload-session-out-of-order tx-entry
+                         "upload chunk is not the next contiguous ordinal"))
+
+                 (and chunk-final? (zero? chunk-index))
+                 (throw (upload-state-error
+                         :db-sync/upload-session-final-first tx-entry
+                         "final chunk cannot start a split upload"))
+
+                 :else
+                 (do
+                   (storage/append-client-tx-upload-chunk!
+                    sql upload-session-id chunk-index tx wire-digest
+                    (count tx-data))
+                   (if-not chunk-final?
+                     false
+                     (let [chunks (storage/client-tx-upload-chunks
+                                   sql upload-session-id)
+                           next-index (require-contiguous-upload! tx-entry chunks)
+                           _ (when-not (= next-index (inc chunk-index))
+                               (throw (upload-state-error
+                                       :db-sync/upload-session-corrupt tx-entry
+                                       "final upload ordinal does not match stored chunks")))
+                           full-tx-data (into []
+                                              (mapcat (comp protocol/transit->tx :tx))
+                                              chunks)
+                           completed-digest
+                           (protocol/tx-upload-completed-digest
+                            outliner-op (mapv :wire-digest chunks))
+                           apply-entry (-> tx-entry
+                                           (assoc :tx-id logical-tx-id
+                                                  ::decoded-tx-data full-tx-data
+                                                  ::identity (str "upload/" logical-tx-id)
+                                                  ::payload-digest completed-digest
+                                                  ::staged-upload-final? true)
+                                           (dissoc ::upload?))
+                           applied? (apply-tx-entry!
+                                     self conn apply-entry request-context)]
+                       (storage/complete-client-tx-upload!
+                        sql logical-tx-id upload-session-id chunk-index
+                        wire-digest completed-digest)
+                       applied?)))))))))
+      (catch :default error
+        (reset! conn db-before)
+        (throw error)))))
+
 (defn- sanitize-tx-entry
   [db {:keys [tx outliner-op] :as tx-entry}]
-  (let [input-tx-data (protocol/transit->tx tx)
+  (let [input-tx-data (or (::decoded-tx-data tx-entry)
+                          (protocol/transit->tx tx))
         tx-data (tx-sanitize/sanitize-tx db
                                          input-tx-data
                                          {:drop-missing-retract-ops? (or (= outliner-op :fix)
@@ -637,7 +859,12 @@
                 applied-entry? (if already-applied?
                                  false
                                  (try
-                                   (boolean (apply-tx-entry! self conn tx-entry request-context))
+                                   (boolean
+                                    (if (::upload? tx-entry)
+                                      (apply-upload-chunk!
+                                       self conn tx-entry request-context)
+                                      (apply-tx-entry!
+                                       self conn tx-entry request-context)))
                                    (catch :default e
                                    (log/error :db-sync/transact-failed e)
                                    (let [missing-block-uuids (missing-block-uuids-from-error e)]

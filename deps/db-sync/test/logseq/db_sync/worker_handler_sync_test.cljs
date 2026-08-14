@@ -3000,6 +3000,27 @@
           :block/title from-title to-title]])
    :outliner-op :save-block})
 
+(defn- staged-session-entry
+  [{:keys [logical-tx-id full-tx-data chunk-tx-data chunk-index chunk-final?
+           outliner-op]
+    :or {outliner-op :save-block}}]
+  (let [session-id (protocol/tx-upload-session-id
+                    logical-tx-id outliner-op full-tx-data)]
+    {:tx-id (protocol/tx-chunk-id
+             logical-tx-id session-id chunk-index chunk-final?)
+     :logical-tx-id logical-tx-id
+     :upload-session-id session-id
+     :chunk-index chunk-index
+     :chunk-final? chunk-final?
+     :tx (protocol/tx->transit chunk-tx-data)
+     :outliner-op outliner-op}))
+
+(defn- apply-staged-entry!
+  [self entry]
+  (with-redefs [ws/broadcast! (fn [& _] nil)]
+    (sync-handler/handle-tx-batch!
+     self nil [entry] (storage/get-t (.-sql ^js self)))))
+
 (deftest reset-after-partial-commit-retries-eleven-txs-exactly-once-test
   (testing "a lost response can replay every stable tx id without duplicating committed work"
     (with-memory-sql
@@ -3091,6 +3112,155 @@
           (is (= "payload-a"
                  (:block/title
                   (d/entity @conn [:block/uuid block-uuid])))))))))
+
+(deftest logical-chunk-session-contiguous-sequence-and-same-chunk-retry-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            logical-tx-id (random-uuid)
+            block-uuid (random-uuid)
+            _ (d/transact! conn [{:block/uuid block-uuid
+                                  :block/name "staged-contiguous"
+                                  :block/title "before"}])
+            full-tx-data [[:db/add [:block/uuid block-uuid]
+                           :block/title "chunk-0"]
+                          [:db/add [:block/uuid block-uuid]
+                           :block/updated-at 2]
+                          [:db/add [:block/uuid block-uuid]
+                           :block/title "final-2"]]
+            t-before (storage/get-t sql)
+            checksum-before (storage/get-checksum sql)
+            chunk-0 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(nth full-tx-data 0)]
+                      :chunk-index 0
+                      :chunk-final? false})
+            response-0 (apply-staged-entry! self chunk-0)
+            retry-0 (apply-staged-entry! self chunk-0)
+            chunk-1 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(nth full-tx-data 1)]
+                      :chunk-index 1
+                      :chunk-final? false})
+            response-1 (apply-staged-entry! self chunk-1)
+            final-2 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(nth full-tx-data 2)]
+                      :chunk-index 2
+                      :chunk-final? true})]
+        (is (= "tx/batch/ok" (:type response-0) (:type retry-0)))
+        (is (= t-before (:t response-0) (:t retry-0) (:t response-1)))
+        (is (= checksum-before (storage/get-checksum sql)))
+        (is (= "before"
+               (:block/title (d/entity @conn [:block/uuid block-uuid]))))
+        (let [response-2 (apply-staged-entry! self final-2)
+              final-retry (apply-staged-entry! self final-2)
+              session (storage/client-tx-upload sql logical-tx-id)]
+          (is (= "tx/batch/ok" (:type response-2) (:type final-retry)))
+          (is (= (inc t-before) (:t response-2) (:t final-retry)))
+          (is (= "final-2"
+                 (:block/title (d/entity @conn [:block/uuid block-uuid]))))
+          (is (= 1 (count (storage/fetch-tx-since sql t-before))))
+          (is (= "completed" (:status session)))
+          (is (empty? (storage/client-tx-upload-chunks
+                       sql (:session-id session)))))))))
+
+(deftest large-staged-upload-commits-one-logical-history-entry-test
+  (testing "a staged payload larger than the live apply chunk bound advances t and tx_log once"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              logical-tx-id (random-uuid)
+              page-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid page-uuid
+                                    :block/name "large-staged-page"
+                                    :block/title "large-staged-page"}])
+              full-tx-data (large-block-insert-tx page-uuid 120)
+              [chunk-0-data final-data] (split-at 350 full-tx-data)
+              chunk-0 (staged-session-entry
+                       {:logical-tx-id logical-tx-id
+                        :full-tx-data full-tx-data
+                        :chunk-tx-data chunk-0-data
+                        :chunk-index 0
+                        :chunk-final? false
+                        :outliner-op :insert-blocks})
+              final-1 (staged-session-entry
+                       {:logical-tx-id logical-tx-id
+                        :full-tx-data full-tx-data
+                        :chunk-tx-data final-data
+                        :chunk-index 1
+                        :chunk-final? true
+                        :outliner-op :insert-blocks})
+              t-before (storage/get-t sql)
+              response-0 (apply-staged-entry! self chunk-0)
+              response-1 (apply-staged-entry! self final-1)
+              committed (storage/fetch-tx-since sql t-before)]
+          (is (= "tx/batch/ok" (:type response-0) (:type response-1)))
+          (is (= t-before (:t response-0)))
+          (is (= (inc t-before) (:t response-1)))
+          (is (= 1 (count committed)))
+          (is (= (count full-tx-data)
+                 (count (protocol/transit->tx (:tx (first committed))))))
+          (is (= 120
+                 (block-title-prefix-count @conn "large-op-block-")))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (storage/get-checksum sql))))))))
+
+(deftest modern-staged-final-failure-rolls-back-current-and-fresh-connections-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            logical-tx-id (random-uuid)
+            block-uuid (random-uuid)
+            _ (d/transact! conn [{:block/uuid block-uuid
+                                  :block/name "staged-final-rollback"
+                                  :block/title "before"}])
+            full-tx-data [[:db/add [:block/uuid block-uuid]
+                           :block/title "must-roll-back"]
+                          [:db/add [:block/uuid block-uuid]
+                           :block/updated-at 99]]
+            chunk-0 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(first full-tx-data)]
+                      :chunk-index 0
+                      :chunk-final? false})
+            final-1 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(second full-tx-data)]
+                      :chunk-index 1
+                      :chunk-final? true})
+            _ (is (= "tx/batch/ok" (:type (apply-staged-entry! self chunk-0))))
+            t-before (storage/get-t sql)
+            checksum-before (storage/get-checksum sql)
+            response (with-redefs [storage/append-tx!
+                                   (fn [& _]
+                                     (throw (js/Error. "injected final tx_log failure")))
+                                   ws/broadcast! (fn [& _] nil)]
+                       (sync-handler/handle-tx-batch!
+                        self nil [final-1] t-before))
+            fresh-conn (storage/open-conn sql)
+            session (storage/client-tx-upload sql logical-tx-id)]
+        (is (= "tx/reject" (:type response)))
+        (is (= t-before (:t response) (storage/get-t sql)))
+        (is (= checksum-before (storage/get-checksum sql)))
+        (is (= "before"
+               (:block/title (d/entity @conn [:block/uuid block-uuid]))
+               (:block/title (d/entity @fresh-conn [:block/uuid block-uuid]))))
+        (is (= "active" (:status session)))
+        (is (= 1 (:next-index session)))
+        (is (= 1 (count (storage/client-tx-upload-chunks
+                         sql (:session-id session)))))))))
 
 (deftest sync-pull-is-blocked-when-graph-is-not-ready-for-use-test
   (async done
