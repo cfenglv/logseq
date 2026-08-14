@@ -90,3 +90,34 @@
           (p/catch (fn [error]
                      (is false (str "unexpected error: " error))))
           (p/finally done)))))
+
+(deftest platform-container-readers-return-the-same-bounded-manifest
+  (async done
+    (if (= "win32" (.-platform js/process))
+      (do
+        ;; The Windows packaged receipt exercises the real 7za.exe + NSIS pair.
+        (is true)
+        (done))
+      (let [directory (fs/mkdtempSync (node-path/join (os/tmpdir) "selfhost6-container-readers-"))
+            manifest "{\"schema-version\":1}"
+            nsis-helper (node-path/join directory "fake-7za")
+            appimage (node-path/join directory "fake.AppImage")
+            archive (node-path/join directory "fake.exe")]
+        (fs/writeFileSync nsis-helper (str "#!/bin/sh\nprintf '%s' '" manifest "'\n"))
+        (fs/writeFileSync appimage
+                          (str "#!/bin/sh\n"
+                               "mkdir -p squashfs-root/resources/updater\n"
+                               "printf '%s' '" manifest "' > squashfs-root/resources/updater/TARGET_BUILD_MANIFEST.json\n"))
+        (fs/writeFileSync archive "fixture")
+        (fs/chmodSync nsis-helper 493)
+        (fs/chmodSync appimage 493)
+        (-> (p/let [^js nsis (updater-target/read-target-manifest-from-nsis! archive nsis-helper)
+                    ^js linux (updater-target/read-target-manifest-from-appimage! appimage)]
+              (is (= 1 (aget (.-manifest nsis) "schema-version")))
+              (is (= (.-sha256 nsis) (.-sha256 linux)))
+              (is (= (.-bytesRead nsis) (.-bytesRead linux))))
+            (p/catch (fn [error]
+                       (is false (str "unexpected error: " error))))
+            (p/finally (fn []
+                         (fs/rmSync directory #js {:recursive true :force true})
+                         (done))))))))

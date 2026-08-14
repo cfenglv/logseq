@@ -79,6 +79,9 @@ dmg:
   format: ULFO
 
 win:
+  extraResources:
+    - from: node_modules/7zip-bin/win/x64/7za.exe
+      to: updater/7za.exe
   icon: icons/logseq.ico
   target:
     - nsis
@@ -86,6 +89,7 @@ win:
 
 nsis:
   artifactName: ${productName}-win-${arch}-${version}-nsis.${ext}
+  include: windows/selfhost6-updater.nsh
   oneClick: false
   allowToChangeInstallationDirectory: true
   installerIcon: icons/logseq.ico
