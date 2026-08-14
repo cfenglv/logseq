@@ -1,5 +1,6 @@
 (ns electron.db-worker-manager-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require [clojure.string :as string]
+            [cljs.test :refer [async deftest is]]
             [electron.db-worker :as db-worker]
             [logseq.cli.server :as cli-server]
             [promesa.core :as p]))
@@ -213,6 +214,65 @@
                   _ (db-worker/ensure-started! manager "graph-b" :window-2)
                   _ (db-worker/stop-all! manager)]
             (is (= ["graph-a"] @stop-calls)))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn [] (done)))))))
+
+(deftest updater-quiesce-waits-for-inflight-claim-and-captures-identities-only
+  (async done
+    (let [start-resolve (atom nil)
+          quiesce-resolved? (atom false)
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo]
+                                     (js/Promise.
+                                      (fn [resolve _reject]
+                                        (reset! start-resolve
+                                                #(resolve (runtime repo))))))
+                    :stop-daemon! (fn [_] (p/resolved true))})
+          claim (db-worker/ensure-started! manager "graph-a" :window-1)
+          quiesce (-> (db-worker/begin-update-quiesce! manager)
+                      (p/then (fn [token]
+                                (reset! quiesce-resolved? true)
+                                token)))]
+      (-> (p/let [_ (p/delay 0)
+                  _ (is (false? @quiesce-resolved?))
+                  _ (@start-resolve)
+                  _ claim
+                  token quiesce]
+            (is (= #{:attempt-id :active-repo-identities :window-to-repo-ownership}
+                   (set (keys token))))
+            (is (= ["graph-a"] (:active-repo-identities token)))
+            (is (= {:window-1 "graph-a"} (:window-to-repo-ownership token)))
+            (is (not (string/includes? (pr-str token) "token-graph-a")))
+            (db-worker/resume-update-quiesce! manager token))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn [] (done)))))))
+
+(deftest updater-quiesce-blocks-new-claims-and-restores-captured-owners-on-failure
+  (async done
+    (let [start-calls (atom [])
+          stop-calls (atom [])
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo]
+                                     (swap! start-calls conj repo)
+                                     (p/resolved (runtime repo)))
+                    :stop-daemon! (fn [rt]
+                                    (swap! stop-calls conj (:repo rt))
+                                    (p/resolved true))})]
+      (-> (p/let [_ (db-worker/ensure-started! manager "graph-a" :window-1)
+                  token (db-worker/begin-update-quiesce! manager)
+                  blocked-code (-> (db-worker/ensure-started! manager "graph-b" :window-2)
+                                   (p/then (fn [_] :unexpected-success))
+                                   (p/catch (fn [error] (:code (ex-data error)))))
+                  _ (is (= :updater-quiescing blocked-code))
+                  _ (db-worker/stop-active-for-update! manager token)
+                  _ (is (= ["graph-a"] @stop-calls))
+                  _ (db-worker/resume-update-quiesce! manager token)
+                  state @(:state manager)]
+            (is (= ["graph-a" "graph-a"] @start-calls))
+            (is (= "graph-a" (get-in state [:window->repo :window-1])))
+            (is (false? (db-worker/update-quiescing? manager))))
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally (fn [] (done)))))))
