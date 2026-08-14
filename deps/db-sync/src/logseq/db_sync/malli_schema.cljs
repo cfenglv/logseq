@@ -91,6 +91,7 @@
     [:map
      [:type [:= "hello"]]
      [:t :int]
+     [:capabilities {:optional true} [:sequential :string]]
      [:checksum {:optional true} :string]]]
    ["online-users" online-users-schema]
    ["presence"

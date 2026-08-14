@@ -228,7 +228,9 @@
                    rejected-data)))))
 
 (defn- handle-hello!
-  [repo client local-tx remote-tx remote-checksum]
+  [repo client local-tx remote-tx remote-checksum capabilities]
+  (when-let [server-capabilities (:server-capabilities client)]
+    (reset! server-capabilities (set capabilities)))
   (require-non-negative remote-tx {:repo repo :type "hello"})
   (verify-sync-checksum! repo client local-tx remote-tx remote-checksum {:type "hello"})
   (broadcast-rtc-state! client)
@@ -327,7 +329,8 @@
       (validate-local-tx! repo message local-tx)
       (update-latest-remote-state! repo message)
       (case (:type message)
-        "hello" (handle-hello! repo client local-tx remote-tx remote-checksum)
+        "hello" (handle-hello! repo client local-tx remote-tx remote-checksum
+                               (:capabilities message))
         "online-users" (handle-online-users! repo client message)
         "presence" (handle-presence! client message)
         "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx remote-checksum)

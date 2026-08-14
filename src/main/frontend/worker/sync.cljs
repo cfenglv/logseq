@@ -204,6 +204,7 @@
    :stale-kill-timer (atom nil)
    :last-ws-message-ts (atom (common-util/time-ms))
    :online-users (atom [])
+   :server-capabilities (atom #{})
    :ws-state (atom :closed)})
 
 (declare connect!)

@@ -2022,6 +2022,31 @@
             (is (= 0 (get @db-sync/*repo->latest-remote-tx test-repo)))
             (reset! db-sync/*repo->latest-remote-tx latest-prev)))))))
 
+(deftest hello-negotiates-runtime-only-server-capabilities-test
+  (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+        capabilities (atom #{"stale-capability"})
+        client {:repo test-repo
+                :graph-id "graph-1"
+                :inflight (atom [])
+                :online-users (atom [])
+                :server-capabilities capabilities
+                :ws-state (atom :open)}]
+    (with-datascript-conns conn client-ops-conn
+      (fn []
+        (with-redefs [sync-apply/flush-pending! (fn [& _] nil)
+                      sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+          (sync-handle-message/handle-message!
+           test-repo client
+           (js/JSON.stringify
+            (clj->js {:type "hello"
+                      :t 0
+                      :capabilities ["tx-upload-staged-v1"]})))
+          (is (= #{"tx-upload-staged-v1"} @capabilities))
+          (sync-handle-message/handle-message!
+           test-repo client
+           (js/JSON.stringify (clj->js {:type "hello" :t 0})))
+          (is (= #{} @capabilities)))))))
+
 (deftest pull-ok-without-checksum-is-accepted-test
   (testing "legacy pull/ok without checksum is accepted"
     (async done
