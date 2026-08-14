@@ -126,10 +126,9 @@
                                   :block/title "large-memory-page"}])
             t-before (storage/get-t sql)
             {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
-            tx-id (random-uuid)
             tx-entries (mapv (fn [chunk]
                                {:tx (protocol/tx->transit chunk)
-                                :tx-id tx-id
+                                :tx-id (random-uuid)
                                 :outliner-op :insert-blocks})
                              (partition-all 392 tx-data))
             self #js {:sql sql

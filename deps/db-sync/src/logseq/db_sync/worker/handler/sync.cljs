@@ -508,6 +508,26 @@
     (protocol/tx-wire-payload-digest tx-entry)
     (protocol/tx-payload-digest outliner-op (protocol/transit->tx tx))))
 
+(defn- duplicate-tx-entry
+  [prepared]
+  (let [seen-identities (volatile! #{})
+        seen-upload-logical-ids (volatile! #{})
+        duplicate (volatile! nil)]
+    (doseq [entry prepared
+            :while (nil? @duplicate)]
+      (let [identity (::batch-identity entry)
+            logical-tx-id (when (::upload? entry) (:logical-tx-id entry))]
+        (if (or (and identity (contains? @seen-identities identity))
+                (and logical-tx-id
+                     (contains? @seen-upload-logical-ids logical-tx-id)))
+          (vreset! duplicate entry)
+          (do
+            (when identity
+              (vswap! seen-identities conj identity))
+            (when logical-tx-id
+              (vswap! seen-upload-logical-ids conj logical-tx-id))))))
+    @duplicate))
+
 (defn- prepare-tx-batch
   [sql tx-entries]
   (let [prepared (mapv (fn [tx-entry]
@@ -520,37 +540,31 @@
                              (and identity (not upload?))
                              (assoc ::identity identity))))
                        tx-entries)
-        batch-identities (into [] (keep ::batch-identity) prepared)
         identities (into [] (keep ::identity) prepared)
-        duplicate-upload-logical
-        (some (fn [[logical-tx-id n]]
-                (when (> n 1) logical-tx-id))
-              (frequencies (keep #(when (::upload? %)
-                                    (:logical-tx-id %))
-                                 prepared)))
-        duplicate-identity (some (fn [[identity n]]
-                                   (when (> n 1) identity))
-                                 (frequencies batch-identities))]
-    (when (or duplicate-identity duplicate-upload-logical)
-      (let [entry (some #(when (if duplicate-identity
-                                 (= duplicate-identity (::batch-identity %))
-                                 (= duplicate-upload-logical (:logical-tx-id %)))
-                           %)
-                        prepared)]
-        (throw (ex-info "duplicate tx identity in batch"
-                        (cond-> {:type :db-sync/duplicate-tx-identity}
-                          (:tx-id entry) (assoc :failed-tx-id (:tx-id entry)))))))
-    (let [persisted (storage/applied-client-tx-records sql identities)]
-      (doseq [{:keys [tx-id] :as entry} prepared
-              :let [identity (::identity entry)
-                    previous-digest (get persisted identity)]
-              :when (and identity previous-digest
-                         (not= previous-digest (::payload-digest entry)))]
-        (throw (ex-info "tx identity payload conflict"
-                        (cond-> {:type :db-sync/tx-identity-conflict}
-                          tx-id (assoc :failed-tx-id tx-id)))))
-      {:tx-entries prepared
-       :applied-identities (set (keys persisted))})))
+        persisted (storage/applied-client-tx-records sql identities)
+        duplicate-entry (duplicate-tx-entry prepared)
+        conflict-entry
+        (some (fn [{:keys [tx-id] :as entry}]
+                (let [identity (::identity entry)
+                      previous-digest (get persisted identity)]
+                  (when (and identity previous-digest
+                             (not= previous-digest (::payload-digest entry)))
+                    {:tx-id tx-id})))
+              prepared)
+        validation-error
+        (cond
+          duplicate-entry
+          {:message "duplicate tx identity in batch"
+           :type :db-sync/duplicate-tx-identity
+           :failed-tx-id (:tx-id duplicate-entry)}
+
+          conflict-entry
+          {:message "tx identity payload conflict"
+           :type :db-sync/tx-identity-conflict
+           :failed-tx-id (:tx-id conflict-entry)})]
+    {:tx-entries prepared
+     :applied-identities (set (keys persisted))
+     :validation-error validation-error}))
 
 (defn- apply-large-tx-entry!
   [self conn tx-data {:keys [tx-id outliner-op] :as tx-entry} request-context]
@@ -916,17 +930,26 @@
        :else
        (if (seq txs)
          (try
-           (let [{:keys [tx-entries applied-identities]}
-                 (prepare-tx-batch (.-sql self) txs)
-                 {:keys [t applied?]}
-                 (apply-tx! self tx-entries applied-identities request-context)
-                 checksum (current-checksum self)]
-             (when applied?
-               ;; Broadcast once per processed batch after tx-log/checksum settle.
-               (ws/broadcast! self sender {:type "changed" :t t}))
-             (cond-> {:type "tx/batch/ok"
-                      :t t}
-               (string? checksum) (assoc :checksum checksum)))
+           (let [{:keys [tx-entries applied-identities validation-error]}
+                 (prepare-tx-batch (.-sql self) txs)]
+             (if validation-error
+               (let [checksum (current-checksum self)]
+                 (cond-> {:type "tx/reject"
+                          :reason "db transact failed"
+                          :error-detail (:message validation-error)
+                          :t current-t}
+                   (:failed-tx-id validation-error)
+                   (assoc :failed-tx-id (:failed-tx-id validation-error))
+                   (string? checksum) (assoc :checksum checksum)))
+               (let [{:keys [t applied?]}
+                     (apply-tx! self tx-entries applied-identities request-context)
+                     checksum (current-checksum self)]
+                 (when applied?
+                   ;; Broadcast once per processed batch after tx-log/checksum settle.
+                   (ws/broadcast! self sender {:type "changed" :t t}))
+                 (cond-> {:type "tx/batch/ok"
+                          :t t}
+                   (string? checksum) (assoc :checksum checksum)))))
            (catch :default e
              (let [new-t (t-now self)
                    checksum (current-checksum self)
