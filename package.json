@@ -106,6 +106,8 @@
     "db-worker-node:release:bundle": "run-s db-worker-node:release db-worker-node:bundle",
     "db-worker-node:compile:bundle": "run-s db-worker-node:compile db-worker-node:bundle",
     "cli:release": "pnpm --dir cli bundle && node ./scripts/stage-cli-runtime.mjs",
+    "selfhost6:prepare-release-identity": "node ./scripts/selfhost6/generate-target-build-manifest.mjs",
+    "selfhost6:test-release-identity": "node --test ./scripts/selfhost6/generate-target-build-manifest.test.mjs",
     "desktop:prepare-runtime-js": "node ./scripts/prepare-desktop-runtime-js.mjs",
     "cli:e2e": "bb dev:cli-e2e",
     "cli:e2e:skip-build": "bb dev:cli-e2e --skip-build",

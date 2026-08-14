@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "releaseLineId": "selfhost-official-architecture-v1",
+  "sourceVersion": "2.0.1-selfhost.6",
+  "syntheticForwardTargetVersion": "2.0.1-selfhost.7",
+  "bundleIdentity": "com.logseq.logseq",
+  "forwardUpdateChannel": "selfhost-official-architecture-v1",
+  "firstInstall": "controlled-manual-artifact",
+  "allowDowngrade": false,
+  "sameVersionUpdate": false,
+  "legacySharedLatestMutation": false,
+  "legacyChannelsAccepted": [],
+  "readableActivationFormats": ["selfhost-activation-v1"],
+  "readableClientOpsFormats": ["official-client-ops-sqlite-v2+selfhost-upload-v1"],
+  "activationWriteFormat": "selfhost-activation-v1",
+  "clientOpsWriteFormat": "official-client-ops-sqlite-v2+selfhost-upload-v1"
+}

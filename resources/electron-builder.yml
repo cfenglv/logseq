@@ -47,6 +47,10 @@ publish:
     repo: logseq
 
 extraResources:
+  - from: updater/TARGET_BUILD_MANIFEST.json
+    to: updater/TARGET_BUILD_MANIFEST.json
+  - from: updater/selfhost-release-policy.json
+    to: updater/selfhost-release-policy.json
   - from: .agents/skills/logseq-cli/SKILL.md
     to: .agents/skills/logseq-cli/SKILL.md
   - from: ../sidecar

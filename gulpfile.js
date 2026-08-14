@@ -287,7 +287,7 @@ const prepareElectronMaker = async () => {
   const version = fs.readFileSync(
     path.join(__dirname, 'src/main/frontend/version.cljs')).
     toString().
-    match(/[0-9.]{3,}/)[0]
+    match(/defonce version "([^"]+)"/)?.[1]
 
   if (!version) {
     throw new Error('release version error in src/**/*/version.cljs')
