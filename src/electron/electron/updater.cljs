@@ -2,6 +2,7 @@
   (:require [cljs-bean.core :as bean]
             [electron.configs :as cfgs]
             [electron.logger :as logger]
+            [electron.updater-config :as updater-config]
             [electron.utils :refer [*win prod?]]
             [frontend.version :refer [version]]
             ["electron" :refer [ipcMain]]
@@ -11,17 +12,6 @@
 (def *downloaded-update (atom nil))
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
-
-(defn- updater-channel
-  []
-  (let [platform (.-platform js/process)
-        arch (.-arch js/process)]
-    (case platform
-      "win32" (when (#{"x64" "arm64"} arch)
-                (str "latest-" arch))
-      "darwin" (when (#{"x64" "arm64"} arch)
-                 (str "latest-" arch))
-      nil)))
 
 (defn- emit-update!
   [^js win type payload]
@@ -49,14 +39,18 @@
 
 (defn- configure-auto-updater!
   []
-  (let [channel (updater-channel)]
+  (let [platform (.-platform js/process)
+        arch (.-arch js/process)
+        {:keys [channel allow-prerelease? allow-downgrade?] :as options}
+        (updater-config/updater-options electron-version platform arch)]
     (when channel
       (set! (.-channel autoUpdater) channel)
-      ;; Keep the original downgrade policy even though setting channel flips it on.
-      (set! (.-allowDowngrade autoUpdater) false))
-    (debug "configure-auto-updater" {:platform (.-platform js/process)
-                                     :arch (.-arch js/process)
-                                     :channel channel}))
+      (set! (.-allowPrerelease autoUpdater) allow-prerelease?)
+      ;; Setting channel enables downgrade in electron-updater; restore policy.
+      (set! (.-allowDowngrade autoUpdater) allow-downgrade?))
+    (debug "configure-auto-updater" (assoc options
+                                           :platform platform
+                                           :arch arch)))
   (set! (.-autoInstallOnAppQuit autoUpdater) false)
   (set! (.-autoDownload autoUpdater) false))
 
@@ -127,12 +121,7 @@
   [^js win]
   (when (and prod? (not= false (cfgs/get-item :auto-update)))
     (debug "init-auto-updater")
-    (set! (.-autoDownload autoUpdater) true)
-    (-> (.checkForUpdates autoUpdater)
-        (.catch (fn [error]
-                  (logger/warn "[updater/auto-check]" error)
-                  (emit-update! win "error" (normalize-error error))
-                  (emit-completed! win))))))
+    (<check-for-updates! win true)))
 
 (defn init-updater
   [{:keys [^js win] :as _opts}]
