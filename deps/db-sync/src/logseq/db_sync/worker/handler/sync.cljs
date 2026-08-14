@@ -39,14 +39,10 @@
     (try
       (storage/init-schema! (.-sql self))
       (catch :default e
-        ;; Schema may already exist. If DDL writes are rejected, probe
-        ;; existing tables before deciding this is a fatal error.
-        (try
-          (common/sql-exec (.-sql self) "select 1 from kvs limit 1")
-          (common/sql-exec (.-sql self) "select 1 from tx_log limit 1")
-          (common/sql-exec (.-sql self) "select 1 from sync_meta limit 1")
-          (catch :default _
-            (throw e)))))
+        ;; Schema may already exist. If DDL writes are rejected, require every
+        ;; exact-once column rather than accepting a partially initialized DO.
+        (when-not (storage/schema-ready? (.-sql self))
+          (throw e))))
     (set! (.-schema-ready self) true)))
 
 (defn- ensure-conn! [^js self]
@@ -461,8 +457,45 @@
     (assoc :db-migrate? true
            :skip-validate-db? true)))
 
+(defn- tx-entry-identity
+  [{:keys [tx-id]}]
+  (when tx-id
+    (str "tx/" tx-id)))
+
+(defn- tx-entry-payload-digest
+  [{:keys [outliner-op tx]}]
+  (protocol/tx-payload-digest outliner-op (protocol/transit->tx tx)))
+
+(defn- prepare-tx-batch
+  [sql tx-entries]
+  (let [prepared (mapv (fn [tx-entry]
+                         (assoc tx-entry
+                                ::identity (tx-entry-identity tx-entry)
+                                ::payload-digest (tx-entry-payload-digest tx-entry)))
+                       tx-entries)
+        identities (into [] (keep ::identity) prepared)
+        duplicate-identity (some (fn [[identity n]]
+                                   (when (> n 1) identity))
+                                 (frequencies identities))]
+    (when duplicate-identity
+      (let [entry (some #(when (= duplicate-identity (::identity %)) %) prepared)]
+        (throw (ex-info "duplicate tx identity in batch"
+                        (cond-> {:type :db-sync/duplicate-tx-identity}
+                          (:tx-id entry) (assoc :failed-tx-id (:tx-id entry)))))))
+    (let [persisted (storage/applied-client-tx-records sql identities)]
+      (doseq [{:keys [tx-id] :as entry} prepared
+              :let [identity (::identity entry)
+                    previous-digest (get persisted identity)]
+              :when (and identity previous-digest
+                         (not= previous-digest (::payload-digest entry)))]
+        (throw (ex-info "tx identity payload conflict"
+                        (cond-> {:type :db-sync/tx-identity-conflict}
+                          tx-id (assoc :failed-tx-id tx-id)))))
+      {:tx-entries prepared
+       :applied-identities (set (keys persisted))})))
+
 (defn- apply-large-tx-entry!
-  [self conn tx-data {:keys [tx-id outliner-op]} request-context]
+  [self conn tx-data {:keys [tx-id outliner-op] :as tx-entry} request-context]
   (let [db-before @conn
         tx-meta (apply-client-tx-meta request-context outliner-op)
         sql (when self (.-sql ^js self))
@@ -505,6 +538,8 @@
                {:db-before db-before
                 :db-after @conn
                 :tx-data @logical-tx-data})))
+             (storage/record-applied-client-tx!
+              sql (::identity tx-entry) (::payload-digest tx-entry))
            (finally
              (when sql
                (d/unlisten! conn ::large-logical-tx-checksum))))))
@@ -543,39 +578,53 @@
   ([conn tx-entry]
    (apply-tx-entry! nil conn tx-entry nil))
   ([self conn {:keys [outliner-op] :as tx-entry} request-context]
-   (let [sanitized (sanitize-tx-entry @conn tx-entry)
+   (let [db-before @conn
+         sql (when self (.-sql ^js self))
+         sanitized (sanitize-tx-entry db-before tx-entry)
          input-tx-data (:input-tx-data sanitized)
          tx-data (:tx-data sanitized)
          sanitized-entry (:tx-entry sanitized)]
-     (if (seq tx-data)
+     (if (and (not= outliner-op :db-migrate)
+              (large-tx? tx-data))
+       (apply-large-tx-entry! self conn tx-data sanitized-entry request-context)
        (try
-         (if (and (not= outliner-op :db-migrate)
-                  (large-tx? tx-data))
-           (apply-large-tx-entry! self conn tx-data sanitized-entry request-context)
-           (do
-             (ldb/transact! conn tx-data (apply-client-tx-meta request-context outliner-op))
-             true))
-         (catch :default e
-           ;; Rebase/fix txs are inferred from local history and can become stale
-           ;; when concurrent remote edits remove referenced entities before upload.
-           ;; Treat stale :entity-id/missing rebases/fixes as no-op so sync can continue.
-           (if (and (contains? #{:rebase :fix} outliner-op)
-                    (= :entity-id/missing (:error (ex-data e))))
-             (do
-               (log/warn :db-sync/drop-stale-rebase-tx
-                         {:outliner-op outliner-op
-                          :tx-data tx-data
-                          :error (str e)})
-               false)
-             (throw e))))
-       (if (and (contains? delete-outliner-ops outliner-op)
-                (empty? input-tx-data))
-         (throw (ex-info "delete tx input is empty"
-                         {:type :db-sync/empty-delete-tx
-                          :outliner-op outliner-op}))
-         false)))))
+         ((if sql
+            #(storage/with-sql-transaction! sql %)
+            (fn [f] (f)))
+          (fn []
+            (let [applied?
+                  (if (seq tx-data)
+                    (try
+                      (ldb/transact! conn tx-data (apply-client-tx-meta request-context outliner-op))
+                      true
+                      (catch :default e
+                        ;; Rebase/fix txs are inferred from local history and can become stale
+                        ;; when concurrent remote edits remove referenced entities before upload.
+                        ;; Treat stale :entity-id/missing rebases/fixes as no-op so sync can continue.
+                        (if (and (contains? #{:rebase :fix} outliner-op)
+                                 (= :entity-id/missing (:error (ex-data e))))
+                          (do
+                            (log/warn :db-sync/drop-stale-rebase-tx
+                                      {:outliner-op outliner-op
+                                       :tx-data tx-data
+                                       :error (str e)})
+                            false)
+                          (throw e))))
+                    (if (and (contains? delete-outliner-ops outliner-op)
+                             (empty? input-tx-data))
+                      (throw (ex-info "delete tx input is empty"
+                                      {:type :db-sync/empty-delete-tx
+                                       :outliner-op outliner-op}))
+                      false))]
+              (when sql
+                (storage/record-applied-client-tx!
+                 sql (::identity tx-entry) (::payload-digest tx-entry)))
+              applied?)))
+         (catch :default error
+           (reset! conn db-before)
+           (throw error)))))))
 
-(defn- apply-tx! [^js self tx-entries request-context]
+(defn- apply-tx! [^js self tx-entries applied-identities request-context]
   (let [sql (.-sql self)]
     (ensure-conn! self)
     (let [conn (.-conn self)]
@@ -584,9 +633,12 @@
              successful-tx-ids []]
         (if-let [tx-entry (first remaining)]
           (let [tx-id (:tx-id tx-entry)
-                applied-entry? (try
-                                 (boolean (apply-tx-entry! self conn tx-entry request-context))
-                                 (catch :default e
+                already-applied? (contains? applied-identities (::identity tx-entry))
+                applied-entry? (if already-applied?
+                                 false
+                                 (try
+                                   (boolean (apply-tx-entry! self conn tx-entry request-context))
+                                   (catch :default e
                                    (log/error :db-sync/transact-failed e)
                                    (let [missing-block-uuids (missing-block-uuids-from-error e)]
                                      (throw (ex-info "tx entry apply failed"
@@ -595,7 +647,7 @@
                                                        tx-id (assoc :failed-tx-id tx-id)
                                                        (seq missing-block-uuids)
                                                        (assoc :missing-block-uuids missing-block-uuids))
-                                                     e)))))
+                                                     e))))))
                 next-successful-tx-ids (cond-> successful-tx-ids
                                          tx-id (conj tx-id))]
             (recur (next remaining)
@@ -629,7 +681,10 @@
        :else
        (if (seq txs)
          (try
-           (let [{:keys [t applied?]} (apply-tx! self txs request-context)
+           (let [{:keys [tx-entries applied-identities]}
+                 (prepare-tx-batch (.-sql self) txs)
+                 {:keys [t applied?]}
+                 (apply-tx! self tx-entries applied-identities request-context)
                  checksum (current-checksum self)]
              (when applied?
                ;; Broadcast once per processed batch after tx-log/checksum settle.

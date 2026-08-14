@@ -4,7 +4,6 @@
             [clojure.string :as string]
             [datascript.core :as d]
             [logseq.db-sync.checksum :as sync-checksum]
-            [logseq.db-sync.common :as common]
             [logseq.db-sync.index :as index]
             [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.snapshot :as snapshot]
@@ -1600,16 +1599,16 @@
                           (is false (str error))
                           (done)))))))
 
-(deftest ensure-schema-fallback-probes-existing-tables-test
+(deftest ensure-schema-fallback-requires-complete-schema-test
   (async done
          (let [self #js {:sql (empty-sql)}
-               schema-probes (atom [])
+               schema-checks (atom 0)
                {:keys [request url]} (request-url "/sync/graph-1/pull?graph-id=graph-1&since=0")]
            (-> (p/with-redefs [storage/init-schema! (fn [_]
                                                       (throw (js/Error. "ddl rejected")))
-                               common/sql-exec (fn [_ sql-str & _args]
-                                                 (swap! schema-probes conj sql-str)
-                                                 #js [])
+                               storage/schema-ready? (fn [_]
+                                                       (swap! schema-checks inc)
+                                                       true)
                                storage/fetch-tx-since (fn [_ _] [])
                                storage/get-t (fn [_] 7)
                                sync-handler/current-checksum (fn [_] "checksum-ok")]
@@ -1619,13 +1618,11 @@
                                                     :route {:handler :sync/pull}})
                          text (.text resp)
                          body (js->clj (js/JSON.parse text) :keywordize-keys true)
-                         probe-set (set @schema-probes)]
+                         checks @schema-checks]
                    (is (= 200 (.-status resp)))
                    (is (= 7 (:t body)))
                    (is (= "checksum-ok" (:checksum body)))
-                   (is (contains? probe-set "select 1 from kvs limit 1"))
-                   (is (contains? probe-set "select 1 from tx_log limit 1"))
-                   (is (contains? probe-set "select 1 from sync_meta limit 1"))))
+                   (is (= 1 checks))))
                (p/then (fn []
                          (done)))
                (p/catch (fn [error]
@@ -2994,6 +2991,106 @@
       (is (nil? (d/entity @conn [:block/uuid parent-uuid])))
       (is (nil? (d/entity @conn [:block/uuid child-a-uuid])))
       (is (nil? (d/entity @conn [:block/uuid child-b-uuid]))))))
+
+(defn- cas-title-entry
+  [block-uuid from-title to-title tx-id]
+  {:tx-id tx-id
+   :tx (protocol/tx->transit
+        [[:db.fn/cas [:block/uuid block-uuid]
+          :block/title from-title to-title]])
+   :outliner-op :save-block})
+
+(deftest reset-after-partial-commit-retries-eleven-txs-exactly-once-test
+  (testing "a lost response can replay every stable tx id without duplicating committed work"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "ack-loss"
+                                    :block/title "state-0"
+                                    :block/created-at 1
+                                    :block/updated-at 1}])
+              initial-t (storage/get-t sql)
+              tx-ids (mapv (fn [_] (random-uuid)) (range 11))
+              entries (mapv (fn [idx tx-id]
+                              (cas-title-entry block-uuid
+                                               (str "state-" idx)
+                                               (str "state-" (inc idx))
+                                               tx-id))
+                            (range 11)
+                            tx-ids)
+              apply-entry*
+              #_{:clj-kondo/ignore [:private-call]}
+              sync-handler/apply-tx-entry!
+              apply-attempts (atom 0)
+              interrupted-response
+              (with-redefs [sync-handler/apply-tx-entry!
+                            (fn
+                              ([conn* entry]
+                               (apply-entry* conn* entry))
+                              ([self* conn* entry context]
+                               (if (= 6 (swap! apply-attempts inc))
+                                 (throw (js/Error. "simulated Durable Object reset"))
+                                 (apply-entry* self* conn* entry context))))
+                            ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 #js {:sql sql :conn conn :schema-ready true}
+                 nil entries initial-t))]
+          (is (= "tx/reject" (:type interrupted-response)))
+          (is (= (take 5 tx-ids) (:success-tx-ids interrupted-response)))
+          (is (= (nth tx-ids 5) (:failed-tx-id interrupted-response)))
+          (is (= (+ initial-t 5) (storage/get-t sql)))
+          (let [restarted-self #js {:sql sql :conn nil :schema-ready true}
+                retry-response
+                (with-redefs [ws/broadcast! (fn [& _] nil)]
+                  (sync-handler/handle-tx-batch!
+                   restarted-self nil entries (storage/get-t sql)))
+                committed (storage/fetch-tx-since sql initial-t)]
+            (is (= "tx/batch/ok" (:type retry-response)))
+            (is (= (+ initial-t 11) (:t retry-response)))
+            (is (= 11 (count committed)))
+            (is (= "state-11"
+                   (:block/title
+                    (d/entity @(.-conn restarted-self)
+                              [:block/uuid block-uuid]))))))))))
+
+(deftest same-tx-id-with-different-payload-is-rejected-test
+  (testing "an accepted ordinary identity remains bound to its server-computed digest"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              block-uuid (random-uuid)
+              tx-id (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "payload-binding"
+                                    :block/title "before"
+                                    :block/created-at 1
+                                    :block/updated-at 1}])
+              t-before (storage/get-t sql)
+              entry-a {:tx-id tx-id
+                       :tx (protocol/tx->transit
+                            [[:db/add [:block/uuid block-uuid]
+                              :block/title "payload-a"]])
+                       :outliner-op :save-block}
+              response-a (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry-a] t-before))
+              entry-b (assoc entry-a
+                             :tx (protocol/tx->transit
+                                  [[:db/add [:block/uuid block-uuid]
+                                    :block/title "payload-b"]]))
+              response-b (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry-b] (:t response-a)))]
+          (is (= "tx/batch/ok" (:type response-a)))
+          (is (= "tx/reject" (:type response-b)))
+          (is (= "payload-a"
+                 (:block/title
+                  (d/entity @conn [:block/uuid block-uuid])))))))))
 
 (deftest sync-pull-is-blocked-when-graph-is-not-ready-for-use-test
   (async done

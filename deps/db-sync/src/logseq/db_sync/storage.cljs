@@ -39,11 +39,70 @@
                         "created_at INTEGER"
                         ");"))
   (ensure-tx-log-outliner-op-column! sql)
+  (common/sql-exec
+   sql
+   (str "create table if not exists applied_client_txs ("
+        "identity TEXT primary key,"
+        "payload_digest TEXT not null,"
+        "created_at INTEGER not null"
+        ");"))
+  (common/sql-exec
+   sql
+   (str "create table if not exists client_tx_uploads ("
+        "logical_tx_id TEXT primary key,"
+        "session_id TEXT not null,"
+        "outliner_op TEXT,"
+        "next_index INTEGER not null,"
+        "status TEXT not null,"
+        "final_index INTEGER,"
+        "final_wire_digest TEXT,"
+        "completed_digest TEXT,"
+        "created_at INTEGER not null,"
+        "updated_at INTEGER not null"
+        ");"))
+  (common/sql-exec
+   sql
+   (str "create table if not exists client_tx_upload_chunks ("
+        "session_id TEXT not null,"
+        "chunk_index INTEGER not null,"
+        "tx TEXT not null,"
+        "wire_digest TEXT not null,"
+        "datom_count INTEGER not null,"
+        "created_at INTEGER not null,"
+        "primary key(session_id, chunk_index)"
+        ");"))
   (common/sql-exec sql
                    (str "create table if not exists sync_meta ("
                         "key TEXT primary key,"
                         "value TEXT"
                         ");")))
+
+(def ^:private required-schema-columns
+  {"kvs" #{"addr" "content" "addresses"}
+   "tx_log" #{"t" "tx" "created_at" "outliner_op"}
+   "sync_meta" #{"key" "value"}
+   "applied_client_txs" #{"identity" "payload_digest" "created_at"}
+   "client_tx_uploads" #{"logical_tx_id" "session_id" "outliner_op"
+                         "next_index" "status" "final_index"
+                         "final_wire_digest" "completed_digest"
+                         "created_at" "updated_at"}
+   "client_tx_upload_chunks" #{"session_id" "chunk_index" "tx"
+                                "wire_digest" "datom_count" "created_at"}})
+
+(defn schema-ready?
+  [sql]
+  (try
+    (every?
+     (fn [[table required-columns]]
+       (let [rows (common/get-sql-rows
+                   (common/sql-exec
+                    sql
+                    (str "select name from pragma_table_info('" table "')")))
+             actual-columns (into #{} (map #(aget % "name")) rows)]
+         (every? actual-columns required-columns)))
+     required-schema-columns)
+    (catch :default _
+      false)))
 
 (defn- select-one [sql sql-str & args]
   (first (common/get-sql-rows (apply common/sql-exec sql sql-str args))))
@@ -75,6 +134,13 @@
   (set-meta! sql :t t))
 
 (def ^:dynamic *in-sql-transaction?* false)
+(defonce ^:private sql->transaction-sync (js/WeakMap.))
+
+(defn register-transaction-sync!
+  [sql transaction-sync-f]
+  (when (and sql (fn? transaction-sync-f))
+    (.set sql->transaction-sync sql transaction-sync-f))
+  sql)
 
 (defn with-sql-transaction!
   [sql f]
@@ -83,13 +149,15 @@
     (let [f' (fn []
                (binding [*in-sql-transaction?* true]
                  (f)))]
-      (if-let [db (aget sql "_db")]
-        (let [transaction (.-transaction db)]
-          (if (fn? transaction)
-            (let [tx-fn (.call transaction db f')]
-              (tx-fn))
-            (f')))
-        (f')))))
+      (if-let [transaction-sync (.get sql->transaction-sync sql)]
+        (transaction-sync f')
+        (if-let [db (aget sql "_db")]
+          (let [transaction (.-transaction db)]
+            (if (fn? transaction)
+              (let [tx-fn (.call transaction db f')]
+                (tx-fn))
+              (f')))
+          (f'))))))
 
 (defn set-initial-checksum! [sql checksum]
   (with-sql-transaction!
@@ -133,6 +201,36 @@
                    tx-str
                    created-at
                    (outliner-op->sql outliner-op)))
+
+(defn applied-client-tx-records
+  "Fetch all requested ordinary idempotency identities with one indexed query."
+  [sql identities]
+  (let [identities (->> identities (filter string?) distinct vec)]
+    (if (seq identities)
+      (let [placeholders (string/join "," (repeat (count identities) "?"))
+            rows (common/get-sql-rows
+                  (apply common/sql-exec
+                         sql
+                         (str "select identity, payload_digest "
+                              "from applied_client_txs where identity in ("
+                              placeholders ")")
+                         identities))]
+        (into {}
+              (map (fn [row]
+                     [(aget row "identity") (aget row "payload_digest")]))
+              rows))
+      {})))
+
+(defn record-applied-client-tx!
+  [sql identity payload-digest]
+  (when identity
+    (common/sql-exec
+     sql
+     (str "insert into applied_client_txs "
+          "(identity, payload_digest, created_at) values (?, ?, ?)")
+     identity
+     payload-digest
+     (common/now-ms))))
 
 (defn fetch-tx-since [sql since-t]
   (let [rows (common/get-sql-rows
