@@ -64,6 +64,9 @@ extraResources:
 
 mac:
   artifactName: ${productName}-darwin-${arch}-${version}.${ext}
+  extraResources:
+    - from: updater/ProjectUpdater
+      to: updater/ProjectUpdater
   icon: icons/logseq_big_sur.icns
   target:
     - dmg

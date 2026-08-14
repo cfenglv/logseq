@@ -49,6 +49,7 @@
   (init-updater {:repo   "logseq/logseq"
                  :win    win
                  :set-dirty! #(vreset! *quit-dirty? %)
+                 :quit! #(.quit app)
                  :restart! #(do
                               (.relaunch app)
                               (.quit app))}))

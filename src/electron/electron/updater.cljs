@@ -6,11 +6,12 @@
             [electron.logger :as logger]
             [electron.updater-config :as updater-config]
             [electron.updater-install :as updater-install]
+            [electron.updater-macos :as updater-macos]
             [electron.updater-target :as updater-target]
             [electron.utils :refer [*win prod?]]
             [frontend.version :refer [version]]
             [promesa.core :as p]
-            ["electron" :refer [ipcMain]]
+            ["electron" :refer [app ipcMain]]
             ["electron-updater" :refer [autoUpdater]]
             ["node:path" :as node-path]))
 
@@ -150,33 +151,42 @@
     (<check-for-updates! win true)))
 
 (defn- run-downloaded-install!
-  [^js win {:keys [set-dirty! restart!]}]
-  (updater-install/run-install!
-   {:preflight! (fn []
-                  (if-let [target @*downloaded-target]
-                    (updater-target/preflight-downloaded-target! target)
-                    (p/rejected (ex-info "no verified update target is downloaded"
-                                         {:code :missing-downloaded-update-target}))))
-    :begin-quiesce! #(db-worker/begin-update-quiesce! db-worker/manager)
-    :stop-active! #(db-worker/stop-active-for-update! db-worker/manager %)
-    :handoff! (fn []
-                (if (= "darwin" (.-platform js/process))
-                  (p/rejected (ex-info "the qualified macOS install helper is not configured"
-                                       {:code :macos-update-helper-unavailable}))
-                  (do
-                    (.quitAndInstall autoUpdater false true)
-                    (p/resolved true))))
-    :commit-quiesce! #(db-worker/commit-update-quiesce! db-worker/manager %)
-    :resume-quiesce! #(db-worker/resume-update-quiesce! db-worker/manager %)
-    :set-dirty! set-dirty!
-    :restart! restart!
-    :emit-error! (fn [error]
-                   (logger/warn "[updater/install]" error)
-                   (emit-update! win "error" (normalize-error error))
-                   (emit-completed! win))}))
+  [^js win {:keys [set-dirty! restart! quit!]}]
+  (let [mac? (= "darwin" (.-platform js/process))
+        mac-attempt* (atom nil)]
+    (updater-install/run-install!
+     {:preflight! (fn []
+                    (if-let [target @*downloaded-target]
+                      (p/let [_ (updater-target/preflight-downloaded-target! target)
+                              attempt (when mac?
+                                        (updater-macos/prepare-and-verify! target (.getPath app "exe")))]
+                        (reset! mac-attempt* attempt)
+                        true)
+                      (p/rejected (ex-info "no verified update target is downloaded"
+                                           {:code :missing-downloaded-update-target}))))
+      :begin-quiesce! #(db-worker/begin-update-quiesce! db-worker/manager)
+      :stop-active! #(db-worker/stop-active-for-update! db-worker/manager %)
+      :handoff! (fn []
+                  (if mac?
+                    (updater-macos/spawn-handoff! @mac-attempt*)
+                    (do
+                      (.quitAndInstall autoUpdater false true)
+                      (p/resolved true))))
+      :commit-quiesce! (fn [token]
+                         (db-worker/commit-update-quiesce! db-worker/manager token)
+                         (when mac? (quit!)))
+      :resume-quiesce! #(db-worker/resume-update-quiesce! db-worker/manager %)
+      :set-dirty! set-dirty!
+      :restart! restart!
+      :emit-error! (fn [error]
+                     (when-let [attempt @mac-attempt*]
+                       (updater-macos/discard-attempt! attempt))
+                     (logger/warn "[updater/install]" error)
+                     (emit-update! win "error" (normalize-error error))
+                     (emit-completed! win))})))
 
 (defn init-updater
-  [{:keys [^js win set-dirty! restart!] :as _opts}]
+  [{:keys [^js win set-dirty! restart! quit!] :as _opts}]
   (configure-auto-updater!)
   (let [dispose-listeners! (register-auto-updater-listeners! win)
         check-channel "check-for-updates"
@@ -190,7 +200,8 @@
                                  (.finally #(reset! *update-pending nil))))))
         install-listener (fn [_e]
                            (run-downloaded-install! win {:set-dirty! set-dirty!
-                                                        :restart! restart!}))
+                                                        :restart! restart!
+                                                        :quit! quit!}))
         get-downloaded-listener (fn [_e]
                                   (some-> @*downloaded-update bean/->js))]
     (init-auto-updater! win)
