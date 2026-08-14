@@ -3,6 +3,8 @@
 (def release-line-id "selfhost-official-architecture-v1")
 (def source-version "2.0.1-selfhost.6")
 (def synthetic-forward-target-version "2.0.1-selfhost.7")
+(def provider-base-url
+  "https://github.com/cfenglv/logseq/releases/download/selfhost-official-architecture-v1")
 
 (def ^:private supported-targets
   #{["darwin" "arm64"]
@@ -23,6 +25,9 @@
 
 (defn updater-options
   [version platform arch]
-  {:channel (updater-channel version platform arch)
-   :allow-prerelease? false
-   :allow-downgrade? false})
+  (when-let [channel (updater-channel version platform arch)]
+    {:provider "generic"
+     :feed-url provider-base-url
+     :channel channel
+     :allow-prerelease? false
+     :allow-downgrade? false}))

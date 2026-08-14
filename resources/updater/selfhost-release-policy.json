@@ -5,6 +5,11 @@
   "syntheticForwardTargetVersion": "2.0.1-selfhost.7",
   "bundleIdentity": "com.logseq.logseq",
   "forwardUpdateChannel": "selfhost-official-architecture-v1",
+  "provider": {
+    "kind": "generic",
+    "baseUrl": "https://github.com/cfenglv/logseq/releases/download/selfhost-official-architecture-v1",
+    "remoteMutation": "promotion-only"
+  },
   "firstInstall": "controlled-manual-artifact",
   "allowDowngrade": false,
   "sameVersionUpdate": false,

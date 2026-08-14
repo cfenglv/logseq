@@ -22,8 +22,12 @@
                "2.0.1-selfhost.6.nightly.20260815" "darwin" "arm64")))))
 
 (deftest updater-options-test
-  (is (= {:channel updater-config/release-line-id
+  (is (= {:provider "generic"
+          :feed-url updater-config/provider-base-url
+          :channel updater-config/release-line-id
           :allow-prerelease? false
           :allow-downgrade? false}
          (updater-config/updater-options
-          updater-config/source-version "darwin" "arm64"))))
+          updater-config/source-version "darwin" "arm64")))
+  (is (nil? (updater-config/updater-options
+             updater-config/source-version "win32" "arm64"))))
