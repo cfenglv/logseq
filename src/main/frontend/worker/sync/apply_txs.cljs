@@ -1025,6 +1025,26 @@
                        :wire-entry wire-payload}))
         wire-payload)))
 
+(defn- prepare-wire-tx-entry!
+  [repo graph-id aes-key {:keys [tx-data wire-cache] :as tx-entry}]
+  (if wire-cache
+    tx-entry
+    (p/let [tx-data* (offload-large-titles tx-data
+                                            {:repo repo
+                                             :graph-id graph-id
+                                             :aes-key aes-key})
+            tx-data** (if aes-key
+                        (sync-crypt/<encrypt-tx-data aes-key tx-data*)
+                        tx-data*)
+            freeze-wire? (or (some? aes-key)
+                             (not= tx-data tx-data*))]
+      (assoc tx-entry
+             :tx-data tx-data**
+             :freeze-wire? freeze-wire?
+             :source-digest (when freeze-wire?
+                              (sync-protocol/tx-payload-digest
+                               (:outliner-op tx-entry) tx-data))))))
+
 (defn flush-pending!
   [repo client]
   (let [inflight @(:inflight client)
@@ -1070,26 +1090,8 @@
                         _ (when (and (seq tx-entries) (sync-crypt/graph-e2ee? repo) (nil? aes-key))
                             (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
                         tx-entries* (p/all
-                                     (mapv (fn [{:keys [tx-data wire-cache] :as tx-entry}]
-                                             (if wire-cache
-                                               tx-entry
-                                               (p/let [tx-data* (offload-large-titles
-                                                                 tx-data
-                                                                 {:repo repo
-                                                                  :graph-id (:graph-id client)
-                                                                  :aes-key aes-key})
-                                                       tx-data** (if aes-key
-                                                                   (sync-crypt/<encrypt-tx-data aes-key tx-data*)
-                                                                   tx-data*)
-                                                       freeze-wire? (or (some? aes-key)
-                                                                        (not= tx-data tx-data*))]
-                                                 (assoc tx-entry
-                                                        :tx-data tx-data**
-                                                        :freeze-wire? freeze-wire?
-                                                        :source-digest
-                                                        (when freeze-wire?
-                                                          (sync-protocol/tx-payload-digest
-                                                           (:outliner-op tx-entry) tx-data))))))
+                                     (mapv (partial prepare-wire-tx-entry!
+                                                    repo (:graph-id client) aes-key)
                                            tx-entries))
                         payload (mapv #(tx-entry->wire-payload! repo %) tx-entries*)
                         tx-ids (mapv #(or (:logical-tx-id %) (:tx-id %)) tx-entries*)
