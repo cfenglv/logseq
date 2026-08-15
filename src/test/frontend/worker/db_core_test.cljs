@@ -317,6 +317,7 @@
                target-basis (activation-basis 12 34 graph-id)
                start-basis (activation-basis 11 30 graph-id)
                client-ops-db (new-memory-sqlite-db)
+               clear-history-orig worker-undo-redo/clear-history!
                events (atom [])
                target-db #js {:exec (fn [_sql] nil) :close (fn [] nil)}
                staging {:repo repo
@@ -353,6 +354,9 @@
                           {repo {:db #js {} :search #js {}
                                  :client-ops client-ops-db}})
                   (reset! worker-state/*datascript-conns {repo (atom nil)})
+                  (swap! worker-undo-redo/*undo-ops assoc repo [[:old-undo]])
+                  (swap! worker-undo-redo/*redo-ops assoc repo [[:old-redo]])
+                  (swap! worker-undo-redo/*pending-editor-info assoc repo {:old true})
                   (platform/set-platform!
                    (-> (build-test-platform {:runtime :node})
                        (assoc-in [:storage :prepare-db-artifact-swap!]
@@ -393,7 +397,18 @@
                        (swap! events conj :reopen-canonical)
                        (reset! worker-state/*client-ops-conns
                                {repo client-ops-db})
-                       (p/resolved nil))]
+                       (p/resolved nil))
+                     worker-undo-redo/clear-history!
+                     (fn [clear-repo]
+                       (swap! events conj :clear-undo)
+                       (clear-history-orig clear-repo))
+                     search-handler/<rebuild-blocks-indice!
+                     (fn [_repo _force?]
+                       (swap! events conj :start-search-rebuild)
+                       (p/resolved :started))
+                     shared-service/broadcast-to-clients!
+                     (fn [topic payload]
+                       (swap! events conj [:broadcast topic payload]))]
                     (-> (#'db-core/<commit-repair-staging! repo operation-id)
                         (p/then
                          (fn [result]
@@ -411,7 +426,13 @@
                                    (#'db-core/decode-activation-record))]
                     (is (= [:build :finalize-basis :seal-target
                             :close-canonical :prepare-artifacts :rename
-                            :reopen-canonical :cleanup-target]
+                            :reopen-canonical :clear-undo :start-search-rebuild
+                            [:broadcast :notification
+                             [nil :warning nil nil nil
+                              {:i18n-key :selfhost6/undo-history-reset}]]
+                            [:broadcast :projection-committed
+                             {:repo repo :projection-epoch 5}]
+                            :cleanup-target]
                            @events))
                     (is (= 1 (:rename-count result)))
                     (is (= {:projection-epoch 5} (:committed stored)))
@@ -428,6 +449,14 @@
                     (is (= (get-in target-basis
                                    [:checksum-basis :legacy-anchor])
                            (:latest-remote-checksum result)))
+                    (is (= ::worker-undo-redo/empty-undo-stack
+                           (worker-undo-redo/undo repo)))
+                    (is (= ::worker-undo-redo/empty-redo-stack
+                           (worker-undo-redo/redo repo)))
+                    (is (nil? (get @worker-undo-redo/*pending-editor-info repo)))
+                    (worker-undo-redo/record-ui-state! repo "post-cutover")
+                    (is (= "post-cutover"
+                           (:ui-state-str (worker-undo-redo/undo repo))))
                     (is (nil? (:prepared-swap stored))))))
                (p/catch (fn [error]
                           (is false (str error))))
@@ -569,7 +598,7 @@
           :thread-api/db-sync-stop-upload :thread-api/db-sync-resume-upload :thread-api/db-sync-upload-stopped?
           :thread-api/db-sync-get-all-block-conflicts :thread-api/db-sync-clear-block-conflicts
           :thread-api/db-sync-download-graph-by-id
-          :thread-api/create-or-open-db :thread-api/q :thread-api/datoms :thread-api/pull :thread-api/task-spent-time :thread-api/get-blocks
+          :thread-api/create-or-open-db :thread-api/get-projection-epoch :thread-api/q :thread-api/datoms :thread-api/pull :thread-api/task-spent-time :thread-api/get-blocks
           :thread-api/get-block-refs :thread-api/get-block-source
           :thread-api/get-block-parents :thread-api/set-context :thread-api/transact :thread-api/undo-redo-set-pending-editor-info
           :thread-api/undo-redo-record-editor-info :thread-api/undo-redo-record-ui-state :thread-api/undo-redo-undo
@@ -697,6 +726,9 @@
         opfs-prev @worker-state/*opfs-pools
         latest-remote-tx-prev @db-sync/*repo->latest-remote-tx
         latest-remote-checksum-prev @db-sync/*repo->latest-remote-checksum
+        undo-prev @worker-undo-redo/*undo-ops
+        redo-prev @worker-undo-redo/*redo-ops
+        pending-editor-prev @worker-undo-redo/*pending-editor-info
         main-thread-prev @worker-state/*main-thread
         platform-prev @@#'platform/*platform
         search-build-prev @(deref #'search-handler/*search-index-build-ids)
@@ -713,6 +745,9 @@
                   (reset! db-sync/*repo->latest-remote-tx latest-remote-tx-prev)
                   (reset! db-sync/*repo->latest-remote-checksum
                           latest-remote-checksum-prev)
+                  (reset! worker-undo-redo/*undo-ops undo-prev)
+                  (reset! worker-undo-redo/*redo-ops redo-prev)
+                  (reset! worker-undo-redo/*pending-editor-info pending-editor-prev)
                   (reset! worker-state/*main-thread main-thread-prev)
                   (reset! (deref #'search-handler/*search-index-build-ids) search-build-prev)
                   (reset! (deref #'search-handler/*vector-index-rebuild-ids) vector-build-prev)
@@ -726,6 +761,9 @@
     (reset! worker-state/*opfs-pools {})
     (reset! db-sync/*repo->latest-remote-tx {})
     (reset! db-sync/*repo->latest-remote-checksum {})
+    (reset! worker-undo-redo/*undo-ops {})
+    (reset! worker-undo-redo/*redo-ops {})
+    (reset! worker-undo-redo/*pending-editor-info {})
     (reset! worker-state/*main-thread nil)
     (reset! (deref #'search-handler/*search-index-build-ids) {})
     (reset! (deref #'search-handler/*vector-index-rebuild-ids) {})
@@ -2649,6 +2687,7 @@
   (let [types db-core/broadcast-data-types]
     (is (set? types))
     (is (contains? types "sync-db-changes"))
+    (is (contains? types "projection-committed"))
     (is (contains? types "sync-conflicts-updated"))
     (is (contains? types "notification"))
     (is (contains? types "log"))
@@ -4275,6 +4314,28 @@
                            vec)]
     (is (empty? missing) (str "Missing thread apis: " missing))
     (is (empty? non-functions) (str "Non-function thread apis: " non-functions))))
+
+(deftest projection-epoch-probe-is-open-graph-memory-only-test
+  (restoring-worker-state
+   (fn []
+     (let [repo "projection-epoch-probe"
+           probe (get-thread-api :thread-api/get-projection-epoch)]
+       (is (nil? (probe repo)))
+       (reset! worker-state/*datascript-conns {repo (atom nil)})
+       (worker-state/set-projection-epoch! repo 8)
+       (is (= 8 (probe repo)))))))
+
+(deftest search-query-is-suppressed-while-official-index-owner-rebuilds-test
+  (async done
+         (with-redefs [search-handler/search-index-build-active? (constantly true)]
+           (-> ((get-thread-api :thread-api/search-blocks)
+                "repair-search-rebuild" "query" {})
+               (p/then (fn [result]
+                         (is (nil? result))
+                         (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
 
 (deftest db-sync-get-all-block-conflicts-thread-api-is-explicit-and-fail-fast-test
   (restoring-worker-state

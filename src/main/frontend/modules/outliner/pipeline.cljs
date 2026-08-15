@@ -43,11 +43,17 @@
 
 (defn invoke-hooks
   [{:keys [repo tx-meta delta]}]
-  (let [current-projection? (or (nil? delta)
-                                (db-subs/current-projection? delta))]
-    (when delta
-      (db-subs/apply-delta! delta))
-    (when current-projection?
+  (if (and delta (db-subs/future-projection? delta))
+    ;; A missed compact cutover broadcast is recovered from the next official
+    ;; delta. Drop this one response and let mounted slots reload from G+1.
+    (state/pub-event!
+     [:db/projection-committed
+      {:repo repo :projection-epoch (:projection-epoch delta)}])
+    (let [current-projection? (or (nil? delta)
+                                  (db-subs/current-projection? delta))]
+      (when delta
+        (db-subs/apply-delta! delta))
+      (when current-projection?
       (let [{:keys [initial-pages? end?]} tx-meta
             current-page (state/get-current-page)
             blocks (:blocks delta)
@@ -91,4 +97,4 @@
           (state/pub-event! [:page/deleted (:deleted-page tx-meta) tx-meta]))
 
         (when (= (:outliner-op tx-meta) :rename-page)
-          (state/pub-event! [:page/renamed repo (:data tx-meta)]))))))
+          (state/pub-event! [:page/renamed repo (:data tx-meta)])))))))

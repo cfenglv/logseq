@@ -13,6 +13,7 @@
             [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
             [frontend.db.async :as db-async]
+            [frontend.db.projection-cutover :as projection-cutover]
             [frontend.extensions.fsrs :as fsrs]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.code :as code-handler]
@@ -479,6 +480,10 @@
 ;; db-worker -> UI
 (defevent! :db/sync-changes [[_ data]]
   (pipeline/invoke-hooks data)
+  nil)
+
+(defevent! :db/projection-committed [[_ payload]]
+  (projection-cutover/apply-committed! payload)
   nil)
 
 (defevent! :db/export-sqlite [_]

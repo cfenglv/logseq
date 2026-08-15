@@ -4,6 +4,14 @@
             [frontend.state :as state]
             [promesa.core :as p]))
 
+(deftest projection-commit-worker-event-stays-constant-size-test
+  (let [events (atom [])
+        payload {:repo "graph" :projection-epoch 7}]
+    (with-redefs [state/pub-event! #(swap! events conj %)]
+      (worker-handler/handle :projection-committed nil payload))
+    (is (= [[:db/projection-committed payload]] @events))
+    (is (= #{:repo :projection-epoch} (set (keys payload))))))
+
 (deftest handle-message-reports-comlink-worker-throw-with-extra-data-test
   (let [captured-events (atom [])
         logged-errors (atom [])
