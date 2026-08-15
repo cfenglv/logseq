@@ -63,6 +63,7 @@
           block-b {:block/uuid block-b-uuid :block/tx-id 1}
           row-uuids [block-b-uuid block-a-uuid]
           delta {:graph-id "editor-row-resolution-test"
+                 :projection-epoch 0
                  :rev 1
                  :blocks {block-a-uuid block-a
                           block-b-uuid block-b}
@@ -75,7 +76,8 @@
       (-> (p/with-redefs [db-subs/apply-delta!
                           (fn [value]
                             (swap! calls conj [:delta value])
-                            false)]
+                            false)
+                          db-subs/current-projection? (constantly true)]
             (p/let [_ (#'db-transact/publish-worker-response!
                        {:editor/edit-block-fn
                         (fn [rows]
@@ -96,6 +98,32 @@
                        (set! (.-flushSync react-dom) original-flush-sync)
                        (done)))))))
 
+(deftest stale-projection-worker-response-skips-editor-callback-test
+  (async done
+    (let [delta {:graph-id "stale-direct-response-test"
+                 :projection-epoch 1
+                 :rev 1
+                 :blocks {}
+                 :deleted {}
+                 :children {}
+                 :affected-keys #{}}
+          applied-deltas (atom [])
+          callback-count (atom 0)
+          original-flush-sync (.-flushSync react-dom)]
+      (set! (.-flushSync react-dom) (fn [f] (f)))
+      (-> (p/with-redefs [db-subs/current-projection? (constantly false)
+                          db-subs/apply-delta! #(swap! applied-deltas conj %)]
+            (#'db-transact/publish-worker-response!
+             {:editor/edit-block-fn #(swap! callback-count inc)}
+             delta {} [] true))
+          (p/then (fn [_]
+                    (is (= [delta] @applied-deltas))
+                    (is (zero? @callback-count)
+                        "An old projection cannot restore editor selection.")))
+          (p/finally (fn []
+                       (set! (.-flushSync react-dom) original-flush-sync)
+                       (done)))))))
+
 (deftest apply-outliner-ops-applies-the-exact-delta-once-before-editor-side-effects-test
   (async done
     (let [repo "direct-render-delta-test"
@@ -106,6 +134,7 @@
           inserted-block {:block/uuid inserted-block-id
                           :block/tx-id 2}
           delta {:graph-id repo
+                 :projection-epoch 0
                  :rev 1
                  :blocks {inserted-block-id inserted-block}
                  :deleted {}
@@ -119,6 +148,7 @@
               (f)
               (swap! calls conj :commit-end)))
       (-> (p/with-redefs [util/node-test? false
+                          db-subs/current-projection? (constantly true)
                           db-subs/apply-delta!
                           (fn [value]
                             (swap! calls conj [:delta value])
@@ -344,6 +374,7 @@
           worker-result (p/deferred)
           callback-calls (atom 0)
           delta {:graph-id "old-repo"
+                 :projection-epoch 0
                  :rev 1
                  :blocks {}
                  :deleted {}
@@ -351,6 +382,7 @@
                  :affected-keys #{[:graph]}}
           applied-deltas (atom [])]
       (-> (p/with-redefs [util/node-test? false
+                          db-subs/current-projection? (constantly false)
                           db-subs/apply-delta! (fn [value]
                                                  (swap! applied-deltas conj value)
                                                  false)

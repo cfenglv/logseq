@@ -97,6 +97,7 @@
         deleted-block-uuids (reduce disj deleted-block-uuids (keys blocks))]
     (render-delta/build
      {:graph-id repo
+      :projection-epoch (worker-state/get-projection-epoch repo)
       :rev (:max-tx db-after)
       :op-id (:db-sync/tx-id tx-meta)
       :blocks blocks

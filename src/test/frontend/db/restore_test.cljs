@@ -24,7 +24,8 @@
                       (fn [repo' _opts]
                         (is (= repo repo'))
                         (swap! calls conj [:open repo'])
-                        (p/resolved {:schema db-schema/schema}))
+                        (p/resolved {:schema db-schema/schema
+                                     :projection-epoch 7}))
                       state/pub-event!
                       (fn [event]
                         (swap! events conj event)
@@ -44,21 +45,21 @@
                       (fn [& args]
                         (swap! calls conj (into [:hydrate] args)))
                       db-subs/reset-graph!
-                      (fn [repo']
-                        (swap! reset-graphs conj repo')
-                        (swap! calls conj [:reset repo']))]
+                      (fn [repo' projection-epoch]
+                        (swap! reset-graphs conj [repo' projection-epoch])
+                        (swap! calls conj [:reset repo' projection-epoch]))]
         (-> (db-restore/restore-graph! repo)
             (p/then
              (fn [_]
                (is (= [repo] @current-repos))
-               (is (= [repo] @reset-graphs)
+               (is (= [[repo 7]] @reset-graphs)
                    "A restored worker graph must reset renderer subscriptions before rendering it.")
                (is (= [[:graph/restored repo] [:ui/re-render-root]]
                       @events))
                (is (= [[:open repo]
                        [:worker :thread-api/db-sync-get-all-block-conflicts repo]
                        [:current-repo repo]
-                       [:reset repo]
+                       [:reset repo 7]
                        [:hydrate repo conflicts-by-block]
                        [:event [:graph/restored repo]]
                        [:event [:ui/re-render-root]]]

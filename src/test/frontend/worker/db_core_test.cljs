@@ -449,9 +449,12 @@
                                  (when-not (nat-int? (:block/tx-id entity))
                                    (:block/uuid entity))))
                          entities)})))]
-      (p/let [_ ((get-thread-api :thread-api/create-or-open-db) repo opts)
+      (p/let [open-result ((get-thread-api :thread-api/create-or-open-db) repo opts)
               conn (worker-state/get-datascript-conn repo)
               {:keys [entities missing-revisions]} (first @listener-snapshots)]
+        (is (= (get opts :projection-epoch 0)
+               (:projection-epoch open-result))
+            "Graph open returns the worker-cached projection epoch.")
         (is (= 1 (count @listener-snapshots)))
         (is (= repo (:repo (first @listener-snapshots))))
         (is (seq entities))
@@ -469,7 +472,8 @@
   (async done
          (-> (restoring-worker-state
               (fn []
-                (p/let [_ (<assert-bootstrap-is-canonical! "bootstrap-new-graph" {})
+                (p/let [_ (<assert-bootstrap-is-canonical! "bootstrap-new-graph"
+                                                          {:projection-epoch 7})
                         _ (<assert-bootstrap-is-canonical! "bootstrap-datoms"
                                                           {:datoms (bootstrap-datoms)})]
                   nil)))

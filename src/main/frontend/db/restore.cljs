@@ -13,14 +13,17 @@
   (state/set-state! :graph/loading? true)
   (->
    (p/let [start-time (t/now)
-           {:keys [schema]} (persist-db/<open-and-fetch-schema repo opts)
+           {:keys [schema projection-epoch]} (persist-db/<open-and-fetch-schema repo opts)
            _ (when (nil? schema)
                (throw (ex-info "No valid schema found when reloading db" {:repo repo})))
+           _ (when-not (nat-int? projection-epoch)
+               (throw (ex-info "No valid projection epoch found when reloading db"
+                               {:repo repo :projection-epoch projection-epoch})))
            conflicts-by-block (state/<invoke-db-worker
                                :thread-api/db-sync-get-all-block-conflicts
                                repo)
            _ (state/set-current-repo! repo)
-           _ (db-subs/reset-graph! repo)
+           _ (db-subs/reset-graph! repo projection-epoch)
            _ (state/set-sync-block-conflicts! repo conflicts-by-block)
            end-time (t/now)]
      (log/info ::restore-graph!

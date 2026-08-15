@@ -41,3 +41,17 @@
           (is (true? (worker-state/online?)))))
       (finally
         (reset! worker-state/*state state-prev)))))
+
+(deftest projection-epoch-is-one-in-memory-scalar-per-open-graph-test
+  (let [state-prev @worker-state/*state
+        repo "projection-epoch-test"]
+    (try
+      (is (zero? (worker-state/get-projection-epoch repo)))
+      (is (= 7 (worker-state/set-projection-epoch! repo 7)))
+      (is (= 7 (worker-state/get-projection-epoch repo)))
+      (worker-state/clear-projection-epoch! repo)
+      (is (zero? (worker-state/get-projection-epoch repo)))
+      (is (thrown? js/Error
+                   (worker-state/set-projection-epoch! repo -1)))
+      (finally
+        (reset! worker-state/*state state-prev)))))

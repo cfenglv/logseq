@@ -375,6 +375,7 @@
   (swap! *vector-indexes dissoc repo)
   (swap! *datascript-conns dissoc repo)
   (swap! *client-ops-conns dissoc repo)
+  (worker-state/clear-projection-epoch! repo)
   (swap! client-op/*repo->pending-local-tx-count dissoc repo)
   (search-handler/clear-search-index-builds! repo)
   (when db (.close db))
@@ -752,6 +753,8 @@
          :or {close-other-db? true}
          :as opts}]
   (p/do!
+   (when (contains? opts :projection-epoch)
+     (worker-state/set-projection-epoch! repo (:projection-epoch opts)))
    (when close-other-db?
      (close-other-dbs! repo))
    (when @shared-service/*master-client?
@@ -767,7 +770,8 @@
                    (throw (ex-info "Missing worker graph connection"
                                    {:type :db/missing-connection
                                     :repo repo})))]
-    {:schema (:schema @conn)}))
+    {:schema (:schema @conn)
+     :projection-epoch (worker-state/get-projection-epoch repo)}))
 
 (def-thread-api :thread-api/unsafe-unlink-db
   [repo]
