@@ -843,6 +843,72 @@
                 :build owned-build})
         owned-build))))
 
+(defn <finalize-repair-staging!
+  "Under the short db-core commit fence, prove that the remote cursor did not
+  advance and apply only local journal rows created after the staging build.
+  Remote movement rejects this attempt so the same durable operation can
+  rebuild outside the fence; it is never merged after already-replayed locals."
+  [{:keys [repo operation target target-basis staging-owner-token] :as staging}]
+  (let [{:keys [graph-id]} operation
+        active-conn (worker-state/get-datascript-conn repo)
+        base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+    (when-not (and (repair-staging-owner? repo graph-id staging-owner-token)
+                   active-conn
+                   (seq base))
+      (throw (ex-info "Repair staging target is no longer active"
+                      {:type :db-sync/repair-staging-cancelled
+                       :repo repo})))
+    (p/let [tail-proof (<fetch-repair-diagnostics base graph-id)]
+      (when-not (= (:remote-t target-basis) (:t tail-proof))
+        (throw (ex-info "Repair staging remote basis advanced before commit"
+                        {:type :db-sync/repair-staging-remote-advanced
+                         :repo repo
+                         :staging-remote-t (:remote-t target-basis)
+                         :current-remote-t (:t tail-proof)})))
+      (let [local-state (capture-repair-local-state repo active-conn (:t tail-proof))
+            local-batch (:local-batch local-state)
+            observation (:observation local-batch)
+            new-pending-ids (->> (:pending-ids local-batch)
+                                 (filter #(< (:journal-high-water target-basis) %))
+                                 vec)]
+        (p/let [local-result (<apply-repair-local-watermark!
+                              repo (:conn target) (:active-db local-state)
+                              new-pending-ids)
+                target-checksum (sync-checksum/<recompute-checksum @(:conn target))
+                _ (ensure-repair-build-active!
+                   repo active-conn staging-owner-token)
+                final-basis
+                {:remote-t (:t tail-proof)
+                 :server-checkpoint-identity
+                 (:server-checkpoint-identity tail-proof)
+                 :journal-high-water (:journal-high-water observation)
+                 :checksum-basis
+                 {:version 1
+                  :legacy-checksum target-checksum
+                  :server-recomputed-checksum
+                  (:server-recomputed-checksum tail-proof)
+                  :server-t (:t tail-proof)
+                  :legacy-anchor (:legacy-anchor tail-proof)
+                  :metadata-proof (:metadata-proof tail-proof)}}]
+          (assoc staging
+                 :target-basis final-basis
+                 :local-result
+                 (update (:local-result staging) :local-count +
+                         (:local-count local-result))))))))
+
+(defn seal-repair-staging!
+  [{:keys [repo operation target staging-owner-token] :as staging}]
+  (let [graph-id (:graph-id operation)]
+    (when-not (repair-staging-owner? repo graph-id staging-owner-token)
+      (throw (ex-info "Repair staging target is no longer active"
+                      {:type :db-sync/repair-staging-cancelled
+                       :repo repo})))
+    (.exec (:db target) "PRAGMA wal_checkpoint(TRUNCATE)")
+    (when-let [conn (:conn target)]
+      (reset! conn nil))
+    (.close (:db target))
+    staging))
+
 (defn- <retry-failed-repair-cleanup!
   [repo graph-id owner-token error]
   (if-not (repair-staging-owner? repo graph-id owner-token)

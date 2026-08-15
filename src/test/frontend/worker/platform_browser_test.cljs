@@ -1,5 +1,6 @@
 (ns frontend.worker.platform-browser-test
   (:require [cljs.test :refer [async deftest is]]
+            [frontend.worker.platform :as platform]
             [frontend.worker.platform.browser :as platform-browser]
             [goog.object :as gobj]
             [promesa.core :as p]))
@@ -96,3 +97,23 @@
                      (gobj/set js/globalThis "location" original-location)
                      (gobj/remove js/globalThis "location"))
                    (done)))))))
+
+(deftest browser-repair-artifact-swap-is-explicitly-unsupported-test
+  (let [original-location (gobj/get js/globalThis "location")]
+    (gobj/set js/globalThis "location"
+              #js {:href "http://localhost/" :search ""})
+    (try
+      (let [platform (platform-browser/browser-platform)]
+        (is (false? (platform/db-artifact-swap-supported? platform)))
+        (is (= :selfhost6/artifact-swap-unsupported
+               (:type
+                (ex-data
+                 (try
+                   (platform/prepare-db-artifact-swap!
+                    platform nil nil {})
+                   nil
+                   (catch :default error error)))))))
+      (finally
+        (if (some? original-location)
+          (gobj/set js/globalThis "location" original-location)
+          (gobj/remove js/globalThis "location"))))))

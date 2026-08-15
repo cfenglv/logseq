@@ -80,6 +80,16 @@
           (is (= {:found? true :value replacement}
                  (client-op/read-sync-meta-value db key))))
 
+        (testing "repair cutover advances activation and official sync_meta together"
+          (is (true?
+               (client-op/commit-repair-activation-and-sync-meta!
+                db key replacement "activation-v1-target" 7 "checksum-7")))
+          (is (= {:found? true :value "activation-v1-target"}
+                 (client-op/read-sync-meta-value db key)))
+          (is (= 7 (client-op/get-local-tx "repo-activation-atomicity")))
+          (is (= "checksum-7"
+                 (client-op/get-local-checksum "repo-activation-atomicity"))))
+
         (testing "an aborted replacement leaves the previous value readable"
           (.exec db (str "create trigger abort_activation_update before update on sync_meta "
                          "when old.key = 'selfhost.activation-record.v1' "
@@ -87,10 +97,14 @@
           (is (thrown-with-msg?
                js/Error
                #"activation update aborted"
-               (client-op/compare-and-set-sync-meta-value!
-                db key replacement "activation-v1-cleared")))
-          (is (= {:found? true :value replacement}
-                 (client-op/read-sync-meta-value db key))))))))
+               (client-op/commit-repair-activation-and-sync-meta!
+                db key "activation-v1-target" "activation-v1-cleared"
+                8 "checksum-8")))
+          (is (= {:found? true :value "activation-v1-target"}
+                 (client-op/read-sync-meta-value db key)))
+          (is (= 7 (client-op/get-local-tx "repo-activation-atomicity")))
+          (is (= "checksum-7"
+                 (client-op/get-local-checksum "repo-activation-atomicity"))))))))
 
 (deftest frozen-upload-state-orphan-and-malformed-reader-boundaries-test
   (let [orphan-id #uuid "20000000-0000-4000-8000-000000000002"
