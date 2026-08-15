@@ -2,12 +2,15 @@
   (:require [cljs.test :refer [async deftest is]]
             [frontend.common.thread-api :as thread-api]
             [frontend.worker.state :as worker-state]
+            [frontend.worker.sync.apply-txs :as sync-apply]
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.crypt :as sync-crypt]
             [frontend.worker.sync.download :as sync-download]
             [frontend.worker.sync.log-and-state :as rtc-log-and-state]
+            [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
             [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-sync.snapshot :as snapshot]
+            [frontend.worker.sync.transport :as sync-transport]
             [promesa.core :as p]))
 
 (defn- frame-bytes
@@ -225,6 +228,323 @@
                                 (:type (ex-data @drift-error))))
                          (is (zero? @writes))
                          (is (zero? @claims))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (done)))))))
+
+(deftest repair-staging-resume-clears-stale-rows-pool-test
+  (async done
+         (let [operation-id #uuid "90000000-0000-4000-8000-000000000001"
+               sql-calls (atom [])
+               create-call (atom nil)
+               db #js {:exec (fn [sql] (swap! sql-calls conj sql))}
+               resource {:db db :pool :rows-pool :path "/repair-rows.sqlite"}]
+           (-> (p/with-redefs
+                 [sync-temp-sqlite/<create-named-temp-sqlite-db!
+                  (fn [pool-name file-name]
+                    (reset! create-call [pool-name file-name])
+                    (p/resolved resource))]
+                 (#'sync-download/<create-repair-rows-db! operation-id))
+               (p/then (fn [result]
+                         (is (identical? resource result))
+                         (is (= "/repair-rows.sqlite" (second @create-call)))
+                         (is (= ["delete from kvs"] @sql-calls))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest repair-staging-builder-captures-remote-then-local-watermarks-test
+  (async done
+         (let [repo "repair-staging-repo"
+               operation {:operation-id #uuid "91000000-0000-4000-8000-000000000001"
+                          :graph-id "graph-1"}
+               active-conn (atom :active-db)
+               target-conn (atom :target-db)
+               rows {:name :rows :db :rows-db :pool :rows-pool}
+               target {:name :target :db :target-db :conn target-conn :pool :target-pool}
+               diagnostics (atom [{:t 5
+                                   :legacy-anchor "server-5"
+                                   :server-recomputed-checksum "server-5"
+                                   :server-checkpoint-identity
+                                   "sync-do-checkpoint-v1:graph-1:5:server-5"
+                                   :metadata-proof
+                                   "authenticated-diagnostics-v1:graph-1:5:server-5:server-5"}
+                                  {:t 6
+                                   :legacy-anchor "server-6"
+                                   :server-recomputed-checksum "server-6"
+                                   :server-checkpoint-identity
+                                   "sync-do-checkpoint-v1:graph-1:6:server-6"
+                                   :metadata-proof
+                                   "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}])
+               checksums (atom ["server-6" "local-final"])
+               apply-calls (atom [])
+               cleaned (atom [])
+               rows-create-count (atom 0)
+               target-create-count (atom 0)
+               local-tx {:tx-id #uuid "92000000-0000-4000-8000-000000000001"}
+               config-prev @worker-state/*db-sync-config]
+           (reset! worker-state/*db-sync-config {:http-base "https://sync.example.test"})
+           (-> (p/with-redefs
+                 [sync-download/*repair-staging-builds (atom {})
+                  worker-state/get-datascript-conn (fn [_] active-conn)
+                  sync-download/<create-repair-rows-db!
+                  (fn [_]
+                    (swap! rows-create-count inc)
+                    (p/resolved rows))
+                  sync-download/<create-repair-target!
+                  (fn [_]
+                    (swap! target-create-count inc)
+                    (p/resolved target))
+                  sync-download/<cleanup-repair-resource!
+                  (fn [resource]
+                    (when resource
+                      (swap! cleaned conj (:name resource)))
+                    (p/resolved nil))
+                  sync-crypt/graph-e2ee? (fn [_] false)
+                  sync-download/<fetch-repair-snapshot-rows! (fn [& _] (p/resolved nil))
+                  sync-download/<copy-snapshot-rows-to-conn! (fn [& _] (p/resolved nil))
+                  sync-checksum/<recompute-checksum
+                  (fn [_]
+                    (let [checksum (first @checksums)]
+                      (swap! checksums subvec 1)
+                      (p/resolved checksum)))
+                  sync-download/<fetch-repair-diagnostics
+                  (fn [& _]
+                    (let [proof (first @diagnostics)]
+                      (swap! diagnostics subvec 1)
+                      (p/resolved proof)))
+                  sync-download/fetch-json
+                  (fn [url _opts schema]
+                    (is (= :sync/pull schema))
+                    (is (= "https://sync.example.test/sync/graph-1/pull?since=5" url))
+                    (p/resolved {:type "pull/ok"
+                                 :t 6
+                                 :checksum "server-6"
+                                 :txs [{:t 6 :tx "remote" :outliner-op :save-block}]}))
+                  sync-transport/parse-transit (fn [& _] [:remote-tx])
+                  sync-apply/<apply-repair-staging-tails!
+                  (fn [_conn remote-txs local-txs _active-db]
+                    (swap! apply-calls conj {:remote remote-txs :local local-txs})
+                    {:remote-count (count remote-txs)
+                     :local-count (count local-txs)})
+                  client-op/read-repair-local-batch
+                  (fn [_]
+                    {:observation {:remote-t 6
+                                   :journal-high-water 9
+                                   :pending-count 1
+                                   :legacy-anchor "server-6"}
+                     :pending-ids [9]})
+                  client-op/read-repair-local-page
+                  (fn [_ ids]
+                    (is (= [9] ids))
+                    [local-tx])]
+                 (let [build (sync-download/<build-repair-staging! repo operation)
+                       duplicate-build (sync-download/<build-repair-staging! repo operation)]
+                   (is (identical? build duplicate-build))
+                   (p/let [result build
+                           duplicate-result duplicate-build
+                           _ (sync-download/<cleanup-repair-staging! result)]
+                     (is (identical? result duplicate-result))
+                     result)))
+               (p/then
+                (fn [result]
+                  (is (= [{:remote [{:t 6
+                                     :outliner-op :save-block
+                                     :tx-data [:remote-tx]}]
+                           :local []}
+                          {:remote [] :local [local-tx]}]
+                         @apply-calls))
+                  (is (= {:remote-t 6
+                          :server-checkpoint-identity
+                          "sync-do-checkpoint-v1:graph-1:6:server-6"
+                          :journal-high-water 9
+                          :checksum-basis
+                          {:version 1
+                           :legacy-checksum "local-final"
+                           :server-recomputed-checksum "server-6"
+                           :server-t 6
+                           :legacy-anchor "server-6"
+                           :metadata-proof
+                           "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}}
+                         (:target-basis result)))
+                  (is (= [:rows :target] @cleaned))
+                  (is (= 1 @rows-create-count))
+                  (is (= 1 @target-create-count))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (done)))))))
+
+(deftest repair-staging-cleanup-failure-remains-visible-test
+  (async done
+         (let [target {:name :target :pool :target-pool}
+               staging {:target target}
+               cleanup-error (ex-info "cleanup failed" {:type :db-sync/cleanup-failed})]
+           (-> (p/with-redefs
+                 [sync-download/<cleanup-repair-resource!
+                  (fn [resource]
+                    (is (identical? target resource))
+                    (p/rejected cleanup-error))]
+                 (sync-download/<cleanup-repair-staging! staging))
+               (p/then (fn [_]
+                         (is false "expected cleanup failure")))
+               (p/catch (fn [error]
+                          (is (identical? cleanup-error error))
+                          (is (identical? target (:target staging)))))
+               (p/finally done)))))
+
+(deftest stale-repair-cleanup-cannot-release-new-owner-test
+  (async done
+         (let [repo "repair-owner-token-repo"
+               graph-id "graph-1"
+               operation {:operation-id #uuid "94000000-0000-4000-8000-000000000001"
+                          :graph-id graph-id}
+               stale-token {:cancelled? (atom false)}
+               current-token {:cancelled? (atom false)}
+               cleaned (atom 0)
+               builds (atom {[repo graph-id]
+                             {:operation-id (:operation-id operation)
+                              :owner-token current-token
+                              :build (p/resolved nil)}})]
+           (-> (p/with-redefs
+                 [sync-download/*repair-staging-builds builds
+                  sync-download/<cleanup-repair-resource!
+                  (fn [_]
+                    (swap! cleaned inc)
+                    (p/resolved nil))]
+                 (sync-download/<cleanup-repair-staging!
+                  {:repo repo
+                   :operation operation
+                   :target {:name :stale-target}
+                   :staging-owner-token stale-token}))
+               (p/then (fn [_]
+                         (is (zero? @cleaned))
+                         (is (identical? current-token
+                                         (get-in @builds
+                                                 [[repo graph-id] :owner-token])))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest graph-close-invalidates-and-cleans-repair-staging-owner-test
+  (async done
+         (let [repo "repair-close-repo"
+               graph-id "graph-1"
+               operation {:operation-id #uuid "95000000-0000-4000-8000-000000000001"
+                          :graph-id graph-id}
+               owner-token {:cancelled? (atom false)}
+               target {:name :target}
+               result {:repo repo
+                       :operation operation
+                       :target target
+                       :staging-owner-token owner-token}
+               cleaned (atom [])
+               cleanup-resolve (atom nil)
+               cleanup-promise (js/Promise. (fn [resolve]
+                                              (reset! cleanup-resolve resolve)))
+               builds (atom {[repo graph-id]
+                             {:operation-id (:operation-id operation)
+                              :owner-token owner-token
+                              :build (p/resolved result)}})]
+           (-> (p/with-redefs
+                 [sync-download/*repair-staging-builds builds
+                  sync-download/<cleanup-repair-resource!
+                  (fn [resource]
+                    (swap! cleaned conj resource)
+                    cleanup-promise)]
+                 (sync-download/close-repair-staging-for-repo! repo)
+                 (let [closing-build
+                       (-> (sync-download/<build-repair-staging! repo operation)
+                           (p/then (fn [value] {:value value}))
+                           (p/catch (fn [error] {:error error})))]
+                   (p/let [closing-result closing-build
+                           _ (do (@cleanup-resolve nil) cleanup-promise)]
+                   (is (true? @(:cancelled? owner-token)))
+                   (is (= :db-sync/repair-staging-closing
+                          (-> closing-result :error ex-data :type)))
+                   (is (= [target] @cleaned))
+                   (is (empty? @builds)))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest repair-staging-surfaces-cleanup-failure-with-unverified-tail-test
+  (async done
+         (let [repo "repair-staging-mismatch-repo"
+               operation {:operation-id #uuid "93000000-0000-4000-8000-000000000001"
+                          :graph-id "graph-1"}
+               active-conn (atom :active-db)
+               rows {:name :rows :db :rows-db :pool :rows-pool}
+               target {:name :target
+                       :db :target-db
+                       :conn (atom :target-db)
+                       :pool :target-pool}
+               cleaned (atom [])
+               cleanup-error (ex-info "target cleanup failed"
+                                      {:type :db-sync/target-cleanup-failed})
+               pull-count (atom 0)
+               apply-count (atom 0)
+               local-read-count (atom 0)
+               config-prev @worker-state/*db-sync-config]
+           (reset! worker-state/*db-sync-config {:http-base "https://sync.example.test"})
+           (-> (p/with-redefs
+                 [sync-download/*repair-staging-builds (atom {})
+                  worker-state/get-datascript-conn (fn [_] active-conn)
+                  sync-download/<create-repair-rows-db! (fn [_] (p/resolved rows))
+                  sync-download/<create-repair-target! (fn [_] (p/resolved target))
+                  sync-download/<cleanup-repair-resource!
+                  (fn [resource]
+                    (when resource
+                      (swap! cleaned conj (:name resource)))
+                    (if (= :target (:name resource))
+                      (p/rejected cleanup-error)
+                      (p/resolved nil)))
+                  sync-crypt/graph-e2ee? (fn [_] false)
+                  sync-download/<fetch-repair-snapshot-rows! (fn [& _] (p/resolved nil))
+                  sync-download/<copy-snapshot-rows-to-conn! (fn [& _] (p/resolved nil))
+                  sync-checksum/<recompute-checksum (fn [_] (p/resolved "stale-snapshot"))
+                  sync-download/<fetch-repair-diagnostics
+                  (fn [& _]
+                    (p/resolved
+                     {:t 5
+                      :legacy-anchor "server-5"
+                      :server-recomputed-checksum "server-5"
+                      :server-checkpoint-identity
+                      "sync-do-checkpoint-v1:graph-1:5:server-5"
+                      :metadata-proof
+                      "authenticated-diagnostics-v1:graph-1:5:server-5:server-5"}))
+                  sync-download/fetch-json
+                  (fn [_url _opts schema]
+                    (is (= :sync/pull schema))
+                    (swap! pull-count inc)
+                    (p/resolved {:type "pull/ok"
+                                 :t 5
+                                 :checksum "server-5"
+                                 :txs []}))
+                  sync-apply/<apply-repair-staging-tails!
+                  (fn [& _]
+                    (swap! apply-count inc)
+                    {:remote-count 0 :local-count 0})
+                  client-op/read-repair-local-batch
+                  (fn [& _]
+                    (swap! local-read-count inc)
+                    nil)]
+                 (sync-download/<build-repair-staging! repo operation))
+               (p/then (fn [_]
+                         (is false "expected unverified tail failure")))
+               (p/catch (fn [error]
+                          (is (= :db-sync/repair-staging-cleanup-failed
+                                 (:type (ex-data error))))
+                          (is (= :db-sync/repair-remote-tail-checksum-mismatch
+                                 (-> error ex-data :original-error ex-data :type)))
+                          (is (= [cleanup-error]
+                                 (:cleanup-errors (ex-data error))))
+                          (is (identical? target (:target (ex-data error))))
+                          (is (= [:rows :target] @cleaned))
+                          (is (= 1 @pull-count))
+                          (is (= 1 @apply-count))
+                          (is (zero? @local-read-count))))
                (p/finally (fn []
                             (reset! worker-state/*db-sync-config config-prev)
                             (done)))))))

@@ -194,6 +194,61 @@
         (.close client-ops-db)
         (reset! worker-state/*client-ops-conns previous-conns)))))
 
+(deftest durable-repair-owner-builds-one-staging-resource-set-test
+  (async done
+         (let [repo "repair-staging-owner-repo"
+               graph-id "graph-repair-staging-owner"
+               client-ops-db (new-memory-sqlite-db)
+               previous-conns @worker-state/*client-ops-conns
+               basis (activation-basis 12 34 graph-id)
+               empty-raw (ldb/write-transit-str @#'db-core/empty-activation-record)
+               build-count (atom 0)]
+           (reset! worker-state/*client-ops-conns {repo client-ops-db})
+           (client-op/insert-sync-meta-value-if-absent!
+            client-ops-db "selfhost.activation-record.v1" empty-raw)
+           (let [operation (:operation
+                            (#'db-core/claim-repair-operation!
+                             repo graph-id basis))]
+             (-> (p/with-redefs
+                   [sync-download/*repair-staging-builds (atom {})
+                    sync-download/<build-repair-staging-once!
+                    (fn [build-repo build-operation _owner-token]
+                      (swap! build-count inc)
+                      (p/resolved {:repo build-repo
+                                   :operation build-operation
+                                   :target nil
+                                   :target-basis {:basis :target}
+                                   :remote-result {:remote-count 2}
+                                   :local-result {:local-count 3}}))]
+                   (let [wrong-operation-error
+                         (try
+                           (#'db-core/<build-repair-staging!
+                            repo #uuid "96000000-0000-4000-8000-000000000001")
+                           nil
+                           (catch :default error error))
+                         _wrong-operation-rejected?
+                         (is (= :selfhost6/repair-operation-not-buildable
+                                (:type (ex-data wrong-operation-error))))
+                         _no-build? (is (zero? @build-count))
+                         first-build (#'db-core/<build-repair-staging!
+                                      repo (:operation-id operation))
+                         second-build (#'db-core/<build-repair-staging!
+                                       repo (:operation-id operation))]
+                     (p/let [first-result first-build
+                             second-result second-build]
+                       (is (= {:operation-id (:operation-id operation)
+                               :target-basis {:basis :target}
+                               :remote-count 2
+                               :local-count 3}
+                              first-result second-result))
+                       (is (= 1 @build-count)))))
+                 (p/catch (fn [error]
+                            (is false (str error))))
+                 (p/finally (fn []
+                              (.close client-ops-db)
+                              (reset! worker-state/*client-ops-conns previous-conns)
+                              (done))))))))
+
 (def ^:private task-spent-time-schema
   (merge db-schema/schema
          {:logseq.property.history/block {:db/valueType :db.type/ref}
@@ -221,6 +276,7 @@
           :thread-api/unsafe-unlink-db :thread-api/close-db
           :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db :thread-api/db-sync-recreate-lock
           :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-claim-repair
+          :thread-api/db-sync-build-repair-staging
           :thread-api/db-sync-import-prepare :thread-api/db-sync-import-rows-chunk
           :thread-api/db-sync-import-finalize :thread-api/release-access-handles :thread-api/db-exists
           :thread-api/export-db-binary :thread-api/import-file-graph

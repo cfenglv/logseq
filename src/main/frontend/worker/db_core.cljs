@@ -378,6 +378,43 @@
                             {:type :selfhost6/activation-record-cas-mismatch
                              :repo repo})))))))
 
+(defn- repair-operation-for-staging!
+  [repo operation-id]
+  (let [client-ops-db (or (worker-state/get-client-ops-conn repo)
+                          (throw (ex-info "Missing client-ops connection"
+                                          {:type :selfhost6/missing-client-ops
+                                           :repo repo})))
+        record (:record (read-activation-record! client-ops-db))
+        operation (:operation record)]
+    (when-not (and (= operation-id (:operation-id operation))
+                   (= :repairing (:disposition operation))
+                   (nil? (:target-basis operation))
+                   (nil? (:prepared-swap record)))
+      (throw (ex-info "Repair operation cannot build a staging target"
+                      {:type :selfhost6/repair-operation-not-buildable
+                       :repo repo
+                       :operation-id operation-id})))
+    operation))
+
+(defn- <build-repair-staging!
+  [repo operation-id]
+  (let [operation (repair-operation-for-staging! repo operation-id)]
+    (-> (sync-download/<build-repair-staging! repo operation)
+        (p/then
+         (fn [result]
+           {:operation-id operation-id
+            :target-basis (:target-basis result)
+            :remote-count (get-in result [:remote-result :remote-count])
+            :local-count (get-in result [:local-result :local-count])}))
+        (p/catch
+         (fn [error]
+           (throw (ex-info "Repair staging build failed"
+                           {:type :selfhost6/repair-staging-build-failed
+                            :repo repo
+                            :operation-id operation-id
+                            :cause-type (:type (ex-data error))}
+                           error)))))))
+
 (defn- resolve-db-path
   [repo pool path]
   (let [storage (platform/storage (platform/current))]
@@ -611,6 +648,7 @@
   (checkpoint-db! repo search)
   (checkpoint-db! repo client-ops)
   (sync-download/close-import-state-for-repo! repo)
+  (sync-download/close-repair-staging-for-repo! repo)
   (when-let [timer (get @*client-ops-cleanup-timers repo)]
     (js/clearInterval timer))
   (swap! *client-ops-cleanup-timers dissoc repo)
@@ -1091,6 +1129,10 @@
 (def-thread-api :thread-api/db-sync-claim-repair
   [repo graph-id start-basis]
   (claim-repair-operation! repo graph-id start-basis))
+
+(def-thread-api :thread-api/db-sync-build-repair-staging
+  [repo operation-id]
+  (<build-repair-staging! repo operation-id))
 
 (def-thread-api :thread-api/db-sync-import-prepare
   [repo reset? graph-id graph-e2ee? & [total-datoms]]

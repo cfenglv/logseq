@@ -338,6 +338,84 @@
      :a-child-1 (db-test/find-block-by-content @conn "a child 1")
      :b-child-1 (db-test/find-block-by-content @conn "b child 1")}))
 
+(deftest repair-staging-applies-remote-then-local-without-switching-active-graph-test
+  (async done
+         (testing "one remote tail and one official pending op converge only in staging"
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 staging-conn (d/conn-from-db @conn)
+                 child-uuid (:block/uuid child1)
+                 local-page-uuid (random-uuid)]
+             (-> (with-datascript-conns
+                   conn client-ops-conn
+                   (fn []
+                     (worker-page/create! conn "Local during repair" :uuid local-page-uuid)
+                     (let [local-txs (sync-apply/pending-txs test-repo)
+                           active-db @conn]
+                       (p/let [result (sync-apply/<apply-repair-staging-tails!
+                                        staging-conn
+                                        [{:t 1
+                                          :outliner-op :save-block
+                                          :tx-data [[:db/add [:block/uuid child-uuid]
+                                                     :block/title "Remote during repair"]]}]
+                                        local-txs
+                                        active-db)]
+                         (is (= 1 (:remote-count result)))
+                         (is (= 1 (:local-count result)))
+                         (is (= "Remote during repair"
+                                (:block/title (d/entity @staging-conn [:block/uuid child-uuid]))))
+                         (is (= "Local during repair"
+                                (:block/title (d/entity @staging-conn [:block/uuid local-page-uuid]))))
+                         (is (= "child 1"
+                                (:block/title (d/entity @conn [:block/uuid child-uuid]))))
+                         (is (= "Local during repair"
+                                (:block/title (d/entity @conn [:block/uuid local-page-uuid]))))))))
+                 (p/catch (fn [error]
+                            (is false (str error))))
+                 (p/finally done))))))
+
+(deftest repair-staging-replay-yields-without-changing-order-test
+  (async done
+         (let [remote-txs (mapv (fn [n] {:t n}) (range 17))
+               local-txs (mapv (fn [n] {:tx-id n}) (range 17))
+               suffixes (mapv (fn [n] (keyword (str "suffix-" n))) (range 17))
+               events (atom [])
+               suffix-calls (atom 0)
+               yields (atom 0)]
+           (-> (p/with-redefs
+                 [sync-apply/remote-txs-retract-entity-block-uuid-suffixes
+                  (fn [txs]
+                    (swap! suffix-calls inc)
+                    (is (= remote-txs txs))
+                    suffixes)
+                  sync-apply/transact-remote-txs-with-suffixes!
+                  (fn [_conn batch batch-suffixes _db-before]
+                    (swap! events conj
+                           [:remote (mapv :t batch) (vec batch-suffixes)])
+                    (mapv (fn [tx] {:report tx}) batch))
+                  sync-apply/rebase-local-txs!
+                  (fn [_repo _conn batch _active-db]
+                    (swap! events conj [:local (mapv :tx-id batch)])
+                    (mapv (fn [tx] {:tx-id (:tx-id tx) :status :rebased}) batch))
+                  sync-apply/<yield-repair-turn
+                  (fn []
+                    (swap! yields inc)
+                    (p/resolved nil))]
+                 (sync-apply/<apply-repair-staging-tails!
+                  :staging remote-txs local-txs :active-db))
+               (p/then
+                (fn [result]
+                  (is (= {:remote-count 17 :local-count 17} result))
+                  (is (= [[:remote (vec (range 16)) (subvec suffixes 0 16)]
+                          [:remote [16] (subvec suffixes 16)]
+                          [:local (vec (range 16))]
+                          [:local [16]]]
+                         @events))
+                  (is (= 1 @suffix-calls))
+                  (is (= 4 @yields))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
 (defn- block-id->uuid
   [db block-id]
   (cond

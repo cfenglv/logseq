@@ -298,33 +298,38 @@
            true)
          false)))))
 
+(defn- repair-local-observation-in-tx
+  [tx]
+  (let [sequence-row (sqlite-row
+                      tx
+                      "select seq from sqlite_sequence where name = 'client_ops'"
+                      [])
+        journal-row (sqlite-row
+                     tx
+                     (str "select "
+                          "sum(case when kind = 'tx' and pending = 1 then 1 else 0 end) as pending_count "
+                          "from client_ops")
+                     [])
+        local-t (some-> (sqlite-row tx
+                                    "select value from sync_meta where key = 'local-tx'"
+                                    [])
+                        (aget "value")
+                        (js/parseInt 10))]
+    {:remote-t local-t
+     :journal-high-water (or (some-> sequence-row (aget "seq")) 0)
+     :pending-count (or (some-> journal-row (aget "pending_count")) 0)
+     :legacy-anchor (some-> (sqlite-row
+                             tx
+                             "select value from sync_meta where key = 'checksum'"
+                             [])
+                            (aget "value"))}))
+
 (defn read-repair-local-observation
   "Read the journal/cursor observation used by one repair suspect check.
   This is a cold-path read transaction; it does not create a mirrored cursor."
   [repo]
   (when-let [store (sqlite-store-or-throw repo)]
-    (sqlite-with-tx!
-     store
-     (fn [tx]
-       (let [journal-row (sqlite-row
-                          tx
-                          (str "select coalesce(max(id), 0) as high_water, "
-                               "sum(case when kind = 'tx' and pending = 1 then 1 else 0 end) as pending_count "
-                               "from client_ops")
-                          [])
-             local-t (some-> (sqlite-row tx
-                                         "select value from sync_meta where key = 'local-tx'"
-                                         [])
-                             (aget "value")
-                             (js/parseInt 10))]
-         {:remote-t local-t
-          :journal-high-water (or (some-> journal-row (aget "high_water")) 0)
-          :pending-count (or (some-> journal-row (aget "pending_count")) 0)
-          :legacy-anchor (some-> (sqlite-row
-                                  tx
-                                  "select value from sync_meta where key = 'checksum'"
-                                  [])
-                                 (aget "value"))})))))
+    (sqlite-with-tx! store repair-local-observation-in-tx)))
 
 (defn- sqlite-get-meta
   [db k]
@@ -508,6 +513,58 @@
       (->> rows
            (keep row->pending-local-tx)
            vec))))
+
+(defn read-repair-local-batch
+  "Capture the next repair journal watermark and its ordered pending row IDs in
+  one read transaction. Membership uses id <= high-water; bodies are decoded
+  in bounded pages without changing the official created_at ASC, id ASC order."
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [observation (repair-local-observation-in-tx tx)
+             high-water (:journal-high-water observation)
+             rows (sqlite-rows
+                   tx
+                   (str "select id from client_ops "
+                        "where kind = 'tx' and pending = 1 and id <= ? "
+                        "order by created_at asc, id asc")
+                   [high-water])]
+         {:observation observation
+          :pending-ids (mapv #(aget % "id") rows)})))))
+
+(defn read-repair-local-page
+  "Decode one fixed ordered membership page captured by
+  read-repair-local-batch. Missing or malformed rows fail closed."
+  [repo ids]
+  (let [ids (vec ids)]
+    (if (seq ids)
+      (if-let [store (sqlite-store-or-throw repo)]
+        (sqlite-with-tx!
+         store
+         (fn [tx]
+           (let [placeholders (string/join "," (repeat (count ids) "?"))
+                 rows (sqlite-rows
+                       tx
+                       (str "select id, tx_id, outliner_op, undo_redo, "
+                            "forward_outliner_ops, inverse_outliner_ops, inferred_outliner_ops, "
+                            "normalized_tx_data, reversed_tx_data "
+                            "from client_ops where id in (" placeholders ")")
+                       ids)
+                 row-by-id (into {} (map (fn [row] [(aget row "id") row])) rows)
+                 pending-txs (mapv (fn [id]
+                                     (some-> (get row-by-id id)
+                                             row->pending-local-tx))
+                                   ids)]
+             (when (some nil? pending-txs)
+               (throw (ex-info "Repair journal membership changed during page read"
+                               {:type :db-sync/repair-journal-membership-changed})))
+             pending-txs)))
+        (throw (ex-info "Repair journal disappeared during page read"
+                        {:type :db-sync/repair-journal-membership-changed
+                         :repo repo})))
+      [])))
 
 (defn add-sync-conflicts!
   [repo conflicts]
