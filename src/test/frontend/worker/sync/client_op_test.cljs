@@ -158,6 +158,39 @@
                 :legacy-anchor "legacy-7"}
                (client-op/read-repair-local-observation repo)))))))
 
+(deftest repair-local-batch-binds-watermark-and-official-order-test
+  (let [repo "repo-repair-batch"
+        first-tx-id (random-uuid)
+        second-tx-id (random-uuid)]
+    (with-client-ops-db
+      repo
+      (fn [db]
+        (client-op/update-local-tx repo 11)
+        (doseq [tx-id [first-tx-id second-tx-id]]
+          (client-op/upsert-local-tx-entry!
+           repo {:tx-id tx-id
+                 :created-at 10
+                 :normalized-tx-data []
+                 :reversed-tx-data []}))
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id (random-uuid)
+               :created-at 20
+               :pending? false
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (.exec db "delete from client_ops where id = 3")
+        (let [{:keys [observation pending-ids]}
+              (client-op/read-repair-local-batch repo)]
+          (is (= {:remote-t 11
+                  :journal-high-water 3
+                  :pending-count 2
+                  :legacy-anchor nil}
+                 observation))
+          (is (= [1 2] pending-ids))
+          (is (= [first-tx-id second-tx-id]
+                 (mapv :tx-id
+                       (client-op/read-repair-local-page repo pending-ids)))))))))
+
 (deftest sqlite-asset-ops-coalescing-test
   (let [repo "repo-asset"
         asset-uuid (random-uuid)]

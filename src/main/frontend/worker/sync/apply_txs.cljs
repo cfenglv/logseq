@@ -1347,15 +1347,14 @@
       :block-uuid block-uuid
       :conflicts (client-op/get-sync-conflicts repo block-uuid)})))
 
-(defn- transact-remote-txs!
-  [conn remote-txs & {:keys [db-before-local-reversal]}]
-  (let [deleted-block-uuid-suffixes (remote-txs-retract-entity-block-uuid-suffixes remote-txs)]
-    (loop [remaining remote-txs
-           deleted-block-uuid-suffixes deleted-block-uuid-suffixes
-           results []]
-      (let [db @conn]
-        (if-let [remote-tx (first remaining)]
-          (let [deleted-block-uuids (first deleted-block-uuid-suffixes)
+(defn- transact-remote-txs-with-suffixes!
+  [conn remote-txs deleted-block-uuid-suffixes db-before-local-reversal]
+  (loop [remaining remote-txs
+         deleted-block-uuid-suffixes deleted-block-uuid-suffixes
+         results []]
+    (let [db @conn]
+      (if-let [remote-tx (first remaining)]
+        (let [deleted-block-uuids (first deleted-block-uuid-suffixes)
                 tx-data (some->> (:tx-data remote-tx)
                                  (map (partial resolve-temp-id db))
                                  (tx-sanitize/sanitize-tx db)
@@ -1372,14 +1371,21 @@
                 tx-data (seq tx-data)
                 tx-meta (apply-tx-meta remote-tx)
                 report (ldb/transact! conn tx-data tx-meta)
-                results' (cond-> results
-                           tx-data
-                           (conj {:tx-data tx-data
-                                  :report report}))]
-            (recur (next remaining)
-                   (next deleted-block-uuid-suffixes)
-                   results'))
-          results)))))
+              results' (cond-> results
+                         tx-data
+                         (conj {:tx-data tx-data
+                                :report report}))]
+          (recur (next remaining)
+                 (next deleted-block-uuid-suffixes)
+                 results'))
+        results))))
+
+(defn- transact-remote-txs!
+  [conn remote-txs & {:keys [db-before-local-reversal]}]
+  (transact-remote-txs-with-suffixes!
+   conn remote-txs
+   (remote-txs-retract-entity-block-uuid-suffixes remote-txs)
+   db-before-local-reversal))
 
 (defn reverse-local-txs!
   [conn local-txs]
@@ -1750,6 +1756,63 @@
   (mapv (fn [local-tx]
           (rebase-local-op! repo conn local-tx rebase-db-before))
         local-txs))
+
+(def ^:private repair-replay-batch-size 16)
+
+(defn- <yield-repair-turn
+  []
+  (js/Promise. (fn [resolve] (js/setTimeout resolve 0))))
+
+(defn- <apply-repair-remote-batches!
+  [staging-conn remote-txs]
+  (let [remote-txs (vec remote-txs)
+        suffixes (vec (remote-txs-retract-entity-block-uuid-suffixes remote-txs))]
+    (p/loop [remaining remote-txs
+             remaining-suffixes suffixes
+           applied-count 0]
+      (if (seq remaining)
+        (let [batch-size (min repair-replay-batch-size (count remaining))
+              batch (subvec remaining 0 batch-size)
+              batch-suffixes (subvec remaining-suffixes 0 batch-size)
+              remaining (subvec remaining batch-size)
+              remaining-suffixes (subvec remaining-suffixes batch-size)
+              results (transact-remote-txs-with-suffixes!
+                       staging-conn batch batch-suffixes nil)]
+          (p/let [_ (<yield-repair-turn)]
+            (p/recur remaining remaining-suffixes
+                     (+ applied-count (count results)))))
+        applied-count))))
+
+(defn- <apply-repair-local-batches!
+  [staging-conn local-txs active-db]
+  (p/loop [remaining (vec local-txs)
+           applied-count 0]
+    (if (seq remaining)
+      (let [batch-size (min repair-replay-batch-size (count remaining))
+            batch (subvec remaining 0 batch-size)
+            remaining (subvec remaining batch-size)
+            results (rebase-local-txs! nil staging-conn batch active-db)
+            failed (filterv #(= :failed (:status %)) results)]
+        (when (seq failed)
+          (throw (ex-info "Pending local operation cannot replay into repair staging"
+                          {:type :db-sync/repair-local-replay-failed
+                           :tx-ids (mapv :tx-id failed)})))
+        (p/let [_ (<yield-repair-turn)]
+          (p/recur remaining (+ applied-count (count results)))))
+      applied-count)))
+
+(defn <apply-repair-staging-tails!
+  "Apply one already-decrypted remote tail, then replay one bounded official
+  client_ops batch into an isolated staging connection. This function has no
+  journal, broadcast, conflict-table, undo, or active-repo side effects."
+  [staging-conn remote-txs local-txs active-db]
+  (if-not (and staging-conn active-db)
+    (p/rejected (ex-info "Missing repair staging context"
+                         {:type :db-sync/missing-repair-staging-context}))
+    (p/let [remote-count (<apply-repair-remote-batches! staging-conn remote-txs)
+            local-count (<apply-repair-local-batches! staging-conn local-txs active-db)]
+      {:remote-count remote-count
+       :local-count local-count})))
 
 (defn- fix-tx!
   [conn rebase-tx-report tx-meta]

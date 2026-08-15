@@ -55,12 +55,12 @@
     (-restore [_ addr]
       (restore-data-from-addr db addr))))
 
-(defn <create-temp-sqlite-db!
-  []
+(defn <create-named-temp-sqlite-db!
+  [pool-name file-name]
   (if-let [sqlite @worker-state/*sqlite]
     (let [current-platform (platform/current)]
-      (p/let [pool (platform/install-storage-pool current-platform sqlite upload-temp-pool-name)
-              path (platform/resolve-db-path current-platform upload-temp-pool-name pool "/upload.sqlite")
+      (p/let [pool (platform/install-storage-pool current-platform sqlite pool-name)
+              path (platform/resolve-db-path current-platform pool-name pool file-name)
               db (platform/sqlite-open current-platform
                                        {:sqlite sqlite
                                         :pool pool
@@ -71,6 +71,10 @@
          :pool pool
          :path path}))
     (fail-fast :db-sync/missing-field {:field :sqlite})))
+
+(defn <create-temp-sqlite-db!
+  []
+  (<create-named-temp-sqlite-db! upload-temp-pool-name "/upload.sqlite"))
 
 (defn <create-temp-sqlite-conn
   [schema datoms]
