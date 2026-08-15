@@ -572,6 +572,76 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest repair-staging-final-fence-applies-only-new-local-ids-and-rejects-remote-move-test
+  (async done
+         (let [repo "repair-final-fence-repo"
+               graph-id "repair-final-fence-graph"
+               active-conn (atom :active-db)
+               config-prev @worker-state/*db-sync-config
+               conns-prev @worker-state/*datascript-conns
+               applied-ids (atom nil)
+               remote-t* (atom 12)
+               proof (fn []
+                       (let [remote-t @remote-t*
+                             anchor "server-checksum"]
+                         {:t remote-t
+                          :legacy-anchor anchor
+                          :server-recomputed-checksum anchor
+                          :server-checkpoint-identity
+                          (str "sync-do-checkpoint-v1:" graph-id ":" remote-t ":" anchor)
+                          :metadata-proof
+                          (str "authenticated-diagnostics-v1:" graph-id ":" remote-t ":"
+                               anchor ":" anchor)}))
+               staging {:repo repo
+                        :operation {:operation-id
+                                    #uuid "99000000-0000-4000-8000-000000000001"
+                                    :graph-id graph-id}
+                        :target {:conn (atom :target-db)}
+                        :target-basis {:remote-t 12
+                                       :journal-high-water 10}
+                        :local-result {:local-count 3}
+                        :staging-owner-token {:cancelled? (atom false)}}
+               capture-outcome (fn [f]
+                                 (try
+                                   (-> (f)
+                                       (p/then (fn [value] {:value value}))
+                                       (p/catch (fn [error] {:error error})))
+                                   (catch :default error
+                                     (p/resolved {:error error}))))]
+           (reset! worker-state/*db-sync-config {:http-base "https://sync.example.test"})
+           (reset! worker-state/*datascript-conns {repo active-conn})
+           (-> (p/with-redefs
+                 [sync-download/repair-staging-owner? (fn [& _] true)
+                  sync-download/<fetch-repair-diagnostics (fn [& _] (p/resolved (proof)))
+                  sync-download/capture-repair-local-state
+                  (fn [& _]
+                    {:local-batch {:pending-ids [9 10 11 12]
+                                   :observation {:remote-t 12
+                                                 :journal-high-water 12}}
+                     :active-db :captured-active-db})
+                  sync-download/<apply-repair-local-watermark!
+                  (fn [_repo _target-conn _active-db ids]
+                    (reset! applied-ids ids)
+                    (p/resolved {:remote-count 0 :local-count (count ids)}))
+                  sync-checksum/<recompute-checksum
+                  (fn [_db] (p/resolved "target-checksum"))]
+                 (p/let [finalized (sync-download/<finalize-repair-staging! staging)
+                         _ (reset! remote-t* 13)
+                         remote-move-outcome
+                         (capture-outcome
+                          #(sync-download/<finalize-repair-staging! staging))]
+                   (is (= [11 12] @applied-ids))
+                   (is (= 12 (get-in finalized [:target-basis :journal-high-water])))
+                   (is (= 5 (get-in finalized [:local-result :local-count])))
+                   (is (= :db-sync/repair-staging-remote-advanced
+                          (:type (ex-data (:error remote-move-outcome)))))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (reset! worker-state/*datascript-conns conns-prev)
+                            (done)))))))
+
 (deftest encrypted-download-preflights-e2ee-before-fetching-snapshot-stream-test
   (async done
          (let [config-prev @worker-state/*db-sync-config

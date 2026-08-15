@@ -25,6 +25,21 @@
 
 #?(:cljs (defonce ^:private *worker-thread-api-call-id (atom 0)))
 
+#?(:cljs (defonce ^:private *invoke-wrapper-fn (atom nil)))
+
+#?(:cljs
+   (defn register-invoke-wrapper-fn!
+     [f]
+     (reset! *invoke-wrapper-fn f)))
+
+#?(:cljs
+   (defn invoke-with-wrapper
+     "Invoke one registered handler through the Worker-wide call wrapper."
+     [qkw args f]
+     (if-let [wrapper @*invoke-wrapper-fn]
+       (wrapper qkw args f)
+       (f))))
+
 #?(:cljs
    (defn- log-worker-thread-api-call!
      [data]
@@ -52,7 +67,8 @@
          (let [args (ldb/read-transit-str args-transit-str)
                handler-started-at (.now js/performance)]
            (try
-             (let [result-promise (apply f args)]
+             (let [invoke #(apply f args)
+                   result-promise (invoke-with-wrapper qkw args invoke)]
                (->
                 (p/let [result result-promise
                         handler-completed-at (.now js/performance)

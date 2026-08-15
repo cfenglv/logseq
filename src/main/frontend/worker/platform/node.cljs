@@ -496,6 +496,25 @@
        (.once stream "error" reject)
        (.once stream "end" (fn [] (resolve (.digest hasher "hex"))))))))
 
+(defn- <fsync-file!
+  [path]
+  (p/let [handle (fs/open path "r")]
+    (-> (.sync handle)
+        (p/finally #(.close handle)))))
+
+(defn- <fsync-dir!
+  [path]
+  (p/let [handle (fs/open path "r")]
+    (-> (.sync handle)
+        (p/finally #(.close handle)))))
+
+(defn- <unlink-optional!
+  [path]
+  (-> (fs/unlink path)
+      (p/catch (fn [^js error]
+                 (when-not (= "ENOENT" (.-code error))
+                   (throw error))))))
+
 (defn- <inspect-db-artifact-set
   [pool {:keys [canonical-path wal-path shm-path]}]
   (let [canonical-full-path (pool-path pool canonical-path)
@@ -517,6 +536,58 @@
         {:canonical-sha256 canonical-sha256
          :canonical-byte-size canonical-byte-size
          :bounded-memory? true}))))
+
+(defn- <prepare-db-artifact-swap!
+  [write-guard-fn canonical-pool target-pool
+   {:keys [canonical-path previous-path target-path] :as paths}]
+  (let [source-full-path (pool-path canonical-pool canonical-path)
+        previous-full-path (pool-path canonical-pool previous-path)
+        target-full-path (pool-path target-pool target-path)]
+    (p/let [_ (when write-guard-fn (write-guard-fn))
+            ^js source-stat (fs/stat source-full-path)
+            ^js target-stat (fs/stat target-full-path)
+            _ (when-not (= (.-dev source-stat) (.-dev target-stat))
+                (throw (ex-info "Repair target is not on the canonical filesystem"
+                                {:type :selfhost6/artifact-swap-cross-device})))
+            _ (<unlink-optional! (str previous-full-path "-wal"))
+            _ (<unlink-optional! (str previous-full-path "-shm"))
+            _ (fs/copyFile source-full-path previous-full-path)
+            _ (<fsync-file! previous-full-path)
+            _ (<fsync-dir! (node-path/dirname previous-full-path))
+            _ (<fsync-file! target-full-path)
+            source-result (<inspect-db-artifact-set
+                           canonical-pool
+                           {:canonical-path canonical-path
+                            :wal-path (:canonical-wal-path paths)
+                            :shm-path (:canonical-shm-path paths)})
+            target-result (<inspect-db-artifact-set
+                           target-pool
+                           {:canonical-path target-path
+                            :wal-path (:target-wal-path paths)
+                            :shm-path (:target-shm-path paths)})]
+      (when (= (:canonical-sha256 source-result)
+               (:canonical-sha256 target-result))
+        (throw (ex-info "Repair target is byte-identical to the canonical graph"
+                        {:type :selfhost6/artifact-swap-identical-target})))
+      {:source-artifact-identity source-full-path
+       :source-sha256 (:canonical-sha256 source-result)
+       :source-byte-size (:canonical-byte-size source-result)
+       :previous-artifact-identity previous-full-path
+       :target-artifact-identity target-full-path
+       :target-sha256 (:canonical-sha256 target-result)
+       :target-byte-size (:canonical-byte-size target-result)})))
+
+(defn- <commit-db-artifact-swap!
+  [write-guard-fn canonical-pool target-pool
+   {:keys [canonical-path target-path]}]
+  (let [canonical-full-path (pool-path canonical-pool canonical-path)
+        target-full-path (pool-path target-pool target-path)]
+    (p/let [_ (when write-guard-fn (write-guard-fn))
+            _ (fs/rename target-full-path canonical-full-path)
+            _ (<fsync-file! canonical-full-path)
+            _ (<fsync-dir! (node-path/dirname canonical-full-path))]
+      {:canonical-path canonical-path
+       :rename-count 1})))
 
 (defn- import-db
   [write-guard-fn pool path data]
@@ -757,6 +828,14 @@
                                     (pool-path pool path))
                  :export-file export-file
                  :inspect-db-artifact-set <inspect-db-artifact-set
+                 :prepare-db-artifact-swap!
+                 (fn [canonical-pool target-pool paths]
+                   (<prepare-db-artifact-swap!
+                    write-guard-fn canonical-pool target-pool paths))
+                 :commit-db-artifact-swap!
+                 (fn [canonical-pool target-pool paths]
+                   (<commit-db-artifact-swap!
+                    write-guard-fn canonical-pool target-pool paths))
                  :import-db (fn [pool path data] (import-db write-guard-fn pool path data))
                  :remove-vfs! (fn [pool] (remove-vfs! pool))
                  :read-text! (fn [path] (read-text! data-dir path))

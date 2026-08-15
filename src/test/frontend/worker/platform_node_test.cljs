@@ -195,6 +195,47 @@
                           (is false (str "unexpected error: " error))))
                (p/finally done)))))
 
+(deftest node-platform-prepares-previous-and-commits-one-canonical-rename-test
+  (async done
+         (let [root-dir (node-helper/create-tmp-dir "platform-node-artifact-swap")
+               source (js/Uint8Array. #js [1 2 3])
+               target (js/Uint8Array. #js [4 5 6])
+               paths {:canonical-path "/db.sqlite"
+                      :canonical-wal-path "/db.sqlite-wal"
+                      :canonical-shm-path "/db.sqlite-shm"
+                      :previous-path "/db.previous.sqlite"
+                      :target-path "/repair-target.sqlite"
+                      :target-wal-path "/repair-target.sqlite-wal"
+                      :target-shm-path "/repair-target.sqlite-shm"}]
+           (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir})
+                       storage (:storage platform)
+                       canonical-pool ((:install-opfs-pool storage) nil "swap-canonical")
+                       target-pool ((:install-opfs-pool storage) nil "swap-target")
+                       _ ((:import-db storage) canonical-pool "/db.sqlite" source)
+                       _ ((:import-db storage) target-pool "/repair-target.sqlite" target)
+                       prepared ((:prepare-db-artifact-swap! storage)
+                                 canonical-pool target-pool paths)
+                       previous ((:export-file storage)
+                                 canonical-pool "/db.previous.sqlite")
+                       before ((:export-file storage) canonical-pool "/db.sqlite")
+                       committed ((:commit-db-artifact-swap! storage)
+                                  canonical-pool target-pool paths)
+                       after ((:export-file storage) canonical-pool "/db.sqlite")]
+                 (is (= "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81"
+                        (:source-sha256 prepared)))
+                 (is (= "787c798e39a5bc1910355bae6d0cd87a36b2e10fd0202a83e3bb6b005da83472"
+                        (:target-sha256 prepared)))
+                 (is (string/includes? (:target-artifact-identity prepared)
+                                       "swap-target/repair-target.sqlite"))
+                 (is (= (vec source) (vec previous)))
+                 (is (= (vec source) (vec before)))
+                 (is (= {:canonical-path "/db.sqlite" :rename-count 1}
+                        committed))
+                 (is (= (vec target) (vec after))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally done)))))
+
 (deftest node-platform-cli-owner-bypasses-keychain-in-cli-e2e-test
   (async done
     (let [root-dir (node-helper/create-tmp-dir "platform-node-cli-secrets")

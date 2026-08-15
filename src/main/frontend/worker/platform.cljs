@@ -58,6 +58,32 @@
     (throw (ex-info "platform storage/inspect-db-artifact-set missing"
                     {:paths paths}))))
 
+(defn db-artifact-swap-supported?
+  [platform]
+  (let [storage-adapter (:storage platform)]
+    (and (fn? (:prepare-db-artifact-swap! storage-adapter))
+         (fn? (:commit-db-artifact-swap! storage-adapter)))))
+
+(defn require-db-artifact-swap!
+  [platform]
+  (when-not (db-artifact-swap-supported? platform)
+    (throw (ex-info "Platform does not support an atomic graph artifact swap"
+                    {:type :selfhost6/artifact-swap-unsupported
+                     :runtime (env-flag platform :runtime)})))
+  nil)
+
+(defn prepare-db-artifact-swap!
+  [platform canonical-pool target-pool paths]
+  (require-db-artifact-swap! platform)
+  ((get-in platform [:storage :prepare-db-artifact-swap!])
+   canonical-pool target-pool paths))
+
+(defn commit-db-artifact-swap!
+  [platform canonical-pool target-pool paths]
+  (require-db-artifact-swap! platform)
+  ((get-in platform [:storage :commit-db-artifact-swap!])
+   canonical-pool target-pool paths))
+
 (defn remove-storage-pool!
   [platform pool]
   (if-let [f (get-in platform [:storage :remove-vfs!])]

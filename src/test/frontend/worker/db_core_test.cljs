@@ -24,6 +24,7 @@
             [frontend.worker.platform :as platform]
             [frontend.worker.platform.node :as platform-node]
             [frontend.worker.query-dsl :as worker-query-dsl]
+            [frontend.worker.repair-commit-fence :as repair-commit-fence]
             [frontend.worker.search :as search]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
@@ -51,7 +52,7 @@
 (def ^:private source-artifact-sha (apply str (repeat 64 "a")))
 (def ^:private target-artifact-sha (apply str (repeat 64 "b")))
 
-(declare new-memory-sqlite-db)
+(declare new-memory-sqlite-db restoring-worker-state build-test-platform)
 
 (defn- test-sha256-hex
   [payload]
@@ -249,6 +250,308 @@
                               (reset! worker-state/*client-ops-conns previous-conns)
                               (done))))))))
 
+(deftest repair-commit-fence-drains-started-call-and-holds-later-call-test
+  (async done
+         (let [repo "repair-commit-fence-repo"
+               operation-id #uuid "97000000-0000-4000-8000-000000000001"
+               started (p/deferred)
+               finish-started (p/deferred)
+               later-ran? (atom false)]
+           (repair-commit-fence/reset-for-test!)
+           (let [started-call
+                 (repair-commit-fence/<with-repo-call!
+                  repo
+                  (fn []
+                    (p/resolve! started true)
+                    finish-started))]
+             (-> (p/let [_ started]
+                   (let [fence-promise (repair-commit-fence/<enter!
+                                        repo operation-id)
+                         later-call (repair-commit-fence/<with-repo-call!
+                                     repo
+                                     (fn []
+                                       (reset! later-ran? true)
+                                       :later))]
+                     (is (false? @later-ran?))
+                     (p/resolve! finish-started :started-finished)
+                     (p/let [owner-token fence-promise
+                             started-result started-call]
+                       (is (= :started-finished started-result))
+                       (is (false? @later-ran?))
+                       (is (repair-commit-fence/owner? repo owner-token))
+                       (repair-commit-fence/release! repo owner-token)
+                       (p/let [later-result later-call]
+                         (is (= :later later-result))
+                         (is (true? @later-ran?))))))
+                 (p/catch (fn [error]
+                            (is false (str error))))
+                 (p/finally (fn []
+                              (repair-commit-fence/reset-for-test!)
+                              (done))))))))
+
+(deftest unsupported-repair-artifact-swap-fails-before-staging-test
+  (restoring-worker-state
+   (fn []
+     (let [build-count (atom 0)
+           error (with-redefs
+                   [sync-download/<build-repair-staging!
+                    (fn [& _]
+                      (swap! build-count inc)
+                      (p/resolved nil))]
+                   (try
+                     (#'db-core/<commit-repair-staging!
+                      "browser-repair-unsupported"
+                      #uuid "97900000-0000-4000-8000-000000000001")
+                     nil
+                     (catch :default error
+                       error)))]
+       (is (= :selfhost6/artifact-swap-unsupported
+              (:type (ex-data error))))
+       (is (zero? @build-count))))))
+
+(deftest repair-artifact-commit-writes-proof-renames-and-rolls-forward-test
+  (async done
+         (let [repo "repair-artifact-commit-repo"
+               graph-id "repair-artifact-commit-graph"
+               operation-id #uuid "98000000-0000-4000-8000-000000000001"
+               target-basis (activation-basis 12 34 graph-id)
+               start-basis (activation-basis 11 30 graph-id)
+               client-ops-db (new-memory-sqlite-db)
+               events (atom [])
+               target-db #js {:exec (fn [_sql] nil) :close (fn [] nil)}
+               staging {:repo repo
+                        :operation {:operation-id operation-id :graph-id graph-id}
+                        :target {:db target-db :conn (atom nil) :pool #js {}}
+                        :target-basis target-basis
+                        :remote-result {:remote-count 1}
+                        :local-result {:local-count 2}
+                        :staging-owner-token #js {}}
+               activation {:format-version 1
+                           :record-kind :selfhost-activation
+                           :committed {:projection-epoch 4}
+                           :previous {:projection-epoch 3}
+                           :operation {:operation-id operation-id
+                                       :graph-id graph-id
+                                       :target-projection-epoch 5
+                                       :start-basis start-basis
+                                       :target-basis nil
+                                       :disposition :repairing
+                                       :attempt-count 1
+                                       :next-retry-at-ms nil
+                                       :last-error nil}
+                           :prepared-swap nil}]
+           (repair-commit-fence/reset-for-test!)
+           (client-op/insert-sync-meta-value-if-absent!
+            client-ops-db "selfhost.activation-record.v1"
+            (ldb/write-transit-str activation))
+           (-> (restoring-worker-state
+                (fn []
+                  (reset! worker-state/*client-ops-conns {repo client-ops-db})
+                  (client-op/update-local-tx repo 11)
+                  (client-op/update-local-checksum repo "source-checksum")
+                  (reset! worker-state/*sqlite-conns
+                          {repo {:db #js {} :search #js {}
+                                 :client-ops client-ops-db}})
+                  (reset! worker-state/*datascript-conns {repo (atom nil)})
+                  (platform/set-platform!
+                   (-> (build-test-platform {:runtime :node})
+                       (assoc-in [:storage :prepare-db-artifact-swap!]
+                                 (fn [_canonical-pool _target-pool _paths]
+                                   (swap! events conj :prepare-artifacts)
+                                   (p/resolved
+                                    {:source-artifact-identity "/db.sqlite"
+                                     :source-sha256 source-artifact-sha
+                                     :target-artifact-identity "/repair-target.sqlite"
+                                     :target-sha256 target-artifact-sha})))
+                       (assoc-in [:storage :commit-db-artifact-swap!]
+                                 (fn [_canonical-pool _target-pool _paths]
+                                   (swap! events conj :rename)
+                                   (p/resolved {:rename-count 1})))))
+                  (p/with-redefs
+                    [sync-download/<build-repair-staging!
+                     (fn [_repo _operation]
+                       (swap! events conj :build)
+                       (p/resolved staging))
+                     sync-download/<finalize-repair-staging!
+                     (fn [value]
+                       (swap! events conj :finalize-basis)
+                       (p/resolved value))
+                     sync-download/seal-repair-staging!
+                     (fn [value]
+                       (swap! events conj :seal-target)
+                       value)
+                     sync-download/<cleanup-repair-staging!
+                     (fn [_value]
+                       (swap! events conj :cleanup-target)
+                       (p/resolved nil))
+                     db-core/close-canonical-for-repair!
+                     (fn [_repo]
+                       (swap! events conj :close-canonical)
+                       client-ops-db)
+                     db-core/<reopen-canonical-after-repair!
+                     (fn [_repo _client-ops-db]
+                       (swap! events conj :reopen-canonical)
+                       (reset! worker-state/*client-ops-conns
+                               {repo client-ops-db})
+                       (p/resolved nil))]
+                    (-> (#'db-core/<commit-repair-staging! repo operation-id)
+                        (p/then
+                         (fn [result]
+                           (assoc result
+                                  :latest-remote-tx
+                                  (get @db-sync/*repo->latest-remote-tx repo)
+                                  :latest-remote-checksum
+                                  (get @db-sync/*repo->latest-remote-checksum
+                                       repo))))))))
+               (p/then
+                (fn [result]
+                  (let [stored (-> (client-op/read-sync-meta-value
+                                    client-ops-db "selfhost.activation-record.v1")
+                                   :value
+                                   (#'db-core/decode-activation-record))]
+                    (is (= [:build :finalize-basis :seal-target
+                            :close-canonical :prepare-artifacts :rename
+                            :reopen-canonical :cleanup-target]
+                           @events))
+                    (is (= 1 (:rename-count result)))
+                    (is (= {:projection-epoch 5} (:committed stored)))
+                    (is (= {:projection-epoch 4} (:previous stored)))
+                    (is (= target-basis (get-in stored [:operation :target-basis])))
+                    (is (= "12"
+                           (:value (client-op/read-sync-meta-value
+                                    client-ops-db "local-tx"))))
+                    (is (= (get-in target-basis
+                                   [:checksum-basis :legacy-checksum])
+                           (:value (client-op/read-sync-meta-value
+                                    client-ops-db "checksum"))))
+                    (is (= 12 (:latest-remote-tx result)))
+                    (is (= (get-in target-basis
+                                   [:checksum-basis :legacy-anchor])
+                           (:latest-remote-checksum result)))
+                    (is (nil? (:prepared-swap stored))))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (repair-commit-fence/reset-for-test!)
+                            (when (.-open client-ops-db)
+                              (.close client-ops-db))
+                            (done)))))))
+
+(deftest repair-artifact-rename-failure-reconciles-source-and-cleans-staging-test
+  (async done
+         (let [repo "repair-artifact-source-recovery-repo"
+               graph-id "repair-artifact-source-recovery-graph"
+               operation-id #uuid "98100000-0000-4000-8000-000000000001"
+               start-basis (activation-basis 11 30 graph-id)
+               target-basis (activation-basis 12 34 graph-id)
+               client-ops-db (new-memory-sqlite-db)
+               events (atom [])
+               staging {:repo repo
+                        :operation {:operation-id operation-id :graph-id graph-id}
+                        :target {:db #js {} :conn (atom nil) :pool #js {}}
+                        :target-basis target-basis
+                        :remote-result {:remote-count 1}
+                        :local-result {:local-count 2}
+                        :staging-owner-token #js {}}
+               activation {:format-version 1
+                           :record-kind :selfhost-activation
+                           :committed {:projection-epoch 4}
+                           :previous {:projection-epoch 3}
+                           :operation {:operation-id operation-id
+                                       :graph-id graph-id
+                                       :target-projection-epoch 5
+                                       :start-basis start-basis
+                                       :target-basis nil
+                                       :disposition :repairing
+                                       :attempt-count 1
+                                       :next-retry-at-ms nil
+                                       :last-error nil}
+                           :prepared-swap nil}]
+           (repair-commit-fence/reset-for-test!)
+           (client-op/insert-sync-meta-value-if-absent!
+            client-ops-db "selfhost.activation-record.v1"
+            (ldb/write-transit-str activation))
+           (-> (restoring-worker-state
+                (fn []
+                  (reset! worker-state/*client-ops-conns {repo client-ops-db})
+                  (client-op/update-local-tx repo 11)
+                  (client-op/update-local-checksum repo "source-checksum")
+                  (reset! worker-state/*sqlite-conns
+                          {repo {:db #js {} :search #js {}
+                                 :client-ops client-ops-db}})
+                  (reset! worker-state/*datascript-conns {repo (atom nil)})
+                  (platform/set-platform!
+                   (-> (build-test-platform {:runtime :node})
+                       (assoc-in [:storage :prepare-db-artifact-swap!]
+                                 (fn [& _]
+                                   (swap! events conj :prepare)
+                                   (p/resolved
+                                    {:source-artifact-identity "/db.sqlite"
+                                     :source-sha256 source-artifact-sha
+                                     :target-artifact-identity "/repair-target.sqlite"
+                                     :target-sha256 target-artifact-sha})))
+                       (assoc-in [:storage :commit-db-artifact-swap!]
+                                 (fn [& _]
+                                   (swap! events conj :rename-failed)
+                                   (p/rejected
+                                    (ex-info "rename failed"
+                                             {:type :test/rename-failed}))))
+                       (assoc-in [:storage :inspect-db-artifact-set]
+                                 (fn [& _]
+                                   (p/resolved
+                                    {:canonical-sha256 source-artifact-sha
+                                     :canonical-byte-size 3
+                                     :bounded-memory? true})))))
+                  (p/with-redefs
+                    [sync-download/<build-repair-staging!
+                     (fn [& _] (p/resolved staging))
+                     sync-download/<finalize-repair-staging! p/resolved
+                     sync-download/seal-repair-staging! identity
+                     sync-download/<cleanup-repair-staging!
+                     (fn [_]
+                       (swap! events conj :cleanup)
+                       (p/resolved nil))
+                     db-core/close-canonical-for-repair!
+                     (fn [_]
+                       (swap! events conj :close)
+                       client-ops-db)
+                     db-core/<reopen-canonical-after-repair!
+                     (fn [_ _]
+                       (swap! events conj :reconcile-source)
+                       (let [{:keys [raw record]}
+                             (#'db-core/read-activation-record! client-ops-db)]
+                         (#'db-core/<reconcile-activation-record!
+                          #js {} client-ops-db {:raw raw :record record})))]
+                    (-> (#'db-core/<commit-repair-staging! repo operation-id)
+                        (p/then (fn [value] {:value value}))
+                        (p/catch (fn [error] {:error error}))))))
+               (p/then
+                (fn [{:keys [error]}]
+                  (let [stored (-> (client-op/read-sync-meta-value
+                                    client-ops-db "selfhost.activation-record.v1")
+                                   :value
+                                   (#'db-core/decode-activation-record))]
+                    (is (= :test/rename-failed (:type (ex-data error))))
+                    (is (= [:close :prepare :rename-failed
+                            :reconcile-source :cleanup]
+                           @events))
+                    (is (= {:projection-epoch 4} (:committed stored)))
+                    (is (= target-basis (get-in stored [:operation :target-basis])))
+                    (is (= "11"
+                           (:value (client-op/read-sync-meta-value
+                                    client-ops-db "local-tx"))))
+                    (is (= "source-checksum"
+                           (:value (client-op/read-sync-meta-value
+                                    client-ops-db "checksum"))))
+                    (is (nil? (:prepared-swap stored))))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (repair-commit-fence/reset-for-test!)
+                            (when (.-open client-ops-db)
+                              (.close client-ops-db))
+                            (done)))))))
+
 (def ^:private task-spent-time-schema
   (merge db-schema/schema
          {:logseq.property.history/block {:db/valueType :db.type/ref}
@@ -276,7 +579,7 @@
           :thread-api/unsafe-unlink-db :thread-api/close-db
           :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db :thread-api/db-sync-recreate-lock
           :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-claim-repair
-          :thread-api/db-sync-build-repair-staging
+          :thread-api/db-sync-build-repair-staging :thread-api/db-sync-commit-repair
           :thread-api/db-sync-import-prepare :thread-api/db-sync-import-rows-chunk
           :thread-api/db-sync-import-finalize :thread-api/release-access-handles :thread-api/db-exists
           :thread-api/export-db-binary :thread-api/import-file-graph
@@ -392,6 +695,8 @@
         datascript-prev @worker-state/*datascript-conns
         client-ops-prev @worker-state/*client-ops-conns
         opfs-prev @worker-state/*opfs-pools
+        latest-remote-tx-prev @db-sync/*repo->latest-remote-tx
+        latest-remote-checksum-prev @db-sync/*repo->latest-remote-checksum
         main-thread-prev @worker-state/*main-thread
         platform-prev @@#'platform/*platform
         search-build-prev @(deref #'search-handler/*search-index-build-ids)
@@ -405,6 +710,9 @@
                   (reset! worker-state/*datascript-conns datascript-prev)
                   (reset! worker-state/*client-ops-conns client-ops-prev)
                   (reset! worker-state/*opfs-pools opfs-prev)
+                  (reset! db-sync/*repo->latest-remote-tx latest-remote-tx-prev)
+                  (reset! db-sync/*repo->latest-remote-checksum
+                          latest-remote-checksum-prev)
                   (reset! worker-state/*main-thread main-thread-prev)
                   (reset! (deref #'search-handler/*search-index-build-ids) search-build-prev)
                   (reset! (deref #'search-handler/*vector-index-rebuild-ids) vector-build-prev)
@@ -416,6 +724,8 @@
     (reset! worker-state/*datascript-conns {})
     (reset! worker-state/*client-ops-conns {})
     (reset! worker-state/*opfs-pools {})
+    (reset! db-sync/*repo->latest-remote-tx {})
+    (reset! db-sync/*repo->latest-remote-checksum {})
     (reset! worker-state/*main-thread nil)
     (reset! (deref #'search-handler/*search-index-build-ids) {})
     (reset! (deref #'search-handler/*vector-index-rebuild-ids) {})
@@ -854,6 +1164,22 @@
           (is (= (:operation expected)
                  (:operation (#'db-core/decode-activation-record raw-after-first))))
           (is (nil? (:prepared-swap (#'db-core/decode-activation-record raw-after-first))))
+          (if (= canonical-side :target)
+            (do
+              (is (= (str (get-in record
+                                  [:prepared-swap :target-basis :remote-t]))
+                     (:value (client-op/read-sync-meta-value
+                              client-ops-db "local-tx"))))
+              (is (= (get-in record
+                             [:prepared-swap :target-basis
+                              :checksum-basis :legacy-checksum])
+                     (:value (client-op/read-sync-meta-value
+                              client-ops-db "checksum")))))
+            (do
+              (is (false? (:found? (client-op/read-sync-meta-value
+                                    client-ops-db "local-tx"))))
+              (is (false? (:found? (client-op/read-sync-meta-value
+                                    client-ops-db "checksum"))))))
           (is (= (get-in expected [:committed :projection-epoch])
                  (worker-state/get-projection-epoch repo)))
           (is (= [:open "client-ops-/db.sqlite"] (first @events)))

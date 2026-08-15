@@ -2,6 +2,7 @@
   "Sync client"
   (:require
    [frontend.worker.platform :as platform]
+   [frontend.worker.repair-commit-fence :as repair-commit-fence]
    [frontend.worker.shared-service :as shared-service]
    [frontend.worker.state :as worker-state]
    [frontend.worker.sync.apply-txs :as sync-apply]
@@ -168,13 +169,15 @@
              (-> (or prev (p/resolved nil))
                  ;; Keep queue alive even if one message handler fails.
                  (p/catch (fn [_] nil))
-                 (p/then (fn [_] (task)))
+                 (p/then (fn [_]
+                           (repair-commit-fence/<with-repo-call!
+                            (:repo client) task)))
                  (p/catch (fn [error]
                             (sync-util/set-last-sync-error! client error)
                             (log/error :db-sync/ws-handle-message-failed
                                        {:repo (:repo client)
                                         :error error}))))))
-    (task)))
+    (repair-commit-fence/<with-repo-call! (:repo client) task)))
 
 (defn update-presence!
   [editing-block-uuid]

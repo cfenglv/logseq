@@ -298,6 +298,52 @@
            true)
          false)))))
 
+(defn commit-repair-activation-and-sync-meta!
+  "Atomically replace the activation value and advance the two existing
+  canonical sync_meta fields to one verified repair target basis. A stale
+  activation CAS changes none of the three rows."
+  [db activation-key expected-value replacement-value remote-t checksum]
+  (when-not (and (integer? remote-t) (>= remote-t 0) (string? checksum))
+    (throw (ex-info "Invalid repair sync_meta target"
+                    {:type :db-sync/invalid-repair-sync-meta-target
+                     :remote-t remote-t})))
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (let [activation-row
+           (sqlite-row tx "select value from sync_meta where key = ?"
+                       [activation-key])
+           current-t
+           (some-> (sqlite-row tx
+                               "select value from sync_meta where key = 'local-tx'"
+                               [])
+                   (aget "value")
+                   (js/parseInt 10))]
+       (if (and activation-row
+                (= expected-value (aget activation-row "value")))
+         (do
+           (when (and current-t (< remote-t current-t))
+             (throw (ex-info "Repair remote cursor would move backward"
+                             {:type :db-sync/repair-remote-cursor-regression
+                              :current-t current-t
+                              :target-t remote-t})))
+           (sqlite-run! tx
+                        "update sync_meta set value = ? where key = ?"
+                        [replacement-value activation-key])
+           (sqlite-run!
+            tx
+            (str "insert into sync_meta (key, value) values (?, ?)"
+                 " on conflict(key) do update set value = excluded.value")
+            ["local-tx" (str remote-t)])
+           (sqlite-run!
+            tx
+            (str "insert into sync_meta (key, value) values (?, ?)"
+                 " on conflict(key) do update set value = excluded.value")
+            ["checksum" checksum])
+           true)
+         false)))))
+
 (defn- repair-local-observation-in-tx
   [tx]
   (let [sequence-row (sqlite-row

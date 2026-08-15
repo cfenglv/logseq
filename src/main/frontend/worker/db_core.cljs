@@ -31,6 +31,7 @@
    [frontend.worker.pipeline :as worker-pipeline]
    [frontend.worker.platform :as platform]
    [frontend.worker.publish]
+   [frontend.worker.repair-commit-fence :as repair-commit-fence]
    [frontend.worker.search :as search]
    [frontend.worker.shared-service :as shared-service]
    [frontend.worker.state :as worker-state]
@@ -131,6 +132,8 @@
 
 (def repo-path "/db.sqlite")
 (def client-ops-repo-path (str "client-ops" repo-path))
+(def ^:private previous-repo-path "/db.previous.sqlite")
+(def ^:private repair-target-path "/repair-target.sqlite")
 
 (def ^:private activation-record-key "selfhost.activation-record.v1")
 (def ^:private empty-activation-record
@@ -312,10 +315,20 @@
              {:canonical-path repo-path
               :wal-path (str repo-path "-wal")
               :shm-path (str repo-path "-shm")})]
-      (let [next-record (reconcile-prepared-activation record canonical-sha256)
-            next-raw (ldb/write-transit-str next-record)]
-        (when-not (client-op/compare-and-set-sync-meta-value!
-                   client-ops-db activation-record-key raw next-raw)
+      (let [prepared (:prepared-swap record)
+            target-side? (= canonical-sha256 (:target-sha256 prepared))
+            next-record (reconcile-prepared-activation record canonical-sha256)
+            next-raw (ldb/write-transit-str next-record)
+            committed?
+            (if target-side?
+              (client-op/commit-repair-activation-and-sync-meta!
+               client-ops-db activation-record-key raw next-raw
+               (get-in prepared [:target-basis :remote-t])
+               (get-in prepared
+                       [:target-basis :checksum-basis :legacy-checksum]))
+              (client-op/compare-and-set-sync-meta-value!
+               client-ops-db activation-record-key raw next-raw))]
+        (when-not committed?
           (throw (ex-info "Activation record changed during startup reconciliation"
                           {:type :selfhost6/activation-record-cas-mismatch})))
         next-record))))
@@ -329,6 +342,83 @@
                       {:type :selfhost6/missing-activation-record})))
     {:raw value
      :record (decode-activation-record value)}))
+
+(defn- update-activation-record!
+  [client-ops-db update-fn]
+  (let [{:keys [raw record]} (read-activation-record! client-ops-db)
+        next-record (update-fn record)
+        _ (when-not (valid-activation-record? next-record)
+            (throw (ex-info "Repair commit produced an invalid activation record"
+                            {:type :selfhost6/invalid-activation-record})))
+        next-raw (ldb/write-transit-str next-record)]
+    (when-not (client-op/compare-and-set-sync-meta-value!
+               client-ops-db activation-record-key raw next-raw)
+      (throw (ex-info "Activation record changed during repair commit"
+                      {:type :selfhost6/activation-record-cas-mismatch})))
+    next-record))
+
+(defn- persist-repair-target-basis!
+  [client-ops-db operation-id target-basis]
+  (update-activation-record!
+   client-ops-db
+   (fn [record]
+     (let [operation (:operation record)]
+       (when-not (and (= operation-id (:operation-id operation))
+                      (= :repairing (:disposition operation))
+                      (nil? (:prepared-swap record))
+                      (valid-basis? target-basis (:graph-id operation))
+                      (basis-not-before? target-basis (:start-basis operation)))
+         (throw (ex-info "Repair target basis cannot be committed"
+                         {:type :selfhost6/repair-target-basis-rejected
+                          :operation-id operation-id})))
+       (assoc-in record [:operation :target-basis] target-basis)))))
+
+(defn- persist-prepared-swap!
+  [client-ops-db operation-id target-basis artifact-proof]
+  (update-activation-record!
+   client-ops-db
+   (fn [record]
+     (let [operation (:operation record)
+           prepared-swap
+           {:operation-id operation-id
+            :source-artifact-identity (:source-artifact-identity artifact-proof)
+            :source-sha256 (:source-sha256 artifact-proof)
+            :target-artifact-identity (:target-artifact-identity artifact-proof)
+            :target-sha256 (:target-sha256 artifact-proof)
+            :target-basis target-basis
+            :written-at-ms (js/Date.now)}]
+       (when-not (and (= operation-id (:operation-id operation))
+                      (= target-basis (:target-basis operation))
+                      (nil? (:prepared-swap record)))
+         (throw (ex-info "Repair prepared proof cannot be written"
+                         {:type :selfhost6/repair-prepared-proof-rejected
+                          :operation-id operation-id})))
+       (assoc record :prepared-swap prepared-swap)))))
+
+(defn- roll-forward-repair-commit!
+  [repo client-ops-db operation-id target-sha256]
+  (let [{:keys [raw record]} (read-activation-record! client-ops-db)
+        _ (when-not (= operation-id (get-in record [:operation :operation-id]))
+            (throw (ex-info "Repair operation changed after canonical rename"
+                            {:type :selfhost6/repair-operation-changed
+                             :operation-id operation-id})))
+        prepared (:prepared-swap record)
+        next-record (reconcile-prepared-activation record target-sha256)
+        next-raw (ldb/write-transit-str next-record)]
+    (when-not
+     (client-op/commit-repair-activation-and-sync-meta!
+      client-ops-db activation-record-key raw next-raw
+      (get-in prepared [:target-basis :remote-t])
+      (get-in prepared [:target-basis :checksum-basis :legacy-checksum]))
+      (throw (ex-info "Activation record changed after canonical rename"
+                      {:type :selfhost6/activation-record-cas-mismatch
+                       :operation-id operation-id})))
+    (swap! db-sync/*repo->latest-remote-tx
+           assoc repo (get-in prepared [:target-basis :remote-t]))
+    (swap! db-sync/*repo->latest-remote-checksum
+           assoc repo (get-in prepared
+                              [:target-basis :checksum-basis :legacy-anchor]))
+    next-record))
 
 (defn- claim-repair-operation!
   [repo graph-id start-basis]
@@ -388,7 +478,6 @@
         operation (:operation record)]
     (when-not (and (= operation-id (:operation-id operation))
                    (= :repairing (:disposition operation))
-                   (nil? (:target-basis operation))
                    (nil? (:prepared-swap record)))
       (throw (ex-info "Repair operation cannot build a staging target"
                       {:type :selfhost6/repair-operation-not-buildable
@@ -414,6 +503,162 @@
                             :operation-id operation-id
                             :cause-type (:type (ex-data error))}
                            error)))))))
+
+(defn- checkpoint-db-strict!
+  [^Object db]
+  (when db
+    (.exec db wal-checkpoint-sql)))
+
+(defn- close-canonical-for-repair!
+  [repo]
+  (let [{:keys [db search client-ops]} (get @*sqlite-conns repo)]
+    (when-not (and db search client-ops)
+      (throw (ex-info "Canonical graph handles are not open for repair commit"
+                      {:type :selfhost6/repair-canonical-not-open
+                       :repo repo})))
+    (when-let [timer (get @*wal-checkpoint-timers repo)]
+      (js/clearTimeout timer))
+    (swap! *wal-checkpoint-timers dissoc repo)
+    (checkpoint-db-strict! db)
+    (checkpoint-db-strict! search)
+    (when-let [vector-index (worker-state/get-vector-index repo)]
+      (when-let [close-fn (:close! vector-index)]
+        (close-fn)))
+    (swap! *vector-indexes dissoc repo)
+    (swap! *datascript-conns dissoc repo)
+    (search-handler/clear-search-index-builds! repo)
+    (.close db)
+    (.close search)
+    (swap! *sqlite-conns assoc repo {:client-ops client-ops})
+    client-ops))
+
+(declare <create-or-open-db!)
+
+(defn- <reopen-canonical-after-repair!
+  [repo client-ops-db]
+  (try
+    (.close client-ops-db)
+    (catch :default error
+      ;; A failed reopen may already have closed this handle. Startup below is
+      ;; still the single interpreter for the durable prepared proof.
+      (log/warn :db-worker/repair-client-ops-already-closed
+                {:repo repo :error error})))
+  (swap! *sqlite-conns dissoc repo)
+  (swap! *client-ops-conns dissoc repo)
+  (<create-or-open-db! repo {}))
+
+(defn- <reconcile-after-repair-commit-error!
+  [repo client-ops-db]
+  ;; Reopen through the normal startup path. It opens a fresh client-ops
+  ;; handle, reconciles source-side or target-side prepared proof before the
+  ;; canonical handle, and therefore also works when a failed reopen already
+  ;; closed the old handle.
+  (<reopen-canonical-after-repair! repo client-ops-db))
+
+(defn- <capture-async-error
+  [f]
+  (try
+    (-> (f)
+        (p/then (constantly {:error nil}))
+        (p/catch (fn [error] {:error error}))
+        (p/then :error))
+    (catch :default error
+      (p/resolved error))))
+
+(defn- <commit-repair-staging!
+  [repo operation-id]
+  ;; Desktop repair commits require the Node storage adapter's one-rename
+  ;; primitive. Fail before entering the fence or touching either database.
+  (platform/require-db-artifact-swap! (platform/current))
+  ;; The full snapshot/tail build stays outside the fence. Only final local
+  ;; catch-up, checkpoint, proof, rename and reopen drain graph calls.
+  (p/let [operation (repair-operation-for-staging! repo operation-id)
+          initial-staging (sync-download/<build-repair-staging! repo operation)
+          owner-token (repair-commit-fence/<enter! repo operation-id)]
+    (let [canonical-closed? (atom false)
+          client-ops* (atom nil)
+          staging* (atom initial-staging)]
+      (-> (p/let [staging (sync-download/<finalize-repair-staging! initial-staging)
+                  _ (reset! staging* staging)
+                  target-basis (:target-basis staging)
+                  client-ops-db (worker-state/get-client-ops-conn repo)
+                  _ (reset! client-ops* client-ops-db)
+                  _ (persist-repair-target-basis!
+                     client-ops-db operation-id target-basis)
+                  staging (sync-download/seal-repair-staging! staging)
+                  _ (reset! staging* staging)
+                  canonical-pool (get-storage-pool repo)
+                  _ (close-canonical-for-repair! repo)
+                  _ (reset! canonical-closed? true)
+                  paths {:canonical-path repo-path
+                         :canonical-wal-path (str repo-path "-wal")
+                         :canonical-shm-path (str repo-path "-shm")
+                         :previous-path previous-repo-path
+                         :target-path repair-target-path
+                         :target-wal-path (str repair-target-path "-wal")
+                         :target-shm-path (str repair-target-path "-shm")}
+                  artifact-proof (platform/prepare-db-artifact-swap!
+                                  (platform/current) canonical-pool
+                                  (get-in staging [:target :pool]) paths)
+                  _ (persist-prepared-swap!
+                     client-ops-db operation-id target-basis artifact-proof)
+                  rename-result (platform/commit-db-artifact-swap!
+                                 (platform/current) canonical-pool
+                                 (get-in staging [:target :pool]) paths)
+                  _ (roll-forward-repair-commit!
+                     repo client-ops-db operation-id
+                     (:target-sha256 artifact-proof))
+                  _ (<reopen-canonical-after-repair! repo client-ops-db)
+                  _ (reset! canonical-closed? false)
+                  _ (sync-download/<cleanup-repair-staging! staging)]
+            {:operation-id operation-id
+             :projection-epoch
+             (get-in (read-activation-record!
+                      (worker-state/get-client-ops-conn repo))
+                     [:record :committed :projection-epoch])
+             :target-basis target-basis
+             :source-sha256 (:source-sha256 artifact-proof)
+             :target-sha256 (:target-sha256 artifact-proof)
+             :rename-count (:rename-count rename-result)})
+          (p/catch
+           (fn [error]
+             (p/let [recovery-error
+                     (when (and @canonical-closed? @client-ops*)
+                       (<capture-async-error
+                        #(<reconcile-after-repair-commit-error!
+                          repo @client-ops*)))
+                     cleanup-error
+                     (when @staging*
+                       (<capture-async-error
+                        #(sync-download/<cleanup-repair-staging! @staging*)))]
+               (cond
+                 recovery-error
+                 (throw
+                  (ex-info "Repair commit failed and canonical recovery failed"
+                           {:type :selfhost6/repair-commit-recovery-failed
+                            :repo repo
+                            :operation-id operation-id
+                            :original-error error
+                            :recovery-error recovery-error
+                            :cleanup-error cleanup-error}
+                           error))
+
+                 cleanup-error
+                 (throw
+                  (ex-info "Repair commit failed and staging cleanup failed"
+                           {:type :selfhost6/repair-commit-cleanup-failed
+                            :repo repo
+                            :operation-id operation-id
+                            :original-error error
+                            :cleanup-error cleanup-error}
+                           error))
+
+                 :else
+                 (throw error)))))
+          (p/finally
+           (fn []
+             (when (repair-commit-fence/owner? repo owner-token)
+               (repair-commit-fence/release! repo owner-token))))))))
 
 (defn- resolve-db-path
   [repo pool path]
@@ -1031,6 +1276,11 @@
 
 (def-thread-api :thread-api/init
   []
+  (thread-api/register-invoke-wrapper-fn!
+   (fn [qkw args invoke]
+     (if (= qkw :thread-api/db-sync-commit-repair)
+       (invoke)
+       (repair-commit-fence/<with-repo-call! (first args) invoke))))
   (init-sqlite-module!))
 
 (defn- db-sync-dbs-open?
@@ -1055,7 +1305,7 @@
   (let [qkw (keyword qualified-kw-str)]
     (vswap! thread-api/*profile update qkw inc)
     (if-let [f (@thread-api/*thread-apis qkw)]
-      (p/let [result (apply f args)]
+      (p/let [result (thread-api/invoke-with-wrapper qkw args #(apply f args))]
         (if (instance? js/Uint8Array result)
           (let [transfer-fn (get-in (platform/current) [:storage :transfer])]
             (if (fn? transfer-fn)
@@ -1133,6 +1383,10 @@
 (def-thread-api :thread-api/db-sync-build-repair-staging
   [repo operation-id]
   (<build-repair-staging! repo operation-id))
+
+(def-thread-api :thread-api/db-sync-commit-repair
+  [repo operation-id]
+  (<commit-repair-staging! repo operation-id))
 
 (def-thread-api :thread-api/db-sync-import-prepare
   [repo reset? graph-id graph-e2ee? & [total-datoms]]
