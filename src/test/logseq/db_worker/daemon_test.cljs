@@ -43,6 +43,7 @@
         (is (number? (nth stdio 2))))
       (is (= "1" (get-in @captured [:opts :env :LOGSEQ_DB_WORKER_NODE_STDIO_REDIRECTED_TO_LOG])))
       (is (= "1" (get-in @captured [:opts :env :ELECTRON_RUN_AS_NODE])))
+      (is (nil? (get-in @captured [:opts :env :NODE_USE_ENV_PROXY])))
       (is (= true @unref-called?))
       (finally
         (set! (.-spawn child-process) original-spawn)))))
@@ -64,6 +65,7 @@
                              :owner-source :electron})
       (is (= false (get-in @captured [:opts :detached])))
       (is (= "inherit" (get-in @captured [:opts :stdio])))
+      (is (= "1" (get-in @captured [:opts :env :NODE_USE_ENV_PROXY])))
       (is (= false @unref-called?))
       (finally
         (set! (.-spawn child-process) original-spawn)))))
