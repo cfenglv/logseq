@@ -1,5 +1,8 @@
 (ns electron.db-worker
-  (:require [logseq.cli.server :as cli-server]
+  (:require ["os" :as os]
+            ["path" :as node-path]
+            [electron.home :as home]
+            [logseq.cli.server :as cli-server]
             [logseq.common.graph-dir :as graph-dir]
             [logseq.db-worker.daemon :as daemon]
             [promesa.core :as p]))
@@ -389,23 +392,34 @@
 
 (defonce ^:private *runtime-opts (atom {}))
 
+(defn- managed-root-dir
+  []
+  (node-path/join
+   (home/resolve-root (.-LOGSEQ_TEST_HOME_DIR js/process.env)
+                      (.homedir os))
+   "logseq"))
+
 (defn- start-managed-daemon!
   [repo]
-  (let [config (merge {:owner-source :electron}
-                      @*runtime-opts)]
-    (p/let [_ (when (seq (:embedding-endpoint config))
-                (-> (cli-server/stop-server! config repo)
+  (let [runtime-config (merge {:owner-source :electron
+                               :root-dir (managed-root-dir)}
+                              @*runtime-opts)]
+    (p/let [_ (when (seq (:embedding-endpoint runtime-config))
+                (-> (cli-server/stop-server! runtime-config repo)
                     (p/catch (fn [_] nil))))
-            config (cli-server/ensure-server! config
-                                            repo)]
+            config (cli-server/ensure-server! runtime-config repo)]
       {:repo repo
        :base-url (:base-url config)
+       :root-dir (:root-dir runtime-config)
        :auth-token nil
        :owned? (:owned? config)})))
 
 (defn- stop-managed-daemon!
-  [{:keys [repo]}]
-  (p/let [result (cli-server/stop-server! {:owner-source :electron} repo)]
+  [{:keys [repo root-dir]}]
+  (p/let [result (cli-server/stop-server! {:owner-source :electron
+                                           :root-dir (or root-dir
+                                                         (managed-root-dir))}
+                                          repo)]
     (:ok? result)))
 
 (defonce manager
