@@ -1,7 +1,10 @@
 (ns electron.db-worker-manager-test
-  (:require [clojure.string :as string]
+  (:require ["os" :as os]
+            ["path" :as node-path]
+            [clojure.string :as string]
             [cljs.test :refer [async deftest is]]
             [electron.db-worker :as db-worker]
+            [electron.home :as home]
             [logseq.cli.server :as cli-server]
             [promesa.core :as p]))
 
@@ -373,8 +376,16 @@
           (p/then (fn [runtime-info]
                     (is (= "graph-a" (:repo @captured)))
                     (is (= :electron (get-in @captured [:config :owner-source])))
+                    (is (= (node-path/join
+                            (home/resolve-root
+                             (.-LOGSEQ_TEST_HOME_DIR js/process.env)
+                             (.homedir os))
+                            "logseq")
+                           (get-in @captured [:config :root-dir])))
                     (is (nil? (get-in @captured [:config :server-list-file])))
                     (is (= "http://127.0.0.1:9300" (:base-url runtime-info)))
+                    (is (= (get-in @captured [:config :root-dir])
+                           (:root-dir runtime-info)))
                     (is (= true (:owned? runtime-info)))))
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
