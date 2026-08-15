@@ -8,7 +8,6 @@
             ["electron-window-state" :as windowStateKeeper]
             ["fs" :as fs]
             ["fs-extra" :as fs-extra]
-            ["os" :as os]
             ["path" :as node-path]
             [cljs-bean.core :as bean]
             [clojure.string :as string]
@@ -565,7 +564,7 @@
   (server/set-config! config))
 
 (defmethod handle :system/info [^js _win _]
-  {:home-dir (.homedir os)})
+  {:home-dir cfgs/home-root})
 
 (defmethod handle :window/open-blank-callback [^js win [_ _type]]
   (win/setup-window-listeners! win) nil)

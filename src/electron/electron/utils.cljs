@@ -1,5 +1,5 @@
 (ns electron.utils
-  (:require ["electron" :refer [app BrowserWindow session]]
+  (:require ["electron" :refer [BrowserWindow session]]
             ["fs-extra" :as fs]
             ["node-fetch" :default node-fetch]
             ["open" :as open-module]
@@ -121,7 +121,7 @@
 
 (defn get-ls-dotdir-root
   []
-  (let [lg-dir (node-path/join (.getPath app "home") ".logseq")]
+  (let [lg-dir cfgs/dot-root]
     (when-not (fs/existsSync lg-dir)
       (fs/mkdirSync lg-dir))
     (fix-win-path! lg-dir)))

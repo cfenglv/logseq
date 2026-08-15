@@ -3,7 +3,6 @@
             ["electron" :refer [BrowserWindow Menu app protocol ipcMain dialog shell] :as electron]
             ["fs-extra" :as fs]
 
-            ["os" :as os]
             ["path" :as node-path]
             [cljs-bean.core :as bean]
             [clojure.string :as string]
@@ -37,7 +36,7 @@
 (defonce EXTERNAL_PLUGIN_URL (str LSP_PROTOCOL "logseq.io/external/"))
 (defonce HOST_PLUGIN_URL (str STATIC_URL "plugins/"))
 (defonce HOST_EXTERNAL_PLUGIN_URL (str STATIC_URL "external/"))
-(defonce PLUGINS_ROOT (.join node-path (.homedir os) ".logseq/plugins"))
+(defonce PLUGINS_ROOT (.join node-path cfgs/dot-root "plugins"))
 
 (defonce *setup-fn (volatile! nil))
 (defonce *teardown-fn (volatile! nil))
@@ -340,7 +339,7 @@
 (defn- preferred-unix-cli-dir
   []
   (cli-install/preferred-unix-cli-dir
-   {:home-dir (.homedir os)
+   {:home-dir cfgs/home-root
     :path-join path-join
     :ensure-dir! ensure-dir!
     :writable-dir? writable-dir?}))
