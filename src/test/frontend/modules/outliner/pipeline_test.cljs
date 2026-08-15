@@ -150,7 +150,8 @@
                :affected-keys #{[:graph]}}
         applied-deltas (atom [])
         published-events (atom [])]
-    (with-redefs [db-subs/current-projection? (constantly false)
+    (with-redefs [db-subs/future-projection? (constantly false)
+                  db-subs/current-projection? (constantly false)
                   db-subs/apply-delta! #(swap! applied-deltas conj %)
                   state/pub-event! #(swap! published-events conj %)]
       (pipeline/invoke-hooks {:repo repo
@@ -161,3 +162,23 @@
         "The canonical store still owns validation and stale-delta rejection.")
     (is (empty? @published-events)
         "A stale projection cannot publish plugin or page lifecycle effects.")))
+
+(deftest future-projection-delta-requests-cutover-without-applying-side-effects-test
+  (let [repo "future-projection-broadcast-test"
+        delta {:graph-id repo
+               :projection-epoch 3
+               :rev 12
+               :blocks {}
+               :deleted {}
+               :children {}
+               :affected-keys #{}}
+        applied-deltas (atom [])
+        published-events (atom [])]
+    (with-redefs [db-subs/future-projection? (constantly true)
+                  db-subs/apply-delta! #(swap! applied-deltas conj %)
+                  state/pub-event! #(swap! published-events conj %)]
+      (pipeline/invoke-hooks {:repo repo :tx-meta {} :delta delta}))
+    (is (empty? @applied-deltas))
+    (is (= [[:db/projection-committed
+             {:repo repo :projection-epoch 3}]]
+           @published-events))))

@@ -610,12 +610,27 @@
                      (:target-sha256 artifact-proof))
                   _ (<reopen-canonical-after-repair! repo client-ops-db)
                   _ (reset! canonical-closed? false)
+                  _ (worker-undo-redo/clear-history! repo)
+                  _ (-> (search-handler/<rebuild-blocks-indice! repo true)
+                        (p/catch
+                         (fn [error]
+                           (log/error :db-worker/repair-search-rebuild-start-failed
+                                      {:repo repo :error error})
+                           nil)))
+                  projection-epoch
+                  (get-in (read-activation-record!
+                           (worker-state/get-client-ops-conn repo))
+                          [:record :committed :projection-epoch])
+                  _ (shared-service/broadcast-to-clients!
+                     :notification
+                     [nil :warning nil nil nil
+                      {:i18n-key :selfhost6/undo-history-reset}])
+                  _ (shared-service/broadcast-to-clients!
+                     :projection-committed
+                     {:repo repo :projection-epoch projection-epoch})
                   _ (sync-download/<cleanup-repair-staging! staging)]
             {:operation-id operation-id
-             :projection-epoch
-             (get-in (read-activation-record!
-                      (worker-state/get-client-ops-conn repo))
-                     [:record :committed :projection-epoch])
+             :projection-epoch projection-epoch
              :target-basis target-basis
              :source-sha256 (:source-sha256 artifact-proof)
              :target-sha256 (:target-sha256 artifact-proof)
@@ -1340,6 +1355,11 @@
     {:schema (:schema @conn)
      :projection-epoch (worker-state/get-projection-epoch repo)}))
 
+(def-thread-api :thread-api/get-projection-epoch
+  [repo]
+  (when (worker-state/get-datascript-conn repo)
+    (worker-state/get-projection-epoch repo)))
+
 (def-thread-api :thread-api/unsafe-unlink-db
   [repo]
   (p/let [pool (<get-opfs-pool repo)
@@ -1493,6 +1513,7 @@
   (set (map
         common-util/keyword->string
         [:sync-db-changes
+         :projection-committed
          :sync-conflicts-updated
          :notification
          :log

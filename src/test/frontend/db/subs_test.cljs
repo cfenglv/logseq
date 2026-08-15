@@ -461,6 +461,17 @@
            (subs/block-snapshot block-uuid))
         "An old projection delta must not publish into the active store.")))
 
+(deftest projection-commit-advances-once-and-rejects-past-epochs-test
+  (subs/reset-graph! test-graph-id 2)
+  (is (true? (subs/advance-projection! test-graph-id 4)))
+  (is (= {:graph-id test-graph-id :projection-epoch 4}
+         (subs/projection-context)))
+  (is (false? (subs/advance-projection! test-graph-id 4)))
+  (is (false? (subs/advance-projection! test-graph-id 3)))
+  (is (false? (subs/advance-projection! "another-graph" 5)))
+  (is (= {:graph-id test-graph-id :projection-epoch 4}
+         (subs/projection-context))))
+
 (deftest projection-epoch-rejects-an-old-load-response-test
   (async done
          (let [block-uuid (random-uuid)
@@ -483,6 +494,34 @@
                          (subs/block-snapshot block-uuid)))
                   (is (= before @notifications)
                       "An old projection load must not notify mounted slots.")
+                  (unsubscribe))))))))
+
+(deftest future-projection-load-requests-one-cutover-and-publishes-no-slot-test
+  (async done
+         (let [block-uuid (random-uuid)
+               request (p/deferred)
+               notifications (atom 0)
+               events (atom [])]
+           (subs/reset-graph! test-graph-id 2)
+           (finish-async!
+            done
+            (p/with-redefs [subs/<load-block (fn [_graph-id _block-uuid] request)
+                            state/pub-event! #(swap! events conj %)]
+              (let [unsubscribe (subs/subscribe-block! block-uuid #(swap! notifications inc))]
+                (p/let [_ (p/delay 0)
+                        before @notifications
+                        _ (p/resolve! request
+                                      (assoc (block-patch
+                                              10 {block-uuid
+                                                  (block block-uuid 10 "future projection")})
+                                             :projection-epoch 3))
+                        _ (p/delay 0)]
+                  (is (= [[:db/projection-committed
+                           {:repo test-graph-id :projection-epoch 3}]]
+                         @events))
+                  (is (= before @notifications))
+                  (is (= {:status :loading}
+                         (subs/block-snapshot block-uuid)))
                   (unsubscribe))))))))
 
 (deftest one-block-delta-notifies-only-that-uuid-test

@@ -1812,6 +1812,8 @@
  :sidebar.right/resize-handle "Right sidebar resize handler"
  :sidebar.right/toggle "Toggle right sidebar"
 
+ :selfhost6/undo-history-reset "Undo history was reset after graph recovery."
+
  :storage/invalid-data-writing "Invalid data writing to db!"
  :storage/sqlitedb-error "SQLiteDB error: {1}"
  :storage/sqlitedb-import-error "SQLiteDB import error: {1}"

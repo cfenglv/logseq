@@ -1812,6 +1812,8 @@
  :sidebar.right/resize-handle "调整右侧边栏大小"
  :sidebar.right/toggle "切换右侧边栏"
 
+ :selfhost6/undo-history-reset "图谱恢复后，撤销历史已重置。"
+
  :storage/invalid-data-writing "无效数据写入。"
  :storage/sqlitedb-error "SQLiteDB 错误：{1}"
  :storage/sqlitedb-import-error "SQLiteDB 导入错误：{1}"

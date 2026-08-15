@@ -257,8 +257,14 @@
       (-> request
           (p/then (fn [response]
                     (when (current-request? slot-key token graph-id generation projection-epoch)
-                      (when (apply-patch! generation projection-epoch slot-key response)
-                        (swap! *in-flight assoc-in [slot-key :reload?] true)))))
+                      (let [response-epoch (:projection-epoch response)]
+                        (if (and (nat-int? response-epoch)
+                                 (> response-epoch projection-epoch))
+                          (state/pub-event!
+                           [:db/projection-committed
+                            {:repo graph-id :projection-epoch response-epoch}])
+                          (when (apply-patch! generation projection-epoch slot-key response)
+                            (swap! *in-flight assoc-in [slot-key :reload?] true)))))))
           (p/catch (fn [error]
                      (when (current-request? slot-key token graph-id generation projection-epoch)
                        (load-error! slot-key error))))
@@ -311,6 +317,27 @@
      (loader/reject-pending! error)
      (run! (fn [listener] (listener)) listeners))
    nil))
+
+(defn projection-context
+  []
+  (select-keys @*store [:graph-id :projection-epoch]))
+
+(defn future-projection?
+  [{:keys [graph-id projection-epoch]}]
+  (let [store @*store]
+    (and (= graph-id (:graph-id store))
+         (nat-int? projection-epoch)
+         (> projection-epoch (:projection-epoch store)))))
+
+(defn advance-projection!
+  [graph-id projection-epoch]
+  (require-revision! :projection-epoch projection-epoch)
+  (if (future-projection? {:graph-id graph-id
+                           :projection-epoch projection-epoch})
+    (do
+      (reset-graph! graph-id projection-epoch)
+      true)
+    false))
 
 (defn- retry-mounted-errors!
   [_key _ref _old-value ready?]
