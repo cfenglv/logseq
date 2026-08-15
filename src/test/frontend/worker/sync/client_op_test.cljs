@@ -1,5 +1,8 @@
 (ns frontend.worker.sync.client-op-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require ["fs" :as node-fs]
+            ["path" :as node-path]
+            [cljs.test :refer [deftest is testing]]
+            [frontend.test.node-helper :as node-helper]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync.client-op :as client-op]
             [logseq.db.common.sqlite :as common-sqlite]
@@ -21,6 +24,24 @@
         (.close db)
         (reset! worker-state/*client-ops-conns prev-client-ops-conns)))))
 
+(defn- with-fixture-client-ops-db
+  [repo fixture-relative-path f]
+  (let [root-dir (node-helper/create-tmp-dir "client-op-fixture")
+        source (node-path/join (js/process.cwd)
+                               "docs/selfhost6-phase0/fixtures/v1"
+                               fixture-relative-path)
+        target (node-path/join root-dir "client-ops.sqlite")
+        Database (js/require "better-sqlite3")
+        prev-client-ops-conns @worker-state/*client-ops-conns]
+    (node-fs/copyFileSync source target)
+    (let [db (new Database target)]
+      (reset! worker-state/*client-ops-conns {repo db})
+      (try
+        (f db)
+        (finally
+          (.close db)
+          (reset! worker-state/*client-ops-conns prev-client-ops-conns))))))
+
 (defn- sqlite-count
   [^js db sql & args]
   (let [^js stmt (.prepare db sql)
@@ -31,6 +52,74 @@
       (or (aget row "c")
           (aget row "count"))
       0)))
+
+(deftest reserved-sync-meta-whole-value-atomicity-test
+  (let [key "selfhost.activation-record.v1"
+        initial "activation-v1-initial"
+        replacement "activation-v1-replacement"]
+    (with-client-ops-db
+      "repo-activation-atomicity"
+      (fn [db]
+        (testing "missing values are inserted once without overwriting the existing row"
+          (is (= {:found? false}
+                 (client-op/read-sync-meta-value db key)))
+          (is (= {:inserted? true :value initial}
+                 (client-op/insert-sync-meta-value-if-absent! db key initial)))
+          (is (= {:inserted? false :value initial}
+                 (client-op/insert-sync-meta-value-if-absent! db key replacement)))
+          (is (= {:found? true :value initial}
+                 (client-op/read-sync-meta-value db key))))
+
+        (testing "the whole encoded value is compared before replacement"
+          (is (false? (client-op/compare-and-set-sync-meta-value!
+                       db key "stale-value" replacement)))
+          (is (= {:found? true :value initial}
+                 (client-op/read-sync-meta-value db key)))
+          (is (true? (client-op/compare-and-set-sync-meta-value!
+                      db key initial replacement)))
+          (is (= {:found? true :value replacement}
+                 (client-op/read-sync-meta-value db key))))
+
+        (testing "an aborted replacement leaves the previous value readable"
+          (.exec db (str "create trigger abort_activation_update before update on sync_meta "
+                         "when old.key = 'selfhost.activation-record.v1' "
+                         "begin select raise(abort, 'activation update aborted'); end"))
+          (is (thrown-with-msg?
+               js/Error
+               #"activation update aborted"
+               (client-op/compare-and-set-sync-meta-value!
+                db key replacement "activation-v1-cleared")))
+          (is (= {:found? true :value replacement}
+                 (client-op/read-sync-meta-value db key))))))))
+
+(deftest frozen-upload-state-orphan-and-malformed-reader-boundaries-test
+  (let [orphan-id #uuid "20000000-0000-4000-8000-000000000002"
+        unrelated-id #uuid "20000000-0000-4000-8000-000000000004"
+        malformed-id #uuid "20000000-0000-4000-8000-000000000003"]
+    (with-fixture-client-ops-db
+      "repo-orphan-upload-fixture" "upload-state/orphan.sqlite"
+      (fn [db]
+        (is (= :staged-large-upload-v1
+               (:kind (client-op/get-client-tx-upload-state
+                       "repo-orphan-upload-fixture" orphan-id))))
+        (is (= {} (client-op/get-client-tx-upload-states
+                   "repo-orphan-upload-fixture" [unrelated-id])))
+        (is (= 1 (sqlite-count db
+                               "select count(*) as c from client_tx_upload_state where logical_tx_id = ?"
+                               (str orphan-id))))))
+    (with-fixture-client-ops-db
+      "repo-malformed-upload-fixture" "upload-state/malformed.sqlite"
+      (fn [db]
+        (let [error (try
+                      (client-op/get-client-tx-upload-state
+                       "repo-malformed-upload-fixture" malformed-id)
+                      nil
+                      (catch :default error
+                        error))]
+          (is (some? error))
+          (is (= 1 (sqlite-count db
+                                 "select count(*) as c from client_tx_upload_state where logical_tx_id = ?"
+                                 (str malformed-id)))))))))
 
 (deftest sqlite-sync-meta-roundtrip-test
   (let [repo "repo-1"]

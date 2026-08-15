@@ -256,6 +256,48 @@
         (catch :default _
           nil)))))
 
+(defn read-sync-meta-value
+  "Read one reserved sync_meta value while holding the client-ops transaction."
+  [db k]
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (if-let [row (sqlite-row tx "select value from sync_meta where key = ?" [k])]
+       {:found? true :value (aget row "value")}
+       {:found? false}))))
+
+(defn insert-sync-meta-value-if-absent!
+  "Insert a reserved sync_meta value without replacing an existing row."
+  [db k encoded-value]
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (if-let [row (sqlite-row tx "select value from sync_meta where key = ?" [k])]
+       {:inserted? false :value (aget row "value")}
+       (do
+         (sqlite-run! tx
+                      "insert into sync_meta (key, value) values (?, ?)"
+                      [k encoded-value])
+         {:inserted? true :value encoded-value})))))
+
+(defn compare-and-set-sync-meta-value!
+  "Replace one whole encoded sync_meta value iff it still equals expected-value."
+  [db k expected-value replacement-value]
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (let [row (sqlite-row tx "select value from sync_meta where key = ?" [k])]
+       (if (and row (= expected-value (aget row "value")))
+         (do
+           (sqlite-run! tx
+                        "update sync_meta set value = ? where key = ?"
+                        [replacement-value k])
+           true)
+         false)))))
+
 (defn- sqlite-get-meta
   [db k]
   (some-> (sqlite-row db "select value from sync_meta where key = ?" [(name k)])

@@ -161,6 +161,40 @@
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
 
+(deftest node-prepared-artifact-inspection-streams-canonical-and-checks-wal-test
+  (async done
+         (let [root-dir (node-helper/create-tmp-dir "platform-node-prepared-inspection")
+               paths {:canonical-path "/db.sqlite"
+                      :wal-path "/db.sqlite-wal"
+                      :shm-path "/db.sqlite-shm"}
+               capture-error (fn [f]
+                               (try
+                                 (.catch (.then (js/Promise.resolve (f))
+                                                (constantly nil))
+                                         identity)
+                                 (catch :default error
+                                   (p/resolved error))))
+               payload (js/Uint8Array. #js [1 2 3])]
+           (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir})
+                       storage (:storage platform)
+                       pool ((:install-opfs-pool storage) nil "prepared-graph")
+                       _ ((:import-db storage) pool "/db.sqlite" payload)
+                       result ((:inspect-db-artifact-set storage) pool paths)
+                       _ ((:import-db storage) pool "/db.sqlite-wal"
+                          (js/Uint8Array. #js [9]))
+                       wal-error (capture-error
+                                  #((:inspect-db-artifact-set storage) pool paths))]
+                 (is (= {:canonical-sha256
+                         "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81"
+                         :canonical-byte-size 3
+                         :bounded-memory? true}
+                        result))
+                 (is (= :selfhost6/uncheckpointed-prepared-canonical
+                        (:type (ex-data wal-error)))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally done)))))
+
 (deftest node-platform-cli-owner-bypasses-keychain-in-cli-e2e-test
   (async done
     (let [root-dir (node-helper/create-tmp-dir "platform-node-cli-secrets")

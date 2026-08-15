@@ -51,6 +51,13 @@
     (f repo pool path)
     path))
 
+(defn inspect-db-artifact-set
+  [platform pool paths]
+  (if-let [f (get-in platform [:storage :inspect-db-artifact-set])]
+    (f pool paths)
+    (throw (ex-info "platform storage/inspect-db-artifact-set missing"
+                    {:paths paths}))))
+
 (defn remove-storage-pool!
   [platform pool]
   (if-let [f (get-in platform [:storage :remove-vfs!])]
