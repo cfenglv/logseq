@@ -11,6 +11,16 @@
             [logseq.common.path :as path]
             [promesa.core :as p]))
 
+(defn- bytes->hex
+  [payload]
+  (->> payload
+       (map (fn [byte-value]
+              (let [hex (.toString byte-value 16)]
+                (if (= 1 (count hex))
+                  (str "0" hex)
+                  hex))))
+       (apply str)))
+
 (defn- iter->vec
   [iter']
   (when iter'
@@ -79,6 +89,29 @@
 (defn- export-file
   [pool path]
   (.exportFile ^js pool path))
+
+(defn- <inspect-db-artifact-set
+  [^js pool {:keys [canonical-path wal-path shm-path]}]
+  (let [file-names (set (js->clj (.getFileNames pool)))]
+    (when-not (contains? file-names canonical-path)
+      (throw (ex-info "Canonical graph is missing during prepared swap"
+                      {:type :selfhost6/missing-prepared-canonical})))
+    ;; The SAH pool does not expose file size or bounded reads. A prepared swap
+    ;; requires WAL/SHM to be absent, so reject their presence before exporting
+    ;; the canonical file. WebCrypto keeps hashing off the JS worker turn.
+    (when (or (contains? file-names wal-path)
+              (contains? file-names shm-path))
+      (throw (ex-info "Canonical graph WAL is not checkpointed during prepared swap"
+                      {:type :selfhost6/uncheckpointed-prepared-canonical})))
+    (p/let [canonical (.exportFile pool canonical-path)
+            byte-size (.-byteLength canonical)
+            _ (when (zero? byte-size)
+                (throw (ex-info "Canonical graph is missing during prepared swap"
+                                {:type :selfhost6/missing-prepared-canonical})))
+            digest (.digest (.-subtle (.-crypto js/globalThis)) "SHA-256" canonical)]
+      {:canonical-sha256 (bytes->hex (js/Uint8Array. digest))
+       :canonical-byte-size byte-size
+       :bounded-memory? false})))
 
 (defn- import-db
   [pool path data]
@@ -206,6 +239,7 @@
              :db-exists? db-exists?
              :resolve-db-path (fn [_repo _pool path] path)
              :export-file export-file
+             :inspect-db-artifact-set <inspect-db-artifact-set
              :import-db import-db
              :remove-vfs! remove-vfs!
              :read-text! read-text!

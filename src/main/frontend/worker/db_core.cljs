@@ -132,6 +132,186 @@
 (def repo-path "/db.sqlite")
 (def client-ops-repo-path (str "client-ops" repo-path))
 
+(def ^:private activation-record-key "selfhost.activation-record.v1")
+(def ^:private empty-activation-record
+  {:format-version 1
+   :record-kind :selfhost-activation
+   :committed {:projection-epoch 0}
+   :previous nil
+   :operation nil
+   :prepared-swap nil})
+(def ^:private activation-fields
+  #{:format-version :record-kind :committed :previous :operation :prepared-swap})
+(def ^:private operation-fields
+  #{:operation-id :graph-id :target-projection-epoch :start-basis :target-basis
+    :disposition :attempt-count :next-retry-at-ms :last-error})
+(def ^:private prepared-swap-fields
+  #{:operation-id :source-artifact-identity :source-sha256 :target-artifact-identity
+    :target-sha256 :target-basis :written-at-ms})
+(def ^:private basis-fields
+  #{:remote-t :server-checkpoint-identity :journal-high-water :checksum-basis})
+(def ^:private checksum-basis-fields
+  #{:version :legacy-checksum :server-v2-checksum :server-v2-t :legacy-anchor :metadata-proof})
+(def ^:private sha256-pattern #"^[0-9a-f]{64}$")
+
+(defn- exact-fields?
+  [value fields]
+  (and (map? value) (= fields (set (keys value)))))
+
+(defn- non-empty-string?
+  [value]
+  (and (string? value) (not (string/blank? value))))
+
+(defn- non-negative-integer?
+  [value]
+  (and (integer? value) (>= value 0)))
+
+(defn- valid-basis?
+  [basis]
+  (let [checksum-basis (:checksum-basis basis)]
+    (and (exact-fields? basis basis-fields)
+         (non-negative-integer? (:remote-t basis))
+         (non-empty-string? (:server-checkpoint-identity basis))
+         (non-negative-integer? (:journal-high-water basis))
+         (exact-fields? checksum-basis checksum-basis-fields)
+         (= 1 (:version checksum-basis))
+         (non-empty-string? (:legacy-checksum checksum-basis))
+         (non-empty-string? (:server-v2-checksum checksum-basis))
+         (= (:remote-t basis) (:server-v2-t checksum-basis))
+         (non-empty-string? (:legacy-anchor checksum-basis))
+         (non-empty-string? (:metadata-proof checksum-basis)))))
+
+(defn- basis-not-before?
+  [target-basis start-basis]
+  (and (>= (:remote-t target-basis) (:remote-t start-basis))
+       (>= (:journal-high-water target-basis)
+           (:journal-high-water start-basis))))
+
+(defn- valid-last-error?
+  [last-error]
+  (or (nil? last-error)
+      (and (exact-fields? last-error #{:type :at-ms})
+           (non-empty-string? (:type last-error))
+           (non-negative-integer? (:at-ms last-error)))))
+
+(defn- valid-operation?
+  [operation committed-epoch prepared-swap previous]
+  (or (nil? operation)
+      (let [start-basis (:start-basis operation)
+            target-basis (:target-basis operation)
+            target-epoch (:target-projection-epoch operation)
+            target-committed? (= committed-epoch target-epoch)]
+        (and (exact-fields? operation operation-fields)
+             (uuid? (:operation-id operation))
+             (non-empty-string? (:graph-id operation))
+             (or (= (inc committed-epoch) target-epoch)
+                 (and target-committed?
+                      (nil? prepared-swap)
+                      previous
+                      (= :repairing (:disposition operation))
+                      (some? target-basis)))
+             (valid-basis? start-basis)
+             (or (nil? target-basis)
+                 (and (valid-basis? target-basis)
+                      (basis-not-before? target-basis start-basis)))
+             (contains? #{:repairing :local-only} (:disposition operation))
+             (pos-int? (:attempt-count operation))
+             (or (nil? (:next-retry-at-ms operation))
+                 (non-negative-integer? (:next-retry-at-ms operation)))
+             (valid-last-error? (:last-error operation))))))
+
+(defn- valid-prepared-swap?
+  [prepared-swap operation]
+  (or (nil? prepared-swap)
+      (and operation
+           (= :repairing (:disposition operation))
+           (exact-fields? prepared-swap prepared-swap-fields)
+           (= (:operation-id operation) (:operation-id prepared-swap))
+           (non-empty-string? (:source-artifact-identity prepared-swap))
+           (string? (:source-sha256 prepared-swap))
+           (re-matches sha256-pattern (:source-sha256 prepared-swap))
+           (non-empty-string? (:target-artifact-identity prepared-swap))
+           (not= (:source-artifact-identity prepared-swap)
+                 (:target-artifact-identity prepared-swap))
+           (string? (:target-sha256 prepared-swap))
+           (re-matches sha256-pattern (:target-sha256 prepared-swap))
+           (not= (:source-sha256 prepared-swap) (:target-sha256 prepared-swap))
+           (= (:target-basis operation) (:target-basis prepared-swap))
+           (valid-basis? (:target-basis prepared-swap))
+           (non-negative-integer? (:written-at-ms prepared-swap)))))
+
+(defn- valid-activation-record?
+  [record]
+  (let [committed (:committed record)
+        previous (:previous record)
+        operation (:operation record)
+        committed-epoch (:projection-epoch committed)]
+    (and (exact-fields? record activation-fields)
+         (= 1 (:format-version record))
+         (= :selfhost-activation (:record-kind record))
+         (exact-fields? committed #{:projection-epoch})
+         (non-negative-integer? committed-epoch)
+         (or (nil? previous)
+             (and (exact-fields? previous #{:projection-epoch})
+                  (non-negative-integer? (:projection-epoch previous))
+                  (< (:projection-epoch previous) committed-epoch)))
+         (valid-operation? operation committed-epoch (:prepared-swap record) previous)
+         (valid-prepared-swap? (:prepared-swap record) operation))))
+
+(defn- decode-activation-record
+  [raw]
+  (let [record (try
+                 (ldb/read-transit-str raw)
+                 (catch :default _
+                   nil))]
+    (when-not (valid-activation-record? record)
+      (throw (ex-info "Invalid self-host activation record"
+                      {:type :selfhost6/invalid-activation-record})))
+    record))
+
+(defn- reconcile-prepared-activation
+  [record canonical-sha]
+  (let [{:keys [source-sha256 target-sha256]} (:prepared-swap record)]
+    (cond
+      (= canonical-sha source-sha256)
+      (assoc record :prepared-swap nil)
+
+      (= canonical-sha target-sha256)
+      (assoc record
+             :committed {:projection-epoch (get-in record [:operation :target-projection-epoch])}
+             :previous (:committed record)
+             :prepared-swap nil)
+
+      :else
+      (throw (ex-info "Canonical graph does not match prepared swap"
+                      {:type :selfhost6/ambiguous-prepared-swap})))))
+
+(defn- initialize-activation-record!
+  [client-ops-db]
+  (let [empty-raw (ldb/write-transit-str empty-activation-record)
+        {:keys [value]} (client-op/insert-sync-meta-value-if-absent!
+                         client-ops-db activation-record-key empty-raw)]
+    {:raw value
+     :record (decode-activation-record value)}))
+
+(defn- <reconcile-activation-record!
+  [pool client-ops-db {:keys [raw record]}]
+  (if-not (:prepared-swap record)
+    (p/resolved record)
+    (p/let [{:keys [canonical-sha256]}
+            (platform/inspect-db-artifact-set
+             (platform/current) pool
+             {:canonical-path repo-path
+              :wal-path (str repo-path "-wal")
+              :shm-path (str repo-path "-shm")})]
+      (let [next-record (reconcile-prepared-activation record canonical-sha256)
+            next-raw (ldb/write-transit-str next-record)]
+        (when-not (client-op/compare-and-set-sync-meta-value!
+                   client-ops-db activation-record-key raw next-raw)
+          (throw (ex-info "Activation record changed during startup reconciliation"
+                          {:type :selfhost6/activation-record-cas-mismatch})))
+        next-record))))
+
 (defn- resolve-db-path
   [repo pool path]
   (let [storage (platform/storage (platform/current))]
@@ -422,6 +602,32 @@
   [repo pool]
   (resolve-db-path repo pool "search/vector"))
 
+(declare enable-sqlite-wal-mode!)
+
+(defn- <prepare-client-ops!
+  [pool client-ops-db]
+  (try
+    (enable-sqlite-wal-mode! client-ops-db)
+    (common-sqlite/create-kvs-table! client-ops-db)
+    (let [activation (initialize-activation-record! client-ops-db)]
+      (-> (<reconcile-activation-record! pool client-ops-db activation)
+          (p/catch (fn [error]
+                     (.close client-ops-db)
+                     (throw error)))))
+    (catch :default error
+      (.close client-ops-db)
+      (p/rejected error))))
+
+(defn- close-startup-acquisitions!
+  [repo close-fns]
+  (doseq [close-fn (rseq @close-fns)]
+    (try
+      (close-fn)
+      (catch :default error
+        (log/warn :db-worker/startup-cleanup-failed
+                  {:repo repo :error error}))))
+  (worker-state/clear-projection-epoch! repo))
+
 (defn- get-dbs
   [repo]
   (if @*publishing?
@@ -434,36 +640,49 @@
                                              :path "/search-db.sqlite"
                                              :mode "c"})]
       [db search-db nil nil])
-    (p/let [^js pool (<get-opfs-pool repo)
-            capacity (when (exists? (.-getCapacity pool))
-                       (.getCapacity pool))
-            _ (when (and (some? capacity) (zero? capacity))
-                (.unpauseVfs pool))
-            db-path (resolve-db-path repo pool repo-path)
-            search-path (resolve-db-path repo pool (str "search" repo-path))
-            current-platform (platform/current)
-            vector-path (vector-index-path repo pool)
-            client-ops-path (resolve-db-path repo pool (str "client-ops-" repo-path))
-            _ (log/info :db-worker/get-dbs-open {:repo repo :db-path db-path})
-            db (platform/sqlite-open (platform/current)
-                                     {:sqlite @*sqlite
-                                      :pool pool
-                                      :path db-path})
-            _ (log/info :db-worker/get-dbs-open {:repo repo :search-path search-path})
-            search-db (platform/sqlite-open (platform/current)
-                                            {:sqlite @*sqlite
-                                             :pool pool
-                                             :path search-path})
-            vector-index (when (get-in current-platform [:vector :open-index])
-                           (platform/vector-open current-platform
-                                                 {:path vector-path
-                                                  :dimension (platform/embedding-dimension current-platform)}))
-            _ (log/info :db-worker/get-dbs-open {:repo repo :client-ops-path client-ops-path})
-            client-ops-db (platform/sqlite-open (platform/current)
-                                                {:sqlite @*sqlite
-                                                 :pool pool
-                                                 :path client-ops-path})]
-      [db search-db client-ops-db vector-index])))
+    (let [close-fns (atom [])]
+      (-> (p/let [^js pool (<get-opfs-pool repo)
+                  capacity (when (exists? (.-getCapacity pool))
+                             (.getCapacity pool))
+                  _ (when (and (some? capacity) (zero? capacity))
+                      (.unpauseVfs pool))
+                  db-path (resolve-db-path repo pool repo-path)
+                  search-path (resolve-db-path repo pool (str "search" repo-path))
+                  current-platform (platform/current)
+                  vector-path (vector-index-path repo pool)
+                  client-ops-path (resolve-db-path repo pool (str "client-ops-" repo-path))
+                  _ (log/info :db-worker/get-dbs-open {:repo repo :client-ops-path client-ops-path})
+                  client-ops-db (platform/sqlite-open (platform/current)
+                                                      {:sqlite @*sqlite
+                                                       :pool pool
+                                                       :path client-ops-path})
+                  activation-record (<prepare-client-ops! pool client-ops-db)
+                  _ (swap! close-fns conj #(.close client-ops-db))
+                  _ (worker-state/set-projection-epoch!
+                     repo (get-in activation-record [:committed :projection-epoch]))
+                  _ (log/info :db-worker/get-dbs-open {:repo repo :db-path db-path})
+                  db (platform/sqlite-open (platform/current)
+                                           {:sqlite @*sqlite
+                                            :pool pool
+                                            :path db-path})
+                  _ (swap! close-fns conj #(.close db))
+                  _ (log/info :db-worker/get-dbs-open {:repo repo :search-path search-path})
+                  search-db (platform/sqlite-open (platform/current)
+                                                  {:sqlite @*sqlite
+                                                   :pool pool
+                                                   :path search-path})
+                  _ (swap! close-fns conj #(.close search-db))
+                  vector-index (when (get-in current-platform [:vector :open-index])
+                                 (platform/vector-open
+                                  current-platform
+                                  {:path vector-path
+                                   :dimension (platform/embedding-dimension current-platform)}))
+                  _ (when-let [close-fn (:close! vector-index)]
+                      (swap! close-fns conj close-fn))]
+            [db search-db client-ops-db vector-index])
+          (p/catch (fn [error]
+                     (close-startup-acquisitions! repo close-fns)
+                     (throw error)))))))
 
 (defn- enable-sqlite-wal-mode!
   [^Object db]
@@ -612,8 +831,7 @@
         (client-op/update-local-tx repo 0)))
     (when-not (worker-state/get-sqlite-conn repo)
       (p/let [[db search-db client-ops-db vector-index] (get-dbs repo)
-              dbs (cond-> [db search-db]
-                    client-ops-db (conj client-ops-db))
+              dbs [db search-db]
               storage (new-sqlite-storage repo db)]
         (swap! *sqlite-conns assoc repo {:db db
                                          :search search-db
@@ -624,7 +842,6 @@
           (enable-sqlite-wal-mode! db'))
         (disable-sqlite-auto-checkpoint! db)
         (common-sqlite/create-kvs-table! db)
-        (when-not @*publishing? (common-sqlite/create-kvs-table! client-ops-db))
         (search/create-tables-and-triggers! search-db)
         (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
         (ldb/register-debounce-fn! (gfun/debounce d/store 1000))
@@ -656,8 +873,6 @@
                                           (= "db" (:kv/value (d/entity @conn :logseq.kv/db-type)))))]
           (swap! *datascript-conns assoc repo conn)
           (swap! *client-ops-conns assoc repo client-ops-conn)
-          (when-not @*publishing?
-            (client-op/ensure-sqlite-schema! client-ops-db))
           (when creating-remote-graph?
             (when (nil? (client-op/get-local-tx repo))
               (client-op/update-local-tx repo 0)))
@@ -753,8 +968,6 @@
          :or {close-other-db? true}
          :as opts}]
   (p/do!
-   (when (contains? opts :projection-epoch)
-     (worker-state/set-projection-epoch! repo (:projection-epoch opts)))
    (when close-other-db?
      (close-other-dbs! repo))
    (when @shared-service/*master-client?

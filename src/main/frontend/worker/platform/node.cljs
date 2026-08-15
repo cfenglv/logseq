@@ -2,6 +2,7 @@
   "Node.js platform adapter for db-worker."
   (:require ["fs" :as node-fs]
             ["fs/promises" :as fs]
+            ["node:crypto" :as node-crypto]
             ["node:sqlite" :as node-sqlite]
             ["os" :as os]
             ["path" :as node-path]
@@ -477,6 +478,46 @@
   [pool path]
   (fs/readFile (pool-path pool path)))
 
+(defn- <stat-optional
+  [path]
+  (-> (fs/stat path)
+      (p/catch (fn [^js error]
+                 (if (= "ENOENT" (.-code error))
+                   nil
+                   (throw error))))))
+
+(defn- <sha256-file
+  [path]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [hasher (.createHash node-crypto "sha256")
+           stream (.createReadStream node-fs path)]
+       (.on stream "data" (fn [chunk] (.update hasher chunk)))
+       (.once stream "error" reject)
+       (.once stream "end" (fn [] (resolve (.digest hasher "hex"))))))))
+
+(defn- <inspect-db-artifact-set
+  [pool {:keys [canonical-path wal-path shm-path]}]
+  (let [canonical-full-path (pool-path pool canonical-path)
+        wal-full-path (pool-path pool wal-path)
+        shm-full-path (pool-path pool shm-path)]
+    (p/let [canonical-stat (<stat-optional canonical-full-path)
+            wal-stat (<stat-optional wal-full-path)
+            shm-stat (<stat-optional shm-full-path)
+            canonical-byte-size (some-> canonical-stat .-size)]
+      (when (or (nil? canonical-byte-size)
+                (zero? canonical-byte-size))
+        (throw (ex-info "Canonical graph is missing during prepared swap"
+                        {:type :selfhost6/missing-prepared-canonical})))
+      (when (or (and wal-stat (pos? (.-size wal-stat)))
+                (and shm-stat (pos? (.-size shm-stat))))
+        (throw (ex-info "Canonical graph WAL is not checkpointed during prepared swap"
+                        {:type :selfhost6/uncheckpointed-prepared-canonical})))
+      (p/let [canonical-sha256 (<sha256-file canonical-full-path)]
+        {:canonical-sha256 canonical-sha256
+         :canonical-byte-size canonical-byte-size
+         :bounded-memory? true}))))
+
 (defn- import-db
   [write-guard-fn pool path data]
   (let [full-path (pool-path pool path)
@@ -715,6 +756,7 @@
                  :resolve-db-path (fn [_repo pool path]
                                     (pool-path pool path))
                  :export-file export-file
+                 :inspect-db-artifact-set <inspect-db-artifact-set
                  :import-db (fn [pool path data] (import-db write-guard-fn pool path data))
                  :remove-vfs! (fn [pool] (remove-vfs! pool))
                  :read-text! (fn [path] (read-text! data-dir path))

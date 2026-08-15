@@ -1,11 +1,15 @@
 (ns frontend.worker.db-core-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require ["fs" :as node-fs]
+            ["node:crypto" :as node-crypto]
+            ["path" :as node-path]
+            [cljs.test :refer [async deftest is]]
             [clojure.string :as string]
             [datascript.core :as d]
             [datascript.impl.entity :as de]
             [datascript.storage :as storage]
             [frontend.common.thread-api :as thread-api]
             [frontend.db.query-dsl :as query-dsl]
+            [frontend.test.node-helper :as node-helper]
             [frontend.worker-common.util :as worker-util]
             [frontend.worker.db-core :as db-core]
             [frontend.worker.db-listener :as db-listener]
@@ -18,6 +22,7 @@
             [frontend.worker.handler.search :as search-handler]
             [frontend.worker.pipeline :as worker-pipeline]
             [frontend.worker.platform :as platform]
+            [frontend.worker.platform.node :as platform-node]
             [frontend.worker.query-dsl :as worker-query-dsl]
             [frontend.worker.search :as search]
             [frontend.worker.shared-service :as shared-service]
@@ -40,6 +45,107 @@
             [shadow.resource :as rc]))
 
 (def ^:private test-repo "db-core-test-repo")
+
+(def ^:private activation-operation-id
+  #uuid "60000000-0000-4000-8000-000000000001")
+(def ^:private source-artifact-sha (apply str (repeat 64 "a")))
+(def ^:private target-artifact-sha (apply str (repeat 64 "b")))
+
+(defn- test-sha256-hex
+  [payload]
+  (-> (.createHash node-crypto "sha256")
+      (.update payload)
+      (.digest "hex")))
+
+(defn- activation-basis
+  [remote-t journal-high-water checkpoint]
+  {:remote-t remote-t
+   :server-checkpoint-identity checkpoint
+   :journal-high-water journal-high-water
+   :checksum-basis {:version 1
+                    :legacy-checksum "legacy"
+                    :server-v2-checksum "server-v2"
+                    :server-v2-t remote-t
+                    :legacy-anchor "anchor"
+                    :metadata-proof "proof"}})
+
+(defn- repairing-activation-record
+  []
+  (let [target-basis (activation-basis 11 20 "checkpoint-target")]
+    {:format-version 1
+     :record-kind :selfhost-activation
+     :committed {:projection-epoch 4}
+     :previous {:projection-epoch 3}
+     :operation {:operation-id activation-operation-id
+                 :graph-id "graph-1"
+                 :target-projection-epoch 5
+                 :start-basis (activation-basis 10 19 "checkpoint-source")
+                 :target-basis target-basis
+                 :disposition :repairing
+                 :attempt-count 1
+                 :next-retry-at-ms nil
+                 :last-error nil}
+     :prepared-swap {:operation-id activation-operation-id
+                     :source-artifact-identity "canonical-source"
+                     :source-sha256 source-artifact-sha
+                     :target-artifact-identity "staged-target"
+                     :target-sha256 target-artifact-sha
+                     :target-basis target-basis
+                     :written-at-ms 1000}}))
+
+(deftest activation-record-validation-and-prepared-reconciliation-test
+  (let [decode #'db-core/decode-activation-record
+        reconcile #'db-core/reconcile-prepared-activation
+        empty-record {:format-version 1
+                      :record-kind :selfhost-activation
+                      :committed {:projection-epoch 0}
+                      :previous nil
+                      :operation nil
+                      :prepared-swap nil}]
+    (is (= empty-record (decode (ldb/write-transit-str empty-record))))
+    (doseq [invalid [(assoc empty-record :format-version 2)
+                     (assoc empty-record :record-kind :unknown-kind)
+                     (assoc empty-record :unexpected true)]]
+      (is (thrown-with-msg? cljs.core.ExceptionInfo
+                            #"Invalid self-host activation record"
+                            (decode (ldb/write-transit-str invalid)))))
+    (let [repairing (repairing-activation-record)
+          local-only-invalid (-> repairing
+                                 (assoc-in [:operation :disposition] :local-only))
+          rollback-basis (activation-basis 9 20 "checkpoint-target")
+          rollback-journal-basis (activation-basis 10 18 "checkpoint-target")
+          target-committed (assoc repairing
+                                  :committed {:projection-epoch 5}
+                                  :previous {:projection-epoch 4}
+                                  :prepared-swap nil)]
+      (is (thrown-with-msg? cljs.core.ExceptionInfo
+                            #"Invalid self-host activation record"
+                            (decode (ldb/write-transit-str local-only-invalid))))
+      (doseq [invalid [(assoc-in repairing
+                                [:operation :target-basis :checksum-basis :legacy-checksum]
+                                nil)
+                       (assoc-in repairing
+                                 [:operation :target-basis :checksum-basis :server-v2-t]
+                                 12)
+                       (-> repairing
+                           (assoc-in [:operation :target-basis] rollback-basis)
+                           (assoc-in [:prepared-swap :target-basis] rollback-basis))
+                       (-> repairing
+                           (assoc-in [:operation :target-basis] rollback-journal-basis)
+                           (assoc-in [:prepared-swap :target-basis]
+                                     rollback-journal-basis))]]
+        (is (thrown-with-msg? cljs.core.ExceptionInfo
+                              #"Invalid self-host activation record"
+                              (decode (ldb/write-transit-str invalid)))))
+      (is (= (assoc repairing :prepared-swap nil)
+             (reconcile repairing source-artifact-sha)))
+      (is (= target-committed
+             (reconcile repairing target-artifact-sha)))
+      (is (= target-committed
+             (decode (ldb/write-transit-str target-committed))))
+      (is (thrown-with-msg? cljs.core.ExceptionInfo
+                            #"does not match prepared swap"
+                            (reconcile repairing (apply str (repeat 64 "c"))))))))
 
 (def ^:private task-spent-time-schema
   (merge db-schema/schema
@@ -149,6 +255,9 @@
               :db-exists? (fn [_] (p/resolved false))
               :resolve-db-path (fn [_repo _pool path] path)
               :export-file (fn [_pool _path] (p/resolved (js/Uint8Array. 0)))
+              :inspect-db-artifact-set
+              (fn [_pool _paths]
+                (p/rejected (ex-info "unexpected prepared artifact inspection" {})))
               :import-db (or import-db (fn [_pool _path _data] (p/resolved nil)))
               :remove-vfs! remove-vfs!
               :read-text! (fn [_path] (p/resolved ""))
@@ -390,9 +499,26 @@
                    (swap! close-calls conj close-label)))}))
 
 (defn- fake-storage-db
+  ([]
+   (fake-storage-db {}))
+  ([opts]
+   (let [db (fake-db opts)]
+     (gobj/set db "transaction" (fn [f] (f db)))
+     db)))
+
+(defn- new-memory-sqlite-db
   []
-  (let [db (fake-db)]
-    (gobj/set db "transaction" (fn [f] (f db)))
+  (let [Database (js/require "better-sqlite3")]
+    (new Database ":memory:")))
+
+(defn- tracking-memory-sqlite-db
+  [close-calls close-label]
+  (let [db (new-memory-sqlite-db)
+        original-close (.-close db)]
+    (gobj/set db "close"
+              (fn []
+                (swap! close-calls conj close-label)
+                (.call original-close db)))
     db))
 
 (defn- bootstrap-datoms
@@ -422,12 +548,14 @@
   (let [db (fake-storage-db)
         search-db (fake-storage-db)
         client-ops-db (fake-storage-db)
-        opened-dbs (atom [db search-db client-ops-db])
+        opened-dbs (atom [client-ops-db db search-db])
+        opened-paths (atom [])
         listener-snapshots (atom [])
         broadcasts (atom [])
         platform' (assoc-in (build-test-platform)
                             [:sqlite :open-db]
-                            (fn [_opts]
+                            (fn [open-opts]
+                              (swap! opened-paths conj (:path open-opts))
                               (let [opened-db (first @opened-dbs)]
                                 (swap! opened-dbs subvec 1)
                                 opened-db)))]
@@ -452,9 +580,10 @@
       (p/let [open-result ((get-thread-api :thread-api/create-or-open-db) repo opts)
               conn (worker-state/get-datascript-conn repo)
               {:keys [entities missing-revisions]} (first @listener-snapshots)]
-        (is (= (get opts :projection-epoch 0)
-               (:projection-epoch open-result))
-            "Graph open returns the worker-cached projection epoch.")
+        (is (= 0 (:projection-epoch open-result))
+            "Graph open returns the activation-record projection epoch.")
+        (is (string/includes? (first @opened-paths) "client-ops")
+            "Client-ops and its activation row must open before the canonical graph.")
         (is (= 1 (count @listener-snapshots)))
         (is (= repo (:repo (first @listener-snapshots))))
         (is (seq entities))
@@ -473,9 +602,426 @@
          (-> (restoring-worker-state
               (fn []
                 (p/let [_ (<assert-bootstrap-is-canonical! "bootstrap-new-graph"
-                                                          {:projection-epoch 7})
+                                                          {})
                         _ (<assert-bootstrap-is-canonical! "bootstrap-datoms"
                                                           {:datoms (bootstrap-datoms)})]
+                  nil)))
+             (p/catch (fn [error]
+                        (is false (str error))))
+             (p/finally done))))
+
+(deftest invalid-activation-fails-before-canonical-graph-open-test
+  (async done
+         (let [client-ops-db (new-memory-sqlite-db)
+               invalid-record (assoc @#'db-core/empty-activation-record :format-version 2)
+               opened-paths (atom [])]
+           (client-op/insert-sync-meta-value-if-absent!
+            client-ops-db
+            "selfhost.activation-record.v1"
+            (ldb/write-transit-str invalid-record))
+           (-> (restoring-worker-state
+                (fn []
+                  (platform/set-platform!
+                   (assoc-in (build-test-platform)
+                             [:sqlite :open-db]
+                             (fn [open-opts]
+                               (swap! opened-paths conj (:path open-opts))
+                               (if (string/includes? (:path open-opts) "client-ops")
+                                 client-ops-db
+                                 (fake-storage-db)))))
+                  (try
+                    (-> (#'db-core/get-dbs "invalid-activation-startup")
+                        (p/then (fn [_] :opened))
+                        (p/catch (fn [error] {:error error})))
+                    (catch :default error
+                      (p/resolved {:error error})))))
+               (p/then (fn [result]
+                         (is (= :selfhost6/invalid-activation-record
+                                (:type (ex-data (:error result)))))
+                         (is (= 1 (count @opened-paths)))
+                         (is (string/includes? (first @opened-paths) "client-ops"))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (when (.-open client-ops-db)
+                              (.close client-ops-db))
+                            (done)))))))
+
+(deftest existing-activation-bootstraps-epoch-without-rewrite-test
+  (async done
+         (let [client-ops-db (new-memory-sqlite-db)
+               db (fake-storage-db)
+               search-db (fake-storage-db)
+               record (assoc @#'db-core/empty-activation-record
+                             :committed {:projection-epoch 9}
+                             :previous {:projection-epoch 8})
+               raw (ldb/write-transit-str record)]
+           (client-op/insert-sync-meta-value-if-absent!
+            client-ops-db "selfhost.activation-record.v1" raw)
+           (.exec client-ops-db
+                  (str "create trigger reject_activation_rewrite before update on sync_meta "
+                       "when old.key = 'selfhost.activation-record.v1' "
+                       "begin select raise(abort, 'existing activation rewritten'); end"))
+           (-> (restoring-worker-state
+                (fn []
+                  (platform/set-platform!
+                   (assoc-in (build-test-platform)
+                             [:sqlite :open-db]
+                             (fn [open-opts]
+                               (cond
+                                 (string/includes? (:path open-opts) "client-ops") client-ops-db
+                                 (string/includes? (:path open-opts) "search") search-db
+                                 :else db))))
+                  (p/let [[opened-db opened-search opened-client-ops _]
+                          (#'db-core/get-dbs "existing-activation-startup")]
+                    (is (= db opened-db))
+                    (is (= search-db opened-search))
+                    (is (= client-ops-db opened-client-ops))
+                    (is (= 9 (worker-state/get-projection-epoch
+                              "existing-activation-startup")))
+                    (is (= {:found? true :value raw}
+                           (client-op/read-sync-meta-value
+                            client-ops-db "selfhost.activation-record.v1")))
+                    (.close opened-db)
+                    (.close opened-search)
+                    (.close opened-client-ops))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (when (.-open client-ops-db)
+                              (.close client-ops-db))
+                            (done)))))))
+
+(defn- <assert-prepared-startup-reconciliation!
+  [repo canonical-side]
+  (let [client-ops-db (new-memory-sqlite-db)
+        db (fake-storage-db)
+        search-db (fake-storage-db)
+        source-payload (js/Uint8Array. #js [1 2 3])
+        target-payload (js/Uint8Array. #js [4 5 6])
+        source-sha (test-sha256-hex source-payload)
+        target-sha (test-sha256-hex target-payload)
+        record (-> (repairing-activation-record)
+                   (assoc-in [:prepared-swap :source-sha256] source-sha)
+                   (assoc-in [:prepared-swap :target-sha256] target-sha))
+        canonical-payload (if (= canonical-side :source) source-payload target-payload)
+        expected (if (= canonical-side :source)
+                   (assoc record :prepared-swap nil)
+                   (assoc record
+                          :committed {:projection-epoch 5}
+                          :previous {:projection-epoch 4}
+                          :prepared-swap nil))
+        events (atom [])
+        platform' (-> (build-test-platform)
+                      (assoc-in [:storage :inspect-db-artifact-set]
+                                (fn [_pool paths]
+                                  (swap! events conj [:inspect paths])
+                                  (p/resolved
+                                   {:canonical-sha256
+                                    (if (= canonical-side :source) source-sha target-sha)
+                                    :canonical-byte-size (.-byteLength canonical-payload)})))
+                      (assoc-in [:sqlite :open-db]
+                                (fn [open-opts]
+                                  (let [path (:path open-opts)]
+                                    (swap! events conj [:open path])
+                                    (cond
+                                      (string/includes? path "client-ops") client-ops-db
+                                      (string/includes? path "search") search-db
+                                      :else db)))))]
+    (client-op/insert-sync-meta-value-if-absent!
+     client-ops-db "selfhost.activation-record.v1" (ldb/write-transit-str record))
+    (platform/set-platform! platform')
+    (-> (p/let [[opened-db opened-search _opened-client-ops _] (#'db-core/get-dbs repo)
+                stored (client-op/read-sync-meta-value
+                        client-ops-db "selfhost.activation-record.v1")
+                raw-after-first (:value stored)
+                _ (.exec client-ops-db
+                         (str "CREATE TRIGGER reject_activation_rewrite "
+                              "BEFORE UPDATE ON sync_meta "
+                              "WHEN OLD.key = 'selfhost.activation-record.v1' "
+                              "BEGIN SELECT RAISE(ABORT, 'activation rewrite'); END"))
+                _ (.close opened-db)
+                _ (.close opened-search)
+                [reopened-db reopened-search reopened-client-ops _] (#'db-core/get-dbs repo)
+                stored-after-reopen (client-op/read-sync-meta-value
+                                     client-ops-db "selfhost.activation-record.v1")]
+          (is (= expected (#'db-core/decode-activation-record (:value stored))))
+          (is (= raw-after-first (:value stored-after-reopen)))
+          (is (= (:operation expected)
+                 (:operation (#'db-core/decode-activation-record raw-after-first))))
+          (is (nil? (:prepared-swap (#'db-core/decode-activation-record raw-after-first))))
+          (is (= (get-in expected [:committed :projection-epoch])
+                 (worker-state/get-projection-epoch repo)))
+          (is (= [:open "client-ops-/db.sqlite"] (first @events)))
+          (is (< (.indexOf @events [:inspect {:canonical-path "/db.sqlite"
+                                              :wal-path "/db.sqlite-wal"
+                                              :shm-path "/db.sqlite-shm"}])
+                 (.indexOf @events [:open "/db.sqlite"])))
+          (is (= 1 (count (filter #(= :inspect (first %)) @events))))
+          (.close reopened-db)
+          (.close reopened-search)
+          (.close reopened-client-ops))
+        (p/finally (fn []
+                     (when (.-open client-ops-db)
+                       (.close client-ops-db)))))))
+
+(deftest prepared-source-and-target-reconcile-before-canonical-open-test
+  (async done
+         (-> (restoring-worker-state
+              (fn []
+                (p/let [_ (<assert-prepared-startup-reconciliation!
+                           "prepared-source-startup" :source)
+                        _ (<assert-prepared-startup-reconciliation!
+                           "prepared-target-startup" :target)]
+                  nil)))
+             (p/catch (fn [error]
+                        (is false (str error))))
+             (p/finally done))))
+
+(defn- <assert-prepared-startup-rejected!
+  [repo inspection-error expected-type]
+  (let [client-ops-db (new-memory-sqlite-db)
+        canonical-payload (js/Uint8Array. #js [1 2 3])
+        source-sha (test-sha256-hex canonical-payload)
+        record (assoc-in (repairing-activation-record)
+                         [:prepared-swap :source-sha256] source-sha)
+        opened-paths (atom [])]
+    (client-op/insert-sync-meta-value-if-absent!
+     client-ops-db "selfhost.activation-record.v1" (ldb/write-transit-str record))
+    (platform/set-platform!
+     (-> (build-test-platform)
+         (assoc-in [:storage :inspect-db-artifact-set]
+                   (fn [_pool _paths]
+                     (p/rejected inspection-error)))
+         (assoc-in [:sqlite :open-db]
+                   (fn [open-opts]
+                     (swap! opened-paths conj (:path open-opts))
+                     (if (string/includes? (:path open-opts) "client-ops")
+                       client-ops-db
+                       (fake-storage-db))))))
+    (-> (try
+          (-> (#'db-core/get-dbs repo)
+              (p/then (fn [_] :opened))
+              (p/catch (fn [error] {:error error})))
+          (catch :default error
+            (p/resolved {:error error})))
+        (p/then (fn [result]
+                  (if expected-type
+                    (is (= expected-type (:type (ex-data (:error result)))))
+                    (is (= "EIO" (.-code ^js (:error result)))))
+                  (is (= ["client-ops-/db.sqlite"] @opened-paths))
+                  (is (false? (.-open client-ops-db)))))
+        (p/finally (fn []
+                     (when (.-open client-ops-db)
+                       (.close client-ops-db)))))))
+
+(deftest prepared-swap-fails-closed-on-wal-boundary-test
+  (async done
+         (let [io-error (js/Error. "WAL read failed")]
+           (set! (.-code io-error) "EIO")
+           (-> (restoring-worker-state
+                (fn []
+                  (p/let [_ (<assert-prepared-startup-rejected!
+                             "prepared-wal-startup"
+                             (ex-info "uncheckpointed"
+                                      {:type :selfhost6/uncheckpointed-prepared-canonical})
+                             :selfhost6/uncheckpointed-prepared-canonical)
+                          _ (<assert-prepared-startup-rejected!
+                             "prepared-wal-io-startup"
+                             io-error
+                             nil)]
+                    nil)))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(defn- <assert-startup-acquisition-cleanup!
+  [repo failure-stage expected-first-close-order]
+  (let [first-attempt? (atom true)
+        close-calls (atom [])
+        capture-error (fn [f]
+                        (try
+                          (.catch (.then (js/Promise.resolve (f))
+                                         (constantly nil))
+                                  identity)
+                          (catch :default error
+                            (p/resolved error))))
+        platform'
+        (-> (build-test-platform)
+            (assoc-in [:sqlite :open-db]
+                      (fn [{:keys [path]}]
+                        (cond
+                          (string/includes? path "client-ops")
+                          (tracking-memory-sqlite-db
+                           close-calls
+                           (if @first-attempt? :first-client-ops :retry-client-ops))
+
+                          (= path "/db.sqlite")
+                          (if (and @first-attempt? (= failure-stage :canonical))
+                            (throw (ex-info "canonical open failed" {:stage :canonical}))
+                            (fake-storage-db
+                             {:close-calls close-calls
+                              :close-label (if @first-attempt?
+                                             :first-canonical
+                                             :retry-canonical)}))
+
+                          (= path "search/db.sqlite")
+                          (if (and @first-attempt? (= failure-stage :search))
+                            (throw (ex-info "search open failed" {:stage :search}))
+                            (fake-storage-db
+                             {:close-calls close-calls
+                              :close-label (if @first-attempt?
+                                             :first-search
+                                             :retry-search)}))
+
+                          :else
+                          (throw (ex-info "unexpected startup path" {:path path})))))
+            (assoc :vector
+                   {:open-index
+                    (fn [_]
+                      (if (and @first-attempt? (= failure-stage :vector))
+                        (throw (ex-info "vector open failed" {:stage :vector}))
+                        {:close! #(swap! close-calls conj :retry-vector)}))}))]
+    (platform/set-platform! platform')
+    (worker-state/clear-projection-epoch! repo)
+    (p/let [first-error (capture-error #(#'db-core/get-dbs repo))
+            _ (is (= failure-stage (:stage (ex-data first-error))))
+            _ (is (= expected-first-close-order @close-calls))
+            _ (is (not (contains? (:worker/projection-epochs @worker-state/*state)
+                                  repo)))
+            _ (reset! first-attempt? false)
+            [db search-db client-ops-db vector-index] (#'db-core/get-dbs repo)]
+      (is (= 0 (worker-state/get-projection-epoch repo)))
+      (when-let [close-fn (:close! vector-index)]
+        (close-fn))
+      (.close search-db)
+      (.close db)
+      (.close client-ops-db))))
+
+(deftest startup-open-failure-closes-acquired-resources-and-allows-retry-test
+  (async done
+         (-> (restoring-worker-state
+              (fn []
+                (p/let [_ (<assert-startup-acquisition-cleanup!
+                           "canonical-startup-failure" :canonical
+                           [:first-client-ops])
+                        _ (<assert-startup-acquisition-cleanup!
+                           "search-startup-failure" :search
+                           [:first-canonical :first-client-ops])
+                        _ (<assert-startup-acquisition-cleanup!
+                           "vector-startup-failure" :vector
+                           [:first-search :first-canonical :first-client-ops])]
+                  nil)))
+             (p/catch (fn [error]
+                        (is false (str error))))
+             (p/finally done))))
+
+(defn- sqlite-query-json
+  [db sql]
+  (js/JSON.stringify
+   (.exec db #js {:sql sql
+                  :rowMode "object"
+                  :returnValue "resultRows"})))
+
+(defn- fixture-client-ops-snapshot
+  [client-ops-db]
+  {:client-ops (sqlite-query-json client-ops-db
+                                  "SELECT * FROM client_ops ORDER BY created_at, id")
+   :upload-state (sqlite-query-json client-ops-db
+                                    "SELECT * FROM client_tx_upload_state ORDER BY logical_tx_id")
+   :conflicts (sqlite-query-json client-ops-db
+                                 "SELECT * FROM sync_conflicts ORDER BY id")
+   :sync-meta (sqlite-query-json
+               client-ops-db
+               "SELECT * FROM sync_meta WHERE key <> 'selfhost.activation-record.v1' ORDER BY key")})
+
+(defn- fixture-runtime-snapshot
+  [db client-ops-db]
+  {:graph-kvs (sqlite-query-json db "SELECT * FROM kvs ORDER BY rowid")
+   :client-ops (fixture-client-ops-snapshot client-ops-db)})
+
+(defn- <assert-phase5-fixture-reopens-without-semantic-rewrite!
+  [{:keys [id client-ops-fixture]}]
+  (let [root-dir (node-helper/create-tmp-dir (str "phase5-fixture-" id))
+        repo (str "phase5-fixture-" id)
+        fixture-root (node-path/join (js/process.cwd)
+                                     "docs/selfhost6-phase0/fixtures/v1")
+        canonical-fixture (node-path/join fixture-root "clean/db.sqlite")]
+    (p/let [platform' (platform-node/node-platform {:root-dir root-dir})
+            _ (platform/set-platform! platform')
+            pool (#'db-core/<get-opfs-pool repo)
+            storage (:storage platform')
+            canonical-path ((:resolve-db-path storage) repo pool "/db.sqlite")
+            client-ops-path ((:resolve-db-path storage)
+                             repo pool "client-ops-/db.sqlite")
+            _ (node-fs/copyFileSync canonical-fixture canonical-path)
+            _ (when client-ops-fixture
+                (node-fs/mkdirSync (node-path/dirname client-ops-path)
+                                   #js {:recursive true})
+                (node-fs/copyFileSync (node-path/join fixture-root client-ops-fixture)
+                                      client-ops-path))
+            source-db (platform/sqlite-open platform' {:path canonical-path})
+            source-graph-kvs (sqlite-query-json source-db
+                                                 "SELECT * FROM kvs ORDER BY rowid")
+            source-client-ops-db (when client-ops-fixture
+                                   (platform/sqlite-open platform'
+                                                         {:path client-ops-path}))
+            source-client-ops (when source-client-ops-db
+                                (fixture-client-ops-snapshot source-client-ops-db))
+            source-activation (when source-client-ops-db
+                                (:value (client-op/read-sync-meta-value
+                                         source-client-ops-db
+                                         "selfhost.activation-record.v1")))
+            _ (.close source-db)
+            _ (when source-client-ops-db (.close source-client-ops-db))
+            [db search-db client-ops-db _] (#'db-core/get-dbs repo)
+            first-snapshot (fixture-runtime-snapshot db client-ops-db)
+            first-activation (:value (client-op/read-sync-meta-value
+                                      client-ops-db "selfhost.activation-record.v1"))
+            _ (.exec client-ops-db
+                     (str "CREATE TRIGGER reject_activation_rewrite "
+                          "BEFORE UPDATE ON sync_meta "
+                          "WHEN OLD.key = 'selfhost.activation-record.v1' "
+                          "BEGIN SELECT RAISE(ABORT, 'activation rewrite'); END"))
+            _ (.close search-db)
+            _ (.close db)
+            _ (.close client-ops-db)
+            [reopened-db reopened-search reopened-client-ops _] (#'db-core/get-dbs repo)
+            second-snapshot (fixture-runtime-snapshot reopened-db reopened-client-ops)
+            second-activation (:value (client-op/read-sync-meta-value
+                                       reopened-client-ops
+                                       "selfhost.activation-record.v1"))]
+      (is (= source-graph-kvs (:graph-kvs first-snapshot))
+          (str id " first open preserves graph kvs"))
+      (when client-ops-fixture
+        (is (= source-client-ops (:client-ops first-snapshot))
+            (str id " first open preserves client-ops semantics"))
+        (is (= source-activation first-activation)
+            (str id " first open preserves activation")))
+      (is (= first-snapshot second-snapshot) id)
+      (is (= first-activation second-activation) id)
+      (.close reopened-search)
+      (.close reopened-db)
+      (.close reopened-client-ops)
+      (#'db-core/forget-storage-pool! repo))))
+
+(deftest phase5-frozen-fixture-groups-reopen-without-semantic-rewrite-test
+  (async done
+         (-> (restoring-worker-state
+              (fn []
+                (p/let [_ (<assert-phase5-fixture-reopens-without-semantic-rewrite!
+                           {:id "clean"})
+                        _ (<assert-phase5-fixture-reopens-without-semantic-rewrite!
+                           {:id "pending-history-asset"
+                            :client-ops-fixture
+                            "pending-history-asset/client-ops.sqlite"})
+                        _ (<assert-phase5-fixture-reopens-without-semantic-rewrite!
+                           {:id "upload-state"
+                            :client-ops-fixture "upload-state/valid.sqlite"})
+                        _ (<assert-phase5-fixture-reopens-without-semantic-rewrite!
+                           {:id "repair-corruption"
+                            :client-ops-fixture
+                            "repair-corruption/client-ops.sqlite"})]
                   nil)))
              (p/catch (fn [error]
                         (is false (str error))))
