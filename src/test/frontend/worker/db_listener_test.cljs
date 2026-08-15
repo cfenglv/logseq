@@ -7,6 +7,7 @@
             [frontend.worker.platform :as platform]
             [frontend.worker.render-delta :as render-delta]
             [frontend.worker.shared-service :as shared-service]
+            [frontend.worker.state :as worker-state]
             [frontend.worker.sync :as db-sync]
             [logseq.db :as ldb]
             [logseq.db.test.helper :as db-test]
@@ -106,6 +107,7 @@
         operation-id 41
         affected-keys #{[:resource :tasks]}
         delta {:graph-id repo
+               :projection-epoch 7
                :rev 1
                :blocks {block-uuid {:block/uuid block-uuid
                                     :block/tx-id 1}}
@@ -116,6 +118,7 @@
         build-inputs (atom [])
         broadcast-payloads (atom [])]
     (with-redefs [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  worker-state/get-projection-epoch (constantly 7)
                   db-sync/handle-local-tx! (fn [& _] nil)
                   worker-pipeline/invoke-hooks
                   (fn [_conn tx-report _context]
@@ -161,12 +164,14 @@
       (is (identical? @post-pipeline-report (:tx-report build-input))
           "Delta construction must use the post-pipeline transaction report.")
       (is (= {:graph-id repo
+              :projection-epoch 7
               :rev (:max-tx (:db-after @post-pipeline-report))
               :op-id operation-id
               :deleted-block-uuids #{deleted-block-uuid}
               :affected-keys affected-keys}
              (select-keys build-input
-                          [:graph-id :rev :op-id :deleted-block-uuids :affected-keys])))
+                          [:graph-id :projection-epoch :rev :op-id
+                           :deleted-block-uuids :affected-keys])))
       (is (= #{block-uuid} (set (keys (:blocks build-input)))))
       (is (= {:block/uuid block-uuid
               :block/title "hello"

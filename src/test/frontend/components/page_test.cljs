@@ -17,6 +17,7 @@
 (defn- delta
   [rev overrides]
   (merge {:graph-id test-graph-id
+          :projection-epoch 0
           :rev rev
           :op-id (str "operation-" rev)
           :blocks {}
@@ -27,7 +28,8 @@
 
 (defn- block-patch
   [basis-rev blocks]
-  {:basis-rev basis-rev
+  {:projection-epoch 0
+   :basis-rev basis-rev
    :slots (into {}
                 (map (fn [[block-uuid block-value]]
                        [[:block block-uuid] {:value block-value}]))
@@ -35,7 +37,8 @@
 
 (defn- children-patch
   [basis-rev parent-uuid tx-id items]
-  {:basis-rev basis-rev
+  {:projection-epoch 0
+   :basis-rev basis-rev
    :slots {[:children parent-uuid] {:tx-id tx-id :items items}}})
 
 (defn- finish-async!

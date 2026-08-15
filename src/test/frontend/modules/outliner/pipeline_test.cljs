@@ -11,6 +11,7 @@
         published-events (atom [])
         repo "broadcast-render-delta-test"
         delta {:graph-id repo
+               :projection-epoch 0
                :rev 7
                :blocks {}
                :deleted {}
@@ -25,6 +26,7 @@
       (with-redefs [db-subs/apply-delta! (fn [value]
                                            (swap! applied-deltas conj value)
                                            true)
+                    db-subs/current-projection? (constantly true)
                     state/get-current-repo (constantly repo)
                     state/get-current-page (constantly nil)
                     state/set-state! (fn [& args]
@@ -50,6 +52,7 @@
         repo "sidebar-tombstone-test"
         deleted-uuid (random-uuid)
         delta {:graph-id repo
+               :projection-epoch 0
                :rev 9
                :blocks {}
                :deleted {deleted-uuid {:rev 9 :db/id 42}}
@@ -59,6 +62,7 @@
     (try
       (state/replace-state! {:client-id "client"})
       (with-redefs [db-subs/apply-delta! (constantly true)
+                    db-subs/current-projection? (constantly true)
                     state/get-current-repo (constantly repo)
                     state/get-current-page (constantly nil)
                     state/sidebar-remove-deleted-block! (fn [ids]
@@ -76,6 +80,7 @@
         repo "recycled-page-recents-test"
         page-uuid (random-uuid)
         delta {:graph-id repo
+               :projection-epoch 0
                :rev 10
                :blocks {page-uuid {:db/id 42
                                    :block/uuid page-uuid
@@ -92,6 +97,7 @@
                              :git/current-repo repo
                              :ui/recent-pages {repo [42 7]}})
       (with-redefs [db-subs/apply-delta! (constantly true)
+                    db-subs/current-projection? (constantly true)
                     state/get-current-page (constantly nil)
                     state/pub-event! (constantly nil)]
         (pipeline/invoke-hooks {:repo repo
@@ -107,6 +113,7 @@
         repo "hard-deleted-page-recents-test"
         page-uuid (random-uuid)
         delta {:graph-id repo
+               :projection-epoch 0
                :rev 11
                :blocks {}
                :deleted {page-uuid {:rev 11 :db/id 42}}
@@ -120,6 +127,7 @@
                              :git/current-repo repo
                              :ui/recent-pages {repo [42 7]}})
       (with-redefs [db-subs/apply-delta! (constantly true)
+                    db-subs/current-projection? (constantly true)
                     state/get-current-page (constantly nil)
                     state/sidebar-remove-deleted-block! (constantly nil)
                     state/pub-event! (constantly nil)]
@@ -130,3 +138,26 @@
             "Hard deletion removes only that page from recent history."))
       (finally
         (state/replace-state! original-state)))))
+
+(deftest stale-projection-broadcast-applies-no-lifecycle-side-effects-test
+  (let [repo "stale-projection-broadcast-test"
+        delta {:graph-id repo
+               :projection-epoch 1
+               :rev 12
+               :blocks {}
+               :deleted {}
+               :children {}
+               :affected-keys #{[:graph]}}
+        applied-deltas (atom [])
+        published-events (atom [])]
+    (with-redefs [db-subs/current-projection? (constantly false)
+                  db-subs/apply-delta! #(swap! applied-deltas conj %)
+                  state/pub-event! #(swap! published-events conj %)]
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:outliner-op :rename-page
+                                        :data {:old-name "old" :new-name "new"}}
+                              :delta delta}))
+    (is (= [delta] @applied-deltas)
+        "The canonical store still owns validation and stale-delta rejection.")
+    (is (empty? @published-events)
+        "A stale projection cannot publish plugin or page lifecycle effects.")))

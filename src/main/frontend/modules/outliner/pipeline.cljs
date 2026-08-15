@@ -43,49 +43,52 @@
 
 (defn invoke-hooks
   [{:keys [repo tx-meta delta]}]
-  (when delta
-    (db-subs/apply-delta! delta))
-  (let [{:keys [initial-pages? end?]} tx-meta
-        current-page (state/get-current-page)
-        blocks (:blocks delta)
-        deleted (:deleted delta)]
-    (when (= repo (state/get-current-repo))
-      (let [deleted-ids (not-empty (keep :db/id (vals deleted)))
-            recycled-ids (keep (fn [block]
-                                 (when (and (ldb/page? block)
-                                            (ldb/recycled? block))
-                                   (:db/id block)))
-                               (vals blocks))]
-        (when deleted-ids
-          (state/sidebar-remove-deleted-block! deleted-ids))
-        (when-let [removed-page-ids (not-empty (concat deleted-ids recycled-ids))]
-          (state/remove-pages-from-recent! removed-page-ids)))
-      (when (and (current-page-deleted? current-page deleted)
-                 (not (util/mobile?)))
-        (route-handler/redirect-to-home!))
+  (let [current-projection? (or (nil? delta)
+                                (db-subs/current-projection? delta))]
+    (when delta
+      (db-subs/apply-delta! delta))
+    (when current-projection?
+      (let [{:keys [initial-pages? end?]} tx-meta
+            current-page (state/get-current-page)
+            blocks (:blocks delta)
+            deleted (:deleted delta)]
+        (when (= repo (state/get-current-repo))
+          (let [deleted-ids (not-empty (keep :db/id (vals deleted)))
+                recycled-ids (keep (fn [block]
+                                     (when (and (ldb/page? block)
+                                                (ldb/recycled? block))
+                                       (:db/id block)))
+                                   (vals blocks))]
+            (when deleted-ids
+              (state/sidebar-remove-deleted-block! deleted-ids))
+            (when-let [removed-page-ids (not-empty (concat deleted-ids recycled-ids))]
+              (state/remove-pages-from-recent! removed-page-ids)))
+          (when (and (current-page-deleted? current-page deleted)
+                     (not (util/mobile?)))
+            (route-handler/redirect-to-home!))
 
-      (cond
-        initial-pages?
-        (when end?
-          (state/pub-event! [:init/commands])
-          (ui-handler/re-render-root!))
+          (cond
+            initial-pages?
+            (when end?
+              (state/pub-event! [:init/commands])
+              (ui-handler/re-render-root!))
 
-        :else
-        (do
-          (when (current-page-recycled? current-page blocks)
-            (route-handler/redirect! {:to :home :push false}))
+            :else
+            (do
+              (when (current-page-recycled? current-page blocks)
+                (route-handler/redirect! {:to :home :push false}))
 
-          (when (or (not= (:client-id tx-meta) (:client-id (state/get-state)))
-                    (= :apply-template (:outliner-op tx-meta)))
-            (update-editing-block-title-if-changed! blocks))
+              (when (or (not= (:client-id tx-meta) (:client-id (state/get-state)))
+                        (= :apply-template (:outliner-op tx-meta)))
+                (update-editing-block-title-if-changed! blocks))
 
-          (state/set-state! :editor/start-pos nil)
+              (state/set-state! :editor/start-pos nil)
 
-          (when-not (:graph/importing (state/get-state))
-            (publish-plugin-hook! tx-meta delta)))))
+              (when-not (:graph/importing (state/get-state))
+                (publish-plugin-hook! tx-meta delta)))))
 
-    (when (= (:outliner-op tx-meta) :delete-page)
-      (state/pub-event! [:page/deleted (:deleted-page tx-meta) tx-meta]))
+        (when (= (:outliner-op tx-meta) :delete-page)
+          (state/pub-event! [:page/deleted (:deleted-page tx-meta) tx-meta]))
 
-    (when (= (:outliner-op tx-meta) :rename-page)
-      (state/pub-event! [:page/renamed repo (:data tx-meta)]))))
+        (when (= (:outliner-op tx-meta) :rename-page)
+          (state/pub-event! [:page/renamed repo (:data tx-meta)]))))))

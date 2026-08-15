@@ -188,7 +188,8 @@
                             (fn [_graph-id resource-key]
                               (swap! resource-loads conj resource-key)
                               (if (= [:journals] resource-key)
-                                (p/resolved {:basis-rev 1
+                                (p/resolved {:projection-epoch 0
+                                             :basis-rev 1
                                              :slots
                                              {[:resource resource-key]
                                               {:watch {:keys #{[:journals]}
@@ -200,7 +201,8 @@
                             (fn [_graph-id block-uuid]
                               (swap! block-loads conj block-uuid)
                               (p/resolved
-                               {:basis-rev 1
+                               {:projection-epoch 0
+                                :basis-rev 1
                                 :slots {[:block block-uuid]
                                         {:value journal-a-block}}}))]
               (let [outer (mount-hook! db-hooks/use-resource [:journals])]

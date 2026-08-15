@@ -23,6 +23,7 @@
 (defn- delta
   [rev overrides]
   (merge {:graph-id test-graph-id
+          :projection-epoch 0
           :rev rev
           :op-id (str "operation-" rev)
           :blocks {}
@@ -33,7 +34,8 @@
 
 (defn- block-patch
   [basis-rev blocks]
-  {:basis-rev basis-rev
+  {:projection-epoch 0
+   :basis-rev basis-rev
    :slots (into {}
                 (map (fn [[block-uuid block-value]]
                        [[:block block-uuid] {:value block-value}]))
@@ -41,17 +43,20 @@
 
 (defn- missing-block-patch
   [basis-rev block-uuid]
-  {:basis-rev basis-rev
+  {:projection-epoch 0
+   :basis-rev basis-rev
    :slots {[:block block-uuid] {:missing? true}}})
 
 (defn- children-patch
   [basis-rev parent-uuid tx-id items]
-  {:basis-rev basis-rev
+  {:projection-epoch 0
+   :basis-rev basis-rev
    :slots {[:children parent-uuid] {:tx-id tx-id :items items}}})
 
 (defn- subtree-patch
   [basis-rev blocks children]
-  {:basis-rev basis-rev
+  {:projection-epoch 0
+   :basis-rev basis-rev
    :slots (merge
            (:slots (block-patch basis-rev blocks))
            (into {}
@@ -62,7 +67,8 @@
 
 (defn- resource-patch
   [basis-rev resource-key watch value]
-  {:basis-rev basis-rev
+  {:projection-epoch 0
+   :basis-rev basis-rev
    :slots {[:resource resource-key] {:watch watch :value value}}})
 
 (defn- exact-resource-patch
@@ -125,7 +131,8 @@
                                  (fn [api graph-id request]
                                    (swap! worker-calls conj [api graph-id request])
                                    (p/resolved
-                                    {:basis-rev 1
+                                   {:projection-epoch 0
+                                    :basis-rev 1
                                      :slots
                                      {[:resource resource-key]
                                       {:watch {:keys #{[:journals]} :all? false}
@@ -191,8 +198,9 @@
                           (let [[graph-id request] args]
                             (is (= test-graph-id graph-id))
                             (p/resolved
-                             (render-engine/render-snapshots @conn request
-                                                             {:repo graph-id})))
+                             (assoc (render-engine/render-snapshots
+                                     @conn request {:repo graph-id})
+                                    :projection-epoch 0)))
 
                           (p/rejected
                            (ex-info "Unexpected worker API" {:api api :args args}))))
@@ -441,6 +449,41 @@
                             :value (block block-uuid 101 "new generation")}
                            (subs/block-snapshot block-uuid))))
                   (@unsubscribe-new))))))))
+
+(deftest projection-epoch-rejects-an-old-delta-test
+  (let [block-uuid (random-uuid)
+        old-block (block block-uuid 1 "old projection")]
+    (subs/reset-graph! test-graph-id 2)
+    (is (nil? (subs/apply-delta!
+               (delta 1 {:projection-epoch 1
+                         :blocks {block-uuid old-block}}))))
+    (is (= {:status :loading}
+           (subs/block-snapshot block-uuid))
+        "An old projection delta must not publish into the active store.")))
+
+(deftest projection-epoch-rejects-an-old-load-response-test
+  (async done
+         (let [block-uuid (random-uuid)
+               request (p/deferred)
+               notifications (atom 0)]
+           (subs/reset-graph! test-graph-id 2)
+           (finish-async!
+            done
+            (p/with-redefs [subs/<load-block (fn [_graph-id _block-uuid] request)]
+              (let [unsubscribe (subs/subscribe-block! block-uuid #(swap! notifications inc))]
+                (p/let [_ (p/delay 0)
+                        before @notifications
+                        _ (p/resolve! request
+                                      (assoc (block-patch
+                                              10 {block-uuid
+                                                  (block block-uuid 10 "old projection")})
+                                             :projection-epoch 1))
+                        _ (p/delay 0)]
+                  (is (= {:status :loading}
+                         (subs/block-snapshot block-uuid)))
+                  (is (= before @notifications)
+                      "An old projection load must not notify mounted slots.")
+                  (unsubscribe))))))))
 
 (deftest one-block-delta-notifies-only-that-uuid-test
   (async done
@@ -1407,7 +1450,9 @@
                                                          :value resource-key}]))
                                                 resource-keys)]
                                 (p/resolved
-                                 (grouped-patch {:basis-rev 1 :slots slots}
+                                 (grouped-patch {:projection-epoch 0
+                                                 :basis-rev 1
+                                                 :slots slots}
                                                 (keys slots)))))]
               (let [unsubscribes
                     (mapv #(subs/subscribe-resource! % (fn [])) resource-keys)]
@@ -1466,7 +1511,8 @@
             (p/with-redefs [state/<invoke-db-worker
                             (fn [_api _graph-id _requested-keys]
                               (p/resolved
-                               {:basis-rev 1
+                               {:projection-epoch 0
+                                :basis-rev 1
                                 :slots
                                 {[:resource present-key]
                                  {:watch {:keys #{} :all? true}
@@ -1845,7 +1891,8 @@
                             (fn [graph-id requested-key]
                               (swap! calls conj [:resource graph-id requested-key])
                               (p/resolved
-                               {:basis-rev 1
+                               {:projection-epoch 0
+                                :basis-rev 1
                                 :slots
                                 {[:resource resource-key]
                                  {:watch {:keys #{} :all? false}
@@ -1895,7 +1942,8 @@
                current-block (block block-uuid 2 "current")
                calls (atom 0)
                response (fn [basis-rev block-value]
-                          {:basis-rev basis-rev
+                          {:projection-epoch 0
+                           :basis-rev basis-rev
                            :slots
                            {[:resource resource-key]
                             {:watch {:keys #{} :all? false}
@@ -1940,7 +1988,8 @@
                second-request (p/deferred)
                calls (atom 0)
                response (fn [basis-rev tx-id items]
-                          {:basis-rev basis-rev
+                          {:projection-epoch 0
+                           :basis-rev basis-rev
                            :slots
                            {[:resource resource-key]
                             {:watch {:keys #{} :all? false}
