@@ -138,6 +138,26 @@
         (is (= 12 (client-op/get-local-tx repo)))
         (is (= "checksum-2" (client-op/get-local-checksum repo)))))))
 
+(deftest repair-local-observation-is-one-journal-read-transaction-test
+  (let [repo "repo-repair-observation"
+        tx-id (random-uuid)]
+    (with-client-ops-db
+      repo
+      (fn [_db]
+        (client-op/update-local-tx repo 7)
+        (client-op/update-local-checksum repo "legacy-7")
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id tx-id
+               :created-at 10
+               :pending? true
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (is (= {:remote-t 7
+                :journal-high-water 1
+                :pending-count 1
+                :legacy-anchor "legacy-7"}
+               (client-op/read-repair-local-observation repo)))))))
+
 (deftest sqlite-asset-ops-coalescing-test
   (let [repo "repo-asset"
         asset-uuid (random-uuid)]

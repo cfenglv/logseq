@@ -298,6 +298,34 @@
            true)
          false)))))
 
+(defn read-repair-local-observation
+  "Read the journal/cursor observation used by one repair suspect check.
+  This is a cold-path read transaction; it does not create a mirrored cursor."
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [journal-row (sqlite-row
+                          tx
+                          (str "select coalesce(max(id), 0) as high_water, "
+                               "sum(case when kind = 'tx' and pending = 1 then 1 else 0 end) as pending_count "
+                               "from client_ops")
+                          [])
+             local-t (some-> (sqlite-row tx
+                                         "select value from sync_meta where key = 'local-tx'"
+                                         [])
+                             (aget "value")
+                             (js/parseInt 10))]
+         {:remote-t local-t
+          :journal-high-water (or (some-> journal-row (aget "high_water")) 0)
+          :pending-count (or (some-> journal-row (aget "pending_count")) 0)
+          :legacy-anchor (some-> (sqlite-row
+                                  tx
+                                  "select value from sync_meta where key = 'checksum'"
+                                  [])
+                                 (aget "value"))})))))
+
 (defn- sqlite-get-meta
   [db k]
   (some-> (sqlite-row db "select value from sync_meta where key = ?" [(name k)])

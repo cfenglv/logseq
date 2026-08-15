@@ -1,9 +1,12 @@
 (ns frontend.worker.sync.download-test
   (:require [cljs.test :refer [async deftest is]]
+            [frontend.common.thread-api :as thread-api]
             [frontend.worker.state :as worker-state]
+            [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.crypt :as sync-crypt]
             [frontend.worker.sync.download :as sync-download]
             [frontend.worker.sync.log-and-state :as rtc-log-and-state]
+            [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-sync.snapshot :as snapshot]
             [promesa.core :as p]))
 
@@ -22,6 +25,209 @@
    #js {:start (fn [controller]
                  (.enqueue controller payload)
                  (.close controller))}))
+
+(deftest checksum-mismatch-suspect-claims-from-bounded-proof-test
+  (async done
+         (let [repo "repair-suspect-repo"
+               client {:graph-id "graph-1" :inflight (atom [])}
+               conn (atom :db)
+               observation {:remote-t 9
+                            :journal-high-water 14
+                            :pending-count 0
+                            :legacy-anchor "local-cached"}
+               diagnostics {:checksum "remote-full"
+                            :t 9
+                            :legacy-anchor "remote-full"
+                            :server-recomputed-checksum "remote-full"
+                            :server-checkpoint-identity "checkpoint-9"
+                            :metadata-proof "proof-9"}
+               fetch-count (atom 0)
+               fetch-urls (atom [])
+               claims (atom [])
+               config-prev @worker-state/*db-sync-config]
+           (reset! worker-state/*db-sync-config
+                   {:http-base "https://sync.example.test"})
+           (-> (p/with-redefs
+                 [worker-state/get-datascript-conn (fn [_] conn)
+                  client-op/read-repair-local-observation
+                  (fn [_] observation)
+                  sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))
+                  sync-download/fetch-json
+                  (fn [url _opts schema]
+                    (is (= :sync/checksum-diagnostics schema))
+                    (swap! fetch-count inc)
+                    (swap! fetch-urls conj url)
+                    (p/resolved diagnostics))
+                  thread-api/*thread-apis
+                  (atom {:thread-api/db-sync-claim-repair
+                         (fn [claim-repo graph-id basis]
+                           (let [result {:claimed? true
+                                         :operation {:operation-id
+                                                     #uuid "90000000-0000-4000-8000-000000000001"}}]
+                             (swap! claims conj [claim-repo graph-id basis])
+                             result))})]
+                 (sync-download/<claim-repair-after-checksum-mismatch!
+                  repo client 9 "remote-full"))
+               (p/then
+                (fn [result]
+                  (is (= 1 @fetch-count))
+                  (is (= ["https://sync.example.test/sync/graph-1/checksum/diagnostics?proof-only=true"]
+                         @fetch-urls))
+                  (is (= 1 (count @claims)))
+                  (is (true? (:claimed? result)))
+                  (is (= {:remote-t 9
+                          :server-checkpoint-identity "checkpoint-9"
+                          :journal-high-water 14
+                          :checksum-basis
+                          {:version 1
+                           :legacy-checksum "local-full"
+                           :server-recomputed-checksum "remote-full"
+                           :server-t 9
+                           :legacy-anchor "remote-full"
+                           :metadata-proof "proof-9"}}
+                         (nth (first @claims) 2)))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (done)))))))
+
+(deftest changed-suspect-does-not-claim-test
+  (async done
+         (let [repo "repair-suspect-changed-repo"
+               client {:graph-id "graph-1" :inflight (atom [])}
+               conn (atom :db)
+               observations (atom [{:remote-t 9 :journal-high-water 14
+                                    :pending-count 0 :legacy-anchor "local"}
+                                   {:remote-t 9 :journal-high-water 15
+                                    :pending-count 0 :legacy-anchor "local"}])
+               claim-count (atom 0)
+               config-prev @worker-state/*db-sync-config]
+           (reset! worker-state/*db-sync-config
+                   {:http-base "https://sync.example.test"})
+           (-> (p/with-redefs
+                 [worker-state/get-datascript-conn (fn [_] conn)
+                  client-op/read-repair-local-observation
+                  (fn [_]
+                    (let [result (first @observations)]
+                      (swap! observations subvec 1)
+                      result))
+                  sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))
+                  sync-download/fetch-json
+                  (fn [& _]
+                    (p/resolved {:checksum "remote-full"
+                                 :t 9
+                                 :legacy-anchor "remote-full"
+                                 :server-recomputed-checksum "remote-full"
+                                 :server-checkpoint-identity "checkpoint-9"
+                                 :metadata-proof "proof-9"}))
+                  thread-api/*thread-apis
+                  (atom {:thread-api/db-sync-claim-repair
+                         (fn [& _] (swap! claim-count inc))})]
+                 (sync-download/<claim-repair-after-checksum-mismatch!
+                  repo client 9 "remote-full"))
+               (p/then (fn [result]
+                         (is (= {:claimed? false :reason :suspect-changed}
+                                result))
+                         (is (zero? @claim-count))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (done)))))))
+
+(deftest reopened-graph-discards-stale-suspect-test
+  (async done
+         (let [repo "repair-suspect-reopened-repo"
+               client {:graph-id "graph-1" :inflight (atom [])}
+               old-conn (atom :old-db)
+               new-conn (atom :new-db)
+               current-conn (atom old-conn)
+               resolve-diagnostics (atom nil)
+               diagnostics-promise
+               (js/Promise. (fn [resolve _reject]
+                              (reset! resolve-diagnostics resolve)))
+               observation {:remote-t 9 :journal-high-water 14
+                            :pending-count 0 :legacy-anchor "remote-full"}
+               writes (atom 0)
+               claims (atom 0)
+               config-prev @worker-state/*db-sync-config]
+           (reset! worker-state/*db-sync-config
+                   {:http-base "https://sync.example.test"})
+           (-> (p/with-redefs
+                 [worker-state/get-datascript-conn (fn [_] @current-conn)
+                  client-op/read-repair-local-observation (fn [_] observation)
+                  client-op/update-local-checksum (fn [& _] (swap! writes inc))
+                  sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))
+                  sync-download/fetch-json (fn [& _] diagnostics-promise)
+                  thread-api/*thread-apis
+                  (atom {:thread-api/db-sync-claim-repair
+                         (fn [& _] (swap! claims inc))})]
+                 (let [result (sync-download/<claim-repair-after-checksum-mismatch!
+                               repo client 9 "remote-full")]
+                   (js/setTimeout
+                    (fn []
+                      (reset! current-conn new-conn)
+                      (@resolve-diagnostics
+                       {:checksum "remote-full"
+                        :t 9
+                        :legacy-anchor "remote-full"
+                        :server-recomputed-checksum "remote-full"
+                        :server-checkpoint-identity "checkpoint-9"
+                        :metadata-proof "proof-9"}))
+                    0)
+                   result))
+               (p/then (fn [result]
+                         (is (= {:claimed? false :reason :suspect-changed} result))
+                         (is (zero? @writes))
+                         (is (zero? @claims))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (done)))))))
+
+(deftest server-checksum-drift-fails-before-anchor-change-test
+  (async done
+         (let [repo "repair-server-drift-repo"
+               client {:graph-id "graph-1" :inflight (atom [])}
+               conn (atom :db)
+               observation {:remote-t 9 :journal-high-water 14
+                            :pending-count 0 :legacy-anchor "message-anchor"}
+               writes (atom 0)
+               claims (atom 0)
+               drift-error (atom nil)
+               config-prev @worker-state/*db-sync-config]
+           (reset! worker-state/*db-sync-config
+                   {:http-base "https://sync.example.test"})
+           (-> (p/with-redefs
+                 [worker-state/get-datascript-conn (fn [_] conn)
+                  client-op/read-repair-local-observation (fn [_] observation)
+                  client-op/update-local-checksum (fn [& _] (swap! writes inc))
+                  sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))
+                  sync-download/fetch-json
+                  (fn [& _]
+                    (p/resolved {:checksum "recomputed"
+                                 :t 9
+                                 :legacy-anchor "server-anchor"
+                                 :server-recomputed-checksum "recomputed"
+                                 :server-checkpoint-identity "checkpoint-9"
+                                 :metadata-proof "proof-9"}))
+                  thread-api/*thread-apis
+                  (atom {:thread-api/db-sync-claim-repair
+                         (fn [& _] (swap! claims inc))})]
+                 (sync-download/<claim-repair-after-checksum-mismatch!
+                  repo client 9 "message-anchor"))
+               (p/catch (fn [error]
+                          (reset! drift-error error)))
+               (p/then (fn []
+                         (is (= :db-sync/server-checksum-drift
+                                (:type (ex-data @drift-error))))
+                         (is (zero? @writes))
+                         (is (zero? @claims))))
+               (p/finally (fn []
+                            (reset! worker-state/*db-sync-config config-prev)
+                            (done)))))))
 
 (deftest stream-snapshot-row-batches-ignores-stale-gzip-header-test
   (async done
