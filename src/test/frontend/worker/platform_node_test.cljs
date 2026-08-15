@@ -32,6 +32,37 @@
       (js/Object.defineProperty js/process "platform" platform-descriptor)
       (js/Object.defineProperty js/process "arch" arch-descriptor))))
 
+(def ^:private websocket-proxy-env-keys
+  ["HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy"
+   "ALL_PROXY" "all_proxy" "NO_PROXY" "no_proxy"])
+
+(defn- set-websocket-proxy-env!
+  [values]
+  (let [env (.-env js/process)
+        original (into {} (map (fn [key] [key (gobj/get env key)]))
+                       websocket-proxy-env-keys)]
+    (doseq [key websocket-proxy-env-keys]
+      (gobj/remove env key))
+    (doseq [[key value] values]
+      (gobj/set env key value))
+    (fn []
+      (doseq [key websocket-proxy-env-keys]
+        (gobj/remove env key))
+      (doseq [[key value] original]
+        (when (some? value)
+          (gobj/set env key value))))))
+
+(defn- close-test-websocket!
+  [ws]
+  (when ws
+    (.on ^js ws "error" (fn [_] nil))
+    (.terminate ^js ws)))
+
+(defn- websocket-agent
+  [ws]
+  (some-> (gobj/get ws "_req")
+          (gobj/get "agent")))
+
 (defn- <open-test-db
   []
   (let [root-dir (node-helper/create-tmp-dir "platform-node")
@@ -140,6 +171,46 @@
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
+
+(deftest node-platform-websocket-uses-https-proxy-agent
+  (async done
+    (let [restore-env! (set-websocket-proxy-env!
+                        {"HTTPS_PROXY" "http://127.0.0.1:9"})
+          ws* (atom nil)]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir (node-helper/create-tmp-dir "platform-node-ws-proxy")})
+                  ws ((get-in platform [:websocket :connect])
+                      "wss://sync.example.invalid/sync/graph")]
+            (reset! ws* ws)
+            (is (= "HttpsProxyAgent"
+                   (some-> (websocket-agent ws)
+                           (gobj/get "constructor")
+                           (gobj/get "name")))))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (close-test-websocket! @ws*)
+                       (restore-env!)
+                       (done)))))))
+
+(deftest node-platform-websocket-honors-no-proxy
+  (async done
+    (let [restore-env! (set-websocket-proxy-env!
+                        {"HTTPS_PROXY" "http://127.0.0.1:9"
+                         "NO_PROXY" "sync.example.invalid"})
+          ws* (atom nil)]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir (node-helper/create-tmp-dir "platform-node-ws-no-proxy")})
+                  ws ((get-in platform [:websocket :connect])
+                      "wss://sync.example.invalid/sync/graph")]
+            (reset! ws* ws)
+            (is (nil? (websocket-agent ws))))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (close-test-websocket! @ws*)
+                       (restore-env!)
+                       (done)))))))
 
 (deftest node-platform-writes-text-atomically-and-deletes-files
   (async done

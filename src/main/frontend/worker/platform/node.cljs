@@ -2,10 +2,12 @@
   "Node.js platform adapter for db-worker."
   (:require ["fs" :as node-fs]
             ["fs/promises" :as fs]
+            ["https-proxy-agent" :refer [HttpsProxyAgent]]
             ["node:crypto" :as node-crypto]
             ["node:sqlite" :as node-sqlite]
             ["os" :as os]
             ["path" :as node-path]
+            ["proxy-from-env" :refer [getProxyForUrl]]
             [clojure.string :as string]
             [cognitect.transit :as transit]
             [frontend.worker.db-worker-node-lock :as db-lock]
@@ -684,10 +686,26 @@
       (-> (fs/rm full-path #js {:force true})
           (p/catch (constantly nil))))))
 
+(defn- websocket-proxy-resolution-url
+  [url]
+  (let [target (js/URL. url)
+        protocol (case (.-protocol target)
+                   "wss:" "https:"
+                   "ws:" "http:"
+                   (.-protocol target))]
+    (str protocol "//" (.-host target))))
+
 (defn- websocket-connect
   [url]
-  (let [WebSocket (js/require "ws")]
-    (new WebSocket url)))
+  (let [WebSocket (js/require "ws")
+        proxy-url (not-empty (getProxyForUrl (websocket-proxy-resolution-url url)))]
+    (if proxy-url
+      (let [agent (new HttpsProxyAgent proxy-url)]
+        (log/info :db-sync/ws-proxy
+                  {:target-host (.-hostname (js/URL. url))
+                   :proxy-protocol (.-protocol (js/URL. proxy-url))})
+        (new WebSocket url #js {:agent agent}))
+      (new WebSocket url))))
 
 (def ^:private kv-transit-writer
   (transit/writer
