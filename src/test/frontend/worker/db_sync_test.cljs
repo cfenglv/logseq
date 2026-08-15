@@ -32,6 +32,7 @@
    [logseq.common.util :as common-util]
    [logseq.common.util.page-ref :as page-ref]
    [logseq.db :as ldb]
+   [logseq.db-sync.protocol :as sync-protocol]
    [logseq.db-sync.checksum :as sync-checksum]
    [logseq.db-sync.storage :as sync-storage]
    [logseq.db-sync.worker.handler.sync :as sync-handler]
@@ -680,6 +681,318 @@
             (is (= 0 @send-calls)))
           (#'sync-apply/set-upload-stopped! test-repo false))))))
 
+(deftest client-upload-state-schema-and-ack-cleanup-test
+  (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+        tx-id (random-uuid)
+        state {:format-version 1
+               :kind :staged-large-upload-v1
+               :session-id (apply str (repeat 64 "a"))
+               :source-digest (apply str (repeat 64 "b"))
+               :outliner-op :insert-blocks
+               :boundaries [5000 5001]
+               :source-next-index 0
+               :chunk-seq 0
+               :wire-cache nil}]
+    (with-datascript-conns
+      conn
+      client-ops-conn
+      (fn []
+        (seed-client-op-txs!
+         test-repo
+         [{:db-sync/tx-id tx-id
+           :db-sync/pending? true
+           :db-sync/created-at 1
+           :db-sync/outliner-op :insert-blocks
+           :db-sync/normalized-tx-data [[:db/add -1 :block/title "durable upload"]]}])
+        (client-op/put-client-tx-upload-state! test-repo tx-id state)
+        (is (= state (client-op/get-client-tx-upload-state test-repo tx-id)))
+        (is (= 1 (aget (sqlite-get-row client-ops-conn
+                                       "select count(*) as c from client_tx_upload_state")
+                       "c")))
+        (is (= 1 (client-op/mark-pending-txs-false! test-repo [tx-id])))
+        (is (= 0 (aget (client-op-tx-row client-ops-conn tx-id) "pending")))
+        (is (= 1 (aget (sqlite-get-row client-ops-conn
+                                       "select count(*) as c from client_ops where tx_id = ?"
+                                       (str tx-id))
+                       "c")))
+        (is (= 0 (aget (sqlite-get-row client-ops-conn
+                                       "select count(*) as c from client_tx_upload_state")
+                       "c")))))))
+
+(deftest flush-pending-staged-upload-reuses-wire-after-restart-test
+  (async done
+         (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               tx-id (random-uuid)
+               tx-data (vec (concat
+                             (repeat 5000 [:db/add [:block/uuid (:block/uuid child1)]
+                                           :block/title
+                                           "staged lost ack"])
+                             [[:db/add [:block/uuid (:block/uuid child1)]
+                               :block/title
+                               "staged tail"]]))
+               sent (atom [])
+               make-client (fn []
+                             {:repo test-repo
+                              :graph-id "graph-1"
+                              :inflight (atom [])
+                              :upload-request (atom nil)
+                              :server-capabilities (atom #{"tx-upload-staged-v1"})
+                              :ws (doto (js-obj)
+                                    (aset "readyState" 1)
+                                    (aset "send" (fn [raw]
+                                                   (swap! sent conj
+                                                          (js->clj (js/JSON.parse raw)
+                                                                   :keywordize-keys true)))))})]
+           (-> (with-datascript-conns
+                 conn
+                 client-ops-conn
+                 (fn []
+                   (-> (p/with-redefs [worker-state/online? (constantly true)
+                                        sync-crypt/graph-e2ee? (constantly false)]
+                         (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                         (client-op/update-local-tx test-repo 0)
+                         (seed-client-op-txs!
+                          test-repo
+                          [{:db-sync/tx-id tx-id
+                            :db-sync/pending? true
+                            :db-sync/created-at 1
+                            :db-sync/outliner-op :insert-blocks
+                            :db-sync/normalized-tx-data tx-data}])
+                         (p/let [client-before (make-client)
+                                 _ (#'sync-apply/flush-pending! test-repo client-before)
+                                 _ (sync-apply/clear-upload-response-timeout! client-before)
+                                 client-after (make-client)
+                                 _ (#'sync-apply/flush-pending! test-repo client-after)]
+                           (let [first-entry (get-in @sent [0 :txs 0])
+                                 retry-entry (get-in @sent [1 :txs 0])
+                                 session-id (sync-protocol/tx-upload-session-id
+                                             tx-id :insert-blocks tx-data)
+                                 wire-id (sync-protocol/tx-chunk-id tx-id session-id 0 false)]
+                             (is (= 2 (count @sent)))
+                             (is (= first-entry retry-entry))
+                             (is (= (str wire-id) (:tx-id first-entry)))
+                             (is (= (str tx-id) (:logical-tx-id first-entry)))
+                             (is (= session-id (:upload-session-id first-entry)))
+                             (is (= 0 (:chunk-index first-entry)))
+                             (is (false? (:chunk-final? first-entry)))
+                             (is (= 5000
+                                    (count (sqlite-util/read-transit-str (:tx first-entry))))))))
+                       (p/catch (fn [error]
+                                  (is nil (str error)))))))
+               (p/finally done)))))
+
+(deftest flush-pending-randomized-single-wire-reuses-frozen-entry-after-restart-test
+  (async done
+         (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               tx-id (random-uuid)
+               tx-data [[:db/add [:block/uuid (:block/uuid child1)]
+                         :block/title
+                         "plain title"]]
+               encrypt-calls (atom 0)
+               sent (atom [])
+               make-client (fn []
+                             {:repo test-repo
+                              :graph-id "graph-1"
+                              :inflight (atom [])
+                              :upload-request (atom nil)
+                              :server-capabilities (atom #{})
+                              :ws-state (atom :open)
+                              :online-users (atom [])
+                              :ws (doto (js-obj)
+                                    (aset "readyState" 1)
+                                    (aset "send" (fn [raw]
+                                                   (swap! sent conj
+                                                          (js->clj (js/JSON.parse raw)
+                                                                   :keywordize-keys true)))))})]
+           (-> (with-datascript-conns
+                 conn
+                 client-ops-conn
+                 (fn []
+                   (-> (p/with-redefs [worker-state/online? (constantly true)
+                                        sync-crypt/graph-e2ee? (constantly true)
+                                        sync-crypt/<ensure-graph-aes-key (fn [& _] (p/resolved ::aes-key))
+                                        sync-crypt/<encrypt-tx-data
+                                        (fn [_ tx-data*]
+                                          (let [call (swap! encrypt-calls inc)]
+                                            (p/resolved
+                                             (mapv #(assoc % 3 (str "cipher-" call)) tx-data*))))]
+                         (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                         (client-op/update-local-tx test-repo 0)
+                         (seed-client-op-txs!
+                          test-repo
+                          [{:db-sync/tx-id tx-id
+                            :db-sync/pending? true
+                            :db-sync/created-at 1
+                            :db-sync/outliner-op :save-block
+                            :db-sync/normalized-tx-data tx-data}])
+                         (p/let [client-before (make-client)
+                                 _ (#'sync-apply/flush-pending! test-repo client-before)
+                                 _ (sync-apply/clear-upload-response-timeout! client-before)
+                                 client-after (make-client)
+                                 _ (#'sync-apply/flush-pending! test-repo client-after)
+                                 frozen-state (client-op/get-client-tx-upload-state test-repo tx-id)
+                                 _ (do
+                                     (is (= 1 @encrypt-calls))
+                                     (is (= 2 (count @sent)))
+                                     (is (= (first @sent) (second @sent)))
+                                     (is (= :single-wire-v1 (:kind frozen-state)))
+                                     (is (= (select-keys (get-in @sent [0 :txs 0]) [:tx :tx-id])
+                                            (select-keys (:wire-entry frozen-state) [:tx :tx-id]))))
+                                 _ (#'sync-handle-message/handle-tx-batch-ok!
+                                    test-repo client-after 1 nil)]
+                           (is (= 0 (aget (client-op-tx-row client-ops-conn tx-id) "pending")))
+                           (is (nil? (client-op/get-client-tx-upload-state test-repo tx-id)))))
+                       (p/catch (fn [error]
+                                  (is nil (str error)))))))
+               (p/finally done)))))
+
+(deftest flush-pending-ordinary-wire-reuses-logical-id-and-body-after-restart-test
+  (async done
+         (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               tx-id (random-uuid)
+               tx-data [[:db/add [:block/uuid (:block/uuid child1)]
+                         :block/title
+                         "ordinary lost ack"]]
+               sent (atom [])
+               make-client (fn []
+                             {:repo test-repo
+                              :graph-id "graph-1"
+                              :inflight (atom [])
+                              :upload-request (atom nil)
+                              :server-capabilities (atom #{})
+                              :ws (doto (js-obj)
+                                    (aset "readyState" 1)
+                                    (aset "send" (fn [raw]
+                                                   (swap! sent conj
+                                                          (js->clj (js/JSON.parse raw)
+                                                                   :keywordize-keys true)))))})]
+           (-> (with-datascript-conns
+                 conn
+                 client-ops-conn
+                 (fn []
+                   (-> (p/with-redefs [worker-state/online? (constantly true)
+                                        sync-crypt/graph-e2ee? (constantly false)]
+                         (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                         (client-op/update-local-tx test-repo 0)
+                         (seed-client-op-txs!
+                          test-repo
+                          [{:db-sync/tx-id tx-id
+                            :db-sync/pending? true
+                            :db-sync/created-at 1
+                            :db-sync/outliner-op :save-block
+                            :db-sync/normalized-tx-data tx-data}])
+                         (p/let [client-before (make-client)
+                                 _ (#'sync-apply/flush-pending! test-repo client-before)
+                                 _ (sync-apply/clear-upload-response-timeout! client-before)
+                                 client-after (make-client)
+                                 _ (#'sync-apply/flush-pending! test-repo client-after)]
+                           (is (= 2 (count @sent)))
+                           (is (= (first @sent) (second @sent)))
+                           (is (= (str tx-id) (get-in @sent [0 :txs 0 :tx-id])))
+                           (is (nil? (get-in @sent [0 :txs 0 :logical-tx-id])))
+                           (is (nil? (client-op/get-client-tx-upload-state test-repo tx-id)))))
+                       (p/catch (fn [error]
+                                  (is nil (str error)))))))
+               (p/finally done)))))
+
+(deftest flush-pending-large-upload-without-staged-capability-uses-single-wire-test
+  (async done
+         (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               tx-id (random-uuid)
+               tx-data (vec (repeat 5001 [:db/add [:block/uuid (:block/uuid child1)]
+                                           :block/title
+                                           "single wire fallback"]))
+               sent (atom [])
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :upload-request (atom nil)
+                       :server-capabilities (atom #{})
+                       :ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [raw]
+                                            (reset! sent
+                                                    (js->clj (js/JSON.parse raw)
+                                                             :keywordize-keys true)))))}]
+           (-> (with-datascript-conns
+                 conn
+                 client-ops-conn
+                 (fn []
+                   (-> (p/with-redefs [worker-state/online? (constantly true)
+                                        sync-crypt/graph-e2ee? (constantly false)]
+                         (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                         (client-op/update-local-tx test-repo 0)
+                         (seed-client-op-txs!
+                          test-repo
+                          [{:db-sync/tx-id tx-id
+                            :db-sync/pending? true
+                            :db-sync/created-at 1
+                            :db-sync/outliner-op :save-block
+                            :db-sync/normalized-tx-data tx-data}])
+                         (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                           (let [tx-entry (get-in @sent [:txs 0])]
+                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (nil? (:logical-tx-id tx-entry)))
+                             (is (= tx-data (sqlite-util/read-transit-str (:tx tx-entry))))
+                             (is (nil? (client-op/get-client-tx-upload-state test-repo tx-id))))))
+                       (p/catch (fn [error]
+                                  (is nil (str error)))))))
+               (p/finally done)))))
+
+(deftest staged-upload-acks-advance-cursor-before-final-atomic-cleanup-test
+  (async done
+         (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               tx-id (random-uuid)
+               tx-data (vec (repeat 5001 [:db/add [:block/uuid (:block/uuid child1)]
+                                           :block/title
+                                           "staged ack lifecycle"]))
+               sent (atom [])
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :upload-request (atom nil)
+                       :server-capabilities (atom #{"tx-upload-staged-v1"})
+                       :ws-state (atom :open)
+                       :online-users (atom [])
+                       :ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [raw]
+                                            (swap! sent conj
+                                                   (js->clj (js/JSON.parse raw)
+                                                            :keywordize-keys true)))))}]
+           (-> (with-datascript-conns
+                 conn
+                 client-ops-conn
+                 (fn []
+                   (-> (p/with-redefs [worker-state/online? (constantly true)
+                                        sync-crypt/graph-e2ee? (constantly false)]
+                         (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                         (client-op/update-local-tx test-repo 0)
+                         (seed-client-op-txs!
+                          test-repo
+                          [{:db-sync/tx-id tx-id
+                            :db-sync/pending? true
+                            :db-sync/created-at 1
+                            :db-sync/outliner-op :save-block
+                            :db-sync/normalized-tx-data tx-data}])
+                         (p/let [_ (#'sync-apply/flush-pending! test-repo client)
+                                 _ (#'sync-handle-message/handle-tx-batch-ok!
+                                    test-repo client 0 nil)
+                                 state (client-op/get-client-tx-upload-state test-repo tx-id)
+                                 _ (do
+                                     (is (= 2 (count @sent)))
+                                     (is (= 5000 (:source-next-index state)))
+                                     (is (= 1 (:chunk-seq state)))
+                                     (is (= 1 (aget (client-op-tx-row client-ops-conn tx-id)
+                                                    "pending"))))
+                                 _ (#'sync-handle-message/handle-tx-batch-ok!
+                                    test-repo client 1 nil)]
+                           (is (= 0 (aget (client-op-tx-row client-ops-conn tx-id) "pending")))
+                           (is (nil? (client-op/get-client-tx-upload-state test-repo tx-id)))))
+                       (p/catch (fn [error]
+                                  (is nil (str error)))))))
+               (p/finally done)))))
+
 (deftest flush-pending-splits-large-upload-request-test
   (async done
          (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
@@ -696,6 +1009,7 @@
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
+                       :server-capabilities (atom #{"tx-upload-staged-v1"})
                        :ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
@@ -722,18 +1036,23 @@
                                          tx-entry (first (:txs payload))
                                          uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                                      (is (= "tx/batch" (:type payload)))
-                                     (is (nil? (:tx-id tx-entry)))
+                                     (is (string? (:tx-id tx-entry)))
+                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
+                                     (is (= 0 (:chunk-index tx-entry)))
+                                     (is (false? (:chunk-final? tx-entry)))
                                      (is (= 4999 (count uploaded-tx)))
-                                     (is (= [] @(:inflight client)))
+                                     (is (= [tx-id] @(:inflight client)))
                                      (sync-apply/ack-upload-response! test-repo client)
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! (:inflight client) [])
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
                                  uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (not= (str tx-id) (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
+                             (is (= 1 (:chunk-index tx-entry)))
+                             (is (true? (:chunk-final? tx-entry)))
                              (is (= 2 (count uploaded-tx)))
                              (is (= [tx-id] @(:inflight client))))))
                        (p/catch (fn [error]
@@ -756,6 +1075,7 @@
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
+                       :server-capabilities (atom #{"tx-upload-staged-v1"})
                        :ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
@@ -778,13 +1098,18 @@
                             :db-sync/outliner-op :insert-blocks
                             :db-sync/normalized-tx-data tx-data}])
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
+                                 _ (sync-apply/clear-upload-response-timeout! client)
+                                 _ (reset! (:inflight client) [])
                                  _ (#'sync-apply/flush-pending! test-repo client)]
                            (is (= 2 (count @sent)))
+                           (is (= (get-in @sent [0 :txs 0])
+                                  (get-in @sent [1 :txs 0])))
                            (doseq [payload @sent]
                              (let [tx-entry (first (:txs payload))
                                    uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                                (is (= "tx/batch" (:type payload)))
-                               (is (nil? (:tx-id tx-entry)))
+                               (is (string? (:tx-id tx-entry)))
+                               (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                (is (= 5000 (count uploaded-tx)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
@@ -823,6 +1148,7 @@
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
+                       :server-capabilities (atom #{"tx-upload-staged-v1"})
                        :ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
@@ -848,20 +1174,21 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (is (= parent-tx (subvec first-uploaded-tx 4993 5000)))
                                      (sync-apply/ack-upload-response! test-repo client)
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! (:inflight client) [])
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (not= (str tx-id) (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= child-tx second-uploaded-tx))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
                              (is (= [tx-id] @(:inflight client))))))
@@ -881,6 +1208,7 @@
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
+                       :server-capabilities (atom #{"tx-upload-staged-v1"})
                        :ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
@@ -906,19 +1234,20 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! (:inflight client) [])
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (not= (str tx-id) (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 1 (count second-uploaded-tx)))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
                              (is (= [tx-id] @(:inflight client))))))
@@ -936,6 +1265,7 @@
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
+                       :server-capabilities (atom #{"tx-upload-staged-v1"})
                        :ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
@@ -961,19 +1291,20 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
-                                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
-                                     (client-op/update-local-tx test-repo 1)
+                                     (reset! (:inflight client) [])
                                      (#'sync-apply/flush-pending! test-repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (not= (str tx-id) (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 1 (count second-uploaded-tx)))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
                              (is (= [tx-id] @(:inflight client))))))
@@ -994,6 +1325,7 @@
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
+                       :server-capabilities (atom #{"tx-upload-staged-v1"})
                        :ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
@@ -1022,8 +1354,12 @@
                              (is (= 1 (count @sent)))
                              (is (= "tx/batch" (:type payload)))
                              (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (nil? (:logical-tx-id tx-entry)))
+                             (is (nil? (:chunk-index tx-entry)))
+                             (is (nil? (:chunk-final? tx-entry)))
                              (is (= 5001 (count uploaded-tx)))
                              (is (= tx-data uploaded-tx))
+                             (is (nil? (client-op/get-client-tx-upload-state test-repo tx-id)))
                              (is (= [tx-id] @(:inflight client))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))

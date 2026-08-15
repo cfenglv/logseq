@@ -166,8 +166,8 @@
 
 (defn- handle-tx-reject!
   [repo client message local-tx]
-  (sync-apply/clear-upload-response-timeout! client)
-  (let [reason (:reason message)
+  (let [request (sync-apply/clear-upload-response-timeout! client)
+        reason (:reason message)
         remote-tx (:t message)
         success-tx-ids (:success-tx-ids message)
         failed-tx-id (:failed-tx-id message)
@@ -193,11 +193,19 @@
 
       (let [inflight @(:inflight client)
             inflight-set (set inflight)
+            wire-id->logical-id (:wire-id->logical-id request)
+            semantic-ack-set (set (or (:semantic-ack-tx-ids request) inflight))
+            logical-id (fn [tx-id]
+                         (get wire-id->logical-id tx-id tx-id))
             successful-tx-ids (->> (or success-tx-ids [])
+                                   (map logical-id)
                                    (filter inflight-set)
+                                   (filter semantic-ack-set)
                                    vec)
-            failed-tx-id (when (and failed-tx-id (contains? inflight-set failed-tx-id))
-                           failed-tx-id)
+            failed-logical-tx-id (some-> failed-tx-id logical-id)
+            failed-tx-id (when (and failed-logical-tx-id
+                                    (contains? inflight-set failed-logical-tx-id))
+                           failed-logical-tx-id)
             data (when-let [raw-data (:data message)]
                    (parse-transit raw-data
                                   {:repo repo
@@ -267,12 +275,14 @@
 (defn- handle-tx-batch-ok!
   [repo client remote-tx remote-checksum]
   (require-non-negative remote-tx {:repo repo :type "tx/batch/ok"})
-  (sync-apply/ack-upload-response! repo client)
-  (let [current-local-tx (client-op/get-local-tx repo)
+  (let [request (sync-apply/ack-upload-response! repo client)
+        semantic-ack-tx-ids (or (:semantic-ack-tx-ids request)
+                                @(:inflight client))
+        current-local-tx (client-op/get-local-tx repo)
         next-local-tx (max current-local-tx remote-tx)]
     (client-op/update-local-tx repo next-local-tx)
     (sync-util/clear-last-sync-error! client)
-    (sync-apply/mark-pending-txs-false! repo @(:inflight client))
+    (sync-apply/mark-pending-txs-false! repo semantic-ack-tx-ids)
     (reset! (:inflight client) [])
     (broadcast-rtc-state! client)
     (verify-sync-checksum! repo client next-local-tx remote-tx remote-checksum {:type "tx/batch/ok"})

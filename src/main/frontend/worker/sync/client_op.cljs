@@ -32,7 +32,7 @@
 
 (defonce *repo->pending-local-tx-count (atom {}))
 
-(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v2")
+(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v3")
 (def ^:private sqlite-mode-key "__logseq_client_ops_sqlite_mode")
 (def ^:private sync-meta-table-sql
   "create table if not exists sync_meta (key text primary key, value text)")
@@ -72,6 +72,15 @@
        ")"))
 (def ^:private sync-conflicts-block-index-sql
   "create index if not exists idx_sync_conflicts_block_uuid on sync_conflicts(block_uuid, created_at)")
+(def ^:private client-tx-upload-state-table-sql
+  (str "create table if not exists client_tx_upload_state ("
+       "logical_tx_id text primary key,"
+       "format_version integer not null,"
+       "kind text not null,"
+       "source_digest text not null,"
+       "state text not null,"
+       "updated_at integer not null"
+       ")"))
 
 (defn- client-ops-store
   [repo]
@@ -238,6 +247,7 @@
          (sqlite-run! tx sync-meta-table-sql [])
          (sqlite-run! tx client-ops-table-sql [])
          (sqlite-run! tx sync-conflicts-table-sql [])
+         (sqlite-run! tx client-tx-upload-state-table-sql [])
          (sqlite-run! tx pending-index-sql [])
          (sqlite-run! tx asset-index-sql [])
          (sqlite-run! tx sync-conflicts-block-index-sql [])))
@@ -500,35 +510,124 @@
                         [(str tx-id)])]
     (= 1 (some-> row (aget "pending")))))
 
+(defn- valid-client-tx-upload-state?
+  [format-version kind source-digest state]
+  (and (= 1 format-version)
+       (contains? #{:single-wire-v1 :staged-large-upload-v1} kind)
+       (string? source-digest)
+       (map? state)
+       (= format-version (:format-version state))
+       (= kind (:kind state))
+       (= source-digest (:source-digest state))
+       (case kind
+         :single-wire-v1
+         (and (keyword? (:outliner-op state))
+              (map? (:wire-entry state)))
+
+         :staged-large-upload-v1
+         (and (keyword? (:outliner-op state))
+              (string? (:session-id state))
+              (vector? (:boundaries state))
+              (integer? (:source-next-index state))
+              (integer? (:chunk-seq state)))
+
+         false)))
+
+(defn- client-tx-upload-state-row->entry
+  [row]
+  (let [logical-tx-id (parse-uuid-str (aget row "logical_tx_id"))
+        format-version (aget row "format_version")
+        kind (str->kw (aget row "kind"))
+        source-digest (aget row "source_digest")
+        state (some-> (aget row "state") sqlite-util/read-transit-str)]
+    (when-not (and logical-tx-id
+                   (valid-client-tx-upload-state?
+                    format-version kind source-digest state))
+      (throw (ex-info "Invalid client transaction upload state"
+                      {:type :db-sync/invalid-client-tx-upload-state
+                       :logical-tx-id logical-tx-id})))
+    [logical-tx-id state]))
+
+(defn get-client-tx-upload-state
+  [repo logical-tx-id]
+  (when (uuid? logical-tx-id)
+    (when-let [store (sqlite-store-or-throw repo)]
+      (when-let [row (sqlite-row store
+                                 (str "select logical_tx_id, format_version, kind, source_digest, state "
+                                      "from client_tx_upload_state where logical_tx_id = ?")
+                                 [(str logical-tx-id)])]
+        (second (client-tx-upload-state-row->entry row))))))
+
+(defn get-client-tx-upload-states
+  [repo logical-tx-ids]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (let [logical-tx-ids (->> logical-tx-ids (filter uuid?) distinct vec)]
+      (if (seq logical-tx-ids)
+        (->> (sqlite-rows
+              store
+              (str "select logical_tx_id, format_version, kind, source_digest, state "
+                   "from client_tx_upload_state where logical_tx_id in ("
+                   (string/join "," (repeat (count logical-tx-ids) "?")) ")")
+              (mapv str logical-tx-ids))
+             (map client-tx-upload-state-row->entry)
+             (into {}))
+        {}))))
+
+(defn put-client-tx-upload-state!
+  [repo logical-tx-id state]
+  {:pre [(uuid? logical-tx-id)
+         (= 1 (:format-version state))
+         (contains? #{:single-wire-v1 :staged-large-upload-v1}
+                    (:kind state))
+         (string? (:source-digest state))]}
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-run! store
+                 (str "insert into client_tx_upload_state "
+                      "(logical_tx_id, format_version, kind, source_digest, state, updated_at) "
+                      "values (?, ?, ?, ?, ?, ?) "
+                      "on conflict(logical_tx_id) do update set "
+                      "format_version = excluded.format_version, "
+                      "kind = excluded.kind, "
+                      "source_digest = excluded.source_digest, "
+                      "state = excluded.state, "
+                      "updated_at = excluded.updated_at")
+                 [(str logical-tx-id)
+                  (:format-version state)
+                  (kw->str (:kind state))
+                  (:source-digest state)
+                  (sqlite-util/write-transit-str state)
+                  (.now js/Date)])
+    state))
+
+(defn- finish-pending-txs!
+  [repo tx-ids failed?]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (let [tx-ids (->> tx-ids (filter uuid?) distinct vec)]
+      (sqlite-with-tx!
+       store
+       (fn [tx]
+         (let [pending-to-remove (->> tx-ids
+                                      (filter (fn [tx-id]
+                                                (pending-tx-id? tx tx-id)))
+                                      count)]
+           (doseq [tx-id tx-ids]
+             (sqlite-run! tx
+                          (if failed?
+                            "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
+                            "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?")
+                          [(str tx-id)])
+             (sqlite-run! tx
+                          "delete from client_tx_upload_state where logical_tx_id = ?"
+                          [(str tx-id)]))
+           pending-to-remove))))))
+
 (defn mark-pending-txs-false!
   [repo tx-ids]
-  (when-let [store (sqlite-store-or-throw repo)]
-    (let [tx-ids (->> tx-ids (filter uuid?) vec)
-          pending-to-remove (->> tx-ids
-                                 (filter (fn [tx-id]
-                                           (pending-tx-id? store tx-id)))
-                                 count)]
-      (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
-      pending-to-remove)))
+  (finish-pending-txs! repo tx-ids false))
 
 (defn mark-failed-txs!
   [repo tx-ids]
-  (when-let [store (sqlite-store-or-throw repo)]
-    (let [tx-ids (->> tx-ids (filter uuid?) vec)
-          pending-to-remove (->> tx-ids
-                                 (filter (fn [tx-id]
-                                           (pending-tx-id? store tx-id)))
-                                 count)]
-      (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
-      pending-to-remove)))
+  (finish-pending-txs! repo tx-ids true))
 
 (defn history-action-ops-by-tx-id
   [repo tx-id]
