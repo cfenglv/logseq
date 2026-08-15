@@ -1,6 +1,7 @@
 (ns frontend.worker.sync.download-test
   (:require [cljs.test :refer [async deftest is]]
             [frontend.common.thread-api :as thread-api]
+            [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync.apply-txs :as sync-apply]
             [frontend.worker.sync.client-op :as client-op]
@@ -47,6 +48,7 @@
                fetch-count (atom 0)
                fetch-urls (atom [])
                claims (atom [])
+               repair-runs (atom [])
                config-prev @worker-state/*db-sync-config]
            (reset! worker-state/*db-sync-config
                    {:http-base "https://sync.example.test"})
@@ -68,7 +70,11 @@
                                          :operation {:operation-id
                                                      #uuid "90000000-0000-4000-8000-000000000001"}}]
                              (swap! claims conj [claim-repo graph-id basis])
-                             result))})]
+                             result))
+                         :thread-api/db-sync-commit-repair
+                         (fn [run-repo operation-id]
+                           (swap! repair-runs conj [run-repo operation-id])
+                           (p/resolved {:completed? true}))})]
                  (sync-download/<claim-repair-after-checksum-mismatch!
                   repo client 9 "remote-full"))
                (p/then
@@ -77,6 +83,8 @@
                   (is (= ["https://sync.example.test/sync/graph-1/checksum/diagnostics?proof-only=true"]
                          @fetch-urls))
                   (is (= 1 (count @claims)))
+                  (is (= [[repo #uuid "90000000-0000-4000-8000-000000000001"]]
+                         @repair-runs))
                   (is (true? (:claimed? result)))
                   (is (= {:remote-t 9
                           :server-checkpoint-identity "checkpoint-9"
@@ -94,6 +102,224 @@
                (p/finally (fn []
                             (reset! worker-state/*db-sync-config config-prev)
                             (done)))))))
+
+(deftest repair-transient-retry-is-one-bounded-chain-test
+  (async done
+    (let [repo "repair-transient-retry"
+          operation-id #uuid "90300000-0000-4000-8000-000000000001"
+          operation* (atom {:operation-id operation-id
+                            :attempt-count 1
+                            :disposition :repairing
+                            :next-retry-at-ms nil})
+          commits (atom [])
+          delays (atom [])]
+      (-> (p/with-redefs
+            [sync-download/<delay-repair-retry
+             (fn [delay-ms]
+               (swap! delays conj delay-ms)
+               (p/resolved nil))
+             thread-api/*thread-apis
+             (atom {:thread-api/db-sync-commit-repair
+                    (fn [_repo id]
+                      (swap! commits conj id)
+                      (if (= 1 (count @commits))
+                        (p/rejected
+                         (ex-info "remote moved"
+                                  {:type :db-sync/repair-staging-remote-advanced}))
+                        (p/resolved {:completed? true})))
+                    :thread-api/db-sync-record-repair-failure
+                    (fn [_repo _id transition]
+                      (swap! operation* merge transition)
+                      {:operation @operation*})
+                    :thread-api/db-sync-claim-repair-retry
+                    (fn [_repo _id _explicit? _now]
+                      (swap! operation*
+                             #(-> %
+                                  (update :attempt-count inc)
+                                  (assoc :next-retry-at-ms nil)))
+                      @operation*)})]
+            (sync-download/<run-repair-operation! repo @operation*))
+          (p/then
+           (fn [result]
+             (is (= {:completed? true} result))
+             (is (= [operation-id operation-id] @commits))
+             (is (= 1 (count @delays)))
+             (is (<= 0 (first @delays) 1000))
+             (is (= 2 (:attempt-count @operation*)))))
+          (p/catch (fn [error]
+                     (is false (str error))))
+          (p/finally done)))))
+
+(deftest transient-repair-budget-exhaustion-enters-local-only-test
+  (async done
+    (let [repo "repair-retry-budget"
+          operation-id #uuid "90300000-0000-4000-8000-000000000002"
+          operation {:operation-id operation-id
+                     :attempt-count 3
+                     :disposition :repairing
+                     :next-retry-at-ms nil}
+          transitions (atom [])
+          delays (atom 0)]
+      (-> (p/with-redefs
+            [sync-download/<delay-repair-retry
+             (fn [_]
+               (swap! delays inc)
+               (p/resolved nil))
+             shared-service/broadcast-to-clients! (fn [& _] nil)
+             thread-api/*thread-apis
+             (atom {:thread-api/db-sync-commit-repair
+                    (fn [& _]
+                      (p/rejected
+                       (ex-info "remote moved"
+                                {:type :db-sync/repair-staging-remote-advanced})))
+                    :thread-api/db-sync-record-repair-failure
+                    (fn [_repo _id transition]
+                      (swap! transitions conj transition)
+                      {:operation (merge operation transition)})
+                    :thread-api/db-sync-stop (fn [] (p/resolved nil))})]
+            (sync-download/<run-repair-operation! repo operation))
+          (p/then
+           (fn [result]
+             (is (= :local-only (:disposition result)))
+             (is (= :local-only (:disposition (first @transitions))))
+             (is (nil? (:next-retry-at-ms (first @transitions))))
+             (is (zero? @delays))))
+          (p/catch (fn [error]
+                     (is false (str error))))
+          (p/finally done)))))
+
+(deftest deterministic-local-only-explicit-retry-keeps-operation-id-test
+  (async done
+    (let [repo "repair-local-only-retry"
+          operation-id #uuid "90400000-0000-4000-8000-000000000001"
+          fault? (atom true)
+          operation* (atom {:operation-id operation-id
+                            :attempt-count 1
+                            :disposition :repairing
+                            :next-retry-at-ms nil})
+          notifications (atom [])
+          lifecycle (atom [])
+          commits (atom [])]
+      (-> (p/with-redefs
+            [shared-service/broadcast-to-clients!
+             (fn [topic payload]
+               (swap! notifications conj [topic payload]))
+             thread-api/*thread-apis
+             (atom {:thread-api/db-sync-stop
+                    (fn []
+                      (swap! lifecycle conj :stop)
+                      (p/resolved nil))
+                    :thread-api/db-sync-start
+                    (fn [start-repo]
+                      (swap! lifecycle conj [:start start-repo])
+                      (p/resolved nil))
+                    :thread-api/db-sync-repair-status
+                    (fn [_repo]
+                      {:committed {:projection-epoch 4}
+                       :prepared-swap? false
+                       :operation (assoc @operation*
+                                         :target-projection-epoch 5)})
+                    :thread-api/db-sync-commit-repair
+                    (fn [_repo id]
+                      (swap! commits conj id)
+                      (if @fault?
+                        (p/rejected
+                         (ex-info "deterministic corruption"
+                                  {:type :db-sync/repair-corrupt-snapshot}))
+                        (p/resolved {:completed? true})))
+                    :thread-api/db-sync-record-repair-failure
+                    (fn [_repo _id transition]
+                      (swap! operation* merge transition)
+                      {:operation @operation*})
+                    :thread-api/db-sync-claim-repair-retry
+                    (fn [_repo id explicit? _now]
+                      (is explicit?)
+                      (is (= operation-id id))
+                      (swap! operation*
+                             #(-> %
+                                  (update :attempt-count inc)
+                                  (assoc :disposition :repairing
+                                         :next-retry-at-ms nil)))
+                      @operation*)})]
+            (p/let [first-result
+                    (sync-download/<run-repair-operation! repo @operation*)
+                    restart-result
+                    (sync-download/<resume-repair-operation! repo)
+                    _ (reset! fault? false)
+                    second-result
+                    (sync-download/<explicit-retry-repair! repo operation-id)]
+              {:initial first-result
+               :restart restart-result
+               :retried second-result}))
+          (p/then
+           (fn [{:keys [initial restart retried]}]
+             (is (= :local-only (:disposition initial)))
+             (is (= {:resumed? false :disposition :local-only} restart))
+             (is (= {:completed? true} retried))
+             (is (= [operation-id operation-id] @commits))
+             (is (= operation-id (:operation-id @operation*)))
+             (is (= 2 (:attempt-count @operation*)))
+             (is (= :repairing (:disposition @operation*)))
+             (is (= 2 (count @notifications)))
+             (is (= [:stop :stop [:start repo]] @lifecycle))))
+          (p/catch (fn [error]
+                     (is false (str error))))
+          (p/finally done)))))
+
+(deftest checksum-ready-boundary-completes-only-target-membership-test
+  (async done
+    (let [repo "repair-completion-boundary"
+          graph-id "repair-completion-graph"
+          operation-id #uuid "90500000-0000-4000-8000-000000000001"
+          conn (atom :canonical-db)
+          client {:graph-id graph-id :inflight (atom [])}
+          completions (atom [])
+          conns-prev @worker-state/*datascript-conns]
+      (reset! worker-state/*datascript-conns {repo conn})
+      (-> (p/with-redefs
+            [client-op/read-repair-completion-observation
+             (fn [_repo high-water]
+               (is (= 34 high-water))
+               {:remote-t 12
+                :journal-high-water 35
+                :pending-count 1
+                :pending-through-target 0
+                :legacy-anchor "checksum-12"})
+             sync-checksum/<recompute-checksum
+             (fn [db]
+               (is (= :canonical-db db))
+               (p/resolved "checksum-12"))
+             thread-api/*thread-apis
+             (atom {:thread-api/db-sync-repair-status-from-value
+                    (fn [raw]
+                      (is (= "activation-value" raw))
+                      {:committed {:projection-epoch 5}
+                       :prepared-swap? false
+                       :operation
+                       {:operation-id operation-id
+                        :graph-id graph-id
+                        :disposition :repairing
+                        :target-projection-epoch 5
+                        :target-basis {:remote-t 12
+                                       :journal-high-water 34}}})
+                    :thread-api/db-sync-complete-repair
+                    (fn [complete-repo id verification]
+                      (swap! completions conj [complete-repo id verification])
+                      (p/resolved {:completed? true}))})]
+            (sync-download/<complete-repair-if-converged!
+             repo client 12 "checksum-12" "activation-value"))
+          (p/then
+           (fn [result]
+             (is (= {:completed? true} result))
+             (is (= 1 (count @completions)))
+             (is (= operation-id (second (first @completions))))
+             (is (= 0 (get-in (first @completions)
+                              [2 :pending-through-target])))))
+          (p/catch (fn [error]
+                     (is false (str error))))
+          (p/finally (fn []
+                       (reset! worker-state/*datascript-conns conns-prev)
+                       (done)))))))
 
 (deftest changed-suspect-does-not-claim-test
   (async done
@@ -253,6 +479,30 @@
                           (is false (str error))))
                (p/finally done)))))
 
+(def ^:private repair-builder-diagnostics
+  [{:t 5
+    :legacy-anchor "server-5"
+    :server-recomputed-checksum "server-5"
+    :server-checkpoint-identity "sync-do-checkpoint-v1:graph-1:5:server-5"
+    :metadata-proof "authenticated-diagnostics-v1:graph-1:5:server-5:server-5"}
+   {:t 6
+    :legacy-anchor "server-6"
+    :server-recomputed-checksum "server-6"
+    :server-checkpoint-identity "sync-do-checkpoint-v1:graph-1:6:server-6"
+    :metadata-proof "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}])
+
+(def ^:private repair-builder-target-basis
+  {:remote-t 6
+   :server-checkpoint-identity "sync-do-checkpoint-v1:graph-1:6:server-6"
+   :journal-high-water 9
+   :checksum-basis
+   {:version 1
+    :legacy-checksum "local-final"
+    :server-recomputed-checksum "server-6"
+    :server-t 6
+    :legacy-anchor "server-6"
+    :metadata-proof "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}})
+
 (deftest repair-staging-builder-captures-remote-then-local-watermarks-test
   (async done
          (let [repo "repair-staging-repo"
@@ -262,20 +512,7 @@
                target-conn (atom :target-db)
                rows {:name :rows :db :rows-db :pool :rows-pool}
                target {:name :target :db :target-db :conn target-conn :pool :target-pool}
-               diagnostics (atom [{:t 5
-                                   :legacy-anchor "server-5"
-                                   :server-recomputed-checksum "server-5"
-                                   :server-checkpoint-identity
-                                   "sync-do-checkpoint-v1:graph-1:5:server-5"
-                                   :metadata-proof
-                                   "authenticated-diagnostics-v1:graph-1:5:server-5:server-5"}
-                                  {:t 6
-                                   :legacy-anchor "server-6"
-                                   :server-recomputed-checksum "server-6"
-                                   :server-checkpoint-identity
-                                   "sync-do-checkpoint-v1:graph-1:6:server-6"
-                                   :metadata-proof
-                                   "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}])
+               diagnostics (atom repair-builder-diagnostics)
                checksums (atom ["server-6" "local-final"])
                apply-calls (atom [])
                cleaned (atom [])
@@ -354,19 +591,7 @@
                            :local []}
                           {:remote [] :local [local-tx]}]
                          @apply-calls))
-                  (is (= {:remote-t 6
-                          :server-checkpoint-identity
-                          "sync-do-checkpoint-v1:graph-1:6:server-6"
-                          :journal-high-water 9
-                          :checksum-basis
-                          {:version 1
-                           :legacy-checksum "local-final"
-                           :server-recomputed-checksum "server-6"
-                           :server-t 6
-                           :legacy-anchor "server-6"
-                           :metadata-proof
-                           "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}}
-                         (:target-basis result)))
+                  (is (= repair-builder-target-basis (:target-basis result)))
                   (is (= [:rows :target] @cleaned))
                   (is (= 1 @rows-create-count))
                   (is (= 1 @target-create-count))))

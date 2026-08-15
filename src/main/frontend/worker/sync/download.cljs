@@ -162,8 +162,15 @@
 (defonce ^:private *import-state (atom nil))
 (defonce ^:private *repair-staging-builds (atom {}))
 (def ^:private snapshot-import-datoms-batch-size 10000)
+(def ^:private repair-max-automatic-attempts 3)
+(def ^:private repair-retry-backoff-ms [1000 5000 30000])
+(def ^:private transient-repair-error-types
+  #{:db-sync/repair-snapshot-download-failed
+    :db-sync/repair-staging-remote-advanced
+    :db-sync/repair-active-graph-changed
+    :db-sync/repair-staging-cancelled})
 
-(declare require-thread-api-f!)
+(declare require-thread-api-f! <run-repair-operation!)
 
 (defn- stable-repair-observation?
   [repo conn before after client remote-t]
@@ -228,7 +235,17 @@
                   :legacy-anchor (:legacy-anchor diagnostics)
                   :metadata-proof (:metadata-proof diagnostics)}}
                 claim-f (require-thread-api-f! :thread-api/db-sync-claim-repair)]
-            (claim-f repo graph-id start-basis)))))))
+            (p/let [result (claim-f repo graph-id start-basis)]
+              (when (:claimed? result)
+                (-> (<run-repair-operation! repo (:operation result))
+                    (p/catch
+                     (fn [error]
+                       (log/error :db-sync/repair-run-failed
+                                  {:repo repo
+                                   :operation-id
+                                   (get-in result [:operation :operation-id])
+                                   :error error})))))
+              result)))))))
 
 (defn <claim-repair-after-checksum-mismatch!
   "Recheck one mismatch suspect. DB-core's durable CAS is the only operation
@@ -268,6 +285,150 @@
   (if-let [f (@thread-api/*thread-apis k)]
     f
     (fail-fast :db-sync/missing-field {:field k})))
+
+(defn- repair-error-type
+  [error]
+  (let [type (:type (ex-data error))]
+    (if (keyword? type) type :db-sync/repair-unknown-failure)))
+
+(defn- <delay-repair-retry
+  [delay-ms]
+  (p/delay delay-ms))
+
+(defn- notify-repair-local-only!
+  []
+  (shared-service/broadcast-to-clients!
+   :notification
+   [nil :warning nil nil nil
+    {:i18n-key :sync/repair-local-only-warning}]))
+
+(defn- <schedule-recorded-repair-retry!
+  [repo operation]
+  (let [operation-id (:operation-id operation)
+        retry-at (:next-retry-at-ms operation)
+        delay-ms (max 0 (- retry-at (js/Date.now)))]
+    (p/let [_ (<delay-repair-retry delay-ms)
+            retry-f (require-thread-api-f!
+                     :thread-api/db-sync-claim-repair-retry)
+            operation (retry-f repo operation-id false (js/Date.now))]
+      (<run-repair-operation! repo operation))))
+
+(defn <run-repair-operation!
+  "Run the one durable repair operation. Only the frozen transient class uses
+  the single bounded delay chain; every other failure enters LocalOnly."
+  [repo operation]
+  (let [operation-id (:operation-id operation)]
+    (if (:next-retry-at-ms operation)
+      (<schedule-recorded-repair-retry! repo operation)
+      (let [commit-f (require-thread-api-f! :thread-api/db-sync-commit-repair)]
+        (-> (p/then (p/resolved nil)
+                    (fn [_] (commit-f repo operation-id)))
+            (p/catch
+             (fn [error]
+               (let [error-type (repair-error-type error)
+                     attempt-count (:attempt-count operation)
+                     transient? (contains? transient-repair-error-types error-type)
+                     retry? (and transient?
+                                 (< attempt-count repair-max-automatic-attempts))
+                     now-ms (js/Date.now)
+                     delay-ms (when retry?
+                                (nth repair-retry-backoff-ms
+                                     (dec attempt-count)))
+                     transition
+                     {:disposition (if retry? :repairing :local-only)
+                      :next-retry-at-ms (when retry? (+ now-ms delay-ms))
+                      :error-type (str error-type)
+                      :at-ms now-ms}
+                     record-f (require-thread-api-f!
+                               :thread-api/db-sync-record-repair-failure)
+                     next-record (record-f repo operation-id transition)
+                     next-operation (:operation next-record)]
+                 (if retry?
+                   (<schedule-recorded-repair-retry! repo next-operation)
+                   (p/let [stop-f (require-thread-api-f!
+                                   :thread-api/db-sync-stop)
+                           _ (stop-f)]
+                     (notify-repair-local-only!)
+                     {:completed? false
+                      :disposition :local-only
+                      :operation-id operation-id}))))))))))
+
+(defn <resume-repair-operation!
+  "Resume only a pre-commit Repairing receipt when the official RTC owner
+  starts. LocalOnly and post-commit verification receipts do not auto-build."
+  [repo]
+  (let [status-f (require-thread-api-f! :thread-api/db-sync-repair-status)
+        {:keys [committed operation prepared-swap?]} (status-f repo)]
+    (cond
+      (= :local-only (:disposition operation))
+      (let [stop-f (require-thread-api-f! :thread-api/db-sync-stop)]
+        (p/let [_ (stop-f)]
+          (notify-repair-local-only!)
+          {:resumed? false :disposition :local-only}))
+
+      (and operation
+           (= :repairing (:disposition operation))
+           (not prepared-swap?)
+           (= (inc (:projection-epoch committed))
+              (:target-projection-epoch operation)))
+      (<run-repair-operation! repo operation)
+
+      :else
+      (p/resolved {:resumed? false}))))
+
+(defn <explicit-retry-repair!
+  "Explicitly re-claim the same LocalOnly operation and preserve its id."
+  [repo operation-id]
+  (let [retry-f (require-thread-api-f!
+                 :thread-api/db-sync-claim-repair-retry)
+        operation (retry-f repo operation-id true (js/Date.now))]
+    (p/let [result (<run-repair-operation! repo operation)]
+      (if (= :local-only (:disposition result))
+        result
+        (let [start-f (require-thread-api-f! :thread-api/db-sync-start)]
+          (p/let [_ (start-f repo)]
+            result))))))
+
+(defn <complete-repair-if-converged!
+  "Retire a post-commit operation only from an official checksum-ready
+  hello/pull/ACK boundary. Newer journal rows are not part of the old target."
+  [repo client remote-t remote-checksum activation-value]
+  (let [status-f (require-thread-api-f!
+                  :thread-api/db-sync-repair-status-from-value)
+        {:keys [committed operation prepared-swap?]}
+        (status-f activation-value)]
+    (if-not (and operation
+                 (= :repairing (:disposition operation))
+                 (not prepared-swap?)
+                 (= (:projection-epoch committed)
+                    (:target-projection-epoch operation)))
+      (p/resolved {:completed? false})
+      (let [target (:target-basis operation)
+            conn (worker-state/get-datascript-conn repo)
+            graph-id (some-> (:graph-id client) str)]
+        (if-not (and conn (= graph-id (:graph-id operation)))
+          (p/resolved {:completed? false})
+          (p/let [observation
+                  (client-op/read-repair-completion-observation
+                   repo (:journal-high-water target))
+                  canonical-checksum
+                  (sync-checksum/<recompute-checksum @conn)]
+            (if-not (and (identical? conn
+                                     (worker-state/get-datascript-conn repo))
+                         (empty? @(:inflight client))
+                         (= remote-t (:remote-t observation))
+                         (= remote-checksum (:legacy-anchor observation)))
+              {:completed? false}
+              (let [complete-f
+                    (require-thread-api-f! :thread-api/db-sync-complete-repair)]
+                (complete-f
+                 repo (:operation-id operation)
+                 (assoc observation
+                        :graph-id graph-id
+                        :remote-t remote-t
+                        :local-checksum (:legacy-anchor observation)
+                        :remote-checksum remote-checksum
+                        :canonical-checksum canonical-checksum))))))))))
 
 (defn- stale-import-ex-info
   [repo graph-id import-id]

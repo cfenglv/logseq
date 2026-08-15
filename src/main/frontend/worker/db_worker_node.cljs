@@ -151,7 +151,16 @@
                                 {:method (or method-kw method-str)
                                  :elapsed-ms (- (js/Date.now) started-at)}))
                     10000)]
-    (-> (p/do! (.remoteInvoke proxy method-str args-transit))
+    (-> (p/let [result-transit (.remoteInvoke proxy method-str args-transit)
+                result (ldb/read-transit-str result-transit)]
+          ;; `remote-function` transports handler failures as Transit values so
+          ;; browser callers can reject them at their shared state boundary.
+          ;; The HTTP daemon is itself that boundary and must not report the
+          ;; transported error as a successful 200 response.
+          (if (or (instance? ExceptionInfo result)
+                  (instance? js/Error result))
+            (throw result)
+            result-transit))
         (p/finally (fn []
                      (js/clearTimeout timeout-id))))))
 

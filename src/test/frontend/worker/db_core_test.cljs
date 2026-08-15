@@ -77,6 +77,23 @@
       (str "authenticated-diagnostics-v1:" graph-id ":" remote-t ":"
            server-checksum ":" server-checksum)}}))
 
+(defn- repair-test-activation
+  [operation-id graph-id start-basis target-basis]
+  {:format-version 1
+   :record-kind :selfhost-activation
+   :committed {:projection-epoch 4}
+   :previous {:projection-epoch 3}
+   :operation {:operation-id operation-id
+               :graph-id graph-id
+               :target-projection-epoch 5
+               :start-basis start-basis
+               :target-basis target-basis
+               :disposition :repairing
+               :attempt-count 1
+               :next-retry-at-ms nil
+               :last-error nil}
+   :prepared-swap nil})
+
 (defn- repairing-activation-record
   []
   (let [target-basis (activation-basis 11 20 "graph-1")]
@@ -190,10 +207,133 @@
         (is (= basis (get-in stored [:operation :start-basis])))
         (is (= 1 (get-in stored [:operation :attempt-count])))
         (is (= :repairing (get-in stored [:operation :disposition])))
-        (is (nil? (:prepared-swap stored))))
+      (is (nil? (:prepared-swap stored))))
       (finally
         (.close client-ops-db)
         (reset! worker-state/*client-ops-conns previous-conns)))))
+
+(deftest repair-failure-retry-preserves-one-operation-identity-test
+  (let [repo "repair-retry-transition"
+        graph-id "repair-retry-graph"
+        operation-id #uuid "60100000-0000-4000-8000-000000000001"
+        client-ops-db (new-memory-sqlite-db)
+        previous-conns @worker-state/*client-ops-conns
+        activation {:format-version 1
+                    :record-kind :selfhost-activation
+                    :committed {:projection-epoch 4}
+                    :previous nil
+                    :operation {:operation-id operation-id
+                                :graph-id graph-id
+                                :target-projection-epoch 5
+                                :start-basis (activation-basis 10 20 graph-id)
+                                :target-basis nil
+                                :disposition :repairing
+                                :attempt-count 1
+                                :next-retry-at-ms nil
+                                :last-error nil}
+                    :prepared-swap nil}]
+    (reset! worker-state/*client-ops-conns {repo client-ops-db})
+    (try
+      (client-op/insert-sync-meta-value-if-absent!
+       client-ops-db "selfhost.activation-record.v1"
+       (ldb/write-transit-str activation))
+      (let [scheduled (#'db-core/record-repair-failure!
+                       repo operation-id
+                       {:disposition :repairing
+                        :next-retry-at-ms 2000
+                        :error-type ":db-sync/repair-staging-remote-advanced"
+                        :at-ms 1000})
+            retried (#'db-core/claim-repair-retry!
+                     repo operation-id false 2000)
+            local-only (#'db-core/record-repair-failure!
+                        repo operation-id
+                        {:disposition :local-only
+                         :next-retry-at-ms nil
+                         :error-type ":db-sync/repair-corrupt-snapshot"
+                         :at-ms 3000})
+            explicit (#'db-core/claim-repair-retry!
+                      repo operation-id true 4000)]
+        (is (= operation-id (get-in scheduled [:operation :operation-id])))
+        (is (= 2000 (get-in scheduled [:operation :next-retry-at-ms])))
+        (is (= 2 (:attempt-count retried)))
+        (is (= operation-id (:operation-id retried)))
+        (is (= :local-only (get-in local-only [:operation :disposition])))
+        (is (= 3 (:attempt-count explicit)))
+        (is (= operation-id (:operation-id explicit)))
+        (is (= :repairing (:disposition explicit))))
+      (finally
+        (.close client-ops-db)
+        (reset! worker-state/*client-ops-conns previous-conns)))))
+
+(deftest committed-repair-clears-only-after-basis-and-idempotent-previous-cleanup-test
+  (async done
+    (let [repo "repair-completion-transition"
+          graph-id "repair-completion-graph"
+          operation-id #uuid "60200000-0000-4000-8000-000000000001"
+          target-basis (activation-basis 12 34 graph-id)
+          client-ops-db (new-memory-sqlite-db)
+          cleanup-count (atom 0)
+          activation {:format-version 1
+                      :record-kind :selfhost-activation
+                      :committed {:projection-epoch 5}
+                      :previous {:projection-epoch 4}
+                      :operation {:operation-id operation-id
+                                  :graph-id graph-id
+                                  :target-projection-epoch 5
+                                  :start-basis (activation-basis 11 30 graph-id)
+                                  :target-basis target-basis
+                                  :disposition :repairing
+                                  :attempt-count 1
+                                  :next-retry-at-ms nil
+                                  :last-error nil}
+                      :prepared-swap nil}
+          verification {:graph-id graph-id
+                        :remote-t 12
+                        :journal-high-water 34
+                        :pending-through-target 0
+                        :local-checksum "legacy"
+                        :remote-checksum "legacy"
+                        :canonical-checksum "legacy"}]
+      (-> (restoring-worker-state
+           (fn []
+             (reset! worker-state/*client-ops-conns {repo client-ops-db})
+             (reset! worker-state/*opfs-pools {repo #js {}})
+             (client-op/insert-sync-meta-value-if-absent!
+              client-ops-db "selfhost.activation-record.v1"
+              (ldb/write-transit-str activation))
+             (platform/set-platform!
+              (assoc-in (build-test-platform {:runtime :node})
+                        [:storage :cleanup-db-previous!]
+                        (fn [_pool _paths]
+                          (swap! cleanup-count inc)
+                          (p/resolved {:removed? true}))))
+             (let [rejected (try
+                              (#'db-core/complete-repair-operation!
+                               repo operation-id
+                               (assoc verification :pending-through-target 1))
+                              nil
+                              (catch :default error error))]
+               (is (= :selfhost6/repair-completion-rejected
+                      (:type (ex-data rejected)))))
+             (#'db-core/complete-repair-operation!
+              repo operation-id verification)
+             (p/let [first-cleanup (#'db-core/<cleanup-previous-artifact! repo)
+                     second-cleanup (#'db-core/<cleanup-previous-artifact! repo)
+                     stored (-> (client-op/read-sync-meta-value
+                                 client-ops-db "selfhost.activation-record.v1")
+                                :value
+                                (#'db-core/decode-activation-record))]
+               (is (= {:cleaned? true} first-cleanup))
+               (is (= {:cleaned? false} second-cleanup))
+               (is (= 1 @cleanup-count))
+               (is (nil? (:operation stored)))
+               (is (nil? (:previous stored))))))
+          (p/catch (fn [error]
+                     (is false (str error))))
+          (p/finally (fn []
+                       (when (.-open client-ops-db)
+                         (.close client-ops-db))
+                       (done)))))))
 
 (deftest durable-repair-owner-builds-one-staging-resource-set-test
   (async done
@@ -309,6 +449,69 @@
               (:type (ex-data error))))
        (is (zero? @build-count))))))
 
+(defn- repair-commit-test-platform
+  [events]
+  (-> (build-test-platform {:runtime :node})
+      (assoc-in [:storage :prepare-db-artifact-swap!]
+                (fn [_canonical-pool _target-pool _paths]
+                  (swap! events conj :prepare-artifacts)
+                  (p/resolved {:source-artifact-identity "/db.sqlite"
+                               :source-sha256 source-artifact-sha
+                               :target-artifact-identity "/repair-target.sqlite"
+                               :target-sha256 target-artifact-sha})))
+      (assoc-in [:storage :commit-db-artifact-swap!]
+                (fn [_canonical-pool _target-pool _paths]
+                  (swap! events conj :rename)
+                  (p/resolved {:rename-count 1})))))
+
+(defn- assert-repair-commit-result!
+  [repo target-basis client-ops-db events result]
+  (let [stored (-> (client-op/read-sync-meta-value
+                    client-ops-db "selfhost.activation-record.v1")
+                   :value
+                   (#'db-core/decode-activation-record))]
+    (is (= [:build :finalize-basis :seal-target :close-canonical
+            :prepare-artifacts :rename :reopen-canonical :clear-undo
+            :start-search-rebuild
+            [:broadcast :notification
+             [nil :warning nil nil nil
+              {:i18n-key :sync/repair-undo-reset-warning}]]
+            [:broadcast :projection-committed
+             {:repo repo :projection-epoch 5}]
+            :cleanup-target]
+           @events))
+    (is (= 1 (:rename-count result)))
+    (is (= {:projection-epoch 5} (:committed stored)))
+    (is (= {:projection-epoch 4} (:previous stored)))
+    (is (= target-basis (get-in stored [:operation :target-basis])))
+    (is (= "12" (:value (client-op/read-sync-meta-value client-ops-db "local-tx"))))
+    (is (= (get-in target-basis [:checksum-basis :legacy-checksum])
+           (:value (client-op/read-sync-meta-value client-ops-db "checksum"))))
+    (is (= 12 (:latest-remote-tx result)))
+    (is (= (get-in target-basis [:checksum-basis :legacy-anchor])
+           (:latest-remote-checksum result)))
+    (is (= ::worker-undo-redo/empty-undo-stack (worker-undo-redo/undo repo)))
+    (is (= ::worker-undo-redo/empty-redo-stack (worker-undo-redo/redo repo)))
+    (is (nil? (get @worker-undo-redo/*pending-editor-info repo)))
+    (worker-undo-redo/record-ui-state! repo "post-cutover")
+    (is (= "post-cutover" (:ui-state-str (worker-undo-redo/undo repo))))
+    (is (nil? (:prepared-swap stored)))))
+
+(defn- assert-repair-source-recovery!
+  [target-basis client-ops-db events error]
+  (let [stored (-> (client-op/read-sync-meta-value
+                    client-ops-db "selfhost.activation-record.v1")
+                   :value
+                   (#'db-core/decode-activation-record))]
+    (is (= :test/rename-failed (:type (ex-data error))))
+    (is (= [:close :prepare :rename-failed :reconcile-source :cleanup] @events))
+    (is (= {:projection-epoch 4} (:committed stored)))
+    (is (= target-basis (get-in stored [:operation :target-basis])))
+    (is (= "11" (:value (client-op/read-sync-meta-value client-ops-db "local-tx"))))
+    (is (= "source-checksum"
+           (:value (client-op/read-sync-meta-value client-ops-db "checksum"))))
+    (is (nil? (:prepared-swap stored)))))
+
 (deftest repair-artifact-commit-writes-proof-renames-and-rolls-forward-test
   (async done
          (let [repo "repair-artifact-commit-repo"
@@ -327,20 +530,8 @@
                         :remote-result {:remote-count 1}
                         :local-result {:local-count 2}
                         :staging-owner-token #js {}}
-               activation {:format-version 1
-                           :record-kind :selfhost-activation
-                           :committed {:projection-epoch 4}
-                           :previous {:projection-epoch 3}
-                           :operation {:operation-id operation-id
-                                       :graph-id graph-id
-                                       :target-projection-epoch 5
-                                       :start-basis start-basis
-                                       :target-basis nil
-                                       :disposition :repairing
-                                       :attempt-count 1
-                                       :next-retry-at-ms nil
-                                       :last-error nil}
-                           :prepared-swap nil}]
+               activation (repair-test-activation
+                           operation-id graph-id start-basis nil)]
            (repair-commit-fence/reset-for-test!)
            (client-op/insert-sync-meta-value-if-absent!
             client-ops-db "selfhost.activation-record.v1"
@@ -357,20 +548,7 @@
                   (swap! worker-undo-redo/*undo-ops assoc repo [[:old-undo]])
                   (swap! worker-undo-redo/*redo-ops assoc repo [[:old-redo]])
                   (swap! worker-undo-redo/*pending-editor-info assoc repo {:old true})
-                  (platform/set-platform!
-                   (-> (build-test-platform {:runtime :node})
-                       (assoc-in [:storage :prepare-db-artifact-swap!]
-                                 (fn [_canonical-pool _target-pool _paths]
-                                   (swap! events conj :prepare-artifacts)
-                                   (p/resolved
-                                    {:source-artifact-identity "/db.sqlite"
-                                     :source-sha256 source-artifact-sha
-                                     :target-artifact-identity "/repair-target.sqlite"
-                                     :target-sha256 target-artifact-sha})))
-                       (assoc-in [:storage :commit-db-artifact-swap!]
-                                 (fn [_canonical-pool _target-pool _paths]
-                                   (swap! events conj :rename)
-                                   (p/resolved {:rename-count 1})))))
+                  (platform/set-platform! (repair-commit-test-platform events))
                   (p/with-redefs
                     [sync-download/<build-repair-staging!
                      (fn [_repo _operation]
@@ -418,46 +596,9 @@
                                   :latest-remote-checksum
                                   (get @db-sync/*repo->latest-remote-checksum
                                        repo))))))))
-               (p/then
-                (fn [result]
-                  (let [stored (-> (client-op/read-sync-meta-value
-                                    client-ops-db "selfhost.activation-record.v1")
-                                   :value
-                                   (#'db-core/decode-activation-record))]
-                    (is (= [:build :finalize-basis :seal-target
-                            :close-canonical :prepare-artifacts :rename
-                            :reopen-canonical :clear-undo :start-search-rebuild
-                            [:broadcast :notification
-                             [nil :warning nil nil nil
-                              {:i18n-key :selfhost6/undo-history-reset}]]
-                            [:broadcast :projection-committed
-                             {:repo repo :projection-epoch 5}]
-                            :cleanup-target]
-                           @events))
-                    (is (= 1 (:rename-count result)))
-                    (is (= {:projection-epoch 5} (:committed stored)))
-                    (is (= {:projection-epoch 4} (:previous stored)))
-                    (is (= target-basis (get-in stored [:operation :target-basis])))
-                    (is (= "12"
-                           (:value (client-op/read-sync-meta-value
-                                    client-ops-db "local-tx"))))
-                    (is (= (get-in target-basis
-                                   [:checksum-basis :legacy-checksum])
-                           (:value (client-op/read-sync-meta-value
-                                    client-ops-db "checksum"))))
-                    (is (= 12 (:latest-remote-tx result)))
-                    (is (= (get-in target-basis
-                                   [:checksum-basis :legacy-anchor])
-                           (:latest-remote-checksum result)))
-                    (is (= ::worker-undo-redo/empty-undo-stack
-                           (worker-undo-redo/undo repo)))
-                    (is (= ::worker-undo-redo/empty-redo-stack
-                           (worker-undo-redo/redo repo)))
-                    (is (nil? (get @worker-undo-redo/*pending-editor-info repo)))
-                    (worker-undo-redo/record-ui-state! repo "post-cutover")
-                    (is (= "post-cutover"
-                           (:ui-state-str (worker-undo-redo/undo repo))))
-                    (is (nil? (:prepared-swap stored))))))
+               (p/then (fn [result]
+                         (assert-repair-commit-result!
+                          repo target-basis client-ops-db events result)))
                (p/catch (fn [error]
                           (is false (str error))))
                (p/finally (fn []
@@ -482,20 +623,8 @@
                         :remote-result {:remote-count 1}
                         :local-result {:local-count 2}
                         :staging-owner-token #js {}}
-               activation {:format-version 1
-                           :record-kind :selfhost-activation
-                           :committed {:projection-epoch 4}
-                           :previous {:projection-epoch 3}
-                           :operation {:operation-id operation-id
-                                       :graph-id graph-id
-                                       :target-projection-epoch 5
-                                       :start-basis start-basis
-                                       :target-basis nil
-                                       :disposition :repairing
-                                       :attempt-count 1
-                                       :next-retry-at-ms nil
-                                       :last-error nil}
-                           :prepared-swap nil}]
+               activation (repair-test-activation
+                           operation-id graph-id start-basis nil)]
            (repair-commit-fence/reset-for-test!)
            (client-op/insert-sync-meta-value-if-absent!
             client-ops-db "selfhost.activation-record.v1"
@@ -554,25 +683,9 @@
                     (-> (#'db-core/<commit-repair-staging! repo operation-id)
                         (p/then (fn [value] {:value value}))
                         (p/catch (fn [error] {:error error}))))))
-               (p/then
-                (fn [{:keys [error]}]
-                  (let [stored (-> (client-op/read-sync-meta-value
-                                    client-ops-db "selfhost.activation-record.v1")
-                                   :value
-                                   (#'db-core/decode-activation-record))]
-                    (is (= :test/rename-failed (:type (ex-data error))))
-                    (is (= [:close :prepare :rename-failed
-                            :reconcile-source :cleanup]
-                           @events))
-                    (is (= {:projection-epoch 4} (:committed stored)))
-                    (is (= target-basis (get-in stored [:operation :target-basis])))
-                    (is (= "11"
-                           (:value (client-op/read-sync-meta-value
-                                    client-ops-db "local-tx"))))
-                    (is (= "source-checksum"
-                           (:value (client-op/read-sync-meta-value
-                                    client-ops-db "checksum"))))
-                    (is (nil? (:prepared-swap stored))))))
+               (p/then (fn [{:keys [error]}]
+                         (assert-repair-source-recovery!
+                          target-basis client-ops-db events error)))
                (p/catch (fn [error]
                           (is false (str error))))
                (p/finally (fn []
@@ -609,6 +722,10 @@
           :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db :thread-api/db-sync-recreate-lock
           :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-claim-repair
           :thread-api/db-sync-build-repair-staging :thread-api/db-sync-commit-repair
+          :thread-api/db-sync-repair-status :thread-api/db-sync-record-repair-failure
+          :thread-api/db-sync-repair-status-from-value
+          :thread-api/db-sync-claim-repair-retry :thread-api/db-sync-complete-repair
+          :thread-api/db-sync-retry-repair
           :thread-api/db-sync-import-prepare :thread-api/db-sync-import-rows-chunk
           :thread-api/db-sync-import-finalize :thread-api/release-access-handles :thread-api/db-exists
           :thread-api/export-db-binary :thread-api/import-file-graph

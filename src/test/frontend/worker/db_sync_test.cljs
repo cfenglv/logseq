@@ -5518,7 +5518,7 @@
           *captured (atom nil)
           repair-claims (atom [])
           checksum-reads (atom 0)
-          get-local-checksum client-op/get-local-checksum
+          read-ready-metadata client-op/read-local-checksum-and-sync-meta-value
           client {:repo test-repo
                   :graph-id "graph-1"
                   :inflight (atom [])
@@ -5546,10 +5546,10 @@
                           (fn [& args]
                             (swap! repair-claims conj args)
                             (p/resolved {:claimed? true}))
-                          client-op/get-local-checksum
-                          (fn [target-repo]
+                          client-op/read-local-checksum-and-sync-meta-value
+                          (fn [target-repo key]
                             (swap! checksum-reads inc)
-                            (get-local-checksum target-repo))]
+                            (read-ready-metadata target-repo key))]
               (sync-handle-message/handle-message! test-repo client raw-message))
             (is (= [] @(:inflight client)))
             (is (empty? (#'sync-apply/pending-txs test-repo)))

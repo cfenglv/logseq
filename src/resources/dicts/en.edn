@@ -1812,8 +1812,6 @@
  :sidebar.right/resize-handle "Right sidebar resize handler"
  :sidebar.right/toggle "Toggle right sidebar"
 
- :selfhost6/undo-history-reset "Undo history was reset after graph recovery."
-
  :storage/invalid-data-writing "Invalid data writing to db!"
  :storage/sqlitedb-error "SQLiteDB error: {1}"
  :storage/sqlitedb-import-error "SQLiteDB import error: {1}"
@@ -1848,6 +1846,8 @@
  :sync/pending-asset-uploads "pending asset uploads"
  :sync/pending-local-changes "pending local changes"
  :sync/pending-server-changes "pending server changes"
+ :sync/repair-local-only-warning "Cloud recovery paused. Local editing and export remain available; retry after the underlying issue is resolved."
+ :sync/repair-undo-reset-warning "Undo history was reset after graph recovery."
  :sync/show-conflicts "Show sync conflicts"
  :sync/something-wrong "Something wrong, please try again."
  :sync/start-sync "Start sync"
