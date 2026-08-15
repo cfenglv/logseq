@@ -172,6 +172,43 @@
                 :legacy-anchor "legacy-7"}
                (client-op/read-repair-local-observation repo)))))))
 
+(deftest repair-completion-observation-bounds-pending-membership-test
+  (let [repo "repo-repair-completion"
+        target-tx-id (random-uuid)
+        later-tx-id (random-uuid)]
+    (with-client-ops-db
+      repo
+      (fn [db]
+        (client-op/update-local-tx repo 12)
+        (client-op/update-local-checksum repo "legacy-12")
+        (client-op/insert-sync-meta-value-if-absent!
+         db "selfhost.activation-record.v1" "activation-raw")
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id target-tx-id
+               :created-at 10
+               :pending? false
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id later-tx-id
+               :created-at 20
+               :pending? true
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (is (= {:remote-t 12
+                :journal-high-water 2
+                :pending-count 1
+                :legacy-anchor "legacy-12"
+                :pending-through-target 0}
+               (client-op/read-repair-completion-observation repo 1)))
+        (is (= 1
+               (:pending-through-target
+                (client-op/read-repair-completion-observation repo 2))))
+        (is (= {:local-checksum "legacy-12"
+               :reserved-value "activation-raw"}
+               (client-op/read-local-checksum-and-sync-meta-value
+                repo "selfhost.activation-record.v1")))))))
+
 (deftest repair-local-batch-binds-watermark-and-official-order-test
   (let [repo "repo-repair-batch"
         first-tx-id (random-uuid)

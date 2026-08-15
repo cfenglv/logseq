@@ -5,6 +5,7 @@
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync :as sync]
             [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.download :as sync-download]
             [frontend.worker.sync.util :as sync-util]
             [promesa.core :as p]))
 
@@ -51,6 +52,8 @@
                                client-op/update-graph-uuid (fn [_repo _graph-id] nil)
                                sync-util/get-graph-id (fn [_repo] graph-id)
                                sync/<resolve-ws-token (fn [] (p/resolved "token"))
+                               sync-download/<resume-repair-operation!
+                               (fn [_repo] (p/resolved {:resumed? false}))
                                shared-service/broadcast-to-clients! (fn [& _] nil)]
                  (sync/start! repo))
                (p/then

@@ -9,6 +9,7 @@
    [frontend.worker.sync.assets :as sync-assets]
    [frontend.worker.sync.auth :as sync-auth]
    [frontend.worker.sync.client-op :as client-op]
+   [frontend.worker.sync.download :as sync-download]
    [frontend.worker.sync.handle-message :as sync-handle-message]
    [frontend.worker.sync.presence :as sync-presence]
    [frontend.worker.sync.transport :as sync-transport]
@@ -409,6 +410,11 @@
                       token (<resolve-ws-token)
                       connected (connect! repo connected url token)]
                 (reset! worker-state/*db-sync-client connected)
+                (-> (sync-download/<resume-repair-operation! repo)
+                    (p/catch
+                     (fn [error]
+                       (log/error :db-sync/repair-resume-failed
+                                  {:repo repo :error error}))))
                 nil))
              (p/finally
                (fn []

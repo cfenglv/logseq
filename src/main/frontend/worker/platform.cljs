@@ -84,6 +84,16 @@
   ((get-in platform [:storage :commit-db-artifact-swap!])
    canonical-pool target-pool paths))
 
+(defn <cleanup-db-previous!
+  "Remove the one non-authoritative previous graph artifact set. The storage
+  owner makes this idempotent; callers retain durable metadata until success."
+  [platform canonical-pool paths]
+  (if-let [f (get-in platform [:storage :cleanup-db-previous!])]
+    (f canonical-pool paths)
+    (throw (ex-info "Platform does not support previous artifact cleanup"
+                    {:type :selfhost6/previous-cleanup-unsupported
+                     :runtime (env-flag platform :runtime)}))))
+
 (defn remove-storage-pool!
   [platform pool]
   (if-let [f (get-in platform [:storage :remove-vfs!])]

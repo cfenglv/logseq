@@ -377,6 +377,31 @@
   (when-let [store (sqlite-store-or-throw repo)]
     (sqlite-with-tx! store repair-local-observation-in-tx)))
 
+(defn read-repair-completion-observation
+  "Read the durable journal/cursor evidence used to retire one committed repair.
+  Only pending official tx rows at or below the repair membership watermark
+  prevent completion; newer rows remain owned by the normal RTC path."
+  [repo journal-high-water]
+  (when-not (and (integer? journal-high-water) (>= journal-high-water 0))
+    (throw (ex-info "Invalid repair completion high-water"
+                    {:type :db-sync/invalid-repair-completion-high-water
+                     :journal-high-water journal-high-water})))
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [observation (repair-local-observation-in-tx tx)
+             pending-row
+             (sqlite-row
+              tx
+              (str "select count(*) as pending_through_target "
+                   "from client_ops "
+                   "where kind = 'tx' and pending = 1 and id <= ?")
+              [journal-high-water])]
+         (assoc observation
+                :pending-through-target
+                (or (some-> pending-row (aget "pending_through_target")) 0)))))))
+
 (defn- sqlite-get-meta
   [db k]
   (some-> (sqlite-row db "select value from sync_meta where key = ?" [(name k)])
@@ -460,6 +485,23 @@
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
     (sqlite-get-meta store :db-sync/checksum)))
+
+(defn read-local-checksum-and-sync-meta-value
+  "Read the existing checksum and one reserved cold-path value in the single
+  query already needed at a checksum-ready RTC boundary."
+  [repo key]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (let [rows (sqlite-rows
+                store
+                "select key, value from sync_meta where key in ('checksum', ?)"
+                [key])
+          values (into {}
+                       (map (fn [row]
+                              [(aget row "key") (aget row "value")]))
+                       rows)]
+      {:local-checksum (get values "checksum")
+       :reserved-value (get values key)})))
 
 (defn rtc-db-graph?
   "Is RTC enabled"

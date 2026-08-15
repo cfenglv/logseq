@@ -56,6 +56,35 @@
          (throw e)))))
 
 #?(:cljs
+   (defn- transit-safe-ex-data
+     [error]
+     (reduce-kv
+      (fn [result k v]
+        (try
+          ;; A handler can attach parser/runtime values which Transit cannot encode.
+          ;; Preserve every independently transportable field instead of replacing
+          ;; the original handler error with the serialization failure.
+          (ldb/write-transit-str [k v])
+          (assoc result k v)
+          (catch :default _
+            result)))
+      {}
+      (or (ex-data error) {}))))
+
+#?(:cljs
+   (defn- write-error-transit-str
+     [error qualified-kw-str]
+     (try
+       (ldb/write-transit-str error)
+       (catch :default serialization-error
+         (log/error :thread-api-write-error-transit-failed
+                    {:api qualified-kw-str
+                     :error serialization-error})
+         (ldb/write-transit-str
+          (ex-info (or (.-message error) (str error))
+                   (transit-safe-ex-data error)))))))
+
+#?(:cljs
    (defn remote-function
      "Return a promise whose value is transit-str."
      [qualified-kw-str args-transit-str]
@@ -86,7 +115,7 @@
                 (p/catch
                  (fn [error]
                    (let [handler-completed-at (.now js/performance)
-                         error-transit-str (write-transit-str-with-catch error qualified-kw-str)
+                         error-transit-str (write-error-transit-str error qualified-kw-str)
                          completed-at (.now js/performance)]
                      (log-worker-thread-api-call!
                       {:worker-call-id call-id

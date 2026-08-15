@@ -589,6 +589,19 @@
       {:canonical-path canonical-path
        :rename-count 1})))
 
+(defn- <cleanup-db-previous!
+  [write-guard-fn canonical-pool
+   {:keys [previous-path previous-wal-path previous-shm-path]}]
+  (let [previous-full-path (pool-path canonical-pool previous-path)
+        wal-full-path (pool-path canonical-pool previous-wal-path)
+        shm-full-path (pool-path canonical-pool previous-shm-path)]
+    (p/let [_ (when write-guard-fn (write-guard-fn))
+            _ (<unlink-optional! wal-full-path)
+            _ (<unlink-optional! shm-full-path)
+            _ (<unlink-optional! previous-full-path)
+            _ (<fsync-dir! (node-path/dirname previous-full-path))]
+      {:removed? true})))
+
 (defn- import-db
   [write-guard-fn pool path data]
   (let [full-path (pool-path pool path)
@@ -836,6 +849,10 @@
                  (fn [canonical-pool target-pool paths]
                    (<commit-db-artifact-swap!
                     write-guard-fn canonical-pool target-pool paths))
+                 :cleanup-db-previous!
+                 (fn [canonical-pool paths]
+                   (<cleanup-db-previous!
+                    write-guard-fn canonical-pool paths))
                  :import-db (fn [pool path data] (import-db write-guard-fn pool path data))
                  :remove-vfs! (fn [pool] (remove-vfs! pool))
                  :read-text! (fn [path] (read-text! data-dir path))

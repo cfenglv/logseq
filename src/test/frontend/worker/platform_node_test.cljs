@@ -528,3 +528,24 @@
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
+
+(deftest previous-artifact-cleanup-is-idempotent
+  (async done
+    (let [root-dir (node-helper/create-tmp-dir "platform-node-previous-cleanup")
+          paths {:previous-path "/db.previous.sqlite"
+                 :previous-wal-path "/db.previous.sqlite-wal"
+                 :previous-shm-path "/db.previous.sqlite-shm"}]
+      (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage) nil "cleanup-previous")
+                  repo-dir (gobj/get pool "repoDir")
+                  previous-path (node-path/join repo-dir "db.previous.sqlite")
+                  _ (fs/writeFileSync previous-path "previous" "utf8")
+                  first-result ((:cleanup-db-previous! storage) pool paths)
+                  second-result ((:cleanup-db-previous! storage) pool paths)]
+            (is (= {:removed? true} first-result))
+            (is (= {:removed? true} second-result))
+            (is (not (fs/existsSync previous-path))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))

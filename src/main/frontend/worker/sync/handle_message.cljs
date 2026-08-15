@@ -141,18 +141,29 @@
        (not (pending-local-tx? repo))
        (empty? @(:inflight client))))
 
-(defn- ready-local-checksum
+(defn- ready-sync-metadata
   [repo client local-t remote-t]
   (when (synced-checksum-ready? repo client local-t remote-t)
-    (let [checksum (client-op/get-local-checksum repo)]
-      (when (string? checksum)
-        checksum))))
+    (let [metadata
+          (client-op/read-local-checksum-and-sync-meta-value
+           repo "selfhost.activation-record.v1")]
+      (when (string? (:local-checksum metadata))
+        metadata))))
 
 (defn- verify-sync-checksum!
   [repo client local-tx remote-tx remote-checksum context]
   (when (string? remote-checksum)
-    (when-let [local-checksum (ready-local-checksum repo client local-tx remote-tx)]
-      (when-not (= local-checksum remote-checksum)
+    (when-let [{:keys [local-checksum reserved-value]}
+               (ready-sync-metadata repo client local-tx remote-tx)]
+      (if (= local-checksum remote-checksum)
+        (p/catch
+         (sync-download/<complete-repair-if-converged!
+          repo client remote-tx remote-checksum reserved-value)
+         (fn [error]
+           (log/error :db-sync/repair-completion-failed
+                      {:repo repo
+                       :remote-tx remote-tx
+                       :error error})))
         (let [mismatch-data (merge context
                                    {:type :db-sync/checksum-mismatch
                                     :repo repo
@@ -163,13 +174,14 @@
                                     :remote-checksum remote-checksum})]
           (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
           (log/warn :db-sync/checksum-mismatch mismatch-data)
-          (-> (sync-download/<claim-repair-after-checksum-mismatch!
-               repo client remote-tx remote-checksum)
-              (p/catch (fn [error]
-                         (log/error :db-sync/repair-claim-failed
-                                    {:repo repo
-                                     :remote-tx remote-tx
-                                     :error error})))))))))
+          (p/catch
+           (sync-download/<claim-repair-after-checksum-mismatch!
+            repo client remote-tx remote-checksum)
+           (fn [error]
+             (log/error :db-sync/repair-claim-failed
+                        {:repo repo
+                         :remote-tx remote-tx
+                         :error error}))))))))
 
 (defn- handle-tx-reject!
   [repo client message local-tx]
