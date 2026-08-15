@@ -16,6 +16,7 @@
    [frontend.worker.sync.util :refer [fail-fast] :as sync-util]
    [lambdaisland.glogi :as log]
    [logseq.db-sync.snapshot :as snapshot]
+   [logseq.db-sync.checksum :as sync-checksum]
    [logseq.db.common.sqlite :as common-sqlite]
    [logseq.db.frontend.schema :as db-schema]
    [promesa.core :as p]
@@ -158,6 +159,80 @@
 
 (defonce ^:private *import-state (atom nil))
 (def ^:private snapshot-import-datoms-batch-size 10000)
+
+(declare require-thread-api-f!)
+
+(defn- stable-repair-observation?
+  [repo conn before after client remote-t]
+  (and (= before after)
+       (identical? conn (worker-state/get-datascript-conn repo))
+       (= remote-t (:remote-t after))
+       (zero? (:pending-count after))
+       (empty? @(:inflight client))))
+
+(defn- <claim-repair-after-checksum-mismatch*
+  [repo client remote-t remote-checksum]
+  (let [graph-id (some-> (:graph-id client) str)
+        conn (worker-state/get-datascript-conn repo)
+        base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+    ;; A checksum message can finish while the graph is closing. In that case
+    ;; there is no repair context to claim; leave the durable state untouched.
+    (if-not (and (seq graph-id) conn (seq base))
+      (p/resolved {:claimed? false :reason :missing-context})
+      (p/let [before (client-op/read-repair-local-observation repo)
+              local-checksum-before (sync-checksum/<recompute-checksum @conn)
+              diagnostics (fetch-json
+                           (str base "/sync/" graph-id
+                                "/checksum/diagnostics?proof-only=true")
+                           {:method "GET"}
+                           :sync/checksum-diagnostics)
+              after (client-op/read-repair-local-observation repo)]
+        (cond
+          (not (stable-repair-observation? repo conn before after client remote-t))
+          {:claimed? false :reason :suspect-changed}
+
+          (not= remote-t (:t diagnostics))
+          {:claimed? false :reason :server-t-changed}
+
+          (not= (:legacy-anchor diagnostics)
+                (:server-recomputed-checksum diagnostics))
+          (throw (ex-info "Server checksum anchor failed recomputation"
+                          {:type :db-sync/server-checksum-drift
+                           :repo repo
+                           :remote-t remote-t}))
+
+          (not= remote-checksum (:legacy-anchor diagnostics))
+          {:claimed? false :reason :server-anchor-changed}
+
+          (= local-checksum-before (:server-recomputed-checksum diagnostics))
+          (do
+            (when (not= (:legacy-anchor after) local-checksum-before)
+              (client-op/update-local-checksum repo local-checksum-before))
+            {:claimed? false :reason :recomputed-match})
+
+          :else
+          (let [start-basis
+                {:remote-t remote-t
+                 :server-checkpoint-identity
+                 (:server-checkpoint-identity diagnostics)
+                 :journal-high-water (:journal-high-water after)
+                 :checksum-basis
+                 {:version 1
+                  :legacy-checksum local-checksum-before
+                  :server-recomputed-checksum
+                  (:server-recomputed-checksum diagnostics)
+                  :server-t (:t diagnostics)
+                  :legacy-anchor (:legacy-anchor diagnostics)
+                  :metadata-proof (:metadata-proof diagnostics)}}
+                claim-f (require-thread-api-f! :thread-api/db-sync-claim-repair)]
+            (claim-f repo graph-id start-basis)))))))
+
+(defn <claim-repair-after-checksum-mismatch!
+  "Recheck one mismatch suspect. DB-core's durable CAS is the only operation
+  claim and makes overlapping requests idempotent without a second scheduler."
+  [repo client remote-t remote-checksum]
+  (<claim-repair-after-checksum-mismatch*
+   repo client remote-t remote-checksum))
 
 (defn complete-datoms-import!
   [repo graph-id remote-tx]

@@ -1,11 +1,12 @@
 (ns logseq.db-sync.checksum-test
   (:require ["fs" :as fs]
             [cljs.reader :as reader]
-            [cljs.test :refer [deftest is testing]]
+            [cljs.test :refer [async deftest is testing]]
             [datascript.core :as d]
             [logseq.db :as ldb]
             [logseq.db-sync.checksum :as checksum]
-            [logseq.db.frontend.schema :as db-schema]))
+            [logseq.db.frontend.schema :as db-schema]
+            [promesa.core :as p]))
 
 (defn- sample-db
   []
@@ -340,6 +341,25 @@
       (is (= child-parent-uuid (:block/parent child)))
       (is (= child-page-uuid (:block/page child)))
       (is (string? (:block/title child))))))
+
+(deftest yielded-recompute-matches-official-checksum-test
+  (async done
+         (let [timer-fired? (atom false)
+               _ (js/setTimeout #(reset! timer-fired? true) 0)
+               db (-> (d/empty-db db-schema/schema)
+                      (d/db-with
+                       (mapv (fn [idx]
+                               {:block/uuid (random-uuid)
+                                :block/name (str "page-" idx)
+                                :block/title (str "Page " idx)})
+                             (range 300))))]
+           (-> (checksum/<recompute-checksum db)
+               (p/then (fn [yielded]
+                         (is @timer-fired?)
+                         (is (= (checksum/recompute-checksum db) yielded))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
 
 (deftest recompute-checksum-diagnostics-omits-title-and-name-in-e2ee-test
   (testing "diagnostics for E2EE graphs omits title/name from checksum attrs and export blocks"

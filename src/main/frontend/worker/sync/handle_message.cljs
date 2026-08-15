@@ -7,13 +7,13 @@
             [frontend.worker.sync.auth :as sync-auth]
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.crypt :as sync-crypt]
+            [frontend.worker.sync.download :as sync-download]
             [frontend.worker.sync.log-and-state :as sync-log-state]
             [frontend.worker.sync.presence :as sync-presence]
             [frontend.worker.sync.transport :as sync-transport]
             [frontend.worker.sync.util :as sync-util]
             [lambdaisland.glogi :as log]
-            [promesa.core :as p]
-            [frontend.worker-common.util :as worker-util]))
+            [promesa.core :as p]))
 
 (defn- fail-fast
   [tag data]
@@ -141,28 +141,35 @@
        (not (pending-local-tx? repo))
        (empty? @(:inflight client))))
 
-(defn- checksum-compare-ready?
+(defn- ready-local-checksum
   [repo client local-t remote-t]
-  (and (synced-checksum-ready? repo client local-t remote-t)
-       (string? (client-op/get-local-checksum repo))))
+  (when (synced-checksum-ready? repo client local-t remote-t)
+    (let [checksum (client-op/get-local-checksum repo)]
+      (when (string? checksum)
+        checksum))))
 
 (defn- verify-sync-checksum!
   [repo client local-tx remote-tx remote-checksum context]
-  (when worker-util/dev-or-test?
-    (when (and (string? remote-checksum)
-               (checksum-compare-ready? repo client local-tx remote-tx))
-      (let [local-checksum (client-op/get-local-checksum repo)]
-        (when-not (= local-checksum remote-checksum)
-          (let [mismatch-data (merge context
-                                     {:type :db-sync/checksum-mismatch
-                                      :repo repo
-                                      :message-type (:type context)
-                                      :local-tx local-tx
-                                      :remote-tx remote-tx
-                                      :local-checksum local-checksum
-                                      :remote-checksum remote-checksum})]
-            (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
-            (log/warn :db-sync/checksum-mismatch mismatch-data)))))))
+  (when (string? remote-checksum)
+    (when-let [local-checksum (ready-local-checksum repo client local-tx remote-tx)]
+      (when-not (= local-checksum remote-checksum)
+        (let [mismatch-data (merge context
+                                   {:type :db-sync/checksum-mismatch
+                                    :repo repo
+                                    :message-type (:type context)
+                                    :local-tx local-tx
+                                    :remote-tx remote-tx
+                                    :local-checksum local-checksum
+                                    :remote-checksum remote-checksum})]
+          (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
+          (log/warn :db-sync/checksum-mismatch mismatch-data)
+          (-> (sync-download/<claim-repair-after-checksum-mismatch!
+               repo client remote-tx remote-checksum)
+              (p/catch (fn [error]
+                         (log/error :db-sync/repair-claim-failed
+                                    {:repo repo
+                                     :remote-tx remote-tx
+                                     :error error})))))))))
 
 (defn- handle-tx-reject!
   [repo client message local-tx]

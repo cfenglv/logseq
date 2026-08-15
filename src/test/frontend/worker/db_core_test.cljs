@@ -51,6 +51,8 @@
 (def ^:private source-artifact-sha (apply str (repeat 64 "a")))
 (def ^:private target-artifact-sha (apply str (repeat 64 "b")))
 
+(declare new-memory-sqlite-db)
+
 (defn- test-sha256-hex
   [payload]
   (-> (.createHash node-crypto "sha256")
@@ -58,20 +60,25 @@
       (.digest "hex")))
 
 (defn- activation-basis
-  [remote-t journal-high-water checkpoint]
-  {:remote-t remote-t
-   :server-checkpoint-identity checkpoint
-   :journal-high-water journal-high-water
-   :checksum-basis {:version 1
-                    :legacy-checksum "legacy"
-                    :server-v2-checksum "server-v2"
-                    :server-v2-t remote-t
-                    :legacy-anchor "anchor"
-                    :metadata-proof "proof"}})
+  [remote-t journal-high-water graph-id]
+  (let [server-checksum "server-recomputed"]
+    {:remote-t remote-t
+     :server-checkpoint-identity
+     (str "sync-do-checkpoint-v1:" graph-id ":" remote-t ":" server-checksum)
+     :journal-high-water journal-high-water
+     :checksum-basis
+     {:version 1
+      :legacy-checksum "legacy"
+      :server-recomputed-checksum server-checksum
+      :server-t remote-t
+      :legacy-anchor server-checksum
+      :metadata-proof
+      (str "authenticated-diagnostics-v1:" graph-id ":" remote-t ":"
+           server-checksum ":" server-checksum)}}))
 
 (defn- repairing-activation-record
   []
-  (let [target-basis (activation-basis 11 20 "checkpoint-target")]
+  (let [target-basis (activation-basis 11 20 "graph-1")]
     {:format-version 1
      :record-kind :selfhost-activation
      :committed {:projection-epoch 4}
@@ -79,7 +86,7 @@
      :operation {:operation-id activation-operation-id
                  :graph-id "graph-1"
                  :target-projection-epoch 5
-                 :start-basis (activation-basis 10 19 "checkpoint-source")
+                 :start-basis (activation-basis 10 19 "graph-1")
                  :target-basis target-basis
                  :disposition :repairing
                  :attempt-count 1
@@ -112,8 +119,14 @@
     (let [repairing (repairing-activation-record)
           local-only-invalid (-> repairing
                                  (assoc-in [:operation :disposition] :local-only))
-          rollback-basis (activation-basis 9 20 "checkpoint-target")
-          rollback-journal-basis (activation-basis 10 18 "checkpoint-target")
+          anchor-drift (assoc-in repairing
+                                 [:operation :start-basis :checksum-basis :legacy-anchor]
+                                 "drifted-anchor")
+          unbound-proof (assoc-in repairing
+                                  [:operation :start-basis :checksum-basis :metadata-proof]
+                                  "unbound-proof")
+          rollback-basis (activation-basis 9 20 "graph-1")
+          rollback-journal-basis (activation-basis 10 18 "graph-1")
           target-committed (assoc repairing
                                   :committed {:projection-epoch 5}
                                   :previous {:projection-epoch 4}
@@ -121,11 +134,15 @@
       (is (thrown-with-msg? cljs.core.ExceptionInfo
                             #"Invalid self-host activation record"
                             (decode (ldb/write-transit-str local-only-invalid))))
+      (doseq [invalid [anchor-drift unbound-proof]]
+        (is (thrown-with-msg? cljs.core.ExceptionInfo
+                              #"Invalid self-host activation record"
+                              (decode (ldb/write-transit-str invalid)))))
       (doseq [invalid [(assoc-in repairing
                                 [:operation :target-basis :checksum-basis :legacy-checksum]
                                 nil)
                        (assoc-in repairing
-                                 [:operation :target-basis :checksum-basis :server-v2-t]
+                                 [:operation :target-basis :checksum-basis :server-t]
                                  12)
                        (-> repairing
                            (assoc-in [:operation :target-basis] rollback-basis)
@@ -146,6 +163,36 @@
       (is (thrown-with-msg? cljs.core.ExceptionInfo
                             #"does not match prepared swap"
                             (reconcile repairing (apply str (repeat 64 "c"))))))))
+
+(deftest repair-claim-is-single-durable-operation-test
+  (let [repo "repair-claim-repo"
+        graph-id "graph-repair-claim"
+        client-ops-db (new-memory-sqlite-db)
+        previous-conns @worker-state/*client-ops-conns
+        basis (activation-basis 12 34 graph-id)
+        empty-raw (ldb/write-transit-str @#'db-core/empty-activation-record)]
+    (try
+      (reset! worker-state/*client-ops-conns {repo client-ops-db})
+      (client-op/insert-sync-meta-value-if-absent!
+       client-ops-db "selfhost.activation-record.v1" empty-raw)
+      (let [first-claim (#'db-core/claim-repair-operation! repo graph-id basis)
+            second-claim (#'db-core/claim-repair-operation! repo graph-id basis)
+            stored (-> (client-op/read-sync-meta-value
+                        client-ops-db "selfhost.activation-record.v1")
+                       :value
+                       (#'db-core/decode-activation-record))]
+        (is (true? (:claimed? first-claim)))
+        (is (false? (:claimed? second-claim)))
+        (is (= (get-in first-claim [:operation :operation-id])
+               (get-in second-claim [:operation :operation-id])
+               (get-in stored [:operation :operation-id])))
+        (is (= basis (get-in stored [:operation :start-basis])))
+        (is (= 1 (get-in stored [:operation :attempt-count])))
+        (is (= :repairing (get-in stored [:operation :disposition])))
+        (is (nil? (:prepared-swap stored))))
+      (finally
+        (.close client-ops-db)
+        (reset! worker-state/*client-ops-conns previous-conns)))))
 
 (def ^:private task-spent-time-schema
   (merge db-schema/schema
@@ -173,7 +220,8 @@
           :thread-api/get-file-content :thread-api/get-all-properties :thread-api/get-date-scheduled-or-deadlines
           :thread-api/unsafe-unlink-db :thread-api/close-db
           :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db :thread-api/db-sync-recreate-lock
-          :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-import-prepare :thread-api/db-sync-import-rows-chunk
+          :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-claim-repair
+          :thread-api/db-sync-import-prepare :thread-api/db-sync-import-rows-chunk
           :thread-api/db-sync-import-finalize :thread-api/release-access-handles :thread-api/db-exists
           :thread-api/export-db-binary :thread-api/import-file-graph
           :thread-api/export-client-ops-db-binary :thread-api/backup-db-sqlite

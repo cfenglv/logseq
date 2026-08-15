@@ -1,11 +1,13 @@
 (ns logseq.db-sync.checksum
   (:require [clojure.set :as set]
             [datascript.core :as d]
-            [logseq.db :as ldb]))
+            [logseq.db :as ldb]
+            [promesa.core :as p]))
 
 (def ^:private fnv-offset 2166136261)
 (def ^:private djb-offset 5381)
 (def ^:private field-separator 31)
+(def ^:private recompute-yield-entity-count 256)
 
 (defn- fnv-step
   [h code]
@@ -372,6 +374,33 @@
                    (add-digest checksum-state (tuple-digest tuple)))
                  [0 0])
          state->checksum)))
+
+(defn <recompute-checksum
+  "Recompute the official legacy checksum from one immutable DB value while
+  yielding between bounded entity batches. This is for mismatch/repair cold
+  paths; normal transactions continue to use `update-checksum`."
+  [db]
+  (let [e2ee? (ldb/get-graph-rtc-e2ee? db)]
+    (p/loop [remaining (seq (d/datoms db :avet :block/uuid))
+             checksum-state [0 0]
+             processed 0]
+      (if-let [{:keys [e]} (first remaining)]
+        (let [checksum-state'
+              (reduce (fn [state tuple]
+                        (add-digest state (tuple-digest tuple)))
+                      checksum-state
+                      (or (when (checksum-eligible-entity? db e)
+                            (entity-checksum-tuples db e e2ee?))
+                          []))
+              remaining' (next remaining)
+              processed' (inc processed)]
+          (if (and remaining'
+                   (zero? (mod processed' recompute-yield-entity-count)))
+            (p/let [_ (js/Promise. (fn [resolve]
+                                     (js/setTimeout resolve 0)))]
+              (p/recur remaining' checksum-state' processed'))
+            (p/recur remaining' checksum-state' processed')))
+        (state->checksum checksum-state)))))
 
 (defn recompute-checksum-diagnostics
   [db]

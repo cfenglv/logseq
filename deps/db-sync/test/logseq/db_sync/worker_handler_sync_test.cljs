@@ -74,6 +74,63 @@
   (p/let [text (.text response)]
     (js->clj (js/JSON.parse text) :keywordize-keys true)))
 
+(deftest checksum-diagnostics-binds-recomputed-checksum-to-server-t-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   self #js {:sql sql :conn conn :schema-ready true}
+                   graph-id "graph-diagnostics"
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                         :block/title "diagnostic block"}])
+                   recomputed (sync-checksum/recompute-checksum @conn)
+                   _ (storage/set-checksum! sql recomputed)]
+               (-> (p/let [response (#'sync-handler/<checksum-diagnostics-response
+                                      self graph-id false)]
+                     (is (= (storage/get-t sql) (:t response)))
+                     (is (= recomputed
+                            (:checksum response)
+                            (:legacy-anchor response)
+                            (:server-recomputed-checksum response)))
+                     (is (string/includes? (:server-checkpoint-identity response)
+                                           (str graph-id ":" (:t response) ":" recomputed)))
+                     (is (string/includes? (:metadata-proof response)
+                                           (str graph-id ":" (:t response) ":"
+                                                recomputed ":" recomputed)))
+                     (is (not (contains? response :blocks))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest checksum-diagnostics-proof-only-http-response-omits-block-payload-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   self #js {:sql sql :conn conn :schema-ready true}
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                         :block/title "proof only"}])
+                   recomputed (sync-checksum/recompute-checksum @conn)
+                   _ (storage/set-checksum! sql recomputed)
+                   request (js/Request.
+                            "http://localhost/sync/graph-proof/checksum/diagnostics?proof-only=true")]
+               (-> (p/let [response (sync-handler/handle
+                                      {:self self
+                                       :request request
+                                       :route {:handler :sync/checksum-diagnostics}})
+                            body (json-body response)]
+                     (is (= 200 (.-status response)))
+                     (is (= recomputed (:server-recomputed-checksum body)))
+                     (is (= (storage/get-t sql) (:t body)))
+                     (is (not (contains? body :blocks))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
 (deftest semantic-create-page-delegates-to-outliner-and-broadcasts-test
   (async done
          (with-memory-sql-async

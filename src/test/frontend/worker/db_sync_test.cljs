@@ -20,6 +20,7 @@
    [frontend.worker.sync.auth :as sync-auth]
    [frontend.worker.sync.client-op :as client-op]
    [frontend.worker.sync.crypt :as sync-crypt]
+   [frontend.worker.sync.download :as sync-download]
    [frontend.worker.sync.handle-message :as sync-handle-message]
    [frontend.worker.sync.large-title :as sync-large-title]
    [frontend.worker.sync.log-and-state :as sync-log-state]
@@ -5437,6 +5438,9 @@
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)
           remote-checksum "bad-remote-checksum"
           *captured (atom nil)
+          repair-claims (atom [])
+          checksum-reads (atom 0)
+          get-local-checksum client-op/get-local-checksum
           client {:repo test-repo
                   :graph-id "graph-1"
                   :inflight (atom [])
@@ -5456,7 +5460,18 @@
             (reset! (:inflight client) tx-ids)
             (with-redefs [sync-log-state/rtc-log (fn [type payload]
                                                    (reset! *captured {:type type
-                                                                      :payload payload}))]
+                                                                      :payload payload}))
+                          ;; The existing RTC-state broadcast reads checksum for
+                          ;; its payload; isolate the new admission read here.
+                          sync-presence/sync-counts (fn [& _] {})
+                          sync-download/<claim-repair-after-checksum-mismatch!
+                          (fn [& args]
+                            (swap! repair-claims conj args)
+                            (p/resolved {:claimed? true}))
+                          client-op/get-local-checksum
+                          (fn [target-repo]
+                            (swap! checksum-reads inc)
+                            (get-local-checksum target-repo))]
               (sync-handle-message/handle-message! test-repo client raw-message))
             (is (= [] @(:inflight client)))
             (is (empty? (#'sync-apply/pending-txs test-repo)))
@@ -5464,7 +5479,10 @@
             (is (= local-checksum (client-op/get-local-checksum test-repo)))
             (is (= :rtc.log/checksum-mismatch (:type @*captured)))
             (is (= local-checksum (get-in @*captured [:payload :local-checksum])))
-            (is (= remote-checksum (get-in @*captured [:payload :remote-checksum])))))))))
+            (is (= remote-checksum (get-in @*captured [:payload :remote-checksum])))
+            (is (= 1 @checksum-reads))
+            (is (= [[test-repo client 1 remote-checksum]]
+                   @repair-claims))))))))
 
 (deftest apply-remote-tx-does-not-clear-pending-without-ack-test
   (testing "apply-remote-tx should not clear local pending txs before tx/batch/ok ack"

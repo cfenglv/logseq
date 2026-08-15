@@ -990,23 +990,47 @@
     page (assoc :block/page (str page))
     order (assoc :block/order order)))
 
-(defn- checksum-diagnostics-response
-  [^js self]
+(defn- <checksum-diagnostics-response
+  [^js self graph-id include-blocks?]
   (ensure-conn! self)
-  (-> (sync-checksum/recompute-checksum-diagnostics @(.-conn self))
-      (update :blocks (fn [blocks]
-                        (mapv normalize-diagnostic-block blocks)))))
+  (let [db @(.-conn self)
+        remote-t (t-now self)
+        stored-legacy-anchor (current-checksum self)
+        diagnostics (when include-blocks?
+                      (sync-checksum/recompute-checksum-diagnostics db))]
+    (p/let [recomputed (if diagnostics
+                         (:checksum diagnostics)
+                         (sync-checksum/<recompute-checksum db))]
+      (let [legacy-anchor (or stored-legacy-anchor recomputed)
+            checkpoint-identity
+            (str "sync-do-checkpoint-v1:" graph-id ":" remote-t ":" legacy-anchor)
+            metadata-proof
+            (str "authenticated-diagnostics-v1:" graph-id ":" remote-t ":"
+                 legacy-anchor ":" recomputed)]
+        (-> (or diagnostics {:checksum recomputed})
+            (assoc :checksum recomputed
+                   :t remote-t
+                   :legacy-anchor legacy-anchor
+                   :server-recomputed-checksum recomputed
+                   :server-checkpoint-identity checkpoint-identity
+                   :metadata-proof metadata-proof)
+            (cond-> include-blocks?
+              (update :blocks (fn [blocks]
+                                (mapv normalize-diagnostic-block blocks)))))))))
 
 (defn- handle-sync-checksum-diagnostics
   [^js self request]
-  (let [graph-id (graph-id-from-request request)]
+  (let [graph-id (graph-id-from-request request)
+        url (js/URL. (.-url request))
+        proof-only? (= "true" (.get (.-searchParams url) "proof-only"))]
     (if (not (seq graph-id))
       (http/bad-request "missing graph id")
       (p/let [ready-for-sync? (<ready-for-sync? self graph-id)]
         (if-not ready-for-sync?
           (http/error-response "graph not ready" 409)
-          (http/json-response :sync/checksum-diagnostics
-                              (checksum-diagnostics-response self)))))))
+          (p/let [response (<checksum-diagnostics-response
+                            self graph-id (not proof-only?))]
+            (http/json-response :sync/checksum-diagnostics response)))))))
 
 (defn- handle-sync-snapshot-stream
   [^js self request]

@@ -253,6 +253,15 @@
    :any
    http-error-response-schema])
 
+(def checksum-diagnostics-response-schema
+  [:map
+   [:checksum :string]
+   [:t :int]
+   [:legacy-anchor :string]
+   [:server-recomputed-checksum :string]
+   [:server-checkpoint-identity :string]
+   [:metadata-proof :string]])
+
 (def http-request-schemas
   {:graphs/create graph-create-request-schema
    :graph-members/create graph-member-create-request-schema
@@ -274,6 +283,7 @@
    :worker/health http-ok-response-schema
    :sync/health http-ok-response-schema
    :sync/pull pull-ok-schema
+   :sync/checksum-diagnostics checksum-diagnostics-response-schema
    :sync/tx-batch [:or tx-batch-ok-schema tx-reject-schema http-error-response-schema]
    :sync/snapshot-download snapshot-download-response-schema
    :sync/snapshot-upload snapshot-upload-response-schema

@@ -151,7 +151,7 @@
 (def ^:private basis-fields
   #{:remote-t :server-checkpoint-identity :journal-high-water :checksum-basis})
 (def ^:private checksum-basis-fields
-  #{:version :legacy-checksum :server-v2-checksum :server-v2-t :legacy-anchor :metadata-proof})
+  #{:version :legacy-checksum :server-recomputed-checksum :server-t :legacy-anchor :metadata-proof})
 (def ^:private sha256-pattern #"^[0-9a-f]{64}$")
 
 (defn- exact-fields?
@@ -167,19 +167,27 @@
   (and (integer? value) (>= value 0)))
 
 (defn- valid-basis?
-  [basis]
-  (let [checksum-basis (:checksum-basis basis)]
+  [basis graph-id]
+  (let [checksum-basis (:checksum-basis basis)
+        remote-t (:remote-t basis)
+        legacy-anchor (:legacy-anchor checksum-basis)
+        recomputed (:server-recomputed-checksum checksum-basis)]
     (and (exact-fields? basis basis-fields)
-         (non-negative-integer? (:remote-t basis))
-         (non-empty-string? (:server-checkpoint-identity basis))
+         (non-empty-string? graph-id)
+         (non-negative-integer? remote-t)
          (non-negative-integer? (:journal-high-water basis))
          (exact-fields? checksum-basis checksum-basis-fields)
          (= 1 (:version checksum-basis))
          (non-empty-string? (:legacy-checksum checksum-basis))
-         (non-empty-string? (:server-v2-checksum checksum-basis))
-         (= (:remote-t basis) (:server-v2-t checksum-basis))
-         (non-empty-string? (:legacy-anchor checksum-basis))
-         (non-empty-string? (:metadata-proof checksum-basis)))))
+         (non-empty-string? recomputed)
+         (= remote-t (:server-t checksum-basis))
+         (= legacy-anchor recomputed)
+         (= (str "sync-do-checkpoint-v1:" graph-id ":" remote-t ":"
+                 legacy-anchor)
+            (:server-checkpoint-identity basis))
+         (= (str "authenticated-diagnostics-v1:" graph-id ":" remote-t ":"
+                 legacy-anchor ":" recomputed)
+            (:metadata-proof checksum-basis)))))
 
 (defn- basis-not-before?
   [target-basis start-basis]
@@ -210,9 +218,9 @@
                       previous
                       (= :repairing (:disposition operation))
                       (some? target-basis)))
-             (valid-basis? start-basis)
+             (valid-basis? start-basis (:graph-id operation))
              (or (nil? target-basis)
-                 (and (valid-basis? target-basis)
+                 (and (valid-basis? target-basis (:graph-id operation))
                       (basis-not-before? target-basis start-basis)))
              (contains? #{:repairing :local-only} (:disposition operation))
              (pos-int? (:attempt-count operation))
@@ -237,7 +245,7 @@
            (re-matches sha256-pattern (:target-sha256 prepared-swap))
            (not= (:source-sha256 prepared-swap) (:target-sha256 prepared-swap))
            (= (:target-basis operation) (:target-basis prepared-swap))
-           (valid-basis? (:target-basis prepared-swap))
+           (valid-basis? (:target-basis prepared-swap) (:graph-id operation))
            (non-negative-integer? (:written-at-ms prepared-swap)))))
 
 (defn- valid-activation-record?
@@ -311,6 +319,64 @@
           (throw (ex-info "Activation record changed during startup reconciliation"
                           {:type :selfhost6/activation-record-cas-mismatch})))
         next-record))))
+
+(defn- read-activation-record!
+  [client-ops-db]
+  (let [{:keys [found? value]}
+        (client-op/read-sync-meta-value client-ops-db activation-record-key)]
+    (when-not found?
+      (throw (ex-info "Missing self-host activation record"
+                      {:type :selfhost6/missing-activation-record})))
+    {:raw value
+     :record (decode-activation-record value)}))
+
+(defn- claim-repair-operation!
+  [repo graph-id start-basis]
+  (when-not (and (non-empty-string? graph-id) (valid-basis? start-basis graph-id))
+    (throw (ex-info "Invalid repair claim basis"
+                    {:type :selfhost6/invalid-repair-claim
+                     :repo repo})))
+  (let [client-ops-db (or (worker-state/get-client-ops-conn repo)
+                          (throw (ex-info "Missing client-ops connection"
+                                          {:type :selfhost6/missing-client-ops
+                                           :repo repo})))
+        claim-once
+        (fn []
+          (let [{:keys [raw record]} (read-activation-record! client-ops-db)]
+            (if-let [operation (:operation record)]
+              (if (= graph-id (:graph-id operation))
+                {:claimed? false :operation operation}
+                (throw (ex-info "Repair operation belongs to another graph"
+                                {:type :selfhost6/repair-operation-graph-mismatch
+                                 :repo repo})))
+              (let [operation {:operation-id (random-uuid)
+                               :graph-id graph-id
+                               :target-projection-epoch
+                               (inc (get-in record [:committed :projection-epoch]))
+                               :start-basis start-basis
+                               :target-basis nil
+                               :disposition :repairing
+                               :attempt-count 1
+                               :next-retry-at-ms nil
+                               :last-error nil}
+                    next-record (assoc record :operation operation)
+                    next-raw (ldb/write-transit-str next-record)]
+                (if (client-op/compare-and-set-sync-meta-value!
+                     client-ops-db activation-record-key raw next-raw)
+                  {:claimed? true :operation operation}
+                  nil)))))]
+    (or (claim-once)
+        ;; One bounded re-read resolves a concurrent elected-owner request.
+        (let [{:keys [record]} (read-activation-record! client-ops-db)]
+          (if-let [operation (:operation record)]
+            (if (= graph-id (:graph-id operation))
+              {:claimed? false :operation operation}
+              (throw (ex-info "Repair operation belongs to another graph"
+                              {:type :selfhost6/repair-operation-graph-mismatch
+                               :repo repo})))
+            (throw (ex-info "Activation record changed during repair claim"
+                            {:type :selfhost6/activation-record-cas-mismatch
+                             :repo repo})))))))
 
 (defn- resolve-db-path
   [repo pool path]
@@ -1021,6 +1087,10 @@
 (def-thread-api :thread-api/db-sync-rehydrate-large-titles
   [repo graph-id]
   (db-sync/rehydrate-large-titles-from-db! repo graph-id))
+
+(def-thread-api :thread-api/db-sync-claim-repair
+  [repo graph-id start-basis]
+  (claim-repair-operation! repo graph-id start-basis))
 
 (def-thread-api :thread-api/db-sync-import-prepare
   [repo reset? graph-id graph-e2ee? & [total-datoms]]
