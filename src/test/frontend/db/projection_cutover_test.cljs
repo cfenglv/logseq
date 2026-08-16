@@ -9,8 +9,13 @@
 (def ^:private repo "projection-cutover-test")
 
 (deftest future-commit-resets-once-and-throwing-plugin-does-not-block-test
-  (let [hook-calls (atom [])]
+  (let [hook-calls (atom [])
+        editing-before (state/get-state :editor/editing?)
+        block-before (state/get-state :editor/block)
+        block-uuid #uuid "11111111-1111-4111-8111-111111111111"]
     (db-subs/reset-graph! repo 2)
+    (state/set-state! :editor/block {:block/uuid block-uuid})
+    (state/set-state! :editor/editing? {[17 block-uuid] true})
     (with-redefs [state/get-current-repo (constantly repo)
                   plugin-handler/hook-plugin-app
                   (fn [& args]
@@ -20,9 +25,15 @@
                   {:repo repo :projection-epoch 4})))
       (is (= {:graph-id repo :projection-epoch 4}
              (db-subs/projection-context)))
+      (is (true? (get (state/get-state :editor/editing?)
+                      [:unknown-container block-uuid])))
       (is (nil? (projection-cutover/apply-committed!
                  {:repo repo :projection-epoch 3})))
-      (is (= 1 (count @hook-calls))))))
+      (is (= 2 (count (state/get-state :editor/editing?)))
+          "a stale notification does not add another editor owner")
+      (is (= 1 (count @hook-calls))))
+    (state/set-state! :editor/editing? editing-before)
+    (state/set-state! :editor/block block-before)))
 
 (deftest focus-probe-is-single-flight-and-advances-only-current-graph-test
   (async done
