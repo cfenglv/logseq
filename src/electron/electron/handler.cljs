@@ -583,23 +583,27 @@
       (string? command) command
       :else nil)))
 
-(defn set-ipc-handler! [window]
-  (let [main-channel "main"]
-    (.handle ipcMain main-channel
-             (fn [^js event args-js]
-               (let [message* (volatile! nil)]
-                 (->
-                  (p/let [message (decode-main-ipc-message args-js)
-                          _ (vreset! message* message)
-                          result (handle (or (utils/get-win-from-sender event) window) message)]
-                    (if (= (some-> message last keyword) :js-obj)
-                      (bean/->js result)
-                      (sqlite-util/write-transit-str result)))
-                  (p/catch (fn [e]
-                             (let [command (command-name @message*)]
-                               (when-not (contains? #{"mkdir" "stat"} command)
-                                 (logger/error "IPC error: " {:event event
-                                                              :args args-js}
-                                               e)
-                                 (throw e)))))))))
-    #(.removeHandler ipcMain main-channel)))
+(defn set-ipc-handler!
+  ([window]
+   (set-ipc-handler! window (p/resolved nil)))
+  ([window startup-ready]
+   (let [main-channel "main"]
+     (.handle ipcMain main-channel
+              (fn [^js event args-js]
+                (let [message* (volatile! nil)]
+                  (->
+                   (p/let [_ startup-ready
+                           message (decode-main-ipc-message args-js)
+                           _ (vreset! message* message)
+                           result (handle (or (utils/get-win-from-sender event) window) message)]
+                     (if (= (some-> message last keyword) :js-obj)
+                       (bean/->js result)
+                       (sqlite-util/write-transit-str result)))
+                   (p/catch (fn [e]
+                              (let [command (command-name @message*)]
+                                (when-not (contains? #{"mkdir" "stat"} command)
+                                  (logger/error "IPC error: " {:event event
+                                                               :args args-js}
+                                                e)
+                                  (throw e)))))))))
+     #(.removeHandler ipcMain main-channel))))
