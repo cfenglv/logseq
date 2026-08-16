@@ -1,6 +1,7 @@
 (ns frontend.handler.e2ee
   "rtc E2EE related fns"
-  (:require [electron.ipc :as ipc]
+  (:require [goog.object :as gobj]
+            [electron.ipc :as ipc]
             [frontend.mobile.secure-storage :as secure-storage]
             [frontend.util :as util]
             [promesa.core :as p]))
@@ -8,6 +9,13 @@
 (def ^:private save-op :keychain/save-e2ee-password)
 (def ^:private get-op :keychain/get-e2ee-password)
 (def ^:private delete-op :keychain/delete-e2ee-password)
+
+(defn- qualification-home?
+  []
+  (boolean
+   (seq (some-> (gobj/get js/globalThis "process")
+                (gobj/get "env")
+                (gobj/get "LOGSEQ_TEST_HOME_DIR")))))
 
 (defn- <keychain-save!
   [key encrypted-text]
@@ -47,7 +55,9 @@
 
 (defn native-storage-supported?
   []
-  (or (util/electron?) (util/capacitor?)))
+  (or (and (util/electron?)
+           (not (qualification-home?)))
+      (util/capacitor?)))
 
 (defn <native-save-secret!
   [key encrypted-text]
