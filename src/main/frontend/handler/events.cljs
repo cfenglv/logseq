@@ -339,6 +339,9 @@
 (defevent! :editor/save-current-block [_]
   (editor-handler/save-current-block!))
 
+(defevent! :editor/recover-deleted-dirty-draft [[_ editing-block draft]]
+  (editor-handler/recover-deleted-dirty-draft! editing-block draft))
+
 (defevent! :editor/add-comment [_]
   (comments-handler/add-comment-to-current-context!))
 
