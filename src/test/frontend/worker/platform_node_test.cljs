@@ -232,7 +232,7 @@
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
 
-(deftest node-prepared-artifact-inspection-streams-canonical-and-checks-wal-test
+(deftest node-prepared-artifact-inspection-streams-canonical-allows-shm-and-checks-wal-test
   (async done
          (let [root-dir (node-helper/create-tmp-dir "platform-node-prepared-inspection")
                paths {:canonical-path "/db.sqlite"
@@ -251,6 +251,9 @@
                        pool ((:install-opfs-pool storage) nil "prepared-graph")
                        _ ((:import-db storage) pool "/db.sqlite" payload)
                        result ((:inspect-db-artifact-set storage) pool paths)
+                       _ ((:import-db storage) pool "/db.sqlite-shm"
+                          (js/Uint8Array. #js [8]))
+                       result-with-shm ((:inspect-db-artifact-set storage) pool paths)
                        _ ((:import-db storage) pool "/db.sqlite-wal"
                           (js/Uint8Array. #js [9]))
                        wal-error (capture-error
@@ -260,6 +263,7 @@
                          :canonical-byte-size 3
                          :bounded-memory? true}
                         result))
+                 (is (= result result-with-shm))
                  (is (= :selfhost6/uncheckpointed-prepared-canonical
                         (:type (ex-data wal-error)))))
                (p/catch (fn [error]
@@ -280,10 +284,14 @@
                       :target-shm-path "/repair-target.sqlite-shm"}]
            (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir})
                        storage (:storage platform)
-                       canonical-pool ((:install-opfs-pool storage) nil "swap-canonical")
-                       target-pool ((:install-opfs-pool storage) nil "swap-target")
+                       ^js canonical-pool ((:install-opfs-pool storage) nil "swap-canonical")
+                       ^js target-pool ((:install-opfs-pool storage) nil "swap-target")
                        _ ((:import-db storage) canonical-pool "/db.sqlite" source)
+                       _ ((:import-db storage) canonical-pool "/db.sqlite-shm"
+                          (js/Uint8Array. #js [8]))
                        _ ((:import-db storage) target-pool "/repair-target.sqlite" target)
+                       _ ((:import-db storage) target-pool "/repair-target.sqlite-shm"
+                          (js/Uint8Array. #js [9]))
                        prepared ((:prepare-db-artifact-swap! storage)
                                  canonical-pool target-pool paths)
                        previous ((:export-file storage)
@@ -298,6 +306,8 @@
                         (:target-sha256 prepared)))
                  (is (string/includes? (:target-artifact-identity prepared)
                                        "swap-target/repair-target.sqlite"))
+                 (is (not (fs/existsSync
+                           (node-path/join (.-repoDir canonical-pool) "db.sqlite-shm"))))
                  (is (= (vec source) (vec previous)))
                  (is (= (vec source) (vec before)))
                  (is (= {:canonical-path "/db.sqlite" :rename-count 1}

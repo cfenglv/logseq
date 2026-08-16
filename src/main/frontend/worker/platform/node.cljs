@@ -518,20 +518,17 @@
                    (throw error))))))
 
 (defn- <inspect-db-artifact-set
-  [pool {:keys [canonical-path wal-path shm-path]}]
+  [pool {:keys [canonical-path wal-path]}]
   (let [canonical-full-path (pool-path pool canonical-path)
-        wal-full-path (pool-path pool wal-path)
-        shm-full-path (pool-path pool shm-path)]
+        wal-full-path (pool-path pool wal-path)]
     (p/let [canonical-stat (<stat-optional canonical-full-path)
             wal-stat (<stat-optional wal-full-path)
-            shm-stat (<stat-optional shm-full-path)
             canonical-byte-size (some-> canonical-stat .-size)]
       (when (or (nil? canonical-byte-size)
                 (zero? canonical-byte-size))
         (throw (ex-info "Canonical graph is missing during prepared swap"
                         {:type :selfhost6/missing-prepared-canonical})))
-      (when (or (and wal-stat (pos? (.-size wal-stat)))
-                (and shm-stat (pos? (.-size shm-stat))))
+      (when (and wal-stat (pos? (.-size wal-stat)))
         (throw (ex-info "Canonical graph WAL is not checkpointed during prepared swap"
                         {:type :selfhost6/uncheckpointed-prepared-canonical})))
       (p/let [canonical-sha256 (<sha256-file canonical-full-path)]
@@ -557,6 +554,11 @@
             _ (<fsync-file! previous-full-path)
             _ (<fsync-dir! (node-path/dirname previous-full-path))
             _ (<fsync-file! target-full-path)
+            ;; A WAL-index is derived state and may remain after a successful
+            ;; TRUNCATE checkpoint. Remove the closed canonical handle's stale
+            ;; index before the one-file authority rename.
+            _ (<unlink-optional!
+               (pool-path canonical-pool (:canonical-shm-path paths)))
             source-result (<inspect-db-artifact-set
                            canonical-pool
                            {:canonical-path canonical-path
