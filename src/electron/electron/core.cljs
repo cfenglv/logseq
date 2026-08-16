@@ -414,21 +414,21 @@
 
            (vreset! *setup-fn
                     (fn []
-                      (p/let [_ proxy-ready]
-                        (let [t1 (setup-updater! win)
-                              t2 (setup-app-manager! win)
-                              t3 (handler/set-ipc-handler! win)
-                              t4 (server/setup! win)
-                              t5 (when (cfgs/semantic-search-enabled?)
-                                   (embedding-server/setup! app'))
-                              tt (exceptions/setup-exception-listeners!)]
+                      (let [t3 (handler/set-ipc-handler! win proxy-ready)]
+                        (p/let [_ proxy-ready]
+                          (let [t1 (setup-updater! win)
+                                t2 (setup-app-manager! win)
+                                t4 (server/setup! win)
+                                t5 (when (cfgs/semantic-search-enabled?)
+                                     (embedding-server/setup! app'))
+                                tt (exceptions/setup-exception-listeners!)]
 
-                          (vreset! *teardown-fn
-                                   #(-> (handler/stop-all-db-workers!)
-                                        (p/finally
-                                          (fn []
-                                            (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
-                                              (and f (f)))))))))))
+                            (vreset! *teardown-fn
+                                     #(-> (handler/stop-all-db-workers!)
+                                          (p/finally
+                                            (fn []
+                                              (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
+                                                (and f (f))))))))))))
 
            ;; setup effects
            (@*setup-fn)
