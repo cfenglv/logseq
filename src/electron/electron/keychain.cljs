@@ -1,11 +1,18 @@
 (ns electron.keychain
   "Helper functions for storing E2EE secrets inside the OS keychain."
   (:require ["electron" :refer [app]]
-            ["keytar" :as keytar]
             [clojure.string :as string]
             [electron.logger :as logger]
             [goog.object :as gobj]
             [promesa.core :as p]))
+
+(defn- qualification-home?
+  []
+  (boolean (seq (gobj/get (.-env js/process) "LOGSEQ_TEST_HOME_DIR"))))
+
+(def ^:private keytar
+  (when-not (qualification-home?)
+    (js/require "keytar")))
 
 (defonce ^:private service-name
   (delay
@@ -18,10 +25,6 @@
 (defn- keychain-service
   []
   (str (force service-name) " E2EE"))
-
-(defn- qualification-home?
-  []
-  (boolean (seq (gobj/get (.-env js/process) "LOGSEQ_TEST_HOME_DIR"))))
 
 (defn supported?
   []
