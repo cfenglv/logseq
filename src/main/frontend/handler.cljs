@@ -152,7 +152,6 @@
       (projection-cutover/install-probes!)
 
       (register-components-fns!)
-      (user-handler/restore-tokens-from-localstorage)
       (user.login/setup-configure!)
       (when (util/electron?)
         (el/listen!))
@@ -161,6 +160,9 @@
       (instrument/init)
 
       (events/run!)
+      ;; Cached tokens publish the login continuation synchronously, so the
+      ;; event consumer must exist before restoring them.
+      (user-handler/restore-tokens-from-localstorage)
 
       (log/info ::start-web-worker {})
 

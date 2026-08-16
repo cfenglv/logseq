@@ -131,6 +131,26 @@
           (restore!)
           (done))))))
 
+(deftest restore-fresh-tokens-publishes-login-continuation-synchronously-test
+  (let [old-state (state/get-state)
+        events* (atom [])
+        future-exp (+ (quot (.now js/Date) 1000) 7200)]
+    (state/replace-state! (assoc old-state
+                                :auth/id-token nil
+                                :auth/access-token nil
+                                :auth/refresh-token nil))
+    (try
+      (with-mocked-local-storage
+        {"id-token" (jwt {:exp future-exp})
+         "access-token" "access-token-from-local-storage"
+         "refresh-token" "refresh-token-from-local-storage"}
+        (fn []
+          (with-redefs [state/pub-event! #(swap! events* conj %)]
+            (user-handler/restore-tokens-from-localstorage)
+            (is (= [[:user/fetch-info-and-graphs]] @events*)))))
+      (finally
+        (state/replace-state! old-state)))))
+
 (deftest logout-clears-e2ee-password-when-db-worker-ready-test
   (testing "logout should request db-worker to clear persisted e2ee password"
     (let [ops* (atom [])
