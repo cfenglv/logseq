@@ -182,3 +182,99 @@
     (is (= [[:db/projection-committed
              {:repo repo :projection-epoch 3}]]
            @published-events))))
+
+(deftest external-title-update-freezes-one-dirty-draft-semantic-op-test
+  (let [repo "dirty-draft-update-test"
+        block-uuid (random-uuid)
+        events (atom [])
+        set-content (atom [])
+        delta {:graph-id repo
+               :projection-epoch 0
+               :rev 13
+               :blocks {block-uuid {:block/uuid block-uuid
+                                    :block/title "remote title"}}
+               :deleted {}
+               :children {}
+               :affected-keys #{[:entity block-uuid]}}]
+    (with-redefs [db-subs/future-projection? (constantly false)
+                  db-subs/current-projection? (constantly true)
+                  db-subs/apply-delta! (constantly true)
+                  state/get-current-repo (constantly repo)
+                  state/get-current-page (constantly nil)
+                  state/get-edit-block (constantly {:block/uuid block-uuid
+                                                    :block/title "base title"})
+                  state/get-edit-content (constantly "local dirty draft")
+                  state/editing? (constantly true)
+                  state/set-edit-content! #(swap! set-content conj %)
+                  state/pub-event! #(swap! events conj %)]
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "other-window"}
+                              :delta delta}))
+    (is (= [[:editor/save-current-block]]
+           (filterv #(= :editor/save-current-block (first %)) @events)))
+    (is (empty? @set-content)
+        "The incoming title must not replace the active dirty text.")))
+
+(deftest duplicate-title-delta-neither-overwrites-nor-resaves-dirty-draft-test
+  (let [repo "dirty-draft-duplicate-test"
+        block-uuid (random-uuid)
+        events (atom [])
+        set-content (atom [])
+        delta {:graph-id repo
+               :projection-epoch 0
+               :rev 13
+               :blocks {block-uuid {:block/uuid block-uuid
+                                    :block/title "remote title"}}
+               :deleted {}
+               :children {}
+               :affected-keys #{[:entity block-uuid]}}]
+    (with-redefs [db-subs/future-projection? (constantly false)
+                  db-subs/current-projection? (constantly true)
+                  db-subs/apply-delta! (constantly nil)
+                  state/get-current-repo (constantly repo)
+                  state/get-current-page (constantly nil)
+                  state/get-edit-block (constantly {:block/uuid block-uuid
+                                                    :block/title "base title"})
+                  state/get-edit-content (constantly "local dirty draft")
+                  state/editing? (constantly true)
+                  state/set-edit-content! #(swap! set-content conj %)
+                  state/pub-event! #(swap! events conj %)]
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "other-window"}
+                              :delta delta}))
+    (is (empty? (filter #(= :editor/save-current-block (first %)) @events))
+        "A replayed delta cannot create a second recovery operation.")
+    (is (empty? @set-content)
+        "A replayed delta still cannot overwrite the dirty text.")))
+
+(deftest external-delete-recovers-dirty-draft-with-one-insert-event-test
+  (let [repo "dirty-draft-delete-test"
+        block-uuid (random-uuid)
+        editing-block {:block/uuid block-uuid
+                       :block/title "base title"
+                       :block/page {:db/id 42}}
+        events (atom [])
+        delta {:graph-id repo
+               :projection-epoch 0
+               :rev 14
+               :blocks {}
+               :deleted {block-uuid {:db/id 99 :rev 14}}
+               :children {}
+               :affected-keys #{[:entity block-uuid]}}]
+    (with-redefs [db-subs/future-projection? (constantly false)
+                  db-subs/current-projection? (constantly true)
+                  db-subs/apply-delta! (constantly true)
+                  state/get-current-repo (constantly repo)
+                  state/get-current-page (constantly nil)
+                  state/get-edit-block (constantly editing-block)
+                  state/get-edit-content (constantly "local dirty draft")
+                  state/editing? (constantly true)
+                  state/sidebar-remove-deleted-block! (constantly nil)
+                  state/pub-event! #(swap! events conj %)]
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "other-window"}
+                              :delta delta}))
+    (is (= [[:editor/recover-deleted-dirty-draft
+             editing-block
+             "local dirty draft"]]
+           @events))))

@@ -16,6 +16,38 @@
                     (string/trim title))
           (state/set-edit-content! title))))))
 
+(defn- recover-dirty-edit-if-needed!
+  [blocks deleted delta-applied?]
+  (when (state/editing?)
+    (when-let [{editing-block-uuid :block/uuid
+                canonical-title :block/title
+                :as editing-block} (state/get-edit-block)]
+      (let [draft (state/get-edit-content)
+            dirty? (and (string? draft)
+                        (not= draft canonical-title))]
+        (when dirty?
+          (cond
+            (contains? deleted editing-block-uuid)
+            (do
+              (when delta-applied?
+                (state/pub-event!
+                 [:editor/recover-deleted-dirty-draft editing-block draft]))
+              true)
+
+            (when-let [incoming-title
+                       (:block/title (get blocks editing-block-uuid))]
+              (not= incoming-title canonical-title))
+            (do
+              ;; The remote/current canonical title is already materialized.
+              ;; Saving the active draft once makes it an ordinary semantic op,
+              ;; whose inverse keeps that canonical title available to undo.
+              (when delta-applied?
+                (state/pub-event! [:editor/save-current-block]))
+              true)
+
+            :else
+            false))))))
+
 (defn- current-page-deleted?
   [current-page deleted]
   (and current-page
@@ -50,9 +82,9 @@
      [:db/projection-committed
       {:repo repo :projection-epoch (:projection-epoch delta)}])
     (let [current-projection? (or (nil? delta)
-                                  (db-subs/current-projection? delta))]
-      (when delta
-        (db-subs/apply-delta! delta))
+                                  (db-subs/current-projection? delta))
+          delta-applied? (when delta
+                           (db-subs/apply-delta! delta))]
       (when current-projection?
       (let [{:keys [initial-pages? end?]} tx-meta
             current-page (state/get-current-page)
@@ -84,9 +116,17 @@
               (when (current-page-recycled? current-page blocks)
                 (route-handler/redirect! {:to :home :push false}))
 
-              (when (or (not= (:client-id tx-meta) (:client-id (state/get-state)))
-                        (= :apply-template (:outliner-op tx-meta)))
-                (update-editing-block-title-if-changed! blocks))
+              (let [external-edit? (not= (:client-id tx-meta)
+                                         (:client-id (state/get-state)))
+                    refresh-edit? (or external-edit?
+                                      (= :apply-template (:outliner-op tx-meta)))
+                    recovered-dirty-edit?
+                    (and external-edit?
+                         (recover-dirty-edit-if-needed!
+                          blocks deleted delta-applied?))]
+                (when (and refresh-edit?
+                           (not recovered-dirty-edit?))
+                  (update-editing-block-title-if-changed! blocks)))
 
               (state/set-state! :editor/start-pos nil)
 
