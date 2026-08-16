@@ -3,6 +3,7 @@
   (:require [electron.ipc :as ipc]
             [frontend.mobile.secure-storage :as secure-storage]
             [frontend.util :as util]
+            [goog.object :as gobj]
             [promesa.core :as p]))
 
 (def ^:private save-op :keychain/save-e2ee-password)
@@ -11,7 +12,7 @@
 
 (defn- qualification-home?
   []
-  (true? (some-> js/window .-apis .-qualificationHome)))
+  (true? (some-> js/window .-apis (gobj/get "qualificationHome"))))
 
 (defn- <keychain-save!
   [key encrypted-text]
