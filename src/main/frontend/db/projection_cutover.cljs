@@ -23,10 +23,6 @@
   (when (and (= repo (state/get-current-repo))
              (db-subs/future-projection? {:graph-id repo
                                           :projection-epoch projection-epoch}))
-    ;; A projection reset rebuilds renderer container ids. Reuse the existing
-    ;; unknown-container editor fallback so the official editor component can
-    ;; remount and restore its own focus/cursor without a second draft owner.
-    (state/mark-current-editor-container-unknown!)
     (db-subs/advance-projection! repo projection-epoch)
     ;; hook-plugin-app is the existing graph lifecycle owner and normally
     ;; catches plugin exceptions itself. Keep the cutover boundary safe when a

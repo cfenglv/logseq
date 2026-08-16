@@ -472,6 +472,50 @@
   (is (= {:graph-id test-graph-id :projection-epoch 4}
          (subs/projection-context))))
 
+(deftest projection-commit-keeps-mounted-snapshot-until-new-epoch-load-test
+  (async done
+         (let [block-uuid (random-uuid)
+               first-request (p/deferred)
+               replacement-request (p/deferred)
+               calls (atom 0)
+               unsubscribe (atom nil)]
+           (finish-async!
+            done
+            (p/with-redefs [subs/<load-block
+                            (fn [_graph-id _block-uuid]
+                              (if (= 1 (swap! calls inc))
+                                first-request
+                                replacement-request))]
+              (-> (p/let [_ (subs/reset-graph! test-graph-id 2)
+                          _ (reset! unsubscribe
+                                    (subs/subscribe-block! block-uuid (fn [])))
+                          _ (p/resolve! first-request
+                                        (assoc (block-patch
+                                                10 {block-uuid
+                                                    (block block-uuid 10 "before")})
+                                               :projection-epoch 2))
+                          _ (p/delay 0)
+                          before (subs/block-snapshot block-uuid)
+                          _ (is (= "before" (get-in before [:value :block/title])))
+                          _ (is (true? (subs/advance-projection! test-graph-id 3)))
+                          _ (is (identical? before (subs/block-snapshot block-uuid))
+                                "Same-graph cutover must not publish :loading and unmount editors.")
+                          _ (p/delay 0)
+                          _ (is (= 2 @calls))
+                          _ (p/resolve! replacement-request
+                                        (assoc (block-patch
+                                                11 {block-uuid
+                                                    (block block-uuid 11 "after")})
+                                               :projection-epoch 3))
+                          _ (p/delay 0)]
+                    (is (= {:status :ready
+                            :value (block block-uuid 11 "after")}
+                           (subs/block-snapshot block-uuid))))
+                  (p/finally
+                   (fn []
+                     (when-let [unsubscribe! @unsubscribe]
+                       (unsubscribe!))))))))))
+
 (deftest projection-epoch-rejects-an-old-load-response-test
   (async done
          (let [block-uuid (random-uuid)
