@@ -351,23 +351,30 @@
           (derive-history-outliner-ops db-before db-after tx-data tx-meta)
           history-at (perf-time-ms)
           inferred-outliner-ops?' (inferred-outliner-ops? tx-meta)
+          ;; A frozen wire entry may already have reached the server. Rebase the
+          ;; canonical DB, but keep its exact journal source until ACK/reject.
+          preserve-frozen-source? (and (:db-sync/rebased-local? tx-meta)
+                                       (some? (client-op/get-client-tx-upload-state
+                                               repo tx-id)))
           {:keys [should-inc-pending?]}
-          (client-op/upsert-local-tx-entry!
-           repo
-           {:tx-id tx-id
-            :created-at now
-            :pending? true
-            :failed? false
-            :outliner-op outliner-op
-            :undo-redo (cond
-                         (:undo? tx-meta) :undo
-                         (:redo? tx-meta) :redo
-                         :else :none)
-            :forward-outliner-ops forward-outliner-ops
-            :inverse-outliner-ops inverse-outliner-ops
-            :inferred-outliner-ops? inferred-outliner-ops?'
-            :normalized-tx-data normalized-tx-data
-            :reversed-tx-data reversed-datoms})
+          (if preserve-frozen-source?
+            {:should-inc-pending? false}
+            (client-op/upsert-local-tx-entry!
+             repo
+             {:tx-id tx-id
+              :created-at now
+              :pending? true
+              :failed? false
+              :outliner-op outliner-op
+              :undo-redo (cond
+                           (:undo? tx-meta) :undo
+                           (:redo? tx-meta) :redo
+                           :else :none)
+              :forward-outliner-ops forward-outliner-ops
+              :inverse-outliner-ops inverse-outliner-ops
+              :inferred-outliner-ops? inferred-outliner-ops?'
+              :normalized-tx-data normalized-tx-data
+              :reversed-tx-data reversed-datoms}))
           upsert-at (perf-time-ms)]
       ;; (prn :debug :forward-outliner-ops)
       ;; (cljs.pprint/pprint forward-outliner-ops)

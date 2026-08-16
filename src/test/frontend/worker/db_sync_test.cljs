@@ -6342,6 +6342,43 @@
               (is (= tx-ids-before tx-ids-after))
               (is (= :rebase (:outliner-op (first pending-after)))))))))))
 
+(deftest remote-rebase-preserves-frozen-upload-source-test
+  (testing "remote rebase must not rewrite a journal source whose exact wire bytes may need lost-ACK retry"
+    (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (d/transact! conn
+                       [[:db/add (:db/id child1) :block/title "child local"]]
+                       {:outliner-op :save-block})
+          (let [local-tx (first (#'sync-apply/pending-txs test-repo))
+                tx-id (:tx-id local-tx)
+                wire-entry {:tx "frozen-before-rebase"
+                            :tx-id (str tx-id)}
+                frozen-state {:format-version 1
+                              :kind :single-wire-v1
+                              :source-digest (sync-protocol/tx-payload-digest
+                                              (:outliner-op local-tx)
+                                              (vec (:tx local-tx)))
+                              :outliner-op (:outliner-op local-tx)
+                              :wire-entry wire-entry}]
+            (client-op/put-client-tx-upload-state! test-repo tx-id frozen-state)
+            (#'sync-apply/apply-remote-txs!
+             test-repo
+             nil
+             [{:tx-data [[:db/add (:db/id parent) :block/title "remote rebase"]]
+               :outliner-op :save-block}])
+            (let [pending-after (#'sync-apply/pending-txs test-repo)
+                  prepared (sync-apply/prepare-upload-tx-entries
+                            test-repo conn pending-after)]
+              (is (= [tx-id] (mapv :tx-id pending-after)))
+              (is (= (:outliner-op local-tx)
+                     (:outliner-op (first pending-after))))
+              (is (= (:tx local-tx) (:tx (first pending-after))))
+              (is (= frozen-state
+                     (client-op/get-client-tx-upload-state test-repo tx-id)))
+              (is (= wire-entry
+                     (:wire-cache (first (:tx-entries prepared))))))))))))
+
 (deftest rebase-keeps-original-created-at-for-pending-tx-test
   (testing "rebasing a pending tx should keep its original created-at ordering key"
     (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)]
