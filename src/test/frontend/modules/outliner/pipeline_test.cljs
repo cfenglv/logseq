@@ -215,6 +215,56 @@
     (is (empty? @set-content)
         "The incoming title must not replace the active dirty text.")))
 
+(deftest distinct-external-title-deltas-do-not-resave-the-same-dirty-draft-test
+  (let [repo "dirty-draft-feedback-test"
+        block-uuid (random-uuid)
+        input (atom #js {})
+        draft (atom "local dirty draft")
+        events (atom [])
+        delta (fn [rev title]
+                {:graph-id repo
+                 :projection-epoch 0
+                 :rev rev
+                 :blocks {block-uuid {:block/uuid block-uuid
+                                      :block/title title}}
+                 :deleted {}
+                 :children {}
+                 :affected-keys #{[:entity block-uuid]}})]
+    (reset! @#'pipeline/*recovered-dirty-draft nil)
+    (with-redefs [db-subs/future-projection? (constantly false)
+                  db-subs/current-projection? (constantly true)
+                  db-subs/apply-delta! (constantly true)
+                  state/get-current-repo (constantly repo)
+                  state/get-current-page (constantly nil)
+                  state/get-edit-block (constantly {:block/uuid block-uuid
+                                                    :block/title "base title"})
+                  state/get-edit-content #(deref draft)
+                  state/get-input #(deref input)
+                  state/editing? (constantly true)
+                  state/set-edit-content! (constantly nil)
+                  state/pub-event! #(swap! events conj %)]
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "peer-a"}
+                              :delta (delta 13 "remote title a")})
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "peer-b"}
+                              :delta (delta 14 "remote title b")})
+      (is (= [[:editor/save-current-block]]
+             (filterv #(= :editor/save-current-block (first %)) @events))
+          "The same editor input and draft may recover only once across distinct external deltas.")
+      (reset! input #js {})
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "peer-c"}
+                              :delta (delta 15 "remote title c")})
+      (is (= 2 (count (filter #(= :editor/save-current-block (first %)) @events)))
+          "A new editor input may recover the same text again.")
+      (reset! draft "new user input")
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "peer-d"}
+                              :delta (delta 16 "remote title d")})
+      (is (= 3 (count (filter #(= :editor/save-current-block (first %)) @events)))
+          "New user input permits one new recovery operation."))))
+
 (deftest duplicate-title-delta-neither-overwrites-nor-resaves-dirty-draft-test
   (let [repo "dirty-draft-duplicate-test"
         block-uuid (random-uuid)
