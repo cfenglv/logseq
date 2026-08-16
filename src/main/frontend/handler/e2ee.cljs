@@ -1,7 +1,6 @@
 (ns frontend.handler.e2ee
   "rtc E2EE related fns"
-  (:require [goog.object :as gobj]
-            [electron.ipc :as ipc]
+  (:require [electron.ipc :as ipc]
             [frontend.mobile.secure-storage :as secure-storage]
             [frontend.util :as util]
             [promesa.core :as p]))
@@ -12,10 +11,7 @@
 
 (defn- qualification-home?
   []
-  (boolean
-   (seq (some-> (gobj/get js/globalThis "process")
-                (gobj/get "env")
-                (gobj/get "LOGSEQ_TEST_HOME_DIR")))))
+  (true? (some-> js/window .-apis .-qualificationHome)))
 
 (defn- <keychain-save!
   [key encrypted-text]
