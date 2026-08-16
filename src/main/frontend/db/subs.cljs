@@ -148,6 +148,7 @@
 (defn- loaded-slot
   [slot-key current next-slot]
   (let [selected (cond
+                   (:stale? current) next-slot
                    (> (slot-revision current) (slot-revision next-slot)) current
                    (and (= :block (first slot-key))
                         (:tx-id current)
@@ -334,8 +335,34 @@
   (require-revision! :projection-epoch projection-epoch)
   (if (future-projection? {:graph-id graph-id
                            :projection-epoch projection-epoch})
-    (do
-      (reset-graph! graph-id projection-epoch)
+    (let [previous @*store
+          generation (inc (:generation previous))
+          mounted-slot-keys (vec (keys @*listeners))
+          retained-slots
+          (into {}
+                (keep (fn [slot-key]
+                        (when-let [slot (store-slot previous slot-key)]
+                          [slot-key (assoc slot :stale? true)])))
+                mounted-slot-keys)
+          resource-slot-keys
+          (into #{} (filter #(= :resource (first %))) mounted-slot-keys)
+          error (ex-info "Projection changed during renderer load"
+                         {:graph-id graph-id
+                          :projection-epoch projection-epoch})]
+      (clear-query-reloads!)
+      (reset! *store
+              (assoc (empty-store graph-id generation projection-epoch)
+                     :slots retained-slots
+                     :resource-slot-keys resource-slot-keys))
+      (reset! *in-flight {})
+      (loader/reject-pending! error)
+      ;; Same-graph cutovers keep mounted snapshots visible until the new
+      ;; projection replaces them. Graph switches still use reset-graph!.
+      (schedule-load-batch!
+       (fn []
+         (doseq [slot-key mounted-slot-keys
+                 :when (mounted? slot-key)]
+           (start-load! slot-key))))
       true)
     false))
 
@@ -400,8 +427,10 @@
 (defn- put-delta-slot
   [store slot-key next-slot]
   (let [current (store-slot store slot-key)]
-    (if (or (> (slot-revision current) (:rev store))
+    (if (or (and (not (:stale? current))
+                 (> (slot-revision current) (:rev store)))
             (and (= :block (first slot-key))
+                 (not (:stale? current))
                  (:tx-id current)
                  (= (:tx-id current) (:tx-id next-slot))))
       [store false]
