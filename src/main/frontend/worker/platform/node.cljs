@@ -777,8 +777,10 @@
 
 (defn- use-keychain-for-owner?
   [owner-source]
-  (not (and (= :cli owner-source)
-            (truthy-env? (gobj/get (.-env js/process) "CLI_E2E_TEST")))))
+  (let [env (.-env js/process)]
+    (not (or (seq (gobj/get env "LOGSEQ_TEST_HOME_DIR"))
+             (and (= :cli owner-source)
+                  (truthy-env? (gobj/get env "CLI_E2E_TEST")))))))
 
 (defn- <save-secret-text-by-owner!
   [kv owner-source key text]
