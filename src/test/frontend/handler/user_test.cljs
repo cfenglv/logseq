@@ -1,5 +1,6 @@
 (ns frontend.handler.user-test
-  (:require [cljs.core.async :as a]
+  (:require [cljs-http.client :as http]
+            [cljs.core.async :as a]
             [cljs.test :refer [async deftest is testing]]
             [electron.ipc :as ipc]
             [frontend.handler.user :as user-handler]
@@ -41,6 +42,46 @@
   (str "header."
        (js/btoa (js/JSON.stringify (clj->js (merge {:cognito:username ""} payload))))
        ".sig"))
+
+(deftest file-sync-request-uses-existing-electron-http-owner-test
+  (async done
+         (let [called* (atom nil)
+               result-ch (with-redefs [util/electron? (constantly true)
+                                       ipc/ipc (fn [& args]
+                                                 (reset! called* args)
+                                                 (p/resolved {:status 200 :ok true :body "{}"}))]
+                           (#'user-handler/<request-once "user_info" {} "qualification-token"))
+               [method request-id options] @called*]
+           (is (= :httpRequest method))
+           (is (some? (and (string? request-id)
+                           (re-matches #"[0-9a-f-]{36}" request-id))))
+           (is (= {:url "https://api.logseq.com/file-sync/user_info"
+                   :method "POST"
+                   :headers {"authorization" "Bearer qualification-token"
+                             "content-type" "application/json"}
+                   :body "{}"
+                   :returnType "text"
+                   :includeResponse true}
+                  options))
+           (a/take! result-ch
+                    (fn [result]
+                      (is (= {:status 200 :ok true :body "{}"}
+                             (:resp result)))
+                      (done))))))
+
+(deftest file-sync-request-keeps-browser-http-path-test
+  (let [called* (atom nil)]
+    (with-redefs [util/electron? (constantly false)
+                  http/post
+                  (fn [& args]
+                    (reset! called* args)
+                    (a/go {:status 200 :body "{}"}))]
+      (#'user-handler/<request-once "user_info" {} "qualification-token"))
+    (is (= ["https://api.logseq.com/file-sync/user_info"
+            {:oauth-token "qualification-token"
+             :body "{}"
+             :with-credentials? false}]
+           @called*))))
 
 (deftest set-tokens-persists-auth-json-with-latest-token-values-test
   (let [writes* (atom [])
