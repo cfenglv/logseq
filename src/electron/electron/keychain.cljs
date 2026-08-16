@@ -4,6 +4,7 @@
             ["keytar" :as keytar]
             [clojure.string :as string]
             [electron.logger :as logger]
+            [goog.object :as gobj]
             [promesa.core :as p]))
 
 (defonce ^:private service-name
@@ -18,9 +19,14 @@
   []
   (str (force service-name) " E2EE"))
 
+(defn- qualification-home?
+  []
+  (boolean (seq (gobj/get (.-env js/process) "LOGSEQ_TEST_HOME_DIR"))))
+
 (defn supported?
   []
-  (boolean keytar))
+  (and (boolean keytar)
+       (not (qualification-home?))))
 
 (defn <set-password!
   "Persist `encrypted-text` for the `refresh-token` entry."
