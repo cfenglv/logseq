@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,8 +17,21 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.join(updaterDirectory, "..", "package.json"), "utf8"),
 );
 
-const sourceFullSha = process.env.SELFHOST6_SOURCE_FULL_SHA;
-const targetVersion = process.env.SELFHOST6_TARGET_VERSION;
+function inferCleanCheckoutSha() {
+  const repositoryRoot = path.resolve(updaterDirectory, "../..");
+  const status = execFileSync("git", ["status", "--porcelain"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  });
+  assert.equal(status, "", "checkout must be clean when inferring SELFHOST6_SOURCE_FULL_SHA");
+  return execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  }).trim();
+}
+
+const sourceFullSha = process.env.SELFHOST6_SOURCE_FULL_SHA ?? inferCleanCheckoutSha();
+const targetVersion = process.env.SELFHOST6_TARGET_VERSION ?? packageJson.version;
 const platform = process.env.SELFHOST6_TARGET_PLATFORM ?? process.platform;
 const arch = process.env.SELFHOST6_TARGET_ARCH ?? process.arch;
 
