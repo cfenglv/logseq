@@ -398,9 +398,10 @@
 
          (let [t0 (setup-interceptor! app')
                ^js win (win/create-main-window!)
-               _ (reset! *win win)]
-
-           (utils/<restore-proxy-settings)
+               _ (reset! *win win)
+               proxy-ready (-> (utils/<restore-proxy-settings)
+                               (p/catch (fn [error]
+                                          (logger/warn :electron/proxy-restore-failed error))))]
 
            (js-utils/disableXFrameOptions win)
 
@@ -413,20 +414,21 @@
 
            (vreset! *setup-fn
                     (fn []
-                      (let [t1 (setup-updater! win)
-                            t2 (setup-app-manager! win)
-                            t3 (handler/set-ipc-handler! win)
-                            t4 (server/setup! win)
-                            t5 (when (cfgs/semantic-search-enabled?)
-                                 (embedding-server/setup! app'))
-                            tt (exceptions/setup-exception-listeners!)]
+                      (p/let [_ proxy-ready]
+                        (let [t1 (setup-updater! win)
+                              t2 (setup-app-manager! win)
+                              t3 (handler/set-ipc-handler! win)
+                              t4 (server/setup! win)
+                              t5 (when (cfgs/semantic-search-enabled?)
+                                   (embedding-server/setup! app'))
+                              tt (exceptions/setup-exception-listeners!)]
 
-                        (vreset! *teardown-fn
-                                 #(-> (handler/stop-all-db-workers!)
-                                      (p/finally
-                                        (fn []
-                                          (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
-                                            (and f (f))))))))))
+                          (vreset! *teardown-fn
+                                   #(-> (handler/stop-all-db-workers!)
+                                        (p/finally
+                                          (fn []
+                                            (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
+                                              (and f (f)))))))))))
 
            ;; setup effects
            (@*setup-fn)
