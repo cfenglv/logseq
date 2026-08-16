@@ -112,6 +112,7 @@
     "selfhost6:test-updater-preflight": "node --test ./scripts/selfhost6/target-build-manifest-preflight.test.mjs",
     "selfhost6:test-update-feed": "node --test ./scripts/selfhost6/update-feed.test.mjs",
     "selfhost6:test-candidate-workflow": "node --test ./scripts/selfhost6/candidate-workflow.test.mjs",
+    "selfhost6:phase7-launch": "node ./scripts/selfhost6/phase7-qualified-launch.mjs",
     "rtc:prepush": "node ./scripts/run-rtc-prepush.mjs",
     "desktop:release-preflight": "node ./scripts/run-desktop-release-preflight.mjs",
     "release:rehearsal": "node ./scripts/run-local-release-rehearsal.mjs",
