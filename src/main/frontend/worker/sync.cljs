@@ -365,6 +365,18 @@
             (ensure-client-graph-uuid! repo remote-graph-id)
             remote-graph-id))))))
 
+(defn- defer-repair-resume!
+  [repo]
+  ;; db-sync-start itself is a fenced thread-api call. Resume on the next turn
+  ;; so that call can release before a repair commit enters the same fence.
+  (-> (p/delay 0)
+      (p/then #(sync-download/<resume-repair-operation! repo))
+      (p/catch
+       (fn [error]
+         (log/error :db-sync/repair-resume-failed
+                    {:repo repo :error error}))))
+  nil)
+
 (defn start!
   [repo]
   (let [base (ws-base-url)
@@ -410,11 +422,7 @@
                       token (<resolve-ws-token)
                       connected (connect! repo connected url token)]
                 (reset! worker-state/*db-sync-client connected)
-                (-> (sync-download/<resume-repair-operation! repo)
-                    (p/catch
-                     (fn [error]
-                       (log/error :db-sync/repair-resume-failed
-                                  {:repo repo :error error}))))
+                (defer-repair-resume! repo)
                 nil))
              (p/finally
                (fn []
