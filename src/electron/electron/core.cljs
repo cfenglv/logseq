@@ -43,6 +43,11 @@
 (defonce *lifecycle-op (volatile! (p/resolved nil)))
 (defonce *quit-dirty? (volatile! true))
 
+(defn- configure-qualification-command-line!
+  []
+  (when (seq (.-LOGSEQ_TEST_HOME_DIR js/process.env))
+    (.appendSwitch (.-commandLine app) "use-mock-keychain")))
+
 (defn setup-updater! [^js win]
   ;; manual/auto updater
   (init-updater {:repo   "logseq/logseq"
@@ -466,6 +471,7 @@
            (.on app' "activate" #(when @*win (.show win)))))))
 
 (defn main []
+  (configure-qualification-command-line!)
   (if-not (.requestSingleInstanceLock app)
     (.quit app)
     (let [privileges {:standard        true
