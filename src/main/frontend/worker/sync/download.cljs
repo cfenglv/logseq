@@ -74,6 +74,14 @@
                     (gzip-bytes? (->uint8 (.-value result))))))
         (p/catch (fn [_] false))
         (p/finally (fn []
+                     ;; A tee branch keeps ownership of the underlying
+                     ;; response until it is consumed or cancelled. Do not
+                     ;; await cancellation here: tee cancellation settles
+                     ;; only after the payload sibling finishes.
+                     (try
+                       (when-let [cancellation (.cancel reader)]
+                         (p/catch cancellation (fn [_] nil)))
+                       (catch :default _))
                      (try
                        (.releaseLock reader)
                        (catch :default _)))))))

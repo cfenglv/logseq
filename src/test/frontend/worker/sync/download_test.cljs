@@ -797,6 +797,28 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest snapshot-gzip-probe-cancels-unused-tee-branch-test
+  (async done
+         (let [cancel-count (atom 0)
+               release-count (atom 0)
+               reader #js {:read (fn []
+                                    (p/resolved
+                                     #js {:done false
+                                          :value (js/Uint8Array. #js [1 2 3])}))
+                           :cancel (fn []
+                                     (swap! cancel-count inc)
+                                     (p/resolved nil))
+                           :releaseLock (fn [] (swap! release-count inc))}
+               stream #js {:getReader (fn [] reader)}]
+           (-> (#'sync-download/<stream-starts-with-gzip? stream)
+               (p/then (fn [gzip?]
+                         (is (false? gzip?))
+                         (is (= 1 @cancel-count))
+                         (is (= 1 @release-count))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
 (deftest repair-staging-final-fence-applies-only-new-local-ids-and-rejects-remote-move-test
   (async done
          (let [repo "repair-final-fence-repo"
