@@ -16,6 +16,21 @@
                     (string/trim title))
           (state/set-edit-content! title))))))
 
+(defonce ^:private *recovered-dirty-draft (atom nil))
+
+(defn- claim-dirty-draft-recovery!
+  [editing-block-uuid draft]
+  (if-let [input (state/get-input)]
+    (let [claim {:input input
+                 :block-uuid editing-block-uuid
+                 :draft draft}]
+      (when (not= claim @*recovered-dirty-draft)
+        (reset! *recovered-dirty-draft claim)
+        true))
+    ;; The normal renderer path always has an active input. Keep non-DOM callers
+    ;; functional without creating a process-wide fallback identity.
+    true))
+
 (defn- recover-dirty-edit-if-needed!
   [blocks deleted delta-applied?]
   (when (state/editing?)
@@ -29,7 +44,9 @@
           (cond
             (contains? deleted editing-block-uuid)
             (do
-              (when delta-applied?
+              (when (and delta-applied?
+                         (claim-dirty-draft-recovery!
+                          editing-block-uuid draft))
                 (state/pub-event!
                  [:editor/recover-deleted-dirty-draft editing-block draft]))
               true)
@@ -41,7 +58,9 @@
               ;; The remote/current canonical title is already materialized.
               ;; Saving the active draft once makes it an ordinary semantic op,
               ;; whose inverse keeps that canonical title available to undo.
-              (when delta-applied?
+              (when (and delta-applied?
+                         (claim-dirty-draft-recovery!
+                          editing-block-uuid draft))
                 (state/pub-event! [:editor/save-current-block]))
               true)
 
