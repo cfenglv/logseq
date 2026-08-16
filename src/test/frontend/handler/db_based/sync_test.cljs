@@ -1,6 +1,7 @@
 (ns frontend.handler.db-based.sync-test
   (:require [cljs.test :refer [deftest is async]]
             [clojure.string :as string]
+            [electron.ipc :as ipc]
             [frontend.config :as config]
             [frontend.handler.db-based.sync :as db-sync]
             [frontend.persist-db :as persist-db]
@@ -13,6 +14,49 @@
 (defn- finish-async-test!
   [done]
   (js/setTimeout done 0))
+
+(deftest fetch-json-uses-existing-electron-http-owner-test
+  (async done
+         (let [called (atom nil)]
+           (-> (p/with-redefs [util/electron? (constantly true)
+                               state/get-auth-id-token (constantly "qualification-token")
+                               ipc/ipc (fn [& args]
+                                         (reset! called args)
+                                         (p/resolved {:status 200
+                                                      :ok true
+                                                      :body "{\"graphs\":[]}"}))]
+                 (p/let [result (db-sync/fetch-json
+                                  "https://qualification.example/graphs"
+                                  {:method "GET"}
+                                  {})
+                         [method request-id options] @called]
+                   (is (= {:graphs []} result))
+                   (is (= :httpRequest method))
+                   (is (some? (re-matches #"[0-9a-f-]{36}" request-id)))
+                   (is (= {:url "https://qualification.example/graphs"
+                           :method "GET"
+                           :headers {"authorization" "Bearer qualification-token"}
+                           :returnType "text"
+                           :includeResponse true}
+                          options))))
+               (p/catch (fn [e]
+                          (is false (str e))))
+               (p/finally #(finish-async-test! done))))))
+
+(deftest fetch-json-preserves-electron-http-error-contract-test
+  (async done
+         (-> (p/with-redefs [util/electron? (constantly true)
+                             ipc/ipc (fn [& _]
+                                       (p/resolved {:status 403
+                                                    :ok false
+                                                    :body "{\"error\":\"denied\"}"}))]
+               (db-sync/fetch-json "https://qualification.example/graphs" {:method "GET"} {}))
+             (p/then (fn [_]
+                       (is false "expected request failure")))
+             (p/catch (fn [error]
+                        (is (= 403 (:status (ex-data error))))
+                        (is (= {:error "denied"} (:body (ex-data error))))))
+             (p/finally #(finish-async-test! done)))))
 
 (deftest coerce-http-request-does-not-add-client-revision-to-member-request-test
   (is (= {:email "user@example.com"}

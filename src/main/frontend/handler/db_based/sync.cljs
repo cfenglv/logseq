@@ -1,6 +1,7 @@
 (ns frontend.handler.db-based.sync
   "DB-sync handler based on Cloudflare Durable Objects."
   (:require [clojure.string :as string]
+            [electron.ipc :as ipc]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.handler.notification :as notification]
@@ -44,12 +45,30 @@
 (declare coerce-http-response)
 (declare <sync-auth-state-to-db-worker!)
 
+(defn- <fetch-response
+  [url opts]
+  (let [opts (with-auth-headers opts)]
+    (if (util/electron?)
+      (ipc/ipc :httpRequest
+               (str (random-uuid))
+               (cond-> {:url url
+                        :method (or (:method opts) "GET")
+                        :headers (:headers opts)
+                        :returnType "text"
+                        :includeResponse true}
+                 (contains? opts :body) (assoc :body (:body opts))))
+      (p/let [resp (js/fetch url (clj->js opts))
+              text (.text resp)]
+        {:status (.-status resp)
+         :ok (.-ok resp)
+         :body text}))))
+
 (defn fetch-json
   [url opts {:keys [response-schema error-schema] :or {error-schema :error}}]
-  (p/let [resp (js/fetch url (clj->js (with-auth-headers opts)))
-          text (.text resp)
+  (p/let [resp (<fetch-response url opts)
+          text (:body resp)
           data (when (seq text) (js/JSON.parse text))]
-    (if (.-ok resp)
+    (if (:ok resp)
       (let [body (js->clj data :keywordize-keys true)
             body (if response-schema
                    (coerce-http-response response-schema body)
@@ -57,7 +76,7 @@
         (if (or (nil? response-schema) body)
           body
           (throw (ex-info "db-sync invalid response"
-                          {:status (.-status resp)
+                          {:status (:status resp)
                            :url url
                            :body body}))))
       (let [body (when data (js->clj data :keywordize-keys true))
@@ -65,7 +84,7 @@
                    (coerce-http-response error-schema body)
                    body)]
         (throw (ex-info "db-sync request failed"
-                        {:status (.-status resp)
+                        {:status (:status resp)
                          :url url
                          :body body}))))))
 
