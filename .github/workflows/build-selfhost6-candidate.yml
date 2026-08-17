@@ -22,6 +22,8 @@ env:
   JAVA_VERSION: '21'
   CLOJURE_VERSION: '1.12.4.1618'
   OCAML_VERSION: '5.4.0'
+  OPAM_VERSION: '2.5.2'
+  OPAM_X86_64_LINUX_SHA512: '508a128cec8ddf06e763db56232818481a4eee7725fb725c08f543b4aefa0daa23042ec89a4dcb4fe8eac99c53c219196c715eec46b4f1f6769b47782f79943a'
 
 jobs:
   compile-static:
@@ -47,9 +49,21 @@ jobs:
       - uses: DeLaGuardo/setup-clojure@13.5
         with:
           cli: ${{ env.CLOJURE_VERSION }}
-      - uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: ${{ env.OCAML_VERSION }}
+      - name: Install pinned opam and OCaml
+        shell: bash
+        run: |
+          opam_dir="$RUNNER_TEMP/selfhost6-opam"
+          opam_bin="$opam_dir/opam"
+          mkdir -p "$opam_dir"
+          curl --fail --location --silent --show-error \
+            "https://github.com/ocaml/opam/releases/download/${OPAM_VERSION}/opam-${OPAM_VERSION}-x86_64-linux" \
+            --output "$opam_bin"
+          echo "${OPAM_X86_64_LINUX_SHA512}  ${opam_bin}" | sha512sum --check --strict
+          chmod +x "$opam_bin"
+          echo "$opam_dir" >> "$GITHUB_PATH"
+          "$opam_bin" init --bare --disable-sandboxing --yes \
+            default git+https://github.com/ocaml/opam-repository.git
+          "$opam_bin" switch create . "ocaml-base-compiler.${OCAML_VERSION}" --yes
       - name: Build the existing desktop owners
         run: |
           pnpm install --frozen-lockfile
