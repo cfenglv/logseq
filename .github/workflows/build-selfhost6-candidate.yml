@@ -125,27 +125,18 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
-      - name: Import Apple Developer ID
-        if: matrix.platform == 'darwin'
-        uses: apple-actions/import-codesign-certs@v1
-        with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
-          p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
       - name: Install packaged runtime dependencies
         working-directory: static
         run: pnpm install --frozen-lockfile --ignore-workspace
       - name: Build macOS candidate
         if: matrix.platform == 'darwin'
         working-directory: static
-        run: ${{ matrix.arch == 'arm64' && 'pnpm electron:make-macos-arm64' || 'pnpm electron:make' }}
+        run: ${{ matrix.arch == 'arm64' && 'pnpm electron:make-unsigned --mac dmg zip --arm64' || 'pnpm electron:make-unsigned --mac dmg zip --x64' }}
         env:
           SELFHOST6_SOURCE_FULL_SHA: ${{ inputs.source-full-sha }}
           SELFHOST6_TARGET_VERSION: ${{ inputs.target-version }}
           SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
           SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
-          APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       - name: Verify packaged macOS main-process dependencies
         if: matrix.platform == 'darwin'
         shell: bash
@@ -168,31 +159,12 @@ jobs:
         if: matrix.platform == 'win32'
         shell: pwsh
         working-directory: static
-        run: |
-          node updater/prepare-target-build-manifest.mjs
-          $signCfg = @'
-          {
-            "extends": "./electron-builder.yml",
-            "win": {
-              "azureSignOptions": {
-                "publisherName": "Logseq, Inc.",
-                "endpoint": "https://eus.codesigning.azure.net/",
-                "certificateProfileName": "Logseq",
-                "codeSigningAccountName": "logseqwin"
-              }
-            }
-          }
-          '@
-          $signCfg | Out-File -FilePath electron-builder.sign-win.json -Encoding utf8NoBOM
-          pnpm exec electron-builder --config electron-builder.sign-win.json --win nsis zip --x64 --publish never
+        run: pnpm electron:make-unsigned --win nsis zip --x64
         env:
           SELFHOST6_SOURCE_FULL_SHA: ${{ inputs.source-full-sha }}
           SELFHOST6_TARGET_VERSION: ${{ inputs.target-version }}
           SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
           SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
       - name: Normalize Unix updater input
         if: matrix.platform != 'win32'
         shell: bash
@@ -219,7 +191,7 @@ jobs:
   sign-and-stage:
     needs: build-platform
     runs-on: ubuntu-22.04
-    environment: selfhost6-candidate-signing
+    environment: selfhost-release-signing
     steps:
       - uses: actions/checkout@v4
         with:
