@@ -665,18 +665,6 @@
   (.exec (:db resource) "delete from kvs")
   resource)
 
-(defn- <create-repair-rows-db!
-  [operation-id]
-  (p/let [resource
-          (sync-temp-sqlite/<create-named-temp-sqlite-db!
-           (repair-temp-pool-name operation-id :rows)
-           "/repair-rows.sqlite")]
-    (try
-      (reset-repair-temp-resource! resource)
-      (catch :default error
-        (p/let [_ (<best-effort-cleanup-repair-resource! resource)]
-          (throw error))))))
-
 (defn- <cleanup-repair-resource!
   [resource]
   (if resource
@@ -705,12 +693,63 @@
            "/repair-target.sqlite")]
     (try
       (reset-repair-temp-resource! resource)
-      (let [storage (sync-temp-sqlite/new-temp-sqlite-storage (:db resource))
-            conn (d/conn-from-datoms [] db-schema/schema {:storage storage})]
-        (assoc resource :conn conn))
       (catch :default error
         (p/let [_ (<best-effort-cleanup-repair-resource! resource)]
           (throw error))))))
+
+(def ^:private repair-snapshot-transform-page-size 1000)
+
+(defn- snapshot-attr-page
+  [conn attr after-eid]
+  (let [start-eid (if (some? after-eid) (inc after-eid) 1)]
+    (into []
+          (comp (take-while #(= attr (:a %)))
+                (take repair-snapshot-transform-page-size)
+                (map #(select-keys % [:e :a :v])))
+          (d/seek-datoms @conn :aevt attr start-eid))))
+
+(defn- <transform-snapshot-attr!
+  [conn aes-key attr]
+  (p/loop [after-eid nil]
+    (let [page (snapshot-attr-page conn attr after-eid)]
+      (if (seq page)
+        (p/let [decrypted (sync-crypt/<decrypt-snapshot-datoms-batch aes-key page)
+                _ (d/transact! conn (mapv datom->tx decrypted)
+                               {:sync-download-graph? true})
+                _ (<yield-next-tick)]
+          (p/recur (:e (peek page))))
+        nil))))
+
+(defn- <add-snapshot-local-revisions!
+  [conn]
+  (p/loop [after-eid nil]
+    (let [page (snapshot-attr-page conn :block/uuid after-eid)]
+      (if (seq page)
+        (let [tx-id (inc (:max-tx @conn))]
+          (p/let [_ (d/transact!
+                     conn
+                     (mapv (fn [{:keys [e]}]
+                             [:db/add e :block/tx-id tx-id])
+                           page)
+                     {:sync-download-graph? true})
+                  _ (<yield-next-tick)]
+            (p/recur (:e (peek page)))))
+        nil))))
+
+(defn- <materialize-repair-target!
+  [resource aes-key graph-e2ee?]
+  (let [storage (sync-temp-sqlite/new-temp-sqlite-storage (:db resource))
+        conn (d/restore-conn storage)]
+    (when-not conn
+      (throw (ex-info "Repair snapshot is missing its DataScript root"
+                      {:type :db-sync/repair-corrupt-snapshot})))
+    (p/let [_ (when graph-e2ee?
+                (p/loop [attrs (seq [:block/title :block/name])]
+                  (when-let [attr (first attrs)]
+                    (p/let [_ (<transform-snapshot-attr! conn aes-key attr)]
+                      (p/recur (next attrs))))))
+            _ (<add-snapshot-local-revisions! conn)]
+      (assoc resource :conn conn))))
 
 (defn- repair-staging-key
   [repo graph-id]
@@ -872,16 +911,13 @@
   [repo {:keys [operation-id graph-id] :as operation} owner-token]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)
         active-conn (worker-state/get-datascript-conn repo)
-        rows* (atom nil)
         target* (atom nil)]
     (if-not (and (uuid? operation-id) (seq graph-id) (seq base) active-conn
                  (not @(:cancelled? owner-token)))
       (p/rejected (ex-info "Missing repair staging context"
                            {:type :db-sync/missing-repair-staging-context
                             :repo repo}))
-      (-> (p/let [rows (<create-repair-rows-db! operation-id)
-                  _ (reset! rows* rows)
-                  target (<create-repair-target! operation-id)
+      (-> (p/let [target (<create-repair-target! operation-id)
                   _ (reset! target* target)
                   graph-e2ee? (sync-crypt/graph-e2ee? repo)
                   aes-key (when graph-e2ee?
@@ -891,13 +927,11 @@
                                       {:type :db-sync/missing-field
                                        :repo repo :field :aes-key})))
                   snapshot-floor-proof (<fetch-repair-diagnostics base graph-id)
-                  _ (<fetch-repair-snapshot-rows! base graph-id (:db rows))
+                  _ (<fetch-repair-snapshot-rows! base graph-id (:db target))
                   _ (ensure-repair-build-active! repo active-conn owner-token)
-                  _ (<copy-snapshot-rows-to-conn!
-                     (:db rows) (:conn target) aes-key graph-e2ee? nil)
+                  target (<materialize-repair-target! target aes-key graph-e2ee?)
+                  _ (reset! target* target)
                   _ (ensure-repair-build-active! repo active-conn owner-token)
-                  _ (<cleanup-repair-resource! rows)
-                  _ (reset! rows* nil)
                   pull (fetch-json
                         (str base "/sync/" graph-id "/pull?since="
                              (:t snapshot-floor-proof))
@@ -951,8 +985,7 @@
           (p/catch
            (fn [error]
              (p/let [cleanup-results
-                     (p/all [(<capture-repair-cleanup-error @rows*)
-                             (<capture-repair-cleanup-error @target*)])]
+                     (p/all [(<capture-repair-cleanup-error @target*)])]
                (if-let [cleanup-errors (seq (keep :error cleanup-results))]
                  (throw
                   (ex-info "Repair staging cleanup failed"
@@ -961,7 +994,6 @@
                             :operation operation
                             :original-error error
                             :cleanup-errors (vec cleanup-errors)
-                            :rows @rows*
                             :target @target*}
                            error))
                  (throw error)))))))))
@@ -1083,8 +1115,7 @@
   (if-not (repair-staging-owner? repo graph-id owner-token)
     (p/resolved nil)
     (p/let [cleanup-results
-            (p/all [(<capture-repair-cleanup-error (:rows (ex-data error)))
-                    (<capture-repair-cleanup-error (:target (ex-data error)))])]
+            (p/all [(<capture-repair-cleanup-error (:target (ex-data error)))])]
       (if-let [cleanup-errors (seq (keep :error cleanup-results))]
         (log/error :db-sync/repair-staging-close-cleanup-failed
                    {:repo repo
