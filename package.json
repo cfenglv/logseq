@@ -116,6 +116,7 @@
     "selfhost6:phase7-cli": "node ./scripts/selfhost6/phase7-qualified-cli.mjs",
     "selfhost6:phase7-large-graph": "node ./scripts/selfhost6/phase7-large-graph-seed.mjs",
     "selfhost6:verify-phase7d": "node ./scripts/selfhost6/verify-phase7d.mjs",
+    "selfhost6:verify-phase7e": "node ./scripts/selfhost6/verify-phase7e.mjs",
     "rtc:prepush": "node ./scripts/run-rtc-prepush.mjs",
     "desktop:release-preflight": "node ./scripts/run-desktop-release-preflight.mjs",
     "release:rehearsal": "node ./scripts/run-local-release-rehearsal.mjs",

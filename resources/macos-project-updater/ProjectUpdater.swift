@@ -24,7 +24,10 @@ private struct Arguments {
     let relaunch: Bool
     let target: URL
     let verifyOnly: Bool
+#if SELFHOST6_UPDATER_TESTING
+    let testFailAfterParentExit: Bool
     let testFailAfterSwap: Bool
+#endif
 
     init(_ argv: [String]) throws {
         var values: [String: String] = [:]
@@ -39,6 +42,11 @@ private struct Arguments {
                 continue
             }
 #if SELFHOST6_UPDATER_TESTING
+            if item == "--test-fail-after-parent-exit" {
+                guard flags.insert(item).inserted else { try fail("duplicate \(item)") }
+                index += 1
+                continue
+            }
             if item == "--test-fail-after-swap" {
                 guard flags.insert(item).inserted else { try fail("duplicate \(item)") }
                 index += 1
@@ -71,7 +79,10 @@ private struct Arguments {
         }
         relaunch = relaunchValue == "true"
         verifyOnly = flags.contains("--verify-only")
+#if SELFHOST6_UPDATER_TESTING
+        testFailAfterParentExit = flags.contains("--test-fail-after-parent-exit")
         testFailAfterSwap = flags.contains("--test-fail-after-swap")
+#endif
     }
 }
 
@@ -307,6 +318,9 @@ private func install(_ arguments: Arguments) throws {
     if arguments.verifyOnly { return }
 
     try waitForParent(arguments.parentPID)
+#if SELFHOST6_UPDATER_TESTING
+    if arguments.testFailAfterParentExit { try fail("injected failure after parent exit") }
+#endif
 
     let parent = arguments.target.deletingLastPathComponent()
     let staging = parent.appendingPathComponent(".logseq-update-\(UUID().uuidString)")
@@ -324,7 +338,9 @@ private func install(_ arguments: Arguments) throws {
         previousMoved = true
         try manager.moveItem(at: candidate, to: arguments.target)
         candidateMoved = true
+#if SELFHOST6_UPDATER_TESTING
         if arguments.testFailAfterSwap { try fail("injected failure after swap") }
+#endif
         if arguments.relaunch { try launch(arguments.target) }
         try manager.removeItem(at: backup)
     } catch {
