@@ -149,14 +149,15 @@
    :scheduled (atom [])})
 
 (defn- install-electron-failover-test-env!
-  [{:keys [current-repo repos results runtime-results events current-repo-updates notifications sse ipc-calls]
+  [{:keys [current-repo repos results runtime-results events current-repo-updates notifications notification-clears sse ipc-calls]
     :or {sse (sse-state)}}]
   (let [originals {:original-state (state/get-state)
                    :electron? util/electron?
                    :ipc ipc/ipc
                    :pub-event! state/pub-event!
                    :set-current-repo! state/set-current-repo!
-                   :notification-show! notification/show!}]
+                   :notification-show! notification/show!
+                   :notification-clear! notification/clear!}]
     (reset-runtime-state!)
     (state/swap-state! assoc :git/current-repo current-repo)
     (state/swap-state! assoc-in [:me :repos] repos)
@@ -189,19 +190,24 @@
                                     (swap! current-repo-updates conj repo)
                                     (state/swap-state! assoc :git/current-repo repo)
                                     nil))
-    (set! notification/show! (fn [content status]
+    (set! notification/show! (fn [content status & _]
                                (swap! notifications conj [content status])
                                nil))
+    (set! notification/clear! (fn [uid]
+                                (when notification-clears
+                                  (swap! notification-clears conj uid))
+                                nil))
     originals))
 
 (defn- restore-electron-failover-test-env!
-  [{:keys [original-state electron? ipc pub-event! set-current-repo! notification-show!]}]
+  [{:keys [original-state electron? ipc pub-event! set-current-repo! notification-show! notification-clear!]}]
   (state/replace-state! original-state)
   (set! util/electron? electron?)
   (set! ipc/ipc ipc)
   (set! state/pub-event! pub-event!)
   (set! state/set-current-repo! set-current-repo!)
   (set! notification/show! notification-show!)
+  (set! notification/clear! notification-clear!)
   (reset-runtime-state!))
 
 (defn- graph-repos
@@ -1154,8 +1160,8 @@
                                            (swap! current-repo-updates conj repo)
                                            (state/swap-state! assoc :git/current-repo repo)
                                            nil))
-           (set! notification/show! (fn [content status]
-                                      (swap! notifications conj [content status])
+           (set! notification/show! (fn [& args]
+                                      (swap! notifications conj args)
                                       nil))
            (-> (p/let [_ (recovery! "logseq_db_graph_a" remote-client session-id)
                        _ (p/delay 0)]
@@ -1167,7 +1173,10 @@
                         @ipc-calls))
                  (is (= ["logseq_db_graph_a"] @stop-calls))
                  (is (= 1 (count @notifications)))
-                 (is (= :error (second (first @notifications)))))
+                 (is (= :error (second (first @notifications))))
+                 (is (= false (nth (first @notifications) 2)))
+                 (is (= "db-worker-runtime-recovery:logseq_db_graph_a"
+                        (nth (first @notifications) 3))))
                (p/catch (fn [e]
                           (is false (str "unexpected error: " e))))
                (p/finally (fn []
@@ -1189,6 +1198,7 @@
                events (atom [])
                current-repo-updates (atom [])
                notifications (atom [])
+               notification-clears (atom [])
                session-id "session-a"
                wrapped-worker (fn [& _] nil)
                old-client (->FakeRemote "logseq_db_graph_a" (fn [& _] nil))
@@ -1199,7 +1209,8 @@
                original-stop! remote/stop!
                original-pub-event! state/pub-event!
                original-set-current-repo! state/set-current-repo!
-               original-notification-show! notification/show!]
+               original-notification-show! notification/show!
+               original-notification-clear! notification/clear!]
            (reset-runtime-state!)
            (state/replace-state! (assoc original-state :git/current-repo "logseq_db_graph_a"))
            (reset! persist-db/remote-db old-client)
@@ -1234,6 +1245,9 @@
            (set! notification/show! (fn [content status]
                                       (swap! notifications conj [content status])
                                       nil))
+           (set! notification/clear! (fn [uid]
+                                       (swap! notification-clears conj uid)
+                                       nil))
            (-> (p/let [_ (recovery! "logseq_db_graph_a" old-client session-id)
                        _ (p/delay 0)]
                  (is (= [["releaseDbWorkerRuntime" "logseq_db_graph_a"]
@@ -1244,6 +1258,8 @@
                  (is (= [] @current-repo-updates))
                  (is (= [] @events))
                  (is (= [] @notifications))
+                 (is (= ["db-worker-runtime-recovery:logseq_db_graph_a"]
+                        @notification-clears))
                  (is (= "logseq_db_graph_a" (state/get-current-repo)))
                  (is (= new-client @persist-db/remote-db))
                  (is (= "logseq_db_graph_a" @persist-db/remote-repo))
@@ -1258,6 +1274,7 @@
                             (set! state/pub-event! original-pub-event!)
                             (set! state/set-current-repo! original-set-current-repo!)
                             (set! notification/show! original-notification-show!)
+                            (set! notification/clear! original-notification-clear!)
                             (reset-runtime-state!)
                             (done)))))))
 
@@ -1354,7 +1371,8 @@
                original-ipc ipc/ipc
                original-start! remote/start!
                original-stop! remote/stop!
-               original-notification-show! notification/show!]
+               original-notification-show! notification/show!
+               original-notification-clear! notification/clear!]
            (reset-runtime-state!)
            (state/replace-state! (assoc original-state :git/current-repo repo))
            (reset! persist-db/remote-db old-client)
@@ -1380,6 +1398,7 @@
                                 (swap! stop-calls conj (:repo client))
                                 (p/resolved true)))
            (set! notification/show! (fn [_content _status] nil))
+           (set! notification/clear! (fn [_uid] nil))
            (-> (p/let [_ (record-failure! repo session-id app-error)
                        _ (record-failure! repo session-id app-error)
                        _ (record-failure! repo session-id app-error)
@@ -1403,6 +1422,7 @@
                             (set! remote/start! original-start!)
                             (set! remote/stop! original-stop!)
                             (set! notification/show! original-notification-show!)
+                            (set! notification/clear! original-notification-clear!)
                             (reset-runtime-state!)
                             (done)))))))
 
