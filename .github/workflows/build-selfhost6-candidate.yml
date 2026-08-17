@@ -203,7 +203,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-      - name: Sign immutable descriptors and stage channel metadata
+      - name: Sign immutable artifact descriptors
         shell: bash
         env:
           LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64: ${{ secrets.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 }}
@@ -214,6 +214,10 @@ jobs:
           node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-x64-${{ inputs.target-version }}/candidate.exe --target-manifest unsigned/selfhost6-unsigned-win32-x64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform win32 --arch x64 --output-directory signed
           node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-x64-${{ inputs.target-version }}/candidate.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-x64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform linux --arch x64 --output-directory signed
           node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-arm64-${{ inputs.target-version }}/candidate.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-arm64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform linux --arch arm64 --output-directory signed
+      - name: Stage isolated synthetic forward-update channel
+        if: inputs.target-version == '2.0.1-selfhost.7'
+        shell: bash
+        run: |
           node scripts/selfhost6/promote-update-feed.mjs --artifact-directory signed --output-directory signed --expected-target-version "${{ inputs.target-version }}" --descriptors signed/*.selfhost6.json
       - uses: actions/upload-artifact@v4
         with:
