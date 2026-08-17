@@ -1,5 +1,6 @@
 (ns frontend.worker.sync.download-test
   (:require [cljs.test :refer [async deftest is]]
+            [datascript.core :as d]
             [frontend.common.thread-api :as thread-api]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
@@ -11,6 +12,7 @@
             [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
             [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-sync.snapshot :as snapshot]
+            [logseq.db.frontend.schema :as db-schema]
             [frontend.worker.sync.transport :as sync-transport]
             [promesa.core :as p]))
 
@@ -458,23 +460,67 @@
                             (reset! worker-state/*db-sync-config config-prev)
                             (done)))))))
 
-(deftest repair-staging-resume-clears-stale-rows-pool-test
+(deftest repair-staging-resume-clears-stale-target-pool-test
   (async done
          (let [operation-id #uuid "90000000-0000-4000-8000-000000000001"
                sql-calls (atom [])
                create-call (atom nil)
                db #js {:exec (fn [sql] (swap! sql-calls conj sql))}
-               resource {:db db :pool :rows-pool :path "/repair-rows.sqlite"}]
+               resource {:db db :pool :target-pool :path "/repair-target.sqlite"}]
            (-> (p/with-redefs
                  [sync-temp-sqlite/<create-named-temp-sqlite-db!
                   (fn [pool-name file-name]
                     (reset! create-call [pool-name file-name])
                     (p/resolved resource))]
-                 (#'sync-download/<create-repair-rows-db! operation-id))
+                 (#'sync-download/<create-repair-target! operation-id))
                (p/then (fn [result]
                          (is (identical? resource result))
-                         (is (= "/repair-rows.sqlite" (second @create-call)))
+                         (is (= "/repair-target.sqlite" (second @create-call)))
                          (is (= ["delete from kvs"] @sql-calls))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest repair-snapshot-transform-pages-indexed-values-and-local-revisions-test
+  (async done
+         (let [conn (d/create-conn db-schema/schema)
+               entity-count 1001
+               decrypt-page-sizes (atom [])
+               tx-data (into []
+                             (mapcat
+                              (fn [eid]
+                                [{:db/id eid
+                                  :block/uuid (random-uuid)
+                                  :block/title (str "encrypted-title-" eid)}
+                                 {:db/id eid
+                                  :block/name (str "encrypted-name-" eid)}]))
+                             (range 1 (inc entity-count)))]
+           (d/transact! conn tx-data)
+           (-> (p/with-redefs
+                 [sync-crypt/<decrypt-snapshot-datoms-batch
+                  (fn [_aes-key datoms]
+                    (swap! decrypt-page-sizes conj (count datoms))
+                    (p/resolved
+                     (mapv #(update % :v (fn [value]
+                                           (str "plain-" value)))
+                           datoms)))]
+                 (p/let [_ (#'sync-download/<transform-snapshot-attr!
+                            conn :aes-key :block/title)
+                         _ (#'sync-download/<transform-snapshot-attr!
+                            conn :aes-key :block/name)
+                         _ (#'sync-download/<add-snapshot-local-revisions! conn)]
+                   nil))
+               (p/then
+                (fn []
+                  (is (= [1000 1 1000 1] @decrypt-page-sizes))
+                  (is (= entity-count
+                         (count (d/datoms @conn :aevt :block/title))))
+                  (is (= "plain-encrypted-title-1001"
+                         (:v (first (d/datoms @conn :eavt 1001 :block/title)))))
+                  (is (= "plain-encrypted-name-1001"
+                         (:v (first (d/datoms @conn :eavt 1001 :block/name)))))
+                  (is (= entity-count
+                         (count (d/datoms @conn :aevt :block/tx-id))))))
                (p/catch (fn [error]
                           (is false (str error))))
                (p/finally done)))))
@@ -503,31 +549,25 @@
     :legacy-anchor "server-6"
     :metadata-proof "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}})
 
-(deftest repair-staging-builder-captures-remote-then-local-watermarks-test
+(deftest repair-staging-builder-uses-one-snapshot-resource-and-captures-watermarks-test
   (async done
          (let [repo "repair-staging-repo"
                operation {:operation-id #uuid "91000000-0000-4000-8000-000000000001"
                           :graph-id "graph-1"}
                active-conn (atom :active-db)
                target-conn (atom :target-db)
-               rows {:name :rows :db :rows-db :pool :rows-pool}
                target {:name :target :db :target-db :conn target-conn :pool :target-pool}
                diagnostics (atom repair-builder-diagnostics)
                checksums (atom ["server-6" "local-final"])
                apply-calls (atom [])
                cleaned (atom [])
-               rows-create-count (atom 0)
                target-create-count (atom 0)
                local-tx {:tx-id #uuid "92000000-0000-4000-8000-000000000001"}
                config-prev @worker-state/*db-sync-config]
            (reset! worker-state/*db-sync-config {:http-base "https://sync.example.test"})
            (-> (p/with-redefs
-                 [sync-download/*repair-staging-builds (atom {})
+                  [sync-download/*repair-staging-builds (atom {})
                   worker-state/get-datascript-conn (fn [_] active-conn)
-                  sync-download/<create-repair-rows-db!
-                  (fn [_]
-                    (swap! rows-create-count inc)
-                    (p/resolved rows))
                   sync-download/<create-repair-target!
                   (fn [_]
                     (swap! target-create-count inc)
@@ -538,8 +578,14 @@
                       (swap! cleaned conj (:name resource)))
                     (p/resolved nil))
                   sync-crypt/graph-e2ee? (fn [_] false)
-                  sync-download/<fetch-repair-snapshot-rows! (fn [& _] (p/resolved nil))
-                  sync-download/<copy-snapshot-rows-to-conn! (fn [& _] (p/resolved nil))
+                  sync-download/<fetch-repair-snapshot-rows!
+                  (fn [_base _graph-id target-db]
+                    (is (= :target-db target-db))
+                    (p/resolved nil))
+                  sync-download/<materialize-repair-target!
+                  (fn [resource _aes-key _graph-e2ee?]
+                    (is (identical? target resource))
+                    (p/resolved target))
                   sync-checksum/<recompute-checksum
                   (fn [_]
                     (let [checksum (first @checksums)]
@@ -592,8 +638,7 @@
                           {:remote [] :local [local-tx]}]
                          @apply-calls))
                   (is (= repair-builder-target-basis (:target-basis result)))
-                  (is (= [:rows :target] @cleaned))
-                  (is (= 1 @rows-create-count))
+                  (is (= [:target] @cleaned))
                   (is (= 1 @target-create-count))))
                (p/catch (fn [error]
                           (is false (str error))))
@@ -700,7 +745,6 @@
                operation {:operation-id #uuid "93000000-0000-4000-8000-000000000001"
                           :graph-id "graph-1"}
                active-conn (atom :active-db)
-               rows {:name :rows :db :rows-db :pool :rows-pool}
                target {:name :target
                        :db :target-db
                        :conn (atom :target-db)
@@ -714,9 +758,8 @@
                config-prev @worker-state/*db-sync-config]
            (reset! worker-state/*db-sync-config {:http-base "https://sync.example.test"})
            (-> (p/with-redefs
-                 [sync-download/*repair-staging-builds (atom {})
+                  [sync-download/*repair-staging-builds (atom {})
                   worker-state/get-datascript-conn (fn [_] active-conn)
-                  sync-download/<create-repair-rows-db! (fn [_] (p/resolved rows))
                   sync-download/<create-repair-target! (fn [_] (p/resolved target))
                   sync-download/<cleanup-repair-resource!
                   (fn [resource]
@@ -727,7 +770,9 @@
                       (p/resolved nil)))
                   sync-crypt/graph-e2ee? (fn [_] false)
                   sync-download/<fetch-repair-snapshot-rows! (fn [& _] (p/resolved nil))
-                  sync-download/<copy-snapshot-rows-to-conn! (fn [& _] (p/resolved nil))
+                  sync-download/<materialize-repair-target!
+                  (fn [resource _aes-key _graph-e2ee?]
+                    (p/resolved resource))
                   sync-checksum/<recompute-checksum (fn [_] (p/resolved "stale-snapshot"))
                   sync-download/<fetch-repair-diagnostics
                   (fn [& _]
@@ -766,7 +811,7 @@
                           (is (= [cleanup-error]
                                  (:cleanup-errors (ex-data error))))
                           (is (identical? target (:target (ex-data error))))
-                          (is (= [:rows :target] @cleaned))
+                          (is (= [:target] @cleaned))
                           (is (= 1 @pull-count))
                           (is (= 1 @apply-count))
                           (is (zero? @local-read-count))))
