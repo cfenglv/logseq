@@ -176,6 +176,9 @@ importers:
       mldoc:
         specifier: ^1.5.9
         version: 1.5.9
+      node-fetch:
+        specifier: 2.7.0
+        version: 2.7.0
       path:
         specifier: 0.12.7
         version: 0.12.7
