@@ -1,0 +1,236 @@
+name: Build-Selfhost6-Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source-full-sha:
+        description: Exact reviewed source commit
+        required: true
+      target-version:
+        description: Candidate identity
+        type: choice
+        required: true
+        options:
+          - 2.0.1-selfhost.6
+          - 2.0.1-selfhost.7
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
+  JAVA_VERSION: '21'
+  CLOJURE_VERSION: '1.12.4.1618'
+  OCAML_VERSION: '5.4.0'
+
+jobs:
+  compile-static:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-full-sha }}
+      - name: Bind exact source and candidate version
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ inputs.source-full-sha }}"
+          node scripts/selfhost6/set-candidate-version.mjs --version "${{ inputs.target-version }}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ env.OCAML_VERSION }}
+      - name: Build the existing desktop owners
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir cli install --frozen-lockfile --ignore-workspace
+          opam install ./cli --deps-only --with-test --yes
+          pnpm exec gulp build
+          pnpm cljs:release-electron
+          pnpm db-worker-node:bundle
+          opam exec -- pnpm cli:release
+          pnpm webpack-app-build
+          pnpm desktop:prepare-runtime-js
+          node -e 'const fs=require("fs"); const p="static/package.json"; const x=JSON.parse(fs.readFileSync(p)); x.version=process.env.TARGET_VERSION; fs.writeFileSync(p, JSON.stringify(x,null,2)+"\n")'
+        env:
+          TARGET_VERSION: ${{ inputs.target-version }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selfhost6-static-${{ inputs.target-version }}
+          path: static
+          include-hidden-files: true
+
+  build-platform:
+    needs: compile-static
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: darwin-x64
+            runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - id: darwin-arm64
+            runner: macos-14
+            platform: darwin
+            arch: arm64
+          - id: win32-x64
+            runner: windows-latest
+            platform: win32
+            arch: x64
+          - id: linux-x64
+            runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+          - id: linux-arm64
+            runner: ubuntu-22.04
+            platform: linux
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-full-sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: selfhost6-static-${{ inputs.target-version }}
+          path: static
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+      - name: Import Apple Developer ID
+        if: matrix.platform == 'darwin'
+        uses: apple-actions/import-codesign-certs@v1
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
+      - name: Install packaged runtime dependencies
+        working-directory: static
+        run: pnpm install --frozen-lockfile --ignore-workspace
+      - name: Build macOS candidate
+        if: matrix.platform == 'darwin'
+        working-directory: static
+        run: ${{ matrix.arch == 'arm64' && 'pnpm electron:make-macos-arm64' || 'pnpm electron:make' }}
+        env:
+          SELFHOST6_SOURCE_FULL_SHA: ${{ inputs.source-full-sha }}
+          SELFHOST6_TARGET_VERSION: ${{ inputs.target-version }}
+          SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
+          SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
+          APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      - name: Verify packaged macOS main-process dependencies
+        if: matrix.platform == 'darwin'
+        shell: bash
+        run: |
+          app_path="$(find "${GITHUB_WORKSPACE}/static/dist" -maxdepth 2 -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" \
+            -e 'require(process.argv[1] + "/node_modules/electron-log"); console.log("packaged-runtime-ok")' \
+            "$app_path/Contents/Resources/app.asar"
+      - name: Build Linux candidate
+        if: matrix.platform == 'linux'
+        working-directory: static
+        run: ${{ matrix.arch == 'arm64' && 'pnpm electron:make-linux-arm64' || 'pnpm electron:make' }}
+        env:
+          SELFHOST6_SOURCE_FULL_SHA: ${{ inputs.source-full-sha }}
+          SELFHOST6_TARGET_VERSION: ${{ inputs.target-version }}
+          SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
+          SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
+      - name: Build Windows x64 candidate
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        working-directory: static
+        run: |
+          node updater/prepare-target-build-manifest.mjs
+          $signCfg = @'
+          {
+            "extends": "./electron-builder.yml",
+            "win": {
+              "azureSignOptions": {
+                "publisherName": "Logseq, Inc.",
+                "endpoint": "https://eus.codesigning.azure.net/",
+                "certificateProfileName": "Logseq",
+                "codeSigningAccountName": "logseqwin"
+              }
+            }
+          }
+          '@
+          $signCfg | Out-File -FilePath electron-builder.sign-win.json -Encoding utf8NoBOM
+          pnpm exec electron-builder --config electron-builder.sign-win.json --win nsis zip --x64 --publish never
+        env:
+          SELFHOST6_SOURCE_FULL_SHA: ${{ inputs.source-full-sha }}
+          SELFHOST6_TARGET_VERSION: ${{ inputs.target-version }}
+          SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
+          SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      - name: Normalize Unix updater input
+        if: matrix.platform != 'win32'
+        shell: bash
+        run: |
+          mkdir -p candidate-input
+          cp static/updater/TARGET_BUILD_MANIFEST.json candidate-input/TARGET_BUILD_MANIFEST.json
+          if [ "${{ matrix.platform }}" = darwin ]; then
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip' -print -quit)" candidate-input/candidate.zip
+          else
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.AppImage' -print -quit)" candidate-input/candidate.AppImage
+          fi
+      - name: Normalize Windows updater input
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory candidate-input
+          Copy-Item static/updater/TARGET_BUILD_MANIFEST.json candidate-input/TARGET_BUILD_MANIFEST.json
+          Copy-Item (Get-ChildItem static/dist/*-nsis.exe | Select-Object -First 1) candidate-input/candidate.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selfhost6-unsigned-${{ matrix.id }}-${{ inputs.target-version }}
+          path: candidate-input
+
+  sign-and-stage:
+    needs: build-platform
+    runs-on: ubuntu-22.04
+    environment: selfhost6-candidate-signing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-full-sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: selfhost6-unsigned-*-${{ inputs.target-version }}
+          path: unsigned
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Sign immutable descriptors and stage channel metadata
+        shell: bash
+        env:
+          LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64: ${{ secrets.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 }}
+        run: |
+          mkdir -p signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-x64-${{ inputs.target-version }}/candidate.zip --target-manifest unsigned/selfhost6-unsigned-darwin-x64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform darwin --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-arm64-${{ inputs.target-version }}/candidate.zip --target-manifest unsigned/selfhost6-unsigned-darwin-arm64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform darwin --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-x64-${{ inputs.target-version }}/candidate.exe --target-manifest unsigned/selfhost6-unsigned-win32-x64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform win32 --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-x64-${{ inputs.target-version }}/candidate.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-x64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform linux --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-arm64-${{ inputs.target-version }}/candidate.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-arm64-${{ inputs.target-version }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ inputs.source-full-sha }}" --target-version "${{ inputs.target-version }}" --platform linux --arch arm64 --output-directory signed
+          node scripts/selfhost6/promote-update-feed.mjs --artifact-directory signed --output-directory signed --expected-target-version "${{ inputs.target-version }}" --descriptors signed/*.selfhost6.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selfhost6-signed-candidate-${{ inputs.target-version }}-${{ inputs.source-full-sha }}
+          path: signed
+          if-no-files-found: error
