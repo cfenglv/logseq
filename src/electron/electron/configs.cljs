@@ -13,7 +13,11 @@
   (home/resolve-root (.-LOGSEQ_TEST_HOME_DIR js/process.env)
                      (.getPath app "home")))
 (defonce dot-root (.join node-path home-root ".logseq"))
-(defonce cfg-root (.getPath app "userData"))
+(defonce cfg-root
+  (let [qualification-user-data (.-LOGSEQ_TEST_USER_DATA_DIR js/process.env)]
+    (when (seq qualification-user-data)
+      (.setPath app "userData" qualification-user-data))
+    (.getPath app "userData")))
 (defonce cfg-path (.join node-path cfg-root "configs.edn"))
 
 (defn graph-registry-path
