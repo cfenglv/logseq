@@ -114,6 +114,7 @@
     "selfhost6:test-candidate-workflow": "node --test ./scripts/selfhost6/candidate-workflow.test.mjs",
     "selfhost6:phase7-launch": "node ./scripts/selfhost6/phase7-qualified-launch.mjs",
     "selfhost6:phase7-cli": "node ./scripts/selfhost6/phase7-qualified-cli.mjs",
+    "selfhost6:phase7-large-graph": "node ./scripts/selfhost6/phase7-large-graph-seed.mjs",
     "rtc:prepush": "node ./scripts/run-rtc-prepush.mjs",
     "desktop:release-preflight": "node ./scripts/run-desktop-release-preflight.mjs",
     "release:rehearsal": "node ./scripts/run-local-release-rehearsal.mjs",
