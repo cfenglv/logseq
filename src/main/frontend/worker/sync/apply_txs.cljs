@@ -636,8 +636,69 @@
                    (upload-tx-item-tempids db item)))
          {}
          tx-data)]
-    (into {} (map (fn [[start end]] [start end])
+         (into {} (map (fn [[start end]] [start end])
                   (merge-upload-tx-ranges (vals ranges-by-tempid))))))
+
+(defn- entity-uuid-ref
+  [db x]
+  (if (and (integer? x) (pos? x))
+    (if-let [block-uuid (:block/uuid (d/entity db x))]
+      [:block/uuid block-uuid]
+      x)
+    x))
+
+(defn- canonicalize-outbound-tx-data
+  "Wire data must never carry numeric db/ids. Re-resolve any numeric entity or
+  ref value against the current db; ordinary payloads without numeric ids pass
+  through unchanged."
+  [db tx-data]
+  (if db
+    (let [ref-attrs (into #{}
+                          (keep (fn [item]
+                                  (when (and (vector? item)
+                                             (>= (count item) 3)
+                                             (contains? #{:db/add :db/retract} (first item))
+                                             (ref-attr? db (nth item 2)))
+                                    (nth item 2))))
+                          tx-data)
+          needs-canonicalization?
+          (some (fn [item]
+                  (and (vector? item)
+                       (>= (count item) 2)
+                       (contains? #{:db/add :db/retract
+                                    :db/retractEntity :db.fn/retractEntity}
+                                  (first item))
+                       (or (integer? (nth item 1))
+                           (and (>= (count item) 4)
+                                (contains? ref-attrs (nth item 2))
+                                (integer? (nth item 3))))))
+                tx-data)]
+      (if needs-canonicalization?
+        (mapv (fn [item]
+                (cond
+                  (and (vector? item)
+                       (contains? #{:db/retractEntity :db.fn/retractEntity}
+                                  (first item))
+                       (= 2 (count item)))
+                  [(first item) (entity-uuid-ref db (second item))]
+
+                  (and (vector? item)
+                       (contains? #{:db/add :db/retract} (first item))
+                       (>= (count item) 4))
+                  (let [[op e a v] item
+                        ref-value? (contains? ref-attrs a)]
+                    (cond-> [op (entity-uuid-ref db e) a]
+                      (some? v)
+                      (conj (if (and ref-value? (integer? v))
+                              (entity-uuid-ref db v)
+                              v))
+                      (= 5 (count item))
+                      (conj (nth item 4))))
+
+                  :else item))
+              tx-data)
+        tx-data))
+    tx-data))
 
 (defn- next-upload-tx-group
   [tx-data range-by-start idx]
@@ -671,7 +732,9 @@
    (let [entries (mapv (fn [{:keys [tx-id tx outliner-op]}]
                          {:tx-id tx-id
                           :outliner-op outliner-op
-                          :tx-data (vec tx)})
+                          :tx-data (canonicalize-outbound-tx-data
+                                    (some-> conn deref)
+                                    (vec tx))})
                        pending)
          empty-tx-ids (->> entries
                            (filter (comp empty? :tx-data))

@@ -243,6 +243,8 @@
                                    :message-type "tx/reject"
                                    :reason reason}
                             (contains? message :t) (assoc :t remote-tx)
+                            (string? (:error-detail message))
+                            (assoc :error-detail (:error-detail message))
                             (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
                             (some? failed-tx-id) (assoc :failed-tx-id failed-tx-id)
                             (seq missing-block-uuids) (assoc :missing-block-uuids (vec missing-block-uuids))
