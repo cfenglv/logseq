@@ -5,9 +5,13 @@
             [wally.main :as w])
   (:import [com.microsoft.playwright Locator$ClickOptions]))
 
+(declare input-e2ee-password)
+
 (defn refresh-all-remote-graphs
   []
   (let [enabled-refresh "button:not([disabled]):has-text(\"Refresh\")"]
+    (when (w/visible? ".e2ee-password-modal-content")
+      (input-e2ee-password))
     (w/wait-for enabled-refresh {:timeout 30000})
     (w/click enabled-refresh
              (-> (Locator$ClickOptions.)
@@ -137,7 +141,8 @@
   (let [success-toast ".ui__toast:has-text('Your graph is valid')"]
     (k/esc)
     (k/esc)
-    (util/search-and-click "(Dev) Validate current graph")
+    (w/eval-js
+     "() => frontend.handler.common.developer.validate_db().then(() => true)")
     (w/wait-for success-toast {:timeout 30000})
     (w/eval-js
      "() => document.querySelectorAll('.ui__toast.success button')
