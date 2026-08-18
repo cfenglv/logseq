@@ -1143,6 +1143,15 @@
 (defn flush-pending!
   [repo client]
   (let [inflight @(:inflight client)
+        ;; A batch may have had its response consumed without the terminal
+        ;; handler clearing :inflight (e.g. an out-of-order pull advanced t
+        ;; while the timer was already cleared). With no upload-response timer
+        ;; outstanding the inflight is orphaned and must not block flushing.
+        orphaned-inflight? (and (seq inflight)
+                                (nil? @(:upload-request client)))]
+    (when orphaned-inflight?
+      (reset! (:inflight client) []))
+    (let [inflight @(:inflight client)
         local-tx (client-op/get-local-tx repo)
         remote-tx (get @*repo->latest-remote-tx repo)
         conn (worker-state/get-datascript-conn repo)
@@ -1232,7 +1241,7 @@
                            (sync-util/set-last-sync-error! client error)
                            (log/error :db-sync/flush-pending-failed
                                       {:repo repo
-                                       :error error}))))))))))
+                                       :error error})))))))))))
 
 (defn enqueue-flush-pending!
   [repo client]
