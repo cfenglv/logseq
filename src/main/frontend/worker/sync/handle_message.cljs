@@ -208,7 +208,14 @@
         (require-uuid block-uuid {:repo repo :type "tx/reject" :field :missing-block-uuids})))
     (case reason
       "stale"
-      (request-pull! client local-tx)
+      (do
+        (request-pull! client local-tx)
+        ;; A stale batch was not accepted; release the in-memory inflight gate
+        ;; so the pending rows can be retried with the same logical tx ids once
+        ;; the pull has caught the local tx up. The server deduplicates by tx id.
+        (when-let [*inflight (:inflight client)]
+          (reset! *inflight []))
+        (broadcast-rtc-state! client))
 
       (let [inflight @(:inflight client)
             inflight-set (set inflight)

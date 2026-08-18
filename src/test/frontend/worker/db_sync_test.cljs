@@ -1502,6 +1502,7 @@
                        (is (= (* 2 60 1000) @timeout-ms))
                        (is (fn? @timeout-callback))
                        (@timeout-callback)
+                       (is (= [] @(:inflight client)))
                        (is (= 1 (count @events)))
                        (let [[type payload] (first @events)]
                          (is (= :capture-error type))
@@ -1517,14 +1518,20 @@
                          (is (= "Sync upload request did not get response"
                                 (ex-message (:error payload)))))
                        (reset! events [])
-                       (aset (:ws client) "readyState" 3)
-                       (#'sync-apply/start-upload-response-timeout!
-                        client
-                        {:tx-ids [tx-id]
-                         :outliner-ops [:save-block]
-                         :t-before 0})
-                       (@timeout-callback)
-                       (is (empty? @events))))
+                       (reset! sent [])
+                       (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                         (is (= 1 (count @sent)))
+                         (is (= "tx/batch" (:type (first @sent))))
+                         (is (= (str tx-id) (get-in (first @sent) [:txs 0 :tx-id])))
+                         (is (= [tx-id] @(:inflight client)))
+                         (aset (:ws client) "readyState" 3)
+                         (#'sync-apply/start-upload-response-timeout!
+                          client
+                          {:tx-ids [tx-id]
+                           :outliner-ops [:save-block]
+                           :t-before 0})
+                         (@timeout-callback)
+                         (is (empty? @events)))))
                    (p/catch (fn [error]
                               (is nil (str error))))
                    (p/finally
@@ -2244,8 +2251,8 @@
               (is (= 1 (aget failed-ent "failed")))
               (is (empty? tx-entries)))))))))
 
-(deftest tx-reject-stale-keeps-inflight-op-pending-test
-  (testing "stale tx/reject should keep inflight ops pending for retry"
+(deftest tx-reject-stale-clears-inflight-and-keeps-op-pending-test
+  (testing "stale tx/reject should clear the in-memory inflight gate and keep ops pending for an exact-once retry"
     (async done
            (let [{:keys [conn client-ops-conn]} (setup-parent-child)
                  tx-id (random-uuid)
@@ -2275,13 +2282,76 @@
                  (with-redefs [client-op/get-local-tx (constantly 0)]
                    (sync-handle-message/handle-message! test-repo client raw-message)
                    (-> @(:send-queue client)
-                       (p/then (fn [_]
+                         (p/then (fn [_]
                                  (let [ent (client-op-tx-row client-ops-conn tx-id)]
                                    (is (= [{:type "pull" :since 0}] @*sent))
-                                   (is (= [tx-id] @(:inflight client)))
+                                   (is (= [] @(:inflight client)))
                                    (is (= 1 (aget ent "pending")))
                                    (is (not= 1 (aget ent "failed"))))))
                        (p/finally (fn [] (done)))))))))))
+
+(deftest tx-reject-stale-then-flush-resends-same-tx-id-test
+  (testing "after a stale reject and remote catch-up, flushing retries the same tx id with the new t-before"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 tx-id (random-uuid)
+                 *sent (atom [])
+                 timeout-callback (atom nil)
+                 original-set-timeout js/setTimeout
+                 original-clear-timeout js/clearTimeout
+                 ws (doto (js-obj)
+                      (aset "readyState" 1)
+                      (aset "send" (fn [raw]
+                                     (swap! *sent conj (js->clj (js/JSON.parse raw) :keywordize-keys true)))))
+                 raw-message (js/JSON.stringify
+                              (clj->js {:type "tx/reject"
+                                        :reason "stale"
+                                        :t 3}))
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :ws ws
+                         :send-queue (atom (p/resolved nil))
+                         :upload-request (atom nil)
+                         :inflight (atom [tx-id])
+                         :online-users (atom [])
+                         :ws-state (atom :open)}]
+             (set! js/setTimeout
+                   (fn [f ms]
+                     (reset! timeout-callback f)
+                     :upload-timeout))
+             (set! js/clearTimeout (fn [& _] nil))
+             (with-datascript-conns conn client-ops-conn
+               (fn []
+                 (seed-client-op-txs!
+                  test-repo
+                  [{:db-sync/tx-id tx-id
+                    :db-sync/created-at 1
+                    :db-sync/pending? true
+                    :db-sync/outliner-op :save-block
+                    :db-sync/normalized-tx-data
+                    [[:db/add [:block/uuid (:block/uuid child1)]
+                      :block/title
+                      "stale retry title"]]}])
+                 (client-op/update-local-tx test-repo 0)
+                 (p/with-redefs [worker-state/online? (constantly true)
+                                 sync-crypt/graph-e2ee? (constantly false)]
+                   (-> (p/let [_ (sync-handle-message/handle-message! test-repo client raw-message)
+                               _ (client-op/update-local-tx test-repo 3)
+                               _ (#'sync-apply/flush-pending! test-repo client)]
+                         (let [batch (second @*sent)]
+                           (is (= "pull" (:type (first @*sent))))
+                           (is (= 0 (get-in (first @*sent) [:since])))
+                           (is (= "tx/batch" (:type batch)))
+                           (is (= 3 (:t-before batch)))
+                           (is (= (str tx-id) (get-in batch [:txs 0 :tx-id])))
+                           (is (= [tx-id] @(:inflight client)))))
+                       (p/catch (fn [error]
+                                  (is nil (str error))))
+                       (p/finally
+                         (fn []
+                           (set! js/setTimeout original-set-timeout)
+                           (set! js/clearTimeout original-clear-timeout)
+                           (done)))))))))))
 
 (deftest tx-reject-stale-dedupes-pull-request-test
   (testing "repeated stale tx/reject should not send duplicated pull requests"
