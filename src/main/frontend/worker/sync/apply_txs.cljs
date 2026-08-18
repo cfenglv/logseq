@@ -659,7 +659,8 @@
                            {:raw? raw?
                             :op (when-not raw? (first item))
                             :e (nth item (if raw? 0 1))
-                            :a (nth item (if raw? 1 2))
+                            :a (when (>= (count item) (if raw? 3 3))
+                                 (nth item (if raw? 1 2)))
                             :v (when (>= (count item) (if raw? 3 4))
                                  (nth item (if raw? 2 3)))})))
           ref-attrs (into #{}
