@@ -213,7 +213,15 @@
                    (fn []
                      (when (= request' (dissoc @*upload-request :timer))
                        (reset! *upload-request nil)
-                       (report-upload-response-timeout! client request')))
+                       (report-upload-response-timeout! client request')
+                       ;; Lost response while the WebSocket stayed open: release
+                       ;; the in-memory inflight gate and retry the same pending
+                       ;; rows with the same logical tx ids on the next existing
+                       ;; flush trigger (background start!, hello or pull). The
+                       ;; server applies exact-once effects by tx id, so a resend
+                       ;; is safe.
+                       (when-let [*inflight (:inflight client)]
+                         (reset! *inflight []))))
                    upload-response-timeout-ms)]
         (reset! *upload-request (assoc request' :timer timer))))))
 
