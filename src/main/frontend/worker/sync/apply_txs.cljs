@@ -649,53 +649,62 @@
 
 (defn- canonicalize-outbound-tx-data
   "Wire data must never carry numeric db/ids. Re-resolve any numeric entity or
-  ref value against the current db; ordinary payloads without numeric ids pass
-  through unchanged."
+  ref value against the current db for both op-prefixed and raw datom forms;
+  ordinary payloads without numeric ids pass through unchanged."
   [db tx-data]
   (if db
-    (let [ref-attrs (into #{}
+    (let [item-shape (fn [item]
+                       (when (and (vector? item) (>= (count item) 2))
+                         (let [raw? (number? (first item))]
+                           {:raw? raw?
+                            :op (when-not raw? (first item))
+                            :e (nth item (if raw? 0 1))
+                            :a (nth item (if raw? 1 2))
+                            :v (when (>= (count item) (if raw? 3 4))
+                                 (nth item (if raw? 2 3)))})))
+          ref-attrs (into #{}
                           (keep (fn [item]
-                                  (when (and (vector? item)
-                                             (>= (count item) 3)
-                                             (contains? #{:db/add :db/retract} (first item))
-                                             (ref-attr? db (nth item 2)))
-                                    (nth item 2))))
+                                  (when-let [{:keys [raw? a]} (item-shape item)]
+                                    (when (and (keyword? a)
+                                               (or raw?
+                                                   (contains? #{:db/add :db/retract} (:op (item-shape item))))
+                                               (ref-attr? db a))
+                                      a))))
                           tx-data)
           needs-canonicalization?
           (some (fn [item]
-                  (and (vector? item)
-                       (>= (count item) 2)
-                       (contains? #{:db/add :db/retract
-                                    :db/retractEntity :db.fn/retractEntity}
-                                  (first item))
-                       (or (integer? (nth item 1))
-                           (and (>= (count item) 4)
-                                (contains? ref-attrs (nth item 2))
-                                (integer? (nth item 3))))))
+                  (when-let [{:keys [raw? op e a v]} (item-shape item)]
+                    (and (or raw?
+                             (contains? #{:db/add :db/retract
+                                          :db/retractEntity :db.fn/retractEntity}
+                                        op))
+                         (or (integer? e)
+                             (and (integer? v) (contains? ref-attrs a))))))
                 tx-data)]
       (if needs-canonicalization?
         (mapv (fn [item]
-                (cond
-                  (and (vector? item)
-                       (contains? #{:db/retractEntity :db.fn/retractEntity}
-                                  (first item))
-                       (= 2 (count item)))
-                  [(first item) (entity-uuid-ref db (second item))]
+                (if-let [{:keys [raw? op e a v]} (item-shape item)]
+                  (let [e' (entity-uuid-ref db e)
+                        v' (if (and (integer? v) (contains? ref-attrs a))
+                             (entity-uuid-ref db v)
+                             v)]
+                    (cond
+                      raw?
+                      (cond-> [e' a]
+                        (some? v') (conj v')
+                        (>= (count item) 4) (conj (nth item 3))
+                        (= 5 (count item)) (conj (nth item 4)))
 
-                  (and (vector? item)
-                       (contains? #{:db/add :db/retract} (first item))
-                       (>= (count item) 4))
-                  (let [[op e a v] item
-                        ref-value? (contains? ref-attrs a)]
-                    (cond-> [op (entity-uuid-ref db e) a]
-                      (some? v)
-                      (conj (if (and ref-value? (integer? v))
-                              (entity-uuid-ref db v)
-                              v))
-                      (= 5 (count item))
-                      (conj (nth item 4))))
+                      (contains? #{:db/retractEntity :db.fn/retractEntity} op)
+                      [op e']
 
-                  :else item))
+                      (contains? #{:db/add :db/retract} op)
+                      (cond-> [op e' a]
+                        (some? v') (conj v')
+                        (= 5 (count item)) (conj (nth item 4)))
+
+                      :else item))
+                  item))
               tx-data)
         tx-data))
     tx-data))
