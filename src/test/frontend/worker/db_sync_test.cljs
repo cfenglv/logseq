@@ -858,7 +858,10 @@
                                     (count (sqlite-util/read-transit-str (:tx first-entry))))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
-               (p/finally done)))))
+               (p/finally
+                 (fn []
+                   (sync-apply/clear-upload-response-timeout! client)
+                   (done)))))))
 
 (deftest flush-pending-randomized-single-wire-reuses-frozen-entry-after-restart-test
   (async done
@@ -1544,6 +1547,115 @@
                          (platform/set-platform! (minimal-platform :browser)))
                        (done)))))))))
 
+(deftest flush-canonicalizes-numeric-entity-refs-before-send-test
+  (testing "pending tx with numeric db/ids must be canonicalized to block/uuid refs before send"
+    (async done
+           (let [{:keys [conn client-ops-conn child1 parent]} (setup-parent-child)
+                 tx-id (random-uuid)
+                 sent (atom [])
+                 child-eid (:db/id child1)
+                 parent-eid (:db/id parent)
+                 child-uuid (:block/uuid child1)
+                 parent-uuid (:block/uuid parent)
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [raw]
+                                              (swap! sent conj
+                                                     (js->clj (js/JSON.parse raw)
+                                                              :keywordize-keys true)))))
+                         :online-users (atom [])
+                         :ws-state (atom :open)}]
+             (with-datascript-conns conn client-ops-conn
+               (fn []
+                 (client-op/update-local-tx test-repo 0)
+                 (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                 (reset! sync-apply/*repo->upload-stopped? {})
+                 (is (= child-uuid (:block/uuid (d/entity @conn child-eid))))
+                 (is (= parent-uuid (:block/uuid (d/entity @conn parent-eid))))
+                 (is (= [[:db/add [:block/uuid child-uuid]
+                          :block/parent [:block/uuid parent-uuid]
+                          1]]
+                        (#'sync-apply/canonicalize-outbound-tx-data
+                         @conn
+                         [[:db/add child-eid :block/parent parent-eid 1]])))
+                 (seed-client-op-txs!
+                  test-repo
+                  [{:db-sync/tx-id tx-id
+                    :db-sync/created-at 1
+                    :db-sync/pending? true
+                    :db-sync/outliner-op :save-block
+                    :db-sync/normalized-tx-data
+                    [[:db/add child-eid :block/parent parent-eid 1]]}])
+                 (p/with-redefs [worker-state/online? (constantly true)
+                                 sync-crypt/graph-e2ee? (constantly false)]
+                   (-> (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                         (let [wire (first @sent)
+                               wire-tx (some-> wire :txs first :tx sqlite-util/read-transit-str)]
+                           (is (= "tx/batch" (:type wire)))
+                           (is (= 1 (count (:txs wire))))
+                           (is (= [[:db/add [:block/uuid child-uuid]
+                                    :block/parent [:block/uuid parent-uuid]
+                                    1]]
+                                  wire-tx))))
+                       (p/catch (fn [error]
+                                  (is nil (str error))))
+                       (p/finally
+                         (fn []
+                           (sync-apply/clear-upload-response-timeout! client)
+                           (sync-apply/mark-pending-txs-false! test-repo [tx-id])
+                           (done)))))))))))
+
+(deftest flush-passes-through-clean-tx-data-unchanged-test
+  (testing "ordinary pending tx without numeric ids is sent byte-for-byte unchanged"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 tx-id (random-uuid)
+                 sent (atom [])
+                 clean-tx-data [[:db/add [:block/uuid (:block/uuid child1)]
+                                 :block/title
+                                 "clean title"
+                                 1]]
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [raw]
+                                              (swap! sent conj
+                                                     (js->clj (js/JSON.parse raw)
+                                                              :keywordize-keys true)))))
+                         :online-users (atom [])
+                         :ws-state (atom :open)}]
+             (with-datascript-conns conn client-ops-conn
+               (fn []
+                 (client-op/update-local-tx test-repo 0)
+                 (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                 (reset! sync-apply/*repo->upload-stopped? {})
+                 (seed-client-op-txs!
+                  test-repo
+                  [{:db-sync/tx-id tx-id
+                    :db-sync/created-at 1
+                    :db-sync/pending? true
+                    :db-sync/outliner-op :save-block
+                    :db-sync/normalized-tx-data clean-tx-data}])
+                 (p/with-redefs [worker-state/online? (constantly true)
+                                 sync-crypt/graph-e2ee? (constantly false)]
+                   (-> (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                         (let [wire-tx (some-> @sent first :txs first :tx sqlite-util/read-transit-str)]
+                           (is (= clean-tx-data wire-tx))))
+                       (p/catch (fn [error]
+                                  (is nil (str error))))
+                       (p/finally
+                         (fn []
+                           (sync-apply/clear-upload-response-timeout! client)
+                           (sync-apply/mark-pending-txs-false! test-repo [tx-id])
+                           (done)))))))))))
+
 (deftest start-active-client-flushes-pending-local-txs-test
   (async done
          (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
@@ -1918,6 +2030,7 @@
                        (clj->js {:type "tx/reject"
                                  :reason "db transact failed"
                                  :t 3
+                                 :error-detail "missing entity"
                                  :data (sqlite-util/write-transit-str rejected-tx)}))
           client {:repo test-repo
                   :graph-id "graph-1"
@@ -1938,6 +2051,7 @@
                     captured @*captured]
                 (is (= :db-sync/tx-rejected (:type data)))
                 (is (= "db transact failed" (:reason data)))
+                (is (= "missing entity" (:error-detail data)))
                 (is (= rejected-tx (:data data)))
                 (is (= :rtc.log/tx-rejected (:type captured)))
                 (is (= :db-sync/tx-rejected (-> captured :payload :type)))
