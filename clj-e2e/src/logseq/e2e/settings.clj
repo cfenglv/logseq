@@ -1,10 +1,15 @@
 (ns logseq.e2e.settings
-  (:require [logseq.e2e.assert :as assert]
+  (:require [clojure.string :as string]
+            [logseq.e2e.assert :as assert]
             [logseq.e2e.util :as util]
             [wally.main :as w]))
 
-(def ^:private e2e-init-script
-  "localStorage.setItem('preferred-language', '\"en\"'); localStorage.setItem('developer-mode', '\"true\"');")
+(defn- e2e-init-script
+  []
+  (let [sync-server-url (System/getenv "LOGSEQ_E2E_SYNC_SERVER_URL")]
+    (str "localStorage.setItem('preferred-language', '\"en\"'); localStorage.setItem('developer-mode', '\"true\"');"
+         (when-not (string/blank? sync-server-url)
+           (str " localStorage.setItem('sync-server-url', " (pr-str sync-server-url) ");")))))
 
 (def ^:private refresh-ready-script
   "(() => document.documentElement.lang === 'en'
@@ -13,7 +18,7 @@
 
 (defn install-init-script!
   [ctx]
-  (.addInitScript ctx e2e-init-script))
+  (.addInitScript ctx (e2e-init-script)))
 
 (defn wait-test-env-ready!
   []
@@ -47,5 +52,5 @@
 
 (defn developer-mode
   []
-  (w/eval-js e2e-init-script)
+  (w/eval-js (e2e-init-script))
   (assert/assert-in-normal-mode?))
