@@ -1557,6 +1557,8 @@
                  parent-eid (:db/id parent)
                  child-uuid (:block/uuid child1)
                  parent-uuid (:block/uuid parent)
+                 stale-uuid (random-uuid)
+                 stale-parent-uuid (random-uuid)
                  client {:repo test-repo
                          :graph-id "graph-1"
                          :inflight (atom [])
@@ -1591,7 +1593,10 @@
                     :db-sync/normalized-tx-data
                     [[:db/add child-eid :block/parent parent-eid 1]
                      [child-eid :block/parent parent-eid 1]
-                     [:db/retractEntity [:block/uuid child-uuid]]]}])
+                     [:db/retractEntity [:block/uuid child-uuid]]
+                     [9999 :block/uuid stale-uuid 1]
+                     [9999 :block/parent 8888 1]
+                     [8888 :block/uuid stale-parent-uuid 1]]}])
                  (p/with-redefs [worker-state/online? (constantly true)
                                  sync-crypt/graph-e2ee? (constantly false)]
                    (-> (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
@@ -1605,7 +1610,16 @@
                                    [[:block/uuid child-uuid]
                                     :block/parent [:block/uuid parent-uuid]
                                     1]
-                                   [:db/retractEntity [:block/uuid child-uuid]]]
+                                   [:db/retractEntity [:block/uuid child-uuid]]
+                                   [[:block/uuid stale-uuid]
+                                    :block/uuid stale-uuid
+                                    1]
+                                   [[:block/uuid stale-uuid]
+                                    :block/parent [:block/uuid stale-parent-uuid]
+                                    1]
+                                   [[:block/uuid stale-parent-uuid]
+                                    :block/uuid stale-parent-uuid
+                                    1]]
                                   wire-tx))))
                        (p/catch (fn [error]
                                   (is nil (str error))))

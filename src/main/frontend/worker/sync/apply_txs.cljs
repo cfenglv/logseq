@@ -639,17 +639,11 @@
          (into {} (map (fn [[start end]] [start end])
                   (merge-upload-tx-ranges (vals ranges-by-tempid))))))
 
-(defn- entity-uuid-ref
-  [db x]
-  (if (and (integer? x) (pos? x))
-    (if-let [block-uuid (:block/uuid (d/entity db x))]
-      [:block/uuid block-uuid]
-      x)
-    x))
-
 (defn- canonicalize-outbound-tx-data
   "Wire data must never carry numeric db/ids. Re-resolve any numeric entity or
-  ref value against the current db for both op-prefixed and raw datom forms;
+  ref value for both op-prefixed and raw datom forms. Numeric ids are resolved
+  first from the payload's own :block/uuid datoms (entities created in the same
+  op and no longer addressable in the current db), then from the current db;
   ordinary payloads without numeric ids pass through unchanged."
   [db tx-data]
   (if db
@@ -663,6 +657,19 @@
                                  (nth item (if raw? 1 2)))
                             :v (when (>= (count item) (if raw? 3 4))
                                  (nth item (if raw? 2 3)))})))
+          tx-uuid-refs (into {}
+                             (keep (fn [item]
+                                     (when-let [{:keys [e a v]} (item-shape item)]
+                                       (when (and (= :block/uuid a) (uuid? v))
+                                         [e [:block/uuid v]]))))
+                             tx-data)
+          entity-uuid-ref (fn [x]
+                            (if (integer? x)
+                              (or (get tx-uuid-refs x)
+                                  (when-let [block-uuid (:block/uuid (d/entity db x))]
+                                    [:block/uuid block-uuid])
+                                  x)
+                              x))
           ref-attrs (into #{}
                           (keep (fn [item]
                                   (when-let [{:keys [raw? a]} (item-shape item)]
@@ -685,9 +692,9 @@
       (if needs-canonicalization?
         (mapv (fn [item]
                 (if-let [{:keys [raw? op e a v]} (item-shape item)]
-                  (let [e' (entity-uuid-ref db e)
+                  (let [e' (entity-uuid-ref e)
                         v' (if (and (integer? v) (contains? ref-attrs a))
-                             (entity-uuid-ref db v)
+                             (entity-uuid-ref v)
                              v)]
                     (cond
                       raw?
