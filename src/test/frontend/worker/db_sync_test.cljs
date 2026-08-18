@@ -1676,6 +1676,54 @@
                            (sync-apply/mark-pending-txs-false! test-repo [tx-id])
                            (done)))))))))))
 
+(deftest flush-recovers-orphaned-inflight-without-response-timer-test
+  (testing "an inflight batch with no outstanding response timer must not block flushing"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 tx-id (random-uuid)
+                 sent (atom [])
+                 clean-tx-data [[:db/add [:block/uuid (:block/uuid child1)]
+                                 :block/title
+                                 "orphan retry"
+                                 1]]
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [tx-id])
+                         :upload-request (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [raw]
+                                              (swap! sent conj
+                                                     (js->clj (js/JSON.parse raw)
+                                                              :keywordize-keys true)))))
+                         :online-users (atom [])
+                         :ws-state (atom :open)}]
+             (with-datascript-conns conn client-ops-conn
+               (fn []
+                 (client-op/update-local-tx test-repo 0)
+                 (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                 (reset! sync-apply/*repo->upload-stopped? {})
+                 (seed-client-op-txs!
+                  test-repo
+                  [{:db-sync/tx-id tx-id
+                    :db-sync/created-at 1
+                    :db-sync/pending? true
+                    :db-sync/outliner-op :save-block
+                    :db-sync/normalized-tx-data clean-tx-data}])
+                 (p/with-redefs [worker-state/online? (constantly true)
+                                 sync-crypt/graph-e2ee? (constantly false)]
+                   (-> (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                         (is (= 1 (count @sent)))
+                         (is (= "tx/batch" (:type (first @sent))))
+                         (is (= [tx-id] @(:inflight client))))
+                       (p/catch (fn [error]
+                                  (is nil (str error))))
+                       (p/finally
+                         (fn []
+                           (sync-apply/clear-upload-response-timeout! client)
+                           (sync-apply/mark-pending-txs-false! test-repo [tx-id])
+                           (done)))))))))))
+
 (deftest start-active-client-flushes-pending-local-txs-test
   (async done
          (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
