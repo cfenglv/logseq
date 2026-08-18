@@ -1,6 +1,5 @@
 (ns logseq.e2e.fixtures
   (:require [com.climate.claypoole :as cp]
-            [logseq.e2e.assert :as assert]
             [logseq.e2e.config :as config]
             [logseq.e2e.const :refer [*page1 *page2 *graph-name*]]
             [logseq.e2e.custom-report :as custom-report]
@@ -156,7 +155,16 @@
     (w/with-page @*page1
       (graph/new-graph graph-name true false))
     (w/with-page @*page2
-      (graph/wait-for-remote-graph graph-name)
+      (try
+        (graph/wait-for-remote-graph graph-name)
+        (catch Throwable error
+          (throw (ex-info "second RTC client failed to discover the new remote graph"
+                          {:recent-console-logs
+                           (->> (some-> custom-report/*pw-page->console-logs* deref vals)
+                                (mapcat identity)
+                                (take-last 40)
+                                vec)}
+                          error))))
       (graph/switch-graph graph-name true true))
 
     (binding [custom-report/*preserve-graph* false
