@@ -8,6 +8,9 @@
 (def ^:private djb-offset 5381)
 (def ^:private field-separator 31)
 (def ^:private recompute-yield-entity-count 256)
+(def ^:private large-title-byte-limit 4096)
+(def ^:private large-title-object-attr :logseq.property.sync/large-title-object)
+(def ^:private text-encoder (js/TextEncoder.))
 
 (defn- fnv-step
   [h code]
@@ -74,6 +77,19 @@
   (cond-> #{:block/uuid :block/parent :block/page :block/order}
     (not e2ee?) (into #{:block/title :block/name})))
 
+(defn- offloaded-large-title?
+  [db eid]
+  (let [entity (d/entity db eid)
+        title (:block/title entity)]
+    (or (some? (get entity large-title-object-attr))
+        (and (string? title)
+             (> (.-length (.encode text-encoder title)) large-title-byte-limit)))))
+
+(defn- entity-relevant-attrs
+  [db eid e2ee?]
+  (cond-> (relevant-attrs e2ee?)
+    (offloaded-large-title? db eid) (disj :block/title)))
+
 (defn- get-block-uuid
   [db eid]
   (:block/uuid (d/entity db eid)))
@@ -116,7 +132,7 @@
 
 (defn- entity-values
   [db eid e2ee?]
-  (let [attrs (relevant-attrs e2ee?)
+  (let [attrs (entity-relevant-attrs db eid e2ee?)
         datoms (d/datoms db :eavt eid)]
     (reduce (fn [acc datom]
               (let [attr (:a datom)]
@@ -145,7 +161,7 @@
 (defn- entity-checksum-tuples
   [db eid e2ee?]
   (when-let [entity-uuid (get-block-uuid db eid)]
-    (let [attrs (relevant-attrs e2ee?)]
+    (let [attrs (entity-relevant-attrs db eid e2ee?)]
       (->> (d/datoms db :eavt eid)
            (keep (fn [{:keys [a v]}]
                    (when (contains? attrs a)
