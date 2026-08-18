@@ -1590,7 +1590,8 @@
                     :db-sync/outliner-op :save-block
                     :db-sync/normalized-tx-data
                     [[:db/add child-eid :block/parent parent-eid 1]
-                     [child-eid :block/parent parent-eid 1]]}])
+                     [child-eid :block/parent parent-eid 1]
+                     [:db/retractEntity [:block/uuid child-uuid]]]}])
                  (p/with-redefs [worker-state/online? (constantly true)
                                  sync-crypt/graph-e2ee? (constantly false)]
                    (-> (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
@@ -1603,7 +1604,8 @@
                                     1]
                                    [[:block/uuid child-uuid]
                                     :block/parent [:block/uuid parent-uuid]
-                                    1]]
+                                    1]
+                                   [:db/retractEntity [:block/uuid child-uuid]]]
                                   wire-tx))))
                        (p/catch (fn [error]
                                   (is nil (str error))))
