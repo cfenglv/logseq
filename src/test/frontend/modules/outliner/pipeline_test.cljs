@@ -198,6 +198,9 @@
                :affected-keys #{[:entity block-uuid]}}]
     (with-redefs [db-subs/future-projection? (constantly false)
                   db-subs/current-projection? (constantly true)
+                  db-subs/block-snapshot (constantly {:status :ready
+                                                      :value {:block/uuid block-uuid
+                                                              :block/title "base title"}})
                   db-subs/apply-delta! (constantly true)
                   state/get-current-repo (constantly repo)
                   state/get-current-page (constantly nil)
@@ -214,6 +217,42 @@
            (filterv #(= :editor/save-current-block (first %)) @events)))
     (is (empty? @set-content)
         "The incoming title must not replace the active dirty text.")))
+
+(deftest already-saved-editor-content-is-not-recovered-as-a-dirty-draft-test
+  (let [repo "saved-editor-external-update-test"
+        block-uuid (random-uuid)
+        events (atom [])
+        set-content (atom [])
+        delta {:graph-id repo
+               :projection-epoch 0
+               :rev 14
+               :blocks {block-uuid {:block/uuid block-uuid
+                                    :block/title "remote title"}}
+               :deleted {}
+               :children {}
+               :affected-keys #{[:entity block-uuid]}}]
+    (with-redefs [db-subs/future-projection? (constantly false)
+                  db-subs/current-projection? (constantly true)
+                  db-subs/block-snapshot (constantly {:status :ready
+                                                      :value {:block/uuid block-uuid
+                                                              :block/title "already saved"}})
+                  db-subs/apply-delta! (constantly true)
+                  state/get-current-repo (constantly repo)
+                  state/get-current-page (constantly nil)
+                  ;; Editor state can retain the title from when editing began.
+                  state/get-edit-block (constantly {:block/uuid block-uuid
+                                                    :block/title "opening title"})
+                  state/get-edit-content (constantly "already saved")
+                  state/editing? (constantly true)
+                  state/set-edit-content! #(swap! set-content conj %)
+                  state/pub-event! #(swap! events conj %)]
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta {:client-id "other-window"}
+                              :delta delta}))
+    (is (empty? (filter #(= :editor/save-current-block (first %)) @events))
+        "Saved editor text must not create a recovery transaction.")
+    (is (= ["remote title"] @set-content)
+        "The official clean-editor refresh path remains active.")))
 
 (deftest distinct-external-title-deltas-do-not-resave-the-same-dirty-draft-test
   (let [repo "dirty-draft-feedback-test"
@@ -233,6 +272,9 @@
     (reset! @#'pipeline/*recovered-dirty-draft nil)
     (with-redefs [db-subs/future-projection? (constantly false)
                   db-subs/current-projection? (constantly true)
+                  db-subs/block-snapshot (constantly {:status :ready
+                                                      :value {:block/uuid block-uuid
+                                                              :block/title "base title"}})
                   db-subs/apply-delta! (constantly true)
                   state/get-current-repo (constantly repo)
                   state/get-current-page (constantly nil)
@@ -280,6 +322,9 @@
                :affected-keys #{[:entity block-uuid]}}]
     (with-redefs [db-subs/future-projection? (constantly false)
                   db-subs/current-projection? (constantly true)
+                  db-subs/block-snapshot (constantly {:status :ready
+                                                      :value {:block/uuid block-uuid
+                                                              :block/title "base title"}})
                   db-subs/apply-delta! (constantly nil)
                   state/get-current-repo (constantly repo)
                   state/get-current-page (constantly nil)
@@ -313,6 +358,8 @@
                :affected-keys #{[:entity block-uuid]}}]
     (with-redefs [db-subs/future-projection? (constantly false)
                   db-subs/current-projection? (constantly true)
+                  db-subs/block-snapshot (constantly {:status :ready
+                                                      :value editing-block})
                   db-subs/apply-delta! (constantly true)
                   state/get-current-repo (constantly repo)
                   state/get-current-page (constantly nil)

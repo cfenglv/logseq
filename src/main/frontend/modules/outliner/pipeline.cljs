@@ -31,15 +31,22 @@
     ;; functional without creating a process-wide fallback identity.
     true))
 
+(defn- editing-block-before-delta
+  []
+  (when-let [editing-block-uuid (:block/uuid (state/get-edit-block))]
+    (let [{:keys [status value]} (db-subs/block-snapshot editing-block-uuid)]
+      (when (= :ready status)
+        value))))
+
 (defn- recover-dirty-edit-if-needed!
-  [blocks deleted delta-applied?]
-  (when (state/editing?)
+  [editing-block-before blocks deleted delta-applied?]
+  (when (and (state/editing?) editing-block-before)
     (when-let [{editing-block-uuid :block/uuid
-                canonical-title :block/title
                 :as editing-block} (state/get-edit-block)]
       (let [draft (state/get-edit-content)
+            canonical-title-before (:block/title editing-block-before)
             dirty? (and (string? draft)
-                        (not= draft canonical-title))]
+                        (not= draft canonical-title-before))]
         (when dirty?
           (cond
             (contains? deleted editing-block-uuid)
@@ -53,11 +60,8 @@
 
             (when-let [incoming-title
                        (:block/title (get blocks editing-block-uuid))]
-              (not= incoming-title canonical-title))
+              (not= incoming-title canonical-title-before))
             (do
-              ;; The remote/current canonical title is already materialized.
-              ;; Saving the active draft once makes it an ordinary semantic op,
-              ;; whose inverse keeps that canonical title available to undo.
               (when (and delta-applied?
                          (claim-dirty-draft-recovery!
                           editing-block-uuid draft))
@@ -102,6 +106,7 @@
       {:repo repo :projection-epoch (:projection-epoch delta)}])
     (let [current-projection? (or (nil? delta)
                                   (db-subs/current-projection? delta))
+          editing-block-before (when delta (editing-block-before-delta))
           delta-applied? (when delta
                            (db-subs/apply-delta! delta))]
       (when current-projection?
@@ -142,7 +147,7 @@
                     recovered-dirty-edit?
                     (and external-edit?
                          (recover-dirty-edit-if-needed!
-                          blocks deleted delta-applied?))]
+                          editing-block-before blocks deleted delta-applied?))]
                 (when (and refresh-edit?
                            (not recovered-dirty-edit?))
                   (update-editing-block-title-if-changed! blocks)))
