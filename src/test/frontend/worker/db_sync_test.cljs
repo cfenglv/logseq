@@ -1502,7 +1502,7 @@
                      (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
                        (is (= "tx/batch" (:type (first @sent))))
                        (is (= [tx-id] @(:inflight client)))
-                       (is (= (* 2 60 1000) @timeout-ms))
+                       (is (= (* 20 1000) @timeout-ms))
                        (is (fn? @timeout-callback))
                        (@timeout-callback)
                        (is (= [] @(:inflight client)))
@@ -1515,7 +1515,7 @@
                          (is (= "graph-1" (get-in payload [:payload :graph-id])))
                          (is (= 1 (get-in payload [:payload :tx-count])))
                          (is (= "save-block" (get-in payload [:payload :outliner-op])))
-                         (is (= (* 2 60 1000) (get-in payload [:payload :timeout-ms])))
+                         (is (= (* 20 1000) (get-in payload [:payload :timeout-ms])))
                          (is (= [(str tx-id)] (get-in payload [:extra :tx-ids])))
                          (is (= ["save-block"] (get-in payload [:extra :outliner-ops])))
                          (is (= "Sync upload request did not get response"
