@@ -1589,7 +1589,8 @@
                     :db-sync/pending? true
                     :db-sync/outliner-op :save-block
                     :db-sync/normalized-tx-data
-                    [[:db/add child-eid :block/parent parent-eid 1]]}])
+                    [[:db/add child-eid :block/parent parent-eid 1]
+                     [child-eid :block/parent parent-eid 1]]}])
                  (p/with-redefs [worker-state/online? (constantly true)
                                  sync-crypt/graph-e2ee? (constantly false)]
                    (-> (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
@@ -1598,6 +1599,9 @@
                            (is (= "tx/batch" (:type wire)))
                            (is (= 1 (count (:txs wire))))
                            (is (= [[:db/add [:block/uuid child-uuid]
+                                    :block/parent [:block/uuid parent-uuid]
+                                    1]
+                                   [[:block/uuid child-uuid]
                                     :block/parent [:block/uuid parent-uuid]
                                     1]]
                                   wire-tx))))
