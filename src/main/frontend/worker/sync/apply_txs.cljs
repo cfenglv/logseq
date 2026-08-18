@@ -44,7 +44,7 @@
 
 (def ^:private max-remote-apply-snapshot-retries 3)
 (def ^:private remote-apply-snapshot-retry-delay-ms 50)
-(def ^:private upload-response-timeout-ms (* 2 60 1000))
+(def ^:private upload-response-timeout-ms (* 20 1000))
 (def ^:private max-upload-request-datoms 5000)
 
 (defn set-upload-stopped!
