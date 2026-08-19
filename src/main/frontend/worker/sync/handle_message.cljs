@@ -13,6 +13,7 @@
             [frontend.worker.sync.transport :as sync-transport]
             [frontend.worker.sync.util :as sync-util]
             [lambdaisland.glogi :as log]
+            [logseq.common.util :as common-util]
             [promesa.core :as p]))
 
 (defn- fail-fast
@@ -112,7 +113,10 @@
   [value context]
   (sync-transport/parse-transit fail-fast value context))
 
-(defn- request-pull!
+(defn request-pull!
+  "Enqueue one bounded pull request. The same `since` is deduplicated within
+  `catch-up-pull-interval-ms`; after the freeze it may be sent again so one
+  lost `changed`/pull cannot stall sync forever. Newer `since` always sends."
   [client since]
   (when (and (:ws client) (ws-open? (:ws client)))
     (enqueue-send-task!
@@ -120,9 +124,18 @@
      (fn []
        (when (and (:ws client) (ws-open? (:ws client)))
          (if-let [*pending (:pending-pull-since client)]
-           (let [pending @*pending]
-             (when (or (nil? pending) (< since pending))
-               (reset! *pending since)
+           (let [pending @*pending
+                 pending-since (if (map? pending) (:since pending) pending)
+                 sent-at (when (map? pending) (:sent-at pending))
+                 now (common-util/time-ms)
+                 resend-same-since? (and (= since pending-since)
+                                         (some? sent-at)
+                                         (>= (- now sent-at)
+                                             sync-util/catch-up-pull-interval-ms))]
+             (when (or (nil? pending)
+                       (not= since pending-since)
+                       resend-same-since?)
+               (reset! *pending {:since since :sent-at now})
                (send! (:ws client) {:type "pull" :since since})))
            (send! (:ws client) {:type "pull" :since since})))))))
 

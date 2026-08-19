@@ -26,11 +26,13 @@
 (def ^:private reconnect-jitter-ms 250)
 (def ^:private ws-stale-kill-interval-ms 60000)
 (def ^:private ws-stale-timeout-ms 600000)
+(def ^:private catch-up-pull-check-interval-ms 2000)
 (def fail-fast sync-util/fail-fast)
 
 (defonce *repo->latest-remote-tx sync-apply/*repo->latest-remote-tx)
 (defonce *repo->latest-remote-checksum sync-apply/*repo->latest-remote-checksum)
 (defonce *start-inflight-target (atom nil))
+(defonce ^:private *catch-up-pull-timer (atom nil))
 
 (defn- current-client
   [repo]
@@ -340,11 +342,14 @@
                 :fail-fast-f fail-fast})))
       (close-stale-ws-loop updated ws url))))
 
+(declare clear-catch-up-pull-timer!)
+
 (defn stop!
   []
   (when-let [client @worker-state/*db-sync-client]
     (stop-client! client)
     (reset! worker-state/*db-sync-client nil))
+  (clear-catch-up-pull-timer!)
   (p/resolved nil))
 
 (declare list-remote-graphs!)
@@ -377,6 +382,43 @@
                     {:repo repo :error error}))))
   nil)
 
+(defn- catch-up-pull-due?
+  [repo client]
+  (let [remote-tx (get @*repo->latest-remote-tx repo)
+        *pending (:pending-pull-since client)]
+    (and (some? *pending)
+         (integer? remote-tx)
+         (not (sync-download/repair-staging-in-progress?
+               repo (:graph-id client)))
+         (let [pending @*pending
+               sent-at (when (map? pending) (:sent-at pending))
+               now (common-util/time-ms)]
+           (or (nil? sent-at)
+               (>= (- now sent-at) sync-util/catch-up-pull-interval-ms)))
+         (let [local-tx (client-op/get-local-tx repo)]
+           (and (integer? local-tx) (< local-tx remote-tx))))))
+
+(defn- catch-up-pull-check!
+  []
+  (when-let [client @worker-state/*db-sync-client]
+    (when-let [repo (:repo client)]
+      (when (catch-up-pull-due? repo client)
+        (sync-handle-message/request-pull!
+         client (client-op/get-local-tx repo))))))
+
+(defn- clear-catch-up-pull-timer!
+  []
+  (when-let [timer @*catch-up-pull-timer]
+    (js/clearInterval timer)
+    (reset! *catch-up-pull-timer nil)))
+
+(defn- ensure-catch-up-pull-timer!
+  []
+  (when (nil? @*catch-up-pull-timer)
+    (reset! *catch-up-pull-timer
+            (js/setInterval catch-up-pull-check!
+                            catch-up-pull-check-interval-ms))))
+
 (defn start!
   [repo]
   (let [base (ws-base-url)
@@ -407,6 +449,9 @@
           (do
             (broadcast-rtc-state! current)
             (sync-apply/enqueue-flush-pending! repo current)
+            (when (catch-up-pull-due? repo current)
+              (sync-handle-message/request-pull!
+               current (client-op/get-local-tx repo)))
             (p/resolved nil))
 
           :else
@@ -422,6 +467,7 @@
                       token (<resolve-ws-token)
                       connected (connect! repo connected url token)]
                 (reset! worker-state/*db-sync-client connected)
+                (ensure-catch-up-pull-timer!)
                 (defer-repair-resume! repo)
                 nil))
              (p/finally
