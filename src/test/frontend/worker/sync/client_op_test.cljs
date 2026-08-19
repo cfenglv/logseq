@@ -152,6 +152,37 @@
         (is (= 12 (client-op/get-local-tx repo)))
         (is (= "checksum-2" (client-op/get-local-checksum repo)))))))
 
+(deftest legacy-client-tx-upload-state-table-is-migrated-test
+  (testing "legacy .5 client_tx_upload_state (session_data) must migrate to the current upload-state schema"
+    (let [repo "legacy-upload-state-repo"]
+      (with-client-ops-db
+       repo
+       (fn [db]
+         (.exec db (str "create table client_tx_upload_state ("
+                        "logical_tx_id text primary key,"
+                        "session_data text not null,"
+                        "updated_at integer not null)"))
+         (let [tx-id (random-uuid)]
+           (client-op/put-client-tx-upload-state!
+            repo
+            tx-id
+            {:format-version 1
+             :kind :single-wire-v1
+             :source-digest "legacy-migration-digest"
+             :outliner-op :save-block
+             :wire-entry {:tx-id (str tx-id)}})
+           (is (= "legacy-migration-digest"
+                  (get-in (client-op/get-client-tx-upload-state
+                           repo tx-id)
+                          [:source-digest])))
+           (let [columns (->> (.all (.prepare db
+                                              "pragma table_info(client_tx_upload_state)"))
+                              (mapv #(aget % "name")))]
+             (is (contains? (set columns) "format_version"))
+             (is (contains? (set columns) "kind"))
+             (is (contains? (set columns) "source_digest"))
+             (is (contains? (set columns) "state")))))))))
+
 (deftest repair-local-observation-is-one-journal-read-transaction-test
   (let [repo "repo-repair-observation"
         tx-id (random-uuid)]

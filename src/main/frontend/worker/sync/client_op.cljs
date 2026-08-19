@@ -86,7 +86,7 @@
   [repo]
   (worker-state/get-client-ops-conn repo))
 
-(declare ensure-sqlite-schema!)
+(declare ensure-sqlite-schema! sqlite-rows)
 
 (defn- detect-sqlite-mode
   [^js db]
@@ -129,6 +129,12 @@
       (throw (ex-info "Legacy DataScript client-op storage is unsupported. Please back up the graph and re-download it."
                       {:type :db-sync/legacy-client-ops-storage
                        :repo repo})))))
+
+(defn- legacy-client-tx-upload-state?
+  [tx]
+  (boolean
+   (some #(= "session_data" (aget % "name"))
+         (sqlite-rows tx "pragma table_info(client_tx_upload_state)" []))))
 
 (defn- parse-uuid-str
   [v]
@@ -248,6 +254,14 @@
          (sqlite-run! tx client-ops-table-sql [])
          (sqlite-run! tx sync-conflicts-table-sql [])
          (sqlite-run! tx client-tx-upload-state-table-sql [])
+         ;; Graphs created by the legacy selfhost line (.1-.5) carry the old
+         ;; client_tx_upload_state(logical_tx_id, session_data, updated_at)
+         ;; shape. Upload state is only a resume cache, so migrate by
+         ;; rebuilding the table with the current schema; pending journal rows
+         ;; remain authoritative and re-upload stays exact-once.
+         (when (legacy-client-tx-upload-state? tx)
+           (sqlite-run! tx "drop table client_tx_upload_state" [])
+           (sqlite-run! tx client-tx-upload-state-table-sql []))
          (sqlite-run! tx pending-index-sql [])
          (sqlite-run! tx asset-index-sql [])
          (sqlite-run! tx sync-conflicts-block-index-sql [])))
