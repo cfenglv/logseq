@@ -42,7 +42,7 @@ assert.ok(
 );
 assert.equal(packageJson.version, targetVersion, "static package version must equal SELFHOST6_TARGET_VERSION");
 assert.ok(
-  new Set(["darwin/arm64", "darwin/x64", "win32/x64", "linux/arm64", "linux/x64"])
+  new Set(["darwin/arm64", "darwin/x64", "win32/x64", "win32/arm64", "linux/arm64", "linux/x64"])
     .has(`${platform}/${arch}`),
   "target platform/arch is not qualified",
 );
