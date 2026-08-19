@@ -639,6 +639,58 @@
          (into {} (map (fn [[start end]] [start end])
                   (merge-upload-tx-ranges (vals ranges-by-tempid))))))
 
+(defn- outbound-item-shape
+  [item]
+  (when (and (vector? item) (>= (count item) 2))
+    (let [raw? (number? (first item))]
+      {:raw? raw?
+       :op (when-not raw? (first item))
+       :e (nth item (if raw? 0 1))
+       :a (when (>= (count item) (if raw? 3 3))
+            (nth item (if raw? 1 2)))
+       :v (when (>= (count item) (if raw? 3 4))
+            (nth item (if raw? 2 3)))})))
+
+(defn- rewrite-canonicalized-outbound-tx-data
+  [tx-data item-shape created-uuids ref-attrs entity-uuid-ref]
+  (let [retract-item? (fn [item]
+                        (when-let [{:keys [op]} (item-shape item)]
+                          (contains? #{:db/retractEntity :db.fn/retractEntity} op)))
+        created-uuid-add? (fn [item]
+                            (when-let [{:keys [a v]} (item-shape item)]
+                              (and (= :block/uuid a)
+                                   (uuid? v)
+                                   (contains? created-uuids v))))
+        tx-data (concat (filter retract-item? tx-data)
+                        (filter created-uuid-add? tx-data)
+                        (remove #(or (retract-item? %)
+                                     (created-uuid-add? %))
+                                tx-data))]
+    (mapv (fn [item]
+            (if-let [{:keys [raw? op e a v]} (item-shape item)]
+              (let [e' (entity-uuid-ref e)
+                    v' (if (and (integer? v) (contains? ref-attrs a))
+                         (entity-uuid-ref v)
+                         v)]
+                (cond
+                  raw?
+                  (cond-> [e' a]
+                    (some? v') (conj v')
+                    (>= (count item) 4) (conj (nth item 3))
+                    (= 5 (count item)) (conj (nth item 4)))
+
+                  (contains? #{:db/retractEntity :db.fn/retractEntity} op)
+                  [op e']
+
+                  (contains? #{:db/add :db/retract} op)
+                  (cond-> [op e' a]
+                    (some? v') (conj v')
+                    (= 5 (count item)) (conj (nth item 4)))
+
+                  :else item))
+              item))
+          tx-data)))
+
 (defn- canonicalize-outbound-tx-data
   "Wire data must never carry numeric db/ids or refs to entities that no longer
   exist. Re-resolve any numeric entity or ref value for both op-prefixed and raw
@@ -649,31 +701,21 @@
   numeric ids pass through unchanged."
   [db tx-data]
   (if db
-    (let [item-shape (fn [item]
-                       (when (and (vector? item) (>= (count item) 2))
-                         (let [raw? (number? (first item))]
-                           {:raw? raw?
-                            :op (when-not raw? (first item))
-                            :e (nth item (if raw? 0 1))
-                            :a (when (>= (count item) (if raw? 3 3))
-                                 (nth item (if raw? 1 2)))
-                            :v (when (>= (count item) (if raw? 3 4))
-                                 (nth item (if raw? 2 3)))})))
-          tx-uuid-refs (into {}
+    (let [tx-uuid-refs (into {}
                              (keep (fn [item]
-                                     (when-let [{:keys [e a v]} (item-shape item)]
+                                     (when-let [{:keys [e a v]} (outbound-item-shape item)]
                                        (when (and (= :block/uuid a) (uuid? v))
                                          [e [:block/uuid v]]))))
                              tx-data)
           retracted-uuids (into #{}
                                 (keep (fn [item]
-                                        (when-let [{:keys [op e]} (item-shape item)]
+                                        (when-let [{:keys [op e]} (outbound-item-shape item)]
                                           (when (contains? #{:db/retractEntity :db.fn/retractEntity} op)
                                             (block-uuid-lookup-ref-value e)))))
                                 tx-data)
           created-uuids (into #{}
                               (keep (fn [item]
-                                      (when-let [{:keys [raw? op a v]} (item-shape item)]
+                                      (when-let [{:keys [raw? op a v]} (outbound-item-shape item)]
                                         (when (and (= :block/uuid a)
                                                    (uuid? v)
                                                    (or (= :db/add op)
@@ -704,16 +746,16 @@
                               true)))
           ref-attrs (into #{}
                           (keep (fn [item]
-                                  (when-let [{:keys [raw? a]} (item-shape item)]
+                                  (when-let [{:keys [raw? a]} (outbound-item-shape item)]
                                     (when (and (keyword? a)
                                                (or raw?
-                                                   (contains? #{:db/add :db/retract} (:op (item-shape item))))
+                                                   (contains? #{:db/add :db/retract} (:op (outbound-item-shape item))))
                                                (ref-attr? db a))
                                       a))))
                           tx-data)
           tx-data (into []
                         (keep (fn [item]
-                                (if-let [{:keys [e a v]} (item-shape item)]
+                                (if-let [{:keys [e a v]} (outbound-item-shape item)]
                                   (when (and (entity-valid? e)
                                              (or (not (contains? ref-attrs a))
                                                  (target-valid? v)))
@@ -722,7 +764,7 @@
                         tx-data)
           needs-canonicalization?
           (some (fn [item]
-                  (when-let [{:keys [raw? op e a v]} (item-shape item)]
+                  (when-let [{:keys [raw? op e a v]} (outbound-item-shape item)]
                     (and (or raw?
                              (contains? #{:db/add :db/retract
                                           :db/retractEntity :db.fn/retractEntity}
@@ -731,43 +773,8 @@
                              (and (integer? v) (contains? ref-attrs a))))))
                 tx-data)]
       (if needs-canonicalization?
-        (let [retract-item? (fn [item]
-                              (when-let [{:keys [op]} (item-shape item)]
-                                (contains? #{:db/retractEntity :db.fn/retractEntity} op)))
-              created-uuid-add? (fn [item]
-                                  (when-let [{:keys [a v]} (item-shape item)]
-                                    (and (= :block/uuid a)
-                                         (uuid? v)
-                                         (contains? created-uuids v))))
-              tx-data (concat (filter retract-item? tx-data)
-                              (filter created-uuid-add? tx-data)
-                              (remove #(or (retract-item? %)
-                                           (created-uuid-add? %))
-                                      tx-data))]
-          (mapv (fn [item]
-                  (if-let [{:keys [raw? op e a v]} (item-shape item)]
-                    (let [e' (entity-uuid-ref e)
-                          v' (if (and (integer? v) (contains? ref-attrs a))
-                               (entity-uuid-ref v)
-                               v)]
-                      (cond
-                        raw?
-                        (cond-> [e' a]
-                          (some? v') (conj v')
-                          (>= (count item) 4) (conj (nth item 3))
-                          (= 5 (count item)) (conj (nth item 4)))
-
-                        (contains? #{:db/retractEntity :db.fn/retractEntity} op)
-                        [op e']
-
-                        (contains? #{:db/add :db/retract} op)
-                        (cond-> [op e' a]
-                          (some? v') (conj v')
-                          (= 5 (count item)) (conj (nth item 4)))
-
-                        :else item))
-                    item))
-                tx-data))
+        (rewrite-canonicalized-outbound-tx-data
+         tx-data outbound-item-shape created-uuids ref-attrs entity-uuid-ref)
         tx-data))
     tx-data))
 
@@ -1194,6 +1201,23 @@
                               (sync-protocol/tx-payload-digest
                                (:outliner-op tx-entry) tx-data))))))
 
+(defn- log-flush-pending-skipped!
+  [repo pending-count conn local-tx remote-tx inflight ws ws-open-state?
+   online? upload-stopped-state? ready?]
+  (when (and (pos? (or pending-count 0))
+             (not ready?))
+    (log/info :db-sync/flush-pending-skipped
+              {:repo repo
+               :pending-local-tx-count pending-count
+               :has-db? (some? conn)
+               :local-tx local-tx
+               :remote-tx remote-tx
+               :inflight-count (count inflight)
+               :ws-open? ws-open-state?
+               :ws-ready-state (ws-ready-state ws)
+               :online? online?
+               :upload-stopped? upload-stopped-state?})))
+
 (defn flush-pending!
   [repo client]
   (let [inflight @(:inflight client)
@@ -1220,19 +1244,9 @@
                     ws-open-state?
                     online?
                     (not upload-stopped-state?))]
-    (when (and (pos? (or pending-count 0))
-               (not ready?))
-      (log/info :db-sync/flush-pending-skipped
-                {:repo repo
-                 :pending-local-tx-count pending-count
-                 :has-db? (some? conn)
-                 :local-tx local-tx
-                 :remote-tx remote-tx
-                 :inflight-count (count inflight)
-                 :ws-open? ws-open-state?
-                 :ws-ready-state (ws-ready-state ws)
-                 :online? online?
-                 :upload-stopped? upload-stopped-state?}))
+    (log-flush-pending-skipped!
+     repo pending-count conn local-tx remote-tx inflight ws ws-open-state?
+     online? upload-stopped-state? ready?)
     (when ready?
       (let [batch (pending-txs repo {:limit 50})]
         (when (seq batch)
