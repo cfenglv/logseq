@@ -2082,8 +2082,7 @@
                next-id (atom 0)
                registrations (atom {})
                cleared (atom [])
-               sent (atom [])
-               latest-prev @db-sync/*repo->latest-remote-tx]
+               sent (atom [])]
            (reset! worker-state/*db-sync-config {:ws-url "wss://sync.example.test/sync/%s"})
            (reset! worker-state/*db-sync-client nil)
            (platform/set-platform!
@@ -2844,7 +2843,7 @@
                          :online-users (atom [])
                          :ws-state (atom :open)}]
              (set! js/setTimeout
-                   (fn [f ms]
+                   (fn [f _ms]
                      (reset! timeout-callback f)
                      :upload-timeout))
              (set! js/clearTimeout (fn [& _] nil))
