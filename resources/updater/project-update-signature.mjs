@@ -16,6 +16,7 @@ const allowedTargets = new Set([
   "darwin/arm64",
   "darwin/x64",
   "win32/x64",
+  "win32/arm64",
   "linux/arm64",
   "linux/x64",
 ]);
