@@ -9,6 +9,7 @@
             [electron.configs :as cfgs]
             [electron.interop :as interop]
             [electron.logger :as logger]
+            [electron.proxy-env :as proxy-env]
             [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
             [logseq.common.graph-dir :as graph-dir]
@@ -233,15 +234,19 @@
      (= type "system")
      (p/let [_ (<set-electron-proxy {:type "system"})
              proxy (<get-system-proxy)]
-       (set-fetch-agent-proxy proxy))
+       (set-fetch-agent-proxy proxy)
+       (proxy-env/set-worker-proxy-env! proxy))
 
      (= type "direct")
      (p/let [_ (<set-electron-proxy {:type "direct"})]
-       (set-fetch-agent-proxy nil))
+       (set-fetch-agent-proxy nil)
+       (proxy-env/set-worker-proxy-env! nil))
 
      (or (= type "socks5") (= type "http"))
      (p/let [_ (<set-electron-proxy {:type type :host host :port port})]
-       (set-fetch-agent-proxy {:protocol type :host host :port port}))
+       (set-fetch-agent-proxy {:protocol type :host host :port port})
+       (proxy-env/set-worker-proxy-env!
+        {:protocol type :host host :port port}))
 
      :else
      (logger/error "Unknown proxy type:" type))))
