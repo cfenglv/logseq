@@ -823,6 +823,7 @@
                                :block/title
                                "staged tail"]]))
                sent (atom [])
+               active-client (atom nil)
                make-client (fn []
                              {:repo test-repo
                               :graph-id "graph-1"
@@ -850,10 +851,12 @@
                             :db-sync/created-at 1
                             :db-sync/outliner-op :insert-blocks
                             :db-sync/normalized-tx-data tx-data}])
-                         (p/let [client-before (make-client)
+                         (p/let [client-before (do (reset! active-client (make-client))
+                                                   @active-client)
                                  _ (#'sync-apply/flush-pending! test-repo client-before)
                                  _ (sync-apply/clear-upload-response-timeout! client-before)
-                                 client-after (make-client)
+                                 client-after (do (reset! active-client (make-client))
+                                                  @active-client)
                                  _ (#'sync-apply/flush-pending! test-repo client-after)]
                            (let [first-entry (get-in @sent [0 :txs 0])
                                  retry-entry (get-in @sent [1 :txs 0])
@@ -873,7 +876,8 @@
                                   (is nil (str error)))))))
                (p/finally
                  (fn []
-                   (sync-apply/clear-upload-response-timeout! client)
+                   (when-let [client @active-client]
+                     (sync-apply/clear-upload-response-timeout! client))
                    (done)))))))
 
 (deftest flush-pending-randomized-single-wire-reuses-frozen-entry-after-restart-test
