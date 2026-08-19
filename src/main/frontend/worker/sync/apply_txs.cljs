@@ -640,11 +640,13 @@
                   (merge-upload-tx-ranges (vals ranges-by-tempid))))))
 
 (defn- canonicalize-outbound-tx-data
-  "Wire data must never carry numeric db/ids. Re-resolve any numeric entity or
-  ref value for both op-prefixed and raw datom forms. Numeric ids are resolved
-  first from the payload's own :block/uuid datoms (entities created in the same
-  op and no longer addressable in the current db), then from the current db;
-  ordinary payloads without numeric ids pass through unchanged."
+  "Wire data must never carry numeric db/ids or refs to entities that no longer
+  exist. Re-resolve any numeric entity or ref value for both op-prefixed and raw
+  datom forms; drop ops whose ref target is absent from both the payload's own
+  :block/uuid adds and the current db (for example a parent retracted in the
+  same rebased op). Numeric ids are resolved first from the payload's own
+  :block/uuid datoms, then from the current db; ordinary payloads without
+  numeric ids pass through unchanged."
   [db tx-data]
   (if db
     (let [item-shape (fn [item]
@@ -663,6 +665,22 @@
                                        (when (and (= :block/uuid a) (uuid? v))
                                          [e [:block/uuid v]]))))
                              tx-data)
+          retracted-uuids (into #{}
+                                (keep (fn [item]
+                                        (when-let [{:keys [op e]} (item-shape item)]
+                                          (when (contains? #{:db/retractEntity :db.fn/retractEntity} op)
+                                            (block-uuid-lookup-ref-value e)))))
+                                tx-data)
+          created-uuids (into #{}
+                              (keep (fn [item]
+                                      (when-let [{:keys [raw? op a v]} (item-shape item)]
+                                        (when (and (= :block/uuid a)
+                                                   (uuid? v)
+                                                   (or (= :db/add op)
+                                                       (and raw?
+                                                            (not (contains? retracted-uuids v)))))
+                                          v))))
+                              tx-data)
           entity-uuid-ref (fn [x]
                             (if (integer? x)
                               (or (get tx-uuid-refs x)
@@ -670,6 +688,20 @@
                                     [:block/uuid block-uuid])
                                   x)
                               x))
+          entity-valid? (fn [e]
+                          (or (not (integer? e))
+                              (some? (get tx-uuid-refs e))
+                              (some? (d/entity db e))))
+          target-valid? (fn [v]
+                          (if (integer? v)
+                            (if-let [uuid (some-> (get tx-uuid-refs v) second)]
+                              (or (contains? created-uuids uuid)
+                                  (some? (d/entity db [:block/uuid uuid])))
+                              (some? (d/entity db v)))
+                            (if-let [uuid (block-uuid-lookup-ref-value v)]
+                              (or (contains? created-uuids uuid)
+                                  (some? (d/entity db [:block/uuid uuid])))
+                              true)))
           ref-attrs (into #{}
                           (keep (fn [item]
                                   (when-let [{:keys [raw? a]} (item-shape item)]
@@ -679,6 +711,15 @@
                                                (ref-attr? db a))
                                       a))))
                           tx-data)
+          tx-data (into []
+                        (keep (fn [item]
+                                (if-let [{:keys [e a v]} (item-shape item)]
+                                  (when (and (entity-valid? e)
+                                             (or (not (contains? ref-attrs a))
+                                                 (target-valid? v)))
+                                    item)
+                                  item)))
+                        tx-data)
           needs-canonicalization?
           (some (fn [item]
                   (when-let [{:keys [raw? op e a v]} (item-shape item)]
@@ -690,30 +731,43 @@
                              (and (integer? v) (contains? ref-attrs a))))))
                 tx-data)]
       (if needs-canonicalization?
-        (mapv (fn [item]
-                (if-let [{:keys [raw? op e a v]} (item-shape item)]
-                  (let [e' (entity-uuid-ref e)
-                        v' (if (and (integer? v) (contains? ref-attrs a))
-                             (entity-uuid-ref v)
-                             v)]
-                    (cond
-                      raw?
-                      (cond-> [e' a]
-                        (some? v') (conj v')
-                        (>= (count item) 4) (conj (nth item 3))
-                        (= 5 (count item)) (conj (nth item 4)))
+        (let [retract-item? (fn [item]
+                              (when-let [{:keys [op]} (item-shape item)]
+                                (contains? #{:db/retractEntity :db.fn/retractEntity} op)))
+              created-uuid-add? (fn [item]
+                                  (when-let [{:keys [a v]} (item-shape item)]
+                                    (and (= :block/uuid a)
+                                         (uuid? v)
+                                         (contains? created-uuids v))))
+              tx-data (concat (filter retract-item? tx-data)
+                              (filter created-uuid-add? tx-data)
+                              (remove #(or (retract-item? %)
+                                           (created-uuid-add? %))
+                                      tx-data))]
+          (mapv (fn [item]
+                  (if-let [{:keys [raw? op e a v]} (item-shape item)]
+                    (let [e' (entity-uuid-ref e)
+                          v' (if (and (integer? v) (contains? ref-attrs a))
+                               (entity-uuid-ref v)
+                               v)]
+                      (cond
+                        raw?
+                        (cond-> [e' a]
+                          (some? v') (conj v')
+                          (>= (count item) 4) (conj (nth item 3))
+                          (= 5 (count item)) (conj (nth item 4)))
 
-                      (contains? #{:db/retractEntity :db.fn/retractEntity} op)
-                      [op e']
+                        (contains? #{:db/retractEntity :db.fn/retractEntity} op)
+                        [op e']
 
-                      (contains? #{:db/add :db/retract} op)
-                      (cond-> [op e' a]
-                        (some? v') (conj v')
-                        (= 5 (count item)) (conj (nth item 4)))
+                        (contains? #{:db/add :db/retract} op)
+                        (cond-> [op e' a]
+                          (some? v') (conj v')
+                          (= 5 (count item)) (conj (nth item 4)))
 
-                      :else item))
-                  item))
-              tx-data)
+                        :else item))
+                    item))
+                tx-data))
         tx-data))
     tx-data))
 

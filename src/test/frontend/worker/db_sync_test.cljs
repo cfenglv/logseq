@@ -270,33 +270,46 @@
 (declare minimal-platform)
 
 (defn- with-datascript-conns
-  [db-conn ops-conn f]
-  (let [db-prev @worker-state/*datascript-conns
-        ops-prev @worker-state/*client-ops-conns]
-    (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
-    (reset! worker-state/*datascript-conns {test-repo db-conn})
-    (reset! worker-state/*client-ops-conns {test-repo ops-conn})
-    (undo-redo/clear-history! test-repo)
-    ;; Keep sync-message tests deterministic under strict local-tx validation.
-    (when (and ops-conn (nil? (client-op/get-local-tx test-repo)))
-      (client-op/update-local-tx test-repo 0))
-    (when ops-conn
-      (d/listen! db-conn ::listen-db
-                 (fn [tx-report]
-                   (db-sync/enqueue-local-tx! test-repo tx-report))))
-    (let [result (f)
-          cleanup (fn []
-                    (when ops-conn
-                      (d/unlisten! db-conn ::listen-db))
-                    (undo-redo/clear-history! test-repo)
-                    (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
-                    (reset! worker-state/*datascript-conns db-prev)
-                    (reset! worker-state/*client-ops-conns ops-prev))]
-      (if (promise-like? result)
-        (.finally (js/Promise.resolve result) cleanup)
-        (do
-          (cleanup)
-          result)))))
+  ([db-conn ops-conn f]
+   (with-datascript-conns test-repo db-conn ops-conn f))
+  ([repo db-conn ops-conn f]
+   (let [db-prev (get @worker-state/*datascript-conns repo)
+         ops-prev (get @worker-state/*client-ops-conns repo)]
+     (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+     (swap! worker-state/*datascript-conns assoc repo db-conn)
+     (swap! worker-state/*client-ops-conns assoc repo ops-conn)
+     (undo-redo/clear-history! repo)
+     ;; Keep sync-message tests deterministic under strict local-tx validation.
+     (when (and ops-conn (nil? (client-op/get-local-tx repo)))
+       (client-op/update-local-tx repo 0))
+     (when ops-conn
+       (d/listen! db-conn ::listen-db
+                  (fn [tx-report]
+                    (db-sync/enqueue-local-tx! repo tx-report))))
+     (let [result (f)
+           cleanup (fn []
+                     (when ops-conn
+                       (d/unlisten! db-conn ::listen-db))
+                     (undo-redo/clear-history! repo)
+                     (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+                     ;; Only restore this call's own entry. Overlapping async
+                     ;; tests may have replaced the same repo key with their
+                     ;; own conn; an unconditional restore would delete it.
+                     (when (identical? (get @worker-state/*datascript-conns repo)
+                                       db-conn)
+                       (if (some? db-prev)
+                         (swap! worker-state/*datascript-conns assoc repo db-prev)
+                         (swap! worker-state/*datascript-conns dissoc repo)))
+                     (when (identical? (get @worker-state/*client-ops-conns repo)
+                                       ops-conn)
+                       (if (some? ops-prev)
+                         (swap! worker-state/*client-ops-conns assoc repo ops-prev)
+                         (swap! worker-state/*client-ops-conns dissoc repo))))]
+       (if (promise-like? result)
+         (.finally (js/Promise.resolve result) cleanup)
+         (do
+           (cleanup)
+           result))))))
 
 (defn- setup-parent-child
   []
@@ -1200,6 +1213,7 @@
 (deftest flush-pending-splits-large-upload-request-with-dependent-blocks-test
   (async done
          (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               repo (str test-repo "-splits-large-" (random-uuid))
                tx-id (random-uuid)
                parent-uuid (random-uuid)
                child-uuid (random-uuid)
@@ -1226,7 +1240,7 @@
                              parent-tx
                              child-tx))
                sent (atom [])
-               client {:repo test-repo
+               client {:repo repo
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
@@ -1238,21 +1252,20 @@
                                                    (js->clj (js/JSON.parse raw)
                                                             :keywordize-keys true)))))}]
            (-> (with-datascript-conns
-                 conn
-                 client-ops-conn
+                 repo conn client-ops-conn
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
-                         (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
-                         (client-op/update-local-tx test-repo 0)
+                         (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                         (client-op/update-local-tx repo 0)
                          (seed-client-op-txs!
-                          test-repo
+                          repo
                           [{:db-sync/tx-id tx-id
                             :db-sync/pending? true
                             :db-sync/created-at 1
                             :db-sync/outliner-op :insert-blocks
                             :db-sync/normalized-tx-data tx-data}])
-                         (p/let [_ (#'sync-apply/flush-pending! test-repo client)
+                         (p/let [_ (#'sync-apply/flush-pending! repo client)
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
@@ -1262,9 +1275,9 @@
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (is (= parent-tx (subvec first-uploaded-tx 4993 5000)))
-                                     (sync-apply/ack-upload-response! test-repo client)
+                                     (sync-apply/ack-upload-response! repo client)
                                      (reset! (:inflight client) [])
-                                     (#'sync-apply/flush-pending! test-repo client))]
+                                     (#'sync-apply/flush-pending! repo client))]
                            (let [payload (second @sent)
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
@@ -1604,21 +1617,110 @@
                                wire-tx (some-> wire :txs first :tx sqlite-util/read-transit-str)]
                            (is (= "tx/batch" (:type wire)))
                            (is (= 1 (count (:txs wire))))
-                           (is (= [[:db/add [:block/uuid child-uuid]
+                           (is (= [[:db/retractEntity [:block/uuid child-uuid]]
+                                   [[:block/uuid stale-uuid]
+                                    :block/uuid stale-uuid
+                                    1]
+                                   [[:block/uuid stale-parent-uuid]
+                                    :block/uuid stale-parent-uuid
+                                    1]
+                                   [:db/add [:block/uuid child-uuid]
                                     :block/parent [:block/uuid parent-uuid]
                                     1]
                                    [[:block/uuid child-uuid]
                                     :block/parent [:block/uuid parent-uuid]
                                     1]
-                                   [:db/retractEntity [:block/uuid child-uuid]]
-                                   [[:block/uuid stale-uuid]
-                                    :block/uuid stale-uuid
-                                    1]
                                    [[:block/uuid stale-uuid]
                                     :block/parent [:block/uuid stale-parent-uuid]
+                                    1]]
+                                  wire-tx))))
+                       (p/catch (fn [error]
+                                  (is nil (str error))))
+                       (p/finally
+                         (fn []
+                           (sync-apply/clear-upload-response-timeout! client)
+                           (sync-apply/mark-pending-txs-false! test-repo [tx-id])
+                           (done)))))))))))
+
+(deftest flush-drops-outbound-refs-to-entities-missing-from-db-and-payload-test
+  (testing "outbound refs to entities absent from both db and payload must be dropped, never sent as numeric ids"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 tx-id (random-uuid)
+                 sent (atom [])
+                 child-eid (:db/id child1)
+                 child-uuid (:block/uuid child1)
+                 missing-uuid (random-uuid)
+                 recreated-uuid (random-uuid)
+                 recreated2-uuid (random-uuid)
+                 late-created-uuid (random-uuid)
+                 retracted-uuid (random-uuid)
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [raw]
+                                              (swap! sent conj
+                                                     (js->clj (js/JSON.parse raw)
+                                                              :keywordize-keys true)))))
+                         :online-users (atom [])
+                         :ws-state (atom :open)}]
+             (with-datascript-conns conn client-ops-conn
+               (fn []
+                 (client-op/update-local-tx test-repo 0)
+                 (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                 (reset! sync-apply/*repo->upload-stopped? {})
+                 (seed-client-op-txs!
+                  test-repo
+                  [{:db-sync/tx-id tx-id
+                    :db-sync/created-at 1
+                    :db-sync/pending? true
+                    :db-sync/outliner-op :insert-blocks
+                    :db-sync/normalized-tx-data
+                    [[:db/add child-eid :block/title "kept" 1]
+                     [:db/add child-eid :block/parent 9999 1]
+                     [:db/add child-eid :block/parent [:block/uuid missing-uuid] 1]
+                     [:db/add child-eid :block/parent 8888 1]
+                     [:db/add 8888 :block/uuid recreated-uuid 1]
+                     [:db/add child-eid :block/order "a" 1]
+                     [:db/retractEntity [:block/uuid retracted-uuid]]
+                     [7777 :block/uuid retracted-uuid 1]
+                     [:db/add child-eid :block/parent 7777 1]
+                     [:db/add child-eid :block/parent 4444 1]
+                     [:db/add 4444 :block/uuid late-created-uuid 1]
+                     [:db/add 5555 :block/uuid recreated2-uuid 1]
+                     [:db/retractEntity [:block/uuid recreated2-uuid]]
+                     [:db/add child-eid :block/parent 5555 1]]}])
+                 (p/with-redefs [worker-state/online? (constantly true)
+                                 sync-crypt/graph-e2ee? (constantly false)]
+                   (-> (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                         (let [wire-tx (some-> @sent first :txs first :tx sqlite-util/read-transit-str)]
+                           (is (= [[:db/retractEntity [:block/uuid retracted-uuid]]
+                                   [:db/retractEntity [:block/uuid recreated2-uuid]]
+                                   [:db/add [:block/uuid recreated-uuid]
+                                    :block/uuid recreated-uuid
                                     1]
-                                   [[:block/uuid stale-parent-uuid]
-                                    :block/uuid stale-parent-uuid
+                                   [:db/add [:block/uuid late-created-uuid]
+                                    :block/uuid late-created-uuid
+                                    1]
+                                   [:db/add [:block/uuid recreated2-uuid]
+                                    :block/uuid recreated2-uuid
+                                    1]
+                                   [:db/add [:block/uuid child-uuid] :block/title "kept" 1]
+                                    [:db/add [:block/uuid child-uuid]
+                                     :block/parent [:block/uuid recreated-uuid]
+                                     1]
+                                   [:db/add [:block/uuid child-uuid] :block/order "a" 1]
+                                   [[:block/uuid retracted-uuid]
+                                    :block/uuid retracted-uuid
+                                    1]
+                                   [:db/add [:block/uuid child-uuid]
+                                    :block/parent [:block/uuid late-created-uuid]
+                                    1]
+                                   [:db/add [:block/uuid child-uuid]
+                                    :block/parent [:block/uuid recreated2-uuid]
                                     1]]
                                   wire-tx))))
                        (p/catch (fn [error]
@@ -1804,6 +1906,246 @@
                             (undo-redo/clear-history! repo)
                             (swap! client-op/*repo->pending-local-tx-count dissoc repo)
                             (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                            (done)))))))
+
+(defn- active-sync-client
+  [repo sent now]
+  {:repo repo
+   :graph-id "graph-1"
+   :ws (doto (js-obj)
+         (aset "readyState" 1)
+         (aset "send" (fn [raw]
+                        (swap! sent conj
+                               (js->clj (js/JSON.parse raw) :keywordize-keys true)))))
+   :ws-state (atom :open)
+   :inflight (atom [])
+   :send-queue (atom (p/resolved nil))
+   :receive-queue (atom (p/resolved nil))
+   :asset-queue (atom (p/resolved nil))
+   :pending-pull-since (atom nil)
+   :online-users (atom [])
+   :reconnect (atom {:attempt 0 :timer nil})
+   :stale-kill-timer (atom nil)
+   :last-ws-message-ts (atom now)
+   :last-sync-error (atom nil)})
+
+(deftest start-active-client-requests-catch-up-pull-when-local-lags-remote-test
+  (async done
+         (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+               repo (str test-repo "-catch-up-pull-" (random-uuid))
+               now (common-util/time-ms)
+               sent (atom [])
+               latest-prev @db-sync/*repo->latest-remote-tx
+               get-datascript-conn worker-state/get-datascript-conn
+               get-client-ops-conn worker-state/get-client-ops-conn
+               client (active-sync-client repo sent now)
+               client-atom (atom client)
+               config-atom (atom {:ws-url "wss://sync.example.test/sync/%s"})]
+           (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+           (undo-redo/clear-history! repo)
+           (swap! db-sync/*repo->latest-remote-tx assoc repo 10)
+           (reset! (:pending-pull-since client) {:since 5 :sent-at (- now 6000)})
+           (-> (p/with-redefs [worker-state/*db-sync-client client-atom
+                               worker-state/*db-sync-config config-atom
+                               worker-state/get-datascript-conn
+                               (fn [repo']
+                                 (if (= repo repo')
+                                   conn
+                                   (get-datascript-conn repo')))
+                               worker-state/get-client-ops-conn
+                               (fn [repo']
+                                 (if (= repo repo')
+                                   client-ops-conn
+                                   (get-client-ops-conn repo')))
+                               sync-util/get-graph-id (fn [_repo] "graph-1")
+                               sync-download/repair-staging-in-progress? (constantly false)
+                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (client-op/update-local-tx repo 5)
+                 (p/let [_ (db-sync/start! repo)
+                         _ @(:send-queue client)]
+                   (is (= [{:type "pull" :since 5}] @sent))
+                   (let [pending @(:pending-pull-since client)]
+                     (is (= 5 (:since pending)))
+                     (is (number? (:sent-at pending)))
+                     (is (>= (:sent-at pending) now)))))
+               (p/catch (fn [error]
+                          (is nil (str error))))
+               (p/finally (fn []
+                            (undo-redo/clear-history! repo)
+                            (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+                            (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                            (done)))))))
+
+(deftest start-active-client-skips-catch-up-pull-within-freeze-interval-test
+  (async done
+         (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+               repo (str test-repo "-catch-up-freeze-" (random-uuid))
+               now (common-util/time-ms)
+               sent (atom [])
+               latest-prev @db-sync/*repo->latest-remote-tx
+               get-datascript-conn worker-state/get-datascript-conn
+               get-client-ops-conn worker-state/get-client-ops-conn
+               client (active-sync-client repo sent now)
+               client-atom (atom client)
+               config-atom (atom {:ws-url "wss://sync.example.test/sync/%s"})]
+           (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+           (undo-redo/clear-history! repo)
+           (swap! db-sync/*repo->latest-remote-tx assoc repo 10)
+           (reset! (:pending-pull-since client) {:since 5 :sent-at now})
+           (-> (p/with-redefs [worker-state/*db-sync-client client-atom
+                               worker-state/*db-sync-config config-atom
+                               worker-state/get-datascript-conn
+                               (fn [repo']
+                                 (if (= repo repo')
+                                   conn
+                                   (get-datascript-conn repo')))
+                               worker-state/get-client-ops-conn
+                               (fn [repo']
+                                 (if (= repo repo')
+                                   client-ops-conn
+                                   (get-client-ops-conn repo')))
+                               sync-util/get-graph-id (fn [_repo] "graph-1")
+                               sync-download/repair-staging-in-progress? (constantly false)
+                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (client-op/update-local-tx repo 5)
+                 (p/let [_ (db-sync/start! repo)
+                         _ @(:send-queue client)]
+                   (is (empty? @sent))
+                   (is (= {:since 5 :sent-at now}
+                          @(:pending-pull-since client)))))
+               (p/catch (fn [error]
+                          (is nil (str error))))
+               (p/finally (fn []
+                            (undo-redo/clear-history! repo)
+                            (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+                            (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                            (done)))))))
+
+(deftest start-active-client-skips-catch-up-pull-during-repair-staging-test
+  (async done
+         (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+               repo (str test-repo "-catch-up-repair-" (random-uuid))
+               now (common-util/time-ms)
+               sent (atom [])
+               latest-prev @db-sync/*repo->latest-remote-tx
+               get-datascript-conn worker-state/get-datascript-conn
+               get-client-ops-conn worker-state/get-client-ops-conn
+               client (active-sync-client repo sent now)
+               client-atom (atom client)
+               config-atom (atom {:ws-url "wss://sync.example.test/sync/%s"})]
+           (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+           (undo-redo/clear-history! repo)
+           (swap! db-sync/*repo->latest-remote-tx assoc repo 10)
+           (reset! (:pending-pull-since client) {:since 5 :sent-at (- now 6000)})
+           (-> (p/with-redefs [worker-state/*db-sync-client client-atom
+                               worker-state/*db-sync-config config-atom
+                               worker-state/get-datascript-conn
+                               (fn [repo']
+                                 (if (= repo repo')
+                                   conn
+                                   (get-datascript-conn repo')))
+                               worker-state/get-client-ops-conn
+                               (fn [repo']
+                                 (if (= repo repo')
+                                   client-ops-conn
+                                   (get-client-ops-conn repo')))
+                               sync-util/get-graph-id (fn [_repo] "graph-1")
+                               sync-download/repair-staging-in-progress? (constantly true)
+                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (client-op/update-local-tx repo 5)
+                 (p/let [_ (db-sync/start! repo)
+                         _ @(:send-queue client)]
+                   (is (empty? @sent))
+                   (is (= {:since 5 :sent-at (- now 6000)}
+                          @(:pending-pull-since client)))))
+               (p/catch (fn [error]
+                          (is nil (str error))))
+               (p/finally (fn []
+                            (undo-redo/clear-history! repo)
+                            (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+                            (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                            (done)))))))
+
+(deftest catch-up-pull-timer-runs-while-client-active-and-stops-on-stop!-test
+  (async done
+         (let [repo (str test-repo "-catch-up-timer-" (random-uuid))
+               graph-id "graph-1"
+               prev-client @worker-state/*db-sync-client
+               prev-config @worker-state/*db-sync-config
+               prev-platform (try
+                               (platform/current)
+                               (catch :default _ nil))
+               next-id (atom 0)
+               registrations (atom {})
+               cleared (atom [])
+               sent (atom [])
+               latest-prev @db-sync/*repo->latest-remote-tx]
+           (reset! worker-state/*db-sync-config {:ws-url "wss://sync.example.test/sync/%s"})
+           (reset! worker-state/*db-sync-client nil)
+           (platform/set-platform!
+            {:env {:runtime :node}
+             :storage {}
+             :kv {}
+             :broadcast {}
+             :websocket {:connect (fn [_url]
+                                    #js {:readyState 0
+                                         :send (fn [raw]
+                                                 (swap! sent conj
+                                                        (js->clj (js/JSON.parse raw)
+                                                                 :keywordize-keys true)))
+                                         :close (fn [] nil)})}
+             :crypto {}
+             :timers {}
+             :sqlite {}})
+           (swap! db-sync/*repo->latest-remote-tx assoc repo 10)
+           (-> (p/with-redefs [js/setInterval
+                               (fn [f ms]
+                                 (let [id (swap! next-id inc)]
+                                   (swap! registrations assoc id {:f f :ms ms})
+                                   id))
+                               js/clearInterval
+                               (fn [id]
+                                 (swap! cleared conj id))
+                               worker-state/get-client-ops-conn (fn [_repo] true)
+                               client-op/get-local-tx (fn [_repo] 5)
+                               client-op/get-pending-local-tx-count (fn [_repo] 0)
+                               client-op/get-unpushed-asset-ops-count (fn [_repo] 0)
+                               client-op/get-all-asset-ops (fn [_repo] [])
+                               client-op/get-local-checksum (fn [_repo] nil)
+                               client-op/get-graph-uuid (fn [_repo] graph-id)
+                               client-op/update-graph-uuid (fn [_repo _graph-id] nil)
+                               sync-util/get-graph-id (fn [_repo] graph-id)
+                               db-sync/<resolve-ws-token (fn [] (p/resolved "token"))
+                               sync-download/<resume-repair-operation!
+                               (fn [_repo] (p/resolved {:resumed? false}))
+                               shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (p/let [_ (db-sync/start! repo)
+                         client @worker-state/*db-sync-client]
+                   (is (= #{60000 2000}
+                          (set (map :ms (vals @registrations))))
+                       "active client should register the stale-kill and catch-up intervals")
+                   (let [tick (:f (some (fn [[_id reg]]
+                                          (when (= 2000 (:ms reg)) reg))
+                                        @registrations))]
+                     (is (some? tick))
+                     (aset (:ws client) "readyState" 1)
+                     (tick)
+                     (-> @(:send-queue client)
+                         (p/then (fn [_]
+                                   (is (= [{:type "pull" :since 5}] @sent))
+                                   (db-sync/stop!)
+                                   (is (= (sort @cleared)
+                                          (sort (keys @registrations))))
+                                   (is (nil? @worker-state/*db-sync-client))))))))
+               (p/catch (fn [error]
+                          (is nil (str error))))
+               (p/finally (fn []
+                            (db-sync/stop!)
+                            (reset! worker-state/*db-sync-client prev-client)
+                            (reset! worker-state/*db-sync-config prev-config)
+                            (when prev-platform
+                              (platform/set-platform! prev-platform))
+                            (swap! db-sync/*repo->latest-remote-tx dissoc repo)
                             (done)))))))
 
 (deftest receive-queue-failure-updates-last-sync-error-test
@@ -2561,7 +2903,9 @@
                (-> @(:send-queue client)
                    (p/then (fn [_]
                              (is (= [{:type "pull" :since 0}] @*sent))
-                             (is (= 0 @(:pending-pull-since client)))))
+                             (let [pending @(:pending-pull-since client)]
+                               (is (= 0 (:since pending)))
+                               (is (number? (:sent-at pending))))))
                    (p/finally (fn [] (done)))))))))
 
 (deftest changed-message-dedupes-pull-request-test
@@ -2589,7 +2933,9 @@
                (-> @(:send-queue client)
                    (p/then (fn [_]
                              (is (= [{:type "pull" :since 3}] @*sent))
-                             (is (= 3 @(:pending-pull-since client)))))
+                             (let [pending @(:pending-pull-since client)]
+                               (is (= 3 (:since pending)))
+                               (is (number? (:sent-at pending))))))
                    (p/finally (fn [] (done)))))))))
 
 (deftest pull-ok-clears-pending-pull-request-marker-test

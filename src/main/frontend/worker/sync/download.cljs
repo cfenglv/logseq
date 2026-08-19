@@ -755,6 +755,11 @@
   [repo graph-id]
   [repo graph-id])
 
+(defn repair-staging-in-progress?
+  "True while this graph's one in-memory repair staging build is owned."
+  [repo graph-id]
+  (contains? @*repair-staging-builds (repair-staging-key repo graph-id)))
+
 (defn- repair-staging-owner?
   [repo graph-id owner-token]
   (identical? owner-token
