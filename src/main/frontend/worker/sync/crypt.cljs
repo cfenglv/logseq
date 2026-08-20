@@ -20,6 +20,7 @@
 (defonce ^:private node-default-auth-file "~/logseq/auth.json")
 (defonce ^:private e2ee-password-secret-key "logseq-encrypted-password")
 (def ^:private invalid-transit ::invalid-transit)
+(def ^:private native-secret-request-timeout-ms 10000)
 
 (defn- runtime
   [platform']
@@ -45,9 +46,20 @@
   (and (= :browser (runtime platform'))
        (= :capacitor (owner-source platform'))))
 
+(defn- electron-owned-node-runtime?
+  [platform']
+  (and (= :node (runtime platform'))
+       (= :electron (owner-source platform'))))
+
+(defn- native-secret-storage-runtime?
+  [platform']
+  (or (capacitor-runtime? platform')
+      (electron-owned-node-runtime? platform')))
+
 (defn- auth-file-path
   []
-  node-default-auth-file)
+  (or (:auth-path @worker-state/*db-sync-config)
+      node-default-auth-file))
 
 (defn- interactive-runtime?
   []
@@ -117,10 +129,11 @@
           _ (ensure-refresh-token! refresh-token)
           result (crypt/<encrypt-text-by-text-password refresh-token password)
           text (ldb/write-transit-str result)
-          native-saved? (if (capacitor-runtime? platform')
+          native-saved? (if (native-secret-storage-runtime? platform')
                           (-> (ui-request/<request :native-save-e2ee-password
                                                    {:key e2ee-password-secret-key
-                                                    :encrypted-text text})
+                                                    :encrypted-text text}
+                                                   {:timeout-ms native-secret-request-timeout-ms})
                               (p/then (fn [resp]
                                         (true? (:supported? resp))))
                               (p/catch (fn [e]
@@ -128,7 +141,8 @@
                                          false)))
                           false)]
     (if native-saved?
-      nil
+      (when (electron-owned-node-runtime? platform')
+        (platform/kv-set! platform' e2ee-password-secret-key text))
       (platform/save-secret-text! platform' e2ee-password-secret-key text))))
 
 (defn- <read-platform-e2ee-password-text
@@ -142,16 +156,21 @@
   [refresh-token]
   (ensure-refresh-token! refresh-token)
   (p/let [platform' (platform/current)
-          native-result (if (capacitor-runtime? platform')
+          native-result (if (native-secret-storage-runtime? platform')
                           (-> (ui-request/<request :native-get-e2ee-password
-                                                   {:key e2ee-password-secret-key})
+                                                   {:key e2ee-password-secret-key}
+                                                   {:timeout-ms native-secret-request-timeout-ms})
                               (p/catch (fn [e]
                                          (log/warn :db-sync/read-e2ee-password-native-failed {:error e})
                                          {:supported? false})))
                           {:supported? false})
           text (if (:supported? native-result)
                  (:encrypted-text native-result)
-                 (<read-platform-e2ee-password-text platform'))]
+                 (<read-platform-e2ee-password-text platform'))
+          _ (when (and (electron-owned-node-runtime? platform')
+                       (:supported? native-result)
+                       (some? text))
+              (platform/kv-set! platform' e2ee-password-secret-key text))]
     text))
 
 (defn- <decrypt-e2ee-password-text
@@ -177,16 +196,19 @@
 (defn- <clear-e2ee-password!
   []
   (p/let [platform' (platform/current)
-          native-deleted? (if (capacitor-runtime? platform')
+          native-deleted? (if (native-secret-storage-runtime? platform')
                             (-> (ui-request/<request :native-delete-e2ee-password
-                                                     {:key e2ee-password-secret-key})
+                                                     {:key e2ee-password-secret-key}
+                                                     {:timeout-ms native-secret-request-timeout-ms})
                                 (p/then (fn [resp]
                                           (true? (:supported? resp))))
                                 (p/catch (fn [e]
                                            (log/warn :db-sync/delete-e2ee-password-native-failed {:error e})
                                            false)))
                             false)
-          _ (when-not native-deleted?
+          _ (if native-deleted?
+              (when (electron-owned-node-runtime? platform')
+                (platform/kv-set! platform' e2ee-password-secret-key nil))
               (-> (platform/delete-secret-text! platform' e2ee-password-secret-key)
                   (p/catch (fn [e]
                              (log/warn :db-sync/delete-e2ee-password-secret-failed {:error e})
@@ -680,6 +702,28 @@
         (if (= value' invalid-transit)
           value
           value')))))
+
+(defn <decrypt-text-value-strict
+  [aes-key value]
+  (assert (string? value)
+          (str "encrypted value should be a string, value: " value))
+  (let [decoded (read-transit-safe value)]
+    (if (= decoded invalid-transit)
+      (p/rejected
+       (ex-info "invalid encrypted transit payload"
+                {:type :db-sync/large-title-decrypt-failed}))
+      (if-let [decrypted (crypt/<decrypt-text-if-encrypted aes-key decoded)]
+        (p/let [plain-transit decrypted
+                plain-value (read-transit-safe plain-transit)]
+          (if (and (not= plain-value invalid-transit)
+                   (string? plain-value))
+            plain-value
+            (p/rejected
+             (ex-info "invalid decrypted title payload"
+                      {:type :db-sync/large-title-decrypt-failed}))))
+        (p/rejected
+         (ex-info "payload is not encrypted"
+                  {:type :db-sync/large-title-decrypt-failed}))))))
 
 (defn- encrypt-tx-item
   [aes-key item]

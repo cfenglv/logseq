@@ -84,6 +84,10 @@
   [pool path data]
   (.importDb ^js pool path data))
 
+(defn- unlink-db-file!
+  [pool path]
+  (.unlink ^js pool path))
+
 (defn- remove-vfs!
   [pool]
   (when pool
@@ -207,6 +211,7 @@
              :resolve-db-path (fn [_repo _pool path] path)
              :export-file export-file
              :import-db import-db
+             :unlink-db-file! unlink-db-file!
              :remove-vfs! remove-vfs!
              :read-text! read-text!
              :write-text! write-text!

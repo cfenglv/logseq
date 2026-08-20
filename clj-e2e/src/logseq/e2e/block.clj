@@ -5,8 +5,7 @@
             [logseq.e2e.keyboard :as k]
             [logseq.e2e.locator :as loc]
             [logseq.e2e.util :as util]
-            [wally.main :as w]
-            [wally.repl :as repl]))
+            [wally.main :as w]))
 
 (defn open-last-block
   "Open the last existing block or pressing add button to create a new block"
@@ -50,14 +49,21 @@
         (assert/assert-editor-mode)
         (save-block title)
         (catch Throwable e
-          (if in-retry?
-            (throw (ex-info
-                    "new-block exception"
-                    {:current-id (.getAttribute (w/-query ".editor-wrapper textarea") "id")
-                     :last-id last-id}
-                    e))
-            (do (prn :retry-new-block title)
-                (new-block title true))))))))
+          ;; A remote render can replace the transient editor after the input
+          ;; event has already committed the uniquely titled block. Treat the
+          ;; committed UI state as success instead of creating a duplicate.
+          (if (and (not (string/blank? title))
+                   (some #(= title %)
+                         (util/get-page-blocks-contents)))
+            true
+            (if in-retry?
+              (throw (ex-info
+                      "new-block exception"
+                      {:current-id (.getAttribute (w/-query ".editor-wrapper textarea") "id")
+                       :last-id last-id}
+                      e))
+              (do (prn :retry-new-block title)
+                  (new-block title true)))))))))
 
 ;; TODO: support tree
 (defn new-blocks
@@ -98,15 +104,56 @@
 (def undo #(k/press "ControlOrMeta+z" {:delay 100}))
 (def redo #(k/press "ControlOrMeta+y" {:delay 100}))
 
+(def ^:private editor-layout-timeout-ms 10000)
+(def ^:private editor-layout-poll-ms 50)
+(def ^:private block-selection-timeout-ms 10000)
+(def ^:private block-selection-poll-ms 50)
+(def ^:private selected-blocks-q
+  ".ls-page-blocks .page-blocks-inner .ls-block.selected")
+
+(defn- current-editor-x
+  []
+  (when-let [editor (util/get-editor)]
+    (when-let [box (.boundingBox editor)]
+      (.-x box))))
+
+(defn- wait-for-editor-x
+  [moved? context]
+  (let [deadline (+ (System/nanoTime)
+                    (* editor-layout-timeout-ms 1000000))]
+    (loop [last-x nil]
+      (let [x (current-editor-x)]
+        (cond
+          (and (some? x) (moved? x))
+          x
+
+          (< (System/nanoTime) deadline)
+          (do
+            (util/wait-timeout editor-layout-poll-ms)
+            (recur (or x last-x)))
+
+          :else
+          (throw
+           (ex-info
+            "editor layout did not reach the expected position"
+            (merge {:timeout-ms editor-layout-timeout-ms
+                    :last-x (or x last-x)}
+                   context))))))))
+
 (defn- indent-outdent
   [indent?]
-  (let [editor (util/get-editor)
-        [x1 _] (util/bounding-xy editor)
+  (let [x1 (wait-for-editor-x (constantly true)
+                              {:operation (if indent? :indent :outdent)
+                               :stage :before-key})
         _ (if indent? (k/tab) (k/shift+tab))
-        [x2 _] (util/bounding-xy editor)]
-    (if indent?
-      (is (< x1 x2))
-      (is (> x1 x2)))))
+        moved? (if indent?
+                 #(< x1 %)
+                 #(> x1 %))
+        x2 (wait-for-editor-x moved?
+                              {:operation (if indent? :indent :outdent)
+                               :stage :after-key
+                               :before-x x1})]
+    (is (moved? x2))))
 
 (defn indent
   []
@@ -128,6 +175,54 @@
   (util/input property-value)
   (w/wait-for (format "#ac-0.menu-link:has-text('%s')" property-value))
   (k/enter))
+
+(defn select-blocks-to-count
+  [target-count]
+  ;; A remote render can briefly replace the editor/selection DOM. Sending all
+  ;; key events back-to-back lets a slow runner swallow an intermediate event,
+  ;; so wait for each visible selection change before sending the next one.
+  ;; The first key can select either one block or the editor block plus its
+  ;; predecessor, depending on the current mode; stop at the requested count
+  ;; instead of assuming every key changes the count by exactly one.
+  (letfn [(selected-count []
+            (util/count-elements selected-blocks-q))
+          (wait-for-count-change [previous-count]
+            (let [deadline (+ (System/nanoTime)
+                              (* block-selection-timeout-ms 1000000))]
+              (loop []
+                (let [current-count (selected-count)]
+                  (cond
+                    (not= previous-count current-count)
+                    current-count
+
+                    (< (System/nanoTime) deadline)
+                    (do
+                      (util/wait-timeout block-selection-poll-ms)
+                      (recur))
+
+                    :else
+                    (throw
+                     (ex-info
+                      "block selection count did not change"
+                      {:timeout-ms block-selection-timeout-ms
+                       :selected-count current-count
+                       :target-count target-count})))))))]
+    (loop [current-count (selected-count)]
+      (cond
+        (= target-count current-count)
+        true
+
+        (> current-count target-count)
+        (throw
+         (ex-info
+          "block selection exceeded requested count"
+          {:selected-count current-count
+           :target-count target-count}))
+
+        :else
+        (do
+          (k/press "Shift+ArrowUp" {:delay 20})
+          (recur (wait-for-count-change current-count)))))))
 
 (defn select-blocks
   [n]

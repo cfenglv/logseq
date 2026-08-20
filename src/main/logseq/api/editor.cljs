@@ -51,8 +51,10 @@
 
 (def exit_editing_mode
   (fn [select?]
-    (editor-handler/escape-editing {:select? select?})
-    nil))
+    (-> (editor-handler/consume-math-transition-boundary!
+         :plugin-api-exit
+         (editor-handler/escape-editing {:select? select?}))
+        (p/then (constantly nil)))))
 
 (def insert_at_editing_cursor
   (fn [content]

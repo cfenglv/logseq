@@ -15,6 +15,7 @@
             [frontend.util :as util]
             [logseq.common.config :as common-config]
             [logseq.db.frontend.content :as db-content]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.graph-parser.text :as text]
             [logseq.outliner.op]
             [promesa.core :as p]))
@@ -101,47 +102,73 @@
        (util/distinct-by-last-wins :block/uuid)))
 
 (defn wrap-parse-block
-  [{:block/keys [title level] :as block}]
-  (let [block (or (and (:db/id block) (db/entity (:db/id block)))
-                  (and (:block/uuid block) (db/entity [:block/uuid (:block/uuid block)]))
-                  block)
-        block (if (nil? title)
-                block
-                (let [heading-level (when (normalize-markdown-heading? block)
-                                      (markdown-heading-level title))
-                      title (if heading-level
-                              (commands/clear-markdown-heading (string/triml title))
-                              title)
-                      ast (mldoc/->edn (string/trim title) :markdown)
-                      first-elem-type (first (ffirst ast))
-                      block-with-title? (mldoc/block-with-title? first-elem-type)
-                      content' (str common-config/block-pattern (if block-with-title? " " "\n") title)
-                      hashtag-link-refs (existing-markdown-hashtag-link-refs ast)
-                      parsed-block (block/parse-block (assoc block :block/title content'))
-                      new-display-block? (and (nil? (:logseq.property.node/display-type block))
-                                              (contains? #{:code :math}
-                                                         (:logseq.property.node/display-type parsed-block)))
-                      block' (-> (merge block
-                                        parsed-block
-                                        {:block/title (if new-display-block?
-                                                        (:block/title parsed-block)
-                                                        title)}
-                                        (when heading-level
-                                          {:logseq.property/heading heading-level}))
-                                 (dissoc :block/format))]
-                  (update block' :block/refs
-                          (fn [refs]
-                            (->> (concat (-> refs
-                                             remove-non-existed-refs!
-                                             (use-cached-refs! block))
-                                         hashtag-link-refs)
-                                 (remove nil?)
-                                 (util/distinct-by-last-wins ref-dedupe-key))))))
-        title' (db-content/title-ref->id-ref (or (get block :block/title) title) (:block/refs block))
-        result (-> block
-                   (merge (if level {:block/level level} {}))
-                   (assoc :block/title title'))]
-    result))
+  ([block]
+   (wrap-parse-block block {}))
+  ([{:block/keys [title level] :as block}
+    {:keys [allow-display-type-conversion?]
+     :or {allow-display-type-conversion? true}
+     :as opts}]
+   (let [block (or (and (:db/id block) (db/entity (:db/id block)))
+                   (and (:block/uuid block) (db/entity [:block/uuid (:block/uuid block)]))
+                   block)
+         title (if (= :math (:logseq.property.node/display-type block))
+                 (gp-mldoc/canonical-displayed-math-title title)
+                 title)
+         block (if (nil? title)
+                 block
+                 (let [heading-level (when (normalize-markdown-heading? block)
+                                       (markdown-heading-level title))
+                       title (if heading-level
+                               (commands/clear-markdown-heading (string/triml title))
+                               title)
+                       ast (mldoc/->edn (string/trim title) :markdown)
+                       first-elem-type (first (ffirst ast))
+                       block-with-title? (mldoc/block-with-title? first-elem-type)
+                       content' (str common-config/block-pattern (if block-with-title? " " "\n") title)
+                       hashtag-link-refs (existing-markdown-hashtag-link-refs ast)
+                       parsed-block (block/parse-block (assoc block :block/title content'))
+                       detected-new-display-block?
+                       (and (nil? (:logseq.property.node/display-type block))
+                            (contains? #{:code :math}
+                                       (:logseq.property.node/display-type parsed-block)))
+                       detected-display-type (:logseq.property.node/display-type parsed-block)
+                       allow-math-display-type-conversion?
+                       (get opts :allow-math-display-type-conversion?
+                            allow-display-type-conversion?)
+                       display-type-conversion-allowed?
+                       (and allow-display-type-conversion?
+                            (or (not= :math detected-display-type)
+                                allow-math-display-type-conversion?))
+                       new-display-block? (and display-type-conversion-allowed?
+                                               detected-new-display-block?)
+                       parsed-block (if (and detected-new-display-block?
+                                             (not display-type-conversion-allowed?))
+                                      (-> parsed-block
+                                          (assoc :block/title title)
+                                          (dissoc :logseq.property.node/display-type
+                                                  :logseq.property.code/lang))
+                                      parsed-block)
+                       block' (-> (merge block
+                                         parsed-block
+                                         {:block/title (if new-display-block?
+                                                         (:block/title parsed-block)
+                                                         title)}
+                                         (when heading-level
+                                           {:logseq.property/heading heading-level}))
+                                  (dissoc :block/format))]
+                   (update block' :block/refs
+                           (fn [refs]
+                             (->> (concat (-> refs
+                                              remove-non-existed-refs!
+                                              (use-cached-refs! block))
+                                          hashtag-link-refs)
+                                  (remove nil?)
+                                  (util/distinct-by-last-wins ref-dedupe-key))))))
+         title' (db-content/title-ref->id-ref (or (get block :block/title) title) (:block/refs block))
+         result (-> block
+                    (merge (if level {:block/level level} {}))
+                    (assoc :block/title title'))]
+     result)))
 
 (defn save-file!
   "This fn is the db version of file-handler/alter-file"

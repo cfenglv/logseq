@@ -36,6 +36,30 @@
            (do (prn :current-rtc-tx new-m#)
                (recur (dec i#))))))))
 
+(defn wait-current-tx-synced
+  "Wait until the current RTC client has no transaction in flight.
+
+  The initial delay prevents an already-visible idle indicator from satisfying
+  the wait before a just-issued local transaction reaches the sync worker."
+  []
+  (util/wait-timeout 500)
+  (loop [i 15
+         previous nil]
+    (when (zero? i)
+      (throw
+       (ex-info
+        "wait-current-tx-synced failed"
+        {:current (get-rtc-tx)})))
+    (w/wait-for "button.cloud.on.idle" {:timeout 35000})
+    (util/wait-timeout 500)
+    (let [{:keys [local-tx remote-tx] :as current} (get-rtc-tx)
+          local-tx (or local-tx 0)
+          remote-tx (or remote-tx 0)]
+      (if (and (= local-tx remote-tx)
+               (= previous current))
+        current
+        (recur (dec i) current)))))
+
 (defn wait-tx-update-to
   [new-tx]
   (assert (int? new-tx))

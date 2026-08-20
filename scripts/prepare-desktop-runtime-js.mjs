@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { promises as fs } from "node:fs";
+import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,6 +18,16 @@ const cliBundleRelativePath = "cli/_build/default/dist/logseq-cli.js";
 const stagedCliRelativePath = "static/logseq-cli.js";
 const desktopCliRelativePath = "static/js/logseq-cli.js";
 const cliBundlePath = path.join(repoRoot, ...cliBundleRelativePath.split("/"));
+const runtimeRevisionVerifier = path.join(
+  repoRoot,
+  "scripts",
+  "verify-desktop-runtime-revisions.mjs",
+);
+const stagedRuntimeRevisionVerifier = path.join(
+  staticDir,
+  "verify-desktop-runtime-revisions.mjs",
+);
+const stagedRuntimeRevision = path.join(staticDir, "RUNTIME_REVISION");
 
 const copyPairs = [
   {
@@ -39,6 +50,14 @@ const copyPairs = [
   {
     from: path.join(skillSourceDir, "SKILL.md"),
     to: path.join(stagedSkillDir, "SKILL.md"),
+  },
+  {
+    from: path.join(repoRoot, "sidecar", "embedding_server.py"),
+    to: path.join(staticDir, "sidecar", "embedding_server.py"),
+  },
+  {
+    from: runtimeRevisionVerifier,
+    to: stagedRuntimeRevisionVerifier,
   },
 ];
 
@@ -86,6 +105,21 @@ async function main() {
     await assertFreshRuntime(pair);
     await copyOne(pair);
   }
+
+  const revision =
+    process.env.LOGSEQ_REVISION?.trim() ||
+    execFileSync("git", ["describe", "--long", "--always", "--dirty"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    }).trim();
+  if (!revision || revision.includes("\n") || revision.includes("\r")) {
+    throw new Error("desktop runtime revision must be a non-empty single line");
+  }
+  if (await exists(stagedRuntimeRevision)) {
+    const stats = await fs.stat(stagedRuntimeRevision);
+    await fs.chmod(stagedRuntimeRevision, stats.mode | 0o200);
+  }
+  await fs.writeFile(stagedRuntimeRevision, `${revision}\n`, { mode: 0o644 });
 
   // Keep root staged runtime files available for local CLI E2E and npm packaging.
 }

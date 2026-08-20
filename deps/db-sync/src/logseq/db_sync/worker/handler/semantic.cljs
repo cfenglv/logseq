@@ -236,6 +236,13 @@
 (defn- broadcast-change! [^js self]
   (ws/broadcast! self nil {:type "changed" :t (storage/get-t (.-sql self))}))
 
+(defn- perform-write!
+  [{:keys [write!]} f]
+  (when-not (fn? write!)
+    (throw (ex-info "semantic write integrity guard missing"
+                    {:type :db-sync/semantic-write-guard-missing})))
+  (write! f))
+
 (defn- list-pages [db]
   (->> [:logseq.class/Page :logseq.class/Journal]
        (keep #(d/entid db %))
@@ -452,7 +459,8 @@
                           (string/includes? (string/lower-case (or (:block/title entity) "")) needle)))))
          vec)))
 
-(defn- handle-pages [{:keys [^js self request ^js url conn db handler path-params]}]
+(defn- handle-pages [{:keys [^js self request ^js url conn db handler path-params]
+                      :as context}]
   (case handler
     :semantic/pages-list
     (paginated-response url :blocks (list-pages db) block-response)
@@ -461,7 +469,9 @@
     (p/let [body (body-clj request)]
       (if-not (seq (:title body))
         (http/bad-request "missing title")
-        (let [[title page-id] (outliner-page/create! conn (:title body) {})]
+        (let [[title page-id]
+              (perform-write!
+               context #(outliner-page/create! conn (:title body) {}))]
           (broadcast-change! self)
           (http/json-response nil {:uuid (str page-id) :kind "page" :title title} 201))))
 
@@ -490,7 +500,10 @@
       (if (or (not (page? page)) (not (seq (:title body))))
         (http/bad-request "invalid page-id or title")
         (do
-          (outliner-core/save-block! conn {:block/uuid (:block/uuid page) :block/title (:title body)})
+          (perform-write!
+           context
+           #(outliner-core/save-block!
+             conn {:block/uuid (:block/uuid page) :block/title (:title body)}))
           (broadcast-change! self)
           (http/json-response nil (assoc (block-response page) :title (:title body))))))
 
@@ -499,12 +512,14 @@
       (if-not (page? page)
         (http/bad-request "block is not a page")
         (do
-          (outliner-page/delete! conn (:block/uuid page))
+          (perform-write!
+           context #(outliner-page/delete! conn (:block/uuid page)))
           (broadcast-change! self)
           (js/Response. nil #js {:status 204})))
       (http/not-found))))
 
-(defn- handle-blocks [{:keys [^js self request conn db handler path-params]}]
+(defn- handle-blocks [{:keys [^js self request conn db handler path-params]
+                       :as context}]
   (case handler
 
     :semantic/blocks-get
@@ -518,18 +533,23 @@
       (if (or (nil? block) (not (seq (:title body))))
         (http/bad-request "invalid block-id or title")
         (do
-          (outliner-core/save-block! conn
-                                     (assoc (prepare-block-title! conn (:title body))
-                                            :block/uuid (:block/uuid block)))
+          (perform-write!
+           context
+           #(outliner-core/save-block!
+             conn
+             (assoc (prepare-block-title! conn (:title body))
+                    :block/uuid (:block/uuid block))))
           (broadcast-change! self)
           (http/json-response nil {:uuid (str (:block/uuid block)) :kind (block-kind block) :title (:title body)}))))
 
     :semantic/blocks-delete
     (if-let [block (find-entity db (:block-id path-params))]
       (do
-        (if (page? block)
-          (outliner-page/delete! conn (:block/uuid block))
-          (outliner-core/delete-blocks! conn [block] {}))
+        (perform-write!
+         context
+         #(if (page? block)
+            (outliner-page/delete! conn (:block/uuid block))
+            (outliner-core/delete-blocks! conn [block] {})))
         (broadcast-change! self)
         (js/Response. nil #js {:status 204}))
       (http/not-found))
@@ -551,7 +571,8 @@
                      "after" {:sibling? true :bottom? true}
                      "first-child" {:sibling? false :top? true}
                      "last-child" {:sibling? false :bottom? true})]
-          (outliner-core/move-blocks! conn blocks target opts)
+          (perform-write!
+           context #(outliner-core/move-blocks! conn blocks target opts))
           (broadcast-change! self)
           (http/json-response nil {:uuids (mapv #(str (:block/uuid %)) blocks) :moved true}))))
 
@@ -561,7 +582,9 @@
       (if (or (nil? target) (not (contains? #{"append" "prepend"} (:position body)))
               (not (seq (:blocks body))))
         (http/bad-request "invalid target, position, or blocks")
-        (let [inserted (insert-tree! conn target (:blocks body) (:position body))]
+        (let [inserted
+              (perform-write!
+               context #(insert-tree! conn target (:blocks body) (:position body)))]
           (broadcast-change! self)
           (http/json-response nil {:blocks inserted} 201))))
 
@@ -570,11 +593,16 @@
             target (find-entity db (:target-id body))]
       (if (or (nil? target) (not (seq (:blocks body))))
         (http/bad-request "invalid target or blocks")
-        (let [inserted (insert-tree! conn target (:blocks body) (or (:position body) "append"))]
+        (let [inserted
+              (perform-write!
+               context
+               #(insert-tree! conn target (:blocks body)
+                              (or (:position body) "append")))]
           (broadcast-change! self)
           (http/json-response nil {:blocks inserted} 201))))))
 
-(defn- handle-block-properties [{:keys [^js self request conn db handler path-params]}]
+(defn- handle-block-properties
+  [{:keys [^js self request conn db handler path-params] :as context}]
   (case handler
 
     :semantic/blocks-set-property
@@ -588,7 +616,10 @@
         (not (contains? body :value)) (http/bad-request "missing property value")
         (:error prepared) (http/bad-request (:error prepared))
         :else
-        (do (set-prepared-property! conn (:db/id block) property-ident (:value prepared) true)
+        (do (perform-write!
+             context
+             #(set-prepared-property!
+               conn (:db/id block) property-ident (:value prepared) true))
             (broadcast-change! self)
             (http/json-response nil {:updated true}))))
 
@@ -598,7 +629,10 @@
       (if (or (nil? block) (nil? property-ident))
         (http/bad-request "invalid block or property")
         (do
-          (outliner-property/remove-block-property! conn (:db/id block) property-ident)
+          (perform-write!
+           context
+           #(outliner-property/remove-block-property!
+             conn (:db/id block) property-ident))
           (broadcast-change! self)
           (js/Response. nil #js {:status 204}))))
 
@@ -615,12 +649,15 @@
               (some #(or (nil? (:block %)) (nil? (:property-ident %))
                          (:error (:prepared %))) resolved))
         (http/bad-request "invalid batch property entry")
-        (do (ldb/batch-transact-with-temp-conn!
-             conn {:outliner-op :batch-set-property}
-             (fn [temp-conn]
-               (doseq [{:keys [block property-ident prepared]} resolved]
-                 (set-prepared-property! temp-conn (:db/id block) property-ident (:value prepared)
-                                         (true? (:isResetExistingValues body))))))
+        (do (perform-write!
+             context
+             #(ldb/batch-transact-with-temp-conn!
+               conn {:outliner-op :batch-set-property}
+               (fn [temp-conn]
+                 (doseq [{:keys [block property-ident prepared]} resolved]
+                   (set-prepared-property!
+                    temp-conn (:db/id block) property-ident (:value prepared)
+                    (true? (:isResetExistingValues body)))))))
             (broadcast-change! self)
             (http/json-response nil {:updated (count resolved)}))))
 
@@ -633,23 +670,30 @@
       (if (or (not (seq entries)) (some #(or (nil? (:block %)) (nil? (:property-ident %))) resolved))
         (http/bad-request "invalid batch property entry")
         (do
-          (ldb/batch-transact-with-temp-conn!
-           conn {:outliner-op :batch-remove-property}
-           (fn [temp-conn]
-             (doseq [{:keys [block property-ident]} resolved]
-               (outliner-property/remove-block-property! temp-conn (:db/id block) property-ident))))
+          (perform-write!
+           context
+           #(ldb/batch-transact-with-temp-conn!
+             conn {:outliner-op :batch-remove-property}
+             (fn [temp-conn]
+               (doseq [{:keys [block property-ident]} resolved]
+                 (outliner-property/remove-block-property!
+                  temp-conn (:db/id block) property-ident)))))
           (broadcast-change! self)
           (http/json-response nil {:deleted (count resolved)}))))))
 
-(defn- handle-capture-and-tags [{:keys [^js self request ^js url conn db handler path-params]}]
+(defn- handle-capture-and-tags
+  [{:keys [^js self request ^js url conn db handler path-params] :as context}]
   (case handler
 
     :semantic/capture
     (p/let [body (body-clj request)]
       (if-not (seq (:blocks body))
         (http/bad-request "missing blocks")
-        (let [today (ensure-today-page! conn)
-              inserted (insert-tree! conn today (:blocks body) "append")]
+        (let [[today inserted]
+              (perform-write!
+               context
+               #(let [today (ensure-today-page! conn)]
+                  [today (insert-tree! conn today (:blocks body) "append")]))]
           (broadcast-change! self)
           (http/json-response nil {:page-id (str (:block/uuid today)) :blocks inserted} 201))))
 
@@ -660,7 +704,10 @@
     (p/let [body (body-clj request)]
       (if-not (seq (:title body))
         (http/bad-request "missing title")
-        (let [[title tag-id] (outliner-page/create! conn (:title body) {:class? true})]
+        (let [[title tag-id]
+              (perform-write!
+               context
+               #(outliner-page/create! conn (:title body) {:class? true}))]
           (broadcast-change! self)
           (http/json-response nil {:uuid (str tag-id) :title title} 201))))
 
@@ -682,7 +729,10 @@
       (if (or (not (tag? tag)) (not (seq (:title body))))
         (http/bad-request "invalid tag-id or title")
         (do
-          (outliner-core/save-block! conn {:block/uuid (:block/uuid tag) :block/title (:title body)})
+          (perform-write!
+           context
+           #(outliner-core/save-block!
+             conn {:block/uuid (:block/uuid tag) :block/title (:title body)}))
           (broadcast-change! self)
           (http/json-response nil (assoc (tag-response tag) :title (:title body))))))
 
@@ -691,12 +741,14 @@
       (if-not (tag? tag)
         (http/not-found)
         (do
-          (outliner-page/delete! conn (:block/uuid tag))
+          (perform-write!
+           context #(outliner-page/delete! conn (:block/uuid tag)))
           (broadcast-change! self)
           (js/Response. nil #js {:status 204})))
       (http/not-found))))
 
-(defn- handle-tasks [{:keys [^js self request ^js url conn db handler]}]
+(defn- handle-tasks
+  [{:keys [^js self request ^js url conn db handler] :as context}]
   (case handler
     :semantic/tasks-list
     (let [status (.get (.-searchParams url) "status")
@@ -739,32 +791,35 @@
           (and (:page-id body) (not (page? target))) (http/bad-request "invalid task page-id")
           :else
           (let [task-id (atom nil)]
-            (ldb/batch-transact-with-temp-conn!
-             conn {:outliner-op :create-task}
-             (fn [temp-conn]
-               (let [target (if target
-                              (d/entity @temp-conn [:block/uuid (:block/uuid target)])
-                              (ensure-today-page! temp-conn))
-                     inserted (first (insert-tree! temp-conn target [{:title (:title body)}] "append"))
-                     task-uuid (uuid (:uuid inserted))
-                     task (d/entity @temp-conn [:block/uuid task-uuid])]
-                 (reset! task-id task-uuid)
-                 (outliner-property/set-block-property! temp-conn (:db/id task) :block/tags
-                                                        (:db/id (d/entity @temp-conn :logseq.class/Task)))
-                 (outliner-property/set-block-property! temp-conn (:db/id task) :logseq.property/status
-                                                        (:db/id status-choice))
-                 (when priority-choice
-                   (outliner-property/set-block-property! temp-conn (:db/id task) :logseq.property/priority
-                                                          (:db/id priority-choice)))
-                 (doseq [property-ident [:logseq.property/scheduled :logseq.property/deadline]
-                         :let [value (get body (keyword (name property-ident)))]
-                         :when (some? value)]
-                   (outliner-property/set-block-property! temp-conn (:db/id task) property-ident value)))))
+            (perform-write!
+             context
+             #(ldb/batch-transact-with-temp-conn!
+               conn {:outliner-op :create-task}
+               (fn [temp-conn]
+                 (let [target (if target
+                                (d/entity @temp-conn [:block/uuid (:block/uuid target)])
+                                (ensure-today-page! temp-conn))
+                       inserted (first (insert-tree! temp-conn target [{:title (:title body)}] "append"))
+                       task-uuid (uuid (:uuid inserted))
+                       task (d/entity @temp-conn [:block/uuid task-uuid])]
+                   (reset! task-id task-uuid)
+                   (outliner-property/set-block-property! temp-conn (:db/id task) :block/tags
+                                                          (:db/id (d/entity @temp-conn :logseq.class/Task)))
+                   (outliner-property/set-block-property! temp-conn (:db/id task) :logseq.property/status
+                                                          (:db/id status-choice))
+                   (when priority-choice
+                     (outliner-property/set-block-property! temp-conn (:db/id task) :logseq.property/priority
+                                                            (:db/id priority-choice)))
+                   (doseq [property-ident [:logseq.property/scheduled :logseq.property/deadline]
+                           :let [value (get body (keyword (name property-ident)))]
+                           :when (some? value)]
+                     (outliner-property/set-block-property!
+                      temp-conn (:db/id task) property-ident value))))))
             (broadcast-change! self)
             (http/json-response nil (task-response (d/entity @conn [:block/uuid @task-id])) 201)))))))
 
 (defn- handle-assets
-  [{:keys [^js self request ^js url conn db handler path-params]}]
+  [{:keys [^js self request ^js url conn db handler path-params] :as context}]
   (case handler
     :semantic/assets-list
     (paginated-response url :assets
@@ -804,29 +859,46 @@
                                         :content-type (.get (.-headers request) "content-type")
                                         :checksum checksum
                                         :asset-type asset-type
-                                        :encoding encoding})]
+                                        :encoding encoding
+                                        ;; `asset-id` is generated inside this
+                                        ;; request, so failure cleanup cannot
+                                        ;; delete a pre-existing direct asset.
+                                        :cleanup-on-failure? true})]
                 (if-not (.-ok upload-response)
                   upload-response
-                  (-> (p/let [target (or target (ensure-today-page! conn))
-                              block {:block/uuid asset-id
-                                     :block/title title
-                                     :block/tags #{:logseq.class/Asset}
-                                     :logseq.property.asset/type asset-type
-                                     :logseq.property.asset/size size
-                                     :logseq.property.asset/checksum checksum
-                                     :logseq.property.asset/remote-metadata {:checksum checksum
-                                                                            :type asset-type}}
-                              _ (outliner-core/insert-blocks! conn [block] target
-                                                              {:sibling? false :bottom? true
-                                                               :keep-uuid? true})
-                              asset (d/entity @conn [:block/uuid asset-id])]
+                  (-> (p/let [asset
+                              (perform-write!
+                               context
+                               #(let [target (or target (ensure-today-page! conn))
+                                      block {:block/uuid asset-id
+                                             :block/title title
+                                             :block/tags #{:logseq.class/Asset}
+                                             :logseq.property.asset/type asset-type
+                                             :logseq.property.asset/size size
+                                             :logseq.property.asset/checksum checksum
+                                             :logseq.property.asset/remote-metadata
+                                             {:checksum checksum
+                                              :type asset-type}}]
+                                  (outliner-core/insert-blocks!
+                                   conn [block] target
+                                   {:sibling? false :bottom? true
+                                    :keep-uuid? true})
+                                  (d/entity @conn [:block/uuid asset-id])))]
                         (broadcast-change! self)
                         (http/json-response nil (asset-response asset) 201))
                       (p/catch (fn [error]
                                  (p/let [_ (.delete bucket key)]
                                    (throw error)))))))
               (p/catch (fn [error]
-                         (http/error-response (or (.-message error) "asset upload failed") 500)))))))
+                         ;; Preserve the shared semantic integrity contract:
+                         ;; the outer sync boundary maps a mid-flight snapshot
+                         ;; generation change to its retryable 409 response.
+                         (if (= :db-sync/snapshot-write-integrity-invalid
+                                (:type (ex-data error)))
+                           (throw error)
+                           (http/error-response
+                            (or (.-message error) "asset upload failed")
+                            500))))))))
 
     :semantic/assets-get
     (if-let [asset (find-visible-entity db (:asset-block-id path-params))]
@@ -840,7 +912,7 @@
       (http/not-found))))
 
 (defn- handle-properties-and-search
-  [{:keys [^js self request ^js url conn db handler path-params]}]
+  [{:keys [^js self request ^js url conn db handler path-params] :as context}]
   (case handler
 
     :semantic/properties-list
@@ -852,11 +924,14 @@
     (p/let [body (body-clj request)]
       (if (or (not (seq (:title body))) (not (valid-property-schema? body)))
         (http/bad-request "invalid property schema")
-        (let [property (outliner-property/upsert-property!
-                        conn nil
-                        {:logseq.property/type (keyword (or (:type body) "default"))
-                         :db/cardinality (keyword (or (:cardinality body) "db.cardinality/one"))}
-                        {:property-name (:title body)})]
+        (let [property
+              (perform-write!
+               context
+               #(outliner-property/upsert-property!
+                 conn nil
+                 {:logseq.property/type (keyword (or (:type body) "default"))
+                  :db/cardinality (keyword (or (:cardinality body) "db.cardinality/one"))}
+                 {:property-name (:title body)}))]
           (broadcast-change! self)
           (http/json-response nil (property-response property) 201))))
 
@@ -873,9 +948,13 @@
         (let [schema (cond-> {}
                        (:type body) (assoc :logseq.property/type (keyword (:type body)))
                        (:cardinality body) (assoc :db/cardinality (keyword (:cardinality body))))
-              updated (outliner-property/upsert-property!
-                       conn (:db/ident property) schema
-                       (cond-> {} (:title body) (assoc :property-name (:title body))))]
+              updated
+              (perform-write!
+               context
+               #(outliner-property/upsert-property!
+                 conn (:db/ident property) schema
+                 (cond-> {} (:title body)
+                   (assoc :property-name (:title body)))))]
           (broadcast-change! self)
           (http/json-response nil (property-response updated)))))
 
@@ -883,7 +962,8 @@
     (if-let [property (resolve-property db (:property-id path-params))]
       (if-not (property? property)
         (http/not-found)
-        (if (outliner-page/delete! conn (:block/uuid property))
+        (if (perform-write!
+             context #(outliner-page/delete! conn (:block/uuid property)))
           (do
             (broadcast-change! self)
             (js/Response. nil #js {:status 204}))

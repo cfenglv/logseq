@@ -32,15 +32,51 @@
                        n))
     :else nil))
 
+(defn- abort-upload-pipes!
+  [^js abort-controller error]
+  (when abort-controller
+    (try
+      (.abort abort-controller error)
+      (catch :default _ nil))))
+
+(defn- record-first-failure!
+  [first-failure error]
+  (compare-and-set! first-failure nil error)
+  error)
+
+(defn- capture-pipe-failure
+  "Attach a rejection handler in the same turn that an upload participant
+  starts. Every participant resolves this guarded Promise after retaining its
+  original failure, so the aggregate cannot fail fast while another stream is
+  still reading the request body. The first failure also aborts the shared
+  pipe graph."
+  [pipe-promise abort-controller first-failure]
+  (let [failure (atom nil)]
+    {:promise (p/catch (js/Promise.resolve pipe-promise)
+                       (fn [error]
+                         (reset! failure error)
+                         (record-first-failure! first-failure error)
+                         (abort-upload-pipes! abort-controller error)
+                         nil))
+     :failure failure}))
+
 (defn- fixed-length-body
-  [body size]
-  (when (and (number? size)
-             (exists? js/FixedLengthStream)
-             (some? body)
-             (fn? (.-pipeTo body)))
-    (let [^js fixed (js/FixedLengthStream. size)]
-      {:body (.-readable fixed)
-       :pipe-promise (.pipeTo body (.-writable fixed))})))
+  ([body size]
+   (fixed-length-body body size nil (atom nil)))
+  ([body size abort-controller first-failure]
+   (when (and (number? size)
+              (exists? js/FixedLengthStream)
+              (some? body)
+              (fn? (.-pipeTo body)))
+     (let [^js fixed (js/FixedLengthStream. size)
+           pipe-promise
+           (if abort-controller
+             (.pipeTo body (.-writable fixed)
+                      #js {:signal (.-signal abort-controller)})
+             (.pipeTo body (.-writable fixed)))]
+       (merge {:body (.-readable fixed)}
+              (capture-pipe-failure
+               pipe-promise abort-controller first-failure))))))
 
 (defn- decoded-base64-chunk
   [value]
@@ -53,7 +89,7 @@
     result))
 
 (defn- base64-decoded-body
-  [body]
+  [body abort-controller first-failure]
   (let [remainder (atom "")
         decoder (js/TextDecoder.)
         transform (js/TransformStream.
@@ -71,13 +107,50 @@
                         (fn [controller]
                           (let [tail (string/replace (str @remainder (.decode decoder)) #"\s" "")]
                             (when (seq tail)
-                              (.enqueue controller (decoded-base64-chunk tail)))))})]
-    {:body (.-readable transform)
-     :pipe-promise (.pipeTo body (.-writable transform))}))
+                              (.enqueue controller (decoded-base64-chunk tail)))))})
+        pipe-promise
+        (if abort-controller
+          (.pipeTo body (.-writable transform)
+                   #js {:signal (.-signal abort-controller)})
+          (.pipeTo body (.-writable transform)))]
+    (merge {:body (.-readable transform)}
+           (capture-pipe-failure
+            pipe-promise abort-controller first-failure))))
+
+(def ^:private best-effort-cleanup-timeout-ms 1000)
+
+(defn- <bounded-best-effort!
+  [start!]
+  (js/Promise.
+   (fn [resolve _reject]
+     (let [settled? (atom false)
+           timer* (atom nil)
+           finish! (fn [& _]
+                     (when (compare-and-set! settled? false true)
+                       (when-let [timer @timer*]
+                         (js/clearTimeout timer))
+                       (resolve nil)))]
+       (reset! timer* (js/setTimeout finish! best-effort-cleanup-timeout-ms))
+       (try
+         (.then (js/Promise.resolve (start!)) finish! finish!)
+         (catch :default _
+           (finish!)))))))
+
+(defn- <best-effort-delete!
+  [^js bucket key]
+  (if (fn? (.-delete bucket))
+    (<bounded-best-effort! #(.delete bucket key))
+    (p/resolved nil)))
+
+(defn- <best-effort-cancel!
+  [^js body error]
+  (if (fn? (some-> body .-cancel))
+    (<bounded-best-effort! #(.cancel body error))
+    (p/resolved nil)))
 
 (defn- response-fixed-length-body
   [body size]
-  (let [{stream-body :body pipe-promise :pipe-promise} (fixed-length-body body size)]
+  (let [{stream-body :body pipe-promise :promise} (fixed-length-body body size)]
     (when pipe-promise
       ;; The response consumes the paired readable stream after this handler returns.
       (p/catch pipe-promise (fn [_] nil)))
@@ -94,8 +167,10 @@
   | `:content-type` | HTTP content type stored in R2 metadata |
   | `:checksum`     | Client-computed SHA-256 checksum |
   | `:asset-type`   | File extension stored in custom metadata |
-  | `:encoding`     | Optional `base64` streaming transfer encoding |"
-  [^js bucket key body {:keys [size content-type checksum asset-type encoding]}]
+  | `:encoding`     | Optional `base64` streaming transfer encoding |
+  | `:cleanup-on-failure?` | Delete a failed new-key upload; never enable for overwrites |"
+  [^js bucket key body
+   {:keys [size content-type checksum asset-type encoding cleanup-on-failure?]}]
   (cond
     (or (not (number? size)) (neg? size))
     (p/resolved (http/error-response "invalid asset size" 400))
@@ -103,26 +178,58 @@
     (> size max-asset-size)
     (p/resolved (http/error-response "asset too large" 413))
 
-    (nil? body)
+    (and (nil? body) (pos? size))
     (p/resolved (http/error-response "missing asset body" 400))
 
     :else
-    (let [{decoded-body :body decode-promise :pipe-promise}
-          (when (= "base64" encoding) (base64-decoded-body body))
-          source-body (or decoded-body body)
-          {stream-body :body fixed-length-promise :pipe-promise} (fixed-length-body source-body size)
-          put-promise (.put bucket key (or stream-body source-body)
-                            #js {:httpMetadata #js {:contentType (or content-type "application/octet-stream")}
-                                 :customMetadata #js {:checksum checksum :type asset-type}})]
+    (let [abort-controller
+          (when (exists? js/AbortController)
+            (js/AbortController.))
+          first-failure (atom nil)
+          {decoded-body :body
+           decode-promise :promise
+           decode-failure :failure}
+          (when (and (= "base64" encoding) (some? body))
+            (base64-decoded-body body abort-controller first-failure))
+          source-body (or decoded-body body (js/Uint8Array. 0))
+          {stream-body :body
+           fixed-length-promise :promise
+           fixed-length-failure :failure}
+          (fixed-length-body source-body size abort-controller first-failure)
+          upload-body (or stream-body source-body)
+          put-result
+          (try
+            (.put bucket key upload-body
+                  #js {:httpMetadata #js {:contentType (or content-type "application/octet-stream")}
+                       :customMetadata #js {:checksum checksum :type asset-type}
+                       ;; Ignored by R2, consumed by the Node adapter
+                       ;; to reject truncated or oversized streams.
+                       :logseqExpectedSize size})
+            (catch :default error
+              (p/rejected error)))
+          put-failure (atom nil)
+          put-promise
+          (p/catch
+           (js/Promise.resolve put-result)
+           (fn [error]
+             (reset! put-failure error)
+             (record-first-failure! first-failure error)
+             (abort-upload-pipes! abort-controller error)
+             (<best-effort-cancel! upload-body error)))]
       (-> (p/all (cond-> [put-promise]
                    decode-promise (conj decode-promise)
                    fixed-length-promise (conj fixed-length-promise)))
           (p/then (fn [_]
-                    (http/json-response :assets/put {:ok true} 200)))
-          (p/catch (fn [error]
-                     (if (= "invalid base64 asset body" (.-message error))
-                       (http/error-response (.-message error) 400)
-                       (throw error))))))))
+                    (if-let [error (or @first-failure
+                                       (some-> decode-failure deref)
+                                       (some-> fixed-length-failure deref)
+                                       (some-> put-failure deref))]
+                      (p/let [_ (when cleanup-on-failure?
+                                  (<best-effort-delete! bucket key))]
+                        (if (= "invalid base64 asset body" (.-message error))
+                          (http/error-response (.-message error) 400)
+                          (throw error)))
+                      (http/json-response :assets/put {:ok true} 200))))))))
 
 (defn- <body-with-known-length
   [body size]
@@ -222,19 +329,34 @@
               (handle-get-asset bucket key asset-type)
 
               "PUT"
-              (.then (.arrayBuffer request)
-                     (fn [buf]
-                       (if (> (.-byteLength buf) max-asset-size)
-                         (http/error-response "asset too large" 413)
-                         (.then (.put bucket
-                                      key
-                                      buf
-                                      #js {:httpMetadata #js {:contentType (or (.get (.-headers request) "content-type")
-                                                                               "application/octet-stream")}
-                                           :customMetadata #js {:checksum (.get (.-headers request) "x-amz-meta-checksum")
-                                                                :type asset-type}})
-                                (fn [_]
-                                  (http/json-response :assets/put {:ok true} 200))))))
+              (let [headers (.-headers request)
+                    declared-size-header (.get headers "x-logseq-asset-size")
+                    content-type (or (.get headers "content-type")
+                                     "application/octet-stream")
+                    checksum (.get headers "x-amz-meta-checksum")]
+                (if (some? declared-size-header)
+                  (<put-stream! bucket
+                                key
+                                (.-body request)
+                                {:size (parse-size declared-size-header)
+                                 :content-type content-type
+                                 :checksum checksum
+                                 :asset-type asset-type})
+                  ;; Legacy clients do not send x-logseq-asset-size. Keep their
+                  ;; request contract unchanged and validate the actual buffered
+                  ;; length before writing.
+                  (.then (.arrayBuffer request)
+                         (fn [buf]
+                           (if (> (.-byteLength buf) max-asset-size)
+                             (http/error-response "asset too large" 413)
+                             (.then (.put bucket
+                                          key
+                                          buf
+                                          #js {:httpMetadata #js {:contentType content-type}
+                                               :customMetadata #js {:checksum checksum
+                                                                    :type asset-type}})
+                                    (fn [_]
+                                      (http/json-response :assets/put {:ok true} 200))))))))
 
               "DELETE"
               (.then (.delete bucket key)

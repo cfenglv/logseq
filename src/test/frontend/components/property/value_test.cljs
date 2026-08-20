@@ -10,18 +10,28 @@
             [promesa.core :as p]))
 
 (deftest deleting-status-from-task-view-preserves-task-tag-test
-  (let [calls* (atom [])
-        block {:db/id 1}
-        property {:db/ident :logseq.property/status}]
-    (with-redefs [editor-handler/move-cross-boundary-up-down (constantly nil)
-                  property-handler/remove-block-property!
-                  (fn [& args] (swap! calls* conj args))]
-      (#'property-value/delete-block-property!
-       block property {:view-parent {:db/ident :logseq.class/Task}})
-      (is (= [[1
-               :logseq.property/status
-               {:preserve-task-tag? true}]]
-             @calls*)))))
+  (async done
+         (let [calls* (atom [])
+               block {:db/id 1}
+               property {:db/ident :logseq.property/status}]
+           (->
+            (p/with-redefs [editor-handler/move-cross-boundary-up-down
+                            (constantly nil)
+                            property-handler/remove-block-property!
+                            (fn [& args] (swap! calls* conj args))]
+              (#'property-value/delete-block-property!
+               block property {:view-parent {:db/ident :logseq.class/Task}}))
+            (p/then
+             (fn []
+               (is (= [[1
+                        :logseq.property/status
+                        {:preserve-task-tag? true}]]
+                      @calls*))
+               (done)))
+            (p/catch
+             (fn [error]
+               (is false (str error))
+               (done)))))))
 
 (deftest resolve-journal-page-for-date-returns-existing-page-test
   (async done

@@ -14,21 +14,27 @@
             [lambdaisland.glogi :as log]
             [logseq.common.config :as common-config]
             [logseq.graph-parser.block :as gp-block]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.graph-parser.property :as gp-property]))
 
 (defn- standalone-display-block
   [block]
   (let [raw-title (:block/title block)
         title (when (string? raw-title) (string/trim raw-title))
-        display-markup? (and title
-                             (or (re-find #"(?s)^```.*```$" title)
-                                 (re-find #"(?s)^\$\$.*\$\$$" title)))
-        ast-body (when display-markup?
+        math-proof (some-> title gp-mldoc/whole-displayed-math-title)
+        code-markup? (and title (re-find #"(?s)^```.*```$" title))
+        ast-body (when code-markup?
                    (or (:block.temp/ast-body block)
                        (map first (mldoc/->edn title :markdown))))
         [ast-node] ast-body
         [node-type node-data] ast-node]
-    (if (= 1 (count ast-body))
+    (cond
+      math-proof
+      (assoc block
+             :block/title (:title math-proof)
+             :logseq.property.node/display-type :math)
+
+      (= 1 (count ast-body))
       (case node-type
         "Src"
         (let [{:keys [language lines]} node-data]
@@ -38,12 +44,9 @@
             (not-empty language)
             (assoc :logseq.property.code/lang language)))
 
-        "Displayed_Math"
-        (assoc block
-               :block/title (string/trim node-data)
-               :logseq.property.node/display-type :math)
-
         block)
+
+      :else
       block)))
 
 (defn extract-blocks

@@ -279,6 +279,11 @@
                      :thread-api/create-or-open-db create-or-open-db-f
                      :thread-api/db-sync-close-db close-db-f
                      :thread-api/db-sync-invalidate-search-db invalidate-search-db-f
+                     :thread-api/db-sync-reset-target-preserving-backup
+                     (fn [repo]
+                       (p/do!
+                        (close-db-f repo)
+                        (unlink-db-f repo)))
                      :thread-api/unsafe-unlink-db unlink-db-f
                      :thread-api/db-sync-recreate-lock recreate-lock-f))
      (-> (f)
@@ -347,8 +352,8 @@
                              (is (some? (idx :create-or-open)))
                              (is (< (idx :close) (idx :unlink)))
                              (is (< (idx :unlink) (idx :recreate-lock)))
-                             (is (< (idx :recreate-lock) (idx :invalidate-search)))
-                             (is (< (idx :invalidate-search) (idx :create-or-open))))
+                             (is (< (idx :recreate-lock) (idx :create-or-open)))
+                             (is (< (idx :create-or-open) (idx :invalidate-search))))
                            (done)))
                  (p/catch (fn [error]
                             (is false (str error))
@@ -399,7 +404,7 @@
                        :rows-pool rows-pool
                        :rows-path "/download-import.sqlite"
                        :rows-imported? false})
-              (-> (p/with-redefs [sync-download/complete-datoms-import! (fn [_repo _graph-id _remote-tx]
+              (-> (p/with-redefs [sync-download/complete-datoms-import! (fn [_repo _graph-id _remote-tx & _]
                                                                           (p/resolved :ok))
                                   platform/remove-storage-pool! (fn [_platform pool]
                                                                   (swap! removed-pools* conj pool)

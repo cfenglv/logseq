@@ -25,14 +25,18 @@
             [frontend.modules.shortcut.before :as m]
             [frontend.state :as state]
             [frontend.util :refer [mac?] :as util]
-            [medley.core :as medley]))
+            [medley.core :as medley]
+            [promesa.core :as p]))
 
 (defn- search
   [mode]
-  (editor-handler/escape-editing {:select? true})
-  (if (state/get-search-mode)
-    (js/setTimeout #(route-handler/go-to-search! mode) 128)
-    (route-handler/go-to-search! mode)))
+  (editor-handler/consume-math-transition-boundary!
+   :shortcut-search
+   (p/do!
+    (editor-handler/escape-editing {:select? true})
+    (if (state/get-search-mode)
+      (js/setTimeout #(route-handler/go-to-search! mode) 128)
+      (route-handler/go-to-search! mode)))))
 
 ;; TODO: Namespace all-default-keyboard-shortcuts keys with `:command` e.g.
 ;; `:command.date-picker/complete`. They are namespaced in translation but
@@ -96,7 +100,9 @@
 
    :editor/escape-editing                   {:binding []
                                              :fn      (fn [_ _]
-                                                        (editor-handler/escape-editing))}
+                                                        (editor-handler/consume-math-transition-boundary!
+                                                         :shortcut-escape
+                                                         (editor-handler/escape-editing)))}
 
    :editor/backspace                        {:binding "backspace"
                                              :fn      editor-handler/editor-backspace}
@@ -354,14 +360,18 @@
                                                         (state/get-current-repo))
                                              :binding []}
 
-   :graph/open                              {:fn      #(do
-                                                         (editor-handler/escape-editing)
-                                                         (state/pub-event! [:dialog-select/graph-open]))
+   :graph/open                              {:fn      #(editor-handler/consume-math-transition-boundary!
+                                                       :shortcut-graph-open
+                                                       (p/do!
+                                                        (editor-handler/escape-editing)
+                                                        (state/pub-event! [:dialog-select/graph-open])))
                                              :binding "alt+shift+g"}
 
-   :graph/remove                            {:fn      #(do
-                                                         (editor-handler/escape-editing)
-                                                         (state/pub-event! [:dialog-select/graph-remove]))
+   :graph/remove                            {:fn      #(editor-handler/consume-math-transition-boundary!
+                                                       :shortcut-graph-remove
+                                                       (p/do!
+                                                        (editor-handler/escape-editing)
+                                                        (state/pub-event! [:dialog-select/graph-remove])))
                                              :binding []}
 
    :graph/add                               {:fn      (fn [] (route-handler/redirect! {:to :graphs}))
@@ -382,9 +392,11 @@
 
    :shell/run                               {:binding  "mod+shift+1"
                                              :inactive (not (util/electron?))
-                                             :fn       #(do
+                                             :fn       #(editor-handler/consume-math-transition-boundary!
+                                                         :shortcut-shell
+                                                         (p/do!
                                                           (editor-handler/escape-editing {:select? true})
-                                                          (state/pub-event! [:shell/run]))}
+                                                          (state/pub-event! [:shell/run])))}
 
    :go/home                                 {:binding "g h"
                                              :fn      #(route-handler/redirect-to-home!)}

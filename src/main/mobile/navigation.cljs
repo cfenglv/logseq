@@ -354,5 +354,9 @@
   (set! (.-LogseqNative js/window)
         (clj->js
          {:onNativePop (fn []
-                         (when (false? (pop-modal!))
-                           (pop-stack!)))})))
+                         (editor-handler/consume-math-transition-boundary!
+                          :native-pop
+                          (p/let [_ (editor-handler/await-pending-math-transition!)
+                                  handled? (pop-modal!)]
+                            (when (false? handled?)
+                              (pop-stack!)))))})))

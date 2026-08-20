@@ -442,8 +442,9 @@
                    (when (d/entity db-after e)
                      [:db/add e :logseq.property/created-by-ref created-by-id]))))
              tx-data)]
-        (cond->> add-created-by-tx-data
-          (nil? created-by-ent) (cons created-by-block))))))
+        (when (seq add-created-by-tx-data)
+          (cond->> add-created-by-tx-data
+            (nil? created-by-ent) (cons created-by-block)))))))
 
 (defn- revert-disallowed-changes
   [{:keys [tx-meta tx-data db-before db-after]}]
@@ -567,7 +568,8 @@
    (when-not (or (:sync-download-graph? tx-meta)
                  (:reverse? tx-meta)
                  (:transact-remote? tx-meta))
-     (ensure-journal-page-protected-attrs-not-updated! tx-report)
+     (when-not (rtc-tx-or-download-graph? tx-meta)
+       (ensure-journal-page-protected-attrs-not-updated! tx-report))
      (let [extra-tx-data (compute-extra-tx-data tx-report)
            tx-report* (if (seq extra-tx-data)
                         (let [result (d/with db-after extra-tx-data)]

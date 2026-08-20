@@ -36,7 +36,10 @@ let default_auth_path () =
     "auth.json"
 
 let auth_path config =
-  Option.value config.Cli_config.auth_path ~default:(default_auth_path ())
+  match config.Cli_config.auth_path with
+  | Some path when path <> "" -> Node.Path.resolve "." path
+  | Some path -> path
+  | None -> default_auth_path ()
 
 let rec mkdir_p path =
   if path = "" || path = Filename.dirname path || Cli_unix.file_exists path then
@@ -157,6 +160,19 @@ let claims_of_id_token id_token =
                 (fun exp -> Time.time_of_epoch_ms (Int64.mul exp 1_000L))
                 (first_int64_field object_ (Vec.singleton "exp"))) ))
 
+let legacy_expires_at id_token =
+  Option.bind id_token (fun id_token ->
+      try
+        match claims_of_id_token id_token with
+        | Ok (_, _, expires_at) -> expires_at
+        | Error _ -> None
+      with _ -> None)
+
+let with_legacy_expires_at data =
+  match data.expires_at with
+  | Some _ -> data
+  | None -> { data with expires_at = legacy_expires_at data.id_token }
+
 let auth_path_context path =
   Edn_util.map_vec
     (Vec.of_array [| (Edn_util.keyword "auth-path", Edn_util.string path) |])
@@ -166,7 +182,10 @@ let read_auth_file config =
   Cli_effect.pure
     (if not (Cli_unix.file_exists path) then Ok None
      else
-       try Error.map (fun data -> Some data) (parse_auth_json (read_file path))
+       try
+         Error.map
+           (fun data -> Some (with_legacy_expires_at data))
+           (parse_auth_json (read_file path))
        with exn ->
          Error
            (Error.make ~context:(auth_path_context path) Error.Invalid_auth_file

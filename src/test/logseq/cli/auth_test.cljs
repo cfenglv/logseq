@@ -49,6 +49,11 @@
   (is (= (node-path/join (.homedir os) "logseq" "auth.json")
          (auth/default-auth-path))))
 
+(deftest test-relative-auth-path-resolves-from-cwd
+  (let [relative-path (node-path/join "relative-auth" "auth.json")]
+    (is (= (node-path/resolve relative-path)
+           (auth/auth-path {:auth-path relative-path})))))
+
 (deftest test-write-auth-file-creates-parent-dir
   (let [dir (node-helper/create-tmp-dir "cli-auth")
         auth-dir (node-path/join dir "nested" "tokens")
@@ -85,7 +90,8 @@
       (is false "expected invalid-auth-file error")
       (catch :default e
         (is (= :invalid-auth-file (-> e ex-data :code)))
-        (is (= auth-path (-> e ex-data :auth-path)))))))
+        (is (= (node-path/resolve auth-path)
+               (-> e ex-data :auth-path)))))))
 
 (deftest test-resolve-auth-token-refreshes-expired-token
   (async done

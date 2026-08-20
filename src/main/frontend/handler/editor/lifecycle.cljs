@@ -7,6 +7,15 @@
             [goog.dom :as gdom]
             [logseq.shui.hooks :as hooks]))
 
+(defn restore-selection-and-focus!
+  "Apply renderer focus and saved selection to an already mounted editor."
+  [input content config]
+  (when input
+    (when-not (:skip-focus? config)
+      (.focus input))
+    (when content
+      (editor-handler/restore-cursor-pos-on-node! input content))))
+
 (defn did-mount!
   [id config]
   (let [content (state/get-edit-content)
@@ -15,14 +24,9 @@
         container-id (when node
                        (when-let [container-id-str (dom/attr node "containerid")]
                          (util/safe-parse-int container-id-str)))]
-    (when input
-      (when-not (:skip-focus? config)
-        (.focus input)))
+    (restore-selection-and-focus! input content config)
     (when container-id
       (state/set-state! :editor/container-id container-id))
-
-    (when content
-      (editor-handler/restore-cursor-pos! id content))
 
     (when-let [element (gdom/getElement id)]
       ;; TODO: check whether editor is visible, do less work

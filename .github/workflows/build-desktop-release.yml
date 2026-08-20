@@ -1,6 +1,7 @@
 # This is the main desktop application release workflow for both nightly and beta/stable releases.
 
 name: Build-Desktop-Release
+run-name: Desktop release · ${{ github.event.inputs.build-target }} · ${{ github.event.inputs.git-ref }}
 
 on:
   workflow_dispatch:
@@ -10,8 +11,7 @@ on:
         type: choice
         required: true
         options:
-          # NOTE: For now, we only have beta channel to be released on GitHub
-          # - stable
+          - stable
           - beta
           - nightly
           - non-release
@@ -20,6 +20,14 @@ on:
         description: "Release Git Ref (Which branch or tag to build?)"
         required: true
         default: "master"
+      desktop-platforms:
+        description: "Desktop platforms to build"
+        type: choice
+        required: true
+        options:
+          - all
+          - windows-only
+        default: "all"
       is-draft:
         description: 'Draft Release? (Beta only, Nightly will always be a non-draft)'
         type: boolean
@@ -44,7 +52,7 @@ on:
         description: 'Build Android App'
         type: boolean
         required: true
-        default: true
+        default: false
       publish-linux-stores:
         description: 'Publish Flathub and Snap'
         type: boolean
@@ -57,22 +65,26 @@ env:
   CLOJURE_VERSION: '1.12.4.1618'
   NODE_VERSION: '24'
   JAVA_VERSION: '21'
+  BABASHKA_VERSION: '1.12.215'
   OCAML_VERSION: '5.4.0'
 
-jobs:
-  compile-cljs:
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Check build options
-        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
-        run: |
-          echo "::error title=CheckFail::Nightly, Beta and Stable Release MUST be built from master"
-          exit 1
+permissions:
+  contents: read
 
+concurrency:
+  group: desktop-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-preflight:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
       - name: Check out Git repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref }}
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -83,6 +95,173 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10.33.0
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Run deterministic release preflight
+        run: pnpm desktop:release-preflight:quick -- --strict
+
+      - name: Test static desktop release contracts
+        run: |
+          node scripts/test-desktop-sidecar-release-contract.mjs
+          node scripts/test-updater-install-entry-contract.mjs
+          node scripts/test-selfhost-macos-user-guidance.mjs
+          node scripts/test-macos-updater-signature-config.mjs
+          node scripts/test-local-project-update-signing-contract.mjs
+          node scripts/test-packaged-project-signature-runtime.mjs
+
+      - name: Test self-host updater source contracts
+        run: |
+          node scripts/test-desktop-sidecar-release-contract.mjs
+          node scripts/test-updater-install-entry-contract.mjs
+          node scripts/test-selfhost-macos-user-guidance.mjs
+          node scripts/test-no-local-trust-mutation-contract.mjs
+
+  release-source-gate:
+    needs: [ source-preflight ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      source-ref: ${{ steps.source.outputs.ref }}
+      source-sha: ${{ steps.source.outputs.sha }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out requested release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve requested commit
+        id: source
+        run: |
+          echo "ref=${REQUESTED_SOURCE_REF}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          REQUESTED_SOURCE_REF: ${{ github.event.inputs.git-ref || github.ref_name }}
+
+  rtc-release-gate:
+    needs: [ source-preflight, release-source-gate ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install db-sync dependencies
+        run: pnpm --dir deps/db-sync install --frozen-lockfile
+
+      - name: Compile client tests
+        run: pnpm cljs:test
+
+      - name: Install desktop test dependencies
+        run: |
+          cp resources/package.json resources/pnpm-lock.yaml static/
+          pnpm --dir static install --frozen-lockfile --ignore-workspace
+
+      - name: Run complete desktop release contracts
+        run: pnpm desktop:test-release-contracts
+
+      - name: Run RTC client and Electron tests
+        run: |
+          LOGSEQ_STABLE_IDENTS=1 node --require ./scripts/fixtures/electron-test-preload.cjs static/tests.js \
+            -r '^(electron\.(db-worker-manager|power-monitor|proxy|updater|updater-config)-test|frontend\.handler\.db-based\.(rtc-background-tasks|sync)-test|frontend\.worker\.(db-core|db-sync|db-sync-sim|db-worker|pipeline|platform-node|state)-test|frontend\.worker\.sync\..*-test|logseq\.cli\.command\.sync-test|logseq\.db-worker\.daemon-test)$' \
+            -e fix-me
+
+      - name: Run db-sync server tests
+        run: pnpm --dir deps/db-sync test
+
+      - name: Build db-sync production Worker
+        run: pnpm --dir deps/db-sync release
+
+      - name: Build db-sync API documentation asset
+        run: pnpm --dir deps/db-sync build:api-docs
+
+      - name: Validate db-sync Worker bundle
+        working-directory: deps/db-sync/worker
+        run: pnpm exec wrangler deploy --dry-run --env=""
+
+      - name: Run db-sync 128 MB memory test
+        run: pnpm --dir deps/db-sync test:large-op-128m
+
+      - name: Run client snapshot backup 128 MB memory test
+        run: |
+          clojure -M:test release db-sync-backup-memory-test
+          node --expose-gc --max-old-space-size=128 \
+            static/db-sync-backup-memory-test.js
+
+  rtc-browser-e2e:
+    uses: ./.github/workflows/clj-rtc-e2e.yml
+    with:
+      source-ref: ${{ github.event.inputs.git-ref || github.sha }}
+
+  compile-cljs:
+    needs: [ rtc-release-gate, rtc-browser-e2e ]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check build options
+        if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
+        run: |
+          echo "::error title=CheckFail::Nightly, Beta and Stable Release MUST be built from master"
+          exit 1
+
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Require configured project signing policy for selfhost release
+        run: pnpm project-update:require-signing-policy
 
       - name: Get pnpm store directory path
         id: pnpm-store-dir-path
@@ -147,9 +326,7 @@ jobs:
         run: |
           sed -i 's/defonce version ".*"/defonce version "${{ steps.ref.outputs.version }}"/g' src/main/frontend/version.cljs
 
-      - name: Set Build Environment Variables (only when workflow_dispatch)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        # if scheduled, use default settings
+      - name: Set build environment variables
         run: |
           echo "ENABLE_PLUGINS=${{ github.event_name == 'schedule' || github.event.inputs.enable-plugins == 'true' }}" >> $GITHUB_ENV
           echo "ENABLE_FILE_SYNC_PRODUCTION=${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}" >> $GITHUB_ENV
@@ -163,6 +340,7 @@ jobs:
           opam exec -- pnpm cli:release
           pnpm webpack-app-build
           pnpm desktop:prepare-runtime-js
+          pnpm desktop:verify-runtime-revisions
         env:
           LOGSEQ_SENTRY_DSN: ${{ secrets.LOGSEQ_SENTRY_DSN }}
           LOGSEQ_POSTHOG_TOKEN: ${{ secrets.LOGSEQ_POSTHOG_TOKEN }}
@@ -182,11 +360,17 @@ jobs:
         run: |
           test -f ./static/js/db-worker-node.js
           test -f ./static/js/logseq-cli.js
+          test -f ./static/verify-desktop-runtime-revisions.mjs
+          test -f ./static/RUNTIME_REVISION
           test -f ./static/.agents/skills/logseq-cli/SKILL.md
+          test -f ./static/sidecar/embedding_server.py
+          pnpm desktop:verify-runtime-revisions
+
+      - name: Verify release configuration
+        run: node scripts/test-cli-release-config.mjs
 
       - name: Update APP Version
-        run: |
-          sed -i 's/"version": "0.0.1"/"version": "${{ steps.ref.outputs.version }}"/g' ./package.json
+        run: pnpm pkg set version="${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
       - name: Display Package.json
@@ -202,6 +386,7 @@ jobs:
         working-directory: ./static
 
       - name: Upload Sentry Sourcemaps (beta only)
+        if: ${{ github.repository == 'logseq/logseq' }}
         # if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'beta' }}
         run: |
           curl -sL https://sentry.io/get-cli/ | SENTRY_CLI_VERSION=2.58.4 bash
@@ -222,6 +407,7 @@ jobs:
           include-hidden-files: true
 
   build-linux-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
     steps:
@@ -255,7 +441,11 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Build/Release Electron App
-        run: pnpm install --frozen-lockfile && pnpm electron:make
+        run: pnpm install --frozen-lockfile && pnpm electron:verify-updater-provider && pnpm electron:make
+        working-directory: ./static
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform linux --arch x64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
       - name: Save artifacts
@@ -279,6 +469,7 @@ jobs:
           path: builds
 
   build-linux-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
     steps:
@@ -313,7 +504,11 @@ jobs:
         working-directory: ./static
 
       - name: Build/Release Electron App
-        run: pnpm electron:make-linux-arm64
+        run: pnpm electron:verify-updater-provider && pnpm electron:make-linux-arm64
+        working-directory: ./static
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform linux --arch arm64 --version "${{ steps.ref.outputs.version }}"
         working-directory: ./static
 
       - name: Save artifacts
@@ -371,7 +566,12 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: ./static
 
-      - name: Build/Release Electron app
+      - name: Verify updater provider contract
+        run: pnpm electron:verify-updater-provider
+        working-directory: ./static
+
+      - name: Build/Release signed Electron app
+        if: ${{ github.repository == 'logseq/logseq' }}
         shell: pwsh
         run: |
           $signCfg = @'
@@ -395,6 +595,15 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build/Release unsigned Electron app for forks
+        if: ${{ github.repository != 'logseq/logseq' }}
+        run: pnpm exec electron-builder --publish never
+        working-directory: ./static
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform win32 --arch x64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
 
       - name: Save Artifact
         run: |
@@ -445,7 +654,12 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: ./static
 
-      - name: Build/Release Electron app
+      - name: Verify updater provider contract
+        run: pnpm electron:verify-updater-provider
+        working-directory: ./static
+
+      - name: Build/Release signed Electron app
+        if: ${{ github.repository == 'logseq/logseq' }}
         shell: pwsh
         run: |
           $signCfg = @'
@@ -470,6 +684,15 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
 
+      - name: Build/Release unsigned Electron app for forks
+        if: ${{ github.repository != 'logseq/logseq' }}
+        run: pnpm exec electron-builder --win nsis zip --arm64 --publish never
+        working-directory: ./static
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform win32 --arch arm64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
+
       - name: Save Artifact
         run: |
           mkdir builds
@@ -485,14 +708,24 @@ jobs:
           path: builds
 
   build-macos-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-15-intel
+    env:
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
         with:
           name: static
           path: static
+
+      - name: Check out macOS release policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          path: release-gate-source
+          persist-credentials: false
 
       - name: Retrieve tag version
         id: ref
@@ -513,8 +746,12 @@ jobs:
         with:
           version: 10.33.0
 
+      - name: Run x64 native project updater helper E2E
+        run: pnpm project-update:test-helper
+        working-directory: ./release-gate-source
+
       - name: Install Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -531,11 +768,18 @@ jobs:
             ${{ runner.os }}-pnpm-
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.HAS_APPLE_SIGNING == 'true' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
+
+      - name: Build project-signed updater helper for x64
+        run: |
+          test -f static/sidecar/embedding_server.py
+          node release-gate-source/scripts/build-project-update-helper.mjs \
+            --arch x64 \
+            --output static/sidecar/logseq-project-updater
 
       # - name: Cache Node Modules
       #   uses: actions/cache@v4
@@ -544,13 +788,70 @@ jobs:
       #       **/node_modules
       #     key: ${{ runner.os }}-node-modules
 
+      - name: Prepare x64 desktop dependencies
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm rebuild:all
+        working-directory: ./static
+
+      - name: Verify x64 updater provider contract
+        run: pnpm electron:verify-updater-provider
+        working-directory: ./static
+
       - name: Build/Release Electron App for x64
-        run: pnpm install --frozen-lockfile && pnpm rebuild:all && pnpm electron:make
+        run: |
+          if [ "${HAS_APPLE_SIGNING}" = "true" ]; then
+            pnpm electron:make
+          else
+            pnpm electron:make-unsigned --mac dmg zip --x64
+          fi
         working-directory: ./static
         env:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Run project-signed updater native and provider contracts
+        run: |
+          pnpm --dir release-gate-source project-update:test-helper
+          pnpm --dir release-gate-source test:project-signed-macos-updater
+          node release-gate-source/scripts/test-selfhost-macos-updater-release-contract.mjs
+        env:
+          LOGSEQ_UPDATER_TEST_PACKAGE_ROOT: ${{ github.workspace }}/static
+          LOGSEQ_ELECTRON_APP_FIXTURE: ${{ github.workspace }}/static/dist/mac/Logseq.app
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch x64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
+
+      - name: Verify unsigned x64 project update candidate
+        run: |
+          candidate_zip="$(find static/dist -maxdepth 1 -type f -name 'Logseq-darwin-x64-*.zip' -print -quit)"
+          test -n "$candidate_zip"
+          node release-gate-source/scripts/verify-unsigned-macos-project-update-candidate.mjs \
+            --arch x64 \
+            --version "${{ steps.ref.outputs.version }}" \
+            --archive "$candidate_zip" \
+            --metadata static/dist/latest-mac.yml
+
+      - name: Verify fork macOS app can load Electron
+        if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
+
+      - name: Verify Developer ID signature and notarization
+        if: ${{ env.HAS_APPLE_SIGNING == 'true' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+          xcrun stapler validate "$app_path"
 
       - name: Save x64 artifacts
         run: |
@@ -559,7 +860,11 @@ jobs:
           mv static/dist/*.dmg           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.dmg
           mv static/dist/*.zip           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.zip
           mv static/dist/*.blockmap      ./builds/
-          mv static/dist/latest-mac.yml  ./builds/latest-x64-mac.yml
+          metadata_name="$(node release-gate-source/resources/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" x64)"
+          mv static/dist/latest-mac.yml  "./builds/${metadata_name}"
+          if [ "$metadata_name" != "latest-x64-mac.yml" ]; then
+            cp release-gate-source/resources/updater/legacy-macos/latest-x64-mac.yml ./builds/latest-x64-mac.yml
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -568,14 +873,24 @@ jobs:
           path: builds
 
   build-macos-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-14
+    env:
+      HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATES_P12 != '' }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
         with:
           name: static
           path: static
+
+      - name: Check out macOS release policy
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          path: release-gate-source
+          persist-credentials: false
 
       - name: Retrieve tag version
         id: ref
@@ -593,6 +908,10 @@ jobs:
         with:
           version: 10.33.0
 
+      - name: Run arm64 native project updater helper E2E
+        run: pnpm project-update:test-helper
+        working-directory: ./release-gate-source
+
       - name: Get pnpm store directory path
         id: pnpm-store-dir-path
         run: echo "dir=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
@@ -606,16 +925,23 @@ jobs:
             ${{ runner.os }}-arm64-pnpm-
 
       - name: Install Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.HAS_APPLE_SIGNING == 'true' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
+
+      - name: Build project-signed updater helper for arm64
+        run: |
+          test -f static/sidecar/embedding_server.py
+          node release-gate-source/scripts/build-project-update-helper.mjs \
+            --arch arm64 \
+            --output static/sidecar/logseq-project-updater
 
       # - name: Cache Node Modules
       #   uses: actions/cache@v4
@@ -625,16 +951,67 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Fetch deps
-        run: pnpm install --frozen-lockfile --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
+        run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
+        working-directory: ./static
+
+      - name: Verify arm64 updater provider contract
+        run: pnpm electron:verify-updater-provider
         working-directory: ./static
 
       - name: Build/Release Electron App for arm64
-        run: pnpm electron:make-macos-arm64
+        run: |
+          if [ "${HAS_APPLE_SIGNING}" = "true" ]; then
+            pnpm electron:make-macos-arm64
+          else
+            pnpm electron:make-unsigned --mac dmg zip --arm64
+          fi
         working-directory: ./static
         env:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Run project-signed updater native and provider contracts
+        run: |
+          pnpm --dir release-gate-source project-update:test-helper
+          pnpm --dir release-gate-source test:project-signed-macos-updater
+          node release-gate-source/scripts/test-selfhost-macos-updater-release-contract.mjs
+        env:
+          LOGSEQ_UPDATER_TEST_PACKAGE_ROOT: ${{ github.workspace }}/static
+          LOGSEQ_ELECTRON_APP_FIXTURE: ${{ github.workspace }}/static/dist/mac-arm64/Logseq.app
+
+      - name: Verify packaged desktop
+        run: pnpm electron:verify-package -- --search-root dist --platform darwin --arch arm64 --version "${{ steps.ref.outputs.version }}"
+        working-directory: ./static
+
+      - name: Verify unsigned arm64 project update candidate
+        run: |
+          candidate_zip="$(find static/dist -maxdepth 1 -type f -name 'Logseq-darwin-arm64-*.zip' -print -quit)"
+          test -n "$candidate_zip"
+          node release-gate-source/scripts/verify-unsigned-macos-project-update-candidate.mjs \
+            --arch arm64 \
+            --version "${{ steps.ref.outputs.version }}" \
+            --archive "$candidate_zip" \
+            --metadata static/dist/latest-mac.yml
+
+      - name: Verify fork macOS app can load Electron
+        if: ${{ env.HAS_APPLE_SIGNING != 'true' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
+
+      - name: Verify Developer ID signature and notarization
+        if: ${{ env.HAS_APPLE_SIGNING == 'true' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+          xcrun stapler validate "$app_path"
 
       - name: Save arm64 artifacts
         run: |
@@ -643,7 +1020,11 @@ jobs:
           mv static/dist/*.dmg           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.dmg
           mv static/dist/*.zip           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.zip
           mv static/dist/*.blockmap      ./builds/
-          mv static/dist/latest-mac.yml  ./builds/latest-arm64-mac.yml
+          metadata_name="$(node release-gate-source/resources/selfhost-updater-version.mjs macos-metadata-name "${{ steps.ref.outputs.version }}" arm64)"
+          mv static/dist/latest-mac.yml  "./builds/${metadata_name}"
+          if [ "$metadata_name" != "latest-arm64-mac.yml" ]; then
+            cp release-gate-source/resources/updater/legacy-macos/latest-arm64-mac.yml ./builds/latest-arm64-mac.yml
+          fi
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -664,11 +1045,203 @@ jobs:
       ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
       SENTRY_AUTH_TOKEN: "${{ secrets.SENTRY_AUTH_TOKEN }}"
 
-  nightly-release:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' }}
+  release-assets-preflight:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.assets.outputs.version }}
     steps:
+      - name: Check out release verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download all desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: logseq-*-builds
+          path: ${{ runner.temp }}/desktop-release-assets
+          merge-multiple: true
+
+      - name: Verify complete desktop release asset set
+        id: assets
+        run: |
+          version="$(cat "${RUNNER_TEMP}/desktop-release-assets/VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir "${RUNNER_TEMP}/desktop-release-assets" \
+            --version "$version" \
+            --write-checksums
+          cat "${RUNNER_TEMP}/desktop-release-assets/SHA256SUMS.txt"
+
+  selfhost-release-signing:
+    if: ${{ github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.release-source-gate.outputs.source-ref && github.sha == needs.release-source-gate.outputs.source-sha && contains(needs.release-assets-preflight.outputs.version, '-selfhost.') && !contains(needs.release-assets-preflight.outputs.version, '.nightly.') }}
+    needs: [ release-assets-preflight, release-source-gate ]
+    runs-on: macos-14
+    timeout-minutes: 20
+    environment: selfhost-release-signing
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source-ref: ${{ needs.release-source-gate.outputs.source-ref }}
+      source-sha: ${{ needs.release-source-gate.outputs.source-sha }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Check out exact selected release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-source-gate.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download all six-platform candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: logseq-*-builds
+          path: ${{ runner.temp }}/selfhost-release-assets
+          merge-multiple: true
+
+      - name: Reverify complete unsigned release candidates
+        id: release
+        run: |
+          version="$(cat "${RUNNER_TEMP}/selfhost-release-assets/VERSION")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir "${RUNNER_TEMP}/selfhost-release-assets" \
+            --version "$version" \
+            --write-checksums
+          for arch in arm64 x64; do
+            metadata_name="$(node resources/selfhost-updater-version.mjs macos-metadata-name "$version" "$arch")"
+            node scripts/verify-unsigned-macos-project-update-candidate.mjs \
+              --arch "$arch" \
+              --version "$version" \
+              --archive "${RUNNER_TEMP}/selfhost-release-assets/Logseq-darwin-${arch}-${version}.zip" \
+              --metadata "${RUNNER_TEMP}/selfhost-release-assets/${metadata_name}"
+          done
+
+      - name: Sign and finalize both macOS update metadata files
+        run: |
+          node scripts/finalize-github-macos-project-update.mjs \
+            --dir "${RUNNER_TEMP}/selfhost-release-assets" \
+            --version "${{ steps.release.outputs.version }}"
+        env:
+          LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64: ${{ secrets.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 }}
+          LOGSEQ_RELEASE_BUILD_TARGET: ${{ github.event.inputs.build-target }}
+          LOGSEQ_RELEASE_SOURCE_REF: ${{ needs.release-source-gate.outputs.source-ref }}
+          LOGSEQ_RELEASE_SOURCE_SHA: ${{ needs.release-source-gate.outputs.source-sha }}
+
+      - name: Upload single finalized release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: ${{ runner.temp }}/selfhost-release-assets
+          if-no-files-found: error
+          retention-days: 7
+
+  selfhost-release-verifier:
+    needs: [ selfhost-release-signing, release-source-gate ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source-ref: ${{ needs.release-source-gate.outputs.source-ref }}
+      source-sha: ${{ needs.release-source-gate.outputs.source-sha }}
+      version: ${{ needs.selfhost-release-signing.outputs.version }}
+    steps:
+      - name: Check out exact signed release verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-source-gate.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download finalized release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: ${{ runner.temp }}/selfhost-finalized-release-assets
+
+      - name: Reverify complete assets and both project signatures
+        run: |
+          node scripts/verify-finalized-selfhost-release.mjs \
+            --dir "${RUNNER_TEMP}/selfhost-finalized-release-assets" \
+            --source-revision "${{ needs.release-source-gate.outputs.source-sha }}" \
+            --version "${{ needs.selfhost-release-signing.outputs.version }}"
+
+  selfhost-release:
+    if: ${{ github.repository == 'cfenglv/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.desktop-platforms == 'all' && github.ref_name == needs.selfhost-release-verifier.outputs.source-ref && github.sha == needs.selfhost-release-verifier.outputs.source-sha && contains(needs.selfhost-release-verifier.outputs.version, '-selfhost.') && !contains(needs.selfhost-release-verifier.outputs.version, '.nightly.') }}
+    needs: [ selfhost-release-verifier ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: selfhost-production
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      version: ${{ needs.selfhost-release-verifier.outputs.version }}
+    steps:
+      - name: Check out exact release notes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.selfhost-release-verifier.outputs.source-sha }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Download verified finalized release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: release-assets
+
+      - name: Create protected selfhost GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.selfhost-release-verifier.outputs.version }}
+          name: ${{ github.event.inputs.build-target == 'beta' && format('Logseq Selfhost {0} (Beta)', needs.selfhost-release-verifier.outputs.version) || format('Logseq Selfhost {0}', needs.selfhost-release-verifier.outputs.version) }}
+          body_path: release-source/docs/releases/${{ needs.selfhost-release-verifier.outputs.version }}.md
+          draft: ${{ github.event.inputs.is-draft }}
+          prerelease: ${{ github.event.inputs.build-target == 'beta' }}
+          fail_on_unmatched_files: true
+          # The secretless verifier above already proves the exact enabled
+          # platform asset set. Publish that verified directory as a unit so
+          # optional disabled platforms (for example Android) do not create a
+          # false unmatched-glob failure here.
+          files: release-assets/*
+
+  nightly-release:
+    if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
+    needs: [ release-assets-preflight ]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
       - name: Download MacOS x64 Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -706,23 +1279,24 @@ jobs:
           path: ./
 
       - name: Download Android Artifacts
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: logseq-android-builds
           path: ./
 
-      - name: Generate SHA256 checksums
+      - name: Verify desktop release assets
         run: |
-          sha256sum *-darwin-* > SHA256SUMS.txt
-          sha256sum *-win-* >> SHA256SUMS.txt
-          sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir . \
+            --version "$(cat VERSION)" \
+            --write-checksums
           cat SHA256SUMS.txt
 
       - name: List files
         run: ls -rl
 
-      - name: Update Nightly Release
+      - name: Update rolling Nightly Release
         uses: andelf/nightly-release@5834076edc55cc05975561c9722043f072ac5c26 # main
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -730,7 +1304,7 @@ jobs:
           tag_name: nightly
           name: 'Desktop app Nightly Release $$'
           draft: false
-          prerelease: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.is-pre-release) || (github.event_name == 'schedule')}}
+          prerelease: ${{ contains(needs.release-assets-preflight.outputs.version, '-selfhost.') || github.event_name == 'schedule' || github.event.inputs.is-pre-release }}
           body: |
             This is a nightly release of the Logseq desktop app.
             It's unstable compared to the official releases, **use it with caution**!
@@ -745,12 +1319,20 @@ jobs:
             ./*.apk
 
   release:
-    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
-    needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && !contains(needs.release-assets-preflight.outputs.version, '-selfhost.') }}
+    needs: [ release-assets-preflight ]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.ref.outputs.version }}
     steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref || github.sha }}
+          persist-credentials: false
+
       - name: Download MacOS x64 Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -803,24 +1385,26 @@ jobs:
           pkgver=$(cat VERSION)
           echo "version=$pkgver" >> $GITHUB_OUTPUT
 
-      - name: Generate SHA256 checksums
+      - name: Verify desktop release assets
         run: |
-          sha256sum *-darwin-* > SHA256SUMS.txt
-          sha256sum *-win-* >> SHA256SUMS.txt
-          sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          node scripts/verify-desktop-release-assets.mjs \
+            --dir . \
+            --version "${{ steps.ref.outputs.version }}" \
+            --write-checksums \
+            --require-release-notes \
+            --release-notes-root .
           cat SHA256SUMS.txt
 
       - name: Create Release Draft
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.ref.outputs.version }}
           name: ${{ github.event.inputs.build-target == 'beta' && format('Desktop APP {0} (Beta Testing)', steps.ref.outputs.version) || format('Desktop APP {0}', steps.ref.outputs.version) }}
-          body: "TODO: Fill this changelog. Sorry for the inconvenience!"
+          body_path: docs/releases/${{ steps.ref.outputs.version }}.md
           draft: ${{ github.event.inputs.is-draft }}
-          prerelease: ${{ github.event.inputs.is-pre-release }}
+          prerelease: ${{ !contains(steps.ref.outputs.version, '-selfhost.') && github.event.inputs.is-pre-release }}
           files: |
             ./VERSION
             ./SHA256SUMS.txt

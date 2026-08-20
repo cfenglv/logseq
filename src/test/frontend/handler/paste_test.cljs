@@ -224,6 +224,53 @@
                                      :logseq.property.code/lang])
                      @actual-blocks)))))))
 
+(deftest paste-whole-display-math-uses-atomic-editor-conversion
+  (doseq [[clipboard bare-title]
+          [["$$x$$" "x"]
+           ["$$$$" ""]]]
+    (let [block {:db/id 1
+                 :block/uuid (random-uuid)
+                 :block/title ""}
+          input #js {:id "edit-block-test"
+                     :value ""
+                     :selectionStart 0
+                     :selectionEnd 0
+                     :setSelectionRange (fn [_start _end])}
+          insert-options (atom ::not-called)
+          contents (atom [])
+          events (atom [])]
+      (with-redefs [state/get-edit-input-id (constantly "edit-block-test")
+                    state/get-edit-block (constantly block)
+                    state/get-input (constantly input)
+                    state/get-current-page (constantly nil)
+                    state/get-current-repo (constantly nil)
+                    state/set-block-content-and-last-pos! (fn [_ value pos]
+                                                            (swap! contents conj [value pos]))
+                    state/set-state! (constantly nil)
+                    state/pub-event! (fn [event]
+                                       (swap! events conj event)
+                                       (p/resolved nil))
+                    db/entity (constantly block)
+                    db/get-page-format (constantly :markdown)
+                    editor-handler/get-selection-and-format
+                    (constantly {:selection ""
+                                 :selection-start 0
+                                 :selection-end 0
+                                 :value ""})
+                    commands/delete-selection! (constantly nil)
+                    commands/simple-insert!
+                    (fn [_ text opts]
+                      (reset! insert-options opts)
+                      (when-let [check-fn (:check-fn opts)]
+                        (check-fn text 0 (count text))))
+                    util/get-selected-text (constantly "")]
+        (#'paste-handler/paste-copied-text input clipboard "")
+        (is (fn? (:check-fn @insert-options))
+            "Plain one-block paste must participate in the Math transition")
+        (is (= [[bare-title (count bare-title)]] @contents))
+        (is (= :editor/upsert-type-block (ffirst @events)))
+        (is (= bare-title (get-in (first @events) [1 :block :block/title])))))))
+
 (deftest paste-text-parseable-preserves-og-copied-heading-page-refs
   (let [actual-blocks (atom nil)
         date-page-uuid #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"

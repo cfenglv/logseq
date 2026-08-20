@@ -51,6 +51,12 @@
 
 (def ^:private editor-navigation-trigger-class "jtrigger")
 
+(defn- consume-property-action!
+  ([boundary action]
+   (editor-handler/run-math-transition-action! boundary action))
+  ([boundary options action]
+   (editor-handler/run-math-transition-action! boundary options action)))
+
 (defn- property-value-block-container-class
   []
   (str "property-block-container content w-full " editor-navigation-trigger-class))
@@ -60,9 +66,8 @@
   (= "edit" (some-> (.-currentTarget e) (.getAttribute "data-property-nav-mode"))))
 
 (defn- move-property-value-boundary!
-  [e direction]
-  (util/stop e)
-  (if (editing-navigation? e)
+  [editing? direction]
+  (if editing?
     (editor-handler/move-cross-boundary-up-down direction {:input nil})
     (editor-handler/move-property-focus-up-down direction)))
 
@@ -72,14 +77,13 @@
    :tabIndex 0
    :on-key-down (fn [e]
                   (when (= (.-currentTarget e) js/document.activeElement)
-                    (case (util/ekey e)
-                      "ArrowUp"
-                      (move-property-value-boundary! e :up)
-
-                      "ArrowDown"
-                      (move-property-value-boundary! e :down)
-
-                      nil)))
+                    (when-let [direction ({"ArrowUp" :up "ArrowDown" :down}
+                                          (util/ekey e))]
+                      (let [editing? (editing-navigation? e)]
+                        (util/stop e)
+                        (consume-property-action!
+                         :property-value-navigation
+                         #(move-property-value-boundary! editing? direction))))))
    :style (if (= (:db/ident property) :logseq.property/default-value)
             {:min-width 300}
             {})})
@@ -163,15 +167,18 @@
   (let [icon-value (:logseq.property/icon block)
         clear-overlay! (fn []
                          (shui/popup-hide-all!))
-        on-chosen! (fn [_e icon]
-                     (let [blocks (get-operating-blocks block)]
-                       (property-handler/batch-set-block-property!
-                        (map :db/id blocks)
-                        :logseq.property/icon
-                        (when icon (select-keys icon [:type :id :color]))))
-                     (clear-overlay!)
-                     (when editing?
-                       (editor-handler/restore-last-saved-cursor!)))
+        on-chosen! (fn [e icon]
+                     (consume-property-action!
+                      :property-icon-value-select {:event e}
+                      #(p/do!
+                        (let [blocks (get-operating-blocks block)]
+                          (property-handler/batch-set-block-property!
+                           (map :db/id blocks)
+                           :logseq.property/icon
+                           (when icon (select-keys icon [:type :id :color]))))
+                        (clear-overlay!)
+                        (when editing?
+                          (editor-handler/restore-last-saved-cursor!)))))
         icon (get block :logseq.property/icon)]
     (if editing?
       (icon-component/icon-search
@@ -182,6 +189,12 @@
        (icon-component/icon-picker icon-value
                                    {:disabled? config/publishing?
                                     :del-btn? (some? icon-value)
+                                    :on-before-open
+                                    (fn [e open!]
+                                      (consume-property-action!
+                                       :property-icon-value-popup
+                                       {:event e}
+                                       open!))
                                     :on-chosen on-chosen!})])))
 
 (defn select-type?
@@ -426,23 +439,26 @@
         initial-day value
         initial-month (when value (calendar-default-month value))
         select-handler! (hooks/use-callback
-                         (fn [^js d]
+                         (fn [boundary ^js d e]
                            (when d
-                             (p/let [journal-page (<resolve-journal-page-for-date d)]
-                               (p/do!
-                                (when (fn? on-change)
-                                  (let [value (if datetime? (tc/to-long d) journal-page)]
-                                    (on-change value)))
-                                (when-not datetime?
-                                  (shui/popup-hide! id)
-                                  (ui/hide-popups-until-preview-popup!))))))
+                             (consume-property-action!
+                              boundary {:event e}
+                              #(if datetime?
+                                 (when (fn? on-change)
+                                   (on-change (tc/to-long d)))
+                                 (p/let [journal-page (<resolve-journal-page-for-date d)]
+                                   (p/do!
+                                    (when (fn? on-change)
+                                      (on-change journal-page))
+                                    (shui/popup-hide! id)
+                                    (ui/hide-popups-until-preview-popup!)))))))
                          [id datetime? on-change])]
     (hooks/use-window-keydown
      (fn [^js e]
        (when (and (= "Enter" (util/ekey e))
                   (not (some-> (.-target e)
                                (.closest ".ls-nlp-calendar input"))))
-         (select-handler! initial-day)
+         (select-handler! :property-date-enter initial-day e)
          (util/stop e)))
      [initial-day select-handler!])
     (hooks/use-effect!
@@ -462,8 +478,19 @@
           :selected initial-day
           :id @*ident
           :del-btn? del-btn?
-          :on-delete on-delete
-          :on-day-click select-handler!}
+          :on-delete (fn [e]
+                       (consume-property-action!
+                        :property-date-delete {:event e}
+                        #(when (fn? on-delete) (on-delete e))))
+          :on-day-click (fn
+                          ([d]
+                           (select-handler! :property-date-day d nil))
+                          ([d _modifiers e]
+                           (select-handler! :property-date-day d e))
+                          ([selected trigger-date _modifiers e]
+                           (select-handler! :property-date-day
+                                            (or selected trigger-date)
+                                            e)))}
          initial-month
          (assoc :default-month initial-month)))]
      [:div.hidden.sm:initial
@@ -537,12 +564,15 @@
 
 (defn- delete-block-property!
   [block property opts]
-  (editor-handler/move-cross-boundary-up-down :up {})
-  (property-handler/remove-block-property! (:db/id block)
-                                           (:db/ident property)
-                                           {:preserve-task-tag?
-                                            (= :logseq.class/Task
-                                               (:db/ident (:view-parent opts)))}))
+  (consume-property-action!
+   :property-delete
+   #(p/do!
+     (editor-handler/move-cross-boundary-up-down :up {})
+     (property-handler/remove-block-property! (:db/id block)
+                                              (:db/ident property)
+                                              {:preserve-task-tag?
+                                               (= :logseq.class/Task
+                                                  (:db/ident (:view-parent opts)))}))))
 
 (defn- prevent-bottom-property-edit-pointer-dismiss
   [^js e]
@@ -564,15 +594,20 @@
                                                        :on-delete on-delete
                                                        :datetime? datetime?}))
         open-popup! (fn [e]
-                      (when-not (or (util/meta-key? e) (util/shift-key? e))
-                        (util/stop e)
-                        (editor-handler/save-current-block!)
-                        (when-not config/publishing?
-                          (shui/popup-show! (.-target e) content-fn
-                                            {:align "start"
-                                             :auto-focus? true
-                                             :content-props {:without-animation true
-                                                             :onPointerDownOutside prevent-bottom-property-edit-pointer-dismiss}}))))
+                      (let [modified? (or (util/meta-key? e) (util/shift-key? e))
+                            target (.-target e)]
+                        (when-not modified?
+                          (util/stop e)
+                          (consume-property-action!
+                           :property-date-open
+                           (fn []
+                             (editor-handler/save-current-block!)
+                             (when-not config/publishing?
+                               (shui/popup-show! target content-fn
+                                                 {:align "start"
+                                                  :auto-focus? true
+                                                  :content-props {:without-animation true
+                                                                  :onPointerDownOutside prevent-bottom-property-edit-pointer-dismiss}})))))))
         repeated-task? (:logseq.property.repeat/repeated? block)]
     (if editing?
       (content-fn {:id :date-picker})
@@ -597,8 +632,7 @@
                            ("Backspace" "Delete")
                            (delete-block-property! block property opts)
                            (" " "Enter")
-                           (do (some-> (hooks/deref *el) (.click))
-                               (util/stop e))
+                           (open-popup! e)
                            nil))}
          [:div.flex.flex-row.gap-1.items-center
           (when repeated-task?
@@ -749,21 +783,30 @@
                 (remove #(= :logseq.property/empty-placeholder (:value %))))
         k :on-chosen
         f (get opts k)
-        f' (fn [chosen selected?]
-             (if (or (and (not multiple-choices?) (= chosen clear-value))
-                     (and multiple-choices? (= chosen [clear-value])))
-               (p/do!
-                (let [blocks (get-operating-blocks block)
-                      block-ids (map :block/uuid blocks)]
-                  (property-handler/batch-remove-block-property!
-                   block-ids
-                   (:db/ident property)
-                   {:preserve-task-tag?
-                    (= :logseq.class/Task
-                       (:db/ident (:view-parent opts)))}))
-                (when-not (false? (:exit-edit? opts))
-                  (shui/popup-hide!)))
-               (f chosen selected?)))]
+        choose! (fn [chosen selected?]
+                  (if (or (and (not multiple-choices?) (= chosen clear-value))
+                          (and multiple-choices? (= chosen [clear-value])))
+                    (p/do!
+                     (let [blocks (get-operating-blocks block)
+                           block-ids (map :block/uuid blocks)]
+                       (property-handler/batch-remove-block-property!
+                        block-ids
+                        (:db/ident property)
+                        {:preserve-task-tag?
+                         (= :logseq.class/Task
+                            (:db/ident (:view-parent opts)))}))
+                     (when-not (false? (:exit-edit? opts))
+                       (shui/popup-hide!)))
+                    (f chosen selected?)))
+        choose-after-math! (fn [chosen selected? e]
+                             (consume-property-action!
+                              :property-value-select-chosen {:event e}
+                              #(choose! chosen selected?)))
+        f' (fn
+             ([chosen selected?]
+              (choose-after-math! chosen selected? nil))
+             ([chosen selected? _choices e]
+              (choose-after-math! chosen selected? e)))]
     (select/select (assoc opts
                           :selected-choices selected-choices
                           :items items'
@@ -1238,7 +1281,9 @@
     (if table-text-property-render
       (table-text-property-render
        value-block
-       {:create-new-block #(<create-new-block! block property "")
+       {:create-new-block #(consume-property-action!
+                            :property-table-create
+                            (fn [] (<create-new-block! block property "")))
         :property-ident (:db/ident property)})
       (cond
         (seq value-block)
@@ -1251,7 +1296,11 @@
                        :property-block? true
                        :on-block-content-pointer-down (when default-value?
                                                         (fn [_e]
-                                                          (<create-new-block! block property (or (:block/title default-value) ""))))
+                                                          (consume-property-action!
+                                                           :property-default-block-create
+                                                           (fn []
+                                                             (<create-new-block! block property
+                                                                                 (or (:block/title default-value) ""))))))
                        :p-block (:db/id block)
                        :p-property (:db/id property)
                        :view? (:view? opts)}]
@@ -1267,7 +1316,9 @@
          {:tabIndex 0
           :class (if (:table-view? opts) "cursor-pointer" "cursor-text")
           :style {:min-height 20 :margin-left 3}
-          :on-click #(<create-new-block! block property "")}
+          :on-click #(consume-property-action!
+                      :property-empty-block-create
+                      (fn [] (<create-new-block! block property "")))}
          (when (:class-schema? opts)
            (t :property/add-description))]))))
 
@@ -1317,9 +1368,11 @@
 
     [:div.ls-string.flex.flex-1.jtrigger
      {:ref *ref
-      :on-click #(do
-                   (state/clear-selection!)
-                   (set-editing! true))}
+      :on-click #(consume-property-action!
+                  :property-string-edit
+                  (fn []
+                    (state/clear-selection!)
+                    (set-editing! true)))}
      (if editing?
        (shui/input
         {:auto-focus true
@@ -1329,20 +1382,26 @@
          :on-change (fn [e]
                       (set-value! (util/evalue e)))
          :on-blur (fn [_e]
-                    (p/do!
-                     (set-property-value! value)))
+                    (consume-property-action!
+                     :property-string-blur
+                     #(set-property-value! value)))
          :on-key-down (fn [e]
                         (case (util/ekey e)
                           "Enter"
                           (do
                             (util/stop e)
-                            (set-property-value! value))
+                            (consume-property-action!
+                             :property-string-enter
+                             #(set-property-value! value)))
                           "Escape"
                           (do
                             (util/stop e)
-                            (set-value! string-value)
-                            (set-editing! false)
-                            (some-> (hooks/deref *ref) (.focus)))
+                            (consume-property-action!
+                             :property-string-escape
+                             (fn []
+                               (set-value! string-value)
+                               (set-editing! false)
+                               (some-> (hooks/deref *ref) (.focus)))))
                           nil))})
        (if (string/blank? string-value)
          (property-empty-text-value property {:table-view? table-view?})
@@ -1423,21 +1482,34 @@
                      :on-context-menu
                      (fn [e]
                        (util/stop e)
-                       (shui/popup-show! (.-target e)
-                                         (fn []
-                                           [:<>
-                                            (shui/dropdown-menu-item
-                                             {:key "open"
-                                              :on-click #(route-handler/redirect-to-page! (:block/uuid value))}
-                                             (t :ui/open-named (:block/title value)))
+                       (let [target (.-target e)]
+                         (consume-property-action!
+                          :property-page-context-menu
+                          {:event e}
+                          (fn []
+                            (shui/popup-show! target
+                                             (fn []
+                                               [:<>
+                                                (shui/dropdown-menu-item
+                                                 {:key "open"
+                                                  :on-click #(consume-property-action!
+                                                              :property-page-context-route
+                                                              (fn []
+                                                                (route-handler/redirect-to-page!
+                                                                 (:block/uuid value))))}
+                                                 (t :ui/open-named (:block/title value)))
 
-                                            (shui/dropdown-menu-item
-                                             {:key "open sidebar"
-                                              :on-click #(state/sidebar-add-block! (state/get-current-repo) (:db/id value) :page)}
-                                             (t :sidebar.right/open))])
-                                         {:as-dropdown? true
-                                          :content-props {:on-click (fn [] (shui/popup-hide!))}
-                                          :align "start"}))}]
+                                                (shui/dropdown-menu-item
+                                                 {:key "open sidebar"
+                                                  :on-click #(consume-property-action!
+                                                              :property-page-context-sidebar
+                                                              (fn []
+                                                                (state/sidebar-add-block!
+                                                                 (state/get-current-repo) (:db/id value) :page)))}
+                                                 (t :sidebar.right/open))])
+                                             {:as-dropdown? true
+                                              :content-props {:on-click (fn [] (shui/popup-hide!))}
+                                              :align "start"})))))}]
            ^{:key (:db/id value)}
            [:<> (page-cp opts value)]))
 
@@ -1479,17 +1551,21 @@
     (if editing?
       (popup-content nil)
       (let [show! (fn [e]
-                    (util/stop e)
-                    (state/clear-selection!)
-                    (let [target (when e (.-target e))]
-                      (when-not (or config/publishing?
-                                    (util/shift-key? e)
-                                    (util/meta-key? e)
-                                    (util/link? target)
-                                    (when-let [node (.closest target "a")]
-                                      (not (or (d/has-class? node "page-ref")
-                                               (d/has-class? node "tag")))))
-                        (show-popup! target))))]
+                    (let [target (when e (.-target e))
+                          blocked? (or config/publishing?
+                                       (util/shift-key? e)
+                                       (util/meta-key? e)
+                                       (util/link? target)
+                                       (when-let [node (.closest target "a")]
+                                         (not (or (d/has-class? node "page-ref")
+                                                  (d/has-class? node "tag")))))]
+                      (util/stop e)
+                      (consume-property-action!
+                       :property-select-open
+                       (fn []
+                         (state/clear-selection!)
+                         (when-not blocked?
+                           (show-popup! target))))))]
         (shui/trigger-as
          (if (:other-position? opts) :div.jtrigger :div.jtrigger.flex.flex-1.w-full.cursor-pointer)
          {:ref *el
@@ -1501,8 +1577,7 @@
                            ("Backspace" "Delete")
                            (delete-block-property! block property opts)
                            (" " "Enter")
-                           (do (some-> (hooks/deref *el) (.click))
-                               (util/stop e))
+                           (show! e)
                            nil))}
          (if (string/blank? value)
            (property-empty-text-value property opts)
@@ -1529,7 +1604,9 @@
      (cond
        (and (= :logseq.property/default-value (:db/ident property)) (nil? (:block/title value)))
        [:div.jtrigger.cursor-pointer.text-sm.px-2
-        {:on-click #(<create-new-block! block property "")}
+        {:on-click #(consume-property-action!
+                     :property-default-block-create
+                     (fn [] (<create-new-block! block property "")))}
         (t :property/set-default-value)]
 
        (= (:db/ident property) :logseq.property.publish/published-url)
@@ -1545,7 +1622,9 @@
             :class "text-xs"
             :on-click (fn [e]
                         (util/stop e)
-                        (publish-handler/unpublish-page! block))}
+                        (consume-property-action!
+                         :property-unpublish
+                         #(publish-handler/unpublish-page! block)))}
            (t :publish/unpublish)))]
 
        text-ref-type?
@@ -1557,8 +1636,11 @@
            (contains? (set (keys string-value-on-click))
                       (:db/ident property))
            [:div.w-full {:on-click (fn []
-                                     (let [f (get string-value-on-click (:db/ident property))]
-                                       (f block property)))}
+                                     (consume-property-action!
+                                      :property-string-action
+                                      (fn []
+                                        (let [f (get string-value-on-click (:db/ident property))]
+                                          (f block property)))))}
             content]
 
            :else
@@ -1573,6 +1655,7 @@
         number-value-str (if (some? number-value) (str number-value) "")
         [value set-value!] (hooks/use-state number-value-str)
         [*value _] (hooks/use-state (atom value))
+        consume-after-math! consume-property-action!
         set-property-value! (fn [value & {:keys [exit-editing?]
                                           :or {exit-editing? true}}]
                               (p/do!
@@ -1592,7 +1675,8 @@
                                  (set-editing! false))))]
     (hooks/use-effect!
      (fn []
-       #(set-property-value! @*value))
+       #(consume-after-math! :property-number-unmount
+                             (fn [] (set-property-value! @*value))))
      [])
 
     (hooks/use-effect!
@@ -1603,9 +1687,11 @@
 
     [:div.ls-number.flex.flex-1.jtrigger
      {:ref *ref
-      :on-click #(do
-                   (state/clear-selection!)
-                   (set-editing! true))}
+      :on-click #(consume-after-math!
+                  :property-number-edit
+                  (fn []
+                    (state/clear-selection!)
+                    (set-editing! true)))}
      (if editing?
        (shui/input
         {:ref *input-ref
@@ -1615,11 +1701,16 @@
          :value value
          :type "number"
          :on-change (fn [e]
-                      (set-value! (util/evalue e))
-                      (reset! *value (util/evalue e)))
+                      (let [next-value (util/evalue e)]
+                        (consume-after-math!
+                         :property-number-change
+                         (fn []
+                            (set-value! next-value)
+                            (reset! *value next-value)))))
          :on-blur (fn [_e]
-                    (p/do!
-                     (set-property-value! value)))
+                    (consume-after-math!
+                     :property-number-blur
+                     #(set-property-value! value)))
          :on-key-down (fn [e]
                         (let [input (hooks/deref *input-ref)
                               pos (cursor/pos input)
@@ -1628,21 +1719,32 @@
                             (case k
                               ("ArrowUp" "ArrowDown")
                               (do
-                                (util/stop-propagation e)
-                                (set-editing! false)
-                                (editor-handler/move-cross-boundary-up-down (if (= "ArrowUp" (util/ekey e)) :up :down) {})
-                                (set-property-value! value {:exit-editing? false}))
+                                (util/stop e)
+                                (consume-after-math!
+                                 :property-number-navigation
+                                 (fn []
+                                   (let [movement (editor-handler/move-cross-boundary-up-down
+                                                   (if (= "ArrowUp" k) :up :down) {})]
+                                     (p/let [_ movement]
+                                       (set-editing! false)
+                                       (set-property-value! value {:exit-editing? false}))))))
 
                               "Backspace"
                               (when (zero? pos)
-                                (p/do!
-                                 (db-property-handler/remove-block-property! (:db/id block) (:db/ident property))
-                                 (editor-handler/move-cross-boundary-up-down :up {:pos :max})))
+                                (consume-after-math!
+                                 :property-number-delete
+                                 (fn []
+                                   (p/do!
+                                    (db-property-handler/remove-block-property! (:db/id block) (:db/ident property))
+                                    (editor-handler/move-cross-boundary-up-down :up {:pos :max})))))
 
                               ("Escape" "Enter")
-                              (p/do!
-                               (set-property-value! value)
-                               (.focus (hooks/deref *ref)))
+                              (consume-after-math!
+                               :property-number-exit
+                               (fn []
+                                 (p/do!
+                                  (set-property-value! value)
+                                  (.focus (hooks/deref *ref)))))
 
                               nil))))})
        (if (string/blank? value)
@@ -1746,9 +1848,12 @@
         image? (asset-image? asset-type)
         video? (asset-video? asset-type)
         preview! (fn [e]
-                   (when-not (asset-embedded-control-click? (.-target e))
-                     (util/stop e)
-                     (state/pub-event! [:asset/show-preview value])))
+                   (let [embedded-control? (asset-embedded-control-click? (.-target e))]
+                     (when-not embedded-control?
+                       (util/stop e)
+                       (consume-property-action!
+                        :asset-preview
+                        #(state/pub-event! [:asset/show-preview value])))))
         preview-key! (fn [e]
                        (when (contains? #{" " "Enter"} (util/ekey e))
                          (preview! e)))]
@@ -1829,9 +1934,12 @@
     (set! (.. input -style -display) "none")
     (.addEventListener input "change"
                        (fn [e]
-                         (let [input (.-target e)]
-                           (upload-files! (.-files input))
-                           (cleanup!))))
+                         (editor-handler/run-math-transition-action!
+                          :asset-grid-upload-change {:event e}
+                          #(let [input (.-target e)]
+                             (p/finally
+                              (p/resolved (upload-files! (.-files input)))
+                              cleanup!)))))
     (.addEventListener input "cancel" cleanup!)
     (.appendChild js/document.body input)
     (.click input)))
@@ -1844,9 +1952,13 @@
      :variant :outline
      :class "max-w-full whitespace-nowrap"
      :disabled saving?
+     :on-pointer-down (fn [e]
+                        (editor-handler/run-math-transition-action!
+                         :asset-grid-upload-pointer {:event e} (fn [] nil)))
      :on-click (fn [e]
                  (util/stop e)
-                 (open-file-picker!))}
+                 (editor-handler/run-math-transition-action!
+                  :asset-grid-upload {:event e} open-file-picker!))}
     (ui/icon "upload" {:size 14})
     (t :asset/add-assets))])
 
@@ -1862,11 +1974,21 @@
       :style {:aspect-ratio "1 / 1"}
       :class (when selected? "ring-2 ring-primary border-primary")
       :aria-pressed selected?
-      :on-click #(toggle-asset! asset)
+      :on-pointer-down (fn [e]
+                         (editor-handler/run-math-transition-action!
+                          :asset-grid-cell-pointer {:event e} (fn [] nil)))
+      :on-click (fn [e]
+                  (editor-handler/run-math-transition-action!
+                   (if selected? :asset-grid-unselect :asset-grid-select)
+                   {:event e}
+                   #(toggle-asset! asset)))
       :on-key-down (fn [e]
                      (when (contains? #{" " "Enter"} (util/ekey e))
                        (util/stop e)
-                       (toggle-asset! asset)))}
+                       (editor-handler/run-math-transition-action!
+                        (if selected? :asset-grid-unselect :asset-grid-select)
+                        {:event e}
+                        #(toggle-asset! asset))))}
      [:div.asset-picker-title.w-full.px-1.py-0.5.text-xs.truncate.text-left.border-b.opacity-80
       (:block/title asset)]
      [:div.flex.flex-1.items-center.justify-center.w-full.overflow-hidden.p-1.pointer-events-none
@@ -1916,8 +2038,11 @@
                                  (fn [saved-assets]
                                    (let [saved-assets (vec (remove nil? saved-assets))]
                                      (when (seq saved-assets)
-                                       (set-assets! (vec (concat (or assets []) saved-assets)))
-                                       (select-assets! saved-assets)))))
+                                       (editor-handler/run-math-transition-action!
+                                        :asset-grid-upload-save-select
+                                        #(do
+                                           (set-assets! (vec (concat (or assets []) saved-assets)))
+                                           (select-assets! saved-assets)))))))
                                 (p/catch #(show-asset-picker-error! "Failed to add assets from picker" %))
                                 (p/finally #(set-saving! false))))))]
     (hooks/use-effect!
@@ -1952,12 +2077,15 @@
                                          (fn [] (asset-grid-popup-content block property opts))
                                          {:align "start"
                                           :auto-focus? true})))
+        consume-action! consume-property-action!
         show-grid-from-click! (fn [e]
-                                (when-not (some-> (.-target e)
-                                                  (.closest (str "[data-asset-preview-trigger], "
-                                                                 asset-embedded-control-selector)))
-                                  (util/stop e)
-                                  (show-grid! (or (.-currentTarget e) (hooks/deref *el)))))]
+                                (let [embedded-control? (some-> (.-target e)
+                                                                (.closest (str "[data-asset-preview-trigger], "
+                                                                               asset-embedded-control-selector)))
+                                      target (or (hooks/deref *el) (.-currentTarget e))]
+                                  (when-not embedded-control?
+                                    (util/stop e)
+                                    (consume-action! :asset-picker-open #(show-grid! target)))))]
     (if (show-inline-asset-picker? editing? value)
       [:div.property-select.w-full
        (asset-grid-popup-content block property opts)]
@@ -1967,27 +2095,39 @@
         :tabIndex 0
         :aria-label (t :asset/picker-open)
         :onClickCapture show-grid-from-click!
-        :on-click show-grid-from-click!
         :on-key-down (fn [e]
-                       (case (util/ekey e)
-                         "ArrowUp"
-                         (move-property-value-boundary! e :up)
+                       (let [key (util/ekey e)
+                             target (or (.-currentTarget e) (hooks/deref *el))
+                             editing? (editing-navigation? e)]
+                         (case key
+                           "ArrowUp"
+                           (do
+                             (util/stop e)
+                             (consume-action! :asset-picker-navigation
+                                              #(move-property-value-boundary! editing? :up)))
 
-                         "ArrowDown"
-                         (move-property-value-boundary! e :down)
+                           "ArrowDown"
+                           (do
+                             (util/stop e)
+                             (consume-action! :asset-picker-navigation
+                                              #(move-property-value-boundary! editing? :down)))
 
-                         ("Backspace" "Delete")
-                         (when-not config/publishing?
-                           (delete-block-property! block property opts))
-                         (" " "Enter")
-                         (do (show-grid! (or (.-currentTarget e) (hooks/deref *el)))
-                             (util/stop e))
-                         nil))}
+                           ("Backspace" "Delete")
+                           (do
+                             (util/stop e)
+                             (consume-action! :asset-picker-delete
+                                              #(when-not config/publishing?
+                                                 (delete-block-property! block property opts))))
+                           (" " "Enter")
+                           (do
+                             (util/stop e)
+                             (consume-action! :asset-picker-open #(show-grid! target)))
+                           nil)))}
        (if (and value (:db/id value))
          [:div.flex.items-center.gap-2.w-full.flex-wrap
           (asset-value-content value)]
          [:div.w-full.cursor-pointer
-          {:on-click show-grid-from-click!}
+          {}
           (property-empty-text-value property opts)])))))
 
 (hsx/defc property-scalar-value-aux
@@ -2032,11 +2172,14 @@
               (shui/checkbox {:checked checked?
                               :class "mt-1"
                               :on-checked-change (fn [value]
-                                                   (let [choices (:property/closed-values property)
-                                                         choice (some (fn [choice] (when (= value (:logseq.property/choice-checkbox-state choice))
-                                                                                     choice)) choices)]
-                                                     (when choice
-                                                       (db-property-handler/set-block-property! (:db/id block) (:db/ident property) (:db/id choice)))))}))
+                                                   (consume-property-action!
+                                                    :property-closed-checkbox
+                                                    (fn []
+                                                      (let [choices (:property/closed-values property)
+                                                            choice (some (fn [choice] (when (= value (:logseq.property/choice-checkbox-state choice))
+                                                                                        choice)) choices)]
+                                                        (when choice
+                                                          (db-property-handler/set-block-property! (:db/id block) (:db/ident property) (:db/id choice)))))))}))
             (single-value-select block property value
                                  select-opts
                                  (assoc opts
@@ -2059,10 +2202,15 @@
 	                             :auto-focus editing?
 	                             :checked value
 	                             :on-checked-change (fn []
-	                                                  (add-property! (not value)))
+	                                                  (consume-property-action!
+	                                                   :property-checkbox
+	                                                   #(add-property! (not value))))
 	                             :on-key-down (fn [e]
 	                                            (when (= (util/ekey e) "Enter")
-	                                              (add-property! (not value)))
+	                                              (util/stop e)
+	                                              (consume-property-action!
+	                                               :property-checkbox
+	                                               #(add-property! (not value))))
 	                                            (when (contains? #{"Backspace" "Delete"} (util/ekey e))
 	                                              (delete-block-property! block property opts)))})])
           ;; :others
@@ -2110,13 +2258,17 @@
             content-fn (fn [{:keys [_id content-props]} target]
                          (select-cp {:content-props content-props} target))
             show-popup! (fn [^js e]
-                          (let [target (.-target e)]
-                            (when-not (or (util/link? target) (.closest target "a") config/publishing?)
-                              (shui/popup-show! (hooks/deref *el)
-                                                (fn [opts]
-                                                  (content-fn opts target))
-                                                {:as-dropdown? true :as-content? false
-                                                 :align "start" :auto-focus? true}))))]
+                          (let [target (.-target e)
+                                blocked? (or (util/link? target) (.closest target "a") config/publishing?)]
+                            (consume-property-action!
+                             :property-multiple-open
+                             (fn []
+                               (when-not blocked?
+                                 (shui/popup-show! (hooks/deref *el)
+                                                   (fn [opts]
+                                                     (content-fn opts target))
+                                                   {:as-dropdown? true :as-content? false
+                                                    :align "start" :auto-focus? true}))))))]
         [:div.multi-values.jtrigger
          {:tab-index "0"
           :ref *el
@@ -2124,8 +2276,9 @@
           :on-key-down (fn [^js e]
                          (case (.-key e)
                            (" " "Enter")
-                           (do (some-> (hooks/deref *el) (.click))
-                               (util/stop e))
+                           (do
+                             (util/stop e)
+                             (show-popup! e))
                            ("Backspace" "Delete")
                            (delete-block-property! block property opts)
                            :dune))
@@ -2211,9 +2364,11 @@
                        :size :sm
                        :class "h-5"
                        :on-click (fn []
-                                   (db-property-handler/remove-block-property!
-                                    (:db/id block)
-                                    (:db/ident property)))}
+                                   (consume-property-action!
+                                    :property-self-reference-fix
+                                    #(db-property-handler/remove-block-property!
+                                      (:db/id block)
+                                      (:db/ident property))))}
                       (t :ui/fix))]
         (let [empty-value? (when (coll? v) (= :logseq.property/empty-placeholder (:db/ident (first v))))
               closed-values? (seq (:property/closed-values property))
@@ -2223,7 +2378,9 @@
                                      (when-not (:other-position? opts) " w-full"))
                          :on-pointer-down (fn [e]
                                             (when-not (some-> (.-target e) (.closest "[data-radix-popper-content-wrapper]"))
-                                              (state/clear-selection!)))}
+                                              (consume-property-action!
+                                               :property-value-pointer {:event e}
+                                               state/clear-selection!)))}
                         (cond
                           (and multiple-values? (contains? #{:default :url} type) (not closed-values?) (not editing?))
                           (property-normal-block-value block property v opts)

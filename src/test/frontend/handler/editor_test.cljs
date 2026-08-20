@@ -1,12 +1,17 @@
 (ns frontend.handler.editor-test
-  (:require [clojure.test :refer [async deftest is testing use-fixtures]]
+  (:require ["react" :as react]
+            ["react-dom/server" :as react-dom-server]
+            [clojure.test :refer [async deftest is testing use-fixtures]]
             [datascript.core :as d]
             [frontend.commands :as commands]
+            [frontend.components.block :as block-component]
             [frontend.components.editor :as editor-component]
+            [frontend.context.i18n :refer [t]]
             [frontend.db :as db]
             [frontend.db.async :as db-async]
             [frontend.db.model :as model]
             [frontend.handler.assets :as assets-handler]
+            [frontend.handler.block :as block-handler]
             [frontend.handler.editor :as editor]
             [frontend.handler.paste :as paste-handler]
             [frontend.handler.route :as route-handler]
@@ -16,6 +21,7 @@
             [frontend.util :as util]
             [frontend.util.cursor :as cursor]
             [goog.dom :as gdom]
+            [goog.object :as gobj]
             [logseq.db :as ldb]
             [logseq.outliner.core :as outliner-core]
             [promesa.core :as p]))
@@ -330,21 +336,36 @@
       (is (= [8 12] @selection-range)))))
 
 (defn- keydown-dollar-without-selection-result
-  [{:keys [value cursor-pos]}]
+  [{:keys [value cursor-pos display-type]}]
   (let [content (atom nil)
         cursor-pos' (atom nil)
+        events (atom [])
+        block {:db/id 1
+               :block/uuid (random-uuid)
+               :block/title value
+               :logseq.property.node/display-type display-type}
         input #js {:id "edit-block-test"
-                   :value value}
+                   :value value
+                   :selectionStart cursor-pos
+                   :selectionEnd cursor-pos
+                   :setSelectionRange (fn [start end]
+                                        (reset! cursor-pos' start)
+                                        [start end])}
         event #js {:key "$"
                    :ctrlKey false
                    :metaKey false}]
     (with-redefs [state/get-edit-input-id (constantly "edit-block-test")
                   state/get-input (constantly input)
+                  state/get-edit-block (constantly block)
                   state/get-editor-action (constantly nil)
                   state/set-state! (constantly nil)
+                  state/pub-event! (fn [event']
+                                     (swap! events conj event')
+                                     (p/resolved nil))
                   state/set-block-content-and-last-pos! (fn [_input-id value' pos']
                                                           (reset! content value')
                                                           (reset! cursor-pos' pos'))
+                  db/entity (constantly block)
                   gdom/getElement (constantly input)
                   util/get-selected-text (constantly "")
                   util/stop (constantly nil)
@@ -353,17 +374,320 @@
                                           (reset! cursor-pos' pos'))]
       ((editor/keydown-not-matched-handler :markdown) event nil)
       {:content @content
-       :cursor-pos @cursor-pos'})))
+       :cursor-pos @cursor-pos'
+       :events @events})))
 
 (deftest keydown-not-matched-handler-expands-dollar-delimiters-without-selection
   (is (= {:content "inline $$"
-          :cursor-pos 8}
+          :cursor-pos 8
+          :events []}
          (keydown-dollar-without-selection-result {:value "inline "
                                                    :cursor-pos 7})))
-  (is (= {:content "inline $$$$"
-          :cursor-pos 9}
-         (keydown-dollar-without-selection-result {:value "inline $$"
-                                                   :cursor-pos 8}))))
+  (let [{:keys [content cursor-pos events]}
+        (keydown-dollar-without-selection-result {:value "$$"
+                                                  :cursor-pos 1})
+        [_ payload] (first events)]
+    (is (= "" content) "The second physical dollar atomically becomes empty Math")
+    (is (= 0 cursor-pos) "The empty Math caret remains on the converted block")
+    (is (= 1 (count events)))
+    (is (= :math (:type payload)))
+    (is (= "" (get-in payload [:block :block/title])))
+    (is (true? (:update-current-block? payload)))))
+
+(deftest keydown-not-matched-handler-does-not-autopair-dollar-in-math
+  (is (= {:content nil
+          :cursor-pos nil
+          :events []}
+         (keydown-dollar-without-selection-result {:value "x"
+                                                   :cursor-pos 1
+                                                   :display-type :math}))))
+
+(defn- edit-box-math-conversion-result
+  [value]
+  (let [block {:db/id 1
+               :block/uuid (random-uuid)
+               :block/title ""}
+        input #js {:id "edit-block-test"
+                   :value value
+                   :selectionStart (count value)
+                   :selectionEnd (count value)
+                   :setSelectionRange (fn [_start _end])}
+        contents (atom [])
+        cursor-pos (atom nil)
+        events (atom [])
+        ordinary-editor-info {:block-uuid (:block/uuid block)
+                              :container-id 17
+                              :start-pos (count value)
+                              :end-pos (count value)}]
+    (reset! editor/*auto-save-timeout nil)
+    (with-redefs [state/get-current-repo (constantly "test-repo")
+                  state/get-edit-block (constantly block)
+                  state/get-input (constantly input)
+                  state/get-editor-info (constantly ordinary-editor-info)
+                  state/set-edit-content! (fn [_input-id value' & _]
+                                            (swap! contents conj value'))
+                  state/set-block-content-and-last-pos! (fn [_input-id value' pos']
+                                                          (swap! contents conj value')
+                                                          (reset! cursor-pos pos'))
+                  state/set-state! (constantly nil)
+                  state/pub-event! (fn [event]
+                                     (swap! events conj event)
+                                     (p/resolved nil))
+                  db/entity (constantly block)
+                  gdom/getElement (constantly input)
+                  block-handler/mark-last-input-time! (constantly nil)]
+      (editor/edit-box-on-change! #js {:target input} block "edit-block-test")
+      (#'editor/clear-block-auto-save-timeout!)
+      (let [timeout-scheduled? (some? @editor/*auto-save-timeout)]
+        (reset! editor/*auto-save-timeout nil)
+        {:contents @contents
+         :cursor-pos @cursor-pos
+         :events @events
+         :ordinary-editor-info ordinary-editor-info
+         :timeout-scheduled? timeout-scheduled?}))))
+
+(deftest edit-box-on-change-atomically-converts-whole-display-math
+  (doseq [[value bare-title expected-cursor]
+          [["$$x$$" "x" 1]
+           ["$$$$" "" 0]]]
+    (let [{:keys [contents cursor-pos events ordinary-editor-info timeout-scheduled?]}
+          (edit-box-math-conversion-result value)
+          [_ payload] (first events)]
+      (is (= [value bare-title] contents)
+          (str value " rewrites the live editor buffer in the same change path"))
+      (is (= expected-cursor cursor-pos))
+      (is (false? timeout-scheduled?)
+          "A semantic conversion must not be deferred to the 450 ms autosave")
+      (is (= 1 (count events)))
+      (is (= :editor/upsert-type-block (ffirst events)))
+      (is (= :math (:type payload)))
+       (is (= bare-title (get-in payload [:block :block/title])))
+       (is (= ordinary-editor-info (:math-transition-editor-info payload))
+           "Undo must capture the ordinary cursor/focus preimage before optimistic remap")
+       (is (true? (:preserve-editor-state? payload))))))
+
+(deftest edit-box-autosave-test-clock-executes-the-450ms-callback
+  (let [block {:db/id 1
+               :block/uuid #uuid "11111111-1111-1111-1111-111111111111"
+               :block/title "before"}
+        input #js {:id "edit-block-test"
+                   :value "after"}
+        scheduled (atom nil)
+        saves (atom [])
+        original-set-timeout js/setTimeout]
+    (reset! editor/*auto-save-timeout nil)
+    (try
+      (set! js/setTimeout
+            (fn [callback delay]
+              (reset! scheduled {:callback callback :delay delay})
+              41))
+      (with-redefs [state/get-edit-block (constantly block)
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/set-edit-content! (constantly nil)
+                    state/input-idle? (constantly true)
+                    db/entity (constantly block)
+                    block-handler/mark-last-input-time! (constantly nil)
+                    editor/save-current-block! (fn [opts] (swap! saves conj opts))]
+        (editor/edit-box-on-change! #js {:target input} block "edit-block-test")
+        (is (= 450 (:delay @scheduled)))
+        ((:callback @scheduled))
+        (is (= [{:skip-properties? true}] @saves)
+            "The fake clock must run, not merely observe, the autosave callback"))
+      (finally
+        (set! js/setTimeout original-set-timeout)
+        (reset! editor/*auto-save-timeout nil)))))
+
+(deftest slash-command-draft-is-never-autosaved-as-block-content
+  (let [block {:db/id 1
+               :block/uuid #uuid "11111111-1111-1111-1111-111111111111"
+               :block/title "before"}
+        input #js {:id "edit-block-test"
+                   :value "before /"}
+        scheduled (atom nil)
+        cancelled (atom #{})
+        saves (atom [])
+        original-set-timeout js/setTimeout
+        original-clear-timeout js/clearTimeout]
+    (reset! editor/*auto-save-timeout nil)
+    (try
+      (set! js/setTimeout
+            (fn [callback delay]
+              (reset! scheduled {:callback callback :delay delay :id 41})
+              41))
+      (set! js/clearTimeout #(swap! cancelled conj %))
+      (with-redefs [state/get-edit-block (constantly block)
+                    state/get-edit-input-id (constantly "edit-block-test")
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/get-input (constantly input)
+                    state/get-editor-args (constantly [nil nil nil])
+                    state/set-edit-content! (constantly nil)
+                    state/input-idle? (constantly true)
+                    state/set-editor-action-data! (constantly nil)
+                    state/set-editor-show-commands! #(state/set-editor-action! :commands)
+                    commands/reinit-matched-commands! (constantly nil)
+                    cursor/pos (constantly (count (.-value input)))
+                    cursor/get-caret-pos (constantly {})
+                    db/entity (constantly block)
+                    block-handler/mark-last-input-time! (constantly nil)
+                    editor/save-current-block! (fn [opts] (swap! saves conj opts))]
+        (state/set-editor-action! nil)
+        (editor/edit-box-on-change! #js {:target input} block "edit-block-test")
+        (is (= 450 (:delay @scheduled)))
+        (editor/handle-last-input)
+        (is (= :commands (state/get-editor-action)))
+        (is (contains? @cancelled (:id @scheduled))
+            "Opening the slash command palette must cancel the pending content save")
+        (when-not (contains? @cancelled (:id @scheduled))
+          ((:callback @scheduled)))
+        (is (empty? @saves)
+            "A slow or lost command popup must not commit its slash trigger through RTC"))
+      (finally
+        (state/set-editor-action! nil)
+        (set! js/setTimeout original-set-timeout)
+        (set! js/clearTimeout original-clear-timeout)
+        (reset! editor/*auto-save-timeout nil)))))
+
+(deftest slash-command-query-keeps-autosave-disarmed
+  (let [block {:db/id 1
+               :block/uuid #uuid "11111111-1111-1111-1111-111111111111"
+               :block/title "before"}
+        input #js {:id "edit-block-test"
+                   :value "before/Add property"}
+        scheduled? (atom false)
+        original-set-timeout js/setTimeout]
+    (reset! editor/*auto-save-timeout nil)
+    (try
+      (set! js/setTimeout
+            (fn [_callback _delay]
+              (reset! scheduled? true)
+              41))
+      (with-redefs [state/get-edit-block (constantly block)
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/set-edit-content! (constantly nil)
+                    db/entity (constantly block)
+                    block-handler/mark-last-input-time! (constantly nil)]
+        (state/set-editor-action! :commands)
+        (editor/edit-box-on-change! #js {:target input} block "edit-block-test")
+        (is (false? @scheduled?)
+            "Command search text must remain an editor draft until a command is chosen"))
+      (finally
+        (state/set-editor-action! nil)
+        (set! js/setTimeout original-set-timeout)
+        (reset! editor/*auto-save-timeout nil)))))
+
+(deftest empty-math-placeholder-is-only-native-textarea-guidance
+  (let [props-fn (resolve 'frontend.components.editor/empty-math-placeholder-props)]
+    (is (fn? props-fn))
+    (when (fn? props-fn)
+      (let [props (props-fn)]
+        (is (= {:placeholder "$$"
+                :data-math-empty "true"}
+               props))
+        (is (not-any? #(contains? props %)
+                      [:tab-index :tabIndex :role :on-key-down]))))))
+
+(deftest read-mode-empty-math-is-not-an-inert-tab-stop
+  (let [props (block-component/empty-math-read-placeholder-props)
+        placeholder-fn (resolve
+                        'frontend.components.block/empty-math-read-placeholder)]
+    (is (= "true" (:data-math-empty props)))
+    (is (not (contains? props :aria-label))
+        "A generic non-focusable span must not rely on an aria-label")
+    (is (not-any? #(contains? props %)
+                  [:tab-index :tabIndex :role :on-key-down :on-click])
+        "Read mode must not expose a focusable placeholder with no keyboard behavior")
+    (is (fn? placeholder-fn))
+    (when (fn? placeholder-fn)
+      (is (= [:span.math-block-empty-placeholder
+              props
+              [:span.sr-only (t :editor/empty-math-block)]
+              [:span {:aria-hidden true} "$$"]]
+             (placeholder-fn))
+          "Empty Math guidance must have localized screen-reader text and decorative dollars"))))
+
+(deftest public-block-title-renders-empty-math-with-accessible-fallback
+  (let [block {:db/id 91
+               :block/uuid #uuid "91919191-9191-4191-8191-919191919191"
+               :block/title ""
+               :logseq.property.node/display-type :math}
+        previous-language (:preferred-language @state/state)
+        previous-react (gobj/get js/globalThis "React")]
+    (try
+      ;; Spanish intentionally has no key for this new label. The public block
+      ;; renderer must resolve the English fallback before producing hiccup.
+      (state/set-state! :preferred-language :es)
+      (gobj/set js/globalThis "React" react)
+      (with-redefs [db/entity (constantly block)
+                    ldb/page? (constantly false)
+                    ldb/asset? (constantly false)
+                    ldb/class-instance? (constantly false)]
+        (let [html (.renderToStaticMarkup
+                    react-dom-server
+                    (block-component/block-title {} block {}))]
+          (is (re-find
+               #"^<div class=\"[^\"]*math-block[^\"]*\"><span data-math-empty=\"true\" class=\"[^\"]*math-block-empty-placeholder[^\"]*\"[^>]*><span class=\"[^\"]*sr-only[^\"]*\">Empty Math block</span><span aria-hidden=\"true\">\$\$</span></span></div>$"
+               html)
+              "Public outer branch owns the complete placeholder/AX structure")
+          (is (not (re-find
+                    #"<(a|button|input|select|textarea)(\s|>)|tabindex=|contenteditable=|role="
+                    html))
+              "The public marker contains no naturally or explicitly focusable element")))
+      (finally
+        (state/set-state! :preferred-language previous-language)
+        (if (some? previous-react)
+          (gobj/set js/globalThis "React" previous-react)
+          (js-delete js/globalThis "React"))))))
+
+(deftest copy-selection-blocks-exports-empty-math-with-one-delimiter-layer
+  (test-helper/load-test-files
+   [{:page {:block/title "Math copy payload"}
+     :blocks [{:block/title ""
+               :logseq.property.node/display-type :math}]}])
+  (let [block (->> (d/datoms (db/get-db) :avet
+                             :logseq.property.node/display-type :math)
+                   (map #(d/entity (db/get-db) (:e %)))
+                   (filter #(= "" (:block/title %)))
+                   first)
+        clipboard (atom nil)]
+    (with-redefs [util/write-clipboard (fn [data & _]
+                                         (reset! clipboard data))]
+      (editor/copy-selection-blocks false {:selected-blocks [block]}))
+    (let [payload (js->clj @clipboard :keywordize-keys true)
+          text (:text payload)]
+      (is (string? text) "The public copy path must reach the clipboard payload")
+      (is (some? (re-find #"(?s)\$\$\n\s*\n\s*\$\$" text)))
+      (is (= 2 (count (re-seq #"\$\$" text)))
+          "Clipboard text must contain one opening and one closing delimiter"))))
+
+(deftest legacy-math-save-canonicalizes-buffer-and-selection-with-the-db-value
+  (let [block {:db/id 1
+               :block/uuid #uuid "11111111-1111-1111-1111-111111111111"
+               :block/title "$$x$$"
+               :logseq.property.node/display-type :math}
+        calls (atom [])
+        input #js {:value "$$x$$"
+                   :selectionStart 5
+                   :selectionEnd 5
+                   :setSelectionRange (fn [start end]
+                                        (swap! calls conj [:selection start end]))}]
+    (with-redefs [state/get-edit-block (constantly block)
+                  state/set-block-content-and-last-pos!
+                  (fn [id title pos]
+                    (swap! calls conj [:content id title pos]))
+                  state/set-state! (fn [& args]
+                                     (swap! calls conj (into [:state] args)))]
+      (is (= "x"
+             (#'editor/canonicalize-current-math-editor-value!
+              block "edit-block-test" input "$$x$$")))
+      (is (= [[:content "edit-block-test" "x" 1]
+              [:state :editor/block (assoc block :block/title "x")]
+              [:selection 1 1]]
+             @calls))
+      (reset! calls [])
+      (is (= "prefix $$x$$"
+             (#'editor/canonicalize-current-math-editor-value!
+              block "edit-block-test" input "prefix $$x$$")))
+      (is (empty? @calls) "Unproven mixed TeX is never rewritten"))))
 
 (defn- delete-block-at-zero-pos-result
   [block]

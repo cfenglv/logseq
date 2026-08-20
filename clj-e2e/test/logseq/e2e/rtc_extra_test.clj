@@ -22,6 +22,41 @@
 (use-fixtures :each
   fixtures/new-logseq-page-in-rtc)
 
+(def ^:private focus-exact-block-timeout-ms 10000)
+(def ^:private focus-exact-block-poll-ms 100)
+
+(defn- current-editor-value
+  []
+  (when (= 1 (w/count* (w/-query util/editor-q)))
+    (w/value util/editor-q)))
+
+(defn- focus-exact-block!
+  [text]
+  ;; A tree move can replace the clicked block's DOM node before Logseq moves
+  ;; the existing editor. Re-clicking the same immutable target is safe; never
+  ;; replay the move/indent command that preceded this focus boundary.
+  (let [deadline (+ (System/nanoTime)
+                    (* focus-exact-block-timeout-ms 1000000))]
+    (loop [attempt 1]
+      (w/click (util/get-by-text text true))
+      (util/wait-timeout focus-exact-block-poll-ms)
+      (let [editor-value (current-editor-value)]
+        (cond
+          (= text editor-value)
+          true
+
+          (< (System/nanoTime) deadline)
+          (recur (inc attempt))
+
+          :else
+          (throw
+           (ex-info
+            "exact RTC block did not acquire the editor"
+            {:target text
+             :attempts attempt
+             :timeout-ms focus-exact-block-timeout-ms
+             :editor-value editor-value})))))))
+
 (defn- with-stop-restart-rtc
   [pw-page f]
   (w/with-page pw-page
@@ -153,8 +188,8 @@
 (deftest rtc-outliner-test
   (doseq [test-fn [outliner-basic-test/create-test-page-and-insert-blocks
                    outliner-basic-test/indent-and-outdent
-                   outliner-basic-test/move-up-down
-                   outliner-basic-test/delete
+                   #(outliner-basic-test/move-up-down rtc/wait-current-tx-synced)
+                   #(outliner-basic-test/delete rtc/wait-current-tx-synced)
                    outliner-basic-test/delete-test-with-children]]
     (let [test-fn-in-page2 (fn [*latest-remote-tx]
                              (w/with-page @*page2
@@ -194,10 +229,10 @@
                    (assert/assert-in-normal-mode?)
                    (b/new-block "page2-done-1"))]
         (w/with-page @*page1
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 1)))
+          (focus-exact-block! (str title-prefix "-" 1))
           (b/indent))
         (w/with-page @*page2
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 0)))
+          (focus-exact-block! (str title-prefix "-" 0))
           (b/delete-blocks)))
       (validate-graphs-in-2-pw-pages))
     (testing "
@@ -218,18 +253,34 @@ page2:
         [@*page1 (rtc/with-wait-tx-updated (b/new-block "page1-done-2"))
          @*page2 (rtc/with-wait-tx-updated (b/new-block "page2-done-2"))]
         (w/with-page @*page1
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 3)))
+          (focus-exact-block! (str title-prefix "-" 3))
           (b/indent)
           (k/arrow-down)
+          (b/wait-editor-text (str title-prefix "-" 4))
           (b/indent)
           (b/indent))
         (w/with-page @*page2
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 2)))
+          (focus-exact-block! (str title-prefix "-" 2))
           (b/delete-blocks)
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 3)))
+          (focus-exact-block! (str title-prefix "-" 3))
           (k/shift+arrow-down)
           (k/meta+shift+arrow-down)
           (k/enter)
+          ;; The move shortcut can leave the selection in normal mode on a
+          ;; slow runner. Re-establish the exact editor target before Tab so a
+          ;; swallowed Enter is detected without replaying the move.
+          (let [read-count (atom 0)
+                read-current-editor-value current-editor-value]
+            ;; Exercise the idempotent retry path deterministically. This
+            ;; models the stale editor value captured in the GitHub failure
+            ;; without replaying any structural mutation.
+            (with-redefs [current-editor-value
+                          (fn []
+                            (if (= 1 (swap! read-count inc))
+                              (str title-prefix "-" 4)
+                              (read-current-editor-value)))]
+              (focus-exact-block! (str title-prefix "-" 3)))
+            (is (>= @read-count 2)))
           (b/indent)))
       (validate-graphs-in-2-pw-pages))))
 

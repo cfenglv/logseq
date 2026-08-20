@@ -465,6 +465,7 @@
  :editor/cycle-todo "Rotate the TODO state"
  :editor/delete-selection "Delete selected blocks"
  :editor/display-tag-inline-hint "to display this tag inline instead of at the end of this node."
+ :editor/empty-math-block "Empty Math block"
  :editor/expand-block-children "Expand all"
  :editor/heading "Heading {1}"
  :editor/moving-blocks-count (fn [n] (str "Moving " n (if (> n 1) " blocks" " block")))
@@ -1802,7 +1803,7 @@
  :sync/assets-downloading-count "Downloading assets ({1})"
  :sync/assets-uploading "uploading assets"
  :sync/assets-uploading-count "Uploading assets ({1})"
- :sync/conflicts-description "These server versions conflicted with local edits. Copy the text you want and edit the block manually."
+ :sync/conflicts-description "These alternate versions conflicted with the current block. Automatic repair preserves both versions; you can also copy the text you want and reconcile the block manually."
  :sync/conflicts-title "Sync conflicts"
  :sync/creating-remote-graph "Creating remote graph..."
  :sync/downloading "Downloading..."
@@ -1886,7 +1887,7 @@
  :updater/quit-and-install "Restart and install"
  :updater/up-to-date "Your app is up-to-date 🎉"
  :updater/update-available "Update available"
- :updater/update-error "⚠️ Oops, Something Went Wrong!\nPlease check out the {1}."
+ :updater/update-error "⚠️ Automatic update couldn't finish.\nDownload the latest version from the {1} and install it manually."
  :updater/update-ready-to-install "Update ready to install"
 
  :view/add-new-view "Add new view"

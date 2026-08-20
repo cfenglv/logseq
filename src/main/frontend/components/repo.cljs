@@ -357,9 +357,14 @@
                             short-repo-name (text-util/get-graph-name-from-path repo-url)
                             downloading? (and downloading-graph-id (= GraphUUID downloading-graph-id))
                             ready-for-use? (not= false graph-ready-for-use?)
-                            title (str "<" GraphName "> #" GraphUUID)]
+                            remote-download? (and rtc-graph? remote? (not (:root graph)))
+                            title (str "<" GraphName "> #" GraphUUID)
+                            item-key (if GraphUUID
+                                       (str "remote-graph:" GraphUUID)
+                                       (str "local-graph:" repo-url))]
                         (when short-repo-name
-                          {:title [:span.flex.items-center.title-wrap short-repo-name
+                          {:key item-key
+                           :title [:span.flex.items-center.title-wrap short-repo-name
                                    (when remote? [:span.pl-1.flex.items-center
                                                   {:title title}
                                                   (ui/icon (if graph-e2ee? "lock" "cloud") {:size 18})
@@ -368,7 +373,8 @@
                                                   (when downloading?
                                                     [:span.opacity.text-sm.pl-1 (t :graph/downloading)])])]
                            :hover-detail repo-url ;; show full path on hover
-                           :options {:on-click
+                           :options {:native-popup-transition? remote-download?
+                                     :on-click
                                      (fn [e]
                                        (when (and ready-for-use? (not downloading?))
                                          (when-let [on-click (:on-click opts)]
@@ -387,11 +393,8 @@
                                              (state/pub-event! [:graph/switch url])
 
                                              (and rtc-graph? remote?)
-                                             (do
-                                               (state/pub-event!
-                                                [:rtc/download-remote-graph GraphName GraphUUID GraphSchemaVersion graph-e2ee?])
-                                               (when (util/mobile?)
-                                                 false))
+                                             (state/pub-event!
+                                              [:rtc/download-remote-graph GraphName GraphUUID GraphSchemaVersion graph-e2ee?])
 
                                              :else
                                              nil))))}})))
@@ -423,6 +426,15 @@
                                  (state/pub-event! [:mobile/set-tab "graphs"])
                                  (route-handler/redirect-to-all-graphs)))}
                   (shui/tabler-icon "layout-2") [:span (t :graph/all-graphs)]))])
+
+(defn close-sidebar-after-repo-popup-action!
+  []
+  (when (util/sm-breakpoint?)
+    (js/setTimeout #(state/set-left-sidebar-open! false) 0)))
+
+(defn repo-popup-action-target?
+  [target]
+  (boolean (.closest target "a, button, [role='menuitem']")))
 
 (hsx/defc repos-dropdown-content
   [& {:keys [contentid footer?] :as opts
@@ -463,19 +475,33 @@
      {:class (when (<= (count repos) 1) "no-repos")}
      (header-fn)
      [:div.cp__repos-list-wrap
-      (for [{:keys [hr item hover-detail title options icon]} (items-fn)]
+      (for [{:keys [key hr item hover-detail title options icon]} (items-fn)]
         (let [on-click' (:on-click options)
+              native-popup-transition? (true? (:native-popup-transition? options))
+              options (dissoc options :native-popup-transition?)
               href' (:href options)
               menu-item (if (util/mobile?) ui/menu-link shui/dropdown-menu-item)]
           (if hr
-            (if (util/mobile?) [:hr.py-2] (shui/dropdown-menu-separator))
+            (if (util/mobile?)
+              [:hr.py-2 {:key key}]
+              (shui/dropdown-menu-separator {:key key}))
             (menu-item
              (assoc options
+                    :key key
                     :title hover-detail
                     :on-click (fn [^js e]
                                 (when on-click'
                                   (when-not (false? (on-click' e))
-                                    (shui/popup-hide! contentid)))))
+                                    (cond
+                                      (and native-popup-transition?
+                                           (mobile-util/native-platform?))
+                                      nil
+
+                                      (util/mobile?)
+                                      (js/setTimeout #(shui/popup-hide! contentid) 0)
+
+                                      :else
+                                      (shui/popup-hide! contentid))))))
              (or item
                  (if href'
                    [:a.flex.items-center.w-full
@@ -521,9 +547,17 @@
                           (t :graph.switch/select-prompt))
         selector-opts (cond-> {:on-click (fn [^js e]
                                            (shui/popup-show! (.closest (.-target e) "a")
-                                                             (fn [{:keys [id]}] (repos-dropdown-content {:contentid id}))
-                                                             {:as-dropdown? true
-                                                              :content-props {:class "repos-list"}
+                                                             (fn [& _]
+                                                               (repos-dropdown-content
+                                                                {:contentid :graph-switcher}))
+                                                             {:id :graph-switcher
+                                                              :as-dropdown? true
+                                                              :content-props
+                                                              {:class "repos-list"
+                                                               :on-click
+                                                               (fn [^js e]
+                                                                 (when (repo-popup-action-target? (.-target e))
+                                                                   (close-sidebar-after-repo-popup-action!)))}
                                                               :align :start}))}
                         (and (util/electron?) (:root current-repo'))
                         (assoc :on-context-menu

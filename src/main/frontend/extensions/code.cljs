@@ -423,27 +423,47 @@
                             :lineNumbers true
                             :matchBrackets lisp-like?
                             :styleActiveLine true}
-        cm-options (merge default-cm-options
-                          (cond-> (extra-codemirror-options)
-                            config-file?
-                            (dissoc :readOnly))
-                          {:mode mode
-                           :tabIndex -1 ;; do not accept TAB-in, since TAB is bind globally
-                           :extraKeys (merge {"Esc" (fn [cm]
-                                                      ;; Avoid reentrancy
-                                                      (gobj/set cm "escPressed" true)
-                                                      (save-editor! config))}
-                                             (when config-edit?
-                                               {"':'" complete-after
-                                                "Ctrl-Space" "autocomplete"}))}
-                          (when config/publishing?
-                            {:readOnly true
-                             :cursorBlinkRate -1})
-                          (when config-edit?
-                            {:hintOptions {}})
-                          user-options
-                          (when (= mode "calc")
-                            {:viewportMargin js/Infinity}))
+        mandatory-extra-keys {"Esc" (fn [cm]
+                                        (editor-handler/run-math-transition-action!
+                                         :code-escape
+                                         (fn []
+                                           ;; Avoid reentrancy
+                                           (gobj/set cm "escPressed" true)
+                                           (save-editor! config))))}
+        cm-options (-> (merge default-cm-options
+                              (cond-> (extra-codemirror-options)
+                                config-file?
+                                (dissoc :readOnly))
+                              {:mode mode
+                               :tabindex -1} ;; do not accept TAB-in, since TAB is bind globally
+                              (when config/publishing?
+                                {:readOnly true
+                                 :cursorBlinkRate -1})
+                              (when config-edit?
+                                {:hintOptions {}})
+                              user-options
+                              (when (= mode "calc")
+                                {:viewportMargin js/Infinity}))
+                       (update :extraKeys merge
+                               (when config-edit?
+                                 {"':'" complete-after
+                                  "Ctrl-Space" "autocomplete"})
+                               mandatory-extra-keys)
+                       ;; Native keyboard entry must remain disabled so every
+                       ;; programmatic focus crosses the UUID-bound guard.
+                       (dissoc :tabIndex)
+                       (assoc :tabindex -1
+                              :autofocus false))
+        ;; CodeMirror may honor the textarea's existing native focus while it
+        ;; constructs the wrapper, before any wrapper listener can gate it.
+        restore-constructor-focus? (and textarea
+                                        (identical? textarea (.-activeElement js/document)))
+        ;; Blur/from-textarea may synchronously switch the global edit block.
+        ;; Freeze the event-time source before either operation can run.
+        constructor-source-uuid (when restore-constructor-focus?
+                                  (some-> (state/get-edit-block) :block/uuid))
+        _ (when restore-constructor-focus?
+            (.blur textarea))
         editor (when textarea
                  (from-textarea textarea (clj->js cm-options)))
         _ (when (and editor *editor-ref)
@@ -452,6 +472,43 @@
       (let [element (.getWrapperElement editor)
             *cursor-prev (volatile! nil)
             *cursor-curr (volatile! nil)
+            *focus-authorization (volatile! nil)
+            *focus-active? (volatile! false)
+            native-focus (gobj/get editor "focus")
+            run-unless-recovery-blocked! (fn [boundary action]
+                                           (editor-handler/run-math-transition-action!
+                                            boundary action))
+            source-edit-uuid (fn [] (:block/uuid (state/get-edit-block)))
+            run-after-math-transition! (fn [source-uuid boundary action]
+                                         (editor-handler/run-math-transition-action!
+                                          boundary {:source-uuid source-uuid} action))
+            apply-focus-state! (fn []
+                                 (vreset! *focus-active? true)
+                                 (when (and
+                                        (:block/uuid (state/get-edit-block))
+                                        (contains? #{:code} (:logseq.property.node/display-type code-block))
+                                        (not= (:block/uuid edit-block) (:block/uuid (state/get-edit-block))))
+                                   (editor-handler/edit-block! (or code-block edit-block) :max {:container-id (:container-id config)}))
+                                 (state/set-block-component-editing-mode! true)
+                                 (state/set-state! :editor/code-block-context
+                                                   {:editor editor
+                                                    :config config
+                                                    :state state}))
+            native-focus! (fn []
+                            (when (fn? native-focus)
+                              (.call native-focus editor)))
+            authorized-native-focus! (fn []
+                                       (let [token (js-obj)]
+                                         (vreset! *focus-authorization token)
+                                         (try
+                                           (native-focus!)
+                                           (finally
+                                             (when (identical? token @*focus-authorization)
+                                               (vreset! *focus-authorization nil))))))
+            request-focus! (fn [boundary]
+                             (let [source-uuid (source-edit-uuid)]
+                               (run-after-math-transition!
+                                source-uuid boundary authorized-native-focus!)))
             update-cursor-state! (fn []
                                    (let [start-pos (.getCursor editor true)
                                          end-pos (.getCursor editor false)
@@ -470,66 +527,99 @@
                                    ((:set-calc-lines! state) (calc/eval-lines new-code))))))
         (.on editor "blur" (fn [cm e]
                              (when e (util/stop e))
-                             (let [esc? (gobj/get cm "escPressed")]
-                               (when (or (= :file (state/get-current-route))
-                                         (not esc?))
-                                 (code-handler/save-code-editor!))
-                               (state/set-block-component-editing-mode! false)
-                               (state/set-state! :editor/code-block-context nil)
-                               (when (and (not esc?)
-                                          (= (:db/id (state/get-edit-block))
-                                             (:db/id edit-block)))
-                                 (state/clear-edit!))
-                               (vreset! *cursor-curr nil)
-                               (vreset! *cursor-prev nil))))
+                             (run-unless-recovery-blocked!
+                              :code-blur
+                              (fn []
+                                (let [esc? (gobj/get cm "escPressed")]
+                                  (when (or (= :file (state/get-current-route))
+                                            (not esc?))
+                                    (code-handler/save-code-editor!))
+                                  (state/set-block-component-editing-mode! false)
+                                  (state/set-state! :editor/code-block-context nil)
+                                  (vreset! *focus-active? false)
+                                  (when (and (not esc?)
+                                             (= (:db/id (state/get-edit-block))
+                                                (:db/id edit-block)))
+                                    (state/clear-edit!))
+                                  (vreset! *cursor-curr nil)
+                                  (vreset! *cursor-prev nil))))))
         (.on editor "focus" (fn [_e]
-                              (when (and
-                                     (:block/uuid (state/get-edit-block))
-                                     (contains? #{:code} (:logseq.property.node/display-type code-block))
-                                     (not= (:block/uuid edit-block) (:block/uuid (state/get-edit-block))))
-                                (editor-handler/edit-block! (or code-block edit-block) :max {:container-id (:container-id config)}))
-                              (state/set-block-component-editing-mode! true)
-                              (state/set-state! :editor/code-block-context
-                                                {:editor editor
-                                                 :config config
-                                                 :state state})))
+                              (cond
+                                @*focus-authorization
+                                (do
+                                  ;; The first focus callback consumes the
+                                  ;; authorization; duplicate native callbacks
+                                  ;; cannot replay the state transition.
+                                  (vreset! *focus-authorization nil)
+                                  (apply-focus-state!))
+
+                                @*focus-active?
+                                nil
+
+                                :else
+                                ;; A native focus source outside the normal
+                                ;; pointer/programmatic paths still cannot
+                                ;; mutate editor state before Math settles.
+                                (let [source-uuid (source-edit-uuid)]
+                                  (run-after-math-transition!
+                                   source-uuid :code-native-focus
+                                   apply-focus-state!)))))
+        (.on editor "beforeChange" (fn [_cm change]
+                                     (when (editor-handler/math-transition-recovery-blocked?)
+                                       (.cancel change)
+                                       (editor-handler/run-math-transition-action!
+                                        :code-change (fn [] nil)))))
         (.on editor "cursorActivity" update-cursor-state!)
-        (.addEventListener element "keydown" (fn [e]
-                                               (let [key-code (.-code e)
-                                                     meta-or-ctrl-pressed? (or (.-ctrlKey e) (.-metaKey e))
-                                                     shifted? (.-shiftKey e)]
-                                                 (cond
+        (.addEventListener element "keydown"
+                           (fn [e]
+                             (let [source-uuid (source-edit-uuid)]
+                               (editor-handler/run-math-transition-action!
+                                :code-keydown
+                                {:source-uuid source-uuid :event e}
+                                (fn []
+                                  (let [key-code (.-code e)
+                                                       meta-or-ctrl-pressed? (or (.-ctrlKey e) (.-metaKey e))
+                                                       shifted? (.-shiftKey e)]
+                                                   (cond
                                                    (contains? #{"ArrowLeft" "ArrowRight"} key-code)
                                                    (let [direction (if (= "ArrowLeft" key-code) :left :right)]
-                                                     (when (and (= @*cursor-prev @*cursor-curr)
-                                                                (or (and direction (nil? @*cursor-curr))
-                                                                    (case direction
-                                                                      :left (and (zero? (:line (:start @*cursor-curr)))
-                                                                                 (zero? (:ch  (:start @*cursor-curr))))
-                                                                      :right (let [line (when-let [line (:line (:end @*cursor-curr))]
-                                                                                          (.getLine (.-doc editor) line))]
-                                                                               (and (= (:line (:end @*cursor-curr)) (.lastLine editor))
-                                                                                    (= (:ch (:end @*cursor-curr)) (count line))))
-                                                                      false)))
-                                                       (editor-handler/move-to-block-when-cross-boundary direction {}))
-                                                     (update-cursor-state!))
+                                                     (if (and (= @*cursor-prev @*cursor-curr)
+                                                              (or (and direction (nil? @*cursor-curr))
+                                                                  (case direction
+                                                                    :left (and (zero? (:line (:start @*cursor-curr)))
+                                                                               (zero? (:ch  (:start @*cursor-curr))))
+                                                                    :right (let [line (when-let [line (:line (:end @*cursor-curr))]
+                                                                                        (.getLine (.-doc editor) line))]
+                                                                             (and (= (:line (:end @*cursor-curr)) (.lastLine editor))
+                                                                                  (= (:ch (:end @*cursor-curr)) (count line))))
+                                                                    false)))
+                                                       (editor-handler/consume-math-transition-boundary!
+                                                        :code-left-right-navigation
+                                                        (p/do!
+                                                         (editor-handler/move-to-block-when-cross-boundary direction {})
+                                                         (update-cursor-state!)))
+                                                       (update-cursor-state!)))
 
                                                    (contains? #{"ArrowUp" "ArrowDown"} key-code)
                                                    (let [direction (if (= "ArrowUp" key-code) :up :down)]
-                                                     (when (and (= @*cursor-prev @*cursor-curr)
-                                                                (or (and direction (nil? @*cursor-curr))
-                                                                    (case direction
-                                                                      :up (and (zero? (:line (:start @*cursor-curr)))
-                                                                               (zero? (:ch  (:start @*cursor-curr))))
-                                                                      :down (let [line (when-let [line (:line (:end @*cursor-curr))]
-                                                                                         (.getLine (.-doc editor) line))]
-                                                                              (and (= (:line (:end @*cursor-curr)) (.lastLine editor))
-                                                                                   (= (:ch (:end @*cursor-curr)) (count line))))
-                                                                      false)))
-                                                       (editor-handler/move-cross-boundary-up-down
-                                                        direction {:input textarea
-                                                                   :pos [direction 0]}))
-                                                     (update-cursor-state!))
+                                                     (if (and (= @*cursor-prev @*cursor-curr)
+                                                              (or (and direction (nil? @*cursor-curr))
+                                                                  (case direction
+                                                                    :up (and (zero? (:line (:start @*cursor-curr)))
+                                                                             (zero? (:ch  (:start @*cursor-curr))))
+                                                                    :down (let [line (when-let [line (:line (:end @*cursor-curr))]
+                                                                                       (.getLine (.-doc editor) line))]
+                                                                            (and (= (:line (:end @*cursor-curr)) (.lastLine editor))
+                                                                                 (= (:ch (:end @*cursor-curr)) (count line))))
+                                                                    false)))
+                                                       (editor-handler/consume-math-transition-boundary!
+                                                        :code-up-down-navigation
+                                                        (p/do!
+                                                         (editor-handler/move-cross-boundary-up-down
+                                                          direction {:input textarea
+                                                                     :pos [direction 0]})
+                                                         (update-cursor-state!)))
+                                                       (update-cursor-state!)))
                                                    meta-or-ctrl-pressed?
                                                    ;; prevent default behavior of browser
                                                    ;; Cmd + [ => Go back in browser, outdent in CodeMirror
@@ -549,16 +639,38 @@
                                                          (util/schedule #(editor-handler/api-insert-new-block! ""
                                                                                                                {:block-uuid (uuid blockid)
                                                                                                                 :sibling? true}))))
-                                                     nil)))))
+                                                     nil))))))))
         (.addEventListener element "pointerdown"
                            (fn [e]
-                             (.stopPropagation e)
-                             (state/clear-selection!)))
+                             (let [source-uuid (source-edit-uuid)]
+                               (.stopPropagation e)
+                               (.preventDefault e)
+                               (run-after-math-transition!
+                                source-uuid :code-pointer
+                                (fn []
+                                  (state/clear-selection!)
+                                  (authorized-native-focus!))))))
         (.addEventListener element "touchstart"
                            (fn [e]
-                             (.stopPropagation e)))
+                             (let [source-uuid (source-edit-uuid)]
+                               (.stopPropagation e)
+                               (.preventDefault e)
+                               (run-after-math-transition!
+                                source-uuid :code-touch
+                                (fn []
+                                  (state/clear-selection!)
+                                  (authorized-native-focus!))))))
         (.save editor)
-        (.refresh editor)))
+        (.refresh editor)
+        (when (fn? native-focus)
+          (gobj/set editor "focus"
+                    #(request-focus! :code-programmatic-focus)))
+        ;; CodeMirror construction must not inherit focus before the barrier,
+        ;; but an intentionally active textarea regains legitimate focus once
+        ;; its event-time editor UUID has settled.
+        (when restore-constructor-focus?
+          (run-after-math-transition!
+           constructor-source-uuid :code-constructor-focus authorized-native-focus!))))
     editor))
 
 (defn- load-and-render!
@@ -646,13 +758,16 @@
   ;; command is run. It's not elegant... open to suggestions for how to fix it!
   (let [block (state/get-edit-block)
         block-uuid (:block/uuid block)]
-    (p/do!
-     (state/pub-event! [:editor/save-current-block])
-     (state/clear-edit!)
-     (js/setTimeout
-      (fn []
-        (let [block-node (util/get-first-block-by-id block-uuid)
-              textarea-ref (.querySelector block-node "textarea")]
-          (when-let [codemirror-ref (gobj/get textarea-ref codemirror-ref-name)]
-            (.focus codemirror-ref))))
-      256))))
+    (editor-handler/run-math-transition-action!
+     :codemirror-focus-command
+     {:source-uuid block-uuid}
+     (fn []
+       (state/pub-event! [:editor/save-current-block])
+       (state/clear-edit!)
+       (js/setTimeout
+        (fn []
+          (let [block-node (util/get-first-block-by-id block-uuid)
+                textarea-ref (.querySelector block-node "textarea")]
+            (when-let [codemirror-ref (gobj/get textarea-ref codemirror-ref-name)]
+              (.focus codemirror-ref))))
+        256)))))

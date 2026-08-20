@@ -32,6 +32,16 @@
        (nil? (:block/updated-at entity))
        (int? (:block/created-at entity))))
 
+(defn- pdf-annotation-missing-title?
+  [entity dispatch-key]
+  (and (= dispatch-key :block)
+       (nil? (:block/title entity))
+       (:block/page entity)
+       (:block/parent entity)
+       (some? (:logseq.property.pdf/hl-value entity))
+       (some #(= :logseq.class/Pdf-annotation (:db/ident %))
+             (:block/tags entity))))
+
 (defn- ^:large-vars/cleanup-todo fix-invalid-blocks!
   [conn errors]
   (let [db @conn
@@ -106,6 +116,8 @@
                            [[:db/add (:db/id entity) :block/uuid (random-uuid)]]
                            (vector? (:logseq.property/value entity))
                            [[:db/retractEntity (:db/id entity)]]
+                           (pdf-annotation-missing-title? entity dispatch-key)
+                           [[:db/add (:db/id entity) :block/title ""]]
                            (and (:block/tx-id entity) (nil? (:block/title entity)))
                            [[:db/retractEntity (:db/id entity)]]
                            (and (:block/title entity) (nil? (:block/page entity)) (nil? (:block/parent entity)) (nil? (:block/name entity)))

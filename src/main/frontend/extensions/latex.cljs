@@ -5,6 +5,7 @@
             [frontend.ui :as ui]
             [frontend.util :as util]
             [goog.dom :as gdom]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.shui.hooks :as hooks]
             [promesa.core :as p]
             [io.factorhouse.hsx.core :as hsx]))
@@ -50,7 +51,10 @@
 
 (hsx/defc latex
   [s block? display?]
-  (let [id (hooks/use-memo #(str (random-uuid)) [])
+  (let [s (if (and block? display?)
+            (gp-mldoc/canonical-displayed-math-title s)
+            s)
+        id (hooks/use-memo #(str (random-uuid)) [])
         loading? (first (hooks/use-atom *loading?))]
     (hooks/use-effect!
      (fn []
@@ -67,7 +71,10 @@
 
 (defn html-export
   [s block? display?]
-  (let [element (if block?
+  (let [s (if (and block? display?)
+            (gp-mldoc/canonical-displayed-math-title s)
+            s)
+        element (if block?
                   :div.latex
                   :span.latex-inline)]
     [element (if (or block? display?)

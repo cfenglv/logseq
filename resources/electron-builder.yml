@@ -1,5 +1,6 @@
 appId: com.logseq.logseq
 electronUpdaterCompatibility: ">=2.16"
+beforePack: ./electron-builder-verify-runtime-revisions.cjs
 
 directories:
   buildResources: .
@@ -11,6 +12,7 @@ files:
   - "!mobile/**"
   - "!android/**"
   - "!ios/**"
+  - "!sidecar/**"
   - "!js/react.development.js"
   - "!js/react-dom.development.js"
   - "!js/publishing/*.map"
@@ -45,13 +47,17 @@ protocols:
 
 publish:
   - provider: github
-    owner: logseq
+    owner: cfenglv
     repo: logseq
 
 extraResources:
+  - from: project-updater-signature.mjs
+    to: project-updater-signature.mjs
+  - from: updater/project-signing-policy.json
+    to: updater/project-signing-policy.json
   - from: .agents/skills/logseq-cli/SKILL.md
     to: .agents/skills/logseq-cli/SKILL.md
-  - from: ../sidecar
+  - from: sidecar
     to: sidecar
 
 mac:

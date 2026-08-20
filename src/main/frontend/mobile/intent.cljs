@@ -216,8 +216,7 @@
                :target "_blank"} "GitHub"]])
         [:pre.code (with-out-str (pprint/pprint resource))]] :warning false))))
 
-(defn handle-payload
-  "Mobile share intent handler v2, use complex payload to support more types of content."
+(defn- handle-payload-after-math-settled
   [payload]
   ;; use :text template, use {url} as rich text placeholder
   (p/let [page (or (state/get-current-page) (string/lower-case (db/get-today-journal-title)))
@@ -256,12 +255,21 @@
             (editor-handler/insert content)
             (editor-handler/insert (str "\n" content)))
 
-          (do
-            (editor-handler/escape-editing)
-            (js/setTimeout #(editor-handler/api-insert-new-block! content {:page page
-                                                                           :edit-block? true
-                                                                           :replace-empty-target? true})
-                           100)))))))
+          (p/do!
+           (editor-handler/escape-editing)
+           (js/setTimeout #(editor-handler/api-insert-new-block! content {:page page
+                                                                          :edit-block? true
+                                                                          :replace-empty-target? true})
+                          100)))))))
+
+(defn handle-payload
+  "Mobile share intent handler v2, use complex payload to support more types of content."
+  [payload]
+  (editor-handler/consume-math-transition-boundary!
+   :mobile-intent
+   (p/do!
+    (editor-handler/await-pending-math-transition!)
+    (handle-payload-after-math-settled payload))))
 
 (defn handle-result
   "Mobile share intent handler v1, legacy. Only for Android"

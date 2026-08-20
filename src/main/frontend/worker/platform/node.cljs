@@ -2,6 +2,7 @@
   "Node.js platform adapter for db-worker."
   (:require ["fs" :as node-fs]
             ["fs/promises" :as fs]
+            ["node:child_process" :as child-process]
             ["node:sqlite" :as node-sqlite]
             ["os" :as os]
             ["path" :as node-path]
@@ -14,6 +15,11 @@
             [logseq.db.sqlite.backup :as sqlite-backup]
             [promesa.core :as p]
             ["keytar" :as keytar]))
+
+(goog-define TEST-SECRET-STORAGE false)
+
+(def ^:private test-secret-storage-enabled?
+  TEST-SECRET-STORAGE)
 
 (defn- resolve-database-sync-ctor
   []
@@ -486,6 +492,34 @@
             _ (ensure-dir! dir)]
       (fs/writeFile full-path (->buffer data)))))
 
+(defn- copy-db-file!
+  [write-guard-fn ^js pool source-path target-path]
+  (let [pool-repo-dir (.-repoDir pool)
+        source-path (if (or (node-path/isAbsolute source-path)
+                            (and (string? pool-repo-dir)
+                                 (string/starts-with?
+                                  source-path pool-repo-dir)))
+                      source-path
+                      (pool-path pool source-path))
+        ;; Targets use the same pool-relative logical paths as import-db and
+        ;; unlink-db-file!, where a leading slash is not an OS root.
+        target-path (pool-path pool target-path)]
+    (p/let [_ (when write-guard-fn
+                (write-guard-fn))
+            _ (ensure-dir! (node-path/dirname target-path))]
+      (fs/copyFile source-path target-path))))
+
+(defn- unlink-db-file!
+  [write-guard-fn pool path]
+  (p/let [_ (when write-guard-fn
+              (write-guard-fn))]
+    (-> (fs/unlink (pool-path pool path))
+        (p/then (fn [_] true))
+        (p/catch (fn [error]
+                   (if (= "ENOENT" (.-code error))
+                     false
+                     (throw error)))))))
+
 (defn- remove-vfs!
   [^js pool]
   (when pool
@@ -559,10 +593,106 @@
       (-> (fs/rm full-path #js {:force true})
           (p/catch (constantly nil))))))
 
+(defn- proxy-env-value
+  [env keys]
+  (some (fn [key]
+          (let [value (gobj/get env key)]
+            (when (and (string? value) (not (string/blank? value)))
+              value)))
+        keys))
+
+(defn- url-default-port
+  [^js url]
+  (or (not-empty (.-port url))
+      (case (.-protocol url)
+        ("wss:" "https:") "443"
+        ("ws:" "http:") "80"
+        nil)))
+
+(defn- normalize-host
+  [host]
+  (let [host (string/lower-case (or host ""))]
+    (if (and (string/starts-with? host "[")
+             (string/ends-with? host "]"))
+      (subs host 1 (dec (count host)))
+      host)))
+
+(defn- parse-no-proxy-entry
+  [entry]
+  (let [entry (-> entry string/trim string/lower-case)
+        ipv6-match (re-matches #"^\[([^\]]+)\](?::(\d+))?$" entry)
+        host-port-match (re-matches #"^([^:]+?)(?::(\d+))?$" entry)
+        [_ host port] (or ipv6-match host-port-match)
+        host (some-> host
+                     (string/replace-first #"^\*\." "")
+                     (string/replace-first #"^\." ""))]
+    {:host host :port port :wildcard? (= entry "*")}))
+
+(defn- no-proxy-entry-matches?
+  [target-host target-port entry]
+  (let [{:keys [host port wildcard?]} (parse-no-proxy-entry entry)]
+    (and (or wildcard?
+             (and (seq host)
+                  (or (= target-host host)
+                      (string/ends-with? target-host (str "." host)))))
+         (or (nil? port) (= target-port port)))))
+
+(defn- bypass-websocket-proxy?
+  [^js target env]
+  (let [target-host (normalize-host (.-hostname target))
+        target-port (url-default-port target)
+        no-proxy (proxy-env-value env ["NO_PROXY" "no_proxy"])]
+    (and (string? no-proxy)
+         (some #(no-proxy-entry-matches? target-host target-port %)
+               (string/split no-proxy #",")))))
+
+(defn- websocket-proxy-url
+  [url env]
+  (try
+    (let [target (js/URL. url)
+          env-keys (case (.-protocol target)
+                     "wss:" ["HTTPS_PROXY" "https_proxy" "ALL_PROXY" "all_proxy"
+                              "HTTP_PROXY" "http_proxy"]
+                     "ws:" ["HTTP_PROXY" "http_proxy" "ALL_PROXY" "all_proxy"
+                             "HTTPS_PROXY" "https_proxy"]
+                     [])]
+      (when-not (bypass-websocket-proxy? target env)
+        (proxy-env-value env env-keys)))
+    (catch :default error
+      (log/warn :db-sync/ws-proxy-resolution-failed {:url url :error error})
+      nil)))
+
+(defn- build-websocket-proxy-agent
+  [proxy-url]
+  (try
+    (let [protocol (.-protocol (js/URL. proxy-url))]
+      (case protocol
+        ("http:" "https:")
+        (let [module (js/require "https-proxy-agent")]
+          (new (.-HttpsProxyAgent module) proxy-url))
+
+        ("socks:" "socks4:" "socks5:")
+        (let [module (js/require "socks-proxy-agent")]
+          (new (.-SocksProxyAgent module) proxy-url))
+
+        (do
+          (log/warn :db-sync/ws-proxy-unsupported {:protocol protocol})
+          nil)))
+    (catch :default error
+      (log/warn :db-sync/ws-proxy-agent-failed {:error error})
+      nil)))
+
 (defn- websocket-connect
   [url]
-  (let [WebSocket (js/require "ws")]
-    (new WebSocket url)))
+  (let [WebSocket (js/require "ws")
+        proxy-url (websocket-proxy-url url (.-env js/process))]
+    (if-let [agent (some-> proxy-url build-websocket-proxy-agent)]
+      (do
+        (log/info :db-sync/ws-proxy
+                  {:target-host (some-> (js/URL. url) .-hostname)
+                   :proxy-protocol (some-> (js/URL. proxy-url) .-protocol)})
+        (new WebSocket url #js {:agent agent}))
+      (new WebSocket url))))
 
 (def ^:private kv-transit-writer
   (transit/writer
@@ -599,85 +729,219 @@
   (transit/write kv-transit-writer state))
 
 (def ^:private keychain-service "Logseq E2EE")
+(def ^:private test-secret-storage-file "test-only-e2ee-secret-store.json")
+(def ^:private keychain-operation-timeout-ms 3000)
+(def ^:private legacy-keychain-read-timeout-ms 5000)
+(def ^:private legacy-keychain-max-output-bytes (* 1024 1024))
 
-(defn- <save-secret-text!
-  [kv key text]
-  (-> (p/let [_ (.setPassword ^js keytar keychain-service key text)]
-        nil)
-      (p/catch (fn [e]
-                 (log/warn :db-worker/keychain-save-failed {:error e
-                                                            :key key})
-                 ((:set! kv) key text)))))
+(defn- with-timeout
+  [promise timeout-ms context]
+  (p/create
+   (fn [resolve reject]
+     (let [settled? (atom false)
+           settle! (fn [f value]
+                     (when (compare-and-set! settled? false true)
+                       (f value)))
+           timeout-id (js/setTimeout
+                       (fn []
+                         (settle! reject
+                                  (ex-info "keychain operation timeout"
+                                           (assoc context
+                                                  :type :db-worker/keychain-timeout
+                                                  :timeout-ms timeout-ms))))
+                       timeout-ms)]
+       (-> promise
+           (p/then #(settle! resolve %))
+           (p/catch #(settle! reject %))
+           (p/finally #(js/clearTimeout timeout-id)))))))
 
-(defn- <read-secret-text
-  [kv key]
-  (-> (p/let [secret (.getPassword ^js keytar keychain-service key)]
-        secret)
-      (p/catch (fn [e]
-                 (log/warn :db-worker/keychain-read-failed {:error e
-                                                            :key key})
-                 ((:get kv) key)))))
+(defn- executable-file?
+  [path]
+  (try
+    (and (seq path)
+         (.isFile (node-fs/statSync path))
+         (do
+           (node-fs/accessSync path (.-X_OK node-fs/constants))
+           true))
+    (catch :default _
+      false)))
 
-(defn- <delete-secret-text!
-  [kv key]
-  (-> (p/let [_ (.deletePassword ^js keytar keychain-service key)]
-        nil)
-      (p/catch (fn [e]
-                 (log/warn :db-worker/keychain-delete-failed {:error e
-                                                              :key key})
-                 ((:set! kv) key nil)))))
+(defn- canonical-path
+  [path]
+  (try
+    (node-fs/realpathSync path)
+    (catch :default _
+      (node-path/resolve path))))
 
-(defn- truthy-env?
-  [value]
-  (contains? #{"1" "true" "yes" "on"}
-             (string/lower-case (string/trim (str (or value ""))))))
+(defn- system-node-executable
+  []
+  (let [path-value (or (gobj/get (.-env js/process) "PATH") "")
+        path-candidates (map #(node-path/join % "node")
+                             (remove string/blank?
+                                     (string/split path-value
+                                                   (if (= ";" node-path/delimiter)
+                                                     #";"
+                                                     #":"))))
+        candidates (concat path-candidates
+                           ["/opt/homebrew/bin/node"
+                            "/usr/local/bin/node"
+                            "/usr/bin/node"])
+        current-executable (canonical-path (.-execPath js/process))]
+    (some (fn [candidate]
+            (when (and (executable-file? candidate)
+                       (not= current-executable (canonical-path candidate)))
+              candidate))
+          candidates)))
 
-(defn- use-keychain-for-owner?
-  [owner-source]
-  (not (and (= :cli owner-source)
-            (truthy-env? (gobj/get (.-env js/process) "CLI_E2E_TEST")))))
+(defn- unpacked-keytar-module-path
+  []
+  (try
+    (let [resolved (.resolve js/require "keytar")
+          asar-segment (str node-path/sep "app.asar" node-path/sep)
+          unpacked-segment (str node-path/sep "app.asar.unpacked" node-path/sep)
+          unpacked (string/replace resolved asar-segment unpacked-segment)]
+      (when (and (node-fs/existsSync unpacked)
+                 (.isFile (node-fs/statSync unpacked)))
+        unpacked))
+    (catch :default _
+      nil)))
 
-(defn- <save-secret-text-by-owner!
-  [kv owner-source key text]
-  (if (use-keychain-for-owner? owner-source)
-    (<save-secret-text! kv key text)
-    ((:set! kv) key text)))
+(def ^:private legacy-keychain-read-script
+  (string/join
+   "\n"
+   ["const keytar = require(process.argv[1]);"
+    "keytar.getPassword(process.argv[2], process.argv[3]).then((value) => {"
+    "  if (typeof value === 'string') process.stdout.write(value);"
+    "}, () => { process.exitCode = 2; });"]))
 
-(defn- <read-secret-text-by-owner
-  [kv owner-source key]
-  (if (use-keychain-for-owner? owner-source)
-    (<read-secret-text kv key)
-    ((:get kv) key)))
+(defn- <read-legacy-keychain-secret
+  [key]
+  (let [executable (system-node-executable)
+        module-path (unpacked-keytar-module-path)]
+    (if-not (and executable module-path)
+      (p/resolved nil)
+      (p/create
+       (fn [resolve _reject]
+         (.execFile child-process
+                    executable
+                    #js ["-e" legacy-keychain-read-script
+                         module-path keychain-service key]
+                    #js {:encoding "utf8"
+                         :timeout legacy-keychain-read-timeout-ms
+                         :maxBuffer legacy-keychain-max-output-bytes
+                         :windowsHide true}
+                    (fn [error stdout _stderr]
+                      (resolve (when (and (nil? error)
+                                          (string? stdout)
+                                          (not (string/blank? stdout)))
+                                 stdout)))))))))
 
-(defn- <delete-secret-text-by-owner!
-  [kv owner-source key]
-  (if (use-keychain-for-owner? owner-source)
-    (<delete-secret-text! kv key)
-    ((:set! kv) key nil)))
+(defn- keychain-secret-store
+  ([kv keychain]
+   (keychain-secret-store kv keychain {}))
+  ([kv keychain {:keys [owner-source timeout-ms legacy-read-fn]
+                 :or {timeout-ms keychain-operation-timeout-ms}}]
+   (let [native-disabled? (atom false)
+         legacy-read-fn (when (and (= :cli owner-source) (macos?))
+                          (or legacy-read-fn <read-legacy-keychain-secret))
+         native-call
+         (fn [operation key f]
+           (if @native-disabled?
+             (p/rejected (ex-info "native keychain disabled after timeout"
+                                  {:type :db-worker/keychain-disabled
+                                   :operation operation
+                                   :key key}))
+             (-> (with-timeout (f) timeout-ms
+                               {:operation operation
+                                :key key})
+                 (p/catch
+                  (fn [error]
+                    (when (= :db-worker/keychain-timeout
+                             (:type (ex-data error)))
+                      (reset! native-disabled? true))
+                    (throw error))))))
+         fallback-or-legacy
+         (fn [key]
+           (p/let [fallback ((:get kv) key)]
+             (if (or (some? fallback) (nil? legacy-read-fn))
+               fallback
+               (p/let [legacy-secret (legacy-read-fn key)
+                       _ (when (some? legacy-secret)
+                           ((:set! kv) key legacy-secret))]
+                 legacy-secret))))]
+     {:save-secret-text!
+      (fn [key text]
+        (-> (native-call :save key
+                         #(.setPassword ^js keychain keychain-service key text))
+            (p/catch (fn [error]
+                       (log/warn :db-worker/keychain-save-failed
+                                 {:error error :key key})
+                       nil))
+            (p/then (fn [_]
+                      ((:set! kv) key text)))))
+      :read-secret-text
+      (fn [key]
+        (-> (native-call :read key
+                         #(.getPassword ^js keychain keychain-service key))
+            (p/then
+             (fn [secret]
+               (if (some? secret)
+                 (p/let [_ ((:set! kv) key secret)]
+                   secret)
+                 (fallback-or-legacy key))))
+            (p/catch
+             (fn [error]
+               (log/warn :db-worker/keychain-read-failed
+                         {:error error :key key})
+               (fallback-or-legacy key)))))
+      :delete-secret-text!
+      (fn [key]
+        (-> (native-call :delete key
+                         #(.deletePassword ^js keychain keychain-service key))
+            (p/catch (fn [error]
+                       (log/warn :db-worker/keychain-delete-failed
+                                 {:error error :key key})
+                       nil))
+            (p/then (fn [_]
+                      ((:set! kv) key nil)))))})))
+
+(defn- kv-secret-store
+  [kv]
+  {:save-secret-text! (fn [key text] ((:set! kv) key text))
+   :read-secret-text (fn [key] ((:get kv) key))
+   :delete-secret-text! (fn [key] ((:set! kv) key nil))})
+
+(defn- resolve-secret-store
+  [test-storage-enabled? production-kv test-kv owner-source]
+  (if test-storage-enabled?
+    (kv-secret-store test-kv)
+    (keychain-secret-store production-kv keytar {:owner-source owner-source})))
 
 (defn- kv-store
-  [data-dir]
-  (let [kv-path (node-path/join data-dir "kv-store.json")
-        state (atom nil)
-        <load! (fn []
-                 (if (some? @state)
-                   (p/resolved @state)
-                   (-> (fs/readFile kv-path "utf8")
-                       (p/then (fn [contents]
-                                 (let [data (parse-kv-state contents)]
-                                   (reset! state data)
-                                   @state)))
-                       (p/catch (fn [_]
-                                  (reset! state {})
-                                  @state)))))]
-    {:get (fn [k]
-            (p/let [_ (<load!)]
-              (get @state k)))
-     :set! (fn [k value]
-             (p/let [_ (<load!)
-                     _ (swap! state assoc k value)
-                     payload (serialize-kv-state @state)]
-               (fs/writeFile kv-path payload "utf8")))}))
+  ([data-dir]
+   (kv-store data-dir "kv-store.json"))
+  ([data-dir file-name]
+   (let [kv-path (node-path/join data-dir file-name)
+         state (atom nil)
+         <load! (fn []
+                  (if (some? @state)
+                    (p/resolved @state)
+                    (-> (fs/readFile kv-path "utf8")
+                        (p/then (fn [contents]
+                                  (let [data (parse-kv-state contents)]
+                                    (reset! state data)
+                                    @state)))
+                        (p/catch (fn [_]
+                                   (reset! state {})
+                                   @state)))))]
+     {:get (fn [k]
+             (p/let [_ (<load!)]
+               (get @state k)))
+      :set! (fn [k value]
+              (p/let [_ (<load!)
+                      _ (swap! state assoc k value)
+                      payload (serialize-kv-state @state)]
+                (fs/writeFile kv-path payload "utf8")))})))
 
 (defn node-platform
   [{:keys [root-dir event-fn write-guard-fn owner-source recreate-lock-fn
@@ -694,14 +958,21 @@
         embedding-dimension (when vector-embedding-enabled?
                               (resolve-embedding-dimension embedding-model-id))
         open-vector-index-fn (or open-vector-index-fn open-vector-index)
-        kv (kv-store root-dir)]
+        kv (kv-store root-dir)
+        test-kv (when test-secret-storage-enabled?
+                  (kv-store root-dir test-secret-storage-file))
+        secret-store (resolve-secret-store test-secret-storage-enabled?
+                                           kv test-kv owner-source)]
     (p/do!
      (ensure-dir! root-dir)
      (ensure-dir! data-dir)
      (log/info :db-worker-node-platform {:root-dir root-dir
                                           :vector-embedding-enabled? vector-embedding-enabled?
                                           :embedding-endpoint embedding-endpoint
-                                          :embedding-model-id embedding-model-id})
+                                          :embedding-model-id embedding-model-id
+                                          :secret-storage (if test-secret-storage-enabled?
+                                                            :isolated-test
+                                                            :system-keychain)})
      (cond->
       {:env {:publishing? false
              :runtime :node
@@ -716,6 +987,14 @@
                                     (pool-path pool path))
                  :export-file export-file
                  :import-db (fn [pool path data] (import-db write-guard-fn pool path data))
+                 :copy-db-file! (fn [pool source-path target-path]
+                                  (copy-db-file!
+                                   write-guard-fn
+                                   pool
+                                   source-path
+                                   target-path))
+                 :unlink-db-file! (fn [pool path]
+                                    (unlink-db-file! write-guard-fn pool path))
                  :remove-vfs! (fn [pool] (remove-vfs! pool))
                  :read-text! (fn [path] (read-text! data-dir path))
                  :write-text! (fn [path text] (write-text! write-guard-fn data-dir path text))
@@ -742,12 +1021,7 @@
                 :transaction (fn [db f] (.transaction db f))
                 :backup-db (fn [^js db path]
                              (.backup db path))}
-       :crypto {:save-secret-text! (fn [key text]
-                                     (<save-secret-text-by-owner! kv owner-source key text))
-                :read-secret-text (fn [key]
-                                    (<read-secret-text-by-owner kv owner-source key))
-                :delete-secret-text! (fn [key]
-                                       (<delete-secret-text-by-owner! kv owner-source key))}
+       :crypto secret-store
        :timers {:set-interval! (fn [f ms] (js/setInterval f ms))}}
        vector-embedding-enabled?
        (assoc :embedding {:model-id embedding-model-id

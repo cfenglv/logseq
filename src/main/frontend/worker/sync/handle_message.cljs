@@ -1,19 +1,23 @@
 (ns frontend.worker.sync.handle-message
   "WebSocket message handlers for db sync."
-  (:require [frontend.worker.shared-service :as shared-service]
+  (:require [datascript.core :as d]
+            [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync.apply-txs :as sync-apply]
             [frontend.worker.sync.assets :as sync-assets]
             [frontend.worker.sync.auth :as sync-auth]
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.crypt :as sync-crypt]
+            [frontend.worker.sync.large-title :as sync-large-title]
             [frontend.worker.sync.log-and-state :as sync-log-state]
             [frontend.worker.sync.presence :as sync-presence]
             [frontend.worker.sync.transport :as sync-transport]
             [frontend.worker.sync.util :as sync-util]
             [lambdaisland.glogi :as log]
-            [promesa.core :as p]
-            [frontend.worker-common.util :as worker-util]))
+            [logseq.db :as ldb]
+            [logseq.db-sync.checksum :as sync-checksum]
+            [logseq.db-sync.protocol :as sync-protocol]
+            [promesa.core :as p]))
 
 (defn- fail-fast
   [tag data]
@@ -30,9 +34,12 @@
     :get-missing-asset-upload-files sync-assets/get-missing-asset-upload-files
     :get-local-tx client-op/get-local-tx
     :get-local-checksum client-op/get-local-checksum
+    :get-local-server-checksum client-op/get-local-server-checksum
     :get-graph-uuid client-op/get-graph-uuid
     :latest-remote-tx @sync-apply/*repo->latest-remote-tx
-    :latest-remote-checksum @sync-apply/*repo->latest-remote-checksum}
+    :latest-remote-checksum @sync-apply/*repo->latest-remote-checksum
+    :latest-remote-checksum-version
+    @sync-apply/*repo->latest-remote-checksum-version}
    repo))
 
 (defn- broadcast-rtc-state!
@@ -64,10 +71,7 @@
 
 (defn- enqueue-asset-task!
   [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue
-           (fn [prev]
-             (p/then prev (fn [_] (task)))))))
+  (sync-assets/enqueue-asset-task! client task))
 
 (defn- enqueue-send-task!
   [client task]
@@ -80,33 +84,51 @@
                  (p/catch (fn [error]
                             (log/error :db-sync/send-queue-task-failed
                                        {:repo (:repo client)
-                                        :error error}))))))
+                                        :diagnostic
+                                        (dissoc
+                                         (sync-util/error->diagnostic error)
+                                         :at)}))))))
     (task)))
 
 (defn- current-client
   [repo]
   (sync-presence/current-client worker-state/*db-sync-client repo))
 
+(defn- value-shape
+  [value]
+  (cond
+    (nil? value) :nil
+    (number? value) :number
+    (string? value) :string
+    (uuid? value) :uuid
+    (sequential? value) :sequential
+    (map? value) :map
+    :else :other))
+
 (defn- require-number
   [value context]
   (when-not (number? value)
-    (fail-fast :db-sync/invalid-field (assoc context :value value))))
+    (fail-fast :db-sync/invalid-field
+               (assoc context :value-shape (value-shape value)))))
 
 (defn- require-non-negative
   [value context]
   (require-number value context)
   (when (neg? value)
-    (fail-fast :db-sync/invalid-field (assoc context :value value))))
+    (fail-fast :db-sync/invalid-field
+               (assoc context :value-shape (value-shape value)))))
 
 (defn- require-seq
   [value context]
   (when-not (sequential? value)
-    (fail-fast :db-sync/invalid-field (assoc context :value value))))
+    (fail-fast :db-sync/invalid-field
+               (assoc context :value-shape (value-shape value)))))
 
 (defn- require-uuid
   [value context]
   (when-not (uuid? value)
-    (fail-fast :db-sync/invalid-field (assoc context :value value))))
+    (fail-fast :db-sync/invalid-field
+               (assoc context :value-shape (value-shape value)))))
 
 (defn- parse-transit
   [value context]
@@ -131,9 +153,25 @@
   (when-let [*pending (:pending-pull-since client)]
     (reset! *pending nil)))
 
+(def ^:private deferred-pull-delay-ms 250)
+
+(defn- schedule-deferred-pull!
+  [repo client]
+  (js/setTimeout
+   (fn []
+     ;; Read the cursor again: no cursor is advanced by a deferred apply, but a
+     ;; concurrent acknowledgement may have legitimately advanced it.
+     (request-pull! client (client-op/get-local-tx repo)))
+   deferred-pull-delay-ms))
+
 (defn- pending-local-tx?
   [repo]
   (pos? (or (client-op/get-pending-local-tx-count repo) 0)))
+
+(defn- mark-sync-succeeded!
+  [client]
+  (when-let [sync-succeeded-f (:sync-succeeded-f client)]
+    (sync-succeeded-f)))
 
 (defn- synced-checksum-ready?
   [repo client local-t remote-t]
@@ -141,34 +179,562 @@
        (not (pending-local-tx? repo))
        (empty? @(:inflight client))))
 
+(defn- mark-sync-succeeded-if-ready!
+  [repo client local-t remote-t]
+  (when (synced-checksum-ready? repo client local-t remote-t)
+    (mark-sync-succeeded! client)))
+
 (defn- checksum-compare-ready?
   [repo client local-t remote-t]
-  (and (synced-checksum-ready? repo client local-t remote-t)
-       (string? (client-op/get-local-checksum repo))))
+  (synced-checksum-ready? repo client local-t remote-t))
+
+(defn- marker-recovery-fail!
+  [reason data]
+  (throw
+   (ex-info
+    "large-title marker recovery failed"
+    (assoc data
+           :type :db-sync/large-title-marker-recovery-failed
+           :reason reason))))
+
+(defn- marker-state-by-block-uuid
+  [markers context]
+  (when-not (sequential? markers)
+    (marker-recovery-fail! :invalid-marker-state context))
+  (reduce
+   (fn [result {:keys [block-uuid marker]}]
+     (let [block-uuid*
+           (cond
+             (uuid? block-uuid) block-uuid
+             (string? block-uuid)
+             (try
+               (uuid block-uuid)
+               (catch :default _
+                 (marker-recovery-fail!
+                  :invalid-block-uuid
+                  (assoc context :block-uuid block-uuid))))
+             :else
+             (marker-recovery-fail!
+              :invalid-block-uuid-shape context))
+           block-uuid-str (str block-uuid*)]
+       (when (contains? result block-uuid-str)
+         (marker-recovery-fail!
+          :duplicate-block-uuid
+          (assoc context :block-uuid block-uuid-str)))
+       (when-not (and (sync-large-title/large-title-object-v2? marker)
+                      (= sync-large-title/large-title-asset-type
+                         (:asset-type marker)))
+         (marker-recovery-fail!
+          :invalid-marker
+          (assoc context :block-uuid block-uuid-str)))
+       (assoc result block-uuid-str marker)))
+   {}
+   markers))
+
+(defn- expected-large-title-payload-format
+  [e2ee?]
+  (if e2ee?
+    sync-large-title/large-title-encrypted-payload-format
+    sync-large-title/large-title-plain-payload-format))
+
+(defn- <fetch-large-title-marker-state
+  [repo graph-id]
+  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+    (when-not (and (seq base) (seq graph-id))
+      (marker-recovery-fail!
+       :missing-endpoint
+       {:repo repo
+        :graph-id graph-id}))
+    (sync-util/fetch-json
+     (str base
+          "/sync/"
+          (js/encodeURIComponent graph-id)
+          "/checksum/large-title-markers")
+     {:method "GET"
+      :operation :large-title-marker-state
+      :timeout-ms 30000}
+     {:response-schema :sync/large-title-markers
+      :error-schema :error})))
+
+(defn- <recover-large-title-marker-mismatch!
+  [repo client checkpoint-t remote-tx
+   {:keys [basis-local-t post-ack-ready?]}
+   {:keys [checksum checksum-version server-checksum]}]
+  (let [basis-local-t (or basis-local-t checkpoint-t)
+        conn (worker-state/get-datascript-conn repo)
+        graph-id (:graph-id client)]
+    (when-not conn
+      (marker-recovery-fail! :missing-db {:repo repo}))
+    (log/info :db-sync/large-title-marker-recovery
+              {:repo repo :t checkpoint-t :stage :metadata-start})
+    (p/let [response (<fetch-large-title-marker-state repo graph-id)
+            _ (log/info :db-sync/large-title-marker-recovery
+                        {:repo repo :t checkpoint-t :stage :metadata-ready})
+            db-before @conn
+            local-checksum
+            (sync-checksum/recompute-checksum db-before)
+            local-server-checksum
+            (sync-checksum/recompute-server-checksum db-before)
+            _ (when-not
+                (and (= checkpoint-t remote-tx (:t response))
+                     (= basis-local-t (client-op/get-local-tx repo))
+                     (= checksum (:checksum response) local-checksum)
+                     (= checksum-version (:checksum-version response))
+                     (= server-checksum (:server-checksum response))
+                     (= sync-checksum/server-checksum-version
+                        (:checksum-version response))
+                     (or post-ack-ready?
+                         (synced-checksum-ready?
+                          repo client checkpoint-t remote-tx)))
+                (marker-recovery-fail!
+                 :state-binding-mismatch
+                 {:repo repo
+                  :local-tx checkpoint-t
+                  :remote-tx remote-tx
+                  :marker-state-t (:t response)}))
+            _ (when (= local-server-checksum server-checksum)
+                (client-op/update-local-server-checksum
+                 repo local-server-checksum))
+            local-marker-state
+            (marker-state-by-block-uuid
+             (sync-checksum/server-large-title-markers db-before)
+             {:repo repo :source :local})
+            remote-marker-state
+            (marker-state-by-block-uuid
+             (:large-title-markers response)
+             {:repo repo :source :remote})
+            _ (when-not (= (set (keys local-marker-state))
+                           (set (keys remote-marker-state)))
+                (marker-recovery-fail!
+                 :marker-entity-set-mismatch
+                 {:repo repo
+                  :local-marker-count (count local-marker-state)
+                  :remote-marker-count (count remote-marker-state)}))
+            differing-block-uuids
+            (->> (keys local-marker-state)
+                 (filter #(not= (get local-marker-state %)
+                                (get remote-marker-state %)))
+                 sort
+                 vec)
+            _ (when (and (not= local-server-checksum server-checksum)
+                         (empty? differing-block-uuids))
+                (marker-recovery-fail!
+                 :not-marker-only
+                 {:repo repo}))
+            graph-e2ee? (sync-crypt/graph-e2ee? repo)
+            aes-key (when graph-e2ee?
+                      (sync-util/with-timeout
+                       (sync-crypt/<ensure-graph-aes-key repo graph-id)
+                       60000
+                       {:type :db-sync/recovery-timeout
+                        :code :marker-recovery-aes-key-timeout
+                        :operation :large-title-marker-recovery
+                        :stage :aes-key}))
+            _ (when (and graph-e2ee? (nil? aes-key))
+                ;; A nil key means the provider has not made the secret
+                ;; available yet. Reconnect and replay hello instead of
+                ;; converting this transient condition into a persistent
+                ;; checksum mismatch. Decryption/integrity failures still
+                ;; take the fail-closed marker-recovery path below.
+                (throw
+                 (ex-info
+                  "graph E2EE key is temporarily unavailable"
+                  {:type :db-sync/e2ee-key-unavailable
+                   :code :missing-aes-key
+                   :repo repo
+                   :operation :large-title-marker-recovery})))
+            _ (log/info :db-sync/large-title-marker-recovery
+                        {:repo repo :t checkpoint-t :stage :aes-key-ready})
+            expected-payload-format
+            (expected-large-title-payload-format graph-e2ee?)
+            marker-txs
+            (p/all
+             (mapv
+              (fn [block-uuid-str]
+                (let [block-uuid (uuid block-uuid-str)
+                      marker (get remote-marker-state block-uuid-str)
+                      entity (d/entity db-before [:block/uuid block-uuid])
+                      local-title (:block/title entity)]
+                  (when-not
+                      (= expected-payload-format (:payload-format marker))
+                    (marker-recovery-fail!
+                     :payload-format-mismatch
+                     {:repo repo
+                      :block-uuid block-uuid-str}))
+                  (when-not (and entity
+                                 (string? local-title)
+                                 (sync-large-title/large-title? local-title))
+                    (marker-recovery-fail!
+                     :missing-logical-title
+                     {:repo repo
+                      :block-uuid block-uuid-str}))
+                  (p/let [remote-title
+                          (sync-apply/download-large-title!
+                           repo graph-id marker aes-key)]
+                    (when-not (= local-title remote-title)
+                      (marker-recovery-fail!
+                       :logical-title-mismatch
+                       {:repo repo
+                        :block-uuid block-uuid-str}))
+                    [:db/add
+                     [:block/uuid block-uuid]
+                     sync-large-title/large-title-object-attr
+                     marker])))
+              differing-block-uuids))
+            _ (log/info :db-sync/large-title-marker-recovery
+                        {:repo repo
+                         :t checkpoint-t
+                         :stage :payloads-ready
+                         :changed-marker-count
+                         (count differing-block-uuids)})
+            _ (when-not (identical? db-before @conn)
+                (marker-recovery-fail!
+                 :local-db-changed
+                 {:repo repo}))
+            candidate-db
+            (:db-after (d/with db-before marker-txs))
+            candidate-checksum
+            (sync-checksum/recompute-checksum candidate-db)
+            candidate-server-checksum
+            (sync-checksum/recompute-server-checksum candidate-db)
+            _ (when-not (and (= checksum candidate-checksum)
+                             (= server-checksum
+                                candidate-server-checksum))
+                (marker-recovery-fail!
+                 :candidate-checksum-mismatch
+                 {:repo repo
+                  :candidate-checksum candidate-checksum
+                  :candidate-server-checksum candidate-server-checksum}))
+            _ (when (seq marker-txs)
+                (ldb/transact!
+                 conn
+                 marker-txs
+                 {:rtc-tx? true
+                  :persist-op? false
+                  :op :large-title-marker-recovery}))
+            final-checksum
+            (sync-checksum/recompute-checksum @conn)
+            final-server-checksum
+            (sync-checksum/recompute-server-checksum @conn)
+            _ (when-not (and (= checksum final-checksum)
+                             (= server-checksum final-server-checksum))
+                (marker-recovery-fail!
+                 :final-checksum-mismatch
+                 {:repo repo
+                  :final-checksum final-checksum
+                  :final-server-checksum final-server-checksum}))]
+      (client-op/commit-sync-checkpoint!
+       repo
+       {:t checkpoint-t
+        :expected-local-t basis-local-t
+        :checksum final-checksum
+        :server-checksum final-server-checksum})
+      (log/info :db-sync/large-title-marker-recovered
+                {:repo repo
+                 :t checkpoint-t
+                 :marker-count (count remote-marker-state)
+                 :changed-marker-count (count differing-block-uuids)})
+      true)))
+
+(defn- report-checksum-mismatch!
+  [mismatch-data]
+  (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
+  (fail-fast :db-sync/checksum-mismatch mismatch-data))
+
+(def ^:private max-checksum-basis-attempts 3)
+
+(defn- object-id
+  [value]
+  (when value
+    (goog/getUid value)))
+
+(defn- recompute-stable-checksum-basis!
+  [repo expected-local-t]
+  (loop [attempt 1]
+    (let [conn (worker-state/get-datascript-conn repo)
+          basis-local-t (client-op/get-local-tx repo)]
+      (when-not conn
+        (fail-fast :db-sync/missing-db
+                   {:type :db-sync/missing-db
+                    :repo repo
+                    :stage :checksum-recompute}))
+      (let [db @conn
+            recomputed-checksum
+            (sync-checksum/recompute-checksum db)
+            recomputed-server-checksum
+            (sync-checksum/recompute-server-checksum db)
+            current-conn (worker-state/get-datascript-conn repo)
+            current-local-t (client-op/get-local-tx repo)
+            stable?
+            (and current-conn
+                 (= expected-local-t basis-local-t current-local-t)
+                 (identical? conn current-conn)
+                 (identical? db @current-conn))]
+        (if stable?
+          {:recomputed-checksum recomputed-checksum
+           :recomputed-server-checksum recomputed-server-checksum
+           :basis-local-tx basis-local-t
+           :connection-id (object-id conn)
+           :basis-id (object-id db)
+           :basis-attempt attempt}
+          (if (< attempt max-checksum-basis-attempts)
+            (recur (inc attempt))
+            (throw
+             (ex-info
+              "checksum basis did not stabilize"
+              {:type :db-sync/checksum-basis-unstable
+               :repo repo
+               :stage :checksum-recompute
+               :expected-local-t expected-local-t
+               :actual-local-t current-local-t
+               :attempts attempt
+               :connection-id (object-id current-conn)}))))))))
+
+(defn- commit-checkpoint!
+  [repo checkpoint-t expected-local-t checksum server-checksum]
+  (client-op/commit-sync-checkpoint!
+   repo
+   (cond-> {:t checkpoint-t
+            :expected-local-t expected-local-t}
+     (string? checksum) (assoc :checksum checksum)
+     (string? server-checksum) (assoc :server-checksum server-checksum))))
 
 (defn- verify-sync-checksum!
-  [repo client local-tx remote-tx remote-checksum context]
-  (when worker-util/dev-or-test?
-    (when (and (string? remote-checksum)
-               (checksum-compare-ready? repo client local-tx remote-tx))
-      (let [local-checksum (client-op/get-local-checksum repo)]
-        (when-not (= local-checksum remote-checksum)
-          (let [mismatch-data (merge context
-                                     {:type :db-sync/checksum-mismatch
-                                      :repo repo
-                                      :message-type (:type context)
-                                      :local-tx local-tx
-                                      :remote-tx remote-tx
-                                      :local-checksum local-checksum
-                                      :remote-checksum remote-checksum})]
-            (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
-            (log/warn :db-sync/checksum-mismatch mismatch-data)))))))
+  [repo client local-tx remote-tx
+   {:keys [checksum server-checksum checksum-version]}
+   context]
+  (let [compare-ready?
+        (or (:post-ack-ready? context)
+            (checksum-compare-ready? repo client local-tx remote-tx))
+        checkpoint-t (or (:checkpoint-t context) local-tx)
+        basis-local-t (or (:basis-local-tx context) local-tx)
+        cached-checksum (client-op/get-local-checksum repo)
+        versioned-checksum?
+        (and (= sync-checksum/server-checksum-version checksum-version)
+             (string? server-checksum))
+        cached-server-checksum
+        (client-op/get-local-server-checksum repo)
+        cached-legacy-match?
+        (or (not (string? checksum))
+            (= cached-checksum checksum))
+        cached-versioned-match?
+        (or (not versioned-checksum?)
+            (= cached-server-checksum server-checksum))
+        advertised-checksum?
+        (or (string? checksum) versioned-checksum?)
+        force-authoritative-recompute?
+        (true? (:force-authoritative-recompute? context))
+        cached-mismatch?
+        (and advertised-checksum?
+             (or (not cached-legacy-match?)
+                 (not cached-versioned-match?)))]
+    (cond
+      (not compare-ready?)
+      nil
+
+      (and (not force-authoritative-recompute?)
+           (not cached-mismatch?))
+      (when (:checkpoint-t context)
+        (commit-checkpoint!
+         repo checkpoint-t basis-local-t
+         cached-checksum cached-server-checksum))
+
+      :else
+      (let [{:keys [recomputed-checksum recomputed-server-checksum]
+             :as basis}
+            (recompute-stable-checksum-basis! repo basis-local-t)
+            recomputed-legacy-match?
+            (or (not (string? checksum))
+                (= recomputed-checksum checksum))
+            recomputed-versioned-match?
+            (or (not versioned-checksum?)
+                (= recomputed-server-checksum server-checksum))
+            authoritative-match?
+            (if versioned-checksum?
+              recomputed-versioned-match?
+              recomputed-legacy-match?)
+            compatibility?
+            (and versioned-checksum?
+                 authoritative-match?
+                 (not recomputed-legacy-match?))
+            cache-only-drift?
+            (and authoritative-match?
+                 (if versioned-checksum?
+                   (not cached-versioned-match?)
+                   (not cached-legacy-match?)))
+            recovered-ack-basis
+            (when (and (not authoritative-match?)
+                       (= "tx/batch/ok" (:type context))
+                       (:ack-recovery context))
+              (sync-apply/recover-acked-frozen-wire!
+               repo
+               (merge (:ack-recovery context)
+                      {:basis-local-t basis-local-t
+                       :post-ack-ready? (:post-ack-ready? context)})
+               {:checksum checksum
+                :server-checksum server-checksum
+                :checksum-version checksum-version}))
+            diagnostic-data
+            (cond->
+             (merge (dissoc context :ack-recovery)
+                    basis
+                    {:type :db-sync/checksum-mismatch
+                     :repo repo
+                     :message-type (:type context)
+                     :local-tx checkpoint-t
+                     :remote-tx remote-tx
+                     :cached-checksum cached-checksum
+                     :cached-server-checksum cached-server-checksum
+                     :recomputed-checksum recomputed-checksum
+                     :local-checksum recomputed-checksum
+                     :remote-checksum checksum
+                     :cache-only-drift? cache-only-drift?})
+              versioned-checksum?
+              (assoc
+               :checksum-version checksum-version
+               :cached-server-checksum cached-server-checksum
+               :recomputed-server-checksum recomputed-server-checksum
+               :local-server-checksum recomputed-server-checksum
+               :remote-server-checksum server-checksum))]
+        (cond
+          recovered-ack-basis
+          (let [{:keys [recomputed-checksum recomputed-server-checksum]}
+                recovered-ack-basis]
+            (commit-checkpoint!
+             repo checkpoint-t basis-local-t
+             recomputed-checksum recomputed-server-checksum)
+            (log/warn :db-sync/acked-frozen-wire-recovered
+                      {:repo repo
+                       :message-type (:type context)
+                       :checkpoint-t checkpoint-t
+                       :tx-count
+                       (count
+                        (get-in context
+                                [:ack-recovery :completed-tx-ids]))}))
+
+          authoritative-match?
+          (let [cache-repair-data
+                (assoc diagnostic-data
+                       :type :db-sync/checksum-cache-repaired)]
+            (commit-checkpoint!
+             repo checkpoint-t basis-local-t
+             recomputed-checksum recomputed-server-checksum)
+            (when cache-only-drift?
+              (sync-log-state/rtc-log
+               :rtc.log/checksum-cache-repaired
+               cache-repair-data))
+            (if compatibility?
+              (log/warn :db-sync/versioned-server-checksum diagnostic-data)
+              (log/info :db-sync/checksum-cache-revalidated
+                        cache-repair-data)))
+
+          (and versioned-checksum?
+               (or (contains? #{"hello" "pull/ok" "tx/batch/ok"}
+                              (:type context))
+                   (and (= "tx/reject" (:type context))
+                        (:identity-conflict-recovery? context)))
+               (string? checksum)
+               recomputed-legacy-match?
+               (seq (sync-checksum/server-large-title-markers
+                     @(worker-state/get-datascript-conn repo))))
+          (->
+           (<recover-large-title-marker-mismatch!
+            repo client checkpoint-t remote-tx
+            {:basis-local-t basis-local-t
+             :post-ack-ready? (:post-ack-ready? context)}
+            {:checksum checksum
+             :checksum-version checksum-version
+             :server-checksum server-checksum})
+           (p/catch
+            (fn [error]
+              (if (sync-util/transient-sync-error? error)
+                (throw error)
+                (report-checksum-mismatch!
+                 (assoc diagnostic-data
+                        :marker-recovery-failed? true
+                        :marker-recovery-reason
+                        (:reason (ex-data error))))))))
+
+          :else
+          (report-checksum-mismatch! diagnostic-data))))))
+
+(defn- upload-progress-wire-tx-id
+  [{:keys [tx-id logical-tx-id upload-session-id chunk-index chunk-final?]}]
+  (or tx-id
+      (when (and logical-tx-id upload-session-id
+                 (some? chunk-index) (some? chunk-final?))
+        (sync-protocol/tx-chunk-id
+         logical-tx-id upload-session-id chunk-index chunk-final?))))
+
+(defn- wire-tx-ids->completed-pending-tx-ids
+  "Map acknowledged wire ids back to durable logical pending-row ids. A
+  nonfinal staged ACK advances upload progress only; a final ACK completes the
+  logical row. Ordinary envelopes keep their own tx id."
+  [upload-request wire-tx-ids]
+  (let [progress-by-wire-id
+        (into {}
+              (keep (fn [progress]
+                      (when-let [wire-tx-id
+                                 (upload-progress-wire-tx-id progress)]
+                        [wire-tx-id progress])))
+              (:large-upload-progress upload-request))]
+    (into []
+          (keep (fn [wire-tx-id]
+                  (if-let [{:keys [large-upload-original-tx-id
+                                   large-upload-final?]}
+                           (get progress-by-wire-id wire-tx-id)]
+                    (when large-upload-final?
+                      large-upload-original-tx-id)
+                    wire-tx-id)))
+          wire-tx-ids)))
+
+(defn- wire-tx-id->rejected-pending-tx-id
+  [upload-request wire-tx-id]
+  (or (some (fn [{:keys [large-upload-original-tx-id] :as progress}]
+              (when (= wire-tx-id (upload-progress-wire-tx-id progress))
+                large-upload-original-tx-id))
+            (:large-upload-progress upload-request))
+      wire-tx-id))
+
+(defn- recoverable-tx-identity-conflict?
+  [repo upload-request message local-tx inflight]
+  (let [failed-tx-id (:failed-tx-id message)
+        marker-entries (:large-title-marker-tx-entries upload-request)]
+    (and (= ":db-sync/tx-identity-conflict" (:error-detail message))
+         (= local-tx (:t message))
+         (= [failed-tx-id] (vec inflight))
+         (empty? (or (:success-tx-ids message) []))
+         (empty? (:large-upload-progress upload-request))
+         (= sync-checksum/server-checksum-version
+            (:checksum-version message))
+         (string? (:checksum message))
+         (string? (:server-checksum message))
+         (some #(= failed-tx-id (:tx-id %)) marker-entries)
+         (some #(= failed-tx-id (:tx-id %))
+               (sync-apply/pending-txs repo)))))
+
+(defn- finish-tx-identity-conflict-recovery!
+  [repo client tx-id remote-tx]
+  (sync-apply/mark-pending-txs-false! repo [tx-id])
+  (reset! (:inflight client) [])
+  (sync-util/clear-last-sync-error! client)
+  (broadcast-rtc-state! client)
+  (mark-sync-succeeded-if-ready!
+   repo client remote-tx remote-tx)
+  (sync-apply/enqueue-flush-pending! repo client)
+  (log/info :db-sync/tx-identity-conflict-recovered
+            {:repo repo
+             :tx-id tx-id
+             :t remote-tx})
+  nil)
 
 (defn- handle-tx-reject!
   [repo client message local-tx]
-  (sync-apply/clear-upload-response-timeout! client)
-  (let [reason (:reason message)
+  (let [upload-request
+        (sync-apply/clear-upload-response-timeout! client)
+        reason (:reason message)
         remote-tx (:t message)
+        error-detail (:error-detail message)
         success-tx-ids (:success-tx-ids message)
         failed-tx-id (:failed-tx-id message)
         missing-block-uuids (:missing-block-uuids message)]
@@ -177,6 +743,13 @@
                  {:repo repo :type "tx/reject" :field :reason}))
     (when (contains? message :t)
       (require-non-negative remote-tx {:repo repo :type "tx/reject"}))
+    (when (and (contains? message :error-detail)
+               (not (string? error-detail)))
+      (fail-fast :db-sync/invalid-field
+                 {:repo repo
+                  :type "tx/reject"
+                  :field :error-detail
+                  :value-shape (value-shape error-detail)}))
     (when (contains? message :success-tx-ids)
       (require-seq success-tx-ids {:repo repo :type "tx/reject" :field :success-tx-ids})
       (doseq [tx-id success-tx-ids]
@@ -196,14 +769,25 @@
             successful-tx-ids (->> (or success-tx-ids [])
                                    (filter inflight-set)
                                    vec)
-            failed-tx-id (when (and failed-tx-id (contains? inflight-set failed-tx-id))
-                           failed-tx-id)
+            failed-wire-tx-id
+            (when (and failed-tx-id (contains? inflight-set failed-tx-id))
+              failed-tx-id)
+            failed-tx-id (wire-tx-id->rejected-pending-tx-id
+                          upload-request failed-wire-tx-id)
+            completed-pending-tx-ids
+            (wire-tx-ids->completed-pending-tx-ids
+             upload-request successful-tx-ids)
+            partial-success? (and (seq successful-tx-ids)
+                                  (number? remote-tx))
+            next-local-tx (when partial-success?
+                            (max local-tx remote-tx))
             data (when-let [raw-data (:data message)]
                    (parse-transit raw-data
                                   {:repo repo
                                    :type "tx/reject"
                                    :reason reason
                                    :field :data}))
+            rejected-outliner-op (when (map? data) (:outliner-op data))
             rejected-data (cond-> {:type :db-sync/tx-rejected
                                    :repo repo
                                    :message-type "tx/reject"
@@ -212,28 +796,89 @@
                             (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
                             (some? failed-tx-id) (assoc :failed-tx-id failed-tx-id)
                             (seq missing-block-uuids) (assoc :missing-block-uuids (vec missing-block-uuids))
-                            (some? data) (assoc :data data))]
-        (if (or (contains? message :success-tx-ids)
-                (contains? message :failed-tx-id))
-          (do
-            (sync-apply/mark-pending-txs-false! repo successful-tx-ids)
-            (when failed-tx-id
-              (sync-apply/rollback-and-mark-failed-txs! repo [failed-tx-id])))
-          ;; Backward compatibility for older servers without per-tx reject metadata.
-          (sync-apply/rollback-and-mark-failed-txs! repo inflight))
-        (reset! (:inflight client) [])
-        (broadcast-rtc-state! client)
-        (sync-log-state/rtc-log :rtc.log/tx-rejected rejected-data)
-        (fail-fast :db-sync/tx-rejected
-                   rejected-data)))))
+                            (some? error-detail) (assoc :error-detail error-detail)
+                            (some? data) (assoc :has-rejected-data? true)
+                            (some? rejected-outliner-op)
+                            (assoc :rejected-outliner-op rejected-outliner-op))
+            reject!
+            (fn []
+              (when (and upload-request (seq successful-tx-ids))
+                (sync-apply/commit-upload-response!
+                 repo upload-request successful-tx-ids))
+              (if (or (contains? message :success-tx-ids)
+                      (contains? message :failed-tx-id))
+                (do
+                  (sync-apply/mark-pending-txs-false!
+                   repo completed-pending-tx-ids)
+                  (when failed-tx-id
+                    (sync-apply/rollback-and-mark-failed-txs!
+                     repo [failed-tx-id])))
+                ;; Backward compatibility for older servers without per-tx
+                ;; reject metadata.
+                (sync-apply/rollback-and-mark-failed-txs! repo inflight))
+              ;; The server commits txs before the rejected tx and reports the
+              ;; resulting cursor in :t. Advance the local cursor so rebased
+              ;; pending txs can resume.
+              (when partial-success?
+                (client-op/update-local-tx repo next-local-tx))
+              (reset! (:inflight client) [])
+              (broadcast-rtc-state! client)
+              (let [resume-local-tx (or next-local-tx local-tx)
+                    latest-remote-tx
+                    (get @sync-apply/*repo->latest-remote-tx repo)]
+                (if (and (number? latest-remote-tx)
+                         (> latest-remote-tx resume-local-tx))
+                  (request-pull! client resume-local-tx)
+                  ;; A reject can identify the first failed entry without
+                  ;; accepting anything before it. Entries later in the same
+                  ;; inflight batch remain pending and must be scheduled again.
+                  (sync-apply/enqueue-flush-pending! repo client)))
+              (sync-log-state/rtc-log
+               :rtc.log/tx-rejected rejected-data)
+              (fail-fast :db-sync/tx-rejected rejected-data))
+            recover-identity-conflict!
+            (fn []
+              (let [verification
+                    (verify-sync-checksum!
+                     repo client local-tx remote-tx
+                     (select-keys message
+                                  [:checksum
+                                   :checksum-version
+                                   :server-checksum])
+                     {:type "tx/reject"
+                      :basis-local-tx local-tx
+                      :checkpoint-t remote-tx
+                      :post-ack-ready? true
+                      :force-authoritative-recompute? true
+                      :identity-conflict-recovery? true})
+                    finish!
+                    #(finish-tx-identity-conflict-recovery!
+                      repo client failed-tx-id remote-tx)]
+                (if (p/promise? verification)
+                  (-> verification
+                      (p/then (fn [_] (finish!)))
+                      (p/catch (fn [_] (reject!))))
+                  (finish!))))]
+        (if (recoverable-tx-identity-conflict?
+             repo upload-request message local-tx inflight)
+          (try
+            (recover-identity-conflict!)
+            (catch :default _
+              (reject!)))
+          (reject!))))))
 
-(defn- handle-hello!
-  [repo client local-tx remote-tx remote-checksum]
-  (require-non-negative remote-tx {:repo repo :type "hello"})
-  (verify-sync-checksum! repo client local-tx remote-tx remote-checksum {:type "hello"})
+(defn- finish-handle-hello!
+  [repo client local-tx remote-tx]
   (broadcast-rtc-state! client)
-  (when (> remote-tx local-tx)
-    (request-pull! client local-tx))
+  (if (> remote-tx local-tx)
+    ;; Reconnects after a lost upload acknowledgement commonly see the server
+    ;; ahead of the local cursor. Pull and rebase first; uploading against the
+    ;; stale cursor in parallel only creates an avoidable tx/reject race.
+    (request-pull! client local-tx)
+    (do
+      (mark-sync-succeeded-if-ready!
+       repo client local-tx remote-tx)
+      (sync-apply/enqueue-flush-pending! repo client)))
   (sync-assets/enqueue-asset-sync!
    repo client
    {:enqueue-asset-task-f enqueue-asset-task!
@@ -245,8 +890,28 @@
              :online? (worker-state/online?)
              :ws-open? (when-let [ws (:ws client)]
                          (ws-open? ws))
-             :pending-txs-count (count (sync-apply/pending-txs repo {:limit 50}))})
-  (sync-apply/enqueue-flush-pending! repo client))
+             :pending-txs-count (count (sync-apply/pending-txs repo {:limit 50}))}))
+
+(defn- handle-hello!
+  [repo client local-tx remote-tx checksum-fields capabilities]
+  (sync-apply/set-server-capabilities! repo capabilities)
+  (require-non-negative remote-tx {:repo repo :type "hello"})
+  (when (< remote-tx local-tx)
+    (fail-fast :db-sync/server-cursor-regressed
+               {:type :db-sync/server-cursor-regressed
+                :repo repo
+                :message-type "hello"
+                :local-tx local-tx
+                :remote-tx remote-tx}))
+  (let [verification
+        (verify-sync-checksum!
+         repo client local-tx remote-tx checksum-fields {:type "hello"})]
+    (if (p/promise? verification)
+      (p/then verification
+              (fn [_]
+                (finish-handle-hello!
+                 repo client local-tx remote-tx)))
+      (finish-handle-hello! repo client local-tx remote-tx))))
 
 (defn- handle-online-users!
   [repo client message]
@@ -262,26 +927,158 @@
     (when-not (= (get-user-uuid) user-id)
       (update-user-presence! client user-id editing-block-uuid))))
 
+(defn- canonical-ack-data
+  [repo upload-request inflight remote-tx message]
+  (let [canonical-fields [:canonical-basis-t
+                          :canonical-txs
+                          :canonical-tx-ids]
+        present-fields (filterv #(contains? message %) canonical-fields)]
+    (when (seq present-fields)
+    (let [basis-t (:canonical-basis-t message)
+          canonical-tx-ids (:canonical-tx-ids message)
+          canonical-txs (:canonical-txs message)
+          expected-tx-ids (vec inflight)
+          expected-row-count (when (and (integer? basis-t)
+                                        (integer? remote-tx))
+                               (- remote-tx basis-t))
+          canonical-row-tx-ids (into [] (keep :tx-id) canonical-txs)]
+      (when-not (and (= canonical-fields present-fields)
+                     upload-request
+                     (integer? basis-t)
+                     (= basis-t (:t-before upload-request))
+                     (= expected-tx-ids (vec canonical-tx-ids))
+                     (sequential? canonical-txs)
+                     (not (neg? expected-row-count))
+                     (= expected-row-count (count canonical-txs))
+                     (every? true?
+                             (map-indexed
+                              (fn [idx tx]
+                                (= (+ basis-t idx 1) (:t tx)))
+                              canonical-txs))
+                     (= (count canonical-row-tx-ids)
+                        (count (distinct canonical-row-tx-ids)))
+                     (every? (set expected-tx-ids)
+                             canonical-row-tx-ids))
+        (fail-fast :db-sync/invalid-canonical-ack
+                   {:type :db-sync/invalid-canonical-ack
+                    :repo repo
+                    :basis-t basis-t
+                    :expected-basis-t (:t-before upload-request)
+                    :expected-count (count expected-tx-ids)
+                    :actual-count (count canonical-tx-ids)
+                    :expected-row-count expected-row-count
+                    :actual-row-count (count canonical-txs)}))
+      {:tx-ids canonical-tx-ids
+       :txs (mapv (fn [data]
+                    {:t (:t data)
+                     :tx-id (:tx-id data)
+                     :outliner-op (:outliner-op data)
+                     :tx-data (parse-transit
+                               (:tx data)
+                               {:repo repo :type "tx/batch/ok"})})
+                  canonical-txs)}))))
+
+(defn- finish-handle-tx-batch-ok!
+  [repo client remote-tx checksum-fields inflight]
+  (let [upload-request (sync-apply/ack-upload-response! repo client)
+        completed-pending-tx-ids
+        (wire-tx-ids->completed-pending-tx-ids upload-request inflight)
+        current-local-tx (client-op/get-local-tx repo)
+        next-local-tx (max current-local-tx remote-tx)
+        completed-set (set completed-pending-tx-ids)
+        post-ack-ready?
+        (and (= next-local-tx remote-tx)
+             (empty?
+              (remove #(contains? completed-set (:tx-id %))
+                      (sync-apply/pending-txs repo))))
+        verification
+        (verify-sync-checksum!
+         repo client next-local-tx remote-tx checksum-fields
+         {:type "tx/batch/ok"
+          :basis-local-tx current-local-tx
+          :checkpoint-t next-local-tx
+          :post-ack-ready? post-ack-ready?
+          :ack-recovery
+          {:upload-request upload-request
+           :completed-tx-ids completed-pending-tx-ids
+           :inflight-tx-ids inflight}})
+          finish!
+          (fn []
+            (when (= current-local-tx (client-op/get-local-tx repo))
+              (client-op/commit-sync-checkpoint!
+               repo
+               {:t next-local-tx
+                :expected-local-t current-local-tx}))
+            (sync-util/clear-last-sync-error! client)
+            (sync-apply/mark-pending-txs-false!
+             repo completed-pending-tx-ids)
+            (reset! (:inflight client) [])
+            (broadcast-rtc-state! client)
+            (mark-sync-succeeded-if-ready!
+             repo client next-local-tx remote-tx)
+            (sync-apply/enqueue-flush-pending! repo client))]
+      (if (p/promise? verification)
+        (p/then verification (fn [_] (finish!)))
+        (finish!))))
+
 (defn- handle-tx-batch-ok!
-  [repo client remote-tx remote-checksum]
+  [repo client remote-tx checksum-fields message]
   (require-non-negative remote-tx {:repo repo :type "tx/batch/ok"})
-  (sync-apply/ack-upload-response! repo client)
-  (let [current-local-tx (client-op/get-local-tx repo)
-        next-local-tx (max current-local-tx remote-tx)]
-    (client-op/update-local-tx repo next-local-tx)
-    (sync-util/clear-last-sync-error! client)
-    (broadcast-rtc-state! client)
-    (sync-apply/mark-pending-txs-false! repo @(:inflight client))
-    (reset! (:inflight client) [])
-    (verify-sync-checksum! repo client next-local-tx remote-tx remote-checksum {:type "tx/batch/ok"})
-    (sync-apply/enqueue-flush-pending! repo client)))
+  (let [inflight @(:inflight client)
+        pending-upload-request (some-> client :upload-request deref)
+        canonical-ack
+        (canonical-ack-data
+         repo pending-upload-request inflight remote-tx message)
+        finish! #(finish-handle-tx-batch-ok!
+                  repo client remote-tx checksum-fields inflight)]
+    (if-not canonical-ack
+      (finish!)
+      (if-not (sync-crypt/graph-e2ee? repo)
+        (do
+          (sync-apply/apply-canonical-ack!
+           repo (:txs canonical-ack) (:tx-ids canonical-ack)
+           checksum-fields)
+          (finish!))
+        (->
+         (p/let [aes-key (sync-crypt/<ensure-graph-aes-key
+                          repo (:graph-id client))
+                 _ (when (nil? aes-key)
+                     (fail-fast :db-sync/missing-field
+                                {:repo repo :field :aes-key}))
+                 canonical-txs
+                 (p/all
+                  (mapv
+                   (fn [{:keys [tx-data] :as canonical-tx}]
+                     (p/let [tx-data* (sync-crypt/<decrypt-tx-data
+                                       aes-key tx-data)]
+                       (assoc canonical-tx :tx-data tx-data*)))
+                   (:txs canonical-ack)))
+                 _ (sync-apply/apply-canonical-ack!
+                    repo canonical-txs (:tx-ids canonical-ack)
+                    checksum-fields)]
+           (finish!))
+         (p/catch
+          (fn [error]
+            ;; Keep the immutable upload request, inflight ids, pending overlay,
+            ;; and cursor intact. The connection lifecycle can retry or repair
+            ;; without hiding the user's current edit.
+            (sync-util/set-last-sync-error! client error)
+            (p/rejected error))))))))
 
 (defn- update-latest-remote-state!
   [repo message]
   (let [message-type (:type message)
         remote-tx (:t message)
-        remote-checksum (:checksum message)
-        has-checksum? (contains? message :checksum)
+        checksum-version (:checksum-version message)
+        versioned-checksum?
+        (and (= sync-checksum/server-checksum-version checksum-version)
+             (string? (:server-checksum message)))
+        remote-checksum (if versioned-checksum?
+                          (:server-checksum message)
+                          (:checksum message))
+        has-checksum? (if versioned-checksum?
+                        (contains? message :server-checksum)
+                        (contains? message :checksum))
         latest-remote-tx (get @sync-apply/*repo->latest-remote-tx repo)
         authoritative? (contains? #{"hello" "changed"} message-type)
         stale-remote-tx? (and (number? remote-tx)
@@ -298,7 +1095,10 @@
                    (max prev remote-tx)
                    remote-tx)))))
     (when (and has-checksum? (not stale-remote-tx?))
-      (swap! sync-apply/*repo->latest-remote-checksum assoc repo remote-checksum))
+      (swap! sync-apply/*repo->latest-remote-checksum assoc repo remote-checksum)
+      (swap! sync-apply/*repo->latest-remote-checksum-version
+             assoc repo
+             (when versioned-checksum? checksum-version)))
     {:stale-remote-tx? stale-remote-tx?
      :latest-remote-tx-before latest-remote-tx}))
 
@@ -314,53 +1114,107 @@
                          {:repo repo
                           :message-type message-type
                           :local-tx local-tx})))))))
+
+(defn- validate-pull-history!
+  [repo local-tx remote-tx txs]
+  (require-seq txs {:repo repo :type "pull/ok" :field :txs})
+  (let [expected-count (- remote-tx local-tx)
+        tx-count (count txs)
+        contiguous? (and (integer? remote-tx)
+                         (= expected-count tx-count)
+                         (every? true?
+                                 (map-indexed
+                                  (fn [idx tx]
+                                    (= (+ local-tx idx 1) (:t tx)))
+                                  txs)))]
+    (when-not contiguous?
+      (fail-fast :db-sync/pull-history-gap
+                 {:type :db-sync/pull-history-gap
+                  :repo repo
+                  :local-tx local-tx
+                  :remote-tx remote-tx
+                  :expected-first-t (inc local-tx)
+                  :expected-count expected-count
+                  :actual-first-t (some-> txs first :t)
+                  :actual-last-t (some-> txs last :t)
+                  :actual-count tx-count}))))
+
 (defn handle-message!
   [repo client raw]
   (let [message (-> raw
                     sync-transport/parse-message
                     sync-transport/coerce-ws-server-message)]
     (when-not (map? message)
-      (fail-fast :db-sync/response-parse-failed {:repo repo :raw raw}))
+      (fail-fast :db-sync/response-parse-failed
+                 {:type :db-sync/response-parse-failed
+                  :repo repo
+                  :payload-bytes
+                  (if (string? raw)
+                    (sync-transport/encoded-string-byte-length raw)
+                    0)}))
     (let [local-tx (client-op/get-local-tx repo)
           remote-tx (:t message)
-          remote-checksum (:checksum message)]
+          checksum-fields (select-keys message
+                                       [:checksum
+                                        :checksum-version
+                                        :server-checksum])]
       (validate-local-tx! repo message local-tx)
       (update-latest-remote-state! repo message)
       (case (:type message)
-        "hello" (handle-hello! repo client local-tx remote-tx remote-checksum)
+        "hello" (handle-hello! repo client local-tx remote-tx checksum-fields
+                                (:capabilities message))
         "online-users" (handle-online-users! repo client message)
         "presence" (handle-presence! client message)
-        "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx remote-checksum)
-        "pull/ok" (handle-pull-ok! repo client local-tx remote-tx remote-checksum message)
+        "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx checksum-fields message)
+        "pull/ok" (handle-pull-ok! repo client local-tx remote-tx checksum-fields message)
         "changed" (handle-changed! repo client local-tx remote-tx)
         "tx/reject" (handle-tx-reject! repo client message local-tx)
+        "error" (fail-fast :db-sync/server-error
+                           {:type :db-sync/server-error
+                            :repo repo
+                            :message-type "error"})
         "pong" nil
         (fail-fast :db-sync/invalid-field
                    {:repo repo :type (:type message)})))))
 
+(defn- handle-pull-failed!
+  [client error]
+  (if-let [pull-failed-f (:pull-failed-f client)]
+    (pull-failed-f error)
+    (do
+      (sync-util/set-last-sync-error! client error)
+      (clear-pending-pull! client)))
+  (p/rejected error))
+
 (defn- handle-pull-ok!
-  [repo client local-tx remote-tx remote-checksum message]
-  (clear-pending-pull! client)
-  ;; (log/info ::handle-pull-ok! {:repo repo
-  ;;                              :remote-tx remote-tx
-  ;;                              :local-tx local-tx})
-  (when (> remote-tx local-tx)
-    (let [txs (:txs message)]
-      (require-non-negative remote-tx {:repo repo :type "pull/ok"})
-      (require-seq txs {:repo repo :type "pull/ok" :field :txs})
-      (let [remote-txs (mapv (fn [data]
-                               {:t (:t data)
-                                :outliner-op (:outliner-op data)
-                                :tx-data (parse-transit (:tx data) {:repo repo :type "pull/ok"})})
-                             txs)]
-        ;; (log/info ::handle-pull-remote-txs-count {:count (count remote-txs)})
-        (when (seq remote-txs)
+  [repo client local-tx remote-tx checksum-fields message]
+  (try
+    (cond
+      (< remote-tx local-tx)
+      (fail-fast :db-sync/server-cursor-regressed
+                 {:type :db-sync/server-cursor-regressed
+                  :repo repo
+                  :message-type "pull/ok"
+                  :local-tx local-tx
+                  :remote-tx remote-tx})
+
+      (> remote-tx local-tx)
+      (let [txs (:txs message)
+            prior-checksum (client-op/get-local-checksum repo)
+            prior-server-checksum
+            (client-op/get-local-server-checksum repo)
+            checkpoint-committed?* (atom false)]
+        (require-non-negative remote-tx {:repo repo :type "pull/ok"})
+        (validate-pull-history! repo local-tx remote-tx txs)
+        (let [remote-txs (mapv (fn [data]
+                                 {:t (:t data)
+                                  :outliner-op (:outliner-op data)
+                                  :tx-data (parse-transit (:tx data)
+                                                          {:repo repo :type "pull/ok"})})
+                               txs)]
           (->
            (p/let [graph-e2ee? (sync-crypt/graph-e2ee? repo)
-                   ;; _ (log/info ::handle-pull-request-aes-key {})
                    aes-key (sync-crypt/<ensure-graph-aes-key repo (:graph-id client))
-                   ;; _ (when (some? aes-key)
-                   ;;     (log/info ::handle-pull-request-aes-key-success {}))
                    _ (when (and graph-e2ee? (nil? aes-key))
                        (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
                    remote-txs* (if aes-key
@@ -373,15 +1227,85 @@
                        (sync-apply/apply-remote-txs! repo client remote-txs*)
                        (catch :default e
                          (log/error ::apply-remote-tx e)
-                         (throw e)))]
-             (client-op/update-local-tx repo remote-tx)
+                         (throw e)))
+                   _ (verify-sync-checksum!
+                      repo client remote-tx remote-tx checksum-fields
+                      {:type "pull/ok"
+                       :basis-local-tx local-tx
+                       :checkpoint-t remote-tx})]
+             ;; When pending local edits defer the authoritative comparison,
+             ;; still publish the cursor and the currently maintained sidecar
+             ;; in one SQLite transaction. The comparison path above already
+             ;; committed the same checkpoint.
+             (when (= local-tx (client-op/get-local-tx repo))
+               (commit-checkpoint!
+                repo remote-tx local-tx
+                (client-op/get-local-checksum repo)
+                (client-op/get-local-server-checksum repo)))
+             (reset! checkpoint-committed?* true)
+             (clear-pending-pull! client)
              (broadcast-rtc-state! client)
-             (verify-sync-checksum! repo client remote-tx remote-tx remote-checksum {:type "pull/ok"})
+             (mark-sync-succeeded-if-ready!
+              repo client remote-tx remote-tx)
              (sync-apply/enqueue-flush-pending! repo client))
            (p/then (fn [_]
                      (sync-util/clear-last-sync-error! client)))
            (p/catch (fn [error]
-                      (sync-util/set-last-sync-error! client error)))))))))
+                      ;; `apply-remote-txs!` can defer before touching the
+                      ;; local DB (for example while an editor transaction is
+                      ;; still settling). Only require SQLite restoration when
+                      ;; the failed attempt actually changed the published
+                      ;; cursor or either checksum projection.
+                      (when (and
+                             (not @checkpoint-committed?*)
+                             (or
+                              (not= local-tx
+                                    (client-op/get-local-tx repo))
+                              (not= prior-checksum
+                                    (client-op/get-local-checksum repo))
+                              (not= prior-server-checksum
+                                    (client-op/get-local-server-checksum repo))))
+                        (try
+                          (client-op/commit-sync-checkpoint!
+                           repo
+                           (cond->
+                            {:t local-tx
+                             :expected-local-t local-tx
+                             :server-checksum prior-server-checksum}
+                             (string? prior-checksum)
+                             (assoc :checksum prior-checksum)))
+                          (catch :default restore-error
+                            (log/warn
+                             :db-sync/checksum-sidecar-restore-skipped
+                             {:repo repo
+                              :local-tx local-tx
+                              :remote-tx remote-tx
+                              :restore-error-type
+                              (:type (ex-data restore-error))}))))
+                      (if (= :db-sync/remote-apply-deferred
+                             (:type (ex-data error)))
+                        (do
+                          ;; Do not treat ordinary continuous editing as a
+                          ;; connection failure. Release the receive queue,
+                          ;; preserve the local cursor, and coalesce recovery
+                          ;; into a fresh pull after a short quiet period.
+                          (clear-pending-pull! client)
+                          (schedule-deferred-pull! repo client)
+                          (log/info :db-sync/remote-apply-deferred
+                                    {:repo repo
+                                     :local-tx local-tx
+                                     :remote-tx remote-tx})
+                          (p/resolved nil))
+                        (handle-pull-failed! client error)))))))
+      :else
+      (do
+        (clear-pending-pull! client)
+        (mark-sync-succeeded-if-ready!
+         repo client local-tx remote-tx)
+        (sync-apply/enqueue-flush-pending! repo client)
+        (p/resolved nil)))
+    (catch :default error
+      (handle-pull-failed! client error))))
 
 (defn- handle-changed!
   [repo client local-tx remote-tx]

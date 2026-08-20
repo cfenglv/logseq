@@ -18,7 +18,7 @@
 
 (deftest build-plan-matches-required-commands
   (is (= ["pnpm cli:release"
-          "pnpm db-worker-node:compile:bundle"
+          "pnpm db-worker-node:e2e-compile:bundle"
           "pnpm --dir deps/db-sync build:node-adapter"]
          (mapv :cmd preflight/build-plan)))
   (is (not-any? #(re-find #"clojure -M:cljs compile logseq-cli" (:cmd %))
@@ -54,7 +54,7 @@
                                      :file-exists? (set required-artifacts)})]
          (is (= :ok (:status result)))
          (is (= ["pnpm cli:release"
-                 "pnpm db-worker-node:compile:bundle"
+                 "pnpm db-worker-node:e2e-compile:bundle"
                  "pnpm --dir deps/db-sync build:node-adapter"]
                 @calls))))))
 
@@ -74,7 +74,7 @@
                                                      (contains? @existing path))})]
          (is (= :ok (:status result)))
          (is (= ["pnpm cli:release"
-                 "pnpm db-worker-node:compile:bundle"
+                 "pnpm db-worker-node:e2e-compile:bundle"
                  "pnpm --dir deps/db-sync build:node-adapter"]
                 @calls))))))
 
@@ -93,6 +93,6 @@
                                                      (contains? @existing path))})]
          (is (= :ok (:status result)))
          (is (= ["pnpm cli:release"
-                 "pnpm db-worker-node:compile:bundle"
+                 "pnpm db-worker-node:e2e-compile:bundle"
                  "pnpm --dir deps/db-sync build:node-adapter"]
                 @calls))))))

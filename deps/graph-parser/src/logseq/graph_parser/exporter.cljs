@@ -36,6 +36,7 @@
             [logseq.db.sqlite.util :as sqlite-util]
             [logseq.graph-parser.block :as gp-block]
             [logseq.graph-parser.extract :as extract]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.graph-parser.text :as text]
             [logseq.graph-parser.utf8 :as utf8]
             [promesa.core :as p]))
@@ -1483,7 +1484,7 @@
                     {:logseq.property.pdf/hl-color :logseq.property/color.yellow
                      :logseq.property.pdf/hl-page 1
                      :block/title ""}
-                    user-attributes
+                    (common-util/remove-nils-non-nested user-attributes)
                     {:block/uuid (:id m)
                      :block/order (db-order/gen-key)
                      :logseq.property/ls-type :annotation
@@ -1495,8 +1496,8 @@
                     (when asset-image-uuid
                       {:logseq.property.pdf/hl-image [:block/uuid asset-image-uuid]
                        :logseq.property.pdf/hl-type :area})
-                    (when md-block
-                      (select-keys md-block [:block/title])))]
+                    (when-some [title (:block/title md-block)]
+                      {:block/title title}))]
     (sqlite-util/block-with-timestamps annotation)))
 
 (defn- build-pdf-annotations-tx*
@@ -1820,20 +1821,15 @@
 
 (defn- handle-math
   "If a block's entire content is a single displayed math formula, convert to #Math node.
-  Detects blocks whose title is entirely delimited by $$ markers."
+  The conversion is allowed only when the parser proves complete source coverage
+  by exactly one Displayed_Math node, including exact empty display Math."
   [block]
-  (let [title (string/trim (:block/title block))]
-    (if (and (string/starts-with? title "$$")
-             (string/ends-with? title "$$")
-             (> (count title) 4)
-             ;; ensure there's no nested $$ pair (i.e. not two separate inline formulas)
-             (not (string/includes? (subs title 2 (- (count title) 2)) "$$")))
-      (let [math-content (string/trim (subs title 2 (- (count title) 2)))]
-        (merge block
-               {:block/title math-content
-                :logseq.property.node/display-type :math
-                :block/tags [:logseq.class/Math-block]}))
-      block)))
+  (if-let [{:keys [title]} (gp-mldoc/whole-displayed-math-title (:block/title block))]
+    (merge block
+           {:block/title title
+            :logseq.property.node/display-type :math
+            :block/tags [:logseq.class/Math-block]})
+    block))
 
 (defn- split-title-by-code-fences
   "Parses a block title string line-by-line, splitting into non-code text parts

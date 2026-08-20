@@ -369,6 +369,8 @@ let sample_auth ?(id_token = Some "id-token-1")
     updated_at = Time.time_of_epoch_ms updated_at;
   }
 
+let id_token_with_claims claims = jwt_token claims
+
 let env_from_pairs pairs key = Vec.assoc_opt key (Vec.of_array pairs)
 
 let resolve_config ?(env = [||]) globals =
@@ -660,6 +662,12 @@ let () =
       expect_equal "default auth path" expected
         (Auth_state.default_auth_path ()));
 
+  test "CLI parity custom relative auth path resolves from cwd" (fun () ->
+      let relative_path = Node.Path.join [| "relative-auth"; "auth.json" |] in
+      expect_equal "relative auth path"
+        (Node.Path.resolve "." relative_path)
+        (Auth_state.auth_path (config ~auth_path:relative_path ())));
+
   test "CLI parity auth file write read and delete round-trips token data"
     (fun () ->
       let root = temp_dir "logseq-cli-parity-auth-" in
@@ -739,6 +747,83 @@ let () =
       expect_bool "future expires-at is not expired" false
         (Auth_state.expired_auth (sample_auth ~expires_at:Time.max_time ())));
 
+  test
+    "CLI parity auth read derives legacy expiry and keeps explicit expiry authoritative"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-legacy-expiry-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let config = config ~root_dir:root ~auth_path () in
+      let read_auth name =
+        expect_some name
+          (expect_ok name
+             (effect_result name (Auth_state.read_auth_file config)))
+      in
+      try
+        let future_id_token = id_token () in
+        write_file auth_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}"
+             (Js.Json.stringify (Js.Json.string future_id_token)));
+        let future_auth = read_auth "future legacy auth" in
+        expect_int64 "future legacy expiry" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "future legacy expires-at" future_auth.expires_at));
+        expect_bool "future legacy auth is not expired" false
+          (Auth_state.expired_auth future_auth);
+
+        write_file auth_path
+          "{\"id-token\":\"not-a-jwt\",\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"expires-at\":4102444800000}";
+        let explicit_auth = read_auth "explicit expiry auth" in
+        expect_int64 "explicit expiry wins" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "explicit expires-at" explicit_auth.expires_at));
+        expect_bool "explicit future auth is not expired" false
+          (Auth_state.expired_auth explicit_auth);
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
+  test
+    "CLI parity auth read keeps missing malformed and exp-less tokens refreshable"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-legacy-invalid-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let config = config ~root_dir:root ~auth_path () in
+      let read_auth name =
+        expect_some name
+          (expect_ok name
+             (effect_result name (Auth_state.read_auth_file config)))
+      in
+      let expect_refreshable name auth =
+        expect_none (name ^ " expires-at") auth.Auth_state.expires_at;
+        expect_bool (name ^ " is expired") true (Auth_state.expired_auth auth)
+      in
+      try
+        write_file auth_path
+          "{\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\"}";
+        expect_refreshable "missing id-token"
+          (read_auth "missing id-token auth");
+
+        write_file auth_path
+          "{\"id-token\":\"not-a-jwt\",\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\"}";
+        expect_refreshable "malformed id-token"
+          (read_auth "malformed id-token auth");
+
+        let exp_less_id_token =
+          jwt_token "{\"sub\":\"legacy-user\",\"email\":\"legacy@example.com\"}"
+        in
+        write_file auth_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\"}"
+             (Js.Json.stringify (Js.Json.string exp_less_id_token)));
+        expect_refreshable "exp-less id-token"
+          (read_auth "exp-less id-token auth");
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
   test "CLI parity auth read supports old underscore fields and config tokens"
     (fun () ->
       let root = temp_dir "logseq-cli-parity-auth-compat-" in
@@ -779,6 +864,198 @@ let () =
       with exn ->
         remove_tree root;
         fail_test (Printexc.to_string exn));
+
+  test "CLI parity auth read derives only missing expires-at from JWT exp"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-derived-expiry-" in
+      let hyphen_path = Node.Path.join [| root; "hyphen.json" |] in
+      let underscore_path = Node.Path.join [| root; "underscore.json" |] in
+      let explicit_path = Node.Path.join [| root; "explicit.json" |] in
+      let future_id_token = id_token ~sub:"legacy-user" () in
+      let expired_id_token =
+        id_token_with_claims "{\"sub\":\"legacy-user\",\"exp\":1}"
+      in
+      let read path =
+        expect_some ("stored auth " ^ path)
+          (expect_ok ("read auth " ^ path)
+             (effect_result ("read auth " ^ path)
+                (Auth_state.read_auth_file
+                   (config ~root_dir:root ~auth_path:path ()))))
+      in
+      try
+        write_file hyphen_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}\n"
+             (Js.Json.stringify (Js.Json.string future_id_token)));
+        write_file underscore_path
+          (Printf.sprintf
+             "{\"id_token\":%s,\"access_token\":\"legacy-access\",\"refresh_token\":\"legacy-refresh\",\"updated_at\":1735686000000}\n"
+             (Js.Json.stringify (Js.Json.string future_id_token)));
+        write_file explicit_path
+          (Printf.sprintf
+             "{\"id-token\":%s,\"refresh-token\":\"legacy-refresh\",\"expires-at\":4102444800000,\"updated-at\":1735686000000}\n"
+             (Js.Json.stringify (Js.Json.string expired_id_token)));
+        expect_int64 "hyphen JWT-derived expires-at" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "hyphen derived expires-at"
+                (read hyphen_path).expires_at));
+        expect_int64 "underscore JWT-derived expires-at" 4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "underscore derived expires-at"
+                (read underscore_path).expires_at));
+        expect_int64 "explicit expires-at remains authoritative"
+          4_102_444_800_000L
+          (Time.time_to_epoch_ms
+             (expect_some "explicit expires-at" (read explicit_path).expires_at));
+        remove_tree root
+      with exn ->
+        remove_tree root;
+        fail_test (Printexc.to_string exn));
+
+  test_promise
+    "CLI parity resolve auth reuses unexpired .4 JWT without refresh request"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-legacy-unexpired-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let legacy_id_token = id_token ~sub:"legacy-user" () in
+      let legacy_json =
+        Printf.sprintf
+          "{\"id-token\":%s,\"access-token\":\"legacy-access-token\",\"refresh-token\":\"legacy-refresh-token\",\"updated-at\":1735686000000}\n"
+          (Js.Json.stringify (Js.Json.string legacy_id_token))
+      in
+      let request_count = ref 0 in
+      let server =
+        create_server (fun[@u] req res ->
+            incr request_count;
+            let body = ref "" in
+            req_set_encoding req "utf8";
+            req_on_data req "data" (fun[@u] chunk -> body := !body ^ chunk);
+            req_on_end req "end" (fun[@u] () ->
+                ignore !body;
+                if req_method req <> "POST" || req_url req <> "/oauth2/token"
+                then write_json res 404 (error_response "not found")
+                else write_json res 200 (token_response ~sub:"refreshed-user" ())))
+      in
+      with_server server (fun base_url ->
+          let raw_config =
+            Edn_util.map
+              [
+                ( Edn_util.keyword "oauth-token-endpoint",
+                  Edn_util.string (base_url ^ "/oauth2/token") );
+              ]
+          in
+          let config =
+            config ~root_dir:root ~auth_path ~raw_file_config:raw_config ()
+          in
+          write_file auth_path legacy_json;
+          let* resolved = effect_to_promise (Auth_state.resolve_auth config) in
+          let resolved = expect_ok "resolve unexpired legacy auth" resolved in
+          expect_int "legacy refresh request count" 0 !request_count;
+          expect_equal "legacy id-token reused" legacy_id_token
+            (expect_some "resolved legacy id-token" resolved.id_token);
+          expect_equal "legacy auth file remains byte-for-byte unchanged"
+            legacy_json (read_file auth_path);
+          remove_tree root;
+          Js.Promise.resolve pass));
+
+  test_promise
+    "CLI parity resolve auth refreshes expired and invalid legacy JWTs"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-legacy-invalid-" in
+      let request_count = ref 0 in
+      let request_bodies = ref Vec.empty in
+      let refreshed_id_token =
+        id_token ~sub:"refreshed-user" ~email:"refreshed@example.com" ()
+      in
+      let response_body =
+        Printf.sprintf
+          "{\"id_token\":%s,\"access_token\":\"refreshed-access-token\"}"
+          (Js.Json.stringify (Js.Json.string refreshed_id_token))
+      in
+      let server =
+        create_server (fun[@u] req res ->
+            let body = ref "" in
+            req_set_encoding req "utf8";
+            req_on_data req "data" (fun[@u] chunk -> body := !body ^ chunk);
+            req_on_end req "end" (fun[@u] () ->
+                incr request_count;
+                request_bodies := Vec.push_back !request_bodies !body;
+                if req_method req <> "POST" || req_url req <> "/oauth2/token"
+                then write_json res 404 (error_response "not found")
+                else write_json res 200 response_body))
+      in
+      with_server server (fun base_url ->
+          let raw_config =
+            Edn_util.map
+              [
+                ( Edn_util.keyword "oauth-token-endpoint",
+                  Edn_util.string (base_url ^ "/oauth2/token") );
+              ]
+          in
+          let cases =
+            [|
+              ( "expired-exp",
+                Some
+                  (id_token_with_claims
+                     "{\"sub\":\"legacy-user\",\"exp\":1}") );
+              ("missing-token", None);
+              ("malformed-token", Some "not-a-jwt");
+              ( "missing-exp",
+                Some
+                  (id_token_with_claims "{\"sub\":\"legacy-user\"}") );
+              ( "malformed-exp",
+                Some
+                  (id_token_with_claims
+                     "{\"sub\":\"legacy-user\",\"exp\":\"invalid\"}") );
+            |]
+          in
+          let rec resolve_case index =
+            if index >= Array.length cases then Js.Promise.resolve pass
+            else
+              let name, legacy_token = cases.(index) in
+              let auth_path =
+                Node.Path.join [| root; name ^ "-auth.json" |]
+              in
+              let id_token_field =
+                match legacy_token with
+                | Some token ->
+                    Printf.sprintf "\"id-token\":%s,"
+                      (Js.Json.stringify (Js.Json.string token))
+                | None -> ""
+              in
+              let legacy_json =
+                Printf.sprintf
+                  "{%s\"access-token\":\"legacy-access-token\",\"refresh-token\":\"legacy-refresh-token\",\"updated-at\":1735686000000}\n"
+                  id_token_field
+              in
+              let config =
+                config ~root_dir:root ~auth_path
+                  ~raw_file_config:raw_config ()
+              in
+              write_file auth_path legacy_json;
+              let* resolved =
+                effect_to_promise (Auth_state.resolve_auth config)
+              in
+              let resolved =
+                expect_ok ("resolve invalid legacy auth " ^ name) resolved
+              in
+              expect_equal ("refreshed legacy id-token " ^ name)
+                refreshed_id_token
+                (expect_some ("refreshed id-token " ^ name) resolved.id_token);
+              resolve_case (index + 1)
+          in
+          let* () = resolve_case 0 in
+          expect_int "expired or invalid legacy refresh count"
+            (Array.length cases) !request_count;
+          Vec.iter
+            (fun body ->
+              expect_named_contains "legacy refresh grant type" body
+                "grant_type=refresh_token";
+              expect_named_contains "legacy refresh token" body
+                "refresh_token=legacy-refresh-token")
+            !request_bodies;
+          remove_tree root;
+          Js.Promise.resolve pass));
 
   test_promise
     "CLI parity auth refresh uses token endpoint and validates id token"
@@ -976,6 +1253,66 @@ let () =
             (expect_some "stored id token" stored.id_token);
           expect_equal "stored refresh token" "resolved-refresh-token"
             (expect_some "stored refresh token" stored.refresh_token);
+          remove_tree root;
+          Js.Promise.resolve pass));
+
+  test_promise
+    "CLI parity resolve auth skips refresh for valid legacy jwt and refreshes expired jwt"
+    (fun () ->
+      let root = temp_dir "logseq-cli-parity-auth-resolve-legacy-expiry-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let request_count = ref 0 in
+      let server =
+        create_server (fun[@u] req res ->
+            if req_method req <> "POST" || req_url req <> "/oauth2/token" then
+              write_json res 404 (error_response "not found")
+            else (
+              request_count := !request_count + 1;
+              write_json res 200
+                (token_response ~sub:"refreshed-user"
+                   ~email:"refreshed@example.com" ())))
+      in
+      with_server server (fun base_url ->
+          let raw_config =
+            Edn_util.map
+              [
+                ( Edn_util.keyword "oauth-token-endpoint",
+                  Edn_util.string (base_url ^ "/oauth2/token") );
+              ]
+          in
+          let config =
+            config ~root_dir:root ~auth_path ~raw_file_config:raw_config ()
+          in
+          let future_id_token = id_token ~sub:"legacy-user" () in
+          write_file auth_path
+            (Printf.sprintf
+               "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}"
+               (Js.Json.stringify (Js.Json.string future_id_token)));
+          let* future_result =
+            effect_to_promise (Auth_state.resolve_auth config)
+          in
+          let future_auth = expect_ok "resolve future legacy auth" future_result in
+          expect_equal "future legacy token preserved" future_id_token
+            (expect_some "future legacy id-token" future_auth.id_token);
+          expect_int "future legacy refresh count" 0 !request_count;
+
+          let expired_id_token =
+            jwt_token
+              "{\"sub\":\"legacy-user\",\"email\":\"legacy@example.com\",\"exp\":0}"
+          in
+          write_file auth_path
+            (Printf.sprintf
+               "{\"id-token\":%s,\"access-token\":\"legacy-access\",\"refresh-token\":\"legacy-refresh\",\"updated-at\":1735686000000}"
+               (Js.Json.stringify (Js.Json.string expired_id_token)));
+          let* expired_result =
+            effect_to_promise (Auth_state.resolve_auth config)
+          in
+          let expired_auth =
+            expect_ok "resolve expired legacy auth" expired_result
+          in
+          expect_equal "expired legacy token refreshed" "refreshed-user"
+            (expect_some "refreshed legacy sub" expired_auth.sub);
+          expect_int "expired legacy refresh count" 1 !request_count;
           remove_tree root;
           Js.Promise.resolve pass));
 
@@ -4012,6 +4349,54 @@ let () =
             (expect_some "ensure keys e2ee" action.e2ee_password);
           expect_bool "ensure keys upload" true action.upload_keys
       | _ -> fail_test "expected Sync_ensure_keys action");
+
+  test_promise
+    "CLI parity sync start surfaces syncing runtime error before timeout"
+    (fun () ->
+      let status_calls = ref 0 in
+      let server =
+        invoke_server (fun body ->
+            if Js.String.includes ~search:"thread-api/q" body then "false"
+            else if
+              Js.String.includes ~search:"thread-api/db-sync-status" body
+            then (
+              incr status_calls;
+              "[\"^ \
+               \",\"~:repo\",\"logseq_db_demo\",\"~:ws-state\",\"~:syncing\",\"~:sync-ready?\",false,\"~:last-error\",[\"^ \
+               \",\"~:code\",\"~:marker-recovery-aes-key-timeout\"]]")
+            else "null")
+      in
+      with_server server (fun base_url ->
+          let repo = Cli_primitive.create_repo "demo" in
+          let action =
+            Sync.Sync_start
+              {
+                repo;
+                graph = Cli_config.repo_to_graph repo;
+                e2ee_password = None;
+              }
+          in
+          let cfg =
+            {
+              (config ~repo:"demo" ()) with
+              Cli_config.base_url = Some base_url;
+              timeout_span = Time.span_of_ms 5_000L;
+            }
+          in
+          let* result =
+            effect_to_promise
+              (execute_with_output Sync.execute action cfg Output.Mode.Json)
+          in
+          expect_bool "sync start returns error" true
+            (Cli_result.is_error result);
+          (match result.Cli_result.error with
+          | Some err ->
+              expect_equal "sync start runtime error code"
+                "sync-start-runtime-error"
+                (Error.code_to_string err.Error.code)
+          | None -> fail_test "expected sync start runtime error");
+          expect_int "sync status checked once" 1 !status_calls;
+          Js.Promise.resolve pass));
 
   test "CLI parity sync build validates config and asset download actions"
     (fun () ->

@@ -5,6 +5,7 @@
             [logseq.common.util :as common-util]
             [logseq.common.util.block-ref :as block-ref]
             [logseq.common.util.page-ref :as page-ref]
+            [logseq.db.common.initial-data :as common-initial-data]
             [logseq.db.frontend.entity-util :as entity-util]))
 
 (defn- replace-ref-with-deleted-block-title
@@ -149,7 +150,7 @@
     (distinct (concat map-retract-tx vector-retract-tx))))
 
 (defn- block-subtree-entities
-  [root]
+  [db root]
   (loop [pending [root]
          seen-ids #{}
          result []]
@@ -157,7 +158,9 @@
       (if (or (nil? (:db/id entity))
               (contains? seen-ids (:db/id entity)))
         (recur (rest pending) seen-ids result)
-        (recur (concat (rest pending) (filter block-entity? (:block/_parent entity)))
+        (recur (concat (rest pending)
+                       (filter block-entity?
+                               (common-initial-data/get-block-direct-full-children db entity)))
                (conj seen-ids (:db/id entity))
                (conj result entity)))
       result)))
@@ -168,7 +171,7 @@
   (if (= :delete-blocks outliner-op)
     (let [subtree-tx (->> (retracted-entities db txs)
                           (filter block-entity?)
-                          (mapcat block-subtree-entities)
+                          (mapcat (partial block-subtree-entities db))
                           (map (fn [entity] [:db/retractEntity (:db/id entity)])))]
       (distinct (concat txs subtree-tx)))
     txs))

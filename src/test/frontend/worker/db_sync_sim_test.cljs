@@ -8,10 +8,12 @@
             [frontend.state :as state]
             [frontend.test.noise :as test-noise]
             [frontend.worker.handler.page :as worker-page]
+            [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.apply-txs :as sync-apply]
             [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.handle-message :as sync-handle-message]
             [frontend.worker.undo-redo :as undo-redo]
             [logseq.db :as ldb]
             [logseq.db-sync.checksum :as sync-checksum]
@@ -185,7 +187,10 @@
   {:repo repo
    :graph-id nil
    :asset-queue (atom (p/resolved nil))
-   :inflight (atom [])})
+   :inflight (atom [])
+   :upload-request (atom nil)
+   :online-users (atom [])
+   :ws-state (atom :open)})
 
 (defn- page? [ent]
   (ldb/page? ent))
@@ -358,6 +363,7 @@
 (defn- make-server []
   (atom {:t 0
          :txs []
+         :applied {}
          :conn (db-test/create-conn)}))
 
 (defn- server-pull [server since]
@@ -374,8 +380,19 @@
                (do
                  (reset! accepted? true)
                  (reduce
-                  (fn [{:keys [t txs conn] :as state} tx-entry]
+                  (fn [{:keys [t txs conn applied] :as state} tx-entry]
                     (let [tx-data (:tx-data tx-entry)
+                          identity (:tx-id tx-entry)
+                          wire {:tx-data tx-data
+                                :outliner-op (:outliner-op tx-entry)}
+                          prior-wire (when identity (get applied identity))]
+                      (when (and prior-wire (not= prior-wire wire))
+                        (throw (ex-info "server tx identity payload conflict"
+                                        {:type :db-sync/tx-identity-conflict
+                                         :tx-id identity})))
+                      (if prior-wire
+                        state
+                        (let [
                           {:keys [db-before db-after tx-data]}
                           (try
                             (ldb/transact! conn tx-data {:op :apply-client-tx})
@@ -408,7 +425,12 @@
                           normalized-data (->> tx-data
                                                (db-normalize/normalize-tx-data db-after db-before))
                           next-t (inc t)]
-                      (assoc state :t next-t :txs (conj txs {:t next-t :tx normalized-data}))))
+                          (cond->
+                           (assoc state
+                                  :t next-t
+                                  :txs (conj txs {:t next-t :tx normalized-data}))
+                            identity
+                            (assoc-in [:applied identity] wire))))))
                   state
                   tx-entries)))))
     {:accepted? @accepted?
@@ -451,6 +473,138 @@
                     (reset! progress? true))))
               nil))))
       @progress?)))
+
+(defn- sync-client-with-real-ack!
+  [server {:keys [repo conn client online?]}]
+  (when online?
+    (let [progress? (atom false)
+          local-tx (or (client-op/get-local-tx repo) 0)
+          server-t (:t @server)]
+      (when (< local-tx server-t)
+        (#'sync-apply/apply-remote-txs!
+         repo
+         client
+         (mapv (fn [tx-data] {:tx-data tx-data})
+               (server-pull server local-tx)))
+        (client-op/update-local-tx repo server-t)
+        (reset! progress? true))
+      (let [pending (#'sync-apply/pending-txs repo)
+            local-tx' (or (client-op/get-local-tx repo) 0)
+            server-t' (:t @server)]
+        (when (and (seq pending) (= local-tx' server-t'))
+          (let [{:keys [tx-entries drop-tx-ids]}
+                (build-upload-plan conn pending)]
+            (when (seq drop-tx-ids)
+              (#'sync-apply/mark-pending-txs-false! repo drop-tx-ids)
+              (reset! progress? true))
+            (when (seq tx-entries)
+              (let [tx-ids (mapv :tx-id tx-entries)]
+                (doseq [{:keys [tx-data outliner-op] :as entry} tx-entries]
+                  (#'sync-apply/persist-frozen-upload-wire!
+                   repo
+                   entry
+                   {:tx-data (vec tx-data)
+                    :large-title-logical-tx-data (vec tx-data)
+                    :outliner-op outliner-op}))
+                (let [{:keys [accepted? t]}
+                      (server-upload! server local-tx' tx-entries)]
+                  (when accepted?
+                    (reset! (:inflight client) tx-ids)
+                    (reset! (:upload-request client)
+                            {:tx-ids tx-ids
+                             :large-upload-progress []
+                             :large-title-marker-tx-entries []
+                             :t-before local-tx'})
+                    (let [server-db @(get @server :conn)
+                          raw-message
+                          (js/JSON.stringify
+                           (clj->js
+                            {:type "tx/batch/ok"
+                             :t t
+                             :checksum
+                             (sync-checksum/recompute-checksum server-db)
+                             :checksum-version
+                             sync-checksum/server-checksum-version
+                             :server-checksum
+                             (sync-checksum/recompute-server-checksum
+                              server-db)}))]
+                      (with-redefs
+                        [shared-service/broadcast-to-clients! (fn [& _] nil)
+                         sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+                        (sync-handle-message/handle-message!
+                         repo client raw-message)))
+                    (reset! progress? true))))))))
+      @progress?)))
+
+(defn- pull-client-only!
+  [server {:keys [repo client]}]
+  (let [local-tx (or (client-op/get-local-tx repo) 0)
+        server-t (:t @server)]
+    (when (< local-tx server-t)
+      (#'sync-apply/apply-remote-txs!
+       repo
+       client
+       (mapv (fn [tx-data] {:tx-data tx-data})
+             (server-pull server local-tx)))
+      (client-op/update-local-tx repo server-t))))
+
+(defn- upload-client-awaiting-ack!
+  [server {:keys [repo conn client]}]
+  (let [pending (#'sync-apply/pending-txs repo)
+        local-tx (or (client-op/get-local-tx repo) 0)
+        server-t (:t @server)
+        {:keys [tx-entries drop-tx-ids]}
+        (build-upload-plan conn pending)]
+    (when-not (= local-tx server-t)
+      (throw (ex-info "client must pull before upload"
+                      {:repo repo :local-tx local-tx :server-t server-t})))
+    (when (seq drop-tx-ids)
+      (#'sync-apply/mark-pending-txs-false! repo drop-tx-ids))
+    (when (seq tx-entries)
+      (let [tx-ids (mapv :tx-id tx-entries)]
+        (doseq [{:keys [tx-data outliner-op] :as entry} tx-entries]
+          (#'sync-apply/persist-frozen-upload-wire!
+           repo
+           entry
+           {:tx-data (vec tx-data)
+            :large-title-logical-tx-data (vec tx-data)
+            :outliner-op outliner-op}))
+        (let [{:keys [accepted? t]} (server-upload! server local-tx tx-entries)]
+          (when-not accepted?
+            (throw (ex-info "server rejected deterministic upload"
+                            {:repo repo :local-tx local-tx :server-t server-t})))
+          (reset! (:inflight client) tx-ids)
+          (reset! (:upload-request client)
+                  {:tx-ids tx-ids
+                   :large-upload-progress []
+                   :large-title-marker-tx-entries []
+                   :t-before local-tx})
+          (js/JSON.stringify
+           (clj->js
+            {:type "tx/batch/ok"
+             :t t
+             :checksum
+             (sync-checksum/recompute-checksum @(get @server :conn))
+             :checksum-version sync-checksum/server-checksum-version
+             :server-checksum
+             (sync-checksum/recompute-server-checksum
+              @(get @server :conn))})))))))
+
+(defn- deliver-real-ack!
+  [{:keys [repo client]} raw-message]
+  (with-redefs
+    [shared-service/broadcast-to-clients! (fn [& _] nil)
+     sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+    (sync-handle-message/handle-message! repo client raw-message)))
+
+(defn- sync-loop-with-real-ack!
+  [server clients]
+  (loop [attempt 0]
+    (when (< attempt 32)
+      (let [results (mapv #(sync-client-with-real-ack! server %) clients)
+            progress? (some true? results)]
+        (when progress?
+          (recur (inc attempt)))))))
 
 (defn- active-block-uuids
   [db]
@@ -2512,6 +2666,151 @@
                   (assert-synced-attrs! seed history attrs-a attrs-b attrs-b)))
               (finally
                 (restore)))))))))
+
+(deftest ^:long two-clients-outliner-conflicts-converge-for-every-arrival-order-test
+  (testing "delete/move/indent conflicts converge independently of client arrival order"
+    (doseq [seed (range 1 33)
+            first-order [[repo-a repo-b] [repo-b repo-a]]
+            second-order [[repo-a repo-b] [repo-b repo-a]]]
+      (let [rng (make-rng seed)
+            base-uuid (rng-uuid rng)
+            block-uuids (vec (repeatedly 10 #(rng-uuid rng)))
+            conn-a (db-test/create-conn)
+            conn-b (db-test/create-conn)
+            ops-a (new-client-ops-db)
+            ops-b (new-client-ops-db)
+            client-a (make-client repo-a)
+            client-b (make-client repo-b)
+            server (make-server)
+            clients-by-repo
+            {repo-a {:repo repo-a :conn conn-a :client client-a :online? true}
+             repo-b {:repo repo-b :conn conn-b :client client-b :online? true}}
+            ordered-clients (fn [order] (mapv clients-by-repo order))
+            sync-offline-pair!
+            (fn [[first-repo second-repo] marker-prefix ack-mode]
+              (let [{first-conn :conn :as first-client}
+                    (get clients-by-repo first-repo)
+                    {second-conn :conn :as second-client}
+                    (get clients-by-repo second-repo)]
+                ;; Mirror the browser E2E restart sequence: the first client
+                ;; can flush its offline outliner edits before the UI's new
+                ;; marker reaches the worker. Hold that ACK while the marker is
+                ;; added so the pending set changes across the ACK boundary.
+                (let [first-ack
+                      (upload-client-awaiting-ack! server first-client)]
+                  (when-not first-ack
+                    (throw (ex-info "first client had no offline upload"
+                                    {:repo first-repo
+                                     :marker-prefix marker-prefix})))
+                  (create-block!
+                   first-conn
+                   (d/entity @first-conn [:block/uuid base-uuid])
+                   (str marker-prefix "-" (name first-repo))
+                   (rng-uuid rng))
+                  (if (= :lost ack-mode)
+                    (do
+                      (sync-apply/clear-upload-response-timeout!
+                       (:client first-client))
+                      (reset! (:inflight (:client first-client)) [])
+                      (pull-client-only! server first-client))
+                    (deliver-real-ack! first-client first-ack)))
+                (sync-loop-with-real-ack! server [first-client])
+
+                ;; The second client first rebases its offline edits over the
+                ;; first client's committed stream, then hits the same split
+                ;; upload/marker/ACK schedule.
+                (pull-client-only! server second-client)
+                (let [second-ack
+                      (upload-client-awaiting-ack! server second-client)]
+                  (when-not second-ack
+                    (throw (ex-info "second client had no rebased upload"
+                                    {:repo second-repo
+                                     :marker-prefix marker-prefix})))
+                (create-block!
+                   second-conn
+                   (d/entity @second-conn [:block/uuid base-uuid])
+                   (str marker-prefix "-" (name second-repo))
+                   (rng-uuid rng))
+                  (if (= :lost ack-mode)
+                    (do
+                      (sync-apply/clear-upload-response-timeout!
+                       (:client second-client))
+                      (reset! (:inflight (:client second-client)) [])
+                      (pull-client-only! server second-client))
+                    (deliver-real-ack! second-client second-ack)))
+                (sync-loop-with-real-ack!
+                 server [second-client first-client])))
+            server-conn (:conn @server)]
+        (doseq [conn [conn-a conn-b server-conn]]
+          (ensure-base-page! conn base-uuid))
+        (with-test-repos {repo-a {:conn conn-a :ops-conn ops-a}
+                          repo-b {:conn conn-b :ops-conn ops-b}}
+          (fn []
+            (reset! db-sync/*repo->latest-remote-tx {})
+            (doseq [repo [repo-a repo-b]]
+              (client-op/update-local-tx repo 0))
+            (let [base-a (d/entity @conn-a [:block/uuid base-uuid])]
+              (doseq [[index block-uuid] (map-indexed vector block-uuids)]
+                (create-block! conn-a base-a (str "conflict-" index) block-uuid)))
+            (sync-loop-with-real-ack!
+             server (ordered-clients [repo-a repo-b]))
+
+            ;; Conflict one mirrors the browser E2E: A indents block 1 under
+            ;; block 0 while B deletes block 0, then the server observes either
+            ;; client's upload first.
+            (outliner-core/indent-outdent-blocks!
+             conn-a
+             [(d/entity @conn-a [:block/uuid (nth block-uuids 1)])]
+             true
+             {})
+            (delete-block! conn-b (nth block-uuids 0))
+            (sync-offline-pair!
+             first-order "done-1" (if (odd? seed) :lost :delayed))
+
+            ;; Conflict two mirrors delete + nested indent versus delete +
+            ;; reverse move + indent. Exercise both independent arrival orders.
+            (outliner-core/indent-outdent-blocks!
+             conn-a
+             [(d/entity @conn-a [:block/uuid (nth block-uuids 3)])]
+             true
+             {})
+            (outliner-core/indent-outdent-blocks!
+             conn-a
+             [(d/entity @conn-a [:block/uuid (nth block-uuids 4)])]
+             true
+             {})
+            (outliner-core/indent-outdent-blocks!
+             conn-a
+             [(d/entity @conn-a [:block/uuid (nth block-uuids 4)])]
+             true
+             {})
+            (delete-block! conn-b (nth block-uuids 2))
+            (outliner-core/move-blocks-up-down!
+             conn-b
+             [(d/entity @conn-b [:block/uuid (nth block-uuids 3)])]
+             false)
+            (outliner-core/indent-outdent-blocks!
+             conn-b
+             [(d/entity @conn-b [:block/uuid (nth block-uuids 3)])]
+             true
+             {})
+            (sync-offline-pair!
+             second-order "done-2" (if (odd? seed) :lost :delayed))
+
+            (let [server-attrs (block-attr-map @server-conn)
+                  attrs-a (block-attr-map @conn-a)
+                  attrs-b (block-attr-map @conn-b)
+                  schedule {:seed seed
+                            :first first-order
+                            :second second-order}]
+              (is (= server-attrs attrs-a)
+                  (str "client A diverged for schedule " schedule))
+              (is (= server-attrs attrs-b)
+                  (str "client B diverged for schedule " schedule))
+              (is (= (sync-checksum/recompute-server-checksum @server-conn)
+                     (sync-checksum/recompute-server-checksum @conn-a)
+                     (sync-checksum/recompute-server-checksum @conn-b))
+                  (str "checksum diverged for schedule " schedule)))))))))
 
 (deftest ^:long ^:fix-me two-clients-cut-paste-random-sim-test
   (testing "db-sync convergence under random cut-paste with child operations"

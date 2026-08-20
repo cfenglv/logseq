@@ -1,8 +1,15 @@
 (ns logseq.db-sync.worker-large-op-memory-test
   (:require ["better-sqlite3" :as sqlite3]
+            ["crypto" :as node-crypto]
+            ["fs" :as node-fs]
+            ["os" :as node-os]
+            ["path" :as node-path]
+            ["v8" :as node-v8]
             [clojure.string :as string]
             [datascript.core :as d]
+            [logseq.db-sync.checksum :as checksum]
             [logseq.db-sync.protocol :as protocol]
+            [logseq.db-sync.snapshot-integrity :as snapshot-integrity]
             [logseq.db-sync.storage :as storage]
             [logseq.db-sync.worker.handler.sync :as sync-handler]
             [logseq.db-sync.worker.ws :as ws]
@@ -22,23 +29,117 @@
   [^js stmt args]
   (.apply (.-all stmt) stmt (to-array args)))
 
+(defn- sqlite-adapter
+  [^js db]
+  #js {:_db db
+       :exec (fn [sql-str & args]
+               (let [stmt (.prepare db sql-str)]
+                 (if (select-sql? sql-str)
+                   (all-sql stmt args)
+                   (do
+                     (run-sql stmt args)
+                     nil))))
+       :close (fn []
+                (.close db))})
+
 (defn- with-memory-sql
   [f]
   (let [db (new sqlite ":memory:" nil)
-        sql #js {:_db db
-                 :exec (fn [sql-str & args]
-                         (let [stmt (.prepare db sql-str)]
-                           (if (select-sql? sql-str)
-                             (all-sql stmt args)
-                             (do
-                               (run-sql stmt args)
-                               nil))))
-                 :close (fn []
-                          (.close db))}]
+        sql (sqlite-adapter db)]
     (try
       (f sql)
       (finally
         (.close sql)))))
+
+(def ^:private modern-sqlite-cache-kib 4096)
+
+(declare assert!)
+
+(defn- with-bounded-disk-sql
+  "Models attached durable storage without counting an entire :memory: SQLite
+  database as native resident process memory. SQLite cache is explicitly
+  bounded and temporary data is also disk-backed."
+  [f]
+  (let [dir (.mkdtempSync node-fs
+                          (.join node-path (.tmpdir node-os)
+                                 "logseq-modern-staged-"))
+        db-path (.join node-path dir "graph.sqlite")
+        ^js db (new sqlite db-path nil)
+        sql (sqlite-adapter db)]
+    (try
+      (.pragma db "journal_mode = DELETE")
+      (.pragma db "temp_store = FILE")
+      (.pragma db (str "cache_size = -" modern-sqlite-cache-kib))
+      (.pragma db "mmap_size = 0")
+      (assert! (= (- modern-sqlite-cache-kib)
+                  (.pragma db "cache_size" #js {:simple true}))
+               "disk SQLite cache_size must stay explicitly bounded")
+      (assert! (= 1 (.pragma db "temp_store" #js {:simple true}))
+               "SQLite temporary storage must remain disk-backed")
+      (assert! (= 0 (.pragma db "mmap_size" #js {:simple true}))
+               "SQLite mmap must stay disabled for deterministic native memory")
+      (f sql)
+      (finally
+        (.close sql)
+        (.rmSync node-fs dir #js {:recursive true :force true})))))
+
+(defn- memory-sample
+  [phase]
+  (let [usage (.memoryUsage js/process)
+        old-generation-used
+        (->> (.getHeapSpaceStatistics node-v8)
+             array-seq
+             (filter (fn [^js space]
+                       (contains? #{"old_space"
+                                    "large_object_space"
+                                    "shared_space"
+                                    "shared_large_object_space"}
+                                  (.-space_name space))))
+             (map (fn [^js space] (.-space_used_size space)))
+             (reduce + 0))]
+    {:phase phase
+     :rss (.-rss usage)
+     :heap-used (.-heapUsed usage)
+     :heap-total (.-heapTotal usage)
+     :external (.-external usage)
+     :array-buffers (.-arrayBuffers usage)
+     :old-generation-used old-generation-used}))
+
+(defn- observe-memory!
+  [samples phase]
+  (let [sample (memory-sample phase)]
+    (swap! samples conj sample)
+    sample))
+
+(defn- assert-modern-runtime-memory!
+  [samples]
+  (let [samples @samples
+        heap-limit (.-heap_size_limit (.getHeapStatistics node-v8))
+        max-heap-used (apply max (map :heap-used samples))
+        max-old-generation-used
+        (apply max (map :old-generation-used samples))]
+    (assert! (seq samples) "memory phases must be recorded")
+    (assert! (< max-old-generation-used (* 128 1024 1024))
+             (str "observed V8 old generation reached 128 MiB: "
+                  max-old-generation-used))
+    ;; --max-old-space-size governs old generation, not young generation or
+    ;; the test-only fresh-reopen verifier. Total heapUsed is therefore gated
+    ;; against V8's reported heap limit and retained as phase evidence.
+    (assert! (< max-heap-used heap-limit)
+             (str "observed V8 heapUsed reached runtime heap limit: " heap-limit))
+    (doseq [sample samples]
+      (assert! (every? number?
+                       (map sample
+                            [:rss :heap-used :heap-total
+                             :external :array-buffers
+                             :old-generation-used]))
+               (str "incomplete memory sample: " (pr-str sample))))
+    ;; RSS is diagnostic only: Node defines it as the whole native process,
+    ;; while the production limit is Cloudflare V8-isolate memory.
+    (js/console.log
+     (str "modern-staged-memory-phases=" (pr-str samples)
+          " heap-limit=" heap-limit
+          " rss-gate=not-applicable-to-node-process"))))
 
 (defn- large-block-insert-tx
   [page-uuid block-count]
@@ -69,6 +170,186 @@
   (when-not condition
     (throw (js/Error. message))))
 
+(defn- seed-memory-page!
+  "Persist the minimum complete graph/page shape emitted by a DB client. The
+  memory runners exercise Worker request behavior, so an impossible graph that
+  omits the required graph identity must not bypass the integrity gate."
+  [conn page-uuid page-name]
+  (d/transact!
+   conn
+   [{:db/ident :logseq.class/Page}
+    {:db/ident :logseq.kv/graph-created-at
+     :kv/value 1760000000000}
+    {:block/uuid page-uuid
+     :block/name page-name
+     :block/title page-name
+     :block/tags :logseq.class/Page
+     :block/created-at 1
+     :block/updated-at 1}]))
+
+(defn- sha256-hex
+  [value]
+  (-> (.createHash node-crypto "sha256")
+      (.update value "utf8")
+      (.digest "hex")))
+
+(defn- modern-upload-session-id
+  [logical-tx-id outliner-op full-tx-data]
+  (sha256-hex
+   (protocol/tx->transit
+    [:client-tx-upload-session-v1
+     logical-tx-id
+     outliner-op
+     full-tx-data])))
+
+(defn- modern-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index chunk-final?]
+  (let [raw (sha256-hex
+             (str "logseq-tx-chunk-v2/"
+                  logical-tx-id "/"
+                  upload-session-id "/"
+                  chunk-index "/"
+                  (if chunk-final? "final" "more")))
+        versioned (str (subs raw 0 12)
+                       "5"
+                       (subs raw 13 16)
+                       "8"
+                       (subs raw 17 32))]
+    (uuid (str (subs versioned 0 8) "-"
+               (subs versioned 8 12) "-"
+               (subs versioned 12 16) "-"
+               (subs versioned 16 20) "-"
+               (subs versioned 20 32)))))
+
+(defn- modern-session-entry
+  [logical-tx-id upload-session-id outliner-op chunk-index chunk final?]
+  {:tx (protocol/tx->transit chunk)
+   :tx-id (modern-chunk-tx-id
+           logical-tx-id upload-session-id chunk-index final?)
+   :logical-tx-id logical-tx-id
+   :upload-session-id upload-session-id
+   :chunk-index chunk-index
+   :chunk-final? final?
+   :outliner-op outliner-op})
+
+(defn- modern-session-entries
+  [logical-tx-id outliner-op tx-data]
+  (let [upload-session-id
+        (modern-upload-session-id logical-tx-id outliner-op tx-data)
+        chunks (vec (partition-all 1000 tx-data))]
+    (mapv (fn [index chunk]
+            (modern-session-entry
+             logical-tx-id upload-session-id outliner-op
+             index (vec chunk) (= index (dec (count chunks)))))
+          (range (count chunks))
+          chunks)))
+
+(defn- assert-modern-invisible!
+  [sql conn fresh-conn t-before checksum-before block-uuids]
+  (assert! (= t-before (storage/get-t sql))
+           "nonfinal modern chunks must not advance visible t")
+  (assert! (= checksum-before
+              (checksum/recompute-server-checksum @conn))
+           "nonfinal modern chunks must not change the current graph checksum")
+  (assert! (= checksum-before
+              (checksum/recompute-server-checksum @fresh-conn))
+           "nonfinal modern chunks must not change a freshly reopened graph")
+  (assert! (= checksum-before (storage/get-server-checksum sql))
+           "nonfinal or rolled-back final must preserve stored server checksum")
+  (assert! (= t-before (storage/get-server-checksum-t sql))
+           "nonfinal or rolled-back final must preserve checksum cursor")
+  (assert! (not (sample-blocks-present? @conn block-uuids))
+           "nonfinal modern chunks must remain invisible on current conn")
+  (assert! (not (sample-blocks-present? @fresh-conn block-uuids))
+           "nonfinal modern chunks must remain invisible after reopen"))
+
+(defn- run-modern-staged-memory-test!
+  [rollback?]
+  (with-bounded-disk-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [max-old-space-flag? (some #{"--max-old-space-size=128"}
+                                      (array-seq (.-execArgv js/process)))
+            samples (atom [])
+            _ (observe-memory! samples :baseline)
+            conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            _ (seed-memory-page! conn page-uuid "modern-memory-page")
+            t-before (storage/get-t sql)
+            checksum-before (checksum/recompute-server-checksum @conn)
+            {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
+            logical-tx-id (random-uuid)
+            entries (modern-session-entries
+                     logical-tx-id :insert-blocks tx-data)
+            prefix (pop entries)
+            final-entry (peek entries)
+            self #js {:sql sql :conn conn :schema-ready true}
+            _ (observe-memory! samples :fixture-ready)]
+        (assert! max-old-space-flag?
+                 "modern staged memory modes require --max-old-space-size=128")
+        (assert! (= 14000 (count tx-data))
+                 "modern memory fixture must contain exactly 14k datoms")
+        (assert! (> (count entries) 1)
+                 "modern memory fixture must exercise nonfinal staging")
+        (doseq [entry prefix]
+          (let [response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry] t-before))]
+            (assert! (= "tx/batch/ok" (:type response))
+                     (str "nonfinal modern stage rejected: " (pr-str response)))))
+        (observe-memory! samples :prefix-staged)
+        (let [fresh-before (storage/open-conn sql)]
+          (assert-modern-invisible!
+           sql conn fresh-before t-before checksum-before block-uuids)
+          (observe-memory! samples :prefix-fresh-reopen))
+        (if rollback?
+          (let [original-append storage/append-tx!
+                response
+                (with-redefs [storage/append-tx!
+                              (fn [& _]
+                                (throw (js/Error. "injected modern final append failure")))
+                              ws/broadcast! (fn [& _] nil)]
+                  (sync-handler/handle-tx-batch!
+                   self nil [final-entry] t-before))
+                fresh-after (storage/open-conn sql)]
+            ;; Keep an explicit reference so Closure cannot elide the real
+            ;; production var before with-redefs restores it.
+            (assert! (fn? original-append) "append-tx! must be callable")
+            (assert! (= "tx/reject" (:type response))
+                     (str "expected final fault rejection, got " (pr-str response)))
+            (assert! (= t-before (:t response))
+                     "failed final must report the unchanged visible cursor")
+            (assert-modern-invisible!
+             sql conn fresh-after t-before checksum-before block-uuids)
+            (assert! (empty? (storage/fetch-tx-since sql t-before))
+                     "failed final must leave no visible tx log row")
+            (observe-memory! samples :rollback-final))
+          (let [response (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [final-entry] t-before))
+                fresh-after (storage/open-conn sql)
+                recomputed (checksum/recompute-server-checksum @conn)]
+            (assert! (= "tx/batch/ok" (:type response))
+                     (str "expected modern final success, got " (pr-str response)))
+            (assert! (= (inc t-before) (:t response))
+                     "full logical tx advances visible t exactly once")
+            (assert! (= 1 (count (storage/fetch-tx-since sql t-before)))
+                     "full logical tx persists exactly one visible tx row")
+            (assert! (sample-blocks-present? @conn block-uuids)
+                     "final atomically exposes all sampled blocks")
+            (assert! (sample-blocks-present? @fresh-after block-uuids)
+                     "fresh reopen observes the committed full graph")
+            (assert! (= recomputed
+                        (checksum/recompute-server-checksum @fresh-after))
+                     "current and fresh graph checksums converge")
+            (assert! (= recomputed (storage/get-server-checksum sql))
+                     "stored checksum equals full recomputation")
+            (assert! (= (inc t-before)
+                        (storage/get-server-checksum-t sql))
+                     "stored checksum cursor follows the one logical commit")
+            (observe-memory! samples :success-final)))
+        (assert-modern-runtime-memory! samples)))))
+
 (defn- run-large-op-memory-test!
   [{:keys [skip-final-store? skip-validation?]}]
   (with-memory-sql
@@ -76,9 +357,7 @@
       (storage/init-schema! sql)
       (let [conn (storage/open-conn sql)
             page-uuid (random-uuid)
-            _ (d/transact! conn [{:block/uuid page-uuid
-                                  :block/name "large-memory-page"
-                                  :block/title "large-memory-page"}])
+            _ (seed-memory-page! conn page-uuid "large-memory-page")
             t-before (storage/get-t sql)
             {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
             tx-entry {:tx (protocol/tx->transit tx-data)
@@ -121,9 +400,7 @@
       (storage/init-schema! sql)
       (let [conn (storage/open-conn sql)
             page-uuid (random-uuid)
-            _ (d/transact! conn [{:block/uuid page-uuid
-                                  :block/name "large-memory-page"
-                                  :block/title "large-memory-page"}])
+            _ (seed-memory-page! conn page-uuid "large-memory-page")
             t-before (storage/get-t sql)
             {:keys [tx-data block-uuids]} (large-block-insert-tx page-uuid 2000)
             tx-id (random-uuid)
@@ -172,11 +449,143 @@
       (storage/init-schema! sql)
       (let [conn (storage/open-conn sql)
             page-uuid (random-uuid)]
-        (d/transact! conn [{:block/uuid page-uuid
-                            :block/name "large-memory-page"
-                            :block/title "large-memory-page"}])
+        (seed-memory-page! conn page-uuid "large-memory-page")
         (assert! (some? (d/entity @conn [:block/uuid page-uuid]))
                  "expected setup page to be persisted")))))
+
+(defn- run-integrity-bootstrap-memory-test!
+  []
+  (with-bounded-disk-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [samples (atom [])
+            fixture-start-ms (.now js/performance)
+            _ (observe-memory! samples :integrity-bootstrap-baseline)
+            conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            _ (seed-memory-page! conn page-uuid "integrity-memory-page")
+            block-count 15000]
+        (assert! (= (* 128 1024 1024)
+                    (.-heap_size_limit (.getHeapStatistics node-v8)))
+                 "integrity bootstrap must run under an exact 128 MiB V8 heap cap")
+        (doseq [batch-start (range 0 block-count 250)]
+          (let [batch-end (min block-count (+ batch-start 250))]
+            (d/transact!
+             conn
+             (mapv (fn [idx]
+                     {:block/uuid (random-uuid)
+                      :block/title (str "integrity-memory-block-" idx)
+                      :block/page [:block/uuid page-uuid]
+                      :block/parent [:block/uuid page-uuid]
+                      :block/order (str "a" idx)
+                      :block/created-at idx
+                      :block/updated-at idx})
+                   (range batch-start batch-end)))))
+        (observe-memory! samples :integrity-bootstrap-fixture-ready)
+        (let [self #js {:sql sql :conn conn :schema-ready true}
+              shadow-opens (atom 0)
+              original-open-snapshot-conn storage/open-snapshot-conn
+              fixture-ready-ms (.now js/performance)
+              validation-cpu-start (.cpuUsage js/process)
+              validation-start-ms (.now js/performance)
+              integrity-scan-ms (atom 0)
+              legacy-checksum-ms (atom 0)
+              server-checksum-ms (atom 0)
+              reopen-ms (atom 0)
+              reopen-count (atom 0)
+              original-repair-required?
+              snapshot-integrity/repair-required?
+              original-recompute-checksum checksum/recompute-checksum
+              original-recompute-server-checksum
+              checksum/recompute-server-checksum
+              original-open-conn storage/open-conn
+              response
+              (with-redefs
+                [storage/open-snapshot-conn
+                 (fn [& args]
+                   (swap! shadow-opens inc)
+                   (when (some? (.-conn self))
+                     (throw
+                      (js/Error.
+                       "integrity bootstrap retained live while opening shadow")))
+                   (apply original-open-snapshot-conn args))
+                 storage/open-conn
+                 (fn [& args]
+                   (let [started (.now js/performance)
+                         result (apply original-open-conn args)]
+                     (swap! reopen-count inc)
+                     (swap! reopen-ms + (- (.now js/performance) started))
+                     result))
+                 snapshot-integrity/repair-required?
+                 (fn [& args]
+                   (let [started (.now js/performance)
+                         result (apply original-repair-required? args)]
+                     (swap! integrity-scan-ms
+                            + (- (.now js/performance) started))
+                     result))
+                 checksum/recompute-checksum
+                 (fn [& args]
+                   (let [started (.now js/performance)
+                         result (apply original-recompute-checksum args)]
+                     (swap! legacy-checksum-ms
+                            + (- (.now js/performance) started))
+                     result))
+                 checksum/recompute-server-checksum
+                 (fn [& args]
+                   (let [started (.now js/performance)
+                         result
+                         (apply original-recompute-server-checksum args)]
+                     (swap! server-checksum-ms
+                            + (- (.now js/performance) started))
+                     result))]
+                (with-redefs [ws/broadcast! (fn [& _] nil)]
+                  (sync-handler/handle-tx-batch!
+                   self nil [] (storage/get-t sql))))
+              validation-wall-ms (- (.now js/performance)
+                                    validation-start-ms)
+              validation-cpu (.cpuUsage js/process validation-cpu-start)
+              validation-cpu-ms
+              (/ (+ (.-user validation-cpu)
+                    (.-system validation-cpu))
+                 1000)]
+          (observe-memory! samples :integrity-bootstrap-complete)
+          (let [heap-limit
+                (.-heap_size_limit (.getHeapStatistics node-v8))
+                peak-heap-used (apply max (map :heap-used @samples))
+                headroom (- heap-limit peak-heap-used)
+                fixture-wall-ms (- fixture-ready-ms fixture-start-ms)]
+            (assert! (= "empty tx data" (:reason response))
+                     (str "healthy integrity bootstrap failed: " (pr-str response)))
+            (assert! (zero? @shadow-opens)
+                     "healthy bootstrap opened a second DataScript connection")
+            (assert! (storage/snapshot-integrity-attested? sql)
+                     "healthy bootstrap did not persist an exact-root attestation")
+            (assert! (<= validation-wall-ms 15000)
+                     (str "integrity bootstrap exceeded 15s wall budget: "
+                          validation-wall-ms))
+            (assert! (<= validation-cpu-ms 15000)
+                     (str "integrity bootstrap exceeded 15s CPU budget: "
+                          validation-cpu-ms))
+            (assert! (>= headroom (* 8 1024 1024))
+                     (str "integrity bootstrap retained less than 8 MiB headroom: "
+                          headroom))
+            (js/console.log
+             (str "integrity-bootstrap-segments="
+                  (pr-str {:fixture-wall-ms fixture-wall-ms
+                           :validation-wall-ms validation-wall-ms
+                           :validation-cpu-ms validation-cpu-ms
+                           :integrity-scan-ms @integrity-scan-ms
+                           :legacy-checksum-ms @legacy-checksum-ms
+                           :server-checksum-ms @server-checksum-ms
+                           :repair-replay-ms 0
+                           :reopen-ms @reopen-ms
+                           :reopen-count @reopen-count
+                           :heap-limit heap-limit
+                           :peak-heap-used peak-heap-used
+                           :headroom headroom
+                           :blocks block-count
+                           :user-datoms (* block-count 7)}))))
+          (assert-modern-runtime-memory! samples))))))
 
 (defn- run-prepare-memory-test!
   []
@@ -195,10 +604,13 @@
   (case mode
     "baseline" nil
     "open-sql" (run-open-sql-memory-test!)
+    "integrity-bootstrap" (run-integrity-bootstrap-memory-test!)
     "prepare" (run-prepare-memory-test!)
     "apply" (run-large-op-memory-test! nil)
     "apply-client-split" (run-client-split-large-op-memory-test! nil)
     "apply-client-split-serial" (run-client-split-large-op-memory-test! {:serial? true})
+    "apply-modern-staged" (run-modern-staged-memory-test! false)
+    "apply-modern-staged-rollback" (run-modern-staged-memory-test! true)
     "apply-no-store" (run-large-op-memory-test! {:skip-final-store? true})
     "apply-no-validation" (run-large-op-memory-test! {:skip-validation? true})
     "apply-no-store-validation" (run-large-op-memory-test! {:skip-final-store? true

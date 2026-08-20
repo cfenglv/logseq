@@ -1,0 +1,18 @@
+{
+  "repository": "cfenglv/logseq",
+  "version": "2.0.1-selfhost.4",
+  "architectures": {
+    "arm64": {
+      "metadata": "latest-arm64-mac.yml",
+      "metadataSha256": "2dd11f39538c801cf2356a40e753b8f6a9963641df6951e13ed3493b1c5ed705",
+      "zip": "Logseq-darwin-arm64-2.0.1-selfhost.4.zip",
+      "zipSha256": "6668bc87712d849374b5de823cce6bac2c32aa93486dd88ea9fcad8c82c41643"
+    },
+    "x64": {
+      "metadata": "latest-x64-mac.yml",
+      "metadataSha256": "7b35999d6cd7edcd54b08944bca4112abb39e6fc2f12b7d2f602a2c35cdb8ec0",
+      "zip": "Logseq-darwin-x64-2.0.1-selfhost.4.zip",
+      "zipSha256": "48aef39093d0395c692c78a75a4e4cbb00a9d728e118e11f04c86b1783f3ef90"
+    }
+  }
+}

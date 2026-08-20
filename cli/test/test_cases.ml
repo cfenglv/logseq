@@ -2561,12 +2561,14 @@ let () =
       let root = temp_dir "logseq-cli-sync-ensure-keys-password-" in
       let config_path = Node.Path.join [| root; "cli.edn" |] in
       let method_names = ref Vec.empty in
+      let invoke_calls = ref Vec.empty in
       let record_method body method_name =
         if Js.String.includes ~search:method_name body then
           method_names := Vec.push_back !method_names method_name
       in
       let server =
         invoke_server (fun body ->
+            invoke_calls := Vec.push_front !invoke_calls body;
             record_method body "thread-api/verify-and-save-e2ee-password";
             record_method body "thread-api/db-sync-ensure-user-rsa-keys";
             "null")
@@ -2597,16 +2599,29 @@ let () =
                    "thread-api/verify-and-save-e2ee-password";
                    "thread-api/db-sync-ensure-user-rsa-keys";
                  |])
-          then Js.Promise.resolve pass
+          then
+            if
+              Vec.exists
+                (fun body ->
+                  Js.String.includes
+                    ~search:"thread-api/set-db-sync-config" body
+                  && not (Js.String.includes ~search:"auth-path" body))
+                !invoke_calls
+            then Js.Promise.resolve pass
+            else fail_promise "default sync config unexpectedly carries auth-path"
           else
             fail_promise
               ("unexpected sync ensure-keys method order: "
               ^ Vec.string_concat " -> " !method_names)));
 
-  test_promise "sync ensure-keys resolves auth file before uploading keys"
+  test_promise
+    "sync ensure-keys resolves custom auth path into e2ee runtime token"
     (fun () ->
       let root = temp_dir "logseq-cli-sync-ensure-keys-auth-" in
       let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let relative_auth_path =
+        Node.Path.relative ~from:(Sys.getcwd ()) ~to_:auth_path ()
+      in
       let config_path = Node.Path.join [| root; "cli.edn" |] in
       let invoke_calls = ref Vec.empty in
       let server =
@@ -2616,8 +2631,9 @@ let () =
       in
       with_server server (fun base_url ->
           write_file auth_path
-            "{\"provider\":\"cognito\",\"id-token\":\"id-token\",\"access-token\":\"access-token\",\"refresh-token\":\"refresh-token\",\"expires-at\":4102444800000}\n";
-          write_file config_path (Printf.sprintf "{:auth-path %S}\n" auth_path);
+            "{\"provider\":\"cognito\",\"id-token\":\"id-token-custom-path\",\"access-token\":\"access-token-custom-path\",\"refresh-token\":\"refresh-token-custom-path\",\"expires-at\":4102444800000}\n";
+          write_file config_path
+            (Printf.sprintf "{:auth-path %S}\n" relative_auth_path);
           let env = [| ("LOGSEQ_CLI_BASE_URL", base_url) |] in
           let* result =
             run_cli_p ~env
@@ -2635,15 +2651,159 @@ let () =
           in
           remove_tree root;
           ignore (expect_cli_exit_zero "sync ensure-keys auth" result);
-          if
+          let runtime_auth_resolved =
             Vec.exists
               (fun body ->
                 Js.String.includes ~search:"thread-api/sync-app-state" body
                 && Js.String.includes ~search:"auth/id-token" body
-                && Js.String.includes ~search:"id-token" body)
+                && Js.String.includes ~search:"id-token-custom-path" body
+                && Js.String.includes ~search:"auth/refresh-token" body
+                && Js.String.includes ~search:"refresh-token-custom-path" body)
               !invoke_calls
-          then Js.Promise.resolve pass
-          else fail_promise "missing sync-app-state auth payload"));
+          in
+          let custom_auth_path_forwarded =
+            Vec.exists
+              (fun body ->
+                Js.String.includes ~search:"thread-api/set-db-sync-config" body
+                && Js.String.includes ~search:"auth-path" body
+                && Js.String.includes ~search:auth_path body)
+              !invoke_calls
+          in
+          let e2ee_call_uses_custom_refresh_token =
+            Vec.exists
+              (fun body ->
+                Js.String.includes
+                  ~search:"thread-api/verify-and-save-e2ee-password" body
+                && Js.String.includes ~search:"refresh-token-custom-path" body)
+              !invoke_calls
+          in
+          if not runtime_auth_resolved then
+            fail_promise "missing custom auth sync-app-state payload"
+          else if not custom_auth_path_forwarded then
+            fail_promise "missing custom auth path in worker sync config"
+          else if not e2ee_call_uses_custom_refresh_token then
+            fail_promise "missing custom auth refresh token in e2ee call"
+          else Js.Promise.resolve pass));
+
+  test_promise
+    "sync ensure-keys canonicalizes relative custom auth path for worker"
+    (fun () ->
+      let root = temp_dir "logseq-cli-sync-relative-auth-" in
+      let auth_path = Node.Path.join [| root; "auth.json" |] in
+      let relative_auth_path =
+        Node.Path.relative ~from:(Sys.getcwd ()) ~to_:auth_path ()
+      in
+      let config_path = Node.Path.join [| root; "cli.edn" |] in
+      let invoke_calls = ref Vec.empty in
+      let server =
+        invoke_server (fun body ->
+            invoke_calls := Vec.push_front !invoke_calls body;
+            "null")
+      in
+      with_server server (fun base_url ->
+          write_file auth_path
+            "{\"provider\":\"cognito\",\"id-token\":\"id-token-relative-auth\",\"access-token\":\"access-token-relative-auth\",\"refresh-token\":\"refresh-token-relative-auth\",\"expires-at\":4102444800000}\n";
+          write_file config_path
+            (Printf.sprintf "{:auth-path %S}\n" relative_auth_path);
+          let env = [| ("LOGSEQ_CLI_BASE_URL", base_url) |] in
+          let* result =
+            run_cli_p ~env
+              [|
+                "--root-dir";
+                root;
+                "--output";
+                "json";
+                "sync";
+                "ensure-keys";
+                "--e2ee-password";
+                "pw";
+              |]
+          in
+          remove_tree root;
+          ignore
+            (expect_cli_exit_zero "sync ensure-keys relative auth" result);
+          let runtime_auth_resolved =
+            Vec.exists
+              (fun body ->
+                Js.String.includes ~search:"thread-api/sync-app-state" body
+                && Js.String.includes ~search:"refresh-token-relative-auth" body)
+              !invoke_calls
+          in
+          let absolute_auth_path_forwarded =
+            Vec.exists
+              (fun body ->
+                Js.String.includes ~search:"thread-api/set-db-sync-config" body
+                && Js.String.includes ~search:"auth-path" body
+                && Js.String.includes ~search:auth_path body
+                && not
+                     (Js.String.includes ~search:relative_auth_path body))
+              !invoke_calls
+          in
+          if not runtime_auth_resolved then
+            fail_promise "relative auth file was not resolved by CLI"
+          else if not absolute_auth_path_forwarded then
+            fail_promise
+              ("worker did not receive canonical auth path: " ^ auth_path)
+          else Js.Promise.resolve pass));
+
+  test_promise
+    "sync ensure-keys rejects missing and invalid custom auth before e2ee calls"
+    (fun () ->
+      let root = temp_dir "logseq-cli-sync-ensure-keys-auth-errors-" in
+      let auth_path = Node.Path.join [| root; "custom"; "auth.json" |] in
+      let config_path = Node.Path.join [| root; "cli.edn" |] in
+      let invoke_calls = ref Vec.empty in
+      let server =
+        invoke_server (fun body ->
+            invoke_calls := Vec.push_front !invoke_calls body;
+            "null")
+      in
+      with_server server (fun base_url ->
+          write_file config_path (Printf.sprintf "{:auth-path %S}\n" auth_path);
+          let env = [| ("LOGSEQ_CLI_BASE_URL", base_url) |] in
+          let args =
+            [|
+              "--root-dir";
+              root;
+              "--output";
+              "json";
+              "sync";
+              "ensure-keys";
+              "--e2ee-password";
+              "pw";
+            |]
+          in
+          let* missing_result = run_cli_p ~env args in
+          if missing_result.code = 0 then
+            fail_test
+              ("sync ensure-keys missing custom auth: expected non-zero exit\n"
+             ^ missing_result.stdout);
+          expect_named_contains "missing custom auth code"
+            missing_result.stdout "\"code\":\"missing-auth\"";
+          expect_named_contains "missing custom auth path"
+            missing_result.stdout auth_path;
+          mkdir_p (Node.Path.dirname auth_path);
+          write_file auth_path "{\"provider\":";
+          let* invalid_result = run_cli_p ~env args in
+          remove_tree root;
+          if invalid_result.code = 0 then
+            fail_test
+              ("sync ensure-keys invalid custom auth: expected non-zero exit\n"
+             ^ invalid_result.stdout);
+          expect_named_contains "invalid custom auth code"
+            invalid_result.stdout "\"code\":\"invalid-auth-file\"";
+          expect_named_contains "invalid custom auth path"
+            invalid_result.stdout auth_path;
+          if
+            Vec.exists
+              (fun body ->
+                Js.String.includes
+                  ~search:"thread-api/verify-and-save-e2ee-password" body
+                || Js.String.includes
+                     ~search:"thread-api/db-sync-ensure-user-rsa-keys" body)
+              !invoke_calls
+          then fail_promise "custom auth failure invoked e2ee worker methods"
+          else Js.Promise.resolve pass));
 
   test_promise "agent bridge keeps codex alive and forwards worker env"
     (fun () ->

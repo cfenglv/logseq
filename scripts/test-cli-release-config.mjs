@@ -5,6 +5,11 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  macosUpdaterChannel,
+  macosUpdaterMetadataName,
+  resolveSelfhostUpdaterVersions,
+} from "../resources/selfhost-updater-version.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -14,8 +19,342 @@ const readText = (relativePath) =>
 const readJson = (relativePath) =>
   JSON.parse(readText(relativePath));
 
+const updaterNamespaceFilter = (source) => {
+  const normalizedBackslashes = source.replaceAll("\\\\", "\\");
+  const electronGroup = normalizedBackslashes.match(
+    /electron\\\.\(([^)\n]+)\)-test/,
+  )?.[1];
+  return electronGroup?.split("|").includes("updater") ?? false;
+};
+
+const workflowJob = (workflow, jobName) => {
+  const marker = `  ${jobName}:`;
+  const start = workflow.indexOf(marker);
+  assert.notEqual(start, -1, `workflow job ${jobName} must exist`);
+  const tail = workflow.slice(start + marker.length);
+  const nextJobOffset = tail.search(/^  [a-zA-Z0-9_-]+:/m);
+  return nextJobOffset === -1 ? tail : tail.slice(0, nextJobOffset);
+};
+
+assert.deepEqual(
+  resolveSelfhostUpdaterVersions("2.0.1-selfhost.4"),
+  {
+    currentRevision: 4,
+    currentVersion: "2.0.1-selfhost.4",
+    isNightlyRehearsal: false,
+    nextVersion: "2.0.1-selfhost.5",
+  },
+  "stable selfhost updater versions should advance one numbered revision",
+);
+assert.deepEqual(
+  resolveSelfhostUpdaterVersions(
+    "2.0.1-selfhost.4.nightly.20260726",
+  ),
+  {
+    currentRevision: 4,
+    currentVersion: "2.0.1-selfhost.4",
+    isNightlyRehearsal: true,
+    nextVersion: "2.0.1-selfhost.5",
+  },
+  "dated nightly builds should normalize only the nightly suffix",
+);
+for (const invalidVersion of [
+  "2.0.1-selfhost.3",
+  "2.0.1-selfhost.4-alpha.nightly.20260726",
+  "2.0.1-selfhost.4-alpha.other.20260726",
+  "2.0.1-selfhost.4.nightly.20260230",
+  "2.0.1-selfhost.4.nightly",
+  "2.0.1-selfhost.4.nightly.20260726.extra",
+  "2.0.1-selfhost.4.other.20260726",
+  "2.0.1",
+]) {
+  assert.throws(
+    () => resolveSelfhostUpdaterVersions(invalidVersion),
+    undefined,
+    `invalid updater rehearsal version should be rejected: ${invalidVersion}`,
+  );
+}
+
+const nightlyVersion = execFileSync(
+  process.execPath,
+  [path.join(repoRoot, "scripts", "get-pkg-version.js"), "nightly"],
+  { encoding: "utf8" },
+).trim();
+assert.match(
+  nightlyVersion,
+  /^\d+\.\d+\.\d+-selfhost\.[1-9]\d*\.nightly\.\d{8}$/,
+  "nightly version generation must use X.Y.Z-selfhost.N.nightly.YYYYMMDD",
+);
+assert.doesNotMatch(
+  nightlyVersion,
+  /-alpha\.nightly\./,
+  "nightly version generation must reject the obsolete -alpha.nightly form",
+);
+assert.equal(
+  macosUpdaterChannel("2.0.1-selfhost.4", "arm64"),
+  "latest-arm64",
+  "published selfhost.4 clients must remain on the frozen legacy channel",
+);
+assert.equal(
+  macosUpdaterChannel("2.0.1-selfhost.5", "arm64"),
+  "selfhost-macos-v2-arm64",
+  "manual migration clients should use the new signed macOS channel",
+);
+assert.equal(
+  macosUpdaterMetadataName("2.0.1-selfhost.5", "x64"),
+  "selfhost-macos-v2-x64-mac.yml",
+  "published metadata should match the signed macOS channel",
+);
+assert.equal(
+  macosUpdaterChannel(
+    "2.0.1-selfhost.5.nightly.20260729",
+    "arm64",
+  ),
+  "selfhost-macos-v2-nightly-arm64",
+  "selfhost nightly metadata must use an isolated macOS channel",
+);
+assert.equal(
+  macosUpdaterMetadataName(
+    "2.0.1-selfhost.5.nightly.20260729",
+    "x64",
+  ),
+  "selfhost-macos-v2-nightly-x64-mac.yml",
+  "selfhost nightly metadata must not overwrite stable macOS metadata",
+);
+assert.throws(
+  () => macosUpdaterChannel("2.0.1-selfhost.5", "ia32"),
+  /unsupported macOS updater architecture/,
+  "macOS metadata generation should reject unsupported architectures",
+);
+const updaterVersionCli = path.join(
+  repoRoot,
+  "resources",
+  "selfhost-updater-version.mjs",
+);
+for (const [version, arch, expected] of [
+  ["2.0.1-selfhost.4", "arm64", "latest-arm64-mac.yml"],
+  ["2.0.1-selfhost.4", "x64", "latest-x64-mac.yml"],
+  [
+    "2.0.1-selfhost.5",
+    "arm64",
+    "selfhost-macos-v2-arm64-mac.yml",
+  ],
+  ["2.0.1-selfhost.5", "x64", "selfhost-macos-v2-x64-mac.yml"],
+  [
+    "2.0.1-selfhost.5.nightly.20260729",
+    "arm64",
+    "selfhost-macos-v2-nightly-arm64-mac.yml",
+  ],
+  [
+    "2.0.1-selfhost.5.nightly.20260729",
+    "x64",
+    "selfhost-macos-v2-nightly-x64-mac.yml",
+  ],
+]) {
+  assert.equal(
+    execFileSync(
+      process.execPath,
+      [updaterVersionCli, "macos-metadata-name", version, arch],
+      { encoding: "utf8" },
+    ).trim(),
+    expected,
+    `workflow metadata helper should resolve ${version}/${arch}`,
+  );
+}
+
+const assertContains = (text, needle, label) => {
+  assert.ok(text.includes(needle), `${label} should contain ${needle}`);
+};
+
 const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
+const dbSyncPackage = readJson("deps/db-sync/package.json");
+const dbSyncWorkspace = readText("deps/db-sync/pnpm-workspace.yaml");
+const desktopPackagingGulpfile = readText("gulpfile.js");
+const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const prLabelerWorkflow = readText(".github/workflows/pr-labeler.yml");
+const desktopBuilderConfig = readText("resources/electron-builder.yml");
+const unsignedDesktopBuilder = readText("resources/electron-builder-unsigned.mjs");
+const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
+const adhocAfterSign = readText("resources/electron-builder-adhoc-after-sign.cjs");
+const verifyDesktopRuntimeRevisionsScript = readText(
+  "scripts/verify-desktop-runtime-revisions.mjs",
+);
+const desktopReleasePreflight = readText(
+  "scripts/desktop-release-preflight.mjs",
+);
+const localReleaseRehearsal = readText(
+  "scripts/run-local-release-rehearsal.mjs",
+);
+assert.equal(
+  rootPackage.scripts?.["release:rehearsal"],
+  "node ./scripts/run-local-release-rehearsal.mjs",
+  "package.json should expose the local-only release rehearsal",
+);
+for (const requiredGate of ["rtc:prepush", "desktop:release-preflight"]) {
+  assert.ok(
+    localReleaseRehearsal.includes(requiredGate),
+    `local release rehearsal should execute ${requiredGate}`,
+  );
+}
+assert.match(
+  localReleaseRehearsal,
+  /status[\s\S]*--porcelain[\s\S]*clean worktree/,
+  "local release rehearsal should require a clean worktree",
+);
+const fullDesktopReleasePreflight = readText(
+  "scripts/run-desktop-release-preflight.mjs",
+);
+const desktopReleaseAssetVerifier = readText(
+  "scripts/verify-desktop-release-assets.mjs",
+);
+const macosUpdaterSignatureVerifier = readText(
+  "scripts/verify-macos-updater-signature.mjs",
+);
+const macosUpdaterSignaturePolicy = readText(
+  "scripts/run-macos-updater-signature-policy.mjs",
+);
+const projectSignedMacosUpdaterVerifier = readText(
+  "scripts/verify-project-signed-macos-update.mjs",
+);
+const localProjectUpdateSigningContract = readText(
+  "scripts/test-local-project-update-signing-contract.mjs",
+);
+const macosUpdaterBaseline = readJson(
+  "scripts/fixtures/macos-updater-baseline.json",
+);
+const packagedDesktopVerifier = readText(
+  "resources/verify-packaged-desktop.mjs",
+);
+const desktopRuntimeRevisionBuilderHook = readText(
+  "resources/electron-builder-verify-runtime-revisions.cjs",
+);
+const packagedResourceContract = readText(
+  "resources/packaged-resource-contract.mjs",
+);
+const packagedProjectSignatureRuntimeTest = readText(
+  "scripts/test-packaged-project-signature-runtime.mjs",
+);
+const updaterProviderVerifier = readText(
+  "resources/verify-updater-provider.mjs",
+);
+const electronUpdater = readText("src/electron/electron/updater.cljs");
+const electronUpdaterConfig = readText(
+  "src/electron/electron/updater_config.cljs",
+);
+const desktopSettings = readText(
+  "src/main/frontend/components/settings.cljs",
+);
+const e2eSettings = readText("clj-e2e/src/logseq/e2e/settings.clj");
+const e2eGraph = readText("clj-e2e/src/logseq/e2e/graph.clj");
+const e2eRtc = readText("clj-e2e/src/logseq/e2e/rtc.clj");
+const e2eUtil = readText("clj-e2e/src/logseq/e2e/util.clj");
+const e2eOutliner = readText(
+  "clj-e2e/test/logseq/e2e/outliner_basic_test.clj",
+);
+const e2eRtcExtra = readText(
+  "clj-e2e/test/logseq/e2e/rtc_extra_test.clj",
+);
+const e2eRtcExtraPart2 = readText(
+  "clj-e2e/test/logseq/e2e/rtc_extra_part2_test.clj",
+);
+
+assert.match(
+  rootPackage.scripts?.["test:selfhost-updater-source-contracts"] ?? "",
+  /test-desktop-sidecar-release-contract\.mjs[\s\S]*test-updater-install-entry-contract\.mjs[\s\S]*test-selfhost-macos-user-guidance\.mjs/,
+  "package.json should expose all updater source contracts",
+);
+assert.match(
+  rootPackage.scripts?.["test:selfhost-updater-provider-contract"] ?? "",
+  /test-selfhost-macos-updater-release-contract\.mjs/,
+  "package.json should expose the real provider and SemVer contract",
+);
+assert.equal(
+  typeof rootPackage.scripts?.["project-update:test-helper"],
+  "string",
+  "package.json should expose the explicit native updater test-helper target",
+);
+assert.match(
+  desktopReleaseAssetVerifier,
+  /selfhost[\s\S]{0,80}nightly[\s\S]{0,80}YYYYMMDD/i,
+  "release asset verifier guidance should advertise X.Y.Z-selfhost.N.nightly.YYYYMMDD",
+);
+
+assert.match(
+  prLabelerWorkflow,
+  /permissions:\s+contents: read\s+pull-requests: write/,
+  "PR labeler should receive only the repository permissions it needs",
+);
+assert.match(
+  prLabelerWorkflow,
+  /TimonVS\/pr-labeler-action@bd0b592a410983316a454e3d48444608f028ec8e/,
+  "write-capable PR labeler action should be pinned to an immutable commit",
+);
+assert.match(
+  e2eSettings,
+  /\(w\/wait-for "#search-button"\)\s+\(assert\/assert-in-normal-mode\?\)/,
+  "E2E setup should wait for the application shell before asserting normal mode",
+);
+assert.match(
+  e2eGraph,
+  /rtc-graph-control-timeout-ms 15000[\s\S]*?rtc-sync-toggle \{:timeout rtc-graph-control-timeout-ms\}[\s\S]*?rtc-graph-e2ee-toggle \{:timeout rtc-graph-control-timeout-ms\}/,
+  "RTC graph setup should use a bounded cold-runner timeout for both controls",
+);
+assert.match(
+  e2eUtil,
+  /rtc-entitlement-ready-script[\s\S]*?rtc_2025_07_10/,
+  "RTC E2E entitlement gate should accept both supported account groups",
+);
+assert.match(
+  e2eUtil,
+  /rtc-login-dismiss-timeout-ms 30000[\s\S]*?wait-login-dismissed![\s\S]*?w\/visible\? "\.cp__user-login"[\s\S]*?System\/nanoTime[\s\S]*?RTC login modal was not dismissed/,
+  "RTC E2E login should use a bounded cold-runner allowance without resubmitting credentials",
+);
+assert.match(
+  e2eUtil,
+  /w\/click "\.cp__user-login button\[type=\\"submit\\"\]"[\s\S]*?\(wait-login-dismissed!\)[\s\S]*?\(wait-rtc-entitlement-ready!\)/,
+  "RTC E2E login should await dismissal and asynchronous account entitlement before opening graph controls",
+);
+assert.match(
+  e2eRtc,
+  /wait-current-tx-synced[\s\S]*?button\.cloud\.on\.idle[\s\S]*?\(= local-tx remote-tx\)[\s\S]*?\(= previous current\)/,
+  "RTC destructive UI tests should require two consecutive synced transaction observations",
+);
+assert.match(
+  e2eOutliner,
+  /\(settle!\)[\s\S]*?get-by-text "b4" true[\s\S]*?\(b\/delete-blocks\)[\s\S]*?\(settle!\)[\s\S]*?get-by-text "b3" true[\s\S]*?select-blocks-to-count 2/,
+  "outliner deletion should settle RTC before re-establishing each destructive selection context",
+);
+assert.match(
+  e2eRtcExtra,
+  /outliner-basic-test\/delete rtc\/wait-current-tx-synced/,
+  "RTC outliner tests should enable the transaction-settling deletion path",
+);
+assert.match(
+  e2eOutliner,
+  /defn move-up-down[\s\S]*?\(util\/exit-edit\)[\s\S]*?\(settle!\)[\s\S]*?select-b3-and-b4[\s\S]*?move-selected-blocks[\s\S]*?\(settle!\)[\s\S]*?select-b3-and-b4[\s\S]*?move-selected-blocks[\s\S]*?\(settle!\)/,
+  "outliner moves should establish exact selection and observe each ordered stage",
+);
+assert.match(
+  e2eRtcExtra,
+  /outliner-basic-test\/move-up-down rtc\/wait-current-tx-synced/,
+  "RTC outliner tests should settle synchronized move stages",
+);
+assert.match(
+  e2eRtcExtra,
+  /rtc-outliner-conflict-update-test[\s\S]*?focus-exact-block! \(str title-prefix "-" 3\)[\s\S]*?k\/meta\+shift\+arrow-down[\s\S]*?k\/enter[\s\S]*?focus-exact-block! \(str title-prefix "-" 3\)[\s\S]*?\(b\/indent\)/,
+  "RTC conflict moves should re-establish the exact editor target before indentation",
+);
+assert.match(
+  e2eRtcExtra,
+  /defn- focus-exact-block![\s\S]*?loop \[attempt 1\][\s\S]*?w\/click[\s\S]*?current-editor-value[\s\S]*?\(= text editor-value\)[\s\S]*?recur \(inc attempt\)/,
+  "RTC conflict focus should retry only the idempotent click until the exact editor value is active",
+);
+assert.match(
+  e2eRtcExtraPart2,
+  /current-editor-layout[\s\S]*?when-let \[box \(\.boundingBox editor\)\][\s\S]*?:editor-id[\s\S]*?try-indent![\s\S]*?\(= editor-id editor-id'\)[\s\S]*?try-outdent![\s\S]*?\(= editor-id editor-id'\)/,
+  "parallel RTC stress indentation should tolerate detached editor layouts without changing targets",
+);
 
 const zvecOptionalRuntimeDependencies = [
   "@zvec/bindings-darwin-arm64",
@@ -47,6 +386,143 @@ const assertRootScriptDoesNotBuildShadowCli = (scriptName, command) => {
     `${scriptName} should not build the old Shadow CLI`,
   );
 };
+
+assert.equal(
+  desktopPackage.scripts["electron:make-unsigned"],
+  "node ./electron-builder-unsigned.mjs",
+  "the standalone desktop artifact should run its bundled unsigned builder",
+);
+assert.equal(
+  rootPackage.scripts["release-electron:local-signed"],
+  undefined,
+  "the repository must not expose the removed local-certificate build path",
+);
+assert.equal(
+  rootPackage.scripts["setup-macos-local-signing"],
+  undefined,
+  "the repository must not expose a Keychain trust setup command",
+);
+assert.equal(
+  desktopPackage.scripts["electron:make-local-signed"],
+  undefined,
+  "the desktop package must expose only the ad-hoc fork build path",
+);
+assert.doesNotMatch(
+  desktopPackagingGulpfile,
+  /electronMakerLocalSigned|electron:make-local-signed/,
+  "gulp must not retain the removed local-certificate build entry",
+);
+for (const removedLocalSigningPath of [
+  "scripts/setup-local-macos-codesign.mjs",
+  "scripts/electron-builder-local-signed.mjs",
+  "scripts/electron-builder-local-signed-after-pack.cjs",
+  "scripts/electron-builder-local-signed-after-sign.cjs",
+  "resources/electron-builder.local-signed.yml",
+]) {
+  assert.equal(
+    fs.existsSync(path.join(repoRoot, removedLocalSigningPath)),
+    false,
+    `${removedLocalSigningPath} must stay removed`,
+  );
+}
+assert.equal(
+  desktopPackage.scripts["electron:verify-package"],
+  "node ./verify-packaged-desktop.mjs",
+  "the standalone desktop artifact should expose package verification",
+);
+assert.equal(
+  desktopPackage.scripts["electron:verify-updater-provider"],
+  "node ./verify-updater-provider.mjs",
+  "the standalone desktop artifact should expose updater provider verification",
+);
+assert.equal(
+  desktopPackage.devDependencies["@electron/asar"],
+  "3.4.1",
+  "package verification must not rely on a transitive asar dependency",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /resourceFilePath = path\.join\(resourcesPath, '\*\*'\)/,
+  "desktop resource sync should include the bundled signing scripts",
+);
+assert.match(
+  desktopBuilderConfig,
+  /publish:\s+- provider: github\s+owner: cfenglv\s+repo: logseq/,
+  "packaged selfhost clients should read updates from the fork release feed",
+);
+assert.match(
+  desktopBuilderConfig,
+  /beforePack:\s+\.\/electron-builder-verify-runtime-revisions\.cjs/,
+  "all Electron builder entry points should verify runtime revisions before packaging",
+);
+assert.match(
+  desktopRuntimeRevisionBuilderHook,
+  /verify-desktop-runtime-revisions\.mjs/,
+  "the Electron builder hook should invoke the canonical runtime revision verifier",
+);
+assert.match(
+  desktopRuntimeRevisionBuilderHook,
+  /spawnSync\(process\.execPath/,
+  "the Electron builder hook should execute the verifier without a shell",
+);
+for (const relativePath of [
+  "js/logseq-cli.js",
+  "js/db-worker-node.js",
+]) {
+  assert.match(
+    packagedDesktopVerifier,
+    new RegExp(relativePath.replaceAll("/", "[\\\\/]")),
+    `package verification should inspect the CLI runtime ${relativePath}`,
+  );
+}
+assert.match(
+  packagedDesktopVerifier,
+  /packagedPayload\.equals\(stagedPayload\)/,
+  "package verification should compare CLI runtime bytes with the staged files",
+);
+assert.match(
+  packagedDesktopVerifier,
+  /packagedPayload\.includes\(expectedRevision\)/,
+  "package verification should require the current revision in CLI runtimes",
+);
+
+assert.match(
+  rootPackage.scripts["desktop:verify-runtime-revisions"],
+  /verify-desktop-runtime-revisions\.mjs/,
+  "package.json should expose desktop runtime revision verification",
+);
+assert.match(
+  rootPackage.scripts["desktop:test-release-contracts"],
+  /^node \.\/scripts\/test-desktop-runtime-packaging-contract\.mjs &&/,
+  "desktop release contracts should execute the runtime packaging hook test",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop packaging should reject inconsistent runtime revisions",
+);
+assert.match(
+  desktopPackagingWorkflow,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop release CI should reject inconsistent runtime revisions",
+);
+for (const relativePath of [
+  "static/electron.js",
+  "static/db-worker-node.js",
+  "static/logseq-cli.js",
+  "dist/db-worker-node.js",
+  "static/js/db-worker-node.js",
+  "static/js/logseq-cli.js",
+  "static/js/main.js",
+  "static/js/db-worker.js",
+  "static/js/publishing/main.js",
+]) {
+  assert.match(
+    verifyDesktopRuntimeRevisionsScript,
+    new RegExp(relativePath.replaceAll("/", "[\\\\/]")),
+    `runtime revision verification should cover ${relativePath}`,
+  );
+}
 
 const assertCliReleaseCommand = (command, label) => {
   assert.match(command, /pnpm --dir cli bundle/, `${label} should bundle cli/`);
@@ -141,6 +617,566 @@ assertNotContains(
   "clojure -M:cljs release logseq-cli",
   "desktop release workflow",
 );
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /name: Signing By Apple Developer ID\s+if: \$\{\{ github\.repository == 'logseq\/logseq' \}\}/,
+  "desktop release workflow Apple signing should not exclude forks",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /HAS_APPLE_SIGNING: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 != '' \}\}/,
+  "desktop release workflow should expose only a non-secret signing availability flag at job scope",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /^\s{6}APPLE_CERTIFICATES_P12: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 \}\}$/m,
+  "desktop release workflow should not expose the signing certificate at job scope",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /p12-file-base64: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 \}\}/,
+  "desktop release workflow should pass the signing certificate only to the import step",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /if: \$\{\{ env\.HAS_APPLE_SIGNING == 'true' \}\}/,
+  "desktop release workflow should import Apple certificates when a fork configures them",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /permissions:\s+contents: read/,
+  "desktop release workflow should default to read-only repository permissions",
+);
+for (const job of ["nightly-release", "release"]) {
+  assert.match(
+    desktopReleaseWorkflow,
+    new RegExp(`${job}:\\n[\\s\\S]*?permissions:\\n\\s+contents: write`),
+    `${job} should receive write permission explicitly`,
+  );
+}
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?pnpm cljs:test[\s\S]*?pnpm --dir deps\/db-sync test[\s\S]*?pnpm --dir deps\/db-sync test:large-op-128m/,
+  "desktop release workflow should gate packaging on client and server RTC tests",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?node[^\n]*static\/tests\.js/,
+  "desktop release workflow should execute compiled Electron tests with the required preload/flags",
+);
+assert.ok(
+  updaterNamespaceFilter(desktopReleaseWorkflow),
+  "desktop release workflow should select the exact electron.updater-test namespace",
+);
+for (const sourceContract of [
+  "test-desktop-sidecar-release-contract.mjs",
+  "test-updater-install-entry-contract.mjs",
+  "test-selfhost-macos-user-guidance.mjs",
+]) {
+  assert.match(
+    desktopReleaseWorkflow,
+    new RegExp(
+      `source-preflight:[\\s\\S]*?${sourceContract.replaceAll(".", "\\.")}`,
+    ),
+    `source-preflight should execute ${sourceContract}`,
+  );
+}
+for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
+  const job = workflowJob(desktopReleaseWorkflow, jobName);
+  assert.match(
+    job,
+    /project-update:test-helper[\s\S]*?test:project-signed-macos-updater[\s\S]*?test-selfhost-macos-updater-release-contract\.mjs/,
+    `${jobName} must build the native helper before its updater E2E and then run the real provider/SemVer contract`,
+  );
+}
+assert.doesNotMatch(
+  desktopReleaseWorkflow.slice(0, desktopReleaseWorkflow.indexOf("env:")),
+  /^  push:/m,
+  "desktop release workflow should not run automatically on branch push",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /^  workflow_dispatch:/m,
+  "desktop release workflow should run only when explicitly dispatched",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /source-preflight:[\s\S]*?pnpm desktop:release-preflight:quick -- --strict/,
+  "desktop release workflow should fail on source and environment drift before expensive builds",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /release-source-gate:[\s\S]*?source-sha:[\s\S]*?steps\.source\.outputs\.sha/,
+  "stable and beta releases should bind the manually selected exact commit",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /release-assets-preflight:[\s\S]*?pattern: logseq-\*-builds[\s\S]*?merge-multiple: true[\s\S]*?Verify complete desktop release asset set[\s\S]*?verify-desktop-release-assets\.mjs/,
+  "formal releases should merge and validate the exact complete six-platform asset set",
+);
+for (const job of ["nightly-release", "release"]) {
+  assert.match(
+    desktopReleaseWorkflow,
+    new RegExp(`${job}:\\n[\\s\\S]*?needs: \\[ release-assets-preflight \\]`),
+    `${job} should publish only after the aggregate asset preflight`,
+  );
+}
+assert.equal(
+  desktopReleaseWorkflow.match(/- name: Verify packaged desktop/g)?.length,
+  6,
+  "desktop release workflow should verify all six packaged applications",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /node scripts\/verify-desktop-release-assets\.mjs[\s\S]*?--write-checksums/,
+  "desktop release workflow should validate the complete asset set before publishing",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(/pnpm electron:verify-updater-provider/g)
+    ?.length,
+  6,
+  "all six desktop builders should rehearse the updater provider contract",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /prerelease: \$\{\{ !contains\(steps\.ref\.outputs\.version, '-selfhost\.'\) && github\.event\.inputs\.is-pre-release \}\}/,
+  "stable selfhost releases must remain GitHub production releases so /releases/latest can discover them",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Update rolling Nightly Release[\s\S]*?tag_name: nightly[\s\S]*?prerelease: \$\{\{ contains\(needs\.release-assets-preflight\.outputs\.version, '-selfhost\.'\)/,
+  "selfhost nightlies must publish only to the isolated rolling prerelease",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /Publish selfhost dated Nightly Release|dated nightly release[\s\S]*?prerelease: false/i,
+  "selfhost nightlies must never become GitHub production latest",
+);
+assertNotContains(
+  desktopReleaseWorkflow,
+  "sha256sum *.apk",
+  "desktop release workflow",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /clojure -M:test release db-sync-backup-memory-test[\s\S]*?node --expose-gc --max-old-space-size=128[\s\S]*?static\/db-sync-backup-memory-test\.js/,
+  "RTC release gate should exercise durable client backup under a 128 MB heap",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /frontend\\\.handler\\\.db-based\\\.\(rtc-background-tasks\|sync\)-test/,
+  "RTC release gate should include suspend, resume, and background trigger coverage",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /frontend\\\.worker\\\.\(db-core\|db-sync\|db-sync-sim\|db-worker\|pipeline\|platform-node\|state\)-test/,
+  "RTC release gate should execute db-worker import and cleanup coverage",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /logseq\\\.cli\\\.command\\\.sync-test/,
+  "RTC release gate should include CLI repair-required behavior",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?pnpm --dir deps\/db-sync install --frozen-lockfile[\s\S]*?pnpm --dir deps\/db-sync test/,
+  "RTC release gate should install the isolated db-sync dependency tree before testing it",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?pnpm --dir deps\/db-sync release[\s\S]*?pnpm --dir deps\/db-sync build:api-docs[\s\S]*?pnpm exec wrangler deploy --dry-run --env=""/,
+  "RTC release gate should build all Worker assets and dry-run the production bundle",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /name: Update APP Version\s+run: pnpm pkg set version="\$\{\{ steps\.ref\.outputs\.version \}\}"\s+working-directory: \.\/static/,
+  "desktop release workflow should update any previous static package version",
+);
+assert.equal(
+  dbSyncPackage.packageManager,
+  "pnpm@10.33.0",
+  "db-sync should pin the same pnpm version used by CI",
+);
+assert.equal(
+  dbSyncPackage.devDependencies.wrangler,
+  "4.113.0",
+  "db-sync deployments should use a reproducible Wrangler version",
+);
+assert.match(
+  dbSyncWorkspace,
+  /allowBuilds:[\s\S]*"@sentry\/cli": true[\s\S]*better-sqlite3: true[\s\S]*esbuild: true[\s\S]*sharp: true[\s\S]*workerd: true/,
+  "db-sync should explicitly allow only its required native install scripts",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /compile-cljs:[\s\S]*?needs: \[ rtc-release-gate, rtc-browser-e2e \]/,
+  "desktop compilation should wait for both RTC release and browser E2E gates",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /actions\/setup-python@v[1-4]\b/,
+  "desktop release workflow should not use an unsupported setup-python runtime",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?persist-credentials: false/,
+  "RTC test checkout should not retain repository credentials",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /spctl --assess --type execute/,
+  "desktop release workflow should verify notarized apps with Gatekeeper",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /xcrun stapler validate/,
+  "desktop release workflow should verify stapled notarization tickets",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /build-project-update-helper\.mjs/g,
+  )?.length,
+  2,
+  "both macOS builders should embed the project updater helper",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /LOGSEQ_MACOS_UPDATE_ED25519_PRIVATE_KEY_BASE64/,
+  "the macOS candidate workflow must not consume the local signing key",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /release-gate-source\/resources\/selfhost-updater-version\.mjs macos-metadata-name/g,
+  )?.length,
+  2,
+  "both macOS builders should execute the checked-out metadata helper",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /sign-macos-project-update\.mjs/g,
+  )?.length ?? 0,
+  0,
+  "CI must not invoke the local project update signer",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /verify-project-signed-macos-update\.mjs/g,
+  )?.length ?? 0,
+  0,
+  "workflow steps should use the complete finalized-release verifier",
+);
+for (const jobName of ["build-macos-x64", "build-macos-arm64"]) {
+  assert.equal(
+    workflowJob(desktopReleaseWorkflow, jobName).match(
+      /verify-unsigned-macos-project-update-candidate\.mjs/g,
+    )?.length,
+    1,
+    `${jobName} should verify its unsigned candidate metadata exactly once`,
+  );
+}
+assert.equal(
+  workflowJob(desktopReleaseWorkflow, "selfhost-release-signing").match(
+    /verify-unsigned-macos-project-update-candidate\.mjs/g,
+  )?.length,
+  1,
+  "the protected signer should independently reverify both macOS candidates",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /verify-unsigned-macos-project-update-candidate\.mjs/g,
+  )?.length,
+  3,
+  "only both macOS builders and the protected signer should verify unsigned candidates",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /nightly-release:[\s\S]{0,260}!contains\(needs\.release-assets-preflight\.outputs\.version,\s*'-selfhost\.'\)/,
+  "nightly release job must not publish unsigned selfhost metadata",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /release:[\s\S]{0,260}!contains\(needs\.release-assets-preflight\.outputs\.version,\s*'-selfhost\.'\)/,
+  "stable/beta release job must not publish unsigned selfhost metadata",
+);
+assert.match(
+  localProjectUpdateSigningContract,
+  /local macOS publisher only|refuses CI/,
+  "local signing contract must exercise the CI release block",
+);
+const protectedSelfhostSigner = workflowJob(
+  desktopReleaseWorkflow,
+  "selfhost-release-signing",
+);
+assert.match(
+  protectedSelfhostSigner,
+  /environment:\s*selfhost-release-signing/,
+  "selfhost signer must use its protected Environment",
+);
+assert.match(
+  protectedSelfhostSigner,
+  /secrets\.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/,
+  "selfhost signer must consume the Environment-scoped project key",
+);
+assert.doesNotMatch(
+  protectedSelfhostSigner,
+  /contents:\s*write|action-gh-release|nightly-release/,
+  "selfhost signer must not publish",
+);
+const protectedSelfhostVerifier = workflowJob(
+  desktopReleaseWorkflow,
+  "selfhost-release-verifier",
+);
+assert.match(
+  protectedSelfhostVerifier,
+  /verify-finalized-selfhost-release\.mjs/,
+  "secretless verifier must recheck finalized assets",
+);
+assert.doesNotMatch(
+  protectedSelfhostVerifier,
+  /secrets\.|environment:/,
+  "finalized-release verifier must not receive a protected Environment",
+);
+const protectedSelfhostPublisher = workflowJob(
+  desktopReleaseWorkflow,
+  "selfhost-release",
+);
+assert.match(
+  protectedSelfhostPublisher,
+  /needs:\s*\[\s*selfhost-release-verifier\s*\]/,
+  "selfhost publisher must depend on the secretless verifier",
+);
+assert.match(
+  protectedSelfhostPublisher,
+  /environment:\s*selfhost-production[\s\S]*contents:\s*write/,
+  "selfhost publisher must use the protected production write boundary",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /node release-gate-source\/scripts\/verify-macos-updater-signature\.mjs/,
+  "the .5 workflow must not run the .4 designated requirement as a release gate",
+);
+assert.equal(
+  desktopReleaseWorkflow.match(
+    /resources\/updater\/legacy-macos\/latest-(?:arm64|x64)-mac\.yml/g,
+  )?.length,
+  2,
+  "both macOS releases should carry pinned legacy metadata sentinels",
+);
+assert.match(
+  macosUpdaterSignaturePolicy,
+  /manual-migration[\s\S]*revision > 5[\s\S]*project-signed[\s\S]*verifyProjectSignedMacosUpdate/,
+  "the signature policy should route post-bootstrap releases through project signatures",
+);
+assert.doesNotMatch(
+  macosUpdaterSignaturePolicy,
+  /requireDeveloperIdBaseline|macos-updater-signed-baseline/,
+  "the project signature policy must not require an Apple signing baseline",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --x64/,
+  "fork desktop release workflow should build an unsigned macOS x64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Build\/Release Electron App for x64[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace[\s\S]*?pnpm rebuild:all/,
+  "macOS x64 dependencies should be installed outside the root workspace",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --arm64/,
+  "fork desktop release workflow should build an unsigned macOS arm64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Fetch deps[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace --config\.supportedArchitectures\.os=darwin --config\.supportedArchitectures\.cpu=arm64/,
+  "macOS arm64 dependencies should be installed outside the root workspace",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /ELECTRON_RUN_AS_NODE=1/,
+  "fork desktop release workflow should smoke-test the packaged Electron runtime",
+);
+assert.match(
+  unsignedDesktopBuilder,
+  /electron-builder\.unsigned\.yml/,
+  "unsigned desktop builds should use the ad-hoc signing configuration",
+);
+assert.match(
+  unsignedDesktopConfig,
+  /afterSign: \.\/electron-builder-adhoc-after-sign\.cjs/,
+  "unsigned macOS builds should re-sign the completed application bundle",
+);
+assert.match(
+  adhocAfterSign,
+  /"--sign",\s+"-"/,
+  "the fork afterSign hook should use an ad-hoc identity",
+);
+assert.match(
+  adhocAfterSign,
+  /entitlements\.local-signed\.plist/,
+  "the fork afterSign hook should disable library validation",
+);
+assert.deepEqual(
+  macosUpdaterBaseline,
+  {
+    repository: "cfenglv/logseq",
+    version: "2.0.1-selfhost.4",
+    architectures: {
+      arm64: {
+        metadata: "latest-arm64-mac.yml",
+        metadataSha256:
+          "2dd11f39538c801cf2356a40e753b8f6a9963641df6951e13ed3493b1c5ed705",
+        zip: "Logseq-darwin-arm64-2.0.1-selfhost.4.zip",
+        zipSha256:
+          "6668bc87712d849374b5de823cce6bac2c32aa93486dd88ea9fcad8c82c41643",
+      },
+      x64: {
+        metadata: "latest-x64-mac.yml",
+        metadataSha256:
+          "7b35999d6cd7edcd54b08944bca4112abb39e6fc2f12b7d2f602a2c35cdb8ec0",
+        zip: "Logseq-darwin-x64-2.0.1-selfhost.4.zip",
+        zipSha256:
+          "48aef39093d0395c692c78a75a4e4cbb00a9d728e118e11f04c86b1783f3ef90",
+      },
+    },
+  },
+  "macOS updater regression reproducer should pin the published arm64 and x64 baseline assets",
+);
+assert.match(
+  projectSignedMacosUpdaterVerifier,
+  /loadProjectSigningPolicy[\s\S]*projectUpdatePayload[\s\S]*verify\(/,
+  "future physical updater gates should require the fixed project key signature",
+);
+for (const requiredVerifierContract of [
+  "LOGSEQ_UPDATER_BASELINE_ZIP",
+  "LOGSEQ_UPDATER_BASELINE_METADATA",
+  "published baseline metadata",
+  "candidate download payload",
+  "Squirrel designated requirement authorization",
+  "Squirrel.framework",
+  "Squirrel physical install",
+  "target-after=",
+]) {
+  assertContains(
+    macosUpdaterSignatureVerifier,
+    requiredVerifierContract,
+    "macOS updater signature verifier",
+  );
+}
+assert.match(
+  desktopReleasePreflight,
+  /tracked worktree changes must be committed before release/,
+  "desktop preflight should reject dirty tracked release inputs in strict mode",
+);
+assert.match(
+  desktopReleasePreflight,
+  /resources\/verify-updater-provider\.mjs/,
+  "desktop preflight should require the updater provider rehearsal",
+);
+assert.match(
+  fullDesktopReleasePreflight,
+  /verify updater provider contract[\s\S]*?electron:verify-updater-provider/,
+  "the full desktop preflight should execute the real updater provider rehearsal",
+);
+assert.match(
+  electronUpdater,
+  /set! \(\.-allowPrerelease autoUpdater\) allow-prerelease\?/,
+  "the Electron runtime should configure prerelease discovery by selfhost track",
+);
+assert.match(
+  electronUpdater,
+  /\.setFeedURL autoUpdater[\s\S]*?:provider "generic"[\s\S]*?:url feed-url/,
+  "the Electron runtime should isolate nightly discovery on GenericProvider",
+);
+assert.match(
+  electronUpdater,
+  /install-selfhost-update-support-policy![\s\S]*?default-is-update-supported update-info[\s\S]*?selfhostUpdateInfoAllowed[\s\S]*?:arch[\s\S]*?:platform[\s\S]*?:updateInfo/,
+  "the Electron runtime should preserve default support checks before validating all update metadata",
+);
+assert.match(
+  electronUpdaterConfig,
+  /-selfhost\(\?:\\\.\|\$\)/,
+  "the updater contract should identify only selfhost SemVer prereleases",
+);
+assert.match(
+  updaterProviderVerifier,
+  /GenericProvider[\s\S]*?releases\/download\/nightly/,
+  "the updater rehearsal should exercise the isolated rolling nightly feed",
+);
+assert.match(
+  updaterProviderVerifier,
+  /stable[\s\S]*nightly[\s\S]*across six platform\/architecture contracts/,
+  "the updater rehearsal should cover all six desktop targets",
+);
+assert.match(
+  desktopReleaseAssetVerifier,
+  /macosUpdaterMetadataName/,
+  "release asset verification should require the versioned macOS metadata names",
+);
+for (const needle of [
+  'path.join(resourcesDir, "app-update.yml")',
+  '["provider", /^provider:\\s*github\\s*$/m]',
+  '["owner", /^owner:\\s*cfenglv\\s*$/m]',
+  '["repo", /^repo:\\s*logseq\\s*$/m]',
+]) {
+  assertContains(
+    packagedDesktopVerifier,
+    needle,
+    "packaged desktop updater feed verification",
+  );
+}
+assert.ok(
+  packagedDesktopVerifier.indexOf("verifyProjectSignatureRuntime({") <
+    packagedDesktopVerifier.indexOf('if (expectedPlatform === "darwin")'),
+  "the packaged signature runtime gate must run before macOS-only helper and policy checks",
+);
+for (const needle of [
+  "assertRegularFile",
+  "does not match the staged release resource",
+  "project-updater-signature.mjs",
+]) {
+  assertContains(
+    packagedResourceContract,
+    needle,
+    "cross-platform packaged signature runtime contract",
+  );
+}
+for (const target of [
+  '["darwin", "x64"]',
+  '["darwin", "arm64"]',
+  '["win32", "x64"]',
+  '["win32", "arm64"]',
+  '["linux", "x64"]',
+  '["linux", "arm64"]',
+]) {
+  assertContains(
+    packagedProjectSignatureRuntimeTest,
+    target,
+    "packaged signature runtime six-target tests",
+  );
+}
+assert.match(
+  desktopSettings,
+  /openExternal fv\/releases-url/,
+  "selfhost updater errors should link to the fork release page",
+);
+assert.match(
+  desktopReleaseAssetVerifier,
+  /release artifact set mismatch/,
+  "desktop release asset verification should reject incomplete or unexpected assets",
+);
+for (const [format, pattern] of [
+  ["PE", /0x8664[\s\S]*?0xaa64/],
+  ["ELF", /machine === 62[\s\S]*?machine === 183/],
+  ["Mach-O", /0x01000007[\s\S]*?0x0100000c/],
+]) {
+  assert.match(
+    packagedDesktopVerifier,
+    pattern,
+    `packaged desktop verification should understand ${format} binaries`,
+  );
+}
 
 const shadowCljs = readText("shadow-cljs.edn");
 assertNotContains(shadowCljs, ":logseq-cli", "shadow-cljs.edn");

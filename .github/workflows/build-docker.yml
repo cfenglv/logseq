@@ -12,6 +12,9 @@ env:
 jobs:
 
   build-docker:
+    # Self-hosted desktop releases do not publish the web-app container. Keep
+    # manual and reusable invocations available for intentional Docker builds.
+    if: ${{ github.event_name != 'release' || !contains(github.event.release.tag_name, '-selfhost.') }}
     runs-on: ubuntu-22.04
 
     steps:

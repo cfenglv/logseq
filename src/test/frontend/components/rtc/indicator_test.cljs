@@ -2,6 +2,30 @@
   (:require [cljs.test :refer [deftest is]]
             [frontend.components.rtc.indicator :as indicator]))
 
+(deftest repairing-is-visible-as-busy-without-claiming-open-test
+  (is (= :syncing
+         (indicator/rtc-display-state
+          {:rtc-lock false
+           :rtc-state {:ws-state :repairing}})))
+  (is (= :close
+         (indicator/rtc-display-state
+          {:rtc-lock false
+           :rtc-state {:ws-state :repair-required}})))
+  (is (= :close
+         (indicator/rtc-display-state
+          {:rtc-lock true
+           :rtc-state {:ws-state :repair-required}}))
+      "a stale open lock must not hide the repair-required state")
+  (is (= :syncing
+         (indicator/rtc-display-state
+          {:rtc-lock true
+           :rtc-state {:ws-state :repairing}}))
+      "a stale open lock must not claim that snapshot repair is healthy")
+  (is (= :open
+         (indicator/rtc-display-state
+          {:rtc-lock true
+           :rtc-state {:ws-state :open}}))))
+
 (deftest asset-transfer-counts-counts-active-uploads-and-downloads
   (is (= {:upload 2
           :download 1}

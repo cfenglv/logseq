@@ -20,7 +20,7 @@
     (or (re-matches #"^https://twitter\.com/.*?/status/.*?$" url)
         (re-matches #"^https://x\.com/.*?/status/.*?$" url))))
 
-(defn quick-capture [args]
+(defn- quick-capture-after-math-settled [args]
   (if-let [today-page-title (db/get-today-journal-title)]
     (let [{:keys [url title content page append]} (bean/->clj args)
           title (or title "")
@@ -93,9 +93,16 @@
          (editor-handler/escape-editing)
          (when (not= page (state/get-current-page))
            (page-handler/<create! page {:redirect? redirect-page?}))
-        ;; Or else this will clear the newly inserted content
+         ;; Or else this will clear the newly inserted content
          (js/setTimeout #(editor-handler/api-insert-new-block! content {:page page
                                                                         :edit-block? true
                                                                         :replace-empty-target? true})
                         100))))
     (notification/show! (t :journal/parse-date-to-name-error) :error)))
+
+(defn quick-capture [args]
+  (editor-handler/consume-math-transition-boundary!
+   :quick-capture
+   (p/do!
+    (editor-handler/await-pending-math-transition!)
+    (quick-capture-after-math-settled args))))

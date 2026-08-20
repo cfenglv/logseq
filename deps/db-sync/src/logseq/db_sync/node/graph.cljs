@@ -41,6 +41,19 @@
 
 (defn- close-graph-context!
   [^js ctx]
+  (aset ctx "deleting" true)
+  (when-let [state (.-state ctx)]
+    (when-let [get-websockets (.-getWebSockets state)]
+      (doseq [^js socket (get-websockets)]
+        (try
+          ;; Node's terminate() closes immediately. Waiting for a close
+          ;; handshake would leave message handlers able to touch storage
+          ;; after the graph database has been deleted.
+          (if (fn? (.-terminate socket))
+            (.terminate socket)
+            (when (fn? (.-close socket))
+              (.close socket 1001 "graph deleted")))
+          (catch :default _ nil)))))
   (when-let [^js sql (.-sql ctx)]
     (when-let [close (.-close sql)]
       (close))))

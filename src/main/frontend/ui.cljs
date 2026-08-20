@@ -1143,13 +1143,19 @@
   [{:keys [selected on-select on-day-click] :as opts}]
   (let [default-on-select (or on-select on-day-click)
         on-select' (if (:datetime? opts)
-                     (fn [date value]
-                       (let [value (or (and (string? value) value)
-                                       (.-value (gdom/getElement "time-picker")))
-                             [h m] (string/split value ":")]
-                         (when (and date selected)
-                           (.setHours date h m 0))
-                         (default-on-select date)))
+                     (fn
+                       ([date value]
+                        (let [value (or (and (string? value) value)
+                                        (.-value (gdom/getElement "time-picker")))
+                              [h m] (string/split value ":")]
+                          (when (and date selected)
+                            (.setHours date h m 0))
+                          (default-on-select date)))
+                       ([chosen-date trigger-date modifiers e]
+                        (when-let [date (or chosen-date trigger-date)]
+                          (when selected
+                            (.setHours date (.getHours selected) (.getMinutes selected) 0)))
+                        (default-on-select chosen-date trigger-date modifiers e)))
                      default-on-select)]
     [:div.ls-nlp-calendar
      (single-calendar (assoc opts :on-select on-select'))

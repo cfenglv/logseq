@@ -169,16 +169,50 @@
 
   :test {:target :node-test
          :output-to "static/tests.js"
+         :prepend-js "global.React = require('react');"
          :build-hooks [(shadow.hooks/build-metadata-hook
                         {:build-time "test-build-time"
                          :revision "test-revision"})]
+         :build-options {:ns-exclude-regexp "^frontend\\.extensions\\.code-boundary-test$"
+                         :ns-aliases
+                         {electron.logger
+                          frontend.test.electron-logger-stub
+                          frontend.components.lazy-editor
+                          frontend.test.lazy-editor-stub
+                          frontend.version
+                          frontend.test.version-stub}}
          :closure-defines {frontend.util/NODETEST true
                            frontend.worker-common.util/NODETEST true
+                           frontend.worker.platform.node/TEST-SECRET-STORAGE true
                            logseq.shui.util/NODETEST true}
          :devtools {:enabled false}
          ;; disable :static-fns to allow for with-redefs and repl development
          :compiler-options {:static-fns false}
          :main frontend.test.frontend-node-test-runner/main}
+
+  ;; CodeMirror imports browser-only modules at namespace load. Keep its actual
+  ;; callback tests in an isolated node target whose fixture exists before any
+  ;; module is required; the ordinary frontend node suite must stay DOM-free.
+  :math-code-boundary-test
+  {:target :node-test
+   :output-to "static/math-code-boundary-tests.js"
+   :ns-regexp "^frontend\\.extensions\\.code-boundary-test$"
+   :prepend-js "require('../scripts/fixtures/math-code-boundary-preload.cjs'); global.React = require('react');"
+   :js-options {:js-package-dirs ["scripts/fixtures/math-code-node-modules"
+                                  "node_modules"]}
+   :build-hooks [(shadow.hooks/build-metadata-hook
+                  {:build-time "test-build-time"
+                   :revision "test-revision"})]
+   :build-options {:ns-aliases
+                   {electron.logger frontend.test.electron-logger-stub
+                    frontend.components.lazy-editor frontend.test.lazy-editor-stub
+                    frontend.version frontend.test.version-stub}}
+   :closure-defines {frontend.util/NODETEST true
+                     frontend.worker-common.util/NODETEST true
+                     logseq.shui.util/NODETEST true}
+   :devtools {:enabled false}
+   :compiler-options {:static-fns false}
+   :main frontend.test.frontend-node-test-runner/main}
 
   :test-no-worker {:target :node-test
                    :output-to "static/tests-no-worker.js"
@@ -189,10 +223,55 @@
                                      frontend.worker-common.util/NODETEST true
                                      logseq.shui.util/NODETEST true}
                    :devtools {:enabled false}
-                   :build-options {:ns-exclude-regexp "^(frontend\\.worker|logseq\\.db-sync\\.worker)"}
+                   :build-options {:ns-exclude-regexp "^(frontend\\.worker|logseq\\.db-sync\\.worker|frontend\\.extensions\\.code-boundary-test$)"}
                    ;; disable :static-fns to allow for with-redefs and repl development
                    :compiler-options {:static-fns false}
                    :main frontend.test.frontend-node-test-runner/main}
+
+  :worker-system-kv-guard-test
+  {:target :node-script
+   :output-to "static/worker-system-kv-guard-tests.js"
+   :main logseq.db-sync.worker-system-kv-guard-test-runner/main
+   :closure-defines {frontend.util/NODETEST true
+                     frontend.worker-common.util/NODETEST true
+                     logseq.shui.util/NODETEST true}
+   :devtools {:enabled false}
+   :compiler-options {:static-fns false}}
+
+  ;; Dedicated RTC regression runner. Keeping this as a node-script avoids
+  ;; loading unrelated Electron/UI test namespaces before the selected tests.
+  :missing-system-kv-test
+  {:target :node-script
+   :output-to "static/missing-system-kv-tests.js"
+   :main frontend.worker.sync.missing-system-kv-runner/main
+   :build-options {:ns-aliases
+                   {electron.logger
+                    frontend.test.electron-logger-stub
+                    frontend.components.lazy-editor
+                    frontend.test.lazy-editor-stub
+                    frontend.version
+                    frontend.test.version-stub}}
+   :closure-defines {frontend.util/NODETEST true
+                     frontend.worker-common.util/NODETEST true
+                     frontend.worker.platform.node/TEST-SECRET-STORAGE true
+                     logseq.shui.util/NODETEST true}
+   :devtools {:enabled false}
+   :compiler-options {:static-fns false}}
+
+  :electron-project-signature-loader-contract
+  {:target :node-script
+   :output-to "static/electron-project-signature-loader-contract.js"
+   :main electron.project-signature-loader-contract/main
+   :compiler-options {:infer-externs :auto}
+   :devtools {:enabled false}}
+
+  :db-sync-backup-memory-test
+  {:target :node-script
+   :output-to "static/db-sync-backup-memory-test.js"
+   :main frontend.worker.db-sync-backup-memory-test-runner/main
+   :closure-defines {frontend.worker-common.util/NODETEST true
+                     frontend.worker.platform.node/TEST-SECRET-STORAGE true}
+   :devtools {:enabled false}}
 
   :gen-malli-kondo-config {:target :node-script
                            :build-hooks [(shadow.hooks/build-metadata-hook "--long --always --dirty")]

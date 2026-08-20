@@ -43,6 +43,43 @@
 (defonce *db-sync-config (atom {:ws-url nil}))
 (defonce *db-sync-client (atom nil))
 
+;; Snapshot activation replaces the live DB and its client-op sidecar. Keep the
+;; destructive interval short, but queue ordinary UI transactions behind it so
+;; an edit cannot land between the final pending-op preflight and the file
+;; switch. Network download and staging never hold this gate.
+(defonce *snapshot-activation-gates (atom {}))
+
+(defn acquire-snapshot-activation-gate!
+  [repo]
+  (when (contains? @*snapshot-activation-gates repo)
+    (throw (ex-info "snapshot activation already in progress"
+                    {:type :db-sync/snapshot-activation-in-progress
+                     :repo repo})))
+  (let [lease-id (str (random-uuid))
+        resolve* (atom nil)
+        promise (js/Promise. (fn [resolve _reject]
+                              (reset! resolve* resolve)))
+        release! (fn []
+                   (let [released? (atom false)]
+                     (swap! *snapshot-activation-gates
+                            (fn [gates]
+                              (if (= lease-id (get-in gates [repo :lease-id]))
+                                (do
+                                  (reset! released? true)
+                                  (dissoc gates repo))
+                                gates)))
+                     (when @released?
+                       (@resolve* nil))))]
+    (swap! *snapshot-activation-gates
+           assoc repo {:lease-id lease-id
+                       :promise promise})
+    {:lease-id lease-id
+     :release! release!}))
+
+(defn snapshot-activation-promise
+  [repo]
+  (get-in @*snapshot-activation-gates [repo :promise]))
+
 (defonce *sqlite (atom nil))
 ;; repo -> {:db conn :search conn :client-ops conn}
 (defonce *sqlite-conns (atom {}))
@@ -131,7 +168,10 @@
 (defn online?
   []
   (if (node-runtime?)
-    (node-online?)
+    (let [online-event @(:thread-atom/online-event @*state)]
+      (if (boolean? online-event)
+        online-event
+        (node-online?)))
     @(:thread-atom/online-event @*state)))
 
 (comment

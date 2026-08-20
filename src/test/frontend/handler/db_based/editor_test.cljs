@@ -51,6 +51,54 @@
           (db-editor-handler/wrap-parse-block {:block/title " \n$$\n  E = mc^2  \n$$\n "})
           [:block/title :logseq.property.node/display-type]))))
 
+(deftest wrap-parse-block-normalizes-only-whole-damaged-math-title-test
+  (let [block-uuid #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        existing-math {:db/id 12
+                       :block/uuid block-uuid
+                       :block/title "x"
+                       :logseq.property.node/display-type :math}]
+    (with-redefs [db/entity (constantly existing-math)]
+      (testing "one proven outer display layer is removed, including empty Math"
+        (is (= "x"
+               (:block/title
+                (db-editor-handler/wrap-parse-block
+                 {:block/uuid block-uuid :block/title "$$x$$"}))))
+        (is (= ""
+               (:block/title
+                (db-editor-handler/wrap-parse-block
+                 {:block/uuid block-uuid :block/title "$$$$"})))))
+      (testing "text, multiple formulas, inline and escaped dollars are never guessed"
+        (doseq [title ["prefix $$x$$"
+                       "$$x$$ suffix"
+                       "$$x$$\n$$y$$"
+                       "$x$"
+                       "\\$5 + x"]]
+          (is (= title
+                 (:block/title
+                  (db-editor-handler/wrap-parse-block
+                   {:block/uuid block-uuid :block/title title})))
+              title))))))
+
+(deftest generic-save-does-not-change-an-ordinary-block-to-math-test
+  (let [block-uuid #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        ordinary {:db/id 12
+                  :block/uuid block-uuid
+                  :block/title "ordinary"}]
+    (with-redefs [db/entity (constantly ordinary)]
+      (doseq [title ["$$x$$" "$$$$"]]
+        (let [result (db-editor-handler/wrap-parse-block
+                      {:block/uuid block-uuid :block/title title}
+                      {:allow-math-display-type-conversion? false})]
+          (is (= title (:block/title result)))
+          (is (nil? (:logseq.property.node/display-type result)))))
+      (testing "the Math guard does not disable the existing Code conversion"
+        (let [result (db-editor-handler/wrap-parse-block
+                      {:block/uuid block-uuid
+                       :block/title "```clojure\n(+ 1 2)\n```"}
+                      {:allow-math-display-type-conversion? false})]
+          (is (= :code (:logseq.property.node/display-type result)))
+          (is (= "(+ 1 2)" (:block/title result))))))))
+
 (deftest wrap-parse-block-markdown-hashtag-link-test
   (testing "markdown link targets that resolve to existing hashtag pages are saved as refs"
     (let [tag-uuid #uuid "5c6cd067-c602-4955-96b8-74b62e08113c"

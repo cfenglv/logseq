@@ -318,8 +318,62 @@
   (let [progress-atom (get @state/state :rtc/asset-upload-download-progress)
         progress (get (or (some-> progress-atom deref) {}) repo)]
     (when (should-request-remote-asset-download? repo asset-block file-ready? progress)
-      (state/<invoke-db-worker
-       :thread-api/db-sync-request-asset-download
-       repo
-       (:block/uuid asset-block))
-      true)))
+      (-> (state/<invoke-db-worker
+           :thread-api/db-sync-request-asset-download
+           repo
+           (:block/uuid asset-block))
+          (p/then boolean)))))
+
+(defn request-remote-asset-download-once!
+  "Starts one remote download per mounted asset until it either completes or
+  fails. A failure releases the latch so a later render or connectivity-state
+  transition can retry without restarting the application."
+  [repo asset-block file-ready? requested?]
+  (when (and @requested? file-ready?)
+    (reset! requested? false))
+  (when-not @requested?
+    (when-let [request (maybe-request-remote-asset-download!
+                        repo asset-block file-ready?)]
+      (reset! requested? true)
+      (-> request
+          (p/then (fn [requested-download?]
+                    (when-not requested-download?
+                      (reset! requested? false))
+                    requested-download?))
+          (p/catch (fn [_error]
+                     (reset! requested? false)
+                     false))))))
+
+(def remote-asset-download-retry-delays-ms
+  [1000 3000 10000 30000 60000])
+
+(def remote-asset-download-steady-retry-ms
+  (* 5 60 1000))
+
+(defn schedule-remote-asset-download-retry!
+  "Schedules one deduplicated UI retry and returns true when a timer was
+  created. Fast retries are bounded; afterwards one low-frequency timer keeps
+  recovery alive without a hot loop or an application restart."
+  ([timer* attempt* retry-f]
+   (schedule-remote-asset-download-retry!
+    timer* attempt* retry-f js/setTimeout))
+  ([timer* attempt* retry-f set-timeout-f]
+   (if (some? @timer*)
+     false
+     (let [delay (or (get remote-asset-download-retry-delays-ms @attempt*)
+                     remote-asset-download-steady-retry-ms)]
+       (swap! attempt* inc)
+       (reset! timer*
+               (set-timeout-f
+                (fn []
+                  (reset! timer* nil)
+                  (retry-f))
+                delay))
+       true))))
+
+(defn cancel-remote-asset-download-retry!
+  [timer*]
+  (when-let [timer @timer*]
+    (js/clearTimeout timer)
+    (reset! timer* nil))
+  nil)

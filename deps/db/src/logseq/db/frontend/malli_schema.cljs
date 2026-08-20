@@ -8,6 +8,7 @@
             [logseq.db.common.order :as db-order]
             [logseq.db.frontend.class :as db-class]
             [logseq.db.frontend.entity-util :as entity-util]
+            [logseq.db.frontend.kv-entity :as kv-entity]
             [logseq.db.frontend.property :as db-property]
             [logseq.db.frontend.property.type :as db-property-type]
             [logseq.db.frontend.schema :as db-schema]))
@@ -136,8 +137,28 @@
   what the frontend property since they both call validate-property-value"
   [property]
   ;; use explicit call to be nbb compatible
-  (let [closed-values (entity-plus/lookup-kv-then-entity property :property/closed-values)]
-    (cond-> (select-keys property [:db/ident :db/valueType :db/cardinality :logseq.property/type])
+  (let [ident (:db/ident property)
+        stored-property (select-keys property [:db/ident :db/valueType :db/cardinality
+                                               :logseq.property/type])
+        ;; Some legacy remote graphs contain only the ident for built-in
+        ;; properties. Use the shipped definition only when the stored type is
+        ;; absent; explicit stored schema remains authoritative and is validated.
+        built-in-schema (when (nil? (:logseq.property/type stored-property))
+                          (when-let [property-type
+                                     (get-in db-property/built-in-properties [ident :schema :type])]
+                            (cond-> {:db/ident ident
+                                     :db/cardinality
+                                     (if (= :many
+                                            (get-in db-property/built-in-properties
+                                                    [ident :schema :cardinality]))
+                                       :db.cardinality/many
+                                       :db.cardinality/one)
+                                     :logseq.property/type property-type}
+                              (contains? db-property-type/all-ref-property-types property-type)
+                              (assoc :db/valueType :db.type/ref))))
+        validation-property (merge built-in-schema stored-property)
+        closed-values (entity-plus/lookup-kv-then-entity property :property/closed-values)]
+    (cond-> validation-property
       (seq closed-values)
       (assoc :property/closed-values closed-values))))
 
@@ -538,6 +559,16 @@
    [:kv/value :any]
    [:block/tx-id {:optional true} :int]])
 
+(def system-kv-ident
+  (into [:enum] (keys kv-entity/kv-entities)))
+
+(def system-kv
+  "A registered system KV may retain its ident after its value is retracted."
+  [:map {:error/path ["system-kv"]}
+   [:db/ident system-kv-ident]
+   [:kv/value {:optional true} :any]
+   [:block/tx-id {:optional true} :int]])
+
 (def property-value-placeholder
   [:map {:error/path ["property-value-placeholder"]}
    [:db/ident [:= :logseq.property/empty-placeholder]]
@@ -586,6 +617,8 @@
                        :property-value-placeholder
                        (:block/uuid d)
                        :block
+                       (contains? kv-entity/kv-entities (:db/ident d))
+                       :system-kv
                        (:db/ident d)
                        :db-ident-key-value)]
     dispatch-key))
@@ -604,6 +637,7 @@
     :block block
     :asset-block asset-block
     :file-block file-block
+    :system-kv system-kv
     :db-ident-key-value db-ident-key-val
     :property-value-placeholder property-value-placeholder}))
 
@@ -637,7 +671,8 @@
 
 (let [malli-non-ref-attrs (->> (concat property-attrs page-attrs block-attrs page-or-block-attrs (rest normal-page))
                                (concat (rest file-block) (rest property-value-block)
-                                       (rest db-ident-key-val) (rest internal-property))
+                                       (rest db-ident-key-val) (rest system-kv)
+                                       (rest internal-property))
                                (remove #(= (last %) [:set :int]))
                                (map first)
                                set)]

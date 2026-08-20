@@ -1,21 +1,39 @@
 (ns frontend.handler.editor-async-test
-  (:require [cljs.test :refer [deftest is testing async use-fixtures]]
+  (:require ["react" :as react]
+            ["react-dom/server" :as react-dom-server]
+            [cljs.test :refer [deftest is testing async use-fixtures]]
             [datascript.core :as d]
+            [dommy.core :as dom]
+            [frontend.components.block :as block-component]
             [frontend.components.block.comments-model :as comments-model]
+            [frontend.components.editor :as editor-component]
+            [frontend.components.property.value :as property-value]
             [frontend.db :as db]
             [frontend.db.async :as db-async]
             [frontend.db.model :as db-model]
+            [frontend.db.transact :as db-transact]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.block :as block-handler]
             [frontend.handler.comments :as comments-handler]
             [frontend.handler.db-based.property :as db-property-handler]
             [frontend.handler.editor :as editor]
+            [frontend.handler.events :as events]
+            [frontend.handler.property :as property-handler]
+            [frontend.mobile.intent :as mobile-intent]
+            [frontend.mobile.util :as mobile-util]
             [frontend.modules.outliner.op :as outliner-op]
+            [frontend.quick-capture :as quick-capture]
             [frontend.state :as state]
             [frontend.test.helper :as test-helper :include-macros true :refer [deftest-async load-test-files]]
             [frontend.util :as util]
+            [frontend.util.cursor :as cursor]
             [goog.dom :as gdom]
+            [logseq.api.editor :as editor-api]
             [logseq.db :as ldb]
+            [logseq.db.frontend.property :as db-property]
+            [logseq.shui.hooks :as hooks]
+            [logseq.shui.ui :as shui]
+            [mobile.navigation :as mobile-nav]
             [promesa.core :as p]))
 
 (defonce ^:private *previous-state (atom nil))
@@ -39,6 +57,922 @@
     {:event #js {:preventDefault #(reset! stopped? true)
                  :stopPropagation #(reset! stopped? true)}
      :stopped? stopped?}))
+
+(defn- math-transition-input
+  [value]
+  (let [focused? (atom false)
+        input #js {:id "edit-block-math-transition"
+                   :value value
+                   :selectionStart (count value)
+                   :selectionEnd (count value)}]
+    (set! (.-setSelectionRange input)
+          (fn [start end]
+            (set! (.-selectionStart input) start)
+            (set! (.-selectionEnd input) end)))
+    (set! (.-focus input) #(reset! focused? true))
+    {:input input
+     :focused? focused?}))
+
+(deftest-async pending-math-transition-blocks-escape-until-success
+  (let [block {:db/id 1
+               :block/uuid (random-uuid)
+               :block/title "ordinary"}
+        *editing-block (atom block)
+        transition (p/deferred)
+        {:keys [input]} (math-transition-input "$$x$$")
+        calls (atom [])]
+    (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                    state/get-editor-args (constantly nil)
+                    state/get-input (constantly input)
+                    state/get-edit-input-id (constantly (.-id input))
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/set-block-content-and-last-pos!
+                    (fn [_ title pos]
+                      (set! (.-value input) title)
+                      (.setSelectionRange input pos pos))
+                    state/set-state! (fn [path value]
+                                       (when (= :editor/block path)
+                                         (reset! *editing-block value)))
+                    state/pub-event! (constantly transition)
+                    state/clear-edit! #(swap! calls conj :clear)
+                    db/entity (constantly block)
+                    editor/save-current-block! #(swap! calls conj :save)]
+      (is (#'editor/maybe-convert-current-block-to-math!
+           (.-id input) "$$x$$" 5 5))
+      (let [exit-result (editor/escape-editing)]
+        (is (empty? @calls)
+            "Escape/blur must not save or clear while the block transition is pending")
+        (p/resolve! transition :committed)
+        (p/let [_ exit-result]
+          (is (= [:save :clear] @calls)))))))
+
+(deftest-async rejected-empty-math-transition-rolls-back-before-exit
+  (let [block {:db/id 1
+               :block/uuid (random-uuid)
+               :block/title "ordinary"}
+        *editing-block (atom block)
+        transition (p/deferred)
+        {:keys [input focused?]} (math-transition-input "$$$$")
+        calls (atom [])]
+    (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                    state/get-editor-args (constantly nil)
+                    state/get-input (constantly input)
+                    state/get-edit-input-id (constantly (.-id input))
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/set-block-content-and-last-pos!
+                    (fn [_ title pos]
+                      (set! (.-value input) title)
+                      (.setSelectionRange input pos pos))
+                    state/set-state! (fn [path value]
+                                       (when (= :editor/block path)
+                                         (reset! *editing-block value)))
+                    state/pub-event!
+                    (fn [[_ {:keys [math-transition-rollback]}]]
+                      (-> transition
+                          (p/catch (fn [error]
+                                     (editor/rollback-math-transition!
+                                      math-transition-rollback)
+                                     (p/rejected error)))))
+                    state/clear-edit! #(swap! calls conj [:clear (.-value input)])
+                    db/entity (constantly block)
+                    editor/save-current-block!
+                    #(swap! calls conj [:save
+                                        (.-value input)
+                                        (:logseq.property.node/display-type
+                                         @*editing-block)])]
+      (is (#'editor/maybe-convert-current-block-to-math!
+           (.-id input) "$$$$" 4 4))
+      (is (= "" (.-value input)) "The optimistic state is canonical Math")
+      (let [exit-result (editor/escape-editing)
+            failure (ex-info "synthetic Math rejection" {})]
+        (is (empty? @calls))
+        (p/reject! transition failure)
+        (p/let [_ exit-result]
+          (is (= [[:save "$$$$" nil]
+                  [:clear "$$$$"]]
+                 @calls)
+              "The original ordinary delimiters must be restored before save/exit")
+          (is (= 4 (.-selectionStart input)))
+          (is @focused?))))))
+
+(deftest-async target-pointerdown-and-outside-hook-wait-for-old-math-rollback
+  (let [old-block {:db/id 1 :block/uuid (random-uuid) :block/title "$$$$"}
+        target-block {:db/id 2 :block/uuid (random-uuid) :block/title "target"}
+        *editing-block (atom old-block)
+        transition (p/deferred)
+        {:keys [input focused?]} (math-transition-input "$$$$")
+        calls (atom [])
+        block-element #js {}
+        target #js {:classList #js {:contains (constantly false)}
+                    :closest (constantly nil)}
+        suppressed (atom [])
+        pointer-event #js {:target target :buttons 1 :shiftKey false
+                           :preventDefault #(swap! suppressed conj :prevent-default)
+                           :stopPropagation #(swap! suppressed conj :stop-propagation)}
+        outside-event #js {:type "mousedown" :target target}]
+    (set! (.-getElementsByClassName block-element) (fn [_] #js []))
+    (swap! state/state assoc :ui/scrolling? (atom false))
+    (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                    state/get-editor-args (constantly nil)
+                    state/get-editor-action (constantly nil)
+                    state/editor-in-composition? (constantly false)
+                    state/get-input (constantly input)
+                    state/get-edit-input-id (constantly (.-id input))
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/get-selection-blocks (constantly [])
+                    state/get-selection-start-block-or-first (constantly nil)
+                    state/block-content-max-length (constantly 10000)
+                    state/set-block-content-and-last-pos!
+                    (fn [_ title pos]
+                      (set! (.-value input) title)
+                      (.setSelectionRange input pos pos))
+                    state/set-state! (fn [path value]
+                                       (when (= :editor/block path)
+                                         (reset! *editing-block value)))
+                    state/pub-event!
+                    (fn [[event payload]]
+                      (case event
+                        :editor/upsert-type-block
+                        (-> transition
+                            (p/catch (fn [error]
+                                       (editor/rollback-math-transition!
+                                        (:math-transition-rollback payload))
+                                       (p/rejected error))))
+                        :editor/save-code-editor (p/resolved nil)
+                        (p/resolved nil)))
+                    state/set-editing! (fn [_ _ block & _]
+                                         (swap! calls conj [:switch (:block/uuid block)])
+                                         (reset! *editing-block block))
+                    state/set-selection-start-block! (constantly nil)
+                    state/clear-edit! #(swap! calls conj [:clear (:block/uuid @*editing-block)])
+                    db/entity (fn [lookup]
+                                (cond
+                                  (contains? #{1 [:block/uuid (:block/uuid old-block)]} lookup) old-block
+                                  (contains? #{2 [:block/uuid (:block/uuid target-block)]} lookup) target-block))
+                    db/get-db (constantly ::db)
+                    db-async/<get-block (fn [& _] (p/resolved target-block))
+                    editor/save-current-block!
+                    #(swap! calls conj [:save (:block/uuid @*editing-block)
+                                        (.-value input)
+                                        (:logseq.property.node/display-type @*editing-block)])
+                    editor/clear-selection! (constantly nil)
+                    editor/unhighlight-blocks! (constantly nil)
+                    mobile-util/mobile-focus-hidden-input (constantly nil)
+                    util/mobile? (constantly false)
+                    util/meta-key? (constantly false)
+                    util/rec-get-node (fn [_ class-name]
+                                        (when (= "ls-block" class-name) block-element))
+                    util/link? (constantly false)
+                    util/time? (constantly false)
+                    util/input? (constantly false)
+                    util/audio? (constantly false)
+                    util/video? (constantly false)
+                    util/details-or-summary? (constantly false)
+                    util/sup? (constantly false)
+                    dom/has-class? (constantly false)
+                    dom/closest (constantly nil)]
+      (is (#'editor/maybe-convert-current-block-to-math!
+           (.-id input) "$$$$" 4 4))
+      ;; This mirrors browser order: target pointerdown runs before the window
+      ;; mousedown outside hook. Both returned promises are retained so the
+      ;; deferred can be rejected without p/with-redefs awaiting either first.
+      (let [pointer-result (#'block-component/block-content-on-pointer-down
+                            pointer-event target-block "target" "edit-target" "target"
+                            {:container-id 17})
+            outside-result (#'editor-component/editor-on-hide
+                            {:config nil} :click outside-event true)]
+        (is (empty? @calls)
+            "Neither target handler nor outside hook may save/switch while pending")
+        (is (= [:prevent-default :stop-propagation] @suppressed)
+            "The central barrier synchronously suppresses the pending pointer event")
+        (p/reject! transition (ex-info "synthetic rejection" {}))
+        (p/let [_ (p/all [pointer-result outside-result])]
+          (is @focused?)
+          (is (= "$$$$" (.-value input)))
+          (is (= (:block/uuid target-block) (:block/uuid @*editing-block)))
+          (is (= [:save (:block/uuid old-block) "$$$$" nil]
+                 (first @calls))
+              "Rollback must restore the old UUID before any generic save")
+          (is (= [:switch (:block/uuid target-block)] (last @calls))))))))
+
+(deftest-async pending-math-transition-blocks-enter-and-selection-navigation
+  (let [block {:db/id 1
+               :block/uuid (random-uuid)
+               :block/title "ordinary"}
+        *editing-block (atom block)
+        transition (p/deferred)
+        {:keys [input]} (math-transition-input "$$x$$")
+        calls (atom [])
+        container #js {}]
+    (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                    state/get-editor-args (constantly nil)
+                    state/get-input (constantly input)
+                    state/get-edit-input-id (constantly (.-id input))
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/get-editor-block-container (constantly container)
+                    state/editing? (constantly true)
+                    state/selection? (constantly false)
+                    state/doc-mode-enter-for-new-line? (constantly false)
+                    state/set-block-content-and-last-pos!
+                    (fn [_ title pos]
+                      (set! (.-value input) title)
+                      (.setSelectionRange input pos pos))
+                    state/set-state! (fn [path value]
+                                       (when (= :editor/block path)
+                                         (reset! *editing-block value)))
+                    state/pub-event! (constantly transition)
+                    state/exit-editing-and-set-selected-blocks!
+                    (fn [& _] (swap! calls conj :navigate))
+                    db/entity (constantly block)
+                    editor/get-state (constantly {:node nil})
+                    editor/inside-of-single-block (constantly false)
+                    editor/keydown-new-block (fn [_] (swap! calls conj :enter))
+                    editor/save-current-block! #(swap! calls conj :save)
+                    util/scroll-to-block (constantly nil)]
+      (is (#'editor/maybe-convert-current-block-to-math!
+           (.-id input) "$$x$$" 5 5))
+      ;; Keep both returned Promises as values. `p/with-redefs` sequences its
+      ;; top-level forms, so placing either call in a separate form would await
+      ;; it before this test can settle the transition.
+      (let [enter-result (editor/keydown-new-block-handler nil)
+            navigation-result (#'editor/select-block-up-down :down)]
+        (is (empty? @calls)
+            "Enter and keyboard navigation must not mutate/exit before settlement")
+        (p/resolve! transition :committed)
+        (p/let [_ (p/all [enter-result navigation-result])]
+          (is (= 1 (count (filter #{:enter} @calls))))
+          (is (= [:save :navigate]
+                 (filterv #{:save :navigate} @calls))))))))
+
+(deftest-async settled-math-transition-token-rejects-stale-rollback
+  (let [block {:db/id 1
+               :block/uuid (random-uuid)
+               :block/title "ordinary"}
+        *editing-block (atom block)
+        transition (p/deferred)
+        {:keys [input]} (math-transition-input "$$x$$")
+        rollback (atom nil)]
+    (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                    state/get-editor-args (constantly nil)
+                    state/get-input (constantly input)
+                    state/set-block-content-and-last-pos!
+                    (fn [_ title pos]
+                      (set! (.-value input) title)
+                      (.setSelectionRange input pos pos))
+                    state/set-state! (fn [path value]
+                                       (when (= :editor/block path)
+                                         (reset! *editing-block value)))
+                    state/pub-event! (fn [[_ payload]]
+                                       (reset! rollback (:math-transition-rollback payload))
+                                       transition)
+                    db/entity (constantly block)]
+      (is (#'editor/maybe-convert-current-block-to-math!
+           (.-id input) "$$x$$" 5 5))
+      (is (uuid? (:transition-token @rollback))
+          "Every optimistic transition needs a unique rollback token")
+      (p/resolve! transition :committed)
+      (p/let [_ (p/delay 0)]
+        (reset! *editing-block (assoc block :block/title "newer ordinary"))
+        (set! (.-value input) "newer ordinary")
+        (editor/rollback-math-transition! @rollback)
+        (is (= "newer ordinary" (.-value input)))
+        (is (= "newer ordinary" (:block/title @*editing-block))
+            "A settled/stale token cannot roll back a later state on the same UUID")))))
+
+(deftest-async committed-math-transition-is-one-real-db-and-editor-unit
+  (load-test-files
+   [{:page {:block/title "Math atomic lifecycle"}
+     :blocks [{:block/title "$$$$"}]}])
+  (let [block (test-helper/find-block-by-content "$$$$")
+        block-uuid (:block/uuid block)
+        *editing-block (atom block)
+        {:keys [input]} (math-transition-input "$$$$")
+        tx-reports (atom [])
+        previous-document (.-document js/globalThis)
+        listener-key ::math-transition]
+    (d/listen! (db/get-db test-helper/test-db false) listener-key
+               #(when (= :upsert-type-block (get-in % [:tx-meta :outliner-op]))
+                  (swap! tx-reports conj %)))
+    (set! (.-document js/globalThis) #js {:activeElement input})
+    (->
+     (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                     state/get-editor-args (constantly nil)
+                     state/get-input (constantly input)
+                     state/get-edit-input-id (constantly (.-id input))
+                     state/get-current-repo (constantly test-helper/test-db)
+                     state/set-block-content-and-last-pos!
+                     (fn [_ title pos]
+                       (set! (.-value input) title)
+                       (.setSelectionRange input pos pos))
+                     state/set-state! (fn [path value]
+                                        (when (= :editor/block path)
+                                          (reset! *editing-block value)))
+                     state/pub-event! events/handle]
+       (is (#'editor/maybe-convert-current-block-to-math!
+            (.-id input) "$$$$" 4 4))
+       (let [await-fn (resolve 'frontend.handler.editor/await-pending-math-transition!)]
+         (is (fn? await-fn))
+         (p/let [_ (if (fn? await-fn)
+                     (await-fn block-uuid)
+                     (p/resolved nil))
+                 committed (db/entity [:block/uuid block-uuid])]
+           (is (= ["" :math]
+                  [(:block/title committed)
+                   (:logseq.property.node/display-type committed)]))
+           (is (= ["" 0 0]
+                  [(.-value input) (.-selectionStart input) (.-selectionEnd input)]))
+           (is (identical? input (.-activeElement js/document)))
+           (is (= 1 (count @tx-reports))
+               "Title and type must be one real transaction and therefore one undo unit"))))
+     (p/finally (fn []
+                  (d/unlisten! (db/get-db test-helper/test-db false) listener-key)
+                  (set! (.-document js/globalThis) previous-document))))))
+
+(deftest-async rejected-empty-math-real-apply-has-no-partial-title-or-type
+  (load-test-files
+   [{:page {:block/title "Math rejected lifecycle"}
+     :blocks [{:block/title "$$$$"}]}])
+  (let [block (test-helper/find-block-by-content "$$$$")
+        block-uuid (:block/uuid block)
+        *editing-block (atom block)
+        {:keys [input focused?]} (math-transition-input "$$$$")
+        real-apply-outliner-ops db-transact/apply-outliner-ops
+        apply-called? (atom false)]
+    (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                    state/get-editor-args (constantly nil)
+                    state/get-input (constantly input)
+                    state/get-edit-input-id (constantly (.-id input))
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/set-block-content-and-last-pos!
+                    (fn [_ title pos]
+                      (set! (.-value input) title)
+                      (.setSelectionRange input pos pos))
+                    state/set-state! (fn [path value]
+                                       (when (= :editor/block path)
+                                         (reset! *editing-block value)))
+                    state/pub-event! events/handle
+                    db-transact/apply-outliner-ops
+                    (fn [conn ops opts]
+                      (reset! apply-called? true)
+                      (try
+                        ;; The valid Math save is applied to the real temporary
+                        ;; transaction before this valid-shaped second op
+                        ;; rejects. The batch must publish neither change.
+                        (real-apply-outliner-ops
+                         conn
+                         (conj (vec ops) [:rename-page [block-uuid ""]])
+                         opts)
+                        (catch :default error
+                          (p/rejected error))))]
+      (is (#'editor/maybe-convert-current-block-to-math!
+           (.-id input) "$$$$" 4 4))
+      (p/let [outcome (editor/await-pending-math-transition! block-uuid)
+              persisted (db/entity [:block/uuid block-uuid])]
+        (is @apply-called? "The rejection must come from the real DB apply path")
+        (is (= :rolled-back (:status outcome)))
+        (is (= ["$$$$" nil]
+               [(:block/title persisted)
+                (:logseq.property.node/display-type persisted)])
+            "Rejected real batch apply must leave the DB wholly ordinary")
+        (is (= "$$$$" (.-value input)))
+        (is (= 4 (.-selectionStart input)))
+        (is @focused?)))))
+
+(deftest-async postcommit-math-readback-mismatch-restores-db-before-ui-rollback
+  (load-test-files
+   [{:page {:block/title "Math postcommit mismatch lifecycle"}
+     :blocks [{:block/title "$$$$"}]}])
+  (let [block (test-helper/find-block-by-content "$$$$")
+        block-uuid (:block/uuid block)
+        *editing-block (atom block)
+        {:keys [input focused?]} (math-transition-input "$$$$")
+        real-apply-outliner-ops db-transact/apply-outliner-ops
+        real-db-entity db/entity
+        committed? (atom false)
+        mismatch-served? (atom false)
+        tx-reports (atom [])
+        listener-key ::math-postcommit-mismatch]
+    (d/listen! (db/get-db test-helper/test-db false) listener-key
+               #(swap! tx-reports conj %))
+    (->
+     (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                     state/get-editor-args (constantly nil)
+                     state/get-input (constantly input)
+                     state/get-edit-input-id (constantly (.-id input))
+                     state/get-current-repo (constantly test-helper/test-db)
+                     state/set-block-content-and-last-pos!
+                     (fn [_ title pos]
+                       (set! (.-value input) title)
+                       (.setSelectionRange input pos pos))
+                     state/set-state! (fn [path value]
+                                        (when (= :editor/block path)
+                                          (reset! *editing-block value)))
+                     state/pub-event! events/handle
+                     db-transact/apply-outliner-ops
+                     (fn [conn ops opts]
+                       (p/let [result (real-apply-outliner-ops conn ops opts)
+                               _ (reset! committed? true)]
+                         result))
+                     db/entity
+                     (fn [lookup]
+                       (let [entity (real-db-entity lookup)]
+                         (if (and @committed?
+                                  (= lookup [:block/uuid block-uuid])
+                                  (compare-and-set! mismatch-served? false true))
+                           (assoc entity :block/title "forced postcommit mismatch")
+                           entity)))]
+       (is (#'editor/maybe-convert-current-block-to-math!
+            (.-id input) "$$$$" 4 4))
+       (p/let [outcome (editor/await-pending-math-transition! block-uuid)
+               persisted (real-db-entity [:block/uuid block-uuid])]
+         (is @mismatch-served?)
+         (is (= :rolled-back (:status outcome)))
+         (is (= ["$$$$" nil]
+                [(:block/title persisted)
+                 (:logseq.property.node/display-type persisted)])
+             "DB preimage must be restored before the editor becomes ordinary")
+         (is (= ["$$$$" nil]
+                [(.-value input)
+                 (:logseq.property.node/display-type @*editing-block)]))
+         (is @focused?)
+         (is (= 2 (count @tx-reports))
+             "The committed Math tx requires one real compensating tx")))
+     (p/finally
+      (fn []
+        (d/unlisten! (db/get-db test-helper/test-db false) listener-key))))))
+
+(defn- <caught-result
+  [promise]
+  ;; Resolve both branches explicitly so the test observes the rejection
+  ;; without asking the async test harness to treat it as a test failure.
+  (js/Promise.
+   (fn [resolve _reject]
+     (.then (p/promise promise)
+            (fn [value] (resolve {:unexpected-resolution value}))
+            resolve))))
+
+(defn- <wait-for-value
+  ([*value expected]
+   (<wait-for-value *value expected (+ (js/Date.now) 1000)))
+  ([*value expected deadline-ms]
+   (cond
+     (= expected @*value)
+     (p/resolved nil)
+
+     (>= (js/Date.now) deadline-ms)
+     (p/rejected
+      (ex-info "Timed out waiting for test state"
+               {:expected expected :actual @*value}))
+
+     :else
+     (p/let [_ (p/delay 0)]
+       (<wait-for-value *value expected deadline-ms)))))
+
+(defn- <assert-math-recovery-failure-stays-fail-closed!
+  [restore-mode]
+  (let [block (test-helper/find-block-by-content "$$$$")
+        block-uuid (:block/uuid block)
+        target-block (test-helper/find-block-by-content "target")
+        *editing-block (atom block)
+        {:keys [input]} (math-transition-input "$$$$")
+        real-apply-outliner-ops db-transact/apply-outliner-ops
+        real-db-entity db/entity
+        apply-count (atom 0)
+        committed? (atom false)
+        mismatch-served? (atom false)
+        restore-result (p/deferred)
+        side-effects (atom [])
+        expected-error-data {:type :math-transition/recovery-failed}]
+    (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                    state/get-editor-args (constantly nil)
+                    state/get-input (constantly input)
+                    state/get-edit-input-id (constantly (.-id input))
+                    state/get-current-repo (constantly test-helper/test-db)
+                    state/get-editor-block-container (constantly #js {})
+                    state/editing? (constantly true)
+                    state/selection? (constantly false)
+                    state/doc-mode-enter-for-new-line? (constantly false)
+                    state/set-block-content-and-last-pos!
+                    (fn [_ title pos]
+                      (set! (.-value input) title)
+                      (.setSelectionRange input pos pos))
+                    state/set-state! (fn [path value]
+                                       (when (= :editor/block path)
+                                         (reset! *editing-block value)))
+                    state/clear-edit! #(swap! side-effects conj :clear)
+                    state/pub-event! events/handle
+                    editor/save-current-block! #(swap! side-effects conj :save)
+                    editor/get-state (constantly {:node nil})
+                    editor/inside-of-single-block (constantly false)
+                    editor/keydown-new-block #(swap! side-effects conj :enter)
+                    editor/move-cross-boundary-up-down-now
+                    (fn [direction {:keys [block]}]
+                      (swap! side-effects conj
+                             [:navigate direction (:block/uuid block)]))
+                    util/scroll-to-block (constantly nil)
+                    db-transact/apply-outliner-ops
+                    (fn [conn ops opts]
+                      (case (swap! apply-count inc)
+                        1 (p/let [result (real-apply-outliner-ops conn ops opts)
+                                  _ (reset! committed? true)]
+                            result)
+                        2 (case restore-mode
+                            :restore-reject
+                            restore-result
+
+                            :restore-readback-mismatch
+                            ;; Model a worker outcome that resolves without
+                            ;; publishing the compensating transaction. The
+                            ;; following authoritative readback remains Math.
+                            restore-result)
+                        (p/rejected (ex-info "unexpected extra transaction" {}))))
+                    db/entity
+                    (fn [lookup]
+                      (let [entity (real-db-entity lookup)]
+                        (if (and @committed?
+                                 (= lookup [:block/uuid block-uuid])
+                                 (compare-and-set! mismatch-served? false true))
+                          (assoc entity :block/title "forced postcommit mismatch")
+                          entity)))]
+      (is (#'editor/maybe-convert-current-block-to-math!
+           (.-id input) "$$$$" 4 4))
+      (let [escape-result (editor/escape-editing)
+            enter-result (editor/keydown-new-block-handler nil)
+            navigation-result
+            (editor/move-cross-boundary-up-down
+             :down {:block target-block})
+            direct-result (editor/await-pending-math-transition! block-uuid)
+            caught-results (mapv <caught-result
+                                 [escape-result enter-result
+                                  navigation-result direct-result])]
+        (p/let [_ (<wait-for-value apply-count 2)
+                _ (do
+                    (case restore-mode
+                      :restore-reject
+                      (p/reject!
+                       restore-result
+                       (ex-info "secret synthetic restore rejection"
+                                {:secret "$$$$"}))
+                      :restore-readback-mismatch
+                      (p/resolve! restore-result {:blocks []}))
+                    nil)
+                results (p/all caught-results)
+                repeated-error
+                (<caught-result
+                 (editor/await-pending-math-transition! block-uuid))
+                persisted (real-db-entity [:block/uuid block-uuid])]
+          (is @mismatch-served?)
+          (is (= 2 @apply-count))
+          (is (= {:unexpected-resolution {:status :recovery-failed}}
+                 (nth results 1))
+              "The actual Enter boundary consumes only after its p/let aborts")
+          (doseq [error (conj [(nth results 0)
+                               (nth results 2)
+                               (nth results 3)]
+                              repeated-error)]
+            (is (= "Math transition recovery failed" (ex-message error)))
+            (is (= expected-error-data (ex-data error))
+                "Recovery failure is typed and contains no graph content"))
+          (is (empty? @side-effects)
+              "Escape, Enter and old-to-new navigation must remain blocked")
+          (is (= ["" :math]
+                 [(:block/title persisted)
+                  (:logseq.property.node/display-type persisted)]))
+          (is (= [block-uuid "" :math]
+                 [(:block/uuid @*editing-block)
+                  (.-value input)
+                  (:logseq.property.node/display-type @*editing-block)])
+              "The editor remains aligned with the committed Math DB state"))))))
+
+(deftest-async rejected-math-compensation-remains-pending-and-blocks-exit
+  (load-test-files
+   [{:page {:block/title "Math compensation rejection"}
+     :blocks [{:block/title "$$$$"}
+              {:block/title "target"}]}])
+  (<assert-math-recovery-failure-stays-fail-closed! :restore-reject))
+
+(deftest-async mismatched-math-compensation-remains-pending-and-blocks-navigation
+  (load-test-files
+   [{:page {:block/title "Math compensation mismatch"}
+     :blocks [{:block/title "$$$$"}
+              {:block/title "target"}]}])
+  (<assert-math-recovery-failure-stays-fail-closed!
+   :restore-readback-mismatch))
+
+(deftest-async actual-math-event-boundaries-consume-one-recovery-failure
+  (let [old-block {:db/id 1 :block/uuid (random-uuid) :block/title "$$$$"}
+        target-block {:db/id 2 :block/uuid (random-uuid) :block/title "target"}
+        *editing-block (atom old-block)
+        transition (p/deferred)
+        {:keys [input]} (math-transition-input "$$$$")
+        side-effects (atom [])
+        reports (atom [])
+        unhandled (atom [])
+        block-element #js {}
+        target #js {:classList #js {:contains (constantly false)}
+                    :closest (constantly nil)}
+        pointer-event #js {:target target :buttons 1 :shiftKey false}
+        outside-event #js {:type "mousedown" :target target}
+        escape-event #js {:type "keydown" :target target}
+        key-event #js {:preventDefault (fn []) :stopPropagation (fn [])}
+        bottom-block #js {}
+        bottom-row #js {}
+        bottom-event #js {:key "ArrowDown"
+                          :currentTarget bottom-row
+                          :preventDefault (fn [])
+                          :stopPropagation (fn [])}
+        bottom-up-event #js {:key "ArrowUp"
+                             :currentTarget bottom-row
+                             :preventDefault (fn [])
+                             :stopPropagation (fn [])}
+        property-target #js {:getAttribute (fn [attribute]
+                                             (when (= attribute "data-property-nav-mode")
+                                               "edit"))}
+        property-event #js {:key "ArrowDown"
+                            :currentTarget property-target
+                            :preventDefault (fn [])
+                            :stopPropagation (fn [])}
+        property-focus-target #js {:getAttribute (fn [attribute]
+                                                   (when (= attribute "data-property-nav-mode")
+                                                     "focus"))}
+        property-focus-event #js {:key "ArrowUp"
+                                  :currentTarget property-focus-target
+                                  :preventDefault (fn [])
+                                  :stopPropagation (fn [])}
+        number-state-index (atom -1)
+        number-ref-index (atom -1)
+        number-input-props (atom nil)
+        number-outer #js {}
+        number-input #js {:selectionStart 0 :selectionEnd 0 :value "7"}
+        previous-console-error (.-error js/console)
+        previous-document (.-document js/globalThis)
+        previous-react (.-React js/globalThis)
+        unhandled-handler #(swap! unhandled conj %)]
+    (set! (.-getElementsByClassName block-element) (fn [_] #js []))
+    (set! (.-closest bottom-row) (constantly bottom-block))
+    (set! (.-blur bottom-row) #(swap! side-effects conj :bottom-blur))
+    (set! (.-focus number-outer) #(swap! side-effects conj :number-focus))
+    (set! (.-focus number-input) (fn []))
+    (swap! state/state assoc :ui/scrolling? (atom false))
+    (.on js/process "unhandledRejection" unhandled-handler)
+    (set! (.-document js/globalThis)
+          #js {:querySelector (constantly nil)
+               :activeElement property-target})
+    (set! (.-React js/globalThis) react)
+    (set! (.-error js/console) (fn [& args] (swap! reports conj (vec args))))
+    (->
+     (p/with-redefs [state/get-edit-block #(deref *editing-block)
+                     state/get-editor-args (constantly nil)
+                     state/get-editor-action (constantly nil)
+                     state/editor-in-composition? (constantly false)
+                     state/get-input (constantly input)
+                     state/get-edit-input-id (constantly (.-id input))
+                     state/get-current-repo (constantly test-helper/test-db)
+                     state/get-selection-blocks (constantly [])
+                     state/get-selection-start-block-or-first (constantly nil)
+                     state/block-content-max-length (constantly 10000)
+                     state/editing? (constantly true)
+                     state/set-block-content-and-last-pos!
+                     (fn [_ title pos]
+                       (set! (.-value input) title)
+                       (.setSelectionRange input pos pos))
+                     state/set-state! (fn [path value]
+                                        (when (= :editor/block path)
+                                          (reset! *editing-block value)))
+                     state/pub-event!
+                     (fn [[event _payload]]
+                       (if (= :editor/upsert-type-block event)
+                         transition
+                         (p/resolved nil)))
+                     state/set-editing! (fn [& _]
+                                          (swap! side-effects conj :switch))
+                     state/set-selection-start-block! (constantly nil)
+                     state/clear-edit! #(swap! side-effects conj :clear)
+                     state/get-editor-block-container (constantly block-element)
+                     db/entity (fn [lookup]
+                                 (cond
+                                   (contains? #{1 [:block/uuid (:block/uuid old-block)]} lookup)
+                                   old-block
+                                   (contains? #{2 [:block/uuid (:block/uuid target-block)]} lookup)
+                                   target-block))
+                     db/get-db (constantly ::db)
+                     db/get-today-journal-title (constantly "Today")
+                     db/get-page-format (constantly :markdown)
+                     db-async/<get-block (fn [& _] (p/resolved target-block))
+                     editor/save-current-block! #(swap! side-effects conj :save)
+                     editor/insert #(swap! side-effects conj :insert)
+                     editor/edit-block! (fn [& _] (swap! side-effects conj :edit))
+                     editor/api-insert-new-block!
+                     (fn [& _] (swap! side-effects conj :api-insert))
+                     editor/clear-selection! (constantly nil)
+                     editor/unhighlight-blocks! (constantly nil)
+                     editor/get-state (constantly {:node nil})
+                     editor/inside-of-single-block (constantly false)
+                     editor/keydown-new-block #(swap! side-effects conj :enter)
+                     editor/keydown-up-down-handler
+                     (fn [_ _]
+                       (editor/move-cross-boundary-up-down
+                        :down {:block target-block}))
+                     editor/keydown-arrow-handler
+                     (fn [_]
+                       (editor/move-to-block-when-cross-boundary
+                        :right {:block target-block}))
+                     editor/move-cross-boundary-up-down-now
+                     (fn [& _] (swap! side-effects conj :navigate))
+                     editor/move-to-block-when-cross-boundary-now
+                     (fn [& _] (swap! side-effects conj :navigate-left-right))
+                     editor/move-property-focus-up-down
+                     (fn [& _] (swap! side-effects conj :property-focus))
+                     editor/auto-complete? (constantly false)
+                     editor/in-page-preview? (constantly false)
+                     editor/in-shui-popup? (constantly false)
+                     mobile-nav/pop-stack! #(swap! side-effects conj :pop)
+                     property-handler/remove-block-property!
+                     (fn [& _] (swap! side-effects conj :delete-property))
+                     db-property/property-value-content (constantly 0)
+                     db-property-handler/set-block-property!
+                     (fn [& _] (swap! side-effects conj :number-property))
+                     state/get-config (constantly {})
+                     state/get-current-page (constantly "today")
+                     state/get-edit-content (constantly "")
+                     state/get-timestamp-block (constantly nil)
+                     mobile-util/mobile-focus-hidden-input (constantly nil)
+                     util/mobile? (constantly false)
+                     util/meta-key? (constantly false)
+                     util/get-selection-direction (constantly "forward")
+                     util/rec-get-node (fn [_ class-name]
+                                         (when (= "ls-block" class-name) block-element))
+                     util/link? (constantly false)
+                     util/time? (constantly false)
+                     util/input? (constantly false)
+                     util/audio? (constantly false)
+                     util/video? (constantly false)
+                     util/details-or-summary? (constantly false)
+                     util/sup? (constantly false)
+                     cursor/get-caret-pos (constantly #js {})
+                     cursor/textarea-cursor-rect-last-row? (constantly true)
+                     hooks/use-state
+                     (fn [initial]
+                       (case (swap! number-state-index inc)
+                         0 [true (fn [& _])]
+                         1 ["7" (fn [& _])]
+                         2 [(atom "7") (fn [& _])]
+                         [initial (fn [& _])]))
+                     hooks/use-ref
+                     (fn [_]
+                       #js {:current (if (zero? (swap! number-ref-index inc))
+                                       number-outer
+                                       number-input)})
+                     hooks/use-effect! (fn [& _])
+                     shui/input
+                     (fn [props]
+                       (reset! number-input-props props)
+                       (.createElement react "input" nil))
+                     dom/attr (fn [_ attribute]
+                                (case attribute
+                                  "blockid" (str (:block/uuid old-block))
+                                  "containerid" "17"
+                                  nil))
+                     dom/has-class? (constantly false)
+                     dom/closest (constantly nil)]
+       (is (#'editor/maybe-convert-current-block-to-math!
+            (.-id input) "$$$$" 4 4))
+       (.renderToStaticMarkup
+        react-dom-server
+        (property-value/single-number-input
+         {:db/id 11 :user.property/test 0}
+         {:db/ident :user.property/test}
+         {:db/id 12}
+         false))
+       ;; Browser order can invoke target pointerdown and the window outside
+       ;; hook for the same gesture. These actual UI boundaries deliberately
+       ;; discard their return values, as React/shui do.
+       (let [_ (#'block-component/block-content-on-pointer-down
+                pointer-event target-block "target" "edit-target" "target"
+                {:container-id 17})
+             _ (#'editor-component/editor-on-hide
+                {:config nil} :click outside-event true)
+             _ (#'editor-component/editor-on-hide
+                {:config nil} :esc escape-event false)
+             _ (editor/keydown-new-block-handler key-event)
+             _ (editor/keydown-new-line-handler key-event)
+             _ ((editor/shortcut-up-down :down) key-event)
+             _ ((editor/shortcut-select-up-down :down) key-event)
+             _ ((editor/shortcut-left-right :right) key-event)
+             _ ((editor/on-select-block :down) key-event)
+             _ (#'block-component/handle-bottom-properties-row-key-down!
+                bottom-event)
+             _ (#'block-component/handle-bottom-properties-row-key-down!
+                bottom-up-event)
+             _ ((:on-key-down
+                 (#'property-value/property-value-block-container-props
+                  {:db/ident :user.property/test}))
+                property-event)
+             _ (set! (.-activeElement js/document) property-focus-target)
+             _ ((:on-key-down
+                 (#'property-value/property-value-block-container-props
+                  {:db/ident :user.property/test}))
+                property-focus-event)
+             _ ((:on-blur @number-input-props) #js {})
+             _ ((:on-key-down @number-input-props) #js {:key "Escape"})
+             _ ((:on-key-down @number-input-props) #js {:key "Enter"})
+             _ (#'property-value/delete-block-property!
+                {:db/id 11}
+                {:db/ident :user.property/test}
+                {})
+             _ (quick-capture/quick-capture #js {:content "shared"})
+             _ (mobile-intent/handle-payload
+                {:text "shared"
+                 :resources [{:type "text/plain"
+                              :name "shared"
+                              :ext "txt"}]})
+             _ (mobile-nav/install-native-bridge!)
+             _ ((.-onNativePop (.-LogseqNative js/window)))]
+         (p/reject! transition
+                    (ex-info "Math transition recovery failed"
+                             {:type :math-transition/recovery-failed}))
+         (p/let [_ (p/delay 25)]
+           (let [blocked? (resolve
+                           'frontend.handler.editor/math-transition-recovery-blocked?)]
+             (is (fn? blocked?)
+                 "A shared synchronous recovery latch must guard component roots")
+             (when (fn? blocked?)
+               (is (true? (blocked?))))
+             ((:on-change @number-input-props)
+              #js {:target #js {:value "8"}}))
+           (p/let [_ (p/delay 10)]
+             (is (empty? @unhandled)
+                 "Discarded actual DOM boundary Promises must not reject unhandled")
+             (is (= [["Math transition recovery failed" "block-pointer"]]
+                    @reports)
+                 "One content-free report covers the same failure at every boundary")
+             (is (empty? @side-effects)
+                 "Pointer/outside/Escape/Enter/navigation/capture/native back remain fail-closed")))))
+     (p/finally
+      (fn []
+        (.off js/process "unhandledRejection" unhandled-handler)
+        (set! (.-document js/globalThis) previous-document)
+        (set! (.-React js/globalThis) previous-react)
+        (set! (.-error js/console) previous-console-error))))))
+
+(deftest-async native-pop-boundary-preserves-unknown-rejection
+  (let [unknown (ex-info "ordinary native navigation error" {:type :unknown})
+        previous-document (.-document js/globalThis)]
+    (set! (.-document js/globalThis)
+          #js {:querySelector (constantly nil)})
+    (->
+     (p/with-redefs [editor/await-pending-math-transition!
+                     (fn [] (p/rejected unknown))
+                     state/get-selection-blocks (constantly [])
+                     state/editing? (constantly true)]
+       (mobile-nav/install-native-bridge!)
+       (p/let [native-observed (<caught-result
+                                ((.-onNativePop (.-LogseqNative js/window))))
+               plugin-observed (<caught-result
+                                (editor-api/exit_editing_mode false))]
+         (is (identical? unknown native-observed)
+             "The native callback consumes only typed recovery failures")
+         (is (identical? unknown plugin-observed)
+             "The plugin API must not force an unknown rejection to nil")))
+     (p/finally
+      #(set! (.-document js/globalThis) previous-document)))))
+
+(deftest-async plugin-exit-is-promise-void-for-success-and-typed-failure
+  (let [typed (ex-info "Math transition recovery failed"
+                       {:type :math-transition/recovery-failed})
+        unknown (ex-info "ordinary plugin exit failure" {:type :unknown})
+        previous-console-error (.-error js/console)]
+    (set! (.-error js/console) (fn [& _]))
+    (-> (p/let [success (p/with-redefs [editor/escape-editing
+                                        (fn [& _] (p/resolved :internal-success))]
+                           (editor-api/exit_editing_mode false))
+                typed-result (p/with-redefs [editor/escape-editing
+                                             (fn [& _] (p/rejected typed))]
+                               (editor-api/exit_editing_mode false))
+                unknown-result (<caught-result
+                                (p/with-redefs [editor/escape-editing
+                                               (fn [& _] (p/rejected unknown))]
+                                  (editor-api/exit_editing_mode false)))]
+          (is (nil? success)
+              "Plugin exit success exposes Promise<void>, not an internal status")
+          (is (nil? typed-result)
+              "A consumed typed recovery failure also exposes Promise<void>")
+          (is (identical? unknown unknown-result)
+              "Unknown plugin exit failures remain rejected"))
+        (p/finally #(set! (.-error js/console) previous-console-error)))))
+
+(deftest-async math-boundary-consumer-does-not-hide-unknown-errors
+  (let [consumer-var
+        (resolve 'frontend.handler.editor/consume-math-transition-boundary!)]
+    (is (fn? consumer-var))
+    (if (fn? consumer-var)
+      (let [unknown (ex-info "ordinary unknown error" {:type :unknown})]
+        (p/let [observed (<caught-result
+                          (consumer-var :test-boundary
+                                        (p/rejected unknown)))]
+          (is (identical? unknown observed)
+              "Only typed recovery failures may be consumed")))
+      (p/resolved nil))))
 
 (defn- take-edit-block-fn!
   ([]

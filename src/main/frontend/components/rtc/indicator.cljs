@@ -22,21 +22,35 @@
     [:enum :open :close]))
 
 (defonce *detail-info
-  (atom {:pending-local-ops 0
-         :pending-asset-ops 0
+  (atom {:pending-local-ops nil
+         :pending-asset-ops nil
          :missing-asset-upload-files []
-         :pending-server-ops 0
+         :pending-server-ops nil
          :graph-uuid nil
          :local-tx nil
          :remote-tx nil
          :local-checksum nil
          :remote-checksum nil
-         :rtc-state :open
+         :ws-state nil
+         :last-sync-error nil
+         :sync-ready? false
+         :rtc-state :close
          :download-logs nil
          :upload-logs nil
          :misc-logs nil}))
 
 (defonce ^:private *update-detail-info-canceler (atom nil))
+
+(defn rtc-display-state
+  [state]
+  (let [ws-state (get-in state [:rtc-state :ws-state])]
+    (cond
+      (= :repair-required ws-state) :close
+      (= :repairing ws-state) :syncing
+      (:rtc-lock state) :open
+      (contains? #{:open :syncing} ws-state) :syncing
+      :else :close)))
+
 (defn- run-task--update-detail-info
   []
   (when-let [canceler @*update-detail-info-canceler]
@@ -68,7 +82,10 @@
                                          :remote-tx (:remote-tx state)
                                          :local-checksum (:local-checksum state)
                                          :remote-checksum (:remote-checksum state)
-                                         :rtc-state (if (:rtc-lock state) :open :close)))
+                                         :ws-state (get-in state [:rtc-state :ws-state])
+                                         :sync-ready? (:sync-ready? state)
+                                         :last-sync-error (:last-sync-error state)
+                                         :rtc-state (rtc-display-state state)))
                                 rtc-flows/rtc-state-flow)))]
       (reset! *update-detail-info-canceler canceler))))
 (run-task--update-detail-info)
@@ -186,20 +203,27 @@
         show-checksums? (or config/dev? util/node-test?)
         {:keys [graph-uuid local-tx remote-tx local-checksum remote-checksum rtc-state
                 download-logs upload-logs misc-logs pending-local-ops pending-asset-ops
-                missing-asset-upload-files pending-server-ops]}
+                missing-asset-upload-files pending-server-ops ws-state sync-ready?
+                last-sync-error]}
         (hooks/use-flow-state (m/watch *detail-info))
         asset-rows (asset-status-rows {:pending-asset-ops pending-asset-ops
                                        :missing-asset-upload-files missing-asset-upload-files
                                        :asset-transfer-counts (asset-transfer-counts asset-progress)})]
     [:div.rtc-info.flex.flex-col.gap-1.p-2.text-gray-11
      [:div.font-medium.mb-2 (t (if online? :sync/online :sync/offline))]
-     [:div [:span.font-medium.mr-1 (or pending-local-ops 0)] (t :sync/pending-local-changes)]
+     [:div [:span.font-medium.mr-1 (if (number? pending-local-ops)
+                                    pending-local-ops
+                                    "—")]
+      (t :sync/pending-local-changes)]
      (for [{:keys [count label-key]} asset-rows]
        [:div {:key (name label-key)}
         [:span.font-medium.mr-1 count]
         (asset-status-label label-key)])
      ;; FIXME: pending-server-ops
-     [:div [:span.font-medium.mr-1 (or pending-server-ops 0)] (t :sync/pending-server-changes)]
+     [:div [:span.font-medium.mr-1 (if (number? pending-server-ops)
+                                    pending-server-ops
+                                    "—")]
+      (t :sync/pending-server-changes)]
      (missing-asset-files missing-asset-upload-files)
      (assets-progressing asset-progress)
      ;; FIXME: What's the type for downloaded log?
@@ -220,10 +244,13 @@
                remote-tx (assoc :remote-tx remote-tx)
                (and show-checksums? local-checksum) (assoc :local-checksum local-checksum)
                (and show-checksums? remote-checksum) (assoc :remote-checksum remote-checksum)
+               ws-state (assoc :ws-state ws-state)
+               (some? sync-ready?) (assoc :sync-ready? sync-ready?)
+               last-sync-error (assoc :last-sync-error last-sync-error)
                rtc-state (assoc :rtc-state rtc-state))
              pprint/pprint
              with-out-str)]])
-     (when-not (= rtc-state :open)
+     (when (= rtc-state :close)
        [:div.mt-4
         (shui/button {:variant :default
                       :size :sm
@@ -253,15 +280,18 @@
                                :class (util/classnames [{:cloud true
                                                          :on (and online? (= :open rtc-state))
                                                          :syncing (and online?
-                                                                       (= :open rtc-state)
-                                                                       (pos? (or pending-server-ops 0)))
+                                                                       (or (= :syncing rtc-state)
+                                                                           (and (= :open rtc-state)
+                                                                                (pos? (or pending-server-ops 0)))))
                                                          :idle (and online?
                                                                     (= :open rtc-state)
+                                                                    (number? unpushed-block-update-count)
                                                                     (zero? unpushed-block-update-count)
+                                                                    (number? pending-asset-ops)
                                                                     (zero? pending-asset-ops)
                                                                     (zero? (or pending-server-ops 0)))
-                                                         :queuing (or (pos? unpushed-block-update-count)
-                                                                      (pos? pending-asset-ops))}])})]]))
+                                                         :queuing (or (pos? (or unpushed-block-update-count 0))
+                                                                      (pos? (or pending-asset-ops 0)))}])})]]))
 
 (def ^:private *accumulated-download-logs (atom []))
 (when-not config/publishing?
@@ -270,8 +300,10 @@
    (m/reduce
     (fn [_ log]
       (when log
-        (if (= :download-completed (:sub-type log))
-          (reset! *accumulated-download-logs [])
+        (if (contains? #{:download-completed :download-failed}
+                       (:sub-type log))
+          (reset! *accumulated-download-logs
+                  (if (= :download-failed (:sub-type log)) [log] []))
           (swap! *accumulated-download-logs (fn [logs] (take 20 (conj logs log)))))))
     rtc-flows/rtc-download-log-flow)))
 
@@ -316,7 +348,10 @@
 
 (def ^:private downloading?-flow
   (->> rtc-flows/rtc-download-log-flow
-       (m/eduction (map (fn [log] (not= :download-completed (:sub-type log)))))
+       (m/eduction
+        (map (fn [log]
+               (not (contains? #{:download-completed :download-failed}
+                               (:sub-type log))))))
        (c.m/continue-flow false)))
 
 (hsx/defc downloading-detail

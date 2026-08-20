@@ -387,8 +387,11 @@
                                  (let [icon? (= (:type m) :tabler-icon)
                                        m (if (and icon? (not (string/blank? @*color)))
                                            (assoc m :color @*color) m)]
-                                   (and on-chosen (on-chosen e m))
-                                   (when (:type m) (add-used-item! m)))))
+                                   (p/let [outcome (when on-chosen (on-chosen e m))]
+                                     (when (and (:type m)
+                                                (not= :recovery-failed (:status outcome)))
+                                       (add-used-item! m))
+                                     outcome))))
         reset-q! #(when-let [^js input (hooks/deref *input-ref)]
                     (set-q! "")
                     (set-result! {})
@@ -497,7 +500,8 @@
                         (shui/tabler-icon "trash" {:size 17})))]])]))
 
 (hsx/defc icon-picker
-  [icon-value {:keys [empty-label disabled? initial-open? del-btn? on-chosen icon-props popup-opts button-opts]}]
+  [icon-value {:keys [empty-label disabled? initial-open? del-btn? on-chosen on-before-open
+                      icon-props popup-opts button-opts]}]
   (let [*trigger-ref (hooks/use-ref nil)
         content-fn
         (if config/publishing?
@@ -505,8 +509,11 @@
           (fn [{:keys [id]}]
             (icon-search
              {:on-chosen (fn [e icon-value keep-popup?]
-                           (on-chosen e icon-value)
-                           (when-not (true? keep-popup?) (shui/popup-hide! id)))
+                           (p/let [outcome (on-chosen e icon-value)]
+                             (when (and (not (true? keep-popup?))
+                                        (not= :recovery-failed (:status outcome)))
+                               (shui/popup-hide! id))
+                             outcome))
               :icon-value icon-value
               :del-btn? del-btn?})))]
     (hooks/use-effect!
@@ -526,13 +533,18 @@
                     "font-normal text-sm px-[0.5px] text-muted-foreground hover:text-foreground")
          :on-click (fn [^js e]
                      (when-not disabled?
-                       (shui/popup-show! (.-target e) content-fn
-                                         (medley/deep-merge
-                                          {:align :start
-                                           :id :ls-icon-picker
-                                           :content-props {:class "ls-icon-picker"
-                                                           :onEscapeKeyDown #(.preventDefault %)}}
-                                          popup-opts))))}
+                       (let [open! (fn []
+                                     (shui/popup-show!
+                                      (.-target e) content-fn
+                                      (medley/deep-merge
+                                       {:align :start
+                                        :id :ls-icon-picker
+                                        :content-props {:class "ls-icon-picker"
+                                                        :onEscapeKeyDown #(.preventDefault %)}}
+                                       popup-opts)))]
+                         (if (fn? on-before-open)
+                           (on-before-open e open!)
+                           (open!)))))}
         button-opts)
        (if has-icon?
          (if (vector? icon-value)       ; hiccup

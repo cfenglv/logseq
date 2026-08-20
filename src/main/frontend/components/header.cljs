@@ -320,7 +320,7 @@
       [:div.cp__header-tips
        [:p (t :updater/update-ready-to-install)
         [:a.restart.ml-2
-         {:on-click #(handler/quit-and-install-new-version!)}
+         {:on-click #(ipc/quit-and-install-new-version!)}
          (svg/reload 16) [:strong (t :updater/quit-and-install)]]]])))
 
 (defn- clear-recent-highlight!

@@ -14,6 +14,7 @@
             [frontend.db.async :as db-async]
             [frontend.db.model :as db-model]
             [frontend.handler.db-based.property :as db-property-handler]
+            [frontend.handler.editor :as editor-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.property :as property-handler]
@@ -34,6 +35,12 @@
             [logseq.shui.ui :as shui]
             [promesa.core :as p]
             [io.factorhouse.hsx.core :as hsx]))
+
+(defn- consume-property-action!
+  ([boundary action]
+   (editor-handler/run-math-transition-action! boundary action))
+  ([boundary options action]
+   (editor-handler/run-math-transition-action! boundary options action)))
 
 (defn- <add-property-from-dropdown
   "Adds an existing or new property from dropdown. Used from a block or page context."
@@ -96,7 +103,48 @@
                                     db-property-type/internal-built-in-property-types))
                           (map (fn [type]
                                  {:label (property-config/property-type-label type)
-                                  :value type})))]
+                                  :value type})))
+        change-property-type!
+        (fn [v]
+          (let [type (keyword (string/lower-case v))
+                update-schema-fn #(assoc % :logseq.property/type type)]
+            (when *property-schema
+              (swap! *property-schema update-schema-fn))
+            (let [schema (or (and *property-schema @*property-schema)
+                             (update-schema-fn property-schema))]
+              (when *show-new-property-config?
+                (reset! *show-new-property-config? :adding-property))
+              (p/let [property' (when block (<add-property-from-dropdown block property-name schema opts))
+                      property (or property' property)
+                      add-class-property? (and (ldb/class? block) class-schema?)]
+                (when *property (reset! *property property))
+                (p/do!
+                 (when *show-new-property-config?
+                   (reset! *show-new-property-config? false))
+                 (when (= (:logseq.property/type schema) :node) (reset! *show-class-select? true))
+                 (db-property-handler/upsert-property!
+                  (:db/ident property)
+                  schema
+                  {})
+
+                 (cond
+                   (and *show-class-select? @*show-class-select?)
+                   nil
+                   add-class-property?
+                   (shui/popup-hide!)
+                   (pv/batch-operation?)
+                   nil
+                   (and block (= type :checkbox))
+                   (p/do!
+                    (ui/hide-popups-until-preview-popup!)
+                    (let [value (if-some [value (:logseq.property/scalar-default-value property)]
+                                  value
+                                  false)]
+                      (pv/<add-property! block (:db/ident property) value {:exit-edit? true})))
+                   (and block
+                        (contains? #{:default :url} type)
+                        (not (seq (:property/closed-values property))))
+                   (pv/<create-new-block! block property "" {:batch-op? true})))))))]
     [:div {:class "flex items-center"}
      (shui/select
        (cond->
@@ -104,45 +152,9 @@
           :disabled disabled?
           :on-value-change
           (fn [v]
-            (let [type (keyword (string/lower-case v))
-                  update-schema-fn #(assoc % :logseq.property/type type)]
-              (when *property-schema
-                (swap! *property-schema update-schema-fn))
-              (let [schema (or (and *property-schema @*property-schema)
-                               (update-schema-fn property-schema))]
-                (when *show-new-property-config?
-                  (reset! *show-new-property-config? :adding-property))
-                (p/let [property' (when block (<add-property-from-dropdown block property-name schema opts))
-                        property (or property' property)
-                        add-class-property? (and (ldb/class? block) class-schema?)]
-                  (when *property (reset! *property property))
-                  (p/do!
-                   (when *show-new-property-config?
-                     (reset! *show-new-property-config? false))
-                   (when (= (:logseq.property/type schema) :node) (reset! *show-class-select? true))
-                   (db-property-handler/upsert-property!
-                    (:db/ident property)
-                    schema
-                    {})
-
-                   (cond
-                     (and *show-class-select? @*show-class-select?)
-                     nil
-                     add-class-property?
-                     (shui/popup-hide!)
-                     (pv/batch-operation?)
-                     nil
-                     (and block (= type :checkbox))
-                     (p/do!
-                      (ui/hide-popups-until-preview-popup!)
-                      (let [value (if-some [value (:logseq.property/scalar-default-value property)]
-                                    value
-                                    false)]
-                        (pv/<add-property! block (:db/ident property) value {:exit-edit? true})))
-                     (and block
-                          (contains? #{:default :url} type)
-                          (not (seq (:property/closed-values property))))
-                     (pv/<create-new-block! block property "" {:batch-op? true})))))))}
+            (consume-property-action!
+             :property-input-type
+             #(change-property-type! v)))}
 
          ;; only set when in property configure modal
          (and *property-name (:logseq.property/type property-schema))
@@ -265,7 +277,7 @@
 	      [:span.bullet-container
 	       [:span.bullet]])))
 
-(defn- property-input-on-chosen
+(defn- property-input-on-chosen-action
   [block *property *property-key *show-new-property-config? {:keys [class-schema? remove-property? view-parent]}]
   (fn [{:keys [value label convert-page-to-property?]}]
     (let [property (cond
@@ -318,6 +330,18 @@
                         (and (= :default type) (seq (:property/closed-values property'))))
                     (reset! *show-new-property-config? false)))))))))))
 
+(defn- property-input-on-chosen
+  [& args]
+  (let [on-chosen (apply property-input-on-chosen-action args)]
+    (fn
+      ([chosen]
+       (consume-property-action!
+        :property-input-chosen #(on-chosen chosen)))
+      ([chosen _selected? _choices e]
+       (consume-property-action!
+        :property-input-chosen {:event e}
+        #(on-chosen chosen))))))
+
 (defn- property-description-title
   [property]
   (let [property' (or (some-> (:db/id property) db/entity) property)]
@@ -332,25 +356,42 @@
                    {:tabIndex 0
                     :class "property-k flex select-none jtrigger w-full"
                     :on-pointer-down (fn [^js e]
-                                       (when (util/meta-key? e)
-                                         (route-handler/redirect-to-page! (:block/uuid property))
-                                         (.preventDefault e)))
+                                       (if (util/meta-key? e)
+                                         (do
+                                           (.preventDefault e)
+                                           (consume-property-action!
+                                            :property-key-route
+                                            {:event e :prevent-default? false}
+                                            #(route-handler/redirect-to-page! (:block/uuid property))))
+                                         (consume-property-action!
+                                          :property-key-pointer {:event e} (fn [] nil))))
                     :on-click (fn [^js/MouseEvent e]
-                                (when-not (util/meta-key? e)
-                                  (shui/popup-show! (.-target e)
-                                                    (fn []
-                                                      (property-config/property-dropdown property block {:debug? (.-altKey e)
-                                                                                                         :class-schema? class-schema?}))
-                                                    {:content-props
-                                                     {:class "ls-property-dropdown as-root"
-                                                      :onEscapeKeyDown (fn [e]
-                                                                         (util/stop e)
-                                                                         (shui/popup-hide!)
-                                                                         (when-let [input (state/get-input)]
-                                                                           (.focus input)))}
-                                                     :align "start"
-                                                     :dropdown-menu? true
-                                                     :as-dropdown? true})))}
+                                (let [meta? (util/meta-key? e)
+                                      target (.-target e)
+                                      debug? (.-altKey e)]
+                                  (when-not meta?
+                                    (consume-property-action!
+                                     :property-key-popup
+                                     (fn []
+                                       (shui/popup-show! target
+                                                       (fn []
+                                                         (property-config/property-dropdown
+                                                          property block {:debug? debug?
+                                                                          :class-schema? class-schema?}))
+                                                       {:content-props
+                                                        {:class "ls-property-dropdown as-root"
+                                                         :onEscapeKeyDown (fn [e]
+                                                                            (util/stop e)
+                                                                            (consume-property-action!
+                                                                             :property-key-popup-escape
+                                                                             {:event e}
+                                                                             #(do
+                                                                                (shui/popup-hide!)
+                                                                                (when-let [input (state/get-input)]
+                                                                                  (.focus input)))))}
+                                                        :align "start"
+                                                        :dropdown-menu? true
+                                                        :as-dropdown? true}))))))}
 
                    title)]
     (if (string/blank? description)
@@ -368,13 +409,16 @@
        (let [content-fn (fn [{:keys [id]}]
                           (icon-component/icon-search
                            {:on-chosen
-                            (fn [_e icon]
-                              (if icon
-                                (db-property-handler/set-block-property! (:db/id property)
-                                                                         :logseq.property/icon icon)
-                                (db-property-handler/remove-block-property! (:db/id property)
-                                                                            :logseq.property/icon))
-                              (shui/popup-hide! id))
+                            (fn [e icon]
+                              (consume-property-action!
+                               :property-icon-select {:event e}
+                               #(do
+                                  (if icon
+                                    (db-property-handler/set-block-property! (:db/id property)
+                                                                             :logseq.property/icon icon)
+                                    (db-property-handler/remove-block-property! (:db/id property)
+                                                                                :logseq.property/icon))
+                                  (shui/popup-hide! id))))
                             :icon-value icon
                             :del-btn? (boolean icon)}))]
 
@@ -382,10 +426,24 @@
           (shui/trigger-as
            :button.property-m
            (-> (when-not config/publishing?
-                 {:on-click (fn [^js e]
-                              (shui/popup-show! (.-target e) content-fn
-                                                {:as-dropdown? true :auto-focus? true
-                                                 :content-props {:onEscapeKeyDown #(.preventDefault %)}}))})
+                 {:on-pointer-down (fn [e]
+                                     (consume-property-action!
+                                      :property-icon-pointer {:event e} (fn [] nil)))
+                  :on-click (fn [^js e]
+                              (let [target (.-target e)]
+                                (consume-property-action!
+                                 :property-icon-popup
+                                 (fn []
+                                   (shui/popup-show! target content-fn
+                                                     {:as-dropdown? true :auto-focus? true
+                                                      :content-props
+                                                      {:onEscapeKeyDown
+                                                       (fn [e]
+                                                         (.preventDefault e)
+                                                         (consume-property-action!
+                                                          :property-icon-popup-escape
+                                                          {:event e}
+                                                          #(shui/popup-hide!)))}})))))})
                (assoc :class "flex items-center"))
            (if icon
              (icon-component/icon icon {:size 15 :color? true})
@@ -491,20 +549,29 @@
        (state/set-editor-action! :property-input)
        (let [on-key-down (fn [e]
                            (when (= 27 (.-keyCode e))
-                             (shui/popup-hide!)
-                             (shui/popup-hide!)
-                             (when-let [^js input (state/get-input)]
-                               (.focus input))))]
+                             (util/stop e)
+                             (consume-property-action!
+                              :property-input-escape {:event e}
+                              #(do
+                                 (shui/popup-hide!)
+                                 (shui/popup-hide!)
+                                 (when-let [^js input (state/get-input)]
+                                   (.focus input))))))]
          (.addEventListener js/window "keydown" on-key-down)
          #(do
+            ;; Listener ownership ends synchronously at unmount. Only the
+            ;; state mutations wait for the event-time editor transition.
             (.removeEventListener js/window "keydown" on-key-down)
-            (let [[_block *property-key {:keys [original-block edit-original-block]}] (hooks/deref latest-args-ref)
-                  editing-default-property? (and original-block (state/get-edit-block)
-                                                 (not= (:db/id original-block) (:db/id (state/get-edit-block))))]
-              (when *property-key (reset! *property-key nil))
-              (when (and original-block edit-original-block)
-                (edit-original-block {:editing-default-property? editing-default-property?})))
-            (state/set-editor-action! nil))))
+            (consume-property-action!
+             :property-input-cleanup
+             (fn []
+               (let [[_block *property-key {:keys [original-block edit-original-block]}] (hooks/deref latest-args-ref)
+                     editing-default-property? (and original-block (state/get-edit-block)
+                                                    (not= (:db/id original-block) (:db/id (state/get-edit-block))))]
+                 (when *property-key (reset! *property-key nil))
+                 (when (and original-block edit-original-block)
+                   (edit-original-block {:editing-default-property? editing-default-property?})))
+               (state/set-editor-action! nil))))))
      [])
     [:div.ls-property-input.flex.flex-1.flex-row.items-center.flex-wrap.gap-1
      (if property-key
@@ -559,23 +626,38 @@
           bottom-property-add-button? (= :block-below (:property-position opts))
           tab-index (:tab-index opts)
           bottom-row-nav? (:bottom-row-nav? opts)
+          run-action! (fn [action]
+                        (if bottom-property-add-button?
+                          (consume-property-action! :bottom-new-property action)
+                          (action)))
           add-new-property! (fn [e]
-                              (state/pub-event! [:editor/new-property (merge opts {:block block
-                                                                                   :target (.-target e)})]))
+                              (let [target (.-target e)]
+                                (run-action!
+                                 #(state/pub-event! [:editor/new-property (merge opts {:block block
+                                                                                       :target target})]))))
           button
           (shui/button
-             {:variant :secondary
-              :size :sm
-             :class (str "jtrigger flex"
-                         (when bottom-property-add-button? " bottom-property-add-btn"))
-             :tab-index (or tab-index 0)
-             :data-bottom-row-nav (when bottom-row-nav? true)
-             :aria-label (t :property/add-new)
-             :on-click add-new-property!
-             :on-key-press (fn [e]
-                             (when (contains? #{"Enter" " "} (util/ekey e))
-                               (.preventDefault e)
-                               (add-new-property! e)))}
+             (cond-> {:variant :secondary
+                      :size :sm
+                      :class (str "jtrigger flex"
+                                  (when bottom-property-add-button? " bottom-property-add-btn"))
+                      :tab-index (or tab-index 0)
+                      :data-bottom-row-nav (when bottom-row-nav? true)
+                      :aria-label (t :property/add-new)
+                      :on-click add-new-property!}
+               bottom-property-add-button?
+               (assoc :on-key-down
+                      (fn [e]
+                        (when (contains? #{"Enter" " "} (util/ekey e))
+                          (util/stop e)
+                          (add-new-property! e))))
+
+               (not bottom-property-add-button?)
+               (assoc :on-key-press
+                      (fn [e]
+                        (when (contains? #{"Enter" " "} (util/ekey e))
+                          (.preventDefault e)
+                          (add-new-property! e)))))
             (ui/icon "plus" {:size 16 :class "bottom-property-action-icon"})
             (when-not icon-only?
               (t :property/add-new)))]
@@ -656,14 +738,20 @@
             (when (show-property-panel-edit-button? property opts)
               [:button.property-panel-edit-btn.select-none
                {:type "button"
+                :on-pointer-down (fn [e]
+                                   (consume-property-action!
+                                    :property-panel-edit-pointer {:event e} (fn [] nil)))
                 :on-click (fn [e]
-                            (util/stop e)
-                            (when-let [trigger
-                                       (some-> (.-currentTarget e)
-                                               (.closest ".property-value-panel")
-                                               (.querySelector ".jtrigger"))]
-                              (.click trigger)
-                              (some-> trigger .focus)))}
+                            (let [trigger (some-> (.-currentTarget e)
+                                                  (.closest ".property-value-panel")
+                                                  (.querySelector ".jtrigger"))]
+                              (util/stop e)
+                              (consume-property-action!
+                               :property-panel-edit
+                               (fn []
+                                 (when trigger
+                                   (.click trigger)
+                                   (.focus trigger))))))}
                (ui/icon "edit" {:size 15})])])]))))
 
 (defn- entity-ref-value?
@@ -949,7 +1037,21 @@
   [block {:keys [icon-only? tab-index bottom-row-nav? bottom-pill?] :as _opts}]
   (let [block-uuid (:block/uuid block)
         show-hidden-properties? (use-hidden-properties-visible block-uuid)
-        label (hidden-properties-toggle-label show-hidden-properties?)]
+        label (hidden-properties-toggle-label show-hidden-properties?)
+        bottom-control? (or bottom-pill? icon-only? bottom-row-nav?)
+        toggle! (fn []
+                  (if bottom-control?
+                    (consume-property-action!
+                     :bottom-hidden-properties
+                     #(toggle-hidden-properties-visibility! block-uuid))
+                    (toggle-hidden-properties-visibility! block-uuid)))
+        click! (fn [e]
+                 (util/stop e)
+                 (toggle!))
+        keydown! (fn [e]
+                   (when (contains? #{"Enter" " "} (util/ekey e))
+                     (util/stop e)
+                     (toggle!)))]
     (when block-uuid
       (if bottom-pill?
         [:button.bottom-property-pill.bottom-property-pill-focusable.bottom-property-hidden-toggle-btn
@@ -958,9 +1060,8 @@
           :data-bottom-row-nav (when bottom-row-nav? true)
           :tab-index (or tab-index -1)
           :aria-label label
-          :on-click (fn [e]
-                      (util/stop e)
-                      (toggle-hidden-properties-visibility! block-uuid))}
+          :on-click click!
+          :on-key-down keydown!}
          (ui/icon (if show-hidden-properties? "chevron-up" "chevron-down")
                   {:size 16 :class "bottom-property-action-icon"})
          label]
@@ -973,9 +1074,8 @@
              :tab-index (or tab-index 0)
              :data-bottom-row-nav (when bottom-row-nav? true)
              :aria-label label
-             :on-click (fn [e]
-                         (util/stop e)
-                         (toggle-hidden-properties-visibility! block-uuid))}
+             :on-click click!
+             :on-key-down keydown!}
             (ui/icon (if show-hidden-properties? "chevron-up" "chevron-down")
                      {:size 16 :class "bottom-property-action-icon"}))]
           [:div.property-pair.property-panel-row.hidden-properties-toggle-row
@@ -984,9 +1084,8 @@
              {:type "button"
               :tab-index (or tab-index 0)
               :aria-label label
-              :on-click (fn [e]
-                          (util/stop e)
-                          (toggle-hidden-properties-visibility! block-uuid))}
+              :on-click click!
+              :on-key-down keydown!}
              [:span.property-icon
               (ui/icon (if show-hidden-properties? "chevron-up" "chevron-down")
                        {:size 16})]

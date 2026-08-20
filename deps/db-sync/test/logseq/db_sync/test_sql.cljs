@@ -18,16 +18,34 @@
 
 (defn make-sql []
   (let [state (atom {:tx-log {}
-                     :meta {}})]
+                     :meta {}
+                     :changes 0})]
     #js {:exec (fn [sql & args]
                  (cond
+                   (string/includes? sql "update tx_log set t = t where 0")
+                   (do (swap! state assoc :changes 0)
+                       nil)
+
                    (string/includes? sql "insert into tx_log")
                    (let [[t tx created-at outliner-op] args]
-                     (swap! state update :tx-log assoc t {:t t
-                                                          :tx tx
-                                                          :created-at created-at
-                                                          :outliner-op outliner-op})
+                     (swap! state
+                            (fn [current]
+                              (-> current
+                                  (assoc-in [:tx-log t]
+                                            {:t t
+                                             :tx tx
+                                             :created-at created-at
+                                             :outliner-op outliner-op})
+                                  (assoc :changes 1))))
                      nil)
+
+                   (string/includes? sql "select changes() as n")
+                   (js-rows [{:n (:changes @state)}])
+
+                   (string/includes? sql "select max(t) as max_t from tx_log")
+                   (let [cursors (keys (:tx-log @state))]
+                     (js-rows [{:max-t (when (seq cursors)
+                                        (apply max cursors))}]))
 
                    (string/includes? sql "select t, tx, outliner_op from tx_log")
                    (let [since (first args)

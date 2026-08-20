@@ -228,14 +228,19 @@
   (when node
     (state/set-cursor-range! (util/caret-range node))))
 
-(defn restore-cursor-pos!
-  [id markup]
-  (when-let [node (gdom/getElement (str id))]
+(defn restore-cursor-pos-on-node!
+  "Apply the saved renderer cursor to an already mounted editor node."
+  [node markup]
+  (when node
     (let [cursor-range (state/get-cursor-range)
           pos (or (state/get-editor-last-pos)
                   (and cursor-range
                        (diff/find-position markup cursor-range)))]
       (cursor/move-cursor-to node pos))))
+
+(defn restore-cursor-pos!
+  [id markup]
+  (restore-cursor-pos-on-node! (gdom/getElement (str id)) markup))
 
 (defn highlight-block!
   [block-uuid]
@@ -252,14 +257,19 @@
       (gdom-classes/remove block "block-highlight"))))
 
 (defn wrap-parse-block
-  [block]
-  (db-editor-handler/wrap-parse-block block))
+  ([block]
+   (db-editor-handler/wrap-parse-block block))
+  ([block opts]
+   (db-editor-handler/wrap-parse-block block opts)))
 
 (defn- save-block-inner!
   [block value opts]
   (let [block {:block/uuid (:block/uuid block)
                :block/title value}
-        block' (-> (wrap-parse-block block)
+        ;; Saving text is never allowed to change the block's semantic display
+        ;; type. Code/Math conversions use an explicit editor transition so DB
+        ;; and the live buffer cannot diverge.
+        block' (-> (wrap-parse-block block {:allow-math-display-type-conversion? false})
                    ;; :block/uuid might be changed when backspace/delete
                    ;; a block that has been refed
                    (assoc :block/uuid (:block/uuid block)))
@@ -966,7 +976,8 @@
         [top-level-block-uuids content] (compose-copied-blocks-contents repo ids opts)
         block (db/entity [:block/uuid (first ids)])]
     (when block
-      (let [html (export-html/export-blocks-as-html repo top-level-block-uuids nil)
+      (let [html (when html?
+                   (export-html/export-blocks-as-html repo top-level-block-uuids nil))
             copied-blocks (cond->> (get-all-blocks-by-ids repo top-level-block-uuids)
                             true
                             (map (fn [block]
@@ -1285,7 +1296,9 @@
 
 (defonce *action-bar-timeout (atom nil))
 
-(declare navigable-sibling-block)
+(declare navigable-sibling-block
+         await-pending-math-transition!
+         consume-math-transition-boundary!)
 
 (defn popup-exists?
   [id]
@@ -1310,64 +1323,67 @@
 
 (defn- select-block-up-down
   [direction]
-  (cond
-    ;; when editing, quit editing and select current block
-    (state/editing?)
-    (when-let [element (state/get-editor-block-container)]
-      (when element
-        (p/do!
-         (save-current-block!)
-         (util/scroll-to-block element)
-         (state/exit-editing-and-set-selected-blocks! [element]))))
-
-    ;; when selection and one block selected, select next block
-    (and (state/selection?) (== 1 (count (state/get-selection-blocks))))
-    (let [f (if (= :up direction)
-              util/get-prev-block-non-collapsed
-              (fn [block _opts] (util/get-next-block-non-collapsed-skip block)))
-          element (navigable-sibling-block (first (state/get-selection-blocks))
-                                           f
-                                           {:up-down? true
-                                            :direction direction
-                                            :exclude-property? true})]
-      (when element
+  (if (state/editing?)
+    ;; Keep the transition Promise all the way to the event boundary. Returning
+    ;; nil here used to detach a rejected recovery from the shortcut dispatcher.
+    (if-let [element (state/get-editor-block-container)]
+      (p/let [_ (await-pending-math-transition!)]
+        (save-current-block!)
         (util/scroll-to-block element)
-        (state/conj-selection-block! element direction)))
+        (state/exit-editing-and-set-selected-blocks! [element])
+        (show-action-bar! {:delay 500}))
+      (show-action-bar! {:delay 500}))
+    (do
+      (cond
+        ;; when selection and one block selected, select next block
+        (and (state/selection?) (== 1 (count (state/get-selection-blocks))))
+        (let [f (if (= :up direction)
+                  util/get-prev-block-non-collapsed
+                  (fn [block _opts] (util/get-next-block-non-collapsed-skip block)))
+              element (navigable-sibling-block (first (state/get-selection-blocks))
+                                               f
+                                               {:up-down? true
+                                                :direction direction
+                                                :exclude-property? true})]
+          (when element
+            (util/scroll-to-block element)
+            (state/conj-selection-block! element direction)))
 
-    ;; if same direction, keep conj on same direction
-    (and (state/selection?) (= direction (state/get-selection-direction)))
-    (let [f (if (= :up direction)
-              util/get-prev-block-non-collapsed
-              (fn [block _opts] (util/get-next-block-non-collapsed-skip block)))
-          first-last (if (= :up direction) first last)
-          element (navigable-sibling-block (first-last (state/get-selection-blocks))
-                                           f
-                                           {:up-down? true
-                                            :direction direction
-                                            :exclude-property? true})]
-      (when element
-        (util/scroll-to-block element)
-        (state/conj-selection-block! element direction)))
+        ;; if same direction, keep conj on same direction
+        (and (state/selection?) (= direction (state/get-selection-direction)))
+        (let [f (if (= :up direction)
+                  util/get-prev-block-non-collapsed
+                  (fn [block _opts] (util/get-next-block-non-collapsed-skip block)))
+              first-last (if (= :up direction) first last)
+              element (navigable-sibling-block (first-last (state/get-selection-blocks))
+                                               f
+                                               {:up-down? true
+                                                :direction direction
+                                                :exclude-property? true})]
+          (when element
+            (util/scroll-to-block element)
+            (state/conj-selection-block! element direction)))
 
-    ;; if different direction, keep clear until one left
-    (state/selection?)
-    (let [f (if (= :up direction) util/get-prev-block-non-collapsed util/get-next-block-non-collapsed)
-          last-first (if (= :up direction) last first)
-          element (navigable-sibling-block (last-first (state/get-selection-blocks))
-                                           f
-                                           {:up-down? true
-                                            :direction direction
-                                            :exclude-property? true})]
-      (when element
-        (util/scroll-to-block element)
-        (state/drop-last-selection-block!))))
-  (show-action-bar! {:delay 500})
-  nil)
+        ;; if different direction, keep clear until one left
+        (state/selection?)
+        (let [f (if (= :up direction) util/get-prev-block-non-collapsed util/get-next-block-non-collapsed)
+              last-first (if (= :up direction) last first)
+              element (navigable-sibling-block (last-first (state/get-selection-blocks))
+                                               f
+                                               {:up-down? true
+                                                :direction direction
+                                                :exclude-property? true})]
+          (when element
+            (util/scroll-to-block element)
+            (state/drop-last-selection-block!))))
+      (show-action-bar! {:delay 500}))))
 
 (defn on-select-block
   [direction]
   (fn [_event]
-    (select-block-up-down direction)))
+    (consume-math-transition-boundary!
+     :select-block
+     (select-block-up-down direction))))
 
 (defn save-block-aux!
   [block value opts]
@@ -1396,8 +1412,328 @@
 (defonce *auto-save-timeout (atom nil))
 (defn- clear-block-auto-save-timeout!
   []
-  (when @*auto-save-timeout
-    (js/clearTimeout @*auto-save-timeout)))
+  (when-let [timeout-id @*auto-save-timeout]
+    (js/clearTimeout timeout-id)
+    (reset! *auto-save-timeout nil)))
+
+(defn- current-edit-db-block
+  []
+  (when-let [block (state/get-edit-block)]
+    (or (when-let [id (:db/id block)]
+          (db/entity id))
+        (when-let [uuid (:block/uuid block)]
+          (db/entity [:block/uuid uuid]))
+        block)))
+
+(defn- current-edit-display-type
+  []
+  (or (:logseq.property.node/display-type (state/get-edit-block))
+      (:logseq.property.node/display-type (current-edit-db-block))))
+
+(defn- math-selection-range
+  [input source-title bare-title supplied-start supplied-end]
+  (let [leading-space-count (- (count source-title)
+                               (count (string/triml source-title)))
+        content-start (+ leading-space-count 2)
+        fallback-pos (count source-title)
+        source-start (or supplied-start
+                         (some-> input (gobj/get "selectionStart"))
+                         fallback-pos)
+        source-end (or supplied-end
+                       (some-> input (gobj/get "selectionEnd"))
+                       source-start)
+        bare-count (count bare-title)
+        remap #(-> (- % content-start) (max 0) (min bare-count))]
+    [(remap source-start) (remap source-end)]))
+
+(defonce ^:private *pending-math-transitions (atom {}))
+
+(defn- pending-math-transition
+  [block-uuid]
+  (get @*pending-math-transitions block-uuid))
+
+(defn- pending-current-math-transition
+  []
+  (some-> (state/get-edit-block) :block/uuid pending-math-transition))
+
+(defn math-transition-pending?
+  "Read-only synchronous event-time probe used when a native control must
+  replay a default action that was suppressed while its Math transition
+  settled. The caller must still use `run-math-transition-action!`; this probe
+  grants no mutation authority."
+  ([block-uuid]
+   (boolean (pending-math-transition block-uuid))))
+
+(defn math-transition-recovery-blocked?
+  "Synchronous guard for component roots whose native event callback cannot
+  await before deciding whether an edit/focus mutation is allowed. A
+  catastrophic recovery failure keeps the pending entry latched until an
+  explicit recovery replaces the editor state."
+  ([]
+   (math-transition-recovery-blocked?
+    (some-> (state/get-edit-block) :block/uuid)))
+  ([block-uuid]
+   (boolean (:recovery-error (pending-math-transition block-uuid)))))
+
+(defn- math-transition-recovery-failed?
+  [error]
+  (= :math-transition/recovery-failed (:type (ex-data error))))
+
+(defonce ^:private reported-math-transition-recovery-errors
+  (js/WeakSet.))
+
+(defn consume-math-transition-boundary!
+  "Consume only a typed, content-free Math recovery failure at a UI boundary
+  whose Promise React/the shortcut dispatcher will discard. The first boundary
+  to observe one error reports it once; unknown failures remain rejected and
+  observable. Internal transition chains must keep using the rejecting Promise
+  so their mutations stay short-circuited."
+  [boundary promise]
+  (-> (p/promise promise)
+      (p/catch
+       (fn [error]
+         (if (math-transition-recovery-failed? error)
+           (do
+             (when-not (.has reported-math-transition-recovery-errors error)
+               (.add reported-math-transition-recovery-errors error)
+               ;; Never pass the error, UUID, title or DB payload to this UI
+               ;; receipt. It is intentionally content-free.
+               (log/error :math-transition-recovery-failed
+                          {:boundary boundary}))
+             {:status :recovery-failed})
+           (throw error))))))
+
+(defn- register-pending-math-transition!
+  [block-uuid transition-token transition-promise]
+  (let [entry {:token transition-token
+               :promise transition-promise}
+        clear! #(swap! *pending-math-transitions
+                       (fn [pending]
+                         (if (= transition-token
+                                (get-in pending [block-uuid :token]))
+                           (dissoc pending block-uuid)
+                           pending)))]
+    (swap! *pending-math-transitions assoc block-uuid entry)
+    ;; This side branch only owns lifecycle cleanup. It handles both outcomes so
+    ;; it cannot create a second unhandled rejected Promise.
+    (.then transition-promise
+           (fn [_] (clear!))
+           (fn [error]
+             ;; A failed compensation/readback leaves the editor deliberately
+             ;; latched to the same rejected Promise. Clearing here would let a
+             ;; later Escape/navigation call bypass the fail-closed outcome.
+             (if (math-transition-recovery-failed? error)
+               (swap! *pending-math-transitions
+                      update
+                      block-uuid
+                      (fn [current-entry]
+                        (if (= transition-token (:token current-entry))
+                          (assoc current-entry :recovery-error error)
+                          current-entry)))
+               (clear!))))
+    entry))
+
+(defn await-pending-math-transition!
+  "Settles the pending Math transition for the supplied/current block. The
+  returned status is content-free; event-level rollback completes before a
+  recoverable rejected transition resolves as `:rolled-back`. A failed DB
+  compensation/readback remains rejected and latched so every exit/navigation
+  caller stops before a generic mutation."
+  ([]
+   (await-pending-math-transition!
+    (some-> (state/get-edit-block) :block/uuid)))
+  ([block-uuid]
+   (if-let [transition-promise (:promise (pending-math-transition block-uuid))]
+     (-> transition-promise
+         (p/then (fn [value] {:status :committed :value value}))
+         ;; The event handler performs the token-gated rollback before the
+         ;; event deferred rejects. Exit/navigation may continue afterward.
+         (p/catch (fn [error]
+                    (if (math-transition-recovery-failed? error)
+                      (throw error)
+                      {:status :rolled-back}))))
+     (p/resolved {:status :none}))))
+
+(defn run-math-transition-action!
+  "Run one UI action behind the Math transition that belongs to the editor
+  which was active when the event arrived.  The UUID and settlement Promise
+  are captured synchronously.  Event boundaries may also request synchronous
+  native-event suppression while a transition (including a latched recovery
+  failure) exists. Typed recovery failures are consumed as a content-free
+  result; unknown failures stay rejected and the action never runs."
+  ([boundary action]
+   (run-math-transition-action! boundary {} action))
+  ([boundary {:keys [source-uuid event prevent-default? stop-propagation?]
+              :or {prevent-default? true
+                   stop-propagation? true}}
+    action]
+   (let [source-uuid (or source-uuid
+                         (some-> (state/get-edit-block) :block/uuid))]
+     (if (pending-math-transition source-uuid)
+       (do
+         (when (and event prevent-default?)
+           (when-let [prevent-default (gobj/get event "preventDefault")]
+             (.call prevent-default event)))
+         (when (and event stop-propagation?)
+           (when-let [stop-propagation (gobj/get event "stopPropagation")]
+             (.call stop-propagation event)))
+         ;; Do not move this call into the continuation: acquiring it now is
+         ;; what freezes the event-time transition even if editing switches.
+         (let [settlement (await-pending-math-transition! source-uuid)]
+           (consume-math-transition-boundary!
+            boundary
+            (p/then settlement (fn [_] (action))))))
+       ;; The overwhelmingly common path must preserve the action's exact
+       ;; synchronous return/throw and native-event ordering.
+       (action)))))
+
+(defn- current-math-transition-token?
+  [block-uuid transition-token]
+  (= transition-token
+     (get-in @*pending-math-transitions [block-uuid :token])))
+
+(defn- ordinary-title-after-math-rollback
+  [source-title canonical-title current-title]
+  (if (= canonical-title current-title)
+    source-title
+    (let [open-pos (or (string/index-of source-title "$$") 0)
+          close-pos (or (string/last-index-of source-title "$$")
+                        (- (count source-title) 2))
+          prefix (subs source-title 0 open-pos)
+          suffix (subs source-title (+ close-pos 2))]
+      (str prefix "$$" (or current-title "") "$$" suffix))))
+
+(defn rollback-math-transition!
+  "Restores an optimistic ordinary-to-Math editor transition after its atomic
+  DB transaction fails. If the user has already continued typing, keep the new
+  buffer while restoring the ordinary semantic state instead of overwriting
+  newer input."
+  [{:keys [input-id source-title source-selection-start source-selection-end
+           canonical-title ordinary-editing-block transition-token]}]
+  (let [block-uuid (:block/uuid ordinary-editing-block)]
+    (when (and (= block-uuid (:block/uuid (state/get-edit-block)))
+               (current-math-transition-token? block-uuid transition-token))
+    (let [input (or (state/get-input)
+                    (and input-id (gdom/getElement input-id)))
+          current-title (some-> input (gobj/get "value"))
+          transition-untouched? (= canonical-title current-title)
+          restored-title (ordinary-title-after-math-rollback
+                          source-title canonical-title current-title)
+          restored-content-offset (+ 2 (or (string/index-of restored-title "$$") 0))
+          restored-start (if transition-untouched?
+                           source-selection-start
+                           (+ restored-content-offset
+                              (or (some-> input (gobj/get "selectionStart"))
+                                  (count (or current-title "")))))
+          restored-end (if transition-untouched?
+                         source-selection-end
+                         (+ restored-content-offset
+                            (or (some-> input (gobj/get "selectionEnd"))
+                                (- restored-start restored-content-offset))))]
+      (state/set-state! :editor/block
+                        (assoc ordinary-editing-block :block/title restored-title))
+      (state/set-block-content-and-last-pos! input-id restored-title restored-start)
+      (when input
+        (.setSelectionRange input restored-start restored-end)
+        (.focus input))))))
+
+(defn maybe-convert-current-block-to-math!
+  "Converts one whole displayed-Math editor value through the explicit type
+  transition. Returns true only when it consumed the change. This is the only
+  ordinary-editor path that may change a block to Math; generic saves preserve
+  the current display type."
+  ([input-id value]
+   (maybe-convert-current-block-to-math! input-id value nil nil))
+  ([input-id value supplied-start supplied-end]
+   (let [db-block (current-edit-db-block)
+         block-uuid (:block/uuid db-block)
+         pending? (pending-math-transition block-uuid)
+         proof (and (nil? (:logseq.property.node/display-type db-block))
+                    (not (:comment-editor? (last (state/get-editor-args))))
+                    (gp-mldoc/whole-displayed-math-title value))]
+     (cond
+       pending?
+       true
+
+       (and input-id db-block proof)
+       (let [input (or (state/get-input)
+                       (gdom/getElement input-id))
+             ;; DataScript entities are live views. Freeze the ordinary UI
+             ;; preimage before the DB transaction can remap that entity to
+             ;; Math, otherwise a later rollback can inherit the committed
+             ;; display type from the same entity object.
+             ordinary-editing-block (some->> (state/get-edit-block) (into {}))
+             ;; Capture undo/focus before either the buffer or editor block is
+             ;; optimistically remapped to canonical Math.
+             ordinary-editor-info (state/get-editor-info)
+             source-selection-start (or supplied-start
+                                        (some-> input (gobj/get "selectionStart"))
+                                        (count value))
+             source-selection-end (or supplied-end
+                                      (some-> input (gobj/get "selectionEnd"))
+                                      source-selection-start)
+             bare-title (:title proof)
+             [selection-start selection-end]
+             (math-selection-range input value bare-title
+                                   source-selection-start source-selection-end)
+             transition-token (random-uuid)
+             editing-block (assoc ordinary-editing-block
+                                  :block/title bare-title
+                                  :logseq.property.node/display-type :math)]
+         (clear-block-auto-save-timeout!)
+         (state/set-block-content-and-last-pos! input-id bare-title selection-start)
+         (when (and input (not= selection-start selection-end))
+           (.setSelectionRange input selection-start selection-end))
+         ;; Keep key handling on the canonical Math state while the single DB
+         ;; transaction is dispatched. The ordinary textarea remains focused.
+         (state/set-state! :editor/block editing-block)
+         (let [transition-promise
+               (state/pub-event!
+                [:editor/upsert-type-block
+                 {:block (assoc db-block :block/title bare-title)
+                  :type :math
+                  :update-current-block? true
+                  :preserve-editor-state? true
+                  :cursor-pos selection-start
+                  :math-transition-editor-info ordinary-editor-info
+                  :math-transition-rollback
+                  {:input-id input-id
+                   :source-title value
+                   :source-selection-start source-selection-start
+                   :source-selection-end source-selection-end
+                   :canonical-title bare-title
+                   :ordinary-editing-block ordinary-editing-block
+                   :transition-token transition-token}}])]
+           (register-pending-math-transition!
+            block-uuid transition-token transition-promise)
+           true))
+
+       :else
+       nil))))
+
+(defn- canonicalize-current-math-editor-value!
+  "Canonicalizes one strictly proven legacy display-delimited Math buffer before
+  save. The buffer and selection are rewritten in the same save path that
+  records the one-layer repair as one outliner transaction."
+  [db-block input-id input raw-value]
+  (let [value (if (= :math (:logseq.property.node/display-type db-block))
+                (gp-mldoc/canonical-displayed-math-title raw-value)
+                raw-value)]
+    (when (and input-id
+               (not= raw-value value)
+               (= (:block/uuid db-block)
+                  (:block/uuid (state/get-edit-block))))
+      (let [source-start (or (some-> input (gobj/get "selectionStart"))
+                             (count raw-value))
+            source-end (or (some-> input (gobj/get "selectionEnd")) source-start)
+            [selection-start selection-end]
+            (math-selection-range input raw-value value source-start source-end)]
+        (state/set-block-content-and-last-pos! input-id value selection-start)
+        (state/set-state! :editor/block
+                          (assoc (state/get-edit-block) :block/title value))
+        (when input
+          (.setSelectionRange input selection-start selection-end))))
+    value))
 
 (defn save-current-block!
   ([]
@@ -1417,9 +1753,12 @@
                db-content (:block/title db-block)
                db-content-without-heading (and db-content
                                                (common-util/safe-subs db-content (:block/level db-block)))
-               value (if (= (:block/uuid current-block) (:block/uuid block))
-                       (:block/title current-block)
-                       (and elem (gobj/get elem "value")))]
+               raw-value (if (= (:block/uuid current-block) (:block/uuid block))
+                           (:block/title current-block)
+                           (and elem (gobj/get elem "value")))
+               value (when (string? raw-value)
+                       (canonicalize-current-math-editor-value!
+                        db-block input-id elem raw-value))]
            (when value
              (cond
                force?
@@ -1909,15 +2248,18 @@
       (state/set-edit-content! id value false)
       (clear-block-auto-save-timeout!)
       (block-handler/mark-last-input-time! repo)
-      (reset! *auto-save-timeout
-              (js/setTimeout
-               (fn []
-                 (when (and (state/input-idle? repo :diff 450)
-                          ;; don't auto-save block if it has tags
-                            (not (re-find #"#\S+" value)))
-                   ; don't auto-save for page's properties block
-                   (save-current-block! {:skip-properties? true})))
-               450)))))
+      (when-not (or (maybe-convert-current-block-to-math! id value)
+                    (= :commands (state/get-editor-action)))
+        (reset! *auto-save-timeout
+                (js/setTimeout
+                 (fn []
+                   (when (and (state/input-idle? repo :diff 450)
+                              (not= :commands (state/get-editor-action))
+                            ;; don't auto-save block if it has tags
+                              (not (re-find #"#\S+" value)))
+                     ; don't auto-save for page's properties block
+                     (save-current-block! {:skip-properties? true})))
+                 450))))))
 
 (defn- start-of-new-word?
   [input pos]
@@ -1945,6 +2287,10 @@
            (= last-input-char commands/command-trigger)
            (or (re-find #"(?m)^/" (str (.-value input))) (start-of-new-word? input pos)))
       (do
+        ;; Slash commands are transient editor input. If their popup is slow
+        ;; to mount, committing the trigger through RTC can refresh/unmount
+        ;; the editor before the command is chosen.
+        (clear-block-auto-save-timeout!)
         (state/set-editor-action-data! {:pos (cursor/get-caret-pos input)})
         (commands/reinit-matched-commands!)
         (state/set-editor-show-commands!))
@@ -2290,22 +2636,50 @@
         target (when e (.-target e))]
     (when (or (nil? target)
               (inside-of-editor-block target))
-      (if (pending-new-block?)
+      (cond
+        (pending-new-block?)
         (when e (.preventDefault e))
-        (if (or (state/doc-mode-enter-for-new-line?) (inside-of-single-block (:node state)))
-          (keydown-new-line)
-          (do
-            (when e (.preventDefault e))
-            (keydown-new-block state)))))))
+
+        (pending-current-math-transition)
+        (do
+          (when e (.preventDefault e))
+          (consume-math-transition-boundary!
+           :enter
+           (p/let [_ (await-pending-math-transition!)]
+             (let [settled-state (get-state)]
+               (if (or (state/doc-mode-enter-for-new-line?)
+                       (inside-of-single-block (:node settled-state)))
+                 (keydown-new-line)
+                 (keydown-new-block settled-state))))))
+
+        (or (state/doc-mode-enter-for-new-line?)
+            (inside-of-single-block (:node state)))
+        (keydown-new-line)
+
+        :else
+        (do
+          (when e (.preventDefault e))
+          (keydown-new-block state))))))
 
 (defn keydown-new-line-handler [e]
   (let [state (get-state)]
     (when (or (nil? (.-target e)) (inside-of-editor-block (.-target e)))
-      (if (and (state/doc-mode-enter-for-new-line?) (not (inside-of-single-block (:node state))))
-        (keydown-new-block state)
+      (if (pending-current-math-transition)
         (do
           (.preventDefault e)
-          (keydown-new-line))))))
+          (consume-math-transition-boundary!
+           :new-line
+           (p/let [_ (await-pending-math-transition!)]
+             (let [settled-state (get-state)]
+               (if (and (state/doc-mode-enter-for-new-line?)
+                        (not (inside-of-single-block (:node settled-state))))
+                 (keydown-new-block settled-state)
+                 (keydown-new-line))))))
+        (if (and (state/doc-mode-enter-for-new-line?) (not (inside-of-single-block (:node state))))
+          (keydown-new-block state)
+          (do
+            (.preventDefault e)
+            (keydown-new-line)))))))
 
 (defn- select-first-last
   "Select first or last block in viewport"
@@ -2561,7 +2935,7 @@
           (edit-block! block 0 {:container-id container-id
                                 :direction direction}))))))
 
-(defn move-cross-boundary-up-down
+(defn- move-cross-boundary-up-down-now
   [direction move-opts]
   (let [input (if (contains? move-opts :input)
                 (:input move-opts)
@@ -2649,6 +3023,13 @@
             :down (when input
                     (cursor/move-cursor-to-end input))))))))
 
+(defn move-cross-boundary-up-down
+  [direction move-opts]
+  (if (pending-current-math-transition)
+    (p/let [_ (await-pending-math-transition!)]
+      (move-cross-boundary-up-down-now direction move-opts))
+    (move-cross-boundary-up-down-now direction move-opts)))
+
 (defn keydown-up-down-handler
   [direction {:keys [_pos] :as move-opts}]
   (let [input (state/get-input)
@@ -2673,7 +3054,7 @@
           (cursor/move-cursor-up input)
           (cursor/move-cursor-down input))))))
 
-(defn move-to-block-when-cross-boundary
+(defn- move-to-block-when-cross-boundary-now
   [direction {:keys [block]}]
   (let [up? (= :left direction)
         pos (if up? :max 0)
@@ -2710,6 +3091,13 @@
 
           :else
           nil)))))
+
+(defn move-to-block-when-cross-boundary
+  [direction opts]
+  (if (pending-current-math-transition)
+    (p/let [_ (await-pending-math-transition!)]
+      (move-to-block-when-cross-boundary-now direction opts))
+    (move-to-block-when-cross-boundary-now direction opts)))
 
 (defn keydown-arrow-handler
   [direction]
@@ -3001,13 +3389,21 @@
              (= "#" (util/nth-safe value (dec pos))))
         (state/clear-editor-action!)
 
-        (and (= "$" key) (string/blank? (util/get-selected-text)))
+        (and (= "$" key)
+             (not= :math (current-edit-display-type))
+             (string/blank? (util/get-selected-text)))
         (do
           (util/stop e)
-          (commands/simple-insert! input-id "$$" {:backward-pos 1}))
+          (commands/simple-insert!
+           input-id
+           "$$"
+           {:backward-pos 1
+            :check-fn (fn [new-value _prefix-pos new-pos]
+                        (maybe-convert-current-block-to-math!
+                         input-id new-value new-pos new-pos))}))
 
         (and (contains? (set/difference (set (keys reversed-autopair-map))
-                                        #{"`"})
+                                        #{"`" "$"})
                         key)
              (= (get-current-input-char input) key))
         (do
@@ -3033,11 +3429,13 @@
 
           ;; If you type `xyz`, the last backtick should close the first and not add another autopair
           ;; If you type several backticks in a row, each one should autopair to accommodate multiline code (```)
-        (-> (keys autopair-map)
-            set
-            (disj "(")
-            (contains? key)
-            (or (autopair-left-paren? input key)))
+        (and (not (and (= key "$")
+                       (= :math (current-edit-display-type))))
+             (-> (keys autopair-map)
+                 set
+                 (disj "(")
+                 (contains? key)
+                 (or (autopair-left-paren? input key))))
         (let [curr (get-current-input-char input)
               prev (util/nth-safe value (dec pos))]
           (util/stop e)
@@ -3185,6 +3583,9 @@
               (util/goog-event-is-composing? e true)])
             comment-editor? (:comment-editor? (last (state/get-editor-args)))]
         (cond
+          (maybe-convert-current-block-to-math! (.-id input) value)
+          nil
+
           (= value "``````") ; turn this block into a code block
           (do
             (state/set-edit-content! (.-id input) "")
@@ -3378,7 +3779,9 @@
       (util/stop e)
       (cond
         (state/editing?)
-        (keydown-up-down-handler direction {})
+        (consume-math-transition-boundary!
+         :up-down
+         (keydown-up-down-handler direction {}))
 
         (state/selection?)
         (select-up-down direction)
@@ -3392,22 +3795,24 @@
 (defn shortcut-select-up-down [direction]
   (fn [e]
     (util/stop e)
-    (if (state/editing?)
-      (let [input (state/get-input)
-            selected-start (util/get-selection-start input)
-            selected-end (util/get-selection-end input)
-            [anchor cursor] (case (util/get-selection-direction input)
-                              "backward" [selected-end selected-start]
-                              [selected-start selected-end])
-            cursor-rect (cursor/get-caret-pos input cursor)]
-        (if
-          ;; if the move is to cross block boundary, select the whole block
-         (or (and (= direction :up) (cursor/textarea-cursor-rect-first-row? cursor-rect))
-             (and (= direction :down) (cursor/textarea-cursor-rect-last-row? cursor-rect)))
-          (select-block-up-down direction)
-          ;; simulate text selection
-          (cursor/select-up-down input direction anchor cursor-rect)))
-      (select-block-up-down direction))))
+    (consume-math-transition-boundary!
+     :select-up-down
+     (if (state/editing?)
+       (let [input (state/get-input)
+             selected-start (util/get-selection-start input)
+             selected-end (util/get-selection-end input)
+             [anchor cursor] (case (util/get-selection-direction input)
+                               "backward" [selected-end selected-start]
+                               [selected-start selected-end])
+             cursor-rect (cursor/get-caret-pos input cursor)]
+         (if
+           ;; if the move is to cross block boundary, select the whole block
+          (or (and (= direction :up) (cursor/textarea-cursor-rect-first-row? cursor-rect))
+              (and (= direction :down) (cursor/textarea-cursor-rect-last-row? cursor-rect)))
+           (select-block-up-down direction)
+           ;; simulate text selection
+           (cursor/select-up-down input direction anchor cursor-rect)))
+       (select-block-up-down direction)))))
 
 (defn editor-commands-popup-exists?
   []
@@ -3442,7 +3847,9 @@
         (state/editing?)
         (do
           (util/stop e)
-          (keydown-arrow-handler direction))
+          (consume-math-transition-boundary!
+           :left-right
+           (keydown-arrow-handler direction)))
 
         (state/selection?)
         (do
@@ -3903,6 +4310,7 @@
   [& {:keys [select? save-block? editing-another-block?]
       :or {save-block? true}}]
   (p/do!
+   (await-pending-math-transition!)
    (when save-block? (save-current-block!))
    (if select?
      (when-let [node (some-> (state/get-input) (util/rec-get-node "ls-block"))]

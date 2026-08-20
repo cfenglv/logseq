@@ -4,6 +4,7 @@ const cp = require('child_process')
 const exec = utils.promisify(cp.exec)
 const path = require('path')
 const gulp = require('gulp')
+const semver = require('semver')
 const webpack = require('webpack')
 
 const outputPath = path.join(__dirname, 'static')
@@ -84,6 +85,44 @@ const staticCleanKeep = new Set([
   'pnpm-lock.yaml',
 ])
 const staticInstallCommand = 'pnpm install --ignore-workspace --frozen-lockfile'
+const releaseVersionPattern =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+
+const readReleaseVersion = () => {
+  const versionSource = fs.readFileSync(
+    path.join(__dirname, 'src/main/frontend/version.cljs'),
+    'utf8')
+  const version = versionSource.match(/\(defonce version "([^"]+)"\)/)?.[1]
+
+  if (
+    !version ||
+    !releaseVersionPattern.test(version) ||
+    !semver.valid(version)
+  ) {
+    throw new Error(
+      `Invalid release version in src/main/frontend/version.cljs: ${version || 'missing'}`)
+  }
+
+  return version
+}
+
+const buildProjectUpdaterHelper = () => {
+  if (process.platform !== 'darwin') return
+  if (!['arm64', 'x64'].includes(process.arch)) {
+    throw new Error(`Unsupported macOS project updater architecture: ${process.arch}`)
+  }
+
+  cp.execFileSync(
+    process.execPath,
+    [
+      path.join(__dirname, 'scripts/build-project-update-helper.mjs'),
+      '--arch',
+      process.arch,
+      '--output',
+      path.join(outputPath, 'sidecar', 'logseq-project-updater'),
+    ],
+    { stdio: 'inherit' })
+}
 
 const css = {
   watchCSS () {
@@ -357,6 +396,9 @@ exports.electron = () => {
 }
 
 const prepareElectronMaker = async () => {
+  const version = readReleaseVersion()
+  buildProjectUpdaterHelper()
+
   cp.execSync('pnpm cljs:release-electron', {
     stdio: 'inherit',
   })
@@ -372,17 +414,12 @@ const prepareElectronMaker = async () => {
   cp.execSync('pnpm desktop:prepare-runtime-js', {
     stdio: 'inherit',
   })
+  cp.execSync('pnpm desktop:verify-runtime-revisions', {
+    stdio: 'inherit',
+  })
 
   const pkgPath = path.join(outputPath, 'package.json')
   const pkg = require(pkgPath)
-  const version = fs.readFileSync(
-    path.join(__dirname, 'src/main/frontend/version.cljs')).
-    toString().
-    match(/[0-9.]{3,}/)[0]
-
-  if (!version) {
-    throw new Error('release version error in src/**/*/version.cljs')
-  }
 
   pkg.version = version
   fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2))

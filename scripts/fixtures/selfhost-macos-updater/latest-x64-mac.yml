@@ -1,0 +1,11 @@
+version: 2.0.1-selfhost.4
+files:
+  - url: Logseq-darwin-x64-2.0.1-selfhost.4.zip
+    sha512: CmgNjustlpQp5phFdEC/Cq/ReA94JvzyGWCl5amrIS969NOKdqMXABF68XLcBv/OnEG+PErWZeIYSTWg0h0BUA==
+    size: 155582087
+  - url: Logseq-darwin-x64-2.0.1-selfhost.4.dmg
+    sha512: BDpMttP65v/uvAmyV+IExBA9G3l/nbm18aI8M7SY1ilp3Jx1u3UJsxa33Tlu8NPOZrLRusFKeUwc1aMxbwkCGw==
+    size: 160875243
+path: Logseq-darwin-x64-2.0.1-selfhost.4.zip
+sha512: CmgNjustlpQp5phFdEC/Cq/ReA94JvzyGWCl5amrIS969NOKdqMXABF68XLcBv/OnEG+PErWZeIYSTWg0h0BUA==
+releaseDate: '2026-07-26T09:41:57.905Z'

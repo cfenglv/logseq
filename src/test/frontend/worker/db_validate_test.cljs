@@ -1,5 +1,5 @@
 (ns frontend.worker.db-validate-test
-  (:require [cljs.test :refer [deftest is]]
+  (:require [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
             [frontend.worker.db.validate :as worker-db-validate]
             [frontend.worker.shared-service :as shared-service]
@@ -12,6 +12,60 @@
   (let [conn (d/create-conn db-schema/schema)]
     (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
     conn))
+
+(defn- validate-block-with-property-entities
+  [property-entities block-properties]
+  (let [conn (d/create-conn db-schema/schema)
+        _ (d/transact! conn property-entities)
+        tx-report
+        (d/with
+         @conn
+         [(merge
+           {:block/uuid (random-uuid)
+            :block/created-at 1
+            :block/updated-at 1
+            :block/title "Legacy built-in property"
+            :block/parent 1000
+            :block/page 1000
+            :block/order "a0"}
+           block-properties)])]
+    (db-validate/validate-tx-report tx-report nil)))
+
+(deftest validate-tx-report-supports-incomplete-legacy-built-in-properties
+  (let [[valid? errors]
+        (validate-block-with-property-entities
+         [{:db/ident :logseq.property/heading}
+          {:db/ident :logseq.property.node/display-type}]
+         {:logseq.property/heading 2
+          :logseq.property.node/display-type :code})]
+    (is valid?)
+    (is (nil? errors))))
+
+(deftest validate-tx-report-keeps-property-validation-strict
+  (testing "a recovered built-in definition still validates its value"
+    (let [[valid? errors]
+          (validate-block-with-property-entities
+           [{:db/ident :logseq.property.node/display-type}]
+           {:logseq.property.node/display-type "code"})]
+      (is (false? valid?))
+      (is (seq errors))))
+
+  (testing "unknown property definitions are not inferred"
+    (let [[valid? errors]
+          (validate-block-with-property-entities
+           [{:db/ident :logseq.property/unknown-legacy-property}]
+           {:logseq.property/unknown-legacy-property "value"})]
+      (is (false? valid?))
+      (is (seq errors))))
+
+  (testing "an explicit stored type is not replaced by the built-in definition"
+    (let [[valid? errors]
+          (validate-block-with-property-entities
+           [{:db/ident :logseq.property.node/display-type
+             :logseq.property/type :checkbox}]
+           {:logseq.property.node/display-type :code})]
+      (is (false? valid?))
+      (is (seq errors)))))
 
 (deftest validate-db-returns-count-fields-without-counts-wrapper
   (let [conn (create-db-graph-conn)]
@@ -92,3 +146,81 @@
         (is (nil? (:logseq.property.class/extends property)))
         (is (nil? (:kv/value class)))
         (is (empty? (:errors (worker-db-validate/validate-db conn))))))))
+
+(deftest validate-db-preserves-selfhost-4-pdf-annotation-missing-title
+  (let [conn (create-db-graph-conn)
+        page-id (get (:tempids
+                      (d/transact! conn
+                                   [{:db/id "pdf-page"
+                                     :block/uuid #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                                     :block/created-at 1710000000000
+                                     :block/updated-at 1710000001000
+                                     :block/name "paper"
+                                     :block/title "Paper"
+                                     :block/tags :logseq.class/Page}]))
+                     "pdf-page")
+        annotation-uuid #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        ordinary-uuid #uuid "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        hl-value {:id annotation-uuid
+                  :page 7
+                  :content {:text nil}
+                  :position {:page 7}}
+        tempids (:tempids
+                 (d/transact!
+                  conn
+                  [{:db/id "legacy-pdf-annotation"
+                    :block/uuid annotation-uuid
+                    :block/created-at 1710000002000
+                    :block/updated-at 1710000003000
+                    :block/page page-id
+                    :block/parent page-id
+                    :block/order "a0"
+                    :block/tags :logseq.class/Pdf-annotation
+                    :logseq.property/ls-type :annotation
+                    :logseq.property.pdf/hl-color :logseq.property/color.yellow
+                    :logseq.property/asset page-id
+                    :logseq.property.pdf/hl-page 7
+                    :logseq.property.pdf/hl-value hl-value}
+                   {:db/id "ordinary-missing-title"
+                    :block/uuid ordinary-uuid
+                    :block/created-at 1710000004000
+                    :block/updated-at 1710000005000
+                    :block/page page-id
+                    :block/parent page-id
+                    :block/order "a1"}]))
+        annotation-id (get tempids "legacy-pdf-annotation")
+        ordinary-id (get tempids "ordinary-missing-title")
+        initial-invalid-ids
+        (->> (:errors (db-validate/validate-db @conn))
+             (map (comp :db/id :entity))
+             set)]
+    (is (= #{annotation-id ordinary-id} initial-invalid-ids)
+        "the fixture must isolate the two legacy missing-title entities")
+    (with-redefs [shared-service/broadcast-to-clients! (fn [& _args] nil)]
+      (let [result (worker-db-validate/validate-db conn)
+            annotation (d/entity @conn [:block/uuid annotation-uuid])
+            ordinary-block (d/entity @conn [:block/uuid ordinary-uuid])]
+        (is (some? annotation)
+            "default validation repair must preserve the legacy PDF annotation")
+        (is (= "" (:block/title annotation))
+            "legacy missing annotation text must normalize to an empty title")
+        (is (= annotation-uuid (:block/uuid annotation)))
+        (is (= page-id (:db/id (:block/page annotation))))
+        (is (= page-id (:db/id (:block/parent annotation))))
+        (is (= "a0" (:block/order annotation)))
+        (is (= [1710000002000 1710000003000]
+               ((juxt :block/created-at :block/updated-at) annotation)))
+        (is (= [:logseq.class/Pdf-annotation]
+               (mapv :db/ident (:block/tags annotation))))
+        (is (= :annotation (:logseq.property/ls-type annotation)))
+        (is (= :logseq.property/color.yellow
+               (:db/ident (:logseq.property.pdf/hl-color annotation))))
+        (is (= page-id
+               (:db/id (:logseq.property/asset annotation))))
+        (is (= 7 (:logseq.property.pdf/hl-page annotation)))
+        (is (= hl-value (:logseq.property.pdf/hl-value annotation)))
+        (is (nil? ordinary-block)
+            "ordinary non-PDF blocks missing title keep the existing deletion policy")
+        (is (empty? (:errors result)))
+        (is (empty? (:errors (worker-db-validate/validate-db conn)))
+            "the repaired selfhost.4-shaped graph must validate cleanly")))))

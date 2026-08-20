@@ -27,12 +27,18 @@
 
 (def ops-schema [:sequential op-schema])
 (def ops-coercer (ma/coercer ops-schema mt/json-transformer nil
-                             #(do (log/error ::bad-ops (:value %))
+                             #(do (log/error ::bad-ops
+                                             {:value-shape
+                                              (cond
+                                                (nil? (:value %)) :nil
+                                                (sequential? (:value %)) :sequential
+                                                (map? (:value %)) :map
+                                                :else :other)})
                                   (ma/-fail! ::ops-schema (select-keys % [:value])))))
 
 (defonce *repo->pending-local-tx-count (atom {}))
 
-(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v2")
+(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v3")
 (def ^:private sqlite-mode-key "__logseq_client_ops_sqlite_mode")
 (def ^:private sync-meta-table-sql
   "create table if not exists sync_meta (key text primary key, value text)")
@@ -72,6 +78,12 @@
        ")"))
 (def ^:private sync-conflicts-block-index-sql
   "create index if not exists idx_sync_conflicts_block_uuid on sync_conflicts(block_uuid, created_at)")
+(def ^:private client-tx-upload-state-table-sql
+  (str "create table if not exists client_tx_upload_state ("
+       "logical_tx_id text primary key,"
+       "session_data text not null,"
+       "updated_at integer not null"
+       ")"))
 
 (defn- client-ops-store
   [repo]
@@ -237,6 +249,7 @@
        (fn [tx]
          (sqlite-run! tx sync-meta-table-sql [])
          (sqlite-run! tx client-ops-table-sql [])
+         (sqlite-run! tx client-tx-upload-state-table-sql [])
          (sqlite-run! tx sync-conflicts-table-sql [])
          (sqlite-run! tx pending-index-sql [])
          (sqlite-run! tx asset-index-sql [])
@@ -245,6 +258,35 @@
         (gobj/set db sqlite-schema-ready-key true)
         (catch :default _
           nil)))))
+
+(defn get-client-tx-upload-state
+  [repo logical-tx-id]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (some-> (sqlite-row store
+                        "select session_data from client_tx_upload_state where logical_tx_id = ?"
+                        [(str logical-tx-id)])
+            (aget "session_data")
+            sqlite-util/read-transit-str)))
+
+(defn put-client-tx-upload-state!
+  [repo logical-tx-id session]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-run! store
+                 (str "insert into client_tx_upload_state "
+                      "(logical_tx_id, session_data, updated_at) values (?, ?, ?) "
+                      "on conflict(logical_tx_id) do update set "
+                      "session_data = excluded.session_data, updated_at = excluded.updated_at")
+                 [(str logical-tx-id)
+                  (sqlite-util/write-transit-str session)
+                  (.now js/Date)]))
+  session)
+
+(defn delete-client-tx-upload-state!
+  [repo logical-tx-id]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-run! store
+                 "delete from client_tx_upload_state where logical_tx_id = ?"
+                 [(str logical-tx-id)])))
 
 (defn- sqlite-get-meta
   [db k]
@@ -257,6 +299,120 @@
                (str "insert into sync_meta (key, value) values (?, ?)"
                     " on conflict(key) do update set value = excluded.value")
                [(name k) (str v)]))
+
+(defn- sqlite-delete-meta!
+  [db k]
+  (sqlite-run! db
+               "delete from sync_meta where key = ?"
+               [(name k)]))
+
+(def ^:private auto-repair-attempt-key
+  :db-sync/auto-repair-attempt-v1)
+
+(defn get-auto-repair-attempt
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (when-let [value (sqlite-get-meta store auto-repair-attempt-key)]
+      (try
+        (sqlite-util/read-transit-str value)
+        (catch :default _
+          ;; A malformed receipt must block another automatic replacement.
+          ;; The explicit user retry path can clear it safely.
+          {:status :invalid})))))
+
+(defn claim-auto-repair-attempt!
+  "Persist the one automatic repair allowance before any network work starts.
+  Returns false when this graph has already attempted automatic repair."
+  [repo graph-id error-type]
+  (if-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (if (some? (sqlite-get-meta tx auto-repair-attempt-key))
+         false
+         (do
+           (sqlite-set-meta!
+            tx auto-repair-attempt-key
+            (sqlite-util/write-transit-str
+             {:attempt-id (str (random-uuid))
+              :error-type error-type
+              :graph-id (str graph-id)
+              :started-at (.now js/Date)
+              :status :started}))
+           true))))
+    false))
+
+(defn clear-auto-repair-attempt!
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-delete-meta! store auto-repair-attempt-key))
+  nil)
+
+(defn clear-auto-repair-attempt-if-matches!
+  "Clear a completed automatic-repair receipt only when the durable value is
+  still the exact receipt owned by this client generation. Normal RTC success
+  has no receipt and must not write the client-op sidecar."
+  [repo receipt]
+  (if-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [existing
+             (when-let [value (sqlite-get-meta tx auto-repair-attempt-key)]
+               (try
+                 (sqlite-util/read-transit-str value)
+                 (catch :default _
+                   ::invalid)))]
+         (if (= receipt existing)
+           (do
+             (sqlite-delete-meta! tx auto-repair-attempt-key)
+             true)
+           false))))
+    false))
+
+(defn preserve-auto-repair-attempt!
+  "Restore the same one-shot receipt after snapshot activation replaces the
+  client-op sidecar. A different receipt is never overwritten: that would
+  silently re-arm automatic replacement across generations."
+  [repo receipt]
+  (when-not (and (map? receipt)
+                 (string? (:attempt-id receipt))
+                 (seq (:attempt-id receipt))
+                 (string? (:graph-id receipt))
+                 (seq (:graph-id receipt))
+                 (= :started (:status receipt)))
+    (throw
+     (ex-info "invalid automatic repair receipt"
+              {:type :db-sync/invalid-auto-repair-receipt
+               :repo repo})))
+  (if-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [existing (some-> (sqlite-get-meta tx auto-repair-attempt-key)
+                              sqlite-util/read-transit-str)]
+         (cond
+           (nil? existing)
+           (do
+             (sqlite-set-meta!
+              tx auto-repair-attempt-key
+              (sqlite-util/write-transit-str receipt))
+             true)
+
+           (= receipt existing)
+           true
+
+           :else
+           (throw
+            (ex-info "automatic repair receipt changed across activation"
+                     {:type :db-sync/auto-repair-receipt-conflict
+                      :repo repo
+                      :expected-attempt-id (:attempt-id receipt)
+                      :actual-attempt-id (:attempt-id existing)}))))))
+    (throw
+     (ex-info "client-op sidecar unavailable after snapshot activation"
+              {:type :db-sync/auto-repair-receipt-unavailable
+               :repo repo}))))
 
 (defn update-graph-uuid
   [repo graph-uuid]
@@ -286,14 +442,31 @@
                       {:repo repo
                        :prev-t prev-t
                        :new-t t})))
-    (sqlite-set-meta! store :local-tx t)))
+    (sqlite-set-meta! store :local-tx t)
+    ;; A normal acknowledgement changes only the cursor, so the versioned
+    ;; checksum remains valid. An old-client local edit changes the maintained
+    ;; legacy checksum; in that case do not bless the stale versioned value.
+    (when (and
+           (string? (sqlite-get-meta store :db-sync/server-checksum-v2))
+           (= (sqlite-get-meta
+               store
+               :db-sync/server-checksum-v2-legacy-checksum)
+              (sqlite-get-meta store :db-sync/checksum)))
+      (sqlite-set-meta! store :db-sync/server-checksum-v2-t t))))
 
 (defn reset-local-tx
   "Should be used only when uploading a graph"
   [repo]
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
-    (sqlite-set-meta! store :local-tx 0)))
+    (sqlite-set-meta! store :local-tx 0)
+    (when (and
+           (string? (sqlite-get-meta store :db-sync/server-checksum-v2))
+           (= (sqlite-get-meta
+               store
+               :db-sync/server-checksum-v2-legacy-checksum)
+              (sqlite-get-meta store :db-sync/checksum)))
+      (sqlite-set-meta! store :db-sync/server-checksum-v2-t 0))))
 
 (defn update-local-checksum
   [repo checksum]
@@ -302,33 +475,159 @@
     (assert (some? store) repo)
     (sqlite-set-meta! store :db-sync/checksum checksum)))
 
+(defn update-local-server-checksum
+  [repo checksum]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (if (string? checksum)
+      (do
+        (sqlite-set-meta! store :db-sync/server-checksum-v2 checksum)
+        (sqlite-set-meta! store
+                          :db-sync/server-checksum-v2-t
+                          (or (get-local-tx repo) 0))
+        (sqlite-set-meta! store
+                          :db-sync/server-checksum-v2-legacy-checksum
+                          (sqlite-get-meta store :db-sync/checksum)))
+      (do
+        (sqlite-delete-meta! store :db-sync/server-checksum-v2)
+        (sqlite-delete-meta! store :db-sync/server-checksum-v2-t)
+        (sqlite-delete-meta!
+         store :db-sync/server-checksum-v2-legacy-checksum)))))
+
+(defn commit-sync-checkpoint!
+  "Atomically publish a sync cursor and any checksum projections supplied in
+  `checkpoint`. Omitted checksum keys preserve their current values; an
+  explicitly nil server checksum clears the versioned projection."
+  [repo {:keys [t checksum server-checksum expected-local-t] :as checkpoint}]
+  {:pre [(and (integer? t) (>= t 0))]}
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [prev-t (some-> (sqlite-get-meta tx :local-tx)
+                            (js/parseInt 10))]
+         (when (and (some? expected-local-t)
+                    (not= expected-local-t prev-t))
+           (throw
+            (ex-info "sync checkpoint changed"
+                     {:type :db-sync/checkpoint-changed
+                      :repo repo
+                      :expected-local-t expected-local-t
+                      :actual-local-t prev-t})))
+         (when (and prev-t (< t prev-t))
+           (throw
+            (ex-info "local-tx should be monotonically increasing"
+                     {:repo repo
+                      :prev-t prev-t
+                      :new-t t})))
+         (when (contains? checkpoint :checksum)
+           (when-not (string? checksum)
+             (throw
+              (ex-info "invalid sync checkpoint checksum"
+                       {:type :db-sync/invalid-checkpoint
+                        :repo repo
+                        :field :checksum})))
+           (sqlite-set-meta! tx :db-sync/checksum checksum))
+         (sqlite-set-meta! tx :local-tx t)
+         (if (contains? checkpoint :server-checksum)
+           (if (string? server-checksum)
+             (do
+               (sqlite-set-meta! tx
+                                 :db-sync/server-checksum-v2
+                                 server-checksum)
+               (sqlite-set-meta! tx :db-sync/server-checksum-v2-t t)
+               (sqlite-set-meta!
+                tx
+                :db-sync/server-checksum-v2-legacy-checksum
+                (sqlite-get-meta tx :db-sync/checksum)))
+             (do
+               (sqlite-delete-meta! tx :db-sync/server-checksum-v2)
+               (sqlite-delete-meta! tx :db-sync/server-checksum-v2-t)
+               (sqlite-delete-meta!
+                tx :db-sync/server-checksum-v2-legacy-checksum)))
+           ;; A cursor-only legacy acknowledgement can advance an already
+           ;; validated versioned projection only while its legacy anchor is
+           ;; still current.
+           (when (and
+                  (string?
+                   (sqlite-get-meta tx :db-sync/server-checksum-v2))
+                  (= (sqlite-get-meta
+                      tx :db-sync/server-checksum-v2-legacy-checksum)
+                     (sqlite-get-meta tx :db-sync/checksum)))
+             (sqlite-set-meta! tx :db-sync/server-checksum-v2-t t))))))
+    t))
+
+(defn- persisted-pending-local-tx-count
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (or (some-> (sqlite-row store
+                             "select count(*) as c from client_ops where kind = 'tx' and pending = 1"
+                             [])
+                (aget "c"))
+        0)))
+
+(defn get-durable-pending-local-tx-count
+  "Read the authoritative pending count from SQLite, bypassing the warm UI
+  cache. Destructive snapshot preflights must use this value."
+  [repo]
+  (persisted-pending-local-tx-count repo))
+
 (defn get-pending-local-tx-count
   [repo]
-  (if-let [cached (get @*repo->pending-local-tx-count repo)]
+  (if-some [cached (get @*repo->pending-local-tx-count repo)]
     cached
-    (let [count' (if-let [store (sqlite-store-or-throw repo)]
-                   (or (some-> (sqlite-row store
-                                            "select count(*) as c from client_ops where kind = 'tx' and pending = 1"
-                                            [])
-                               (aget "c"))
-                       0)
-                   0)]
-      (swap! *repo->pending-local-tx-count assoc repo count')
-      count')))
+    (if-some [count' (persisted-pending-local-tx-count repo)]
+      (let [counts (swap! *repo->pending-local-tx-count
+                          (fn [counts]
+                            (if (contains? counts repo)
+                              counts
+                              (assoc counts repo count'))))]
+        (get counts repo))
+      0)))
 
 (defn adjust-pending-local-tx-count!
+  "Adjust the warm pending count after the corresponding SQLite mutation.
+  A cold cache is reconciled from the already-updated SQLite state. Before the
+  SQLite store is registered the count stays unknown and is not cached."
   [repo delta]
   (swap! *repo->pending-local-tx-count
          (fn [m]
-           (let [base (or (get m repo) 0)
-                 next (max 0 (+ base delta))]
-             (assoc m repo next)))))
+           (if (contains? m repo)
+             (let [next (max 0 (+ (get m repo) delta))]
+               (assoc m repo next))
+             ;; Every caller changes SQLite before adjusting the cache. On a
+             ;; cold worker SQLite already includes this delta, so initialize
+             ;; from persisted state instead of applying the delta twice.
+             (if-some [count' (persisted-pending-local-tx-count repo)]
+               (assoc m repo count')
+               m)))))
 
 (defn get-local-checksum
   [repo]
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
     (sqlite-get-meta store :db-sync/checksum)))
+
+(defn get-local-server-checksum
+  [repo]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (let [checksum (sqlite-get-meta store :db-sync/server-checksum-v2)
+          checksum-t (some-> (sqlite-get-meta
+                              store
+                              :db-sync/server-checksum-v2-t)
+                             (js/parseInt 10))
+          checksum-legacy
+          (sqlite-get-meta store
+                           :db-sync/server-checksum-v2-legacy-checksum)
+          local-t (get-local-tx repo)]
+      ;; Missing/stale watermarks are expected after a client downgrade. The
+      ;; caller recomputes from the current local DB instead of trusting them.
+      (when (and (string? checksum)
+                 (= checksum-t local-t)
+                 (= checksum-legacy (get-local-checksum repo)))
+        checksum))))
 
 (defn rtc-db-graph?
   "Is RTC enabled"
@@ -341,6 +640,7 @@
   (let [tx-id (parse-uuid-str (aget row "tx_id"))]
     (when tx-id
       {:tx-id tx-id
+       :created-at (aget row "created_at")
        :outliner-op (str->kw (aget row "outliner_op"))
        :forward-outliner-ops (or (normalize-op-entries
                                   (sqlite-util/read-transit-str (aget row "forward_outliner_ops")))
@@ -408,7 +708,7 @@
   (when (uuid? tx-id)
     (when-let [store (sqlite-store-or-throw repo)]
       (some-> (sqlite-row store
-                          (str "select tx_id, outliner_op, undo_redo, "
+                          (str "select tx_id, created_at, outliner_op, undo_redo, "
                                "forward_outliner_ops, inverse_outliner_ops, inferred_outliner_ops, "
                                "normalized_tx_data, reversed_tx_data "
                                "from client_ops where kind = 'tx' and tx_id = ? limit 1")
@@ -418,7 +718,7 @@
 (defn get-pending-local-txs
   [repo & {:keys [limit]}]
   (when-let [store (sqlite-store-or-throw repo)]
-    (let [sql (str "select tx_id, outliner_op, undo_redo, "
+    (let [sql (str "select tx_id, created_at, outliner_op, undo_redo, "
                    "forward_outliner_ops, inverse_outliner_ops, inferred_outliner_ops, "
                    "normalized_tx_data, reversed_tx_data "
                    "from client_ops where kind = 'tx' and pending = 1 "
@@ -496,10 +796,16 @@
                                            (pending-tx-id? store tx-id)))
                                  count)]
       (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
+        (sqlite-with-tx!
+         store
+         (fn [tx]
+           (doseq [tx-id tx-ids]
+             (sqlite-run! tx
+                          "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?"
+                          [(str tx-id)])
+             (sqlite-run! tx
+                          "delete from client_tx_upload_state where logical_tx_id = ?"
+                          [(str tx-id)])))))
       pending-to-remove)))
 
 (defn mark-failed-txs!
@@ -511,10 +817,16 @@
                                            (pending-tx-id? store tx-id)))
                                  count)]
       (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
+        (sqlite-with-tx!
+         store
+         (fn [tx]
+           (doseq [tx-id tx-ids]
+             (sqlite-run! tx
+                          "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
+                          [(str tx-id)])
+             (sqlite-run! tx
+                          "delete from client_tx_upload_state where logical_tx_id = ?"
+                          [(str tx-id)])))))
       pending-to-remove)))
 
 (defn history-action-ops-by-tx-id

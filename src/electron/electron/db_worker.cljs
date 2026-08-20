@@ -207,15 +207,45 @@
 
 (defn stop-all!
   [{:keys [state stop-daemon!]}]
-  (let [entries (vals (:repos (ensure-state @state)))]
-    (-> (p/all (map (fn [{:keys [runtime]}]
-                      (if (owned-runtime? runtime)
-                        (stop-daemon! runtime)
-                        (p/resolved true)))
+  (let [entries (:repos (ensure-state @state))]
+    (-> (p/all (map (fn [[repo {:keys [runtime]}]]
+                      (-> (if (owned-runtime? runtime)
+                            (stop-daemon! runtime)
+                            (p/resolved true))
+                          (p/then (fn [ok?] [repo (true? ok?) nil]))
+                          (p/catch (fn [error] [repo false error]))))
                     entries))
-        (p/then (fn [_]
-                  (reset! state (initial-state))
-                  true)))))
+        (p/then
+         (fn [results]
+           (let [failed (->> results
+                             (remove second)
+                             (map first)
+                             set)
+                 stopped (->> results
+                              (filter second)
+                              (map first)
+                              set)]
+             (swap! state
+                    (fn [current]
+                      (let [current (ensure-state current)]
+                        (-> current
+                            (update :repos #(apply dissoc % stopped))
+                            (update :window->repo
+                                    (fn [window->repo]
+                                      (into {}
+                                            (filter (fn [[_ repo]] (contains? failed repo)))
+                                            window->repo)))))))
+             (if (seq failed)
+               (p/rejected
+                (ex-info "failed to stop all db-worker runtimes"
+                         {:code :db-worker-stop-failed
+                          :repos (vec failed)
+                          :errors (->> results
+                                       (keep (fn [[repo ok? error]]
+                                               (when (and (not ok?) error)
+                                                 [repo error])))
+                                       (into {}))}))
+               true)))))))
 
 (defn ensure-repo-stopped!
   [{:keys [state stop-daemon!]} repo]

@@ -40,3 +40,11 @@
   (when (util/electron?)
     (p/let [result (js/window.apis.invoke channel (bean/->js args))]
       result)))
+
+(defn quit-and-install-new-version!
+  []
+  (-> (invoke "install-updates")
+      (p/catch
+       (fn [error]
+         (js/console.error "[updater/install]" error)
+         nil))))

@@ -395,7 +395,8 @@
                                                     :thread-api/db-sync-status
                                                     (let [idx (swap! status-calls inc)]
                                                       (p/resolved {:repo "logseq_db_demo"
-                                                                   :ws-state (if (= idx 1) :connecting :open)
+                                                                   :ws-state (if (= idx 1) :syncing :open)
+                                                                   :sync-ready? (> idx 1)
                                                                    :pending-local 0
                                                                    :pending-asset 0
                                                                    :pending-server 0}))
@@ -434,6 +435,7 @@
                                                     :thread-api/db-sync-status
                                                     (p/resolved {:repo "logseq_db_demo"
                                                                  :ws-state (if (seq (:ws-url @worker-sync-config)) :open :stopped)
+                                                                 :sync-ready? (boolean (seq (:ws-url @worker-sync-config)))
                                                                  :pending-local 0
                                                                  :pending-asset 0
                                                                  :pending-server 0})
@@ -467,6 +469,7 @@
                                                     :thread-api/verify-and-save-e2ee-password (p/resolved nil)
                                                     :thread-api/db-sync-status (p/resolved {:repo "logseq_db_demo"
                                                                                             :ws-state :open
+                                                                                            :sync-ready? true
                                                                                             :pending-local 0
                                                                                             :pending-asset 0
                                                                                             :pending-server 0})
@@ -540,6 +543,7 @@
                                                                     {:repo "logseq_db_demo"
                                                                      :graph-id "graph-uuid"
                                                                      :ws-state :open
+                                                                     :sync-ready? true
                                                                      :pending-local 0
                                                                      :pending-asset 0
                                                                      :pending-server 0})))
@@ -835,20 +839,17 @@
                                transport/invoke (fn [_ method _args]
                                                   (case method
                                                     :thread-api/db-sync-status
-                                                    (let [idx (swap! status-calls inc)]
-                                                      (p/resolved (if (= idx 1)
-                                                                    {:repo "logseq_db_demo"
-                                                                     :ws-state :connecting
-                                                                     :pending-local 0
-                                                                     :pending-asset 0
-                                                                     :pending-server 0}
-                                                                    {:repo "logseq_db_demo"
-                                                                     :ws-state :open
-                                                                     :pending-local 1
-                                                                     :pending-asset 0
-                                                                     :pending-server 2
-                                                                     :last-error {:code :decrypt-aes-key
-                                                                                  :message "decrypt-aes-key"}})))
+                                                    (do
+                                                      (swap! status-calls inc)
+                                                      (p/resolved
+                                                       {:repo "logseq_db_demo"
+                                                        :ws-state :syncing
+                                                        :sync-ready? false
+                                                        :pending-local 1
+                                                        :pending-asset 0
+                                                        :pending-server 2
+                                                        :last-error {:code :decrypt-aes-key
+                                                                     :message "decrypt-aes-key"}}))
                                                     (p/resolved {:ok true})))]
                  (p/let [result (execute-with-runtime-auth {:type :sync-start
                                                        :repo "logseq_db_demo"
@@ -857,7 +858,108 @@
                                                       {:root-dir "/tmp"})]
                    (is (= :error (:status result)))
                    (is (= :sync-start-runtime-error (get-in result [:error :code])))
-                   (is (= :decrypt-aes-key (get-in result [:error :last-error :code])))))
+                   (is (= :decrypt-aes-key (get-in result [:error :last-error :code])))
+                   (is (= 1 @status-calls))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally done)))))
+
+(deftest test-execute-sync-start-aes-key-recovery-timeout-is-immediate-error
+  (async done
+         (let [status-calls (atom 0)
+               start-calls (atom 0)
+               last-error {:code :marker-recovery-aes-key-timeout
+                           :stage :aes-key
+                           :message "marker recovery timed out waiting for AES key"}]
+           (-> (p/with-redefs [cli-server/ensure-server!
+                               (fn [config _repo]
+                                 (p/resolved
+                                  (assoc config
+                                         :base-url "http://example")))
+                               transport/invoke
+                               (fn [_ method _args]
+                                 (case method
+                                   :thread-api/db-sync-start
+                                   (do
+                                     (swap! start-calls inc)
+                                     (p/resolved nil))
+
+                                   :thread-api/db-sync-status
+                                   (do
+                                     (swap! status-calls inc)
+                                     (p/resolved
+                                      {:repo "logseq_db_demo"
+                                       :graph-id "graph-uuid"
+                                       :ws-state :syncing
+                                       :ready false
+                                       :local-tx 2734
+                                       :remote-tx 2734
+                                       :pending-local 0
+                                       :pending-server 0
+                                       :last-error last-error}))
+
+                                   (p/resolved {:ok true})))]
+                 (p/let [result
+                         (execute-with-runtime-auth
+                          {:type :sync-start
+                           :repo "logseq_db_demo"
+                           :wait-timeout-ms 200
+                           :wait-poll-interval-ms 0}
+                          {:root-dir "/tmp"})]
+                   (is (= :error (:status result))
+                       "sync start must not silently succeed after a recovery timeout")
+                   (is (= :sync-start-runtime-error
+                          (get-in result [:error :code])))
+                   (is (= :syncing
+                          (get-in result [:error :ws-state])))
+                   (is (= last-error
+                          (get-in result [:error :last-error])))
+                   (is (= 1 @status-calls)
+                       "a terminal runtime error must stop polling immediately")
+                   (is (= 1 @start-calls)
+                       "the CLI must not repeatedly issue sync-start while recovery is failed")))
+               (p/catch
+                (fn [error]
+                  (is false
+                      (str "unexpected AES-key timeout result: "
+                           error))))
+               (p/finally done)))))
+
+(deftest test-execute-sync-start-stops-on-repair-required
+  (async done
+         (let [start-calls (atom 0)
+               last-error {:type :db-sync/checksum-mismatch
+                           :message "checksum mismatch"}]
+           (-> (p/with-redefs [cli-server/ensure-server! (fn [config _repo]
+                                                           (p/resolved (assoc config :base-url "http://example")))
+                               transport/invoke (fn [_ method _args]
+                                                  (case method
+                                                    :thread-api/db-sync-start
+                                                    (do
+                                                      (swap! start-calls inc)
+                                                      (p/resolved nil))
+
+                                                    :thread-api/db-sync-status
+                                                    (p/resolved {:repo "logseq_db_demo"
+                                                                 :ws-state :repair-required
+                                                                 :pending-local 3
+                                                                 :pending-asset 0
+                                                                 :pending-server 1
+                                                                 :last-error last-error})
+
+                                                    (p/resolved {:ok true})))]
+                 (p/let [result (execute-with-runtime-auth
+                                 {:type :sync-start
+                                  :repo "logseq_db_demo"
+                                  :wait-timeout-ms 200
+                                  :wait-poll-interval-ms 0}
+                                 {:root-dir "/tmp"})]
+                   (is (= :error (:status result)))
+                   (is (= :sync-start-runtime-error (get-in result [:error :code])))
+                   (is (= last-error (get-in result [:error :last-error])))
+                   ;; execute-sync-start issues one explicit start request before
+                   ;; polling; repair-required must prevent any retry request.
+                   (is (= 1 @start-calls))))
                (p/catch (fn [e]
                           (is false (str "unexpected error: " e))))
                (p/finally done)))))
@@ -1553,6 +1655,29 @@
                           (nth @invoke-calls 1)))
                    (is (= [:thread-api/db-sync-ensure-user-rsa-keys []]
                           (nth @invoke-calls 2)))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally done)))))
+
+(deftest test-execute-sync-ensure-keys-forwards-resolved-relative-auth-path
+  (async done
+         (let [invoke-calls (atom [])
+               relative-auth-path (node-path/join "relative-auth" "auth.json")
+               expected-auth-path (node-path/resolve relative-auth-path)]
+           (-> (p/with-redefs [transport/invoke (fn [_ method args]
+                                                  (swap! invoke-calls conj [method args])
+                                                  (p/resolved {:ok true}))]
+                 (p/let [_ (sync-command/execute {:type :sync-ensure-keys}
+                                                 {:base-url "http://example"
+                                                  :root-dir "/tmp"
+                                                  :auth-path relative-auth-path
+                                                  :id-token "runtime-token"})]
+                   (is (some #(= [:thread-api/set-db-sync-config
+                                  [{:ws-url nil
+                                    :http-base nil
+                                    :auth-path expected-auth-path}]]
+                                 %)
+                             @invoke-calls))))
                (p/catch (fn [e]
                           (is false (str "unexpected error: " e))))
                (p/finally done)))))

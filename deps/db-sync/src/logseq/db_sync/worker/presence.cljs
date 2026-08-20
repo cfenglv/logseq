@@ -22,9 +22,24 @@
   [attachment]
   (:presence/user (bean/->clj attachment)))
 
+(defn attachment->graph-id
+  [attachment]
+  (:sync/graph-id (bean/->clj attachment)))
+
+(defn- attachment
+  [^js ws]
+  (try
+    (.deserializeAttachment ws)
+    (catch :default _ nil)))
+
 (defn- serialize-attachment!
-  [^js ws user]
-  (.serializeAttachment ws (bean/->js {:presence/user user})))
+  [^js ws user graph-id]
+  (.serializeAttachment
+   ws
+   (bean/->js
+    (cond-> {}
+      user (assoc :presence/user user)
+      (string? graph-id) (assoc :sync/graph-id graph-id)))))
 
 (defn presence*
   [^js self]
@@ -40,9 +55,20 @@
   (ws/broadcast! self nil {:type "online-users" :online-users (online-users self)}))
 
 (defn add-presence!
-  [^js self ^js ws user]
-  (swap! (presence* self) assoc ws user)
-  (serialize-attachment! ws user))
+  ([^js self ^js ws user]
+   (add-presence! self ws user (aget self "graph-id")))
+  ([^js self ^js ws user graph-id]
+   (swap! (presence* self) assoc ws user)
+   (serialize-attachment! ws user graph-id)))
+
+(defn set-connection-context!
+  [^js ws user graph-id]
+  (serialize-attachment! ws user graph-id))
+
+(defn get-graph-id
+  [^js self ^js ws]
+  (or (some-> (attachment ws) attachment->graph-id)
+      (aget self "graph-id")))
 
 (defn update-presence!
   [^js self ^js ws {:keys [editing-block-uuid] :as updates}]
@@ -55,7 +81,7 @@
                              (assoc user :editing-block-uuid editing-block-uuid)
                              (dissoc user :editing-block-uuid))
                            user)]
-               (serialize-attachment! ws user')
+               (serialize-attachment! ws user' (get-graph-id self ws))
                (assoc presence ws user'))
              presence))))
 
@@ -66,3 +92,12 @@
 (defn remove-presence!
   [^js self ^js ws]
   (swap! (presence* self) dissoc ws))
+
+(defn revoke-user!
+  [^js self user-id]
+  (let [state (.-state self)]
+    (doseq [^js socket (.getWebSockets state)]
+      (when (= user-id (:user-id (get-user self socket)))
+        (remove-presence! self socket)
+        (.close socket 1008 "graph access revoked")))
+    (broadcast-online-users! self)))

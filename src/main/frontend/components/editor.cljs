@@ -694,15 +694,25 @@
       ;; exit editing mode
       :else
       (let [select? (= type :esc)]
-        (p/do!
-         (editor-handler/escape-editing {:select? select?
-                                         :editing-another-block? editing-another-block?})
-         (some-> config :on-escape-editing
-                 (apply [(str uuid) (= type :esc)])))))))
+        (editor-handler/consume-math-transition-boundary!
+         (if (= type :esc) :editor-escape :editor-outside)
+         (p/do!
+          (editor-handler/escape-editing {:select? select?
+                                          :editing-another-block? editing-another-block?})
+          (some-> config :on-escape-editing
+                  (apply [(str uuid) (= type :esc)]))))))))
 
 (defn editor-readonly?
   [block]
   (boolean (:block/journal-day block)))
+
+(defn empty-math-placeholder-props
+  "Native textarea guidance for an empty Math block. It deliberately adds no
+  separate focus target, role or key handler; the existing editor textarea owns
+  the complete keyboard behavior."
+  []
+  {:placeholder "$$"
+   :data-math-empty "true"})
 
 (hsx/defc box
   [{:keys [format block parent-block] :as opts} id config]
@@ -761,6 +771,10 @@
                  :on-paste #(.preventDefault ^js/Event %)})
                (some? parent-block)
                (assoc :parentblockid (str (:block/uuid parent-block)))
+
+               (and (= :math (:logseq.property.node/display-type block))
+                    (string/blank? content))
+               (merge (empty-math-placeholder-props))
 
                true
                (merge (:editor-opts config)))]

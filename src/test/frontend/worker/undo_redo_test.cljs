@@ -244,6 +244,43 @@
         (is (= [selection-info] (:editor-cursors redo-result)))
         (is (nil? (:block-content redo-result)))))))
 
+(deftest math-title-and-type-undo-redo-as-one-real-unit-test
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        {:keys [child-uuid]} (seed-page-parent-child!)
+        ordinary-editor-info {:block-uuid child-uuid
+                              :container-id 17
+                              :start-pos 4
+                              :end-pos 4}]
+    (d/transact! conn [[:db/add [:block/uuid child-uuid] :block/title "$$$$"]])
+    (worker-undo-redo/clear-history! test-repo)
+    (apply-ops! conn
+                [[:save-block [{:block/uuid child-uuid
+                                :block/title ""
+                                :logseq.property.node/display-type :math}
+                               {:retract-attributes
+                                [:logseq.property.node/display-type]}]]]
+                (local-tx-meta {:client-id "test-client"
+                                :outliner-op :upsert-type-block
+                                :undo-redo/editor-info ordinary-editor-info}))
+    (let [converted (d/entity @conn [:block/uuid child-uuid])]
+      (is (= ["" :math]
+             [(:block/title converted)
+              (:logseq.property.node/display-type converted)])))
+    (let [undo-result (worker-undo-redo/undo test-repo)
+          restored (d/entity @conn [:block/uuid child-uuid])]
+      (is (= ["$$$$" nil]
+             [(:block/title restored)
+              (:logseq.property.node/display-type restored)]))
+      (is (true? (:undo? undo-result)))
+      (is (= [ordinary-editor-info] (:editor-cursors undo-result))))
+    (let [redo-result (worker-undo-redo/redo test-repo)
+          redone (d/entity @conn [:block/uuid child-uuid])]
+      (is (= ["" :math]
+             [(:block/title redone)
+              (:logseq.property.node/display-type redone)]))
+      (is (false? (:undo? redo-result)))
+      (is (= [ordinary-editor-info] (:editor-cursors redo-result))))))
+
 (defn- undo-all!
   []
   (loop [results []]

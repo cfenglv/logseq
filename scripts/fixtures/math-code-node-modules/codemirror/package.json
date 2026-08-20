@@ -1,0 +1,9 @@
+{
+  "name": "codemirror",
+  "version": "0.0.0-boundary-fixture",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./*": "./empty.js"
+  }
+}

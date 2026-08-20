@@ -9,7 +9,7 @@
             [clojure.core.async :as async]
             [clojure.string :as string]
             [frontend.commands :as commands]
-            [frontend.components.rtc.indicator :as indicator]
+            [frontend.components.rtc.download-progress :as download-progress]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
@@ -39,6 +39,7 @@
             [frontend.handler.ui :as ui-handler]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.posthog :as posthog]
+            [frontend.modules.outliner.op :as outliner-op]
             [frontend.modules.outliner.pipeline :as pipeline]
             [frontend.modules.outliner.ui :as ui-outliner-tx]
             [frontend.modules.shortcut.core :as st]
@@ -51,7 +52,6 @@
             [lambdaisland.glogi :as log]
             [logseq.api.plugin :as plugin-api]
             [logseq.db.frontend.schema :as db-schema]
-            [logseq.shui.ui :as shui]
             [promesa.core :as p]))
 
 ;; TODO: should we move all events here?
@@ -323,43 +323,144 @@
   (when-let [blocks (and block (db-model/get-block-immediate-children (state/get-current-repo) (:block/uuid block)))]
     (editor-handler/toggle-blocks-as-own-order-list! blocks)))
 
-(defmethod handle :editor/upsert-type-block [[_ {:keys [block type lang update-current-block?]}]]
-  (p/do!
-   (when-not update-current-block?
-     (editor-handler/save-current-block!))
-   (when-not update-current-block?
-     (p/delay 16))
-   (let [db-block (db/entity (:db/id block))
-         block-type (:logseq.property.node/display-type db-block)
-         block-title (:block/title db-block)
-         requested-title? (contains? block :block/title)
-         requested-title (:block/title block)
-         latest-code-lang (or lang
-                              (:kv/value (db/entity :logseq.kv/latest-code-lang)))
-         turn-type! #(if (and (= (keyword type) :code) latest-code-lang)
-                       (db-property-handler/set-block-properties!
-                        (:block/uuid %)
-                        {:logseq.property.node/display-type (keyword type)
-                         :logseq.property.code/lang latest-code-lang})
-                       (db-property-handler/set-block-property!
-                        (:block/uuid %) :logseq.property.node/display-type (keyword type)))
-         apply-requested-title! #(when (and update-current-block?
-                                            requested-title?
-                                            (not= requested-title (:block/title %)))
-                                   (editor-handler/save-block! (state/get-current-repo) % requested-title))]
-     (p/let [converted-block (if (or (not (nil? block-type))
-                                     (and (not update-current-block?) (not (string/blank? block-title))))
-                               (p/let [result (ui-outliner-tx/transact!
-                                               {:outliner-op :insert-blocks}
-                                               ;; insert a new block
-                                               (let [[_p _ block'] (editor-handler/insert-new-block-aux! {} db-block "")]
-                                                 (turn-type! block')))]
-                                 (when-let [id (:block/uuid (first (:blocks result)))]
-                                   (db/entity [:block/uuid id])))
-                               (p/let [_ (apply-requested-title! db-block)
-                                       _ (turn-type! db-block)]
-                                 (db/entity [:block/uuid (:block/uuid db-block)])))]
-       (js/setTimeout #(editor-handler/edit-block! converted-block :max) 100)))))
+(defn- <restore-math-transition-db-preimage!
+  [db-block]
+  (let [block-uuid (:block/uuid db-block)
+        block-title (:block/title db-block)
+        block-type (:logseq.property.node/display-type db-block)
+        restore-block (cond-> {:block/uuid block-uuid
+                               :block/title block-title}
+                        block-type
+                        (assoc :logseq.property.node/display-type block-type))
+        retract-attributes (cond-> []
+                             (nil? block-type)
+                             (conj :logseq.property.node/display-type))]
+    (p/let [_ (ui-outliner-tx/transact!
+                {:outliner-op :rollback-upsert-type-block
+                 ;; The rejected optimistic transition must not leave a
+                 ;; separate history unit after its compensating write.
+                 :gen-undo-ops? false}
+                (outliner-op/save-block!
+                 restore-block
+                 :retract-attributes retract-attributes))
+            restored (db/entity [:block/uuid block-uuid])]
+      (when (not= [block-title block-type]
+                  [(:block/title restored)
+                   (:logseq.property.node/display-type restored)])
+        (throw (ex-info "Math transition DB preimage recovery failed"
+                        {:block-uuid block-uuid})))
+      restored)))
+
+(defn- math-transition-recovery-failed-error
+  []
+  ;; This error crosses the event/pending boundary. Keep both its message and
+  ;; data content-free: graph text, UUIDs and the underlying DB error must not
+  ;; escape through a recovery receipt.
+  (ex-info "Math transition recovery failed"
+           {:type :math-transition/recovery-failed}))
+
+(defmethod handle :editor/upsert-type-block
+  [[_ {:keys [block type lang update-current-block? preserve-editor-state?
+              math-transition-editor-info math-transition-rollback]}]]
+  (let [*math-commit-settled? (atom false)
+        *math-db-preimage (atom nil)]
+    (->
+     (p/do!
+    (when-not update-current-block?
+      (editor-handler/save-current-block!))
+    (when-not update-current-block?
+      (p/delay 16))
+    (let [db-block (db/entity (:db/id block))
+          block-type (:logseq.property.node/display-type db-block)
+          block-title (:block/title db-block)
+          requested-title? (contains? block :block/title)
+          requested-title (:block/title block)
+          type (keyword type)
+          latest-code-lang (or lang
+                               (:kv/value (db/entity :logseq.kv/latest-code-lang)))
+          turn-type! #(if (and (= type :code) latest-code-lang)
+                        (db-property-handler/set-block-properties!
+                         (:block/uuid %)
+                         {:logseq.property.node/display-type type
+                          :logseq.property.code/lang latest-code-lang})
+                        (db-property-handler/set-block-property!
+                         (:block/uuid %) :logseq.property.node/display-type type))
+          apply-requested-title! #(when (and update-current-block?
+                                             requested-title?
+                                             (not= requested-title (:block/title %)))
+                                    (editor-handler/save-block! (state/get-current-repo) % requested-title))
+          atomic-current-math? (and update-current-block?
+                                    preserve-editor-state?
+                                    (= type :math))]
+      (when (and atomic-current-math?
+                 (not= (:block/uuid db-block)
+                       (get-in math-transition-rollback
+                               [:ordinary-editing-block :block/uuid])))
+        (throw (ex-info "Math transition rollback identity mismatch"
+                        {:block-uuid (:block/uuid db-block)})))
+      (when atomic-current-math?
+        (reset! *math-db-preimage db-block))
+      (p/let [converted-block
+              (cond
+                atomic-current-math?
+                (p/let [_ (ui-outliner-tx/transact!
+                            {:outliner-op :upsert-type-block
+                             :undo-redo/editor-info math-transition-editor-info}
+                            ;; The canonical title and display type must share
+                            ;; one worker transaction and therefore one undo
+                            ;; unit. The live editor transition is optimistic
+                            ;; and has an explicit rollback below.
+                            ;; Use one semantic save op. Property-only ops are
+                            ;; deliberately non-semantic in Worker history; a
+                            ;; separate property op would therefore survive
+                            ;; undo even though the title was restored.
+                            (outliner-op/save-block!
+                             (assoc
+                              (editor-handler/wrap-parse-block
+                               {:block/uuid (:block/uuid db-block)
+                                :block/title requested-title}
+                               {:allow-display-type-conversion? false})
+                              :logseq.property.node/display-type type)
+                             :retract-attributes
+                             [:logseq.property.node/display-type]))
+                        _ (reset! *math-commit-settled? true)]
+                  (db/entity [:block/uuid (:block/uuid db-block)]))
+
+                (or (not (nil? block-type))
+                    (and (not update-current-block?) (not (string/blank? block-title))))
+                (p/let [result (ui-outliner-tx/transact!
+                                {:outliner-op :insert-blocks}
+                                ;; insert a new block
+                                (let [[_p _ block'] (editor-handler/insert-new-block-aux! {} db-block "")]
+                                  (turn-type! block')))]
+                  (when-let [id (:block/uuid (first (:blocks result)))]
+                    (db/entity [:block/uuid id])))
+
+                :else
+                (p/let [_ (apply-requested-title! db-block)
+                        _ (turn-type! db-block)]
+                  (db/entity [:block/uuid (:block/uuid db-block)])))]
+        (when (and atomic-current-math?
+                   (not= [requested-title :math]
+                         [(:block/title converted-block)
+                          (:logseq.property.node/display-type converted-block)]))
+          (throw (ex-info "Math transition did not reach the committed DB state"
+                          {:block-uuid (:block/uuid db-block)})))
+        (when-not preserve-editor-state?
+          (js/setTimeout #(editor-handler/edit-block! converted-block :max) 100)))))
+     (p/catch
+      (fn [error]
+        (p/let [_ (when (and @*math-commit-settled? @*math-db-preimage)
+                    (-> (<restore-math-transition-db-preimage!
+                         @*math-db-preimage)
+                        (p/catch
+                         (fn [_recovery-error]
+                           (throw (math-transition-recovery-failed-error))))))]
+          ;; Do not expose ordinary editor state until a committed Math write
+          ;; has been atomically restored and its DB preimage revalidated.
+          (when math-transition-rollback
+            (editor-handler/rollback-math-transition! math-transition-rollback))
+          (throw error)))))))
 
 (defmethod handle :rtc/sync-state [[_ state]]
   (state/update-state! :rtc/state (fn [old] (merge old state))))
@@ -382,23 +483,18 @@
            :remote-graph graph-schema-version})
   (->
    (p/do!
-    (when (util/mobile?)
-      (shui/popup-show!
-       nil
-       (fn []
-         [:div.flex.flex-col.items-center.justify-center.mt-8.gap-4
-          [:div (t :sync/downloading-graph graph-name)]
-          (indicator/downloading-logs)])
-       {:id :download-rtc-graph}))
+    (when (state/mobile?)
+      (download-progress/show! graph-name))
     (rtc-handler/<rtc-download-graph! graph-name graph-uuid graph-e2ee?)
     (rtc-handler/<get-remote-graphs)
     (state/pub-event! [:graph/switch (str config/db-version-prefix graph-name) {:rtc-download? true}])
-    (when (util/mobile?)
-      (shui/popup-hide! :download-rtc-graph)))
+    (when (state/mobile?)
+      (download-progress/hide!)))
    (p/catch (fn [e]
               (println "RTC download graph failed, error:")
               (log/error :rtc-download-graph-failed e)
-              (shui/popup-hide! :download-rtc-graph)
+              (when (state/mobile?)
+                (download-progress/hide!))
               (when (rtc-error/download-decrypt-failed? e)
                 (notification/show! (t :encryption/wrong-password) :error false))))))
 

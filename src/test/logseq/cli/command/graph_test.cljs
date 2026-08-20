@@ -124,6 +124,7 @@
                                                     (p/resolved {:repo "logseq_db_demo"
                                                                  :graph-id "graph-uuid"
                                                                  :ws-state :open
+                                                                 :sync-ready? true
                                                                  :pending-local 0
                                                                  :pending-asset 0
                                                                  :pending-server 0})
@@ -146,6 +147,7 @@
                                     :start {:repo "logseq_db_demo"
                                             :graph-id "graph-uuid"
                                             :ws-state :open
+                                            :sync-ready? true
                                             :pending-local 0
                                             :pending-asset 0
                                             :pending-server 0}}}

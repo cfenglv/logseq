@@ -76,6 +76,42 @@
     (is (string/includes? source "\"node:sqlite\""))
     (is (not (string/includes? source "\"better-sqlite3\"")))))
 
+(deftest node-platform-test-secret-storage-has-no-runtime-env-toggle
+  (let [source (node-platform-source)]
+    (is (string/includes? source "(goog-define TEST-SECRET-STORAGE false)"))
+    (is (not (string/includes? source "CLI_E2E_TEST")))))
+
+(deftest node-platform-websocket-proxy-env-resolution
+  (let [resolve-proxy #'platform-node/websocket-proxy-url]
+    (testing "wss prefers HTTPS_PROXY and supports lowercase fallback"
+      (is (= "http://127.0.0.1:7897"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                 "HTTP_PROXY" "http://127.0.0.1:7898"})))
+      (is (= "http://127.0.0.1:7899"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"https_proxy" "http://127.0.0.1:7899"}))))
+
+    (testing "ws prefers HTTP_PROXY and supports SOCKS through ALL_PROXY"
+      (is (= "http://127.0.0.1:7898"
+             (resolve-proxy "ws://team.example/sync/graph"
+                            #js {"HTTP_PROXY" "http://127.0.0.1:7898"})))
+      (is (= "socks5://127.0.0.1:1080"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"ALL_PROXY" "socks5://127.0.0.1:1080"}))))
+
+    (testing "NO_PROXY bypasses exact hosts, subdomains, ports, and wildcard"
+      (is (nil? (resolve-proxy "wss://team.example:8443/sync/graph"
+                               #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                    "NO_PROXY" "localhost,.example:8443"})))
+      (is (= "http://127.0.0.1:7897"
+             (resolve-proxy "wss://team.example:443/sync/graph"
+                            #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                 "NO_PROXY" ".example:8443"})))
+      (is (nil? (resolve-proxy "wss://anything.example/sync/graph"
+                               #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                    "NO_PROXY" "*"}))))))
+
 (deftest node-platform-loads-zvec-lazily
   (let [source (node-platform-source)]
     (is (not (string/includes? source "[\"@zvec/zvec\" :as zvec]")))
@@ -187,16 +223,18 @@
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
 
-(deftest node-platform-cli-owner-bypasses-keychain-in-cli-e2e-test
+(deftest node-platform-test-build-secrets-use-isolated-storage
   (async done
-    (let [root-dir (node-helper/create-tmp-dir "platform-node-cli-secrets")
+    (let [root-dir (node-helper/create-tmp-dir "platform-node-test-secrets")
           process-env (.-env js/process)
           original-cli-e2e-test (gobj/get process-env "CLI_E2E_TEST")
           calls (atom {:save 0 :read 0 :delete 0})
           original-save (gobj/get keytar "setPassword")
           original-read (gobj/get keytar "getPassword")
           original-delete (gobj/get keytar "deletePassword")]
-      (gobj/set process-env "CLI_E2E_TEST" "1")
+      ;; The environment variable intentionally has no influence anymore. The
+      ;; test build itself selects the isolated store.
+      (gobj/set process-env "CLI_E2E_TEST" "0")
       (gobj/set keytar "setPassword" (fn [& _]
                                         (swap! calls update :save inc)
                                         (js/Promise.resolve true)))
@@ -206,18 +244,26 @@
       (gobj/set keytar "deletePassword" (fn [& _]
                                            (swap! calls update :delete inc)
                                            (js/Promise.resolve true)))
-      (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir
-                                                         :owner-source :cli})
-                  crypto (:crypto platform)
-                  kv (:kv platform)
-                  _ ((:save-secret-text! crypto) "secret-key" "secret-value")
-                  kv-value ((:get kv) "secret-key")
-                  secret-value ((:read-secret-text crypto) "secret-key")
-                  _ ((:delete-secret-text! crypto) "secret-key")
-                  kv-cleared ((:get kv) "secret-key")]
-            (is (= "secret-value" kv-value))
-            (is (= "secret-value" secret-value))
-            (is (nil? kv-cleared))
+      (-> (p/let [platform-a (platform-node/node-platform {:root-dir root-dir
+                                                           :owner-source :electron})
+                  crypto-a (:crypto platform-a)
+                  production-kv (:kv platform-a)
+                  key "logseq-encrypted-password"
+                  _ ((:save-secret-text! crypto-a) key "encrypted-value")
+                  production-value ((:get production-kv) key)
+                  platform-b (platform-node/node-platform {:root-dir root-dir
+                                                           :owner-source :electron})
+                  crypto-b (:crypto platform-b)
+                  secret-value ((:read-secret-text crypto-b) key)
+                  isolated-path (node-path/join root-dir "test-only-e2ee-secret-store.json")
+                  isolated-contents (.toString (fs/readFileSync isolated-path) "utf8")
+                  _ ((:delete-secret-text! crypto-b) key)
+                  deleted-value ((:read-secret-text crypto-b) key)]
+            (is (true? @#'platform-node/test-secret-storage-enabled?))
+            (is (nil? production-value))
+            (is (= "encrypted-value" secret-value))
+            (is (string/includes? isolated-contents key))
+            (is (nil? deleted-value))
             (is (= {:save 0 :read 0 :delete 0} @calls)))
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
@@ -230,50 +276,105 @@
                          (gobj/remove process-env "CLI_E2E_TEST"))
                        (done)))))))
 
-(deftest node-platform-cli-owner-uses-keychain-when-keychain-present
+(deftest production-keychain-secret-store-preserves-service-and-account
   (async done
-    (let [root-dir (node-helper/create-tmp-dir "platform-node-cli-secrets-keychain")
-          process-env (.-env js/process)
-          original-cli-e2e-test (gobj/get process-env "CLI_E2E_TEST")
-          calls (atom {:save 0 :read 0 :delete 0})
+    (let [calls (atom [])
           secrets (atom {})
-          original-save (gobj/get keytar "setPassword")
-          original-read (gobj/get keytar "getPassword")
-          original-delete (gobj/get keytar "deletePassword")]
-      (gobj/remove process-env "CLI_E2E_TEST")
-      (gobj/set keytar "setPassword" (fn [_service key value]
-                                        (swap! calls update :save inc)
-                                        (swap! secrets assoc key value)
-                                        (js/Promise.resolve true)))
-      (gobj/set keytar "getPassword" (fn [_service key]
-                                        (swap! calls update :read inc)
-                                        (js/Promise.resolve (get @secrets key))))
-      (gobj/set keytar "deletePassword" (fn [_service key]
-                                           (swap! calls update :delete inc)
-                                           (swap! secrets dissoc key)
-                                           (js/Promise.resolve true)))
-      (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir
-                                                         :owner-source :cli})
-                  crypto (:crypto platform)
-                  kv (:kv platform)
-                  _ ((:save-secret-text! crypto) "secret-key" "secret-value")
-                  kv-value ((:get kv) "secret-key")
-                  secret-value ((:read-secret-text crypto) "secret-key")
-                  _ ((:delete-secret-text! crypto) "secret-key")
-                  deleted-value ((:read-secret-text crypto) "secret-key")]
-            (is (nil? kv-value))
-            (is (= "secret-value" secret-value))
+          fallback-secrets (atom {})
+          keychain (js-obj
+                    "setPassword" (fn [service key value]
+                                    (swap! calls conj [:save service key value])
+                                    (swap! secrets assoc key value)
+                                    (js/Promise.resolve true))
+                    "getPassword" (fn [service key]
+                                    (swap! calls conj [:read service key])
+                                    (js/Promise.resolve (get @secrets key)))
+                    "deletePassword" (fn [service key]
+                                       (swap! calls conj [:delete service key])
+                                       (swap! secrets dissoc key)
+                                       (js/Promise.resolve true)))
+          fallback-kv {:get (fn [key] (p/resolved (get @fallback-secrets key)))
+                       :set! (fn [key value]
+                               (swap! fallback-secrets assoc key value)
+                               (p/resolved nil))}
+          crypto (#'platform-node/keychain-secret-store fallback-kv keychain)
+          key "logseq-encrypted-password"]
+      (-> (p/let [_ ((:save-secret-text! crypto) key "encrypted-value")
+                  fallback-after-save (get @fallback-secrets key)
+                  secret-value ((:read-secret-text crypto) key)
+                  _ ((:delete-secret-text! crypto) key)
+                  deleted-value ((:read-secret-text crypto) key)]
+            (is (= "encrypted-value" secret-value))
+            (is (= "encrypted-value" fallback-after-save))
             (is (nil? deleted-value))
-            (is (= {:save 1 :read 2 :delete 1} @calls)))
+            (is (nil? (get @fallback-secrets key)))
+            (is (= [[:save "Logseq E2EE" key "encrypted-value"]
+                    [:read "Logseq E2EE" key]
+                    [:delete "Logseq E2EE" key]
+                    [:read "Logseq E2EE" key]]
+                   @calls)))
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest production-keychain-timeout-migrates-legacy-secret-to-kv
+  (async done
+    (let [restore-platform! (set-process-platform-arch! "darwin" "arm64")
+          calls (atom {:native-read 0 :legacy-read 0})
+          fallback-secrets (atom {})
+          keychain (js-obj
+                    "getPassword" (fn [& _]
+                                    (swap! calls update :native-read inc)
+                                    (js/Promise. (fn [_resolve _reject]))))
+          fallback-kv {:get (fn [key] (p/resolved (get @fallback-secrets key)))
+                       :set! (fn [key value]
+                               (swap! fallback-secrets assoc key value)
+                               (p/resolved nil))}
+          legacy-read-fn (fn [_key]
+                           (swap! calls update :legacy-read inc)
+                           (p/resolved "legacy-encrypted-value"))
+          crypto (#'platform-node/keychain-secret-store
+                  fallback-kv keychain
+                  {:owner-source :cli
+                   :timeout-ms 10
+                   :legacy-read-fn legacy-read-fn})
+          key "logseq-encrypted-password"]
+      (-> (p/let [first-read ((:read-secret-text crypto) key)
+                  second-read ((:read-secret-text crypto) key)]
+            (is (= "legacy-encrypted-value" first-read))
+            (is (= "legacy-encrypted-value" second-read))
+            (is (= "legacy-encrypted-value" (get @fallback-secrets key)))
+            (is (= {:native-read 1 :legacy-read 1} @calls)))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
           (p/finally (fn []
-                       (gobj/set keytar "setPassword" original-save)
-                       (gobj/set keytar "getPassword" original-read)
-                       (gobj/set keytar "deletePassword" original-delete)
-                       (if (some? original-cli-e2e-test)
-                         (gobj/set process-env "CLI_E2E_TEST" original-cli-e2e-test)
-                         (gobj/remove process-env "CLI_E2E_TEST"))
+                       (restore-platform!)
+                       (done)))))))
+
+(deftest production-keychain-legacy-bridge-is-not-used-for-electron-owner
+  (async done
+    (let [restore-platform! (set-process-platform-arch! "darwin" "arm64")
+          legacy-calls (atom 0)
+          keychain (js-obj
+                    "getPassword" (fn [& _]
+                                    (p/rejected (js/Error. "native unavailable"))))
+          fallback-kv {:get (fn [_key] (p/resolved nil))
+                       :set! (fn [& _] (p/resolved nil))}
+          crypto (#'platform-node/keychain-secret-store
+                  fallback-kv keychain
+                  {:owner-source :electron
+                   :timeout-ms 10
+                   :legacy-read-fn (fn [_]
+                                     (swap! legacy-calls inc)
+                                     (p/resolved "must-not-read"))})]
+      (-> ((:read-secret-text crypto) "logseq-encrypted-password")
+          (p/then (fn [secret]
+                    (is (nil? secret))
+                    (is (zero? @legacy-calls))))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (restore-platform!)
                        (done)))))))
 
 (deftest kv-store-preserves-uint8array-values-across-reloads-test
@@ -476,6 +577,52 @@
             (is (not (fs/existsSync lock-path)))
             (is (not (fs/existsSync db-path)))
             (is (not (fs/existsSync nested-path))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest unlink-db-file-removes-only-selected-file
+  (async done
+    (let [root-dir
+          (node-helper/create-tmp-dir "platform-node-unlink-db-file")]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage) nil "logseq_db_demo")
+                  repo-dir (gobj/get pool "repoDir")
+                  db-path (node-path/join repo-dir "db.sqlite")
+                  backup-path
+                  (node-path/join repo-dir "db-sync-backup.sqlite")
+                  _ (fs/writeFileSync db-path "db" "utf8")
+                  _ (fs/writeFileSync backup-path "backup" "utf8")
+                  removed? ((:unlink-db-file! storage) pool "/db.sqlite")
+                  missing? ((:unlink-db-file! storage) pool "/db.sqlite")]
+            (is (true? removed?))
+            (is (false? missing?))
+            (is (not (fs/existsSync db-path)))
+            (is (fs/existsSync backup-path)))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest copy-db-file-copies-into-pool-without-using-os-root
+  (async done
+    (let [root-dir
+          (node-helper/create-tmp-dir "platform-node-copy-db-file")]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage)
+                        nil "logseq_db_demo")
+                  repo-dir (gobj/get pool "repoDir")
+                  source-path (node-path/join repo-dir "db.sqlite")
+                  target-path
+                  (node-path/join repo-dir "db-sync-backup.sqlite")
+                  _ (fs/writeFileSync source-path "database-bytes" "utf8")
+                  _ ((:copy-db-file! storage)
+                     pool source-path "/db-sync-backup.sqlite")]
+            (is (= "database-bytes"
+                   (fs/readFileSync target-path "utf8"))))
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))

@@ -1,18 +1,20 @@
 {
   "name": "Logseq",
   "productName": "Logseq",
-  "version": "2.0.1",
+  "version": "2.0.1-selfhost.6",
   "packageManager": "pnpm@10.33.0",
   "main": "electron.js",
   "author": "Logseq",
   "license": "AGPL-3.0",
   "description": "A privacy-first, open-source platform for knowledge management and collaboration.",
-  "repository": "https://github.com/logseq/logseq",
+  "repository": "https://github.com/cfenglv/logseq",
   "scripts": {
     "electron:dev": "electron .",
     "electron:debug": "electron --inspect=9229 .",
     "electron:make": "electron-builder --config electron-builder.yml --publish never",
-    "electron:make-unsigned": "node ../scripts/electron-builder-unsigned.mjs",
+    "electron:make-unsigned": "node ./electron-builder-unsigned.mjs",
+    "electron:verify-package": "node ./verify-packaged-desktop.mjs",
+    "electron:verify-updater-provider": "node ./verify-updater-provider.mjs",
     "electron:make-linux-arm64": "electron-builder --config electron-builder.yml --linux AppImage zip --arm64 --publish never",
     "electron:publish-snap": "electron-builder --linux snap --x64 --publish always",
     "electron:make-macos-arm64": "electron-builder --config electron-builder.yml --mac dmg zip --arm64 --publish never",
@@ -44,6 +46,7 @@
     "remove-accents": "0.5.0",
     "sanitize-filename": "1.6.4",
     "semver": "7.7.4",
+    "socks": "2.8.7",
     "socks-proxy-agent": "8.0.5",
     "string-width": "8.2.0",
     "tiny-pinyin": "1.3.2",
@@ -51,7 +54,8 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "electron": "42.3.0",
+    "@electron/asar": "3.4.1",
+    "electron": "42.4.1",
     "electron-builder": "26.8.2",
     "electron-devtools-installer": "4.0.0"
   },

@@ -140,7 +140,16 @@
   (let [replace-text-f (fn [text]
                          (let [input-id (state/get-edit-input-id)]
                            (commands/delete-selection! input-id)
-                           (commands/simple-insert! input-id text nil)))
+                           (commands/simple-insert!
+                            input-id
+                            text
+                            {:check-fn
+                             (fn [new-value _prefix-pos new-pos]
+                               (editor-handler/maybe-convert-current-block-to-math!
+                                input-id
+                                new-value
+                                new-pos
+                                new-pos))})))
         text (string/replace *text "\r\n" "\n") ;; Fix for Windows platform
         input-id (state/get-edit-input-id)
         {:keys [selection] :as selection-and-format} (editor-handler/get-selection-and-format)

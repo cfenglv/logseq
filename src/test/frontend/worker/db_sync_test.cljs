@@ -1,5 +1,6 @@
 (ns frontend.worker.db-sync-test
   (:require
+   ["crypto" :as node-crypto]
    [cljs.test :refer [async deftest is testing use-fixtures]]
    [clojure.set :as set]
    [clojure.string :as string]
@@ -20,6 +21,7 @@
    [frontend.worker.sync.auth :as sync-auth]
    [frontend.worker.sync.client-op :as client-op]
    [frontend.worker.sync.crypt :as sync-crypt]
+   [frontend.worker.sync.download :as sync-download]
    [frontend.worker.sync.handle-message :as sync-handle-message]
    [frontend.worker.sync.large-title :as sync-large-title]
    [frontend.worker.sync.log-and-state :as sync-log-state]
@@ -33,8 +35,10 @@
    [logseq.common.util.page-ref :as page-ref]
    [logseq.db :as ldb]
    [logseq.db-sync.checksum :as sync-checksum]
+   [logseq.db-sync.protocol :as sync-protocol]
    [logseq.db-sync.storage :as sync-storage]
    [logseq.db-sync.worker.handler.sync :as sync-handler]
+   [logseq.db-sync.worker.handler.ws :as sync-ws-handler]
    [logseq.db-sync.worker.ws :as ws]
    [logseq.db.common.normalize :as db-normalize]
    [logseq.db.frontend.schema :as db-schema]
@@ -58,6 +62,20 @@
   {:repo test-repo
    :graph-id "graph-1"})
 
+(deftest stop-cancels-preconnect-asset-downloads-without-client-test
+  (let [original-client @worker-state/*db-sync-client
+        cancelled-repos (atom [])]
+    (try
+      (reset! worker-state/*db-sync-client nil)
+      (with-redefs [worker-state/get-current-repo (constantly test-repo)
+                    sync-assets/cancel-remote-asset-downloads!
+                    (fn [repo]
+                      (swap! cancelled-repos conj repo))]
+        (db-sync/stop!)
+        (is (= [test-repo] @cancelled-repos)))
+      (finally
+        (reset! worker-state/*db-sync-client original-client)))))
+
 (def ^:private recycle-built-in-props
   #{:logseq.property.recycle/original-parent
     :logseq.property.recycle/original-page
@@ -74,6 +92,7 @@
         (aset js/console "error" original-console-error)))))
 
 (def ^:private *logseq-db-hooks (atom nil))
+(def ^:private *db-sync-remote-state (atom nil))
 
 (def reset-logseq-db-hooks-fixture
   {:before
@@ -93,8 +112,35 @@
        (reset! ldb/*transact-invalid-callback transact-invalid-callback)
        (reset! *logseq-db-hooks nil)))})
 
+(def reset-db-sync-remote-state-fixture
+  {:before
+   (fn []
+     (sync-apply/set-server-capabilities! test-repo [])
+     (reset! *db-sync-remote-state
+             {:latest-remote-tx @sync-apply/*repo->latest-remote-tx
+              :latest-remote-checksum @sync-apply/*repo->latest-remote-checksum
+              :latest-remote-checksum-version
+              @sync-apply/*repo->latest-remote-checksum-version})
+     (reset! sync-apply/*repo->latest-remote-tx {})
+     (reset! sync-apply/*repo->latest-remote-checksum {})
+     (reset! sync-apply/*repo->latest-remote-checksum-version {}))
+   :after
+   (fn []
+     (sync-apply/set-server-capabilities! test-repo [])
+     (let [{:keys [latest-remote-tx
+                   latest-remote-checksum
+                   latest-remote-checksum-version]}
+           @*db-sync-remote-state]
+       (reset! sync-apply/*repo->latest-remote-tx latest-remote-tx)
+       (reset! sync-apply/*repo->latest-remote-checksum latest-remote-checksum)
+       (reset! sync-apply/*repo->latest-remote-checksum-version
+               latest-remote-checksum-version)
+       (reset! *db-sync-remote-state nil)))})
+
 (use-fixtures :once (test-noise/mute-console-fixture ::db-sync-test))
-(use-fixtures :each reset-logseq-db-hooks-fixture)
+(use-fixtures :each
+  reset-logseq-db-hooks-fixture
+  reset-db-sync-remote-state-fixture)
 
 (defn- js-row
   [m]
@@ -188,13 +234,43 @@
     {:state state
      :sql sql}))
 
-(defn- kvs-rows
-  [storage-state]
-  (->> (:kvs @storage-state)
-       vals
-       (sort-by :addr)
-       (mapv (fn [{:keys [addr content addresses]}]
-               [addr content addresses]))))
+(defn- make-real-storage-sql
+  "Creates the same better-sqlite3-backed SQL adapter used by the real worker.
+  Unlike make-storage-sql, this persists every schema table needed to prove a
+  staged upload survives loss of all process-local state."
+  []
+  (let [Database (js/require "better-sqlite3")
+        db (new Database ":memory:")
+        sql (doto (js-obj)
+              (aset "_db" db)
+              (aset "exec"
+                    (fn [sql-str & args]
+                      (let [stmt (.prepare db sql-str)]
+                        (if (aget stmt "reader")
+                          (.apply (.-all stmt) stmt (to-array args))
+                          (do
+                            (.apply (.-run stmt) stmt (to-array args))
+                            nil)))))
+              (aset "close" (fn [] (.close db))))]
+    {:db db
+     :sql sql}))
+
+(defn- make-real-worker-storage-sql
+  "Creates the real in-memory SQLite adapter with every Worker table present.
+  Protocol integration fixtures must not silently satisfy new storage queries
+  by returning an empty result from the lightweight SQL stub."
+  []
+  (let [{:keys [sql] :as storage} (make-real-storage-sql)]
+    (sync-storage/init-schema! sql)
+    storage))
+
+(defn- real-kvs-rows
+  [sql]
+  (->> (.exec sql "select addr, content, addresses from kvs order by addr")
+       (mapv (fn [row]
+               [(aget row "addr")
+                (aget row "content")
+                (aget row "addresses")]))))
 
 (defn- non-recycle-validation-entities
   [validation]
@@ -202,6 +278,65 @@
        (map :entity)
        (remove (fn [entity]
                  (contains? recycle-built-in-props (:db/ident entity))))))
+
+(def ^:private created-by-rebase-test-user-uuid
+  #uuid "11111111-1111-4111-8111-111111111111")
+
+(def ^:private created-by-rebase-test-user-claims
+  {:sub (str created-by-rebase-test-user-uuid)
+   :cognito:username "rebase-test-user"
+   :email "rebase-test-user@example.test"})
+
+(defn- seed-created-by-rebase-test-user!
+  [conn]
+  (d/transact! conn
+               [{:block/uuid created-by-rebase-test-user-uuid
+                 :block/name "rebase-test-user"
+                 :block/title "rebase-test-user"
+                 :block/tags :logseq.class/Page
+                 :block/created-at 1784725856064
+                 :block/updated-at 1784725856064
+                 :logseq.property.user/name "rebase-test-user"
+                 :logseq.property.user/email "rebase-test-user@example.test"}]
+               {:persist-op? false}))
+
+(defn- created-by-ref-uuid
+  [entity]
+  (some-> entity :logseq.property/created-by-ref :block/uuid))
+
+(defn- uuid-less-rebase-entities
+  [db]
+  (let [created-by-linked-eids
+        (mapcat (fn [datom]
+                  [(:e datom) (:v datom)])
+                (d/datoms db :avet :logseq.property/created-by-ref))
+        timestamped-eids
+        (map :e (d/datoms db :avet :block/created-at))]
+    (->> (concat created-by-linked-eids timestamped-eids)
+         distinct
+         (map #(d/entity db %))
+         (remove nil?)
+         (remove (fn [entity]
+                   (or (uuid? (:block/uuid entity))
+                       (keyword? (:db/ident entity)))))
+         (map #(select-keys % [:db/id
+                               :db/ident
+                               :block/uuid
+                               :block/title
+                               :block/created-at
+                               :block/updated-at
+                               :logseq.property/created-by-ref]))
+         distinct
+         vec)))
+
+(defn- entity-ids-with-title
+  [db title]
+  (d/q '[:find [?e ...]
+         :in $ ?title
+         :where
+         [?e :block/title ?title]]
+       db
+       title))
 
 (defn- new-client-ops-db
   []
@@ -279,6 +414,45 @@
       :normalized-tx-data (or (:db-sync/normalized-tx-data tx) [])
       :reversed-tx-data (or (:db-sync/reversed-tx-data tx) [])})))
 
+(defn- sqlite-pending-local-tx-count
+  [db]
+  (some-> (sqlite-get-row db
+                          (str "select count(*) as c from client_ops "
+                               "where kind = 'tx' and pending = 1"))
+          (aget "c")))
+
+(defn- seed-sqlite-pending-local-txs!
+  [db tx-ids]
+  (let [encoded-empty-ops (sqlite-util/write-transit-str [])
+        ^js stmt
+        (.prepare
+         ^js db
+         (str "insert into client_ops ("
+              "kind, created_at, tx_id, pending, failed, outliner_op, "
+              "forward_outliner_ops, inverse_outliner_ops, inferred_outliner_ops, "
+              "normalized_tx_data, reversed_tx_data"
+              ") values ('tx', ?, ?, 1, 0, 'rebase', ?, ?, 0, ?, ?)"))]
+    (doseq [[index tx-id] (map-indexed vector tx-ids)]
+      (.run stmt
+            (inc index)
+            (str tx-id)
+            encoded-empty-ops
+            encoded-empty-ops
+            encoded-empty-ops
+            encoded-empty-ops))))
+
+(defn- public-pending-local-tx-count
+  [repo]
+  (:pending-local
+   (sync-presence/sync-counts
+    {:get-datascript-conn worker-state/get-datascript-conn
+     :get-pending-local-tx-count client-op/get-pending-local-tx-count
+     :get-unpushed-asset-ops-count client-op/get-unpushed-asset-ops-count
+     :get-local-tx client-op/get-local-tx
+     :get-graph-uuid (constantly nil)
+     :latest-remote-tx {}}
+    repo)))
+
 (defn- promise-like?
   [result]
   (or (p/promise? result)
@@ -292,10 +466,12 @@
 (defn- with-datascript-conns
   [db-conn ops-conn f]
   (let [db-prev @worker-state/*datascript-conns
-        ops-prev @worker-state/*client-ops-conns]
+        ops-prev @worker-state/*client-ops-conns
+        db-current {test-repo db-conn}
+        ops-current {test-repo ops-conn}]
     (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
-    (reset! worker-state/*datascript-conns {test-repo db-conn})
-    (reset! worker-state/*client-ops-conns {test-repo ops-conn})
+    (reset! worker-state/*datascript-conns db-current)
+    (reset! worker-state/*client-ops-conns ops-current)
     (undo-redo/clear-history! test-repo)
     ;; Keep sync-message tests deterministic under strict local-tx validation.
     (when (and ops-conn (nil? (client-op/get-local-tx test-repo)))
@@ -308,10 +484,18 @@
           cleanup (fn []
                     (when ops-conn
                       (d/unlisten! db-conn ::listen-db))
-                    (undo-redo/clear-history! test-repo)
-                    (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
-                    (reset! worker-state/*datascript-conns db-prev)
-                    (reset! worker-state/*client-ops-conns ops-prev))]
+                    ;; A few historical async tests can finish cleanup after
+                    ;; the runner has installed the next test's connections.
+                    ;; Late cleanup may release its own listener, but must
+                    ;; never overwrite a newer test generation.
+                    (when (and (identical? db-current
+                                           @worker-state/*datascript-conns)
+                               (identical? ops-current
+                                           @worker-state/*client-ops-conns))
+                      (undo-redo/clear-history! test-repo)
+                      (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
+                      (reset! worker-state/*datascript-conns db-prev)
+                      (reset! worker-state/*client-ops-conns ops-prev)))]
       (if (promise-like? result)
         (.finally (js/Promise.resolve result) cleanup)
         (do
@@ -659,6 +843,307 @@
       (is (= failed-tx-id (:failed-tx-id coerced)))
       (is (= [success-tx-id] (:success-tx-ids coerced))))))
 
+(deftest cap-upload-request-by-encoded-bytes-test
+  (testing "new clients keep the legacy tx/batch shape while selecting the largest safe prefix"
+    (let [entries [{:tx-id "tx-1" :tx-data [[:db/add 1 :block/title "one"]]}
+                   {:tx-id "tx-2" :tx-data [[:db/add 2 :block/title "two"]]}
+                   {:tx-id "tx-3" :tx-data [[:db/add 3 :block/title "three"]]}]
+          payload [{:tx-id "tx-1" :tx "payload-1"}
+                   {:tx-id "tx-2" :tx "payload-2"}
+                   {:tx-id "tx-3" :tx "payload-3"}]]
+      (with-redefs [sync-transport/encoded-message-byte-length
+                    (fn [message]
+                      (if (<= (count (:txs message)) 2)
+                        1024
+                        (inc sync-transport/max-ws-message-bytes)))]
+        (let [result (#'sync-apply/cap-upload-request-bytes
+                      {:type "tx/batch"
+                       :client-revision "test"
+                       :t-before 0}
+                      entries
+                      payload)]
+          (is (= (subvec entries 0 2) (:tx-entries result)))
+          (is (= (subvec payload 0 2) (:payload result)))
+          (is (= "tx/batch" (get-in result [:message :type])))
+          (is (= (subvec payload 0 2) (get-in result [:message :txs]))))))))
+
+(deftest versioned-large-title-markers-follow-capped-upload-prefix-test
+  (let [v2-object (fn [asset-uuid digest-char]
+                    {:asset-uuid asset-uuid
+                     :asset-type "txt"
+                     :payload-format "utf8-plain-v1"
+                     :payload-digest-alg "sha256-v1"
+                     :payload-digest (apply str (repeat 64 digest-char))})
+        sent-object (v2-object "sent-object" "a")
+        deferred-object (v2-object "deferred-object" "b")
+        stable-block-uuid (random-uuid)
+        sent-entry {:tx-id "sent"
+                    :tx-data [[:db/add 1
+                               :logseq.property.sync/large-title-object
+                               sent-object]]}
+        deferred-entry {:tx-id "deferred"
+                        :tx-data [[:db/add 2
+                                   :logseq.property.sync/large-title-object
+                                   deferred-object]]}
+        stable-entry
+        {:tx-id "stable"
+         :tx-data [[:db/add
+                    [:block/uuid stable-block-uuid]
+                    :logseq.property.sync/large-title-object
+                    sent-object]]}]
+    (is (= [[:db/add 1
+             :logseq.property.sync/large-title-object
+             sent-object]]
+           (#'sync-apply/versioned-large-title-marker-txs
+            [sent-entry])))
+    (is (not-any?
+         #(= deferred-object (nth % 3 nil))
+         (#'sync-apply/versioned-large-title-marker-txs
+          [sent-entry])))
+    (is (= 2
+           (count
+            (#'sync-apply/versioned-large-title-marker-txs
+             [sent-entry deferred-entry]))))
+    (is (= (:tx-data stable-entry)
+           (#'sync-apply/versioned-large-title-marker-txs
+            [stable-entry])))))
+
+(deftest versioned-e2ee-large-title-marker-tempid-resolves-for-local-persistence-test
+  (let [conn (d/create-conn
+              {:block/uuid {:db/unique :db.unique/identity}})
+        block-uuid (random-uuid)
+        deleted-block-uuid (random-uuid)
+        tempid "large-title-block"
+        object {:asset-uuid "encrypted-large-title"
+                :asset-type "txt"
+                :payload-format
+                sync-large-title/large-title-encrypted-payload-format
+                :payload-digest-alg
+                sync-large-title/large-title-payload-digest-alg
+                :payload-digest (apply str (repeat 64 "a"))}
+        tx-entries
+        [{:tx-id "large-title"
+          :tx-data [[:db/add tempid :block/uuid block-uuid]
+                    [:db/add tempid :block/title ""]
+                    [:db/add tempid
+                     sync-large-title/large-title-object-attr
+                     object]]}
+         {:tx-id "delete"
+          :outliner-op :delete-blocks
+          :tx-data [[:db/retractEntity
+                     [:block/uuid deleted-block-uuid]]]}]
+        original-entries tx-entries]
+    (d/transact! conn
+                 [{:block/uuid block-uuid
+                   :block/title "logical large title"}
+                  {:block/uuid deleted-block-uuid
+                   :block/title "deleted block"}])
+    (let [marker-txs
+          (#'sync-apply/versioned-large-title-marker-txs tx-entries)]
+      (is (= [[:db/add
+               [:block/uuid block-uuid]
+               sync-large-title/large-title-object-attr
+               object]]
+             marker-txs))
+      (is (= original-entries tx-entries)
+          "the websocket payload keeps its same-tx tempid relationship")
+      (d/transact! conn marker-txs)
+      (is (= object
+             (get (d/entity @conn [:block/uuid block-uuid])
+                  sync-large-title/large-title-object-attr)))
+      (is (= "logical large title"
+             (:block/title
+              (d/entity @conn [:block/uuid block-uuid])))))))
+
+(deftest acknowledged-large-title-marker-skips-deleted-or-recreated-target-test
+  (testing "an in-flight acknowledgement never attaches an old marker to a missing or replacement entity"
+    (doseq [recreate? [false true]]
+      (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+            block-uuid (:block/uuid parent)
+            target-eid (:db/id parent)
+            logical-title (:block/title parent)
+            marker
+            {:asset-uuid
+             (if recreate? "recreated-target" "deleted-target")
+             :asset-type "txt"
+             :payload-format
+             sync-large-title/large-title-plain-payload-format
+             :payload-digest-alg
+             sync-large-title/large-title-payload-digest-alg
+             :payload-digest (apply str (repeat 64 "a"))}
+            request
+            {:large-upload-progress []
+             :large-title-marker-tx-entries
+             [{:tx-id (random-uuid)
+               :marker-commits
+               [{:marker-tx
+                 [:db/add
+                  [:block/uuid block-uuid]
+                  sync-large-title/large-title-object-attr
+                  marker]
+                 :target-eid target-eid
+                 :logical-title logical-title}]}]}]
+        (with-datascript-conns
+          conn
+          client-ops-conn
+          (fn []
+            (d/transact! conn [[:db/retractEntity target-eid]])
+            (when recreate?
+              (d/transact! conn
+                           [{:block/uuid block-uuid
+                             :block/title logical-title}])
+              (is (not= target-eid
+                        (:db/id
+                         (d/entity @conn [:block/uuid block-uuid])))))
+            (is (= request
+                   (sync-apply/commit-upload-response!
+                    test-repo request nil)))
+            (is (nil?
+                 (get
+                  (d/entity @conn [:block/uuid block-uuid])
+                  sync-large-title/large-title-object-attr))
+                (if recreate?
+                  "replacement entity must not inherit the old marker"
+                  "missing target must not be recreated by the marker"))))))))
+
+(deftest reject-oversized-atomic-upload-before-websocket-send-test
+  (testing "an oversized atomic tx is retained locally and its contents are not copied into error data"
+    (let [secret-title "sensitive oversized block title"
+          entry {:tx-id "oversized-tx"
+                 :tx-data [[:db/add 1 :block/title secret-title]]}
+          payload {:tx-id "oversized-tx" :tx "oversized-payload"}
+          error (with-redefs [sync-transport/encoded-message-byte-length
+                              (constantly (inc sync-transport/max-ws-message-bytes))]
+                  (try
+                    (#'sync-apply/cap-upload-request-bytes
+                     {:type "tx/batch" :t-before 0}
+                     [entry]
+                     [payload])
+                    nil
+                    (catch :default e
+                      e)))]
+      (is (= :db-sync/tx-batch-too-large (:type (ex-data error))))
+      (is (= "oversized-tx" (:tx-id (ex-data error))))
+      (is (not (string/includes? (pr-str (ex-data error)) secret-title)))))
+
+  (testing "the transport enforces the same cap before calling WebSocket.send"
+    (let [send-count (atom 0)
+          ws (doto (js-obj)
+               (aset "readyState" 1)
+               (aset "send" (fn [_] (swap! send-count inc))))
+          error (with-redefs [sync-transport/encoded-string-byte-length
+                              (constantly (inc sync-transport/max-ws-message-bytes))]
+                  (try
+                    (sync-transport/send! identity ws {:type "tx/batch" :txs []})
+                    nil
+                    (catch :default e
+                      e)))]
+      (is (= :db-sync/ws-message-too-large (:type (ex-data error))))
+      (is (= 0 @send-count)))))
+
+(deftest remote-apply-snapshot-retry-policy-backs-off-without-failing-test
+  (testing "ordinary continuous edits switch from quick retry to bounded backoff"
+    (is (= :immediate (#'sync-apply/remote-apply-snapshot-retry-action 0)))
+    (is (= :immediate (#'sync-apply/remote-apply-snapshot-retry-action 2)))
+    (is (= :delayed (#'sync-apply/remote-apply-snapshot-retry-action 3)))
+    (is (= :delayed (#'sync-apply/remote-apply-snapshot-retry-action 100)))
+    (is (= 50 (#'sync-apply/remote-apply-snapshot-retry-delay-ms 3)))
+    (is (= 100 (#'sync-apply/remote-apply-snapshot-retry-delay-ms 4)))
+    (is (= 1000 (#'sync-apply/remote-apply-snapshot-retry-delay-ms 100)))))
+
+(deftest remote-apply-retry-driver-resolves-when-editing-settles-test
+  (async done
+         (let [client {:connection-generation "current"}]
+           (-> (p/with-redefs [sync-apply/current-client (fn [_repo] client)
+                               sync-apply/apply-remote-txs-once!
+                               (fn [_repo _client _remote-txs snapshot-retry-count]
+                                 (is (= 100 snapshot-retry-count))
+                                 :applied)]
+                 (#'sync-apply/retry-apply-remote-txs!
+                  test-repo client [] 100 0))
+               (p/then (fn [result]
+                         (is (= :applied result))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest pull-ok-defers-without-advancing-cursor-or-reporting-sync-error-test
+  (async done
+         (let [tx-data [[:db/add -1 :block/title "remote"]]
+               raw-message
+               (js/JSON.stringify
+                (clj->js {:type "pull/ok"
+                          :t 1
+                          :txs [{:t 1
+                                 :tx (sqlite-util/write-transit-str tx-data)}]}))
+               pending-pull* (atom 0)
+               last-error* (atom nil)
+               cursor-updates* (atom [])
+               scheduled* (atom [])
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :pending-pull-since pending-pull*
+                       :last-sync-error last-error*
+                       :inflight (atom [])
+                       :online-users (atom [])
+                       :ws-state (atom :open)}]
+           (-> (p/with-redefs
+                 [client-op/get-local-tx (constantly 0)
+                  client-op/get-local-checksum (constantly nil)
+                  client-op/get-local-server-checksum (constantly nil)
+                  client-op/update-local-tx
+                  (fn [_repo t]
+                    (swap! cursor-updates* conj t))
+                  sync-crypt/graph-e2ee? (constantly false)
+                  sync-crypt/<ensure-graph-aes-key
+                  (fn [& _] (p/resolved nil))
+                  sync-apply/apply-remote-txs!
+                  (fn [& _]
+                    (p/rejected
+                     (ex-info
+                      "editing continues"
+                      {:type :db-sync/remote-apply-deferred})))
+                  sync-handle-message/schedule-deferred-pull!
+                  (fn [repo client']
+                    (swap! scheduled* conj [repo client']))]
+                 (sync-handle-message/handle-message!
+                  test-repo client raw-message))
+               (p/then
+                (fn [_]
+                  (is (nil? @pending-pull*))
+                  (is (empty? @cursor-updates*))
+                  (is (nil? @last-error*))
+                  (is (= [[test-repo client]] @scheduled*))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest stale-connection-generation-cannot-apply-queued-remote-transactions-test
+  (async done
+         (let [stale-client {:connection-generation "old"}
+               current-client {:connection-generation "new"}]
+           (-> (p/with-redefs [sync-apply/current-client
+                               (fn [_repo] current-client)]
+                 (#'sync-apply/retry-apply-remote-txs!
+                  test-repo stale-client [] 0 0))
+               (p/then (fn [_]
+                         (is false "expected stale generation failure")))
+               (p/catch (fn [error]
+                          (is (= :db-sync/stale-remote-apply
+                                 (:type (ex-data error))))))
+               (p/finally done)))))
+
+(deftest remote-apply-snapshot-retry-log-summary-is-bounded-test
+  (testing "continuous edits do not grow retry logs with every pending tx id"
+    (let [ids (repeatedly 1000 random-uuid)
+          summary (#'sync-apply/pending-tx-log-summary
+                   (mapv (fn [tx-id] {:tx-id tx-id}) ids))]
+      (is (= 1000 (:count summary)))
+      (is (= (first ids) (:first-tx-id summary)))
+      (is (= (last ids) (:last-tx-id summary)))
+      (is (= #{:count :first-tx-id :last-tx-id}
+             (set (keys summary)))))))
+
 (deftest flush-pending-honors-stop-upload-debug-flag-test
   (testing "when stop-upload debug flag is enabled, flush-pending should skip preparing/sending tx batches"
     (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
@@ -702,6 +1187,422 @@
             (is (= 0 @send-calls)))
           (#'sync-apply/set-upload-stopped! test-repo false))))))
 
+(deftest e2ee-flush-pending-sends-tempid-large-title-with-rebases-and-large-delete-test
+  (testing "an E2EE backlog keeps tempid identity while offloading a large title and batching rebases with a semantic delete"
+    (async done
+           (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+                 large-title (str (apply str (repeat 1535 "汉")) "a")
+                 large-block-uuid (:block/uuid child1)
+                 large-tempid (str large-block-uuid)
+                 lookup-block-uuid (:block/uuid child2)
+                 lookup-title "existing lookup ref remains valid"
+                 large-tx-id (random-uuid)
+                 lookup-tx-id (random-uuid)
+                 ordinary-tx-ids (vec (repeatedly 11 random-uuid))
+                 delete-tx-id (random-uuid)
+                 delete-targets (vec (repeatedly 521 random-uuid))
+                 rebase-rows
+                 (vec
+                  (concat
+                   [{:db-sync/tx-id large-tx-id
+                     :db-sync/pending? true
+                     :db-sync/created-at 1
+                     :db-sync/outliner-op :rebase
+                     :db-sync/normalized-tx-data
+                     [[:db/add large-tempid :block/uuid large-block-uuid]
+                      [:db/add large-tempid :block/title large-title]]}
+                    {:db-sync/tx-id lookup-tx-id
+                     :db-sync/pending? true
+                     :db-sync/created-at 2
+                     :db-sync/outliner-op :rebase
+                     :db-sync/normalized-tx-data
+                     [[:db/add [:block/uuid lookup-block-uuid]
+                       :block/title
+                       lookup-title]]}]
+                   (map-indexed
+                    (fn [idx tx-id]
+                      {:db-sync/tx-id tx-id
+                       :db-sync/pending? true
+                       :db-sync/created-at (+ idx 3)
+                       :db-sync/outliner-op :rebase
+                       :db-sync/normalized-tx-data
+                       [[:db/add [:block/uuid lookup-block-uuid]
+                         :block/updated-at
+                         (+ 2000 idx)]]})
+                    ordinary-tx-ids)))
+                 delete-row
+                 {:db-sync/tx-id delete-tx-id
+                  :db-sync/pending? true
+                  :db-sync/created-at 14
+                  :db-sync/outliner-op :rebase
+                  :db-sync/forward-outliner-ops
+                  [[:delete-blocks [delete-targets {}]]]
+                  :db-sync/normalized-tx-data
+                  (mapv (fn [block-uuid]
+                          [:db/retractEntity [:block/uuid block-uuid]])
+                        delete-targets)}
+                 pending-rows (conj rebase-rows delete-row)
+                 expected-tx-ids (mapv :db-sync/tx-id pending-rows)
+                 sent (atom [])
+                 uploaded (atom [])
+                 fetch-prev js/fetch
+                 config-prev @worker-state/*db-sync-config
+                 latest-remote-prev @sync-apply/*repo->latest-remote-tx
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :last-sync-error (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [raw]
+                                              (swap! sent conj
+                                                     (js->clj (js/JSON.parse raw)
+                                                              :keywordize-keys true)))))}
+                 _ (d/transact! conn
+                                [[:db/add (:db/id child1)
+                                  :block/title
+                                  large-title]])
+                 server-conn (d/conn-from-db @conn)]
+             (is (= 4606 (sync-large-title/utf8-byte-length large-title))
+                 "the regression title must cross the 4096-byte boundary by UTF-8 bytes")
+             (reset! worker-state/*db-sync-config
+                     {:http-base "https://sync.example.test"})
+             (set! js/fetch
+                   (fn [url opts]
+                     (swap! uploaded conj
+                            {:url url
+                             :body (.-body opts)})
+                     (js/Promise.resolve #js {:ok true})))
+             (-> (p/let [aes-key (crypt/<generate-aes-key)]
+                   (with-datascript-conns
+                     conn
+                     client-ops-conn
+                     (fn []
+                       (p/with-redefs
+                         [worker-state/online? (constantly true)
+                          worker-state/get-id-token (constantly "test-id-token")
+                          sync-crypt/graph-e2ee? (constantly true)
+                          sync-crypt/<ensure-graph-aes-key
+                          (fn [repo graph-id]
+                            (is (= test-repo repo))
+                            (is (= "graph-1" graph-id))
+                            (p/resolved aes-key))]
+                         (#'sync-apply/set-upload-stopped! test-repo false)
+                         (reset! sync-apply/*repo->latest-remote-tx
+                                 {test-repo 2720})
+                         (client-op/update-local-tx test-repo 2720)
+                         (client-op/update-local-checksum
+                          test-repo
+                          (sync-checksum/recompute-checksum @conn))
+                         (client-op/update-local-server-checksum
+                          test-repo
+                          (sync-checksum/recompute-server-checksum @conn))
+                         (seed-client-op-txs! test-repo pending-rows)
+                         (is (= 14 (count (#'sync-apply/pending-txs test-repo))))
+                         (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                           (is (= 1 (count @sent))
+                               "the valid batch must reach WebSocket.send")
+                           (is (= 1 (count @uploaded))
+                               "the sole large title must be uploaded exactly once")
+                           (is (= expected-tx-ids @(:inflight client))
+                               "all sent durable tx ids stay inflight until acknowledgement")
+                           (is (= expected-tx-ids
+                                  (mapv :tx-id
+                                        (#'sync-apply/pending-txs test-repo)))
+                               "sending without an acknowledgement must retain every pending row")
+                           (is (nil? @(:last-sync-error client)))
+                           (when-let [message (first @sent)]
+                             (let [wire-entries (:txs message)
+                                   wire-by-id
+                                   (into {} (map (juxt :tx-id identity)) wire-entries)
+                                   large-wire
+                                   (get wire-by-id (str large-tx-id))
+                                   lookup-wire
+                                   (get wire-by-id (str lookup-tx-id))
+                                   delete-wire
+                                   (get wire-by-id (str delete-tx-id))
+                                   large-encrypted-tx
+                                   (some-> large-wire :tx sqlite-util/read-transit-str)
+                                   lookup-encrypted-tx
+                                   (some-> lookup-wire :tx sqlite-util/read-transit-str)]
+                               (is (= "tx/batch" (:type message)))
+                               (is (= 2720 (:t-before message)))
+                               (is (= 14 (count wire-entries)))
+                               (is (= expected-tx-ids
+                                      (mapv (comp uuid :tx-id) wire-entries)))
+                               (is (= (vec (repeat 13 "rebase"))
+                                      (mapv :outliner-op
+                                            (take 13 wire-entries))))
+                               (is (= "delete-blocks"
+                                      (:outliner-op delete-wire)))
+                               (is (= 521
+                                      (count
+                                       (some-> delete-wire
+                                               :tx
+                                               sqlite-util/read-transit-str))))
+                               (p/let [large-decrypted-tx
+                                       (sync-crypt/<decrypt-tx-data
+                                        aes-key large-encrypted-tx)
+                                       lookup-decrypted-tx
+                                       (sync-crypt/<decrypt-tx-data
+                                        aes-key lookup-encrypted-tx)
+                                       uploaded-body (:body (first @uploaded))
+                                       uploaded-digest
+                                       (sync-large-title/<sha256-hex uploaded-body)
+                                       uploaded-title
+                                       (sync-crypt/<decrypt-text-value
+                                        aes-key
+                                        (.decode (js/TextDecoder.) uploaded-body))]
+                                 (let [uuid-item
+                                       (some #(when (= :block/uuid (nth % 2 nil)) %)
+                                             large-decrypted-tx)
+                                       title-item
+                                       (some #(when (= :block/title (nth % 2 nil)) %)
+                                             large-decrypted-tx)
+                                       marker-item
+                                       (some
+                                        #(when (= sync-large-title/large-title-object-attr
+                                                   (nth % 2 nil))
+                                           %)
+                                        large-decrypted-tx)
+                                       marker-object (nth marker-item 3 nil)]
+                                   (is (= large-tempid (nth uuid-item 1 nil)))
+                                   (is (= large-tempid (nth title-item 1 nil)))
+                                   (is (= large-tempid (nth marker-item 1 nil))
+                                       "wire data must retain the original same-tx tempid relation")
+                                   (is (= large-block-uuid (nth uuid-item 3 nil)))
+                                   (is (= "" (nth title-item 3 nil)))
+                                   (is (sync-large-title/large-title-object-v2?
+                                        marker-object))
+                                   (is (= sync-large-title/large-title-encrypted-payload-format
+                                          (:payload-format marker-object)))
+                                   (is (= uploaded-digest
+                                          (:payload-digest marker-object)))
+                                   (is (= large-title uploaded-title))
+                                   (is (= [[:db/add
+                                            [:block/uuid lookup-block-uuid]
+                                            :block/title
+                                            lookup-title]]
+                                          lookup-decrypted-tx)
+                                       "lookup-ref uploads must retain their existing identity form")
+                                   (is (true?
+                                        (#'sync-handler/apply-tx-entry!
+                                         server-conn
+                                         (update large-wire
+                                                 :outliner-op
+                                                 keyword)))
+                                       "the server path must accept UUID upsert plus marker under one tempid")
+                                   (is (empty?
+                                        (filter
+                                         #(= sync-large-title/large-title-object-attr
+                                             (:a %))
+                                         (d/datoms @conn :eavt)))
+                                       "an unacknowledged upload must not change the local marker")
+                                   (sync-apply/ack-upload-response!
+                                    test-repo client)
+                                   (let [local-marker-datoms
+                                         (filter
+                                          #(= sync-large-title/large-title-object-attr
+                                              (:a %))
+                                          (d/datoms @conn :eavt))
+                                         local-marker-entity
+                                         (when-let [marker-eid
+                                                    (some-> local-marker-datoms
+                                                            first
+                                                            :e)]
+                                           (d/entity @conn marker-eid))
+                                         server-marker-entity
+                                         (d/entity @server-conn
+                                                   [:block/uuid large-block-uuid])]
+                                     (is (= 1 (count local-marker-datoms)))
+                                     (is (= large-block-uuid
+                                            (:block/uuid local-marker-entity))
+                                         "local marker persistence must target the existing UUID entity")
+                                     (is (not-any?
+                                          (fn [datom]
+                                            (nil?
+                                             (:block/uuid
+                                              (d/entity @conn (:e datom)))))
+                                          local-marker-datoms)
+                                         "marker persistence must not create a marker-only orphan entity")
+                                     (is (= marker-object
+                                            (get server-marker-entity
+                                                 sync-large-title/large-title-object-attr)))
+                                     (is (= (sync-checksum/recompute-checksum @conn)
+                                            (client-op/get-local-checksum test-repo)))
+                                     (is (=
+                                          (sync-checksum/recompute-server-checksum
+                                           @conn)
+                                          (client-op/get-local-server-checksum
+                                           test-repo)))))))))))))
+                 (p/catch (fn [error]
+                            (is false (str "unexpected flush failure: " error))))
+                 (p/finally
+                  (fn []
+                    (sync-apply/clear-upload-response-timeout! client)
+                    (reset! (:inflight client) [])
+                    (#'sync-apply/set-upload-stopped! test-repo false)
+                    (reset! sync-apply/*repo->latest-remote-tx
+                            latest-remote-prev)
+                    (reset! worker-state/*db-sync-config config-prev)
+                    (set! js/fetch fetch-prev)
+                    (done))))))))
+
+(deftest flush-send-failure-does-not-persist-large-title-marker-test
+  (async done
+         (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+               block-uuid (:block/uuid parent)
+               title (apply str (repeat 5000 "s"))
+               tx-id (random-uuid)
+               marker {:asset-uuid "not-confirmed"
+                       :asset-type "txt"
+                       :payload-format
+                       sync-large-title/large-title-plain-payload-format
+                       :payload-digest-alg
+                       sync-large-title/large-title-payload-digest-alg
+                       :payload-digest (apply str (repeat 64 "a"))}
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :upload-request (atom nil)
+                       :last-sync-error (atom nil)
+                       :ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send"
+                                   (fn [_]
+                                     (throw
+                                      (js/Error.
+                                       "synthetic websocket send failure")))))}
+               latest-remote-prev @sync-apply/*repo->latest-remote-tx]
+           (d/transact! conn
+                        [[:db/add
+                          [:block/uuid block-uuid]
+                          :block/title
+                          title]])
+           (-> (with-datascript-conns
+                 conn
+                 client-ops-conn
+                 (fn []
+                   (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                   (client-op/update-local-tx test-repo 0)
+                   (client-op/update-local-checksum
+                    test-repo
+                    (sync-checksum/recompute-checksum @conn))
+                   (client-op/update-local-server-checksum
+                    test-repo
+                    (sync-checksum/recompute-server-checksum @conn))
+                   (seed-client-op-txs!
+                    test-repo
+                    [{:db-sync/tx-id tx-id
+                      :db-sync/created-at 1
+                      :db-sync/pending? true
+                      :db-sync/normalized-tx-data
+                      [[:db/add
+                        [:block/uuid block-uuid]
+                        :block/title
+                        title]]}])
+                   (p/with-redefs
+                     [worker-state/online? (constantly true)
+                      sync-crypt/graph-e2ee? (constantly false)
+                      sync-crypt/<ensure-graph-aes-key
+                      (fn [& _] (p/resolved nil))
+                      sync-apply/offload-large-titles
+                      (fn [_tx-data _opts]
+                        (p/resolved
+                         [[:db/add
+                           [:block/uuid block-uuid]
+                           :block/title
+                           ""]
+                          [:db/add
+                           [:block/uuid block-uuid]
+                           sync-large-title/large-title-object-attr
+                           marker]]))]
+                     (p/let [_ (#'sync-apply/flush-pending!
+                                test-repo client)]
+                       (is (nil?
+                            (get
+                             (d/entity @conn [:block/uuid block-uuid])
+                             sync-large-title/large-title-object-attr)))
+                       (is (= title
+                              (:block/title
+                               (d/entity
+                                @conn
+                                [:block/uuid block-uuid]))))
+                       (is (nil? @(:upload-request client)))))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally
+                (fn []
+                  (reset! sync-apply/*repo->latest-remote-tx
+                          latest-remote-prev)
+                  (done)))))))
+
+(deftest flush-pending-records-generic-async-preparation-failure-test
+  (testing "a generic asynchronous preparation failure is visible in sync state and leaves durable work retryable"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 tx-id (random-uuid)
+                 failure (js/Error. "synthetic async upload preparation failure")
+                 sent (atom 0)
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :upload-request (atom nil)
+                         :last-sync-error (atom nil)
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send" (fn [_raw]
+                                              (swap! sent inc))))}]
+             (-> (with-datascript-conns
+                   conn
+                   client-ops-conn
+                   (fn []
+                     (p/with-redefs
+                       [worker-state/online? (constantly true)
+                        sync-crypt/graph-e2ee? (constantly false)
+                        sync-apply/offload-large-titles
+                        (fn [& _]
+                          (p/rejected failure))]
+                       (#'sync-apply/set-upload-stopped! test-repo false)
+                       (reset! sync-apply/*repo->latest-remote-tx
+                               {test-repo 0})
+                       (client-op/update-local-tx test-repo 0)
+                       (seed-client-op-txs!
+                        test-repo
+                        [{:db-sync/tx-id tx-id
+                          :db-sync/pending? true
+                          :db-sync/created-at 1
+                          :db-sync/outliner-op :rebase
+                          :db-sync/normalized-tx-data
+                          [[:db/add [:block/uuid (:block/uuid child1)]
+                            :block/title
+                            "retry after failure"]]}])
+                       (-> (#'sync-apply/flush-pending! test-repo client)
+                           (p/then (fn [_]
+                                     {:state :resolved}))
+                           (p/catch (fn [error]
+                                      {:state :rejected
+                                       :error error}))
+                           (p/then
+                            (fn [{:keys [state error]}]
+                              (is (= :resolved state)
+                                  "one failed flush must not poison the serialized send queue")
+                              (is (nil? error))
+                              (is (= 0 @sent))
+                              (is (empty? @(:inflight client)))
+                              (is (= [tx-id]
+                                     (mapv
+                                      :tx-id
+                                      (#'sync-apply/pending-txs test-repo))))
+                              (is (= :exception
+                                     (:code @(:last-sync-error client)))
+                                  "the caught failure must remain observable")))))))
+                 (p/finally
+                  (fn []
+                    (#'sync-apply/set-upload-stopped! test-repo false)
+                    (done))))))))
+
 (deftest flush-pending-splits-large-upload-request-test
   (async done
          (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
@@ -730,6 +1631,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -744,10 +1647,13 @@
                                          tx-entry (first (:txs payload))
                                          uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                                      (is (= "tx/batch" (:type payload)))
-                                     (is (nil? (:tx-id tx-entry)))
+                                     (is (string? (:tx-id tx-entry)))
+                                     (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                      (is (= 4999 (count uploaded-tx)))
-                                     (is (= [] @(:inflight client)))
+                                     (is (= [(:tx-id tx-entry)]
+                                            (mapv str @(:inflight client))))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -755,9 +1661,11 @@
                                  tx-entry (first (:txs payload))
                                  uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 2 (count uploaded-tx)))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -790,6 +1698,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -800,13 +1710,20 @@
                             :db-sync/outliner-op :insert-blocks
                             :db-sync/normalized-tx-data tx-data}])
                          (p/let [_ (#'sync-apply/flush-pending! test-repo client)
+                                 first-payload (first @sent)
+                                 _ (do
+                                     ;; Model a lost response followed by a reconnect.
+                                     (sync-apply/clear-upload-response-timeout! client)
+                                     (reset! (:inflight client) []))
                                  _ (#'sync-apply/flush-pending! test-repo client)]
                            (is (= 2 (count @sent)))
+                           (is (= first-payload (second @sent)))
                            (doseq [payload @sent]
                              (let [tx-entry (first (:txs payload))
                                    uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                                (is (= "tx/batch" (:type payload)))
-                               (is (nil? (:tx-id tx-entry)))
+                               (is (string? (:tx-id tx-entry)))
+                               (is (= (str tx-id) (:logical-tx-id tx-entry)))
                                (is (= 5000 (count uploaded-tx)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
@@ -857,6 +1774,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -870,12 +1789,15 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id)
+                                                            (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (is (= parent-tx (subvec first-uploaded-tx 4993 5000)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -883,10 +1805,12 @@
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= child-tx second-uploaded-tx))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -915,6 +1839,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -928,11 +1854,14 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id)
+                                                            (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -940,10 +1869,12 @@
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 1 (count second-uploaded-tx)))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -970,6 +1901,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -983,11 +1916,14 @@
                                  first-uploaded-tx (let [payload (first @sent)
                                                          tx-entry (first (:txs payload))]
                                                      (is (= "tx/batch" (:type payload)))
-                                                     (is (nil? (:tx-id tx-entry)))
+                                                     (is (string? (:tx-id tx-entry)))
+                                                     (is (= (str tx-id)
+                                                            (:logical-tx-id tx-entry)))
                                                      (sqlite-util/read-transit-str (:tx tx-entry)))
                                  _ (do
                                      (is (= 5000 (count first-uploaded-tx)))
                                      (sync-apply/ack-upload-response! test-repo client)
+                                     (reset! (:inflight client) [])
                                      (reset! sync-apply/*repo->latest-remote-tx {test-repo 1})
                                      (client-op/update-local-tx test-repo 1)
                                      (#'sync-apply/flush-pending! test-repo client))]
@@ -995,10 +1931,12 @@
                                  tx-entry (first (:txs payload))
                                  second-uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 1 (count second-uploaded-tx)))
                              (is (= tx-data (vec (concat first-uploaded-tx second-uploaded-tx))))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1028,6 +1966,8 @@
                  (fn []
                    (-> (p/with-redefs [worker-state/online? (constantly true)
                                         sync-crypt/graph-e2ee? (constantly false)]
+                         (sync-apply/set-server-capabilities!
+                          test-repo ["tx-upload-staged-v1"])
                          (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
                          (client-op/update-local-tx test-repo 0)
                          (seed-client-op-txs!
@@ -1043,10 +1983,12 @@
                                  uploaded-tx (sqlite-util/read-transit-str (:tx tx-entry))]
                              (is (= 1 (count @sent)))
                              (is (= "tx/batch" (:type payload)))
-                             (is (= (str tx-id) (:tx-id tx-entry)))
+                             (is (string? (:tx-id tx-entry)))
+                             (is (= (str tx-id) (:logical-tx-id tx-entry)))
                              (is (= 5001 (count uploaded-tx)))
                              (is (= tx-data uploaded-tx))
-                             (is (= [tx-id] @(:inflight client))))))
+                             (is (= [(:tx-id tx-entry)]
+                                    (mapv str @(:inflight client)))))))
                        (p/catch (fn [error]
                                   (is nil (str error)))))))
                (p/finally done)))))
@@ -1057,6 +1999,7 @@
                tx-id (random-uuid)
                sent (atom [])
                events (atom [])
+               recovery-calls (atom 0)
                timeout-callback (atom nil)
                timeout-ms (atom nil)
                original-set-timeout js/setTimeout
@@ -1068,6 +2011,9 @@
                        :graph-id "graph-1"
                        :inflight (atom [])
                        :upload-request (atom nil)
+                       :upload-response-timeout-f
+                       (fn [_request]
+                         (swap! recovery-calls inc))
                        :ws (doto (js-obj)
                              (aset "readyState" 1)
                              (aset "send" (fn [raw]
@@ -1085,64 +2031,112 @@
                    :upload-timeout))
            (set! js/clearTimeout (fn [& _] nil))
            (platform/set-platform! test-platform)
-           (with-datascript-conns
-             conn
-             client-ops-conn
-             (fn []
-               (-> (p/with-redefs [worker-state/online? (constantly true)
-                                    sync-crypt/graph-e2ee? (constantly false)]
-                     (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
-                     (client-op/update-local-tx test-repo 0)
-                     (seed-client-op-txs!
-                      test-repo
-                      [{:db-sync/tx-id tx-id
-                        :db-sync/pending? true
-                        :db-sync/created-at 1
-                        :db-sync/outliner-op :save-block
-                        :db-sync/normalized-tx-data
-                        [[:db/add [:block/uuid (:block/uuid child1)]
-                          :block/title
-                          "pending upload timeout report"]]}])
-                     (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
-                       (is (= "tx/batch" (:type (first @sent))))
-                       (is (= [tx-id] @(:inflight client)))
-                       (is (= (* 2 60 1000) @timeout-ms))
-                       (is (fn? @timeout-callback))
-                       (@timeout-callback)
-                       (is (= 1 (count @events)))
-                       (let [[type payload] (first @events)]
-                         (is (= :capture-error type))
-                         (is (= "db-sync" (get-in payload [:payload :source])))
-                         (is (= "upload-tx-batch" (get-in payload [:payload :operation])))
-                         (is (= test-repo (get-in payload [:payload :repo])))
-                         (is (= "graph-1" (get-in payload [:payload :graph-id])))
-                         (is (= 1 (get-in payload [:payload :tx-count])))
-                         (is (= "save-block" (get-in payload [:payload :outliner-op])))
-                         (is (= (* 2 60 1000) (get-in payload [:payload :timeout-ms])))
-                         (is (= [(str tx-id)] (get-in payload [:extra :tx-ids])))
-                         (is (= ["save-block"] (get-in payload [:extra :outliner-ops])))
-                         (is (= "Sync upload request did not get response"
-                                (ex-message (:error payload)))))
-                       (reset! events [])
-                       (aset (:ws client) "readyState" 3)
-                       (#'sync-apply/start-upload-response-timeout!
-                        client
-                        {:tx-ids [tx-id]
-                         :outliner-ops [:save-block]
-                         :t-before 0})
-                       (@timeout-callback)
-                       (is (empty? @events))))
-                   (p/catch (fn [error]
-                              (is nil (str error))))
-                   (p/finally
-                     (fn []
-                       (sync-apply/mark-pending-txs-false! test-repo [tx-id])
-                       (set! js/setTimeout original-set-timeout)
-                       (set! js/clearTimeout original-clear-timeout)
-                       (if platform-prev
-                         (platform/set-platform! platform-prev)
-                         (platform/set-platform! (minimal-platform :browser)))
-                       (done)))))))))
+           (-> (with-datascript-conns
+                conn
+                client-ops-conn
+                (fn []
+                  (-> (p/with-redefs [worker-state/online? (constantly true)
+                                       sync-crypt/graph-e2ee? (constantly false)]
+                        (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                        (client-op/update-local-tx test-repo 0)
+                        (seed-client-op-txs!
+                         test-repo
+                         [{:db-sync/tx-id tx-id
+                           :db-sync/pending? true
+                           :db-sync/created-at 1
+                           :db-sync/outliner-op :save-block
+                           :db-sync/normalized-tx-data
+                           [[:db/add [:block/uuid (:block/uuid child1)]
+                             :block/title
+                             "pending upload timeout report"]]}])
+                        (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                          (is (= "tx/batch" (:type (first @sent))))
+                          (is (= [tx-id] @(:inflight client)))
+                          (is (= (* 2 60 1000) @timeout-ms))
+                          (is (fn? @timeout-callback))
+                          (@timeout-callback)
+                          (is (= 1 @recovery-calls)
+                              "a lost tx acknowledgement must leave the stale connection")
+                          (is (= 1 (count @events)))
+                          (let [[type payload] (first @events)]
+                            (is (= :capture-error type))
+                            (is (= "db-sync" (get-in payload [:payload :source])))
+                            (is (= "upload-tx-batch" (get-in payload [:payload :operation])))
+                            (is (= test-repo (get-in payload [:payload :repo])))
+                            (is (= "graph-1" (get-in payload [:payload :graph-id])))
+                            (is (= 1 (get-in payload [:payload :tx-count])))
+                            (is (= "save-block" (get-in payload [:payload :outliner-op])))
+                            (is (= (* 2 60 1000) (get-in payload [:payload :timeout-ms])))
+                            (is (= [(str tx-id)] (get-in payload [:extra :tx-ids])))
+                            (is (= ["save-block"] (get-in payload [:extra :outliner-ops])))
+                            (is (= "Sync upload request did not get response"
+                                   (ex-message (:error payload)))))
+                          (reset! events [])
+                          (aset (:ws client) "readyState" 3)
+                          (#'sync-apply/start-upload-response-timeout!
+                           client
+                           {:tx-ids [tx-id]
+                            :outliner-ops [:save-block]
+                            :t-before 0})
+                          (@timeout-callback)
+                          (is (empty? @events))))
+                      (p/catch (fn [error]
+                                 (is nil (str error))))
+                      (p/finally
+                       (fn []
+                         (sync-apply/mark-pending-txs-false! test-repo [tx-id])
+                         (set! js/setTimeout original-set-timeout)
+                         (set! js/clearTimeout original-clear-timeout)
+                         (if platform-prev
+                           (platform/set-platform! platform-prev)
+                           (platform/set-platform! (minimal-platform :browser))))))))
+               (p/finally done)))))
+
+(deftest flush-pending-send-failure-leaves-the-stale-connection-test
+  (async done
+         (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+               tx-id (random-uuid)
+               recovery-calls (atom 0)
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :upload-request (atom nil)
+                       :upload-send-failed-f
+                       (fn [_error]
+                         (swap! recovery-calls inc))
+                       :last-sync-error (atom nil)
+                       :ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [_raw]
+                                            (throw (js/Error. "simulated websocket send failure")))))}]
+           (-> (with-datascript-conns
+                conn
+                client-ops-conn
+                (fn []
+                  (-> (p/with-redefs [worker-state/online? (constantly true)
+                                       sync-crypt/graph-e2ee? (constantly false)]
+                        (reset! sync-apply/*repo->latest-remote-tx {test-repo 0})
+                        (client-op/update-local-tx test-repo 0)
+                        (seed-client-op-txs!
+                         test-repo
+                         [{:db-sync/tx-id tx-id
+                           :db-sync/pending? true
+                           :db-sync/created-at 1
+                           :db-sync/outliner-op :save-block
+                           :db-sync/normalized-tx-data
+                           [[:db/add [:block/uuid (:block/uuid child1)]
+                             :block/title
+                             "pending websocket send failure"]]}])
+                        (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+                          (is (= 1 @recovery-calls)
+                              "a synchronous send failure must leave the stale connection")
+                          (is (= [tx-id]
+                                 (mapv :tx-id (#'sync-apply/pending-txs test-repo)))
+                              "the local transaction must remain pending for replay")
+                          (is (some? @(:last-sync-error client)))))
+                      (p/catch (fn [error]
+                                 (is false (str "unexpected error: " error)))))))
+               (p/finally done)))))
 
 (deftest start-active-client-flushes-pending-local-txs-test
   (async done
@@ -1253,11 +2247,37 @@
                            (is (= "tx-rejected" (:message last-error)))
                            (is (= :db-sync/tx-rejected
                                   (get-in last-error [:data :type])))
-                           (is (= "db transact failed"
-                                  (get-in last-error [:data :reason]))))))
+                           (is (nil?
+                                (get-in last-error [:data :reason]))))))
                (p/catch (fn [caught-error]
                           (is nil (str caught-error))))
                (p/finally done)))))
+
+(deftest malformed-sync-frame-never-enters-diagnostic-state-test
+  (let [secret "SUPER-SECRET-GRAPH-CONTENT"
+        client {:last-sync-error (atom nil)}
+        error (try
+                (sync-handle-message/handle-message!
+                 "repo"
+                 client
+                 (str "{\"tx-data\":\"" secret "\""))
+                nil
+                (catch :default e
+                  e))]
+    (is (some? error))
+    (sync-util/set-last-sync-error! client error)
+    (let [rendered (pr-str @(:last-sync-error client))]
+      (is (not (string/includes? rendered secret)))
+      (is (not
+           (string/includes?
+            (pr-str
+             (#'sync-util/diagnostic-data (ex-data error)))
+            secret)))
+      (is (= :response-parse-failed
+             (:code @(:last-sync-error client))))
+      (is (pos?
+           (get-in @(:last-sync-error client)
+                   [:data :payload-bytes]))))))
 
 (deftest temp-conn-batch-preserves-cardinality-one-schema-test
   (testing "temp conn batch emits replacement retractions for cardinality-one attrs"
@@ -1306,6 +2326,123 @@
                    drop-txs))
             (is (= [valid-tx-id] (mapv :tx-id tx-entries)))))))))
 
+(deftest prepare-upload-tx-entries-recovers-legacy-rebased-delete-outliner-op-test
+  (testing "legacy semantic delete rebases upload with delete sanitation while raw and non-delete rebases stay rebases"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          delete-blocks-tx-id (random-uuid)
+          delete-page-tx-id (random-uuid)
+          raw-empty-tx-id (random-uuid)
+          raw-transact-tx-id (random-uuid)
+          insert-tx-id (random-uuid)
+          delete-block-uuids (vec (repeatedly 521 random-uuid))
+          delete-page-uuid (random-uuid)
+          child-uuid (:block/uuid child1)]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id delete-blocks-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:delete-blocks [delete-block-uuids {}]]]
+             :db-sync/normalized-tx-data
+             (mapv (fn [block-uuid]
+                     [:db/retractEntity [:block/uuid block-uuid]])
+                   delete-block-uuids)}
+            {:db-sync/tx-id delete-page-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 2
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:delete-page [delete-page-uuid]]]
+             :db-sync/normalized-tx-data
+             [[:db/retractEntity [:block/uuid delete-page-uuid]]]}
+            {:db-sync/tx-id raw-empty-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 3
+             :db-sync/outliner-op :rebase
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid child-uuid] :block/title "raw empty ops"]]}
+            {:db-sync/tx-id raw-transact-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 4
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:transact [[[:db/add [:block/uuid child-uuid]
+                             :block/title
+                             "raw transact"]]
+                           nil]]]
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid child-uuid] :block/title "raw transact"]]}
+            {:db-sync/tx-id insert-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 5
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:insert-blocks [[{:block/uuid (random-uuid)
+                                 :block/title "semantic insert"}]
+                               child-uuid
+                               {:sibling? false}]]]
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid child-uuid] :block/title "semantic insert"]]}])
+          (let [pending (#'sync-apply/pending-txs test-repo)
+                {:keys [tx-entries drop-tx-ids]}
+                (sync-apply/prepare-upload-tx-entries test-repo conn pending)
+                entry-by-id (into {} (map (juxt :tx-id identity)) tx-entries)]
+            (is (every? #(= :rebase (:outliner-op %)) pending))
+            (is (empty? drop-tx-ids))
+            (is (= 521 (count (:tx-data (get entry-by-id delete-blocks-tx-id)))))
+            (is (= :delete-blocks
+                   (:outliner-op (get entry-by-id delete-blocks-tx-id))))
+            (is (= :delete-page
+                   (:outliner-op (get entry-by-id delete-page-tx-id))))
+            (is (= :rebase (:outliner-op (get entry-by-id raw-empty-tx-id))))
+            (is (= :rebase (:outliner-op (get entry-by-id raw-transact-tx-id))))
+            (is (= :rebase (:outliner-op (get entry-by-id insert-tx-id))))))))))
+
+(deftest tx-meta-outliner-op-recovers-only-semantic-delete-rebases-test
+  (testing "future semantic delete rebases persist their server sanitation tag without reclassifying fallbacks"
+    (is (= :delete-blocks
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks
+             :db-sync/forward-outliner-ops [[:delete-blocks [[(random-uuid)] {}]]]})))
+    (is (= :delete-page
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-page
+             :db-sync/forward-outliner-ops [[:delete-page [(random-uuid)]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks
+             :db-sync/forward-outliner-ops
+             [[:transact [[[:db/retractEntity [:block/uuid (random-uuid)]]]
+                           nil]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :delete-blocks
+             :db-sync/forward-outliner-ops
+             [[:delete-blocks [[(random-uuid)] {}]]
+              [:save-block [{:block/uuid (random-uuid)}]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :save-block
+             :db-sync/forward-outliner-ops [[:delete-blocks [[(random-uuid)] {}]]]})))
+    (is (= :rebase
+           (#'sync-apply/tx-meta-outliner-op
+            {:outliner-op :rebase
+             :original-outliner-op :insert-blocks
+             :db-sync/forward-outliner-ops [[:insert-blocks [[] nil {}]]]})))))
+
 (defn- large-block-insert-upload-tx
   [page-uuid parent-uuid block-count]
   (vec
@@ -1345,6 +2482,117 @@
             (is (= tx-id (:tx-id (first tx-entries))))
             (is (= tx-data (:tx-data (first tx-entries))))))))))
 
+(deftest prepare-upload-tx-entries-gates-canonical-move-on-server-capability-test
+  (testing "a .6 client sends semantic moves only after the Worker advertises support"
+    (let [{:keys [conn client-ops-conn child2]} (setup-parent-child)
+          tx-id (random-uuid)
+          child-uuid (:block/uuid child2)
+          target-uuid (some-> child2 :block/parent :block/uuid)
+          semantic-op [:move-blocks [[child-uuid]
+                                     target-uuid
+                                     {:sibling? false :bottom? true}]]
+          pending {:tx-id tx-id
+                   :tx [[:db/add [:block/uuid child-uuid]
+                         :block/order "client-order"]]
+                   :outliner-op :rebase
+                   :forward-outliner-ops [semantic-op]}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (sync-apply/set-server-capabilities! test-repo [])
+          (let [legacy-entry
+                (-> (sync-apply/prepare-upload-tx-entries
+                     test-repo conn [pending])
+                    :tx-entries first)]
+            (is (= :rebase (:outliner-op legacy-entry)))
+            (is (not (contains? legacy-entry :semantic-op))))
+          (sync-apply/set-server-capabilities!
+           test-repo ["canonical-structural-move-v1"])
+          (let [modern-entry
+                (-> (sync-apply/prepare-upload-tx-entries
+                     test-repo conn [pending])
+                    :tx-entries first)]
+            (is (= :move-blocks (:outliner-op modern-entry)))
+            (is (= semantic-op (:semantic-op modern-entry))))
+          (with-redefs [sync-crypt/graph-e2ee? (constantly true)]
+            (let [encrypted-entry
+                  (-> (sync-apply/prepare-upload-tx-entries
+                       test-repo conn [pending])
+                      :tx-entries first)]
+              (is (= :rebase (:outliner-op encrypted-entry)))
+              (is (not (contains? encrypted-entry :semantic-op))))))))))
+
+(deftest prepare-upload-tx-entries-restores-legacy-rebase-delete-semantics-test
+  (testing "a persisted legacy rebase row keeps its semantic delete on upload without classifying raw rebases as deletes"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          delete-tx-id (random-uuid)
+          raw-rebase-tx-id (random-uuid)
+          target-uuids (vec (repeatedly 521 random-uuid))
+          delete-tx-data
+          (mapv (fn [block-uuid]
+                  [:db/retractEntity [:block/uuid block-uuid]])
+                target-uuids)
+          raw-rebase-tx-data
+          [[:db/add [:block/uuid (:block/uuid child1)]
+            :block/title
+            "raw legacy rebase"]]]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id delete-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops
+             [[:delete-blocks [target-uuids {}]]]
+             :db-sync/normalized-tx-data delete-tx-data}
+            {:db-sync/tx-id raw-rebase-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 2
+             :db-sync/outliner-op :rebase
+             :db-sync/forward-outliner-ops []
+             :db-sync/normalized-tx-data raw-rebase-tx-data}])
+          (let [pending (#'sync-apply/pending-txs test-repo)
+                delete-pending (first pending)
+                raw-rebase-pending (second pending)
+                {:keys [tx-entries drop-tx-ids]}
+                (sync-apply/prepare-upload-tx-entries test-repo conn pending)
+                delete-entry (first tx-entries)
+                raw-rebase-entry (second tx-entries)
+                delete-payload
+                {:tx-id (str delete-tx-id)
+                 :tx (sqlite-util/write-transit-str (:tx-data delete-entry))
+                 :outliner-op (:outliner-op delete-entry)}
+                capped (#'sync-apply/cap-upload-request-bytes
+                        {:type "tx/batch"
+                         :client-revision "legacy-rebase-delete-test"
+                         :t-before 0}
+                        [delete-entry]
+                        [delete-payload])
+                uploaded-delete
+                (sqlite-util/read-transit-str
+                 (get-in capped [:message :txs 0 :tx]))]
+            (is (= :rebase (:outliner-op delete-pending))
+                "exercise the already-persisted legacy row shape")
+            (is (= [[:delete-blocks [target-uuids {}]]]
+                   (:forward-outliner-ops delete-pending)))
+            (is (= :rebase (:outliner-op raw-rebase-pending)))
+            (is (empty? drop-tx-ids))
+            (is (= [delete-tx-id raw-rebase-tx-id]
+                   (mapv :tx-id tx-entries)))
+            (is (= :delete-blocks (:outliner-op delete-entry))
+                "upload must recover the durable forward delete semantics")
+            (is (= :rebase (:outliner-op raw-rebase-entry))
+                "a raw rebase without semantic forward ops stays a rebase")
+            (is (= 521 (count (:tx-data delete-entry))))
+            (is (= delete-tx-data (:tx-data delete-entry)))
+            (is (= 1 (count (:tx-entries capped)))
+                "the byte cap must retain the complete logical tx entry")
+            (is (= 1 (count (get-in capped [:message :txs]))))
+            (is (= 521 (count uploaded-delete)))
+            (is (= delete-tx-data uploaded-delete))))))))
+
 (deftest sync-counts-counts-only-true-pending-local-ops-test
   (testing "pending-local should count only rows with :db-sync/pending? true"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
@@ -1372,6 +2620,249 @@
                         test-repo)]
             (is (= 1 (:pending-local counts)))))))))
 
+(deftest fresh-cache-local-edit-retains-preexisting-pending-count-test
+  (testing "a fresh process adds a new local tx to the pending rows already stored in SQLite"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          stored-count 13
+          stored-txs (mapv (fn [created-at]
+                             {:db-sync/tx-id (random-uuid)
+                              :db-sync/created-at created-at
+                              :db-sync/pending? true
+                              :db-sync/outliner-op :rebase})
+                           (range 1 (inc stored-count)))]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs! test-repo stored-txs)
+          (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
+          (is (not (contains? @client-op/*repo->pending-local-tx-count test-repo))
+              "simulate a fresh worker whose in-memory count cache is empty")
+
+          (ldb/transact! conn
+                         [[:db/add (:db/id child1) :block/title "fresh local edit"]]
+                         {:outliner-op :save-block})
+
+          (is (= (inc stored-count)
+                 (sqlite-pending-local-tx-count client-ops-conn))
+              "SQLite contains the legacy queue plus the newly persisted tx")
+          (is (= (inc stored-count)
+                 (count (#'sync-apply/pending-txs test-repo)))
+              "the durable pending queue is complete")
+          (is (= (inc stored-count)
+                 (public-pending-local-tx-count test-repo))
+              "public sync status must report N+1, never just the +1 delta"))))))
+
+(deftest client-ops-registration-after-early-status-retains-disk-count-test
+  (testing "an early status read before client-ops registration must not poison the later disk-backed count"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          stored-count 13
+          stored-tx-ids (vec (repeatedly stored-count random-uuid))
+          previous-datascript-conns @worker-state/*datascript-conns
+          previous-client-ops-conns @worker-state/*client-ops-conns
+          previous-count-cache @client-op/*repo->pending-local-tx-count]
+      (seed-sqlite-pending-local-txs! client-ops-conn stored-tx-ids)
+      (try
+        (reset! worker-state/*datascript-conns {test-repo conn})
+        (reset! worker-state/*client-ops-conns {})
+        (reset! client-op/*repo->pending-local-tx-count {})
+        (undo-redo/clear-history! test-repo)
+
+        (is (= 0 (public-pending-local-tx-count test-repo))
+            "status remains usable while the client-ops store is not mounted")
+        (is (not (contains? @client-op/*repo->pending-local-tx-count test-repo))
+            "store absence is unknown, not a durable zero that may be cached")
+
+        (reset! worker-state/*client-ops-conns {test-repo client-ops-conn})
+        (client-op/update-local-tx test-repo 0)
+        (d/listen! conn ::pending-count-store-registration
+                   (fn [tx-report]
+                     (db-sync/enqueue-local-tx! test-repo tx-report)))
+        (ldb/transact! conn
+                       [[:db/add (:db/id child1) :block/title "post-mount local edit"]]
+                       {:outliner-op :save-block})
+
+        (is (= (inc stored-count)
+               (sqlite-pending-local-tx-count client-ops-conn)))
+        (is (= (inc stored-count)
+               (count (#'sync-apply/pending-txs test-repo))))
+        (is (= (inc stored-count)
+               (public-pending-local-tx-count test-repo))
+            "the first real delta after mount must be based on all 13 disk rows")
+        (finally
+          (d/unlisten! conn ::pending-count-store-registration)
+          (undo-redo/clear-history! test-repo)
+          (reset! worker-state/*datascript-conns previous-datascript-conns)
+          (reset! worker-state/*client-ops-conns previous-client-ops-conns)
+          (reset! client-op/*repo->pending-local-tx-count previous-count-cache)
+          (.close client-ops-conn))))))
+
+(deftest opened-empty-client-ops-count-is-cacheable-and-repo-scoped-test
+  (testing "a mounted empty store may cache zero without masking another repo's disk rows"
+    (let [empty-repo "pending-count-open-empty"
+          populated-repo "pending-count-open-populated"
+          empty-db (new-client-ops-db)
+          populated-db (new-client-ops-db)
+          populated-count 13
+          previous-client-ops-conns @worker-state/*client-ops-conns
+          previous-count-cache @client-op/*repo->pending-local-tx-count]
+      (seed-sqlite-pending-local-txs!
+       populated-db
+       (repeatedly populated-count random-uuid))
+      (try
+        (reset! worker-state/*client-ops-conns
+                {empty-repo empty-db
+                 populated-repo populated-db})
+        (reset! client-op/*repo->pending-local-tx-count {})
+
+        (is (= 0 (client-op/get-pending-local-tx-count empty-repo)))
+        (is (= 0 (get @client-op/*repo->pending-local-tx-count empty-repo))
+            "zero is valid and cacheable once SQLite is actually mounted")
+        (is (= populated-count
+               (client-op/get-pending-local-tx-count populated-repo)))
+
+        (let [{:keys [should-inc-pending?]}
+              (client-op/upsert-local-tx-entry!
+               populated-repo
+               {:tx-id (random-uuid)
+                :created-at 30
+                :pending? true
+                :failed? false
+                :normalized-tx-data []
+                :reversed-tx-data []})]
+          (when should-inc-pending?
+            (client-op/adjust-pending-local-tx-count! populated-repo 1)))
+
+        (is (= 0 (client-op/get-pending-local-tx-count empty-repo)))
+        (is (= (inc populated-count)
+               (client-op/get-pending-local-tx-count populated-repo)))
+        (is (= 0 (sqlite-pending-local-tx-count empty-db)))
+        (is (= (inc populated-count)
+               (sqlite-pending-local-tx-count populated-db)))
+        (finally
+          (.close empty-db)
+          (.close populated-db)
+          (reset! worker-state/*client-ops-conns previous-client-ops-conns)
+          (reset! client-op/*repo->pending-local-tx-count previous-count-cache))))))
+
+(deftest cache-miss-batch-removal-and-flush-stay-aligned-test
+  (testing "negative deltas on a cache miss remain aligned with SQLite and never underflow"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          pending-tx-ids (vec (repeatedly 13 random-uuid))
+          completed-tx-id (random-uuid)
+          failed-tx-id (random-uuid)]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           (concat
+            (map-indexed
+             (fn [index tx-id]
+               {:db-sync/tx-id tx-id
+                :db-sync/created-at (inc index)
+                :db-sync/pending? true
+                :db-sync/outliner-op :rebase})
+             pending-tx-ids)
+            [{:db-sync/tx-id completed-tx-id
+              :db-sync/created-at 20
+              :db-sync/pending? false}
+             {:db-sync/tx-id failed-tx-id
+              :db-sync/created-at 21
+              :db-sync/pending? false
+              :db-sync/failed? true}]))
+          (swap! client-op/*repo->pending-local-tx-count dissoc test-repo)
+
+          (sync-apply/mark-pending-txs-false!
+           test-repo
+           (subvec pending-tx-ids 0 4))
+          (is (= 9 (sqlite-pending-local-tx-count client-ops-conn)))
+          (is (= 9 (public-pending-local-tx-count test-repo))
+              "a partial batch drop must not reset the visible count to zero")
+          (is (not (neg? (get @client-op/*repo->pending-local-tx-count
+                              test-repo
+                              0))))
+
+          (sync-apply/mark-failed-txs!
+           test-repo
+           (subvec pending-tx-ids 4 6))
+          (is (= 7 (sqlite-pending-local-tx-count client-ops-conn)))
+          (is (= 7 (public-pending-local-tx-count test-repo))
+              "marking a batch failed must subtract from the durable base")
+
+          (sync-apply/clear-pending-txs! test-repo)
+          (is (= 0 (sqlite-pending-local-tx-count client-ops-conn)))
+          (is (= 0 (public-pending-local-tx-count test-repo)))
+          (sync-apply/clear-pending-txs! test-repo)
+          (is (= 0 (public-pending-local-tx-count test-repo))
+              "an idempotent second flush must stay at zero")
+          (is (empty? (#'sync-apply/pending-txs test-repo))
+              "pending=false and failed rows are excluded from the queue"))))))
+
+(deftest cache-hit-pending-count-is-repo-scoped-test
+  (testing "warm count caches adjust normally without leaking across repos"
+    (let [repo-a "pending-count-repo-a"
+          repo-b "pending-count-repo-b"
+          db-a (new-client-ops-db)
+          db-b (new-client-ops-db)
+          previous-client-ops-conns @worker-state/*client-ops-conns
+          previous-count-cache @client-op/*repo->pending-local-tx-count
+          repo-a-pending (vec (repeatedly 13 random-uuid))
+          repo-b-pending (vec (repeatedly 5 random-uuid))]
+      (try
+        (reset! worker-state/*client-ops-conns {repo-a db-a repo-b db-b})
+        (reset! client-op/*repo->pending-local-tx-count {})
+        (seed-client-op-txs!
+         repo-a
+         (concat
+          (map-indexed
+           (fn [index tx-id]
+             {:db-sync/tx-id tx-id
+              :db-sync/created-at (inc index)
+              :db-sync/pending? true})
+           repo-a-pending)
+          [{:db-sync/tx-id (random-uuid)
+            :db-sync/created-at 20
+            :db-sync/pending? false}
+           {:db-sync/tx-id (random-uuid)
+            :db-sync/created-at 21
+            :db-sync/pending? false
+            :db-sync/failed? true}]))
+        (seed-client-op-txs!
+         repo-b
+         (map-indexed
+          (fn [index tx-id]
+            {:db-sync/tx-id tx-id
+             :db-sync/created-at (inc index)
+             :db-sync/pending? true})
+          repo-b-pending))
+
+        (is (= 13 (client-op/get-pending-local-tx-count repo-a)))
+        (is (= 5 (client-op/get-pending-local-tx-count repo-b)))
+
+        (let [{:keys [should-inc-pending?]}
+              (client-op/upsert-local-tx-entry!
+               repo-a
+               {:tx-id (random-uuid)
+                :created-at 30
+                :pending? true
+                :failed? false
+                :normalized-tx-data []
+                :reversed-tx-data []})]
+          (when should-inc-pending?
+            (client-op/adjust-pending-local-tx-count! repo-a 1)))
+        (let [removed (client-op/mark-pending-txs-false!
+                       repo-b
+                       [(first repo-b-pending)])]
+          (client-op/adjust-pending-local-tx-count! repo-b (- removed)))
+
+        (is (= 14 (client-op/get-pending-local-tx-count repo-a)))
+        (is (= 4 (client-op/get-pending-local-tx-count repo-b)))
+        (is (= 14 (sqlite-pending-local-tx-count db-a)))
+        (is (= 4 (sqlite-pending-local-tx-count db-b)))
+        (finally
+          (.close db-a)
+          (.close db-b)
+          (reset! worker-state/*client-ops-conns previous-client-ops-conns)
+          (reset! client-op/*repo->pending-local-tx-count previous-count-cache))))))
+
 (deftest sync-counts-reports-stored-local-checksum-test
   (testing "sync status reports stored local checksum without recomputing from client db"
     (doseq [cached-checksum ["stale" nil]]
@@ -1386,6 +2877,72 @@
                      :latest-remote-checksum {test-repo "fresh"}}
                     test-repo)]
         (is (= cached-checksum (:local-checksum counts)))))))
+
+(deftest sync-counts-selects-versioned-local-checksum-only-for-known-version-test
+  (let [base {:get-datascript-conn (constantly :conn)
+              :get-pending-local-tx-count (constantly 0)
+              :get-unpushed-asset-ops-count (constantly 0)
+              :get-local-tx (constantly 42)
+              :get-local-checksum (constantly "legacy-local")
+              :get-local-server-checksum (constantly "versioned-local")
+              :get-graph-uuid (constantly "graph-1")
+              :latest-remote-tx {test-repo 42}
+              :latest-remote-checksum {test-repo "remote"}}]
+    (is (= "versioned-local"
+           (:local-checksum
+            (sync-presence/sync-counts
+             (assoc base
+                    :latest-remote-checksum-version
+                    {test-repo sync-checksum/server-checksum-version})
+             test-repo))))
+    (is (= "legacy-local"
+           (:local-checksum
+            (sync-presence/sync-counts
+             (assoc base
+                    :latest-remote-checksum-version
+                    {test-repo "unknown-version"})
+             test-repo))))))
+
+(deftest rtc-state-payload-surfaces-graph-and-repair-diagnostic-test
+  (let [last-error {:code :checksum-mismatch
+                    :data {:type :db-sync/checksum-mismatch}}
+        client {:repo test-repo
+                :ws-state (atom :repair-required)
+                :online-users (atom [])
+                :last-sync-error (atom last-error)}
+        payload
+        (sync-presence/rtc-state-payload
+         (constantly {:graph-id "graph-1"
+                      :pending-local 2
+                      :last-error last-error})
+         client)]
+    (is (= "graph-1" (:graph-uuid payload)))
+    (is (= last-error (:last-sync-error payload)))
+    (is (= :repair-required (get-in payload [:rtc-state :ws-state])))
+    (is (false? (:rtc-lock payload)))
+    (is (= 2 (:unpushed-block-update-count payload)))))
+
+(deftest rtc-state-payload-preserves-unknown-counts-and-requires-ready-open-test
+  (let [sync-ready? (atom false)
+        client {:repo test-repo
+                :ws-state (atom :open)
+                :sync-ready? sync-ready?
+                :online-users (atom [])}
+        counts (constantly {:graph-id "graph-1"
+                            :pending-local nil
+                            :pending-asset nil
+                            :pending-server nil})
+        pending-payload (sync-presence/rtc-state-payload counts client)]
+    (is (false? (:rtc-lock pending-payload))
+        "an open socket is not healthy until checksum convergence")
+    (is (false? (:sync-ready? pending-payload)))
+    (is (nil? (:unpushed-block-update-count pending-payload)))
+    (is (nil? (:pending-asset-ops-count pending-payload)))
+    (is (nil? (:pending-server-ops-count pending-payload)))
+    (reset! sync-ready? true)
+    (let [ready-payload (sync-presence/rtc-state-payload counts client)]
+      (is (true? (:rtc-lock ready-payload)))
+      (is (true? (:sync-ready? ready-payload))))))
 
 (deftest pull-ok-with-older-remote-tx-is-ignored-test
   (testing "pull/ok with remote tx behind local tx does not apply stale tx data"
@@ -1415,8 +2972,8 @@
             (finally
               (reset! db-sync/*repo->latest-remote-tx latest-prev))))))))
 
-(deftest pull-ok-out-of-order-stale-response-is-ignored-test
-  (testing "late stale pull/ok should not overwrite a newer already-applied tx"
+(deftest pull-ok-out-of-order-stale-response-is-rejected-test
+  (testing "late stale pull/ok is rejected without overwriting a newer tx"
     (async done
            (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
                  parent-id (:db/id parent)
@@ -1436,29 +2993,42 @@
                                       :checksum "ignored"
                                       :txs [{:t 1 :tx stale-tx}]}))
                  latest-prev @db-sync/*repo->latest-remote-tx
+                 last-error* (atom nil)
                  client {:repo test-repo
                          :graph-id "graph-1"
                          :inflight (atom [])
+                         :last-sync-error last-error*
                          :online-users (atom [])
                          :ws-state (atom :open)}]
              (reset! db-sync/*repo->latest-remote-tx {})
              (with-datascript-conns conn client-ops-conn
                (fn []
+                 (client-op/update-local-tx test-repo 1)
                  (-> (p/let [_ (sync-handle-message/handle-message! test-repo client raw-new)
-                             _ (sync-handle-message/handle-message! test-repo client raw-stale)
-                             parent' (d/entity @conn parent-id)]
-                       (is (= "remote-new-title" (:block/title parent')))
-                       (is (= 2 (client-op/get-local-tx test-repo))))
+                             _ (sync-handle-message/handle-message!
+                                test-repo client raw-stale)]
+                       (is false "expected stale pull rejection"))
+                     (p/catch
+                      (fn [error]
+                        (let [parent' (d/entity @conn parent-id)]
+                          (is (= :db-sync/server-cursor-regressed
+                                 (:type (ex-data error))))
+                          (is (= :db-sync/server-cursor-regressed
+                                 (get-in @last-error* [:data :type])))
+                          (is (= "remote-new-title" (:block/title parent')))
+                          (is (= 2 (client-op/get-local-tx test-repo))))))
                      (p/finally (fn []
-                                 (reset! db-sync/*repo->latest-remote-tx latest-prev)
-                                 (done))))))))))
+                                  (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                                  (done))))))))))
 
 (deftest pull-ok-does-not-anchor-remote-checksum-before-verify-test
-  (testing "pull/ok compares the incrementally updated local checksum instead of anchoring the remote checksum"
+  (testing "pull/ok keeps the prior cursor and sidecar when full recomputation proves divergence"
     (async done
            (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
                  parent-id (:db/id parent)
                  remote-tx-data [[:db/add parent-id :block/title "remote-checksum-anchor"]]
+                 local-checksum-before
+                 (sync-checksum/recompute-checksum @conn)
                  local-checksum-after-remote (-> (d/with @conn remote-tx-data)
                                                  :db-after
                                                  sync-checksum/recompute-checksum)
@@ -1473,13 +3043,14 @@
                  client {:repo test-repo
                          :graph-id "graph-1"
                          :inflight (atom [])
+                         :last-sync-error (atom nil)
                          :online-users (atom [])
                          :ws-state (atom :open)}
                  *captured (atom nil)]
              (with-datascript-conns conn client-ops-conn
                (fn []
                  (reset! db-sync/*repo->latest-remote-tx {})
-                 (client-op/update-local-checksum test-repo (sync-checksum/recompute-checksum @conn))
+                 (client-op/update-local-checksum test-repo local-checksum-before)
                  (d/listen! conn ::pull-ok-checksum
                             (fn [tx-report]
                               (when (and (seq (:tx-data tx-report))
@@ -1488,22 +3059,99 @@
                  (p/with-redefs [sync-log-state/rtc-log (fn [type payload]
                                                           (reset! *captured {:type type
                                                                              :payload payload}))]
-                   (-> (p/let [_ (sync-handle-message/handle-message! test-repo client raw-message)
-                               parent' (d/entity @conn parent-id)]
-                         (is (= "remote-checksum-anchor" (:block/title parent')))
-                         (is (= 1 (client-op/get-local-tx test-repo)))
-                         (is (= local-checksum-after-remote (client-op/get-local-checksum test-repo)))
-                         (is (= :rtc.log/checksum-mismatch (:type @*captured)))
-                         (is (= local-checksum-after-remote
-                                (get-in @*captured [:payload :local-checksum])))
-                         (is (= remote-checksum (get-in @*captured [:payload :remote-checksum]))))
+                   (-> (p/let [_ (sync-handle-message/handle-message! test-repo client raw-message)]
+                         (is false "expected checksum mismatch"))
+                       (p/catch
+                        (fn [error]
+                          (let [parent' (d/entity @conn parent-id)]
+                            (is (= :db-sync/checksum-mismatch
+                                   (:type (ex-data error))))
+                            (is (= "remote-checksum-anchor" (:block/title parent')))
+                            (is (= 0 (client-op/get-local-tx test-repo)))
+                            (is (= local-checksum-before
+                                   (client-op/get-local-checksum test-repo)))
+                            (is (= :rtc.log/checksum-mismatch (:type @*captured)))
+                            (is (= local-checksum-after-remote
+                                   (get-in @*captured
+                                           [:payload :recomputed-checksum])))
+                            (is (= remote-checksum
+                                   (get-in @*captured [:payload :remote-checksum]))))))
                        (p/finally (fn []
                                     (d/unlisten! conn ::pull-ok-checksum)
                                     (reset! db-sync/*repo->latest-remote-tx latest-prev)
                                     (done)))))))))))
 
-(deftest tx-reject-db-transact-failed-surfaces-rejected-tx-test
-  (testing "tx/reject with db transact failed includes parsed rejected tx and emits rtc-log"
+(deftest pull-ok-heals-cached-checksum-drift-before-publishing-cursor-test
+  (testing "pull/ok recomputes both projections and atomically publishes a matching basis"
+    (async done
+           (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+                 parent-id (:db/id parent)
+                 remote-tx-data [[:db/add parent-id :block/title "remote-after-cache-drift"]]
+                 remote-db (:db-after (d/with @conn remote-tx-data))
+                 remote-legacy (sync-checksum/recompute-checksum remote-db)
+                 remote-server-v2
+                 (sync-checksum/recompute-server-checksum remote-db)
+                 raw-message
+                 (js/JSON.stringify
+                  (clj->js {:type "pull/ok"
+                            :t 1
+                            :checksum remote-legacy
+                            :checksum-version sync-checksum/server-checksum-version
+                            :server-checksum remote-server-v2
+                            :txs [{:t 1
+                                   :tx (sqlite-util/write-transit-str
+                                        remote-tx-data)}]}))
+                 latest-prev @db-sync/*repo->latest-remote-tx
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :inflight (atom [])
+                         :last-sync-error (atom nil)
+                         :online-users (atom [])
+                         :ws-state (atom :open)}
+                 captured* (atom nil)]
+             (with-datascript-conns conn client-ops-conn
+               (fn []
+                 (reset! db-sync/*repo->latest-remote-tx {})
+                 (client-op/update-local-checksum test-repo "stale-legacy-cache")
+                 (client-op/update-local-server-checksum
+                  test-repo "stale-server-v2-cache")
+                 (p/with-redefs
+                   [sync-log-state/rtc-log
+                    (fn [type payload]
+                      (reset! captured* {:type type :payload payload}))
+                    shared-service/broadcast-to-clients! (fn [& _] nil)
+                    sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+                   (-> (sync-handle-message/handle-message!
+                        test-repo client raw-message)
+                       (p/then
+                        (fn [_]
+                          (is (= "remote-after-cache-drift"
+                                 (:block/title (d/entity @conn parent-id))))
+                          (is (= 1 (client-op/get-local-tx test-repo)))
+                          (is (= remote-legacy
+                                 (client-op/get-local-checksum test-repo)))
+                          (is (= remote-server-v2
+                                 (client-op/get-local-server-checksum
+                                  test-repo)))
+                          (is (not= :rtc.log/checksum-mismatch
+                                    (:type @captured*)))
+                          (is (not= :db-sync/checksum-mismatch
+                                    (get-in @captured* [:payload :type])))
+                          (is (or (nil? @captured*)
+                                  (true?
+                                   (get-in @captured*
+                                           [:payload :cache-only-drift?]))))))
+                       (p/catch
+                        (fn [error]
+                          (is false (str "cached-only pull drift must heal: "
+                                         error))))
+                       (p/finally
+                        (fn []
+                          (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                          (done)))))))))))
+
+(deftest tx-reject-db-transact-failed-redacts-rejected-tx-test
+  (testing "tx/reject keeps useful metadata without putting rejected tx content in errors or logs"
     (let [rejected-tx {:tx (sqlite-util/write-transit-str [[:db/add [:block/uuid (random-uuid)] :block/title "bad"]])
                        :outliner-op :save-block}
           *captured (atom nil)
@@ -1531,10 +3179,14 @@
                     captured @*captured]
                 (is (= :db-sync/tx-rejected (:type data)))
                 (is (= "db transact failed" (:reason data)))
-                (is (= rejected-tx (:data data)))
+                (is (true? (:has-rejected-data? data)))
+                (is (= :save-block (:rejected-outliner-op data)))
+                (is (not (contains? data :data)))
                 (is (= :rtc.log/tx-rejected (:type captured)))
                 (is (= :db-sync/tx-rejected (-> captured :payload :type)))
-                (is (= rejected-tx (-> captured :payload :data)))))))))))
+                (is (true? (-> captured :payload :has-rejected-data?)))
+                (is (= :save-block (-> captured :payload :rejected-outliner-op)))
+                (is (not (contains? (:payload captured) :data)))))))))))
 
 (deftest tx-reject-db-transact-failed-marks-inflight-op-failed-test
   (testing "non-stale tx/reject should mark inflight ops failed and clear pending state"
@@ -1577,6 +3229,112 @@
               (is (= [] @(:inflight client)))
               (is (= 0 (aget ent "pending")))
               (is (= 1 (aget ent "failed"))))))))))
+
+(deftest tx-reject-identity-conflict-without-committed-wire-proof-fails-closed-test
+  (testing "a real same-id/different-payload conflict must not be acknowledged as a lost ACK"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          tx-id (random-uuid)
+          raw-message (js/JSON.stringify
+                       (clj->js {:type "tx/reject"
+                                 :reason "db transact failed"
+                                 :error-detail ":db-sync/tx-identity-conflict"
+                                 :t 0
+                                 :success-tx-ids []
+                                 :failed-tx-id (str tx-id)}))
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [tx-id])
+                  :upload-request
+                  (atom {:tx-ids [tx-id]
+                         :large-upload-progress []
+                         :large-title-marker-tx-entries []})
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id tx-id
+             :db-sync/created-at 1
+             :db-sync/pending? true}])
+          (client-op/update-local-tx test-repo 0)
+          (let [error (try
+                        (with-silenced-console-error
+                          #(sync-handle-message/handle-message!
+                            test-repo client raw-message))
+                        nil
+                        (catch :default e
+                          e))
+                ent (client-op-tx-row client-ops-conn tx-id)]
+            (is (some? error))
+            (is (= :db-sync/tx-rejected
+                   (:type (ex-data error))))
+            (is (= ":db-sync/tx-identity-conflict"
+                   (:error-detail (ex-data error))))
+            (is (= [] @(:inflight client)))
+            (is (nil? @(:upload-request client)))
+            (is (= 0 (aget ent "pending")))
+            (is (= 1 (aget ent "failed")))))))))
+
+(deftest tx-reject-identity-conflict-does-not-trust-matching-checksum-cache-test
+  (testing "cached sidecar equality cannot prove that a conflicting tx committed"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          tx-id (random-uuid)
+          forged-checksum "0000000000000000"
+          raw-message
+          (js/JSON.stringify
+           (clj->js {:type "tx/reject"
+                     :reason "db transact failed"
+                     :error-detail ":db-sync/tx-identity-conflict"
+                     :t 0
+                     :success-tx-ids []
+                     :failed-tx-id (str tx-id)
+                     :checksum forged-checksum
+                     :checksum-version sync-checksum/server-checksum-version
+                     :server-checksum forged-checksum}))
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [tx-id])
+                  :upload-request
+                  (atom {:tx-ids [tx-id]
+                         :large-upload-progress []
+                         :large-title-marker-tx-entries
+                         [{:tx-id tx-id :marker-commits []}]})
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id tx-id
+             :db-sync/created-at 1
+             :db-sync/pending? true}])
+          (client-op/update-local-tx test-repo 0)
+          (client-op/update-local-checksum test-repo forged-checksum)
+          (client-op/update-local-server-checksum
+           test-repo forged-checksum)
+          (is (not= forged-checksum
+                    (sync-checksum/recompute-checksum @conn)))
+          (is (not= forged-checksum
+                    (sync-checksum/recompute-server-checksum @conn)))
+          (let [error
+                (try
+                  (with-silenced-console-error
+                    #(sync-handle-message/handle-message!
+                      test-repo client raw-message))
+                  nil
+                  (catch :default error
+                    error))
+                ent (client-op-tx-row client-ops-conn tx-id)]
+            (is (= :db-sync/tx-rejected
+                   (:type (ex-data error))))
+            (is (= ":db-sync/tx-identity-conflict"
+                   (:error-detail (ex-data error))))
+            (is (= [] @(:inflight client)))
+            (is (nil? @(:upload-request client)))
+            (is (= 0 (aget ent "pending")))
+            (is (= 1 (aget ent "failed")))))))))
 
 (deftest tx-reject-db-transact-failed-rolls-back-rejected-local-delete-test
   (testing "a rejected local tx should not stay applied after it is marked failed"
@@ -1748,19 +3506,55 @@
 
 (deftest tx-reject-db-transact-failed-selectively-updates-inflight-ops-test
   (testing "tx/reject should mark success txs as non-pending and failed tx as failed, leaving later inflight pending"
-    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+    (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)
           success-tx-id (random-uuid)
           failed-tx-id (random-uuid)
           untouched-tx-id (random-uuid)
+          success-marker
+          {:asset-uuid "partial-success-marker"
+           :asset-type "txt"
+           :payload-format sync-large-title/large-title-plain-payload-format
+           :payload-digest-alg sync-large-title/large-title-payload-digest-alg
+           :payload-digest (apply str (repeat 64 "a"))}
+          failed-marker
+          {:asset-uuid "failed-marker"
+           :asset-type "txt"
+           :payload-format sync-large-title/large-title-plain-payload-format
+           :payload-digest-alg sync-large-title/large-title-payload-digest-alg
+           :payload-digest (apply str (repeat 64 "b"))}
           raw-message (js/JSON.stringify
                        (clj->js {:type "tx/reject"
                                  :reason "db transact failed"
-                                 :t 3
+                                 :t 5
+                                 :error-detail "server transact exception"
                                  :success-tx-ids [(str success-tx-id)]
                                  :failed-tx-id (str failed-tx-id)}))
+          flush-calls (atom [])
           client {:repo test-repo
                   :graph-id "graph-1"
                   :inflight (atom [success-tx-id failed-tx-id untouched-tx-id])
+                  :upload-request
+                  (atom
+                   {:large-upload-progress []
+                    :large-title-marker-tx-entries
+                    [{:tx-id success-tx-id
+                      :marker-commits
+                      [{:marker-tx
+                        [:db/add
+                         [:block/uuid (:block/uuid parent)]
+                         sync-large-title/large-title-object-attr
+                         success-marker]
+                        :target-eid (:db/id parent)
+                        :logical-title (:block/title parent)}]}
+                     {:tx-id failed-tx-id
+                      :marker-commits
+                      [{:marker-tx
+                        [:db/add
+                         [:block/uuid (:block/uuid child1)]
+                         sync-large-title/large-title-object-attr
+                         failed-marker]
+                        :target-eid (:db/id child1)
+                        :logical-title (:block/title child1)}]}]})
                   :online-users (atom [])
                   :ws-state (atom :open)}]
       (with-datascript-conns conn client-ops-conn
@@ -1776,28 +3570,241 @@
             {:db-sync/tx-id untouched-tx-id
              :db-sync/created-at 3
              :db-sync/pending? true}])
-          (with-redefs [client-op/get-local-tx (constantly 0)]
-            (let [error (try
+          (client-op/update-local-tx test-repo 4)
+          (let [error (with-redefs [sync-apply/enqueue-flush-pending!
+                                    (fn [repo client]
+                                      (swap! flush-calls conj [repo client]))]
+                        (try
                           (with-silenced-console-error
                             #(sync-handle-message/handle-message! test-repo client raw-message))
                           nil
                           (catch :default e
+                            e)))
+                success-ent (client-op-tx-row client-ops-conn success-tx-id)
+                failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
+                untouched-ent (client-op-tx-row client-ops-conn untouched-tx-id)]
+            (is (some? error))
+            (is (= :db-sync/tx-rejected
+                   (:type (ex-data error))))
+            (is (= "db transact failed"
+                   (:reason (ex-data error))))
+            (is (= "server transact exception"
+                   (:error-detail (ex-data error))))
+            (is (= 5 (client-op/get-local-tx test-repo)))
+            (is (= [[test-repo client]] @flush-calls))
+            (is (= [] @(:inflight client)))
+            (is (= 0 (aget success-ent "pending")))
+            (is (not= 1 (aget success-ent "failed")))
+            (is (= 0 (aget failed-ent "pending")))
+            (is (= 1 (aget failed-ent "failed")))
+            (is (= 1 (aget untouched-ent "pending")))
+            (is (not= 1 (aget untouched-ent "failed")))
+            (is (= success-marker
+                   (get
+                    (d/entity @conn [:block/uuid (:block/uuid parent)])
+                    sync-large-title/large-title-object-attr)))
+            (is (nil?
+                 (get
+                  (d/entity @conn [:block/uuid (:block/uuid child1)])
+                  sync-large-title/large-title-object-attr)))))))))
+
+(deftest tx-reject-with-no-successful-prefix-requeues-later-pending-op-test
+  (testing "a first-entry rejection must not strand later entries from the same inflight batch"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          failed-tx-id (random-uuid)
+          untouched-tx-id (random-uuid)
+          raw-message (js/JSON.stringify
+                       (clj->js {:type "tx/reject"
+                                 :reason "db transact failed"
+                                 :t 4
+                                 :success-tx-ids []
+                                 :failed-tx-id (str failed-tx-id)}))
+          flush-calls (atom [])
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [failed-tx-id untouched-tx-id])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id failed-tx-id
+             :db-sync/created-at 1
+             :db-sync/pending? true}
+            {:db-sync/tx-id untouched-tx-id
+             :db-sync/created-at 2
+             :db-sync/pending? true}])
+          (client-op/update-local-tx test-repo 4)
+          (with-redefs [sync-apply/enqueue-flush-pending!
+                        (fn [repo client]
+                          (swap! flush-calls conj [repo client]))]
+            (let [error (try
+                          (with-silenced-console-error
+                            #(sync-handle-message/handle-message!
+                              test-repo client raw-message))
+                          nil
+                          (catch :default e
                             e))
-                  success-ent (client-op-tx-row client-ops-conn success-tx-id)
                   failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
                   untouched-ent (client-op-tx-row client-ops-conn untouched-tx-id)]
-              (is (some? error))
-              (is (= :db-sync/tx-rejected
-                     (:type (ex-data error))))
-              (is (= "db transact failed"
-                     (:reason (ex-data error))))
+              (is (= :db-sync/tx-rejected (:type (ex-data error))))
+              (is (= [[test-repo client]] @flush-calls))
               (is (= [] @(:inflight client)))
-              (is (= 0 (aget success-ent "pending")))
-              (is (not= 1 (aget success-ent "failed")))
-              (is (= 0 (aget failed-ent "pending")))
               (is (= 1 (aget failed-ent "failed")))
               (is (= 1 (aget untouched-ent "pending")))
               (is (not= 1 (aget untouched-ent "failed"))))))))))
+
+(deftest tx-reject-with-authoritative-remote-ahead-pulls-before-retry-test
+  (testing "a genuine remote cursor lead must pull before retrying later pending ops"
+    (async done
+           (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+                 failed-tx-id (random-uuid)
+                 untouched-tx-id (random-uuid)
+                 *sent (atom [])
+                 flush-calls (atom [])
+                 ws (doto (js-obj)
+                      (aset "readyState" 1)
+                      (aset "send"
+                            (fn [raw]
+                              (swap! *sent conj
+                                     (js->clj
+                                      (js/JSON.parse raw)
+                                      :keywordize-keys true)))))
+                 raw-message (js/JSON.stringify
+                              (clj->js {:type "tx/reject"
+                                        :reason "db transact failed"
+                                        :t 4
+                                        :success-tx-ids []
+                                        :failed-tx-id (str failed-tx-id)}))
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :ws ws
+                         :send-queue (atom (p/resolved nil))
+                         :pending-pull-since (atom nil)
+                         :inflight (atom [failed-tx-id untouched-tx-id])
+                         :online-users (atom [])
+                         :ws-state (atom :open)}]
+             (with-datascript-conns
+               conn client-ops-conn
+               (fn []
+                 (seed-client-op-txs!
+                  test-repo
+                  [{:db-sync/tx-id failed-tx-id
+                    :db-sync/created-at 1
+                    :db-sync/pending? true}
+                   {:db-sync/tx-id untouched-tx-id
+                    :db-sync/created-at 2
+                    :db-sync/pending? true}])
+                 (client-op/update-local-tx test-repo 4)
+                 (reset! sync-apply/*repo->latest-remote-tx {test-repo 5})
+                 (reset! sync-apply/*repo->latest-remote-checksum
+                         {test-repo "authoritative-remote-checksum"})
+                 (reset! sync-apply/*repo->latest-remote-checksum-version
+                         {test-repo sync-checksum/server-checksum-version})
+                 (let [error
+                       (with-redefs [sync-apply/enqueue-flush-pending!
+                                     (fn [repo client']
+                                       (swap! flush-calls conj [repo client']))]
+                         (try
+                           (with-silenced-console-error
+                             #(sync-handle-message/handle-message!
+                               test-repo client raw-message))
+                           nil
+                           (catch :default e
+                             e)))]
+                   (->
+                    @(:send-queue client)
+                    (p/then
+                     (fn [_]
+                       (let [failed-ent
+                             (client-op-tx-row client-ops-conn failed-tx-id)
+                             untouched-ent
+                             (client-op-tx-row client-ops-conn untouched-tx-id)]
+                         (is (= :db-sync/tx-rejected
+                                (:type (ex-data error))))
+                         (is (= [{:type "pull" :since 4}] @*sent))
+                         (is (empty? @flush-calls))
+                         (is (= 5
+                                (get @sync-apply/*repo->latest-remote-tx
+                                     test-repo)))
+                         (is (= "authoritative-remote-checksum"
+                                (get @sync-apply/*repo->latest-remote-checksum
+                                     test-repo)))
+                         (is (= sync-checksum/server-checksum-version
+                                (get
+                                 @sync-apply/*repo->latest-remote-checksum-version
+                                 test-repo)))
+                         (is (= 1 (aget failed-ent "failed")))
+                         (is (= 1 (aget untouched-ent "pending")))
+                         (is (not= 1 (aget untouched-ent "failed"))))))
+                    (p/catch
+                     (fn [error]
+                       (is false (str error))))
+                    (p/finally done)))))))))
+
+(deftest tx-reject-retry-starts-with-isolated-remote-state-test
+  (testing "a following test must not inherit remote cursor or checksum state"
+    (is (nil? (get @sync-apply/*repo->latest-remote-tx test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum-version
+                   test-repo)))
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          failed-tx-id (random-uuid)
+          untouched-tx-id (random-uuid)
+          raw-message (js/JSON.stringify
+                       (clj->js {:type "tx/reject"
+                                 :reason "db transact failed"
+                                 :t 4
+                                 :success-tx-ids []
+                                 :failed-tx-id (str failed-tx-id)}))
+          flush-calls (atom [])
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [failed-tx-id untouched-tx-id])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id failed-tx-id
+             :db-sync/created-at 1
+             :db-sync/pending? true}
+            {:db-sync/tx-id untouched-tx-id
+             :db-sync/created-at 2
+             :db-sync/pending? true}])
+          (client-op/update-local-tx test-repo 4)
+          (let [error
+                (with-redefs [sync-apply/enqueue-flush-pending!
+                              (fn [repo client']
+                                (swap! flush-calls conj [repo client']))]
+                  (try
+                    (with-silenced-console-error
+                      #(sync-handle-message/handle-message!
+                        test-repo client raw-message))
+                    nil
+                    (catch :default e
+                      e)))
+                failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
+                untouched-ent
+                (client-op-tx-row client-ops-conn untouched-tx-id)]
+            (is (= :db-sync/tx-rejected (:type (ex-data error))))
+            (is (= [[test-repo client]] @flush-calls))
+            (is (= 4
+                   (get @sync-apply/*repo->latest-remote-tx test-repo)))
+            (is (= 1 (aget failed-ent "failed")))
+            (is (= 1 (aget untouched-ent "pending")))
+            (is (not= 1 (aget untouched-ent "failed")))))))))
+
+(deftest tx-reject-retry-does-not-leak-remote-state-test
+  (testing "a completed retry test must not leak remote state to the next test"
+    (is (nil? (get @sync-apply/*repo->latest-remote-tx test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum test-repo)))
+    (is (nil? (get @sync-apply/*repo->latest-remote-checksum-version
+                   test-repo)))))
 
 (deftest tx-reject-missing-blocks-marks-failed-tx-failed-test
   (testing "tx/reject with missing block ids should fail the rejected tx"
@@ -1940,27 +3947,111 @@
                              (is (= 3 @(:pending-pull-since client)))))
                    (p/finally (fn [] (done)))))))))
 
-(deftest pull-ok-clears-pending-pull-request-marker-test
-  (testing "pull/ok clears pending pull marker so future changed can request next pull"
-    (let [raw-message (js/JSON.stringify
-                       (clj->js {:type "pull/ok"
-                                 :t 4
-                                 :txs []}))
-          client {:repo test-repo
-                  :graph-id "graph-1"
-                  :ws #js {}
-                  :pending-pull-since (atom 3)
-                  :inflight (atom [])
-                  :online-users (atom [])
-                  :ws-state (atom :open)}]
-      (with-redefs [client-op/get-local-tx (constantly 3)
-                    client-op/update-local-tx (fn [_repo _t] nil)
-                    sync-apply/flush-pending! (fn [& _] nil)]
-        (sync-handle-message/handle-message! test-repo client raw-message)
-        (is (nil? @(:pending-pull-since client)))))))
+(deftest hello-waits-for-remote-catch-up-before-uploading-pending-local-txs-test
+  (testing "reconnect after a lost acknowledgement pulls the server cursor before retrying local txs"
+    (async done
+           (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+                 *sent (atom [])
+                 flush-calls (atom 0)
+                 ws (doto (js-obj)
+                      (aset "readyState" 1)
+                      (aset "send" (fn [raw]
+                                     (swap! *sent conj
+                                            (js->clj (js/JSON.parse raw)
+                                                     :keywordize-keys true)))))
+                 client {:repo test-repo
+                         :graph-id "graph-1"
+                         :ws ws
+                         :send-queue (atom (p/resolved nil))
+                         :asset-queue (atom (p/resolved nil))
+                         :pending-pull-since (atom nil)
+                         :inflight (atom [])
+                         :online-users (atom [])
+                         :ws-state (atom :open)}
+                 raw-message (js/JSON.stringify
+                              (clj->js {:type "hello"
+                                        :t 4}))]
+             (-> (with-datascript-conns
+                  conn
+                  client-ops-conn
+                  (fn []
+                    (with-redefs [client-op/get-local-tx (constantly 3)
+                                  client-op/get-pending-local-tx-count (constantly 1)
+                                  sync-apply/pending-txs (constantly [])
+                                  sync-apply/enqueue-flush-pending!
+                                  (fn [& _]
+                                    (swap! flush-calls inc))
+                                  sync-assets/enqueue-asset-sync! (fn [& _] nil)
+                                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                      (sync-handle-message/handle-message! test-repo client raw-message)
+                      (-> @(:send-queue client)
+                          (p/then
+                           (fn [_]
+                             (is (= [{:type "pull" :since 3}] @*sent))
+                             (is (zero? @flush-calls)
+                                 "pending local txs must wait until pull/rebase finishes")))))))
+                 (p/finally done))))))
 
-(deftest hello-checksum-mismatch-logs-warning-test
-  (testing "hello with matching t but mismatched checksum logs warning without throwing"
+(deftest pull-ok-rejects-empty-gapped-and-out-of-order-history-test
+  (testing "pull/ok never advances across missing or reordered history"
+    (async done
+           (let [cases [{:label "empty"
+                         :remote-tx 4
+                         :txs []}
+                        {:label "missing first entry"
+                         :remote-tx 5
+                         :txs [{:t 5 :tx "ignored"}]}
+                        {:label "out of order"
+                         :remote-tx 5
+                         :txs [{:t 5 :tx "ignored"}
+                               {:t 4 :tx "ignored"}]}]
+                 check-case
+                 (fn [{:keys [label remote-tx txs]}]
+                   (let [raw-message (js/JSON.stringify
+                                      (clj->js {:type "pull/ok"
+                                                :t remote-tx
+                                                :txs txs}))
+                         pending* (atom 3)
+                         updates* (atom [])
+                         last-error* (atom nil)
+                         client {:repo test-repo
+                                 :graph-id "graph-1"
+                                 :ws #js {}
+                                 :pending-pull-since pending*
+                                 :last-sync-error last-error*
+                                 :inflight (atom [])
+                                 :online-users (atom [])
+                                 :ws-state (atom :open)}
+                         result
+                         (try
+                           (with-redefs [client-op/get-local-tx (constantly 3)
+                                         client-op/update-local-tx
+                                         (fn [_repo t]
+                                           (swap! updates* conj t))
+                                         sync-apply/flush-pending! (fn [& _] nil)]
+                             (p/resolved
+                              (sync-handle-message/handle-message!
+                               test-repo client raw-message)))
+                           (catch :default error
+                             (p/rejected error)))]
+                     (-> result
+                         (p/then (fn [_] :unexpected-success))
+                         (p/catch identity)
+                         (p/then
+                          (fn [error]
+                            (is (some? error) label)
+                            (is (= :db-sync/pull-history-gap
+                                   (get-in @last-error* [:data :type]))
+                                label)
+                            (is (empty? @updates*) label)
+                            (is (nil? @pending*) label))))))]
+             (-> (p/all (mapv check-case cases))
+                 (p/catch (fn [error]
+                            (is false (str error))))
+                 (p/finally done))))))
+
+(deftest hello-checksum-mismatch-requires-repair-test
+  (testing "hello with matching t but mismatched checksum never reports success"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)
           latest-prev @db-sync/*repo->latest-remote-tx
           raw-message (js/JSON.stringify
@@ -1975,20 +4066,25 @@
       (with-datascript-conns conn client-ops-conn
         (fn []
           (reset! db-sync/*repo->latest-remote-tx {})
+          (client-op/update-local-checksum
+           test-repo
+           (sync-checksum/recompute-checksum @conn))
           (with-redefs [sync-apply/flush-pending! (fn [& _] nil)
                         sync-assets/enqueue-asset-sync! (fn [& _] nil)]
             (try
-              (is (= :ok
-                     (try
-                       (sync-handle-message/handle-message! test-repo client raw-message)
-                       :ok
-                       (catch :default _error
-                         :thrown))))
+              (let [error (try
+                            (sync-handle-message/handle-message!
+                             test-repo client raw-message)
+                            nil
+                            (catch :default error
+                              error))]
+                (is (= :db-sync/checksum-mismatch
+                       (:type (ex-data error)))))
               (finally
                 (reset! db-sync/*repo->latest-remote-tx latest-prev)))))))))
 
-(deftest hello-checksum-mismatch-logs-warning-for-e2ee-test
-  (testing "e2ee graphs also log warning on checksum mismatch without throwing"
+(deftest hello-checksum-mismatch-requires-repair-for-e2ee-test
+  (testing "e2ee graphs also reject a verified checksum mismatch"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)
           latest-prev @db-sync/*repo->latest-remote-tx
           raw-message (js/JSON.stringify
@@ -2003,18 +4099,801 @@
       (with-datascript-conns conn client-ops-conn
         (fn []
           (reset! db-sync/*repo->latest-remote-tx {})
+          (client-op/update-local-checksum
+           test-repo
+           (sync-checksum/recompute-checksum @conn))
           (with-redefs [sync-apply/flush-pending! (fn [& _] nil)
                         sync-assets/enqueue-asset-sync! (fn [& _] nil)
                         sync-crypt/graph-e2ee? (constantly true)]
             (try
-              (is (= :ok
-                     (try
-                       (sync-handle-message/handle-message! test-repo client raw-message)
-                       :ok
-                       (catch :default _error
-                         :thrown))))
+              (let [error (try
+                            (sync-handle-message/handle-message!
+                             test-repo client raw-message)
+                            nil
+                            (catch :default error
+                              error))]
+                (is (= :db-sync/checksum-mismatch
+                       (:type (ex-data error)))))
               (finally
                 (reset! db-sync/*repo->latest-remote-tx latest-prev)))))))))
+
+(deftest hello-heals-cached-checksum-drift-from-one-stable-basis-test
+  (testing "hello repairs only stale checksum metadata when both recomputed projections match"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          latest-prev @db-sync/*repo->latest-remote-tx
+          expected-legacy (sync-checksum/recompute-checksum @conn)
+          expected-server-v2
+          (sync-checksum/recompute-server-checksum @conn)
+          raw-message
+          (js/JSON.stringify
+           (clj->js {:type "hello"
+                     :t 0
+                     :checksum expected-legacy}))
+          captured* (atom nil)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (reset! db-sync/*repo->latest-remote-tx {})
+          (client-op/update-local-checksum test-repo "stale-legacy-cache")
+          (client-op/update-local-server-checksum
+           test-repo "stale-server-v2-cache")
+          (with-redefs
+            [sync-log-state/rtc-log
+             (fn [type payload]
+               (reset! captured* {:type type :payload payload}))
+             sync-apply/flush-pending! (fn [& _] nil)
+             sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+            (try
+              (sync-handle-message/handle-message!
+               test-repo client raw-message)
+              (is (= 0 (client-op/get-local-tx test-repo)))
+              (is (= expected-legacy
+                     (client-op/get-local-checksum test-repo)))
+              (is (= expected-server-v2
+                     (client-op/get-local-server-checksum test-repo)))
+              (let [payload (:payload @captured*)]
+                (is (= :rtc.log/checksum-cache-repaired
+                       (:type @captured*)))
+                (is (= :db-sync/checksum-cache-repaired
+                       (:type payload)))
+                (is (true? (:cache-only-drift? payload)))
+                (is (= "stale-legacy-cache" (:cached-checksum payload)))
+                (is (= expected-legacy (:recomputed-checksum payload)))
+                (is (= "stale-server-v2-cache"
+                       (:cached-server-checksum payload)))
+                (is (= expected-server-v2
+                       (:recomputed-server-checksum payload)))
+                (is (= 0 (:basis-local-tx payload)))
+                (is (number? (:connection-id payload)))
+                (is (number? (:basis-id payload)))
+                (is (not (string/includes? (pr-str payload) "parent"))))
+              (catch :default error
+                (is false (str "cached-only hello drift must heal: " error)))
+              (finally
+                (reset! db-sync/*repo->latest-remote-tx latest-prev)))))))))
+
+(deftest hello-retries-checksum-recompute-when-db-basis-changes-test
+  (testing "hello discards a mixed-basis recomputation and retries both projections"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          parent-id (:db/id parent)
+          concurrent-tx
+          [[:db/add parent-id :block/title "concurrent-rtc-title"]]
+          final-db (:db-after (d/with @conn concurrent-tx))
+          expected-legacy (sync-checksum/recompute-checksum final-db)
+          expected-server-v2
+          (sync-checksum/recompute-server-checksum final-db)
+          raw-message
+          (js/JSON.stringify
+           (clj->js {:type "hello"
+                     :t 0
+                     :checksum expected-legacy
+                     :checksum-version sync-checksum/server-checksum-version
+                     :server-checksum expected-server-v2}))
+          original-recompute sync-checksum/recompute-checksum
+          original-recompute-server sync-checksum/recompute-server-checksum
+          recompute-count* (atom 0)
+          injected?* (atom false)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (client-op/update-local-checksum test-repo "stale-legacy-cache")
+          (client-op/update-local-server-checksum
+           test-repo "stale-server-v2-cache")
+          (with-redefs
+            [sync-checksum/recompute-checksum
+             (fn [db]
+               (swap! recompute-count* inc)
+               (let [result (original-recompute db)]
+                 (when (compare-and-set! injected?* false true)
+                   (ldb/transact! conn concurrent-tx {:rtc-tx? true}))
+                 result))
+             sync-checksum/recompute-server-checksum
+             (fn [db]
+               (swap! recompute-count* inc)
+               (original-recompute-server db))
+             sync-apply/flush-pending! (fn [& _] nil)
+             sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+            (try
+              (sync-handle-message/handle-message!
+               test-repo client raw-message)
+              (is (= "concurrent-rtc-title"
+                     (:block/title (d/entity @conn parent-id))))
+              (is (= expected-legacy
+                     (client-op/get-local-checksum test-repo)))
+              (is (= expected-server-v2
+                     (client-op/get-local-server-checksum test-repo)))
+              (is (<= 4 @recompute-count*)
+                  "a changed DB basis must recompute both projections again")
+              (catch :default error
+                (is false (str "stable-basis retry must converge: " error))))))))))
+
+(deftest hello-fails-transiently-when-checksum-basis-never-stabilizes-test
+  (testing "bounded basis retries never misclassify concurrent DB changes as divergence"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          parent-id (:db/id parent)
+          original-recompute sync-checksum/recompute-checksum
+          attempt* (atom 0)
+          captured* (atom nil)
+          raw-message
+          (js/JSON.stringify
+           (clj->js {:type "hello"
+                     :t 0
+                     :checksum "remote-legacy"
+                     :checksum-version sync-checksum/server-checksum-version
+                     :server-checksum "remote-server-v2"}))
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (client-op/update-local-checksum test-repo "stale-legacy-cache")
+          (client-op/update-local-server-checksum
+           test-repo "stale-server-v2-cache")
+          (let [error
+                (with-redefs
+                  [sync-checksum/recompute-checksum
+                   (fn [db]
+                     (let [result (original-recompute db)
+                           n (swap! attempt* inc)]
+                       (ldb/transact!
+                        conn
+                        [[:db/add parent-id :block/title (str "basis-" n)]]
+                        {:rtc-tx? true})
+                       result))
+                   sync-log-state/rtc-log
+                   (fn [type payload]
+                     (reset! captured* {:type type :payload payload}))
+                   sync-apply/flush-pending! (fn [& _] nil)
+                   sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                  (try
+                    (sync-handle-message/handle-message!
+                     test-repo client raw-message)
+                    nil
+                    (catch :default error
+                      error)))]
+            (is (= :db-sync/checksum-basis-unstable
+                   (:type (ex-data error))))
+            (is (= 3 (:attempts (ex-data error))))
+            (is (= 3 @attempt*))
+            (is (= 0 (client-op/get-local-tx test-repo)))
+            (is (= "stale-legacy-cache"
+                   (client-op/get-local-checksum test-repo)))
+            (is (nil? @captured*)
+                "an unstable basis is transient, not a checksum mismatch")))))))
+
+(deftest sync-checkpoint-sidecar-update-is-atomic-test
+  (testing "a SQLite failure cannot publish a partial cursor/checksum checkpoint"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (client-op/update-local-tx test-repo 7)
+          (client-op/update-local-checksum test-repo "legacy-before")
+          (client-op/update-local-server-checksum
+           test-repo "server-v2-before")
+          (.exec ^js client-ops-conn
+                 (str "create trigger fail_sync_checkpoint "
+                      "before update of value on sync_meta "
+                      "when new.key = 'server-checksum-v2' "
+                      "begin select raise(abort, 'synthetic checkpoint fault'); end"))
+          (try
+            (let [error
+                  (try
+                    (client-op/commit-sync-checkpoint!
+                     test-repo
+                     {:t 8
+                      :expected-local-t 7
+                      :checksum "legacy-after"
+                      :server-checksum "server-v2-after"})
+                    nil
+                    (catch :default error
+                      error))]
+              (is (some? error))
+              (is (= 7 (client-op/get-local-tx test-repo)))
+              (is (= "legacy-before"
+                     (client-op/get-local-checksum test-repo)))
+              (is (= "server-v2-before"
+                     (client-op/get-local-server-checksum test-repo))))
+            (finally
+              (.exec ^js client-ops-conn
+                     "drop trigger if exists fail_sync_checkpoint"))))))))
+
+(deftest upgraded-server-heals-checksum-metadata-before-hello-and-restart-test
+  (testing "server migration prevents false repair-required while preserving strict clients"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          server-storage (make-storage-sql)
+          server-sql (:sql server-storage)
+          server-conn (sync-storage/open-conn server-sql)
+          _ (reset! server-conn @conn)
+          server-self #js {:sql server-sql
+                           :conn server-conn
+                           :schema-ready true}
+          expected-legacy (sync-checksum/recompute-checksum @server-conn)
+          expected-versioned
+          (sync-checksum/recompute-server-checksum @server-conn)
+          wrong-versioned
+          (if (= expected-versioned "0000000000000000")
+            "ffffffffffffffff"
+            "0000000000000000")
+          _ (sync-storage/set-checksum! server-sql expected-legacy)
+          _ (sync-storage/set-server-checksum!
+             server-sql wrong-versioned 0)
+          server-fields (sync-handler/checksum-response-fields server-self)
+          current-client
+          {:repo test-repo
+           :graph-id "graph-1"
+           :inflight (atom [])
+           :online-users (atom [])
+           :ws-state (atom :open)}
+          restarted-client
+          {:repo test-repo
+           :graph-id "graph-1"
+           :inflight (atom [])
+           :online-users (atom [])
+           :ws-state (atom :open)}
+          latest-tx-prev @db-sync/*repo->latest-remote-tx
+          latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+          latest-version-prev @db-sync/*repo->latest-remote-checksum-version]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (reset! db-sync/*repo->latest-remote-tx {})
+          (reset! db-sync/*repo->latest-remote-checksum {})
+          (reset! db-sync/*repo->latest-remote-checksum-version {})
+          (client-op/update-local-tx test-repo 0)
+          (client-op/update-local-checksum
+           test-repo expected-legacy)
+          (client-op/update-local-server-checksum
+           test-repo expected-versioned)
+          (with-redefs [sync-apply/enqueue-flush-pending!
+                        (fn [& _] nil)
+                        sync-assets/enqueue-asset-sync!
+                        (fn [& _] nil)]
+            (try
+              (doseq [[label client message]
+                      [["initial hello"
+                        current-client
+                        (merge {:type "hello" :t 0}
+                               server-fields)]
+                       ["restart hello"
+                        restarted-client
+                        (merge {:type "hello" :t 0}
+                               (sync-handler/checksum-response-fields
+                                #js {:sql server-sql
+                                     :conn nil
+                                     :schema-ready true}))]
+                       [".4 legacy hello"
+                        restarted-client
+                        {:type "hello"
+                         :t 0
+                         :checksum expected-legacy}]]]
+                (let [error
+                      (try
+                        (sync-handle-message/handle-message!
+                         test-repo
+                         client
+                         (js/JSON.stringify (clj->js message)))
+                        nil
+                        (catch :default error
+                          error))]
+                  (is (nil? error)
+                      (str label
+                           " must not enter repair-required: "
+                           (some-> error ex-data pr-str)))))
+              (let [strict-error
+                    (try
+                      (sync-handle-message/handle-message!
+                       test-repo
+                       restarted-client
+                       (js/JSON.stringify
+                        (clj->js
+                         {:type "hello"
+                          :t 0
+                          :checksum expected-legacy
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum wrong-versioned})))
+                      nil
+                      (catch :default error
+                        error))]
+                (is (= :db-sync/checksum-mismatch
+                       (:type (ex-data strict-error)))
+                    "the client remains strict; repair is server-side metadata validation"))
+              (finally
+                (reset! db-sync/*repo->latest-remote-tx latest-tx-prev)
+                (reset! db-sync/*repo->latest-remote-checksum
+                        latest-checksum-prev)
+                (reset! db-sync/*repo->latest-remote-checksum-version
+                        latest-version-prev)))))))))
+
+(defn- v2-large-title-object
+  [asset-uuid digest-char]
+  {:asset-uuid asset-uuid
+   :asset-type "txt"
+   :payload-format "utf8-plain-v1"
+   :payload-digest-alg "sha256-v1"
+   :payload-digest (apply str (repeat 64 digest-char))})
+
+(deftest hello-recovers-confirmed-large-title-marker-for-plain-and-e2ee-test
+  (async done
+         (let [latest-tx-prev @db-sync/*repo->latest-remote-tx
+               latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+               latest-version-prev
+               @db-sync/*repo->latest-remote-checksum-version
+               run-case
+               (fn [e2ee?]
+                 (let [{:keys [conn client-ops-conn parent]}
+                       (setup-parent-child)
+                       parent-id (:db/id parent)
+                       block-uuid (:block/uuid parent)
+                       title (apply str (repeat 5000 (if e2ee? "e" "p")))
+                       payload-format
+                       (if e2ee?
+                         sync-large-title/large-title-encrypted-payload-format
+                         sync-large-title/large-title-plain-payload-format)
+                       local-marker
+                       (assoc (v2-large-title-object
+                               (str "local-" (name (if e2ee? :e2ee :plain)))
+                               "a")
+                              :payload-format payload-format)
+                       remote-marker
+                       (assoc (v2-large-title-object
+                               (str "remote-" (name (if e2ee? :e2ee :plain)))
+                               "b")
+                              :payload-format payload-format)
+                       aes-key (when e2ee? :test-aes-key)
+                       aes-key-attempts* (atom 0)
+                       success-count* (atom 0)
+                       flush-count* (atom 0)
+                       client {:repo test-repo
+                               :graph-id "graph-1"
+                               :inflight (atom [])
+                               :online-users (atom [])
+                               :ws-state (atom :open)
+                               :sync-succeeded-f
+                               (fn [] (swap! success-count* inc))}]
+                   (d/transact!
+                    conn
+                    (cond-> [[:db/add parent-id :block/title title]
+                             [:db/add
+                              parent-id
+                              sync-large-title/large-title-object-attr
+                              local-marker]]
+                      e2ee?
+                      (conj {:db/ident :logseq.kv/graph-rtc-e2ee?
+                             :kv/value true})))
+                   (let [local-db @conn
+                         remote-db
+                         (:db-after
+                          (d/with
+                           local-db
+                           [[:db/add
+                             [:block/uuid block-uuid]
+                             sync-large-title/large-title-object-attr
+                             remote-marker]]))
+                         legacy-checksum
+                         (sync-checksum/recompute-checksum remote-db)
+                         remote-server-checksum
+                         (sync-checksum/recompute-server-checksum remote-db)
+                         marker-state
+                         (mapv
+                          (fn [{:keys [block-uuid marker]}]
+                            {:block-uuid (str block-uuid)
+                             :marker marker})
+                          (sync-checksum/server-large-title-markers remote-db))
+                         response
+                         {:t 2734
+                          :checksum legacy-checksum
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum remote-server-checksum
+                          :large-title-markers marker-state}
+                         raw-message
+                         (js/JSON.stringify
+                          (clj->js
+                           (assoc
+                            (select-keys
+                             response
+                             [:t
+                              :checksum
+                              :checksum-version
+                              :server-checksum])
+                            :type "hello")))]
+                     (is (= legacy-checksum
+                            (sync-checksum/recompute-checksum local-db)))
+                     (is (not=
+                          remote-server-checksum
+                          (sync-checksum/recompute-server-checksum local-db)))
+                     (with-datascript-conns
+                       conn
+                       client-ops-conn
+                       (fn []
+                         (client-op/update-local-tx test-repo 2734)
+                         (client-op/update-local-checksum
+                          test-repo
+                          (sync-checksum/recompute-checksum local-db))
+                         (client-op/update-local-server-checksum
+                          test-repo
+                          (sync-checksum/recompute-server-checksum local-db))
+                         (p/with-redefs
+                           [sync-handle-message/<fetch-large-title-marker-state
+                            (fn [repo graph-id]
+                              (is (= test-repo repo))
+                              (is (= "graph-1" graph-id))
+                              (p/resolved response))
+                            sync-crypt/graph-e2ee? (constantly e2ee?)
+                            sync-crypt/<ensure-graph-aes-key
+                            (fn [& _]
+                              (let [attempt (swap! aes-key-attempts* inc)]
+                                (p/resolved
+                                 (when (or (not e2ee?) (> attempt 1))
+                                   aes-key))))
+                            sync-apply/download-large-title!
+                            (fn [repo graph-id marker key]
+                              (is (= test-repo repo))
+                              (is (= "graph-1" graph-id))
+                              (is (= remote-marker marker))
+                              (is (= aes-key key))
+                              (p/resolved title))
+                            sync-apply/enqueue-flush-pending!
+                            (fn [& _] (swap! flush-count* inc))
+                            sync-assets/enqueue-asset-sync!
+                            (fn [& _] nil)]
+                           (p/let [first-result
+                                   (if e2ee?
+                                     (->
+                                      (sync-handle-message/handle-message!
+                                       test-repo client raw-message)
+                                      (p/then (fn [_] :unexpected-success))
+                                      (p/catch (fn [error]
+                                                 {:error error})))
+                                     (p/resolved :not-applicable))
+                                   _ (when e2ee?
+                                       (is (not= :unexpected-success
+                                                 first-result))
+                                       (is (= :db-sync/e2ee-key-unavailable
+                                              (:type
+                                               (ex-data
+                                                (:error first-result)))))
+                                       (is (= :missing-aes-key
+                                              (:code
+                                               (ex-data
+                                                (:error first-result)))))
+                                       (is (sync-util/transient-sync-error?
+                                            (:error first-result)))
+                                       (is (= local-marker
+                                              (get
+                                               (d/entity
+                                                @conn
+                                                [:block/uuid block-uuid])
+                                               sync-large-title/large-title-object-attr)))
+                                       (is (zero? @success-count*))
+                                       (is (zero? @flush-count*))
+                                       (is (zero?
+                                            (client-op/get-pending-local-tx-count
+                                             test-repo))))
+                                   _
+                                   (sync-handle-message/handle-message!
+                                    test-repo client raw-message)]
+                             (is (= remote-marker
+                                    (get
+                                     (d/entity
+                                      @conn
+                                      [:block/uuid block-uuid])
+                                     sync-large-title/large-title-object-attr)))
+                             (is (= remote-server-checksum
+                                    (sync-checksum/recompute-server-checksum
+                                     @conn)))
+                             (is (= remote-server-checksum
+                                    (client-op/get-local-server-checksum
+                                     test-repo)))
+                             (is (= 1 @success-count*))
+                             (is (= 1 @flush-count*))
+                             (is (= (if e2ee? 2 0)
+                                    @aes-key-attempts*))
+                             (is (zero?
+                                  (client-op/get-pending-local-tx-count
+                                   test-repo))))))))))]
+           (->
+            (p/let [_ (run-case false)
+                    _ (run-case true)])
+            (p/catch (fn [error]
+                       (is false (str error))))
+            (p/finally
+             (fn []
+               (reset! db-sync/*repo->latest-remote-tx latest-tx-prev)
+               (reset! db-sync/*repo->latest-remote-checksum
+                       latest-checksum-prev)
+               (reset! db-sync/*repo->latest-remote-checksum-version
+                       latest-version-prev)
+               (done)))))))
+
+(deftest hello-marker-recovery-fails-closed-on-missing-marker-or-title-mismatch-test
+  (async done
+         (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+               parent-id (:db/id parent)
+               block-uuid (:block/uuid parent)
+               title (apply str (repeat 5000 "f"))
+               local-marker (v2-large-title-object "local-fail-closed" "a")
+               remote-marker (v2-large-title-object "remote-fail-closed" "b")
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [])
+                       :online-users (atom [])
+                       :ws-state (atom :open)}
+               latest-tx-prev @db-sync/*repo->latest-remote-tx
+               latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+               latest-version-prev
+               @db-sync/*repo->latest-remote-checksum-version]
+           (d/transact!
+            conn
+            [[:db/add parent-id :block/title title]
+             [:db/add
+              parent-id
+              sync-large-title/large-title-object-attr
+              local-marker]])
+           (let [local-db @conn
+                 remote-db
+                 (:db-after
+                  (d/with
+                   local-db
+                   [[:db/add
+                     [:block/uuid block-uuid]
+                     sync-large-title/large-title-object-attr
+                     remote-marker]]))
+                 legacy-checksum
+                 (sync-checksum/recompute-checksum remote-db)
+                 remote-server-checksum
+                 (sync-checksum/recompute-server-checksum remote-db)
+                 full-marker-state
+                 (mapv
+                  (fn [{:keys [block-uuid marker]}]
+                    {:block-uuid (str block-uuid)
+                     :marker marker})
+                  (sync-checksum/server-large-title-markers remote-db))
+                 raw-message
+                 (js/JSON.stringify
+                  (clj->js
+                   {:type "hello"
+                    :t 2734
+                    :checksum legacy-checksum
+                    :checksum-version
+                    sync-checksum/server-checksum-version
+                    :server-checksum remote-server-checksum}))
+                 run-failure
+                 (fn [marker-state downloaded-title expected-reason]
+                   (p/with-redefs
+                     [sync-handle-message/<fetch-large-title-marker-state
+                      (fn [& _]
+                        (p/resolved
+                         {:t 2734
+                          :checksum legacy-checksum
+                          :checksum-version
+                          sync-checksum/server-checksum-version
+                          :server-checksum remote-server-checksum
+                          :large-title-markers marker-state}))
+                      sync-crypt/graph-e2ee? (constantly false)
+                      sync-apply/download-large-title!
+                      (fn [& _] (p/resolved downloaded-title))
+                      sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                      sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                     (->
+                      (sync-handle-message/handle-message!
+                       test-repo client raw-message)
+                      (p/then
+                       (fn [_]
+                         (is false "expected marker recovery to fail closed")))
+                      (p/catch
+                       (fn [error]
+                         (is (= :db-sync/checksum-mismatch
+                                (:type (ex-data error))))
+                         (is (= expected-reason
+                                (:marker-recovery-reason
+                                 (ex-data error))))
+                         (is (= local-marker
+                                (get
+                                 (d/entity
+                                  @conn
+                                  [:block/uuid block-uuid])
+                                 sync-large-title/large-title-object-attr))))))))]
+             (->
+              (with-datascript-conns
+                conn
+                client-ops-conn
+                (fn []
+                  (client-op/update-local-tx test-repo 2734)
+                  (client-op/update-local-checksum
+                   test-repo
+                   (sync-checksum/recompute-checksum local-db))
+                  (client-op/update-local-server-checksum
+                   test-repo
+                   (sync-checksum/recompute-server-checksum local-db))
+                  (p/let [_ (run-failure
+                             []
+                             title
+                             :marker-entity-set-mismatch)
+                          _ (run-failure
+                             full-marker-state
+                             (str title "-different")
+                             :logical-title-mismatch)])))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (reset! db-sync/*repo->latest-remote-tx
+                         latest-tx-prev)
+                 (reset! db-sync/*repo->latest-remote-checksum
+                         latest-checksum-prev)
+                 (reset! db-sync/*repo->latest-remote-checksum-version
+                         latest-version-prev)
+                 (done))))))))
+
+(deftest hello-accepts-old-and-versioned-server-checksums-for-large-title-test
+  (testing "rehydrated large titles keep both old and versioned server checksum contracts"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          latest-prev @db-sync/*repo->latest-remote-tx
+          latest-checksum-prev @db-sync/*repo->latest-remote-checksum
+          latest-version-prev @db-sync/*repo->latest-remote-checksum-version
+          large-title (apply str (repeat 5000 "a"))
+          object (v2-large-title-object "versioned-title-1" "a")
+          parent-id (:db/id parent)
+          flush-count* (atom 0)
+          success-count* (atom 0)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)
+                  :sync-succeeded-f (fn [] (swap! success-count* inc))}]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (reset! db-sync/*repo->latest-remote-tx {})
+          (reset! db-sync/*repo->latest-remote-checksum {})
+          (reset! db-sync/*repo->latest-remote-checksum-version {})
+          (ldb/transact! conn
+                         [[:db/add parent-id :block/title large-title]
+                          [:db/add parent-id
+                           :logseq.property.sync/large-title-object
+                           object]]
+                         {:rtc-tx? true
+                          :persist-op? false})
+          (let [local-checksum (sync-checksum/recompute-checksum @conn)
+                server-db (:db-after
+                           (d/with @conn
+                                   [[:db/add parent-id :block/title ""]]))
+                legacy-checksum (sync-checksum/recompute-checksum server-db)
+                server-checksum
+                (sync-checksum/recompute-server-checksum server-db)
+                raw-messages
+                [(js/JSON.stringify
+                  (clj->js {:type "hello"
+                            :t 0
+                            :checksum legacy-checksum}))
+                 (js/JSON.stringify
+                  (clj->js {:type "hello"
+                            :t 0
+                            :checksum legacy-checksum
+                            :checksum-version
+                            sync-checksum/server-checksum-version
+                            :server-checksum server-checksum}))]]
+            (is (string? legacy-checksum))
+            (is (= local-checksum legacy-checksum))
+            (client-op/update-local-checksum test-repo local-checksum)
+            (with-redefs [sync-apply/enqueue-flush-pending!
+                          (fn [& _] (swap! flush-count* inc))
+                          sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+              (try
+                (doseq [raw-message raw-messages]
+                  (is (nil? (sync-handle-message/handle-message!
+                             test-repo client raw-message))))
+                (is (= :open @(:ws-state client)))
+                (is (= 2 @success-count*))
+                (is (= 2 @flush-count*))
+                (finally
+                  (reset! db-sync/*repo->latest-remote-tx latest-prev)
+                  (reset! db-sync/*repo->latest-remote-checksum
+                          latest-checksum-prev)
+                  (reset! db-sync/*repo->latest-remote-checksum-version
+                          latest-version-prev))))))))))
+
+(deftest hello-rejects-versioned-mismatch-even-when-legacy-matches-test
+  (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+        latest-prev @db-sync/*repo->latest-remote-tx
+        local-checksum (sync-checksum/recompute-checksum @conn)
+        local-server-checksum
+        (sync-checksum/recompute-server-checksum @conn)
+        client {:repo test-repo
+                :graph-id "graph-1"
+                :inflight (atom [])
+                :online-users (atom [])
+                :ws-state (atom :open)}
+        raw-message
+        (js/JSON.stringify
+         (clj->js {:type "hello"
+                   :t 0
+                   :checksum local-checksum
+                   :checksum-version sync-checksum/server-checksum-version
+                   :server-checksum
+                   (if (= local-server-checksum "0000000000000000")
+                     "ffffffffffffffff"
+                     "0000000000000000")}))]
+    (with-datascript-conns conn client-ops-conn
+      (fn []
+        (reset! db-sync/*repo->latest-remote-tx {})
+        ;; Leave both cached checksums absent. The verifier must recompute
+        ;; rather than skip an authoritative versioned mismatch.
+        (with-redefs [sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+          (try
+            (let [error (try
+                          (sync-handle-message/handle-message!
+                           test-repo client raw-message)
+                          nil
+                          (catch :default error
+                            error))]
+              (is (= :db-sync/checksum-mismatch
+                     (:type (ex-data error)))))
+            (finally
+              (reset! db-sync/*repo->latest-remote-tx latest-prev))))))))
+
+(deftest hello-server-cursor-regression-never-uploads-test
+  (testing "server rollback is an explicit repair condition"
+    (let [flush-count* (atom 0)
+          success-count* (atom 0)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)
+                  :sync-succeeded-f (fn [] (swap! success-count* inc))}
+          raw-message (js/JSON.stringify
+                       (clj->js {:type "hello" :t 3}))
+          error (with-redefs [client-op/get-local-tx (constantly 4)
+                              sync-apply/enqueue-flush-pending!
+                              (fn [& _] (swap! flush-count* inc))
+                              sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                  (try
+                    (sync-handle-message/handle-message!
+                     test-repo client raw-message)
+                    nil
+                    (catch :default error
+                      error)))]
+      (is (= :db-sync/server-cursor-regressed
+             (:type (ex-data error))))
+      (is (zero? @flush-count*))
+      (is (zero? @success-count*)))))
 
 (deftest hello-without-checksum-is-accepted-test
   (testing "legacy hello without checksum is accepted"
@@ -2045,8 +4924,8 @@
                  new-tx (sqlite-util/write-transit-str [[:db/add parent-id :block/title "remote-new-title"]])
                  raw-message (js/JSON.stringify
                               (clj->js {:type "pull/ok"
-                                        :t 2
-                                        :txs [{:t 2 :tx new-tx}]}))
+                                        :t 1
+                                        :txs [{:t 1 :tx new-tx}]}))
                  latest-prev @db-sync/*repo->latest-remote-tx
                  client {:repo test-repo
                          :graph-id "graph-1"
@@ -2059,7 +4938,7 @@
                  (-> (p/let [_ (sync-handle-message/handle-message! test-repo client raw-message)
                              parent' (d/entity @conn parent-id)]
                        (is (= "remote-new-title" (:block/title parent')))
-                       (is (= 2 (client-op/get-local-tx test-repo))))
+                       (is (= 1 (client-op/get-local-tx test-repo))))
                      (p/finally (fn []
                                   (reset! db-sync/*repo->latest-remote-tx latest-prev)
                                   (done))))))))))
@@ -2093,6 +4972,560 @@
                       nil
                       (catch :default e
                         e)))))))))
+
+(deftest apply-remote-txs-restores-missing-synced-kv-ident-with-pending-local-txs-test
+  (testing "a valid remote KV update applies after a snapshot omitted its synced ident"
+    (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)
+          parent-uuid (:block/uuid parent)
+          child-uuid (:block/uuid child1)
+          tx-id-1 (random-uuid)
+          tx-id-2 (random-uuid)
+          created-at 1760000000123]
+      ;; Model a downloaded snapshot that is otherwise valid but omitted one
+      ;; synced system KV entity which a later server transaction references.
+      (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+      (is (nil? (d/entity @conn :logseq.kv/graph-created-at)))
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id tx-id-1
+             :db-sync/created-at 1
+             :db-sync/outliner-op :fix
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid parent-uuid]
+               :block/title
+               "first pending local value"]]
+             :db-sync/reversed-tx-data []}
+            {:db-sync/tx-id tx-id-2
+             :db-sync/created-at 2
+             :db-sync/outliner-op :fix
+             :db-sync/normalized-tx-data
+             [[:db/add [:block/uuid child-uuid]
+               :block/title
+               "second pending local value"]]
+             :db-sync/reversed-tx-data []}])
+          (let [pending-before (#'sync-apply/pending-txs test-repo)]
+            (#'sync-apply/apply-remote-txs!
+             test-repo
+             nil
+             [{:tx-data [[:db/add
+                          :logseq.kv/graph-created-at
+                          :kv/value
+                          created-at]]}])
+            (is (= created-at
+                   (:kv/value
+                    (d/entity @conn :logseq.kv/graph-created-at))))
+            (is (= pending-before
+                   (#'sync-apply/pending-txs test-repo))
+                "pending transaction identity, order, and payload stay unchanged")))))))
+
+(deftest apply-remote-txs-treats-missing-synced-kv-retracts-as-satisfied-test
+  (testing "a duplicate entity retract is a no-op when a synced system KV is already absent"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
+      (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (#'sync-apply/apply-remote-txs!
+           test-repo
+           nil
+           [{:tx-data [[:db/retractEntity
+                        :logseq.kv/graph-created-at]]}])
+          (is (nil? (d/entity @conn :logseq.kv/graph-created-at))))))))
+
+(deftest apply-remote-txs-converges-missing-synced-kv-value-retract-to-ident-test
+  (testing "a duplicate value retract restores the authoritative ident without changing pending txs"
+    (doseq [pending-count (range 3)]
+      (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+            pending-seed
+            (mapv (fn [index]
+                    {:db-sync/tx-id (random-uuid)
+                     :db-sync/created-at index
+                     :db-sync/outliner-op :fix
+                     :db-sync/normalized-tx-data []
+                     :db-sync/reversed-tx-data []})
+                  (range pending-count))]
+        (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (seed-client-op-txs! test-repo pending-seed)
+            (let [pending-before (#'sync-apply/pending-txs test-repo)]
+              (#'sync-apply/apply-remote-txs!
+               test-repo
+               nil
+               [{:tx-data [[:db/retract
+                            :logseq.kv/graph-created-at
+                            :kv/value
+                            1760000000000]]}])
+              (let [entity (d/entity @conn :logseq.kv/graph-created-at)]
+                (is (= :logseq.kv/graph-created-at (:db/ident entity)))
+                (is (nil? (:kv/value entity))))
+              (is (= pending-before
+                     (#'sync-apply/pending-txs test-repo))))))))))
+
+(deftest apply-remote-txs-preserves-pending-system-kv-update-through-reverse-and-rebase-test
+  (testing "a safe pending system KV update survives a missing reverse target or remote entity delete"
+    (doseq [{:keys [initial-state remote-tx-data]}
+            [{:initial-state :missing
+              :remote-tx-data []}
+             {:initial-state :local-value
+              :remote-tx-data [[:db/retractEntity
+                                :logseq.kv/graph-created-at]]}]]
+      (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+            tx-id (random-uuid)
+            trailing-tx-id (random-uuid)
+            old-value 1760000000122
+            pending-value 1760000000123]
+        (d/transact! conn [[:db/add
+                            :logseq.kv/graph-created-at
+                            :kv/value
+                            pending-value]])
+        (when (= :missing initial-state)
+          (d/transact! conn [[:db/retractEntity
+                              :logseq.kv/graph-created-at]]))
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (seed-client-op-txs!
+             test-repo
+             [{:db-sync/tx-id tx-id
+               :db-sync/created-at 1
+               :db-sync/outliner-op :rebase
+               :db-sync/normalized-tx-data
+               [[:db/add
+                 :logseq.kv/graph-created-at
+                 :kv/value
+                 pending-value]]
+               :db-sync/reversed-tx-data
+               [[:db/add
+                 :logseq.kv/graph-created-at
+                 :kv/value
+                 old-value]]}
+              {:db-sync/tx-id trailing-tx-id
+               :db-sync/created-at 2
+               :db-sync/outliner-op :fix
+               :db-sync/normalized-tx-data []
+               :db-sync/reversed-tx-data []}])
+            (let [pending-list-before (#'sync-apply/pending-txs test-repo)
+                  pending-before (#'sync-apply/pending-tx-by-id
+                                  test-repo tx-id)
+                  trailing-before (#'sync-apply/pending-tx-by-id
+                                   test-repo trailing-tx-id)]
+              (#'sync-apply/apply-remote-txs!
+               test-repo nil [{:tx-data remote-tx-data}])
+              (let [pending-list-after (#'sync-apply/pending-txs test-repo)
+                    pending-after (#'sync-apply/pending-tx-by-id
+                                   test-repo tx-id)]
+                (is (= (mapv :tx-id pending-list-before)
+                       (mapv :tx-id pending-list-after)))
+                (is (= trailing-before
+                       (#'sync-apply/pending-tx-by-id
+                        test-repo trailing-tx-id)))
+                (is (= tx-id (:tx-id pending-after)))
+                (is (= (:created-at pending-before)
+                       (:created-at pending-after)))
+                (is (some #(and (vector? %)
+                                (= :db/add (first %))
+                                (= :kv/value (nth % 2 nil))
+                                (= pending-value (nth % 3 nil)))
+                          (:tx pending-after)))
+                (is (some #(or (and (map? %)
+                                    (= :logseq.kv/graph-created-at
+                                       (:db/ident %)))
+                               (and (vector? %)
+                                    (= :db/add (first %))
+                                    (= :db/ident (nth % 2 nil))
+                                    (= :logseq.kv/graph-created-at
+                                       (nth % 3 nil))))
+                          (:tx pending-after))
+                    "the durable pending wire can recreate the missing ident")
+                (is (= pending-value
+                       (:kv/value
+                        (d/entity @conn
+                                  :logseq.kv/graph-created-at))))
+                (let [authoritative-conn (:conn (setup-parent-child))]
+                  (d/transact! authoritative-conn
+                               [[:db/retractEntity
+                                 :logseq.kv/graph-created-at]])
+                  (ldb/transact! authoritative-conn
+                                 (:tx pending-after)
+                                 {:persist-op? false})
+                  (is (= pending-value
+                         (:kv/value
+                          (d/entity @authoritative-conn
+                                    :logseq.kv/graph-created-at)))))))))))))
+
+(deftest repeated-system-kv-raw-fallback-rebase-preserves-durable-wire-test
+  (testing "pure system KV fallback rebases preserve the accepted pending wire exactly"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          tx-id (random-uuid)
+          ident :logseq.kv/graph-created-at
+          temp-id "system-kv::logseq.kv/graph-created-at"
+          old-value 1760000000122
+          pending-value 1760000000123
+          normalized-wire [[:db/add temp-id :db/ident ident]
+                           [:db/retract ident :kv/value old-value]
+                           [:db/add ident :kv/value pending-value]]
+          reversed-wire [[:db/retract ident :kv/value pending-value]
+                         [:db/add ident :kv/value old-value]]]
+      (d/transact! conn [[:db/add ident :kv/value pending-value]])
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id tx-id
+             :db-sync/created-at 1
+             :db-sync/outliner-op :rebase
+             :db-sync/normalized-tx-data normalized-wire
+             :db-sync/reversed-tx-data reversed-wire}])
+          (let [pending-before (#'sync-apply/pending-tx-by-id test-repo tx-id)]
+            (doseq [_ (range 2)]
+              (#'sync-apply/apply-remote-txs!
+               test-repo
+               nil
+               [{:tx-data [[:db/retractEntity ident]]}])
+              (is (= pending-before
+                     (#'sync-apply/pending-tx-by-id test-repo tx-id)))
+              (is (= [tx-id]
+                     (mapv :tx-id (#'sync-apply/pending-txs test-repo))))
+              (is (= pending-value
+                     (:kv/value (d/entity @conn ident)))))
+            (let [authoritative-conn (:conn (setup-parent-child))]
+              (d/transact! authoritative-conn [[:db/retractEntity ident]])
+              (ldb/transact! authoritative-conn
+                             normalized-wire
+                             {:persist-op? false})
+              (is (= pending-value
+                     (:kv/value
+                      (d/entity @authoritative-conn ident)))))))))))
+
+(deftest listener-generated-system-kv-pending-wire-stays-stable-after-rebase-test
+  (testing "a real listener-generated pure system KV pending tx keeps its accepted wire"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          ident :logseq.kv/graph-created-at
+          old-value (:kv/value (d/entity @conn ident))
+          pending-value (inc old-value)]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (ldb/transact! conn [[:db/add ident :kv/value pending-value]])
+          (let [pending-before (first (#'sync-apply/pending-txs test-repo))
+                tx-id (:tx-id pending-before)]
+            (is (some? tx-id))
+            (is (= [tx-id]
+                   (mapv :tx-id (#'sync-apply/pending-txs test-repo))))
+            (is (nil? (:outliner-op pending-before))
+                "ordinary ldb/transact! does not invent rebase semantics")
+            (is (empty? (:forward-outliner-ops pending-before)))
+            (is (empty? (:inverse-outliner-ops pending-before)))
+            (is (true?
+                 (#'sync-apply/pure-synced-system-kv-wire?
+                  (:tx pending-before))))
+            (is (true?
+                 (#'sync-apply/system-kv-identity-wire?
+                  (:tx pending-before))))
+            (#'sync-apply/apply-remote-txs!
+             test-repo
+             nil
+             [{:tx-data [[:db/retractEntity ident]]}])
+            (let [pending-after (#'sync-apply/pending-tx-by-id
+                                 test-repo tx-id)]
+              (is (= pending-before pending-after)
+                  "rebase must not rewrite a proven replay-safe pending wire")
+              (is (= [tx-id]
+                     (mapv :tx-id (#'sync-apply/pending-txs test-repo))))
+              (is (= pending-value
+                     (:kv/value (d/entity @conn ident)))))))))))
+
+(deftest pure-system-kv-pending-wire-preservation-scope-test
+  (testing "only pure registered system KV identity/value wires qualify"
+    (let [tx-id (random-uuid)
+          tx-meta {:outliner-op :rebase
+                   :db-sync/rebased-local? true
+                   :original-outliner-op nil
+                   :db-sync/tx-id tx-id
+                   :db-sync/forward-outliner-ops []}
+          wire [[:db/add "system-kv::logseq.kv/graph-created-at"
+                 :db/ident :logseq.kv/graph-created-at]
+                [:db/retract :logseq.kv/graph-created-at :kv/value 1]
+                [:db/add :logseq.kv/graph-created-at :kv/value 2]]
+          reversed-wire [[:db/retract
+                          :logseq.kv/graph-created-at :kv/value 2]
+                         [:db/add
+                          :logseq.kv/graph-created-at :kv/value 1]]
+          entry {:tx-id tx-id
+                 :outliner-op nil
+                 :db-sync/undo-redo :none
+                 :forward-outliner-ops []
+                 :inverse-outliner-ops []
+                 :tx wire
+                 :reversed-tx reversed-wire}]
+      (is (true? (#'sync-apply/pure-synced-system-kv-wire? wire)))
+      (is (true?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            tx-meta entry)))
+      (is (false?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            tx-meta
+            (update entry :tx conj
+                    [:db/add [:block/uuid (random-uuid)]
+                     :block/title "mixed"]))))
+      (is (false?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            tx-meta
+            (assoc entry :tx
+                   [[:db/add :logseq.kv/not-registered
+                     :kv/value 2]]))))
+      (is (false?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            tx-meta
+            (assoc entry :tx
+                   [[:db/add :logseq.kv/graph-created-at
+                     :kv/value 2]]))))
+      (is (false?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            (assoc tx-meta :db-sync/tx-id (random-uuid))
+            entry)))
+      (is (false?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            (assoc tx-meta
+                   :db-sync/forward-outliner-ops
+                   [[:save-block [{:block/uuid (random-uuid)} {}]]])
+            entry)))
+      (is (false?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            tx-meta
+            (assoc entry
+                   :forward-outliner-ops
+                   [[:save-block [{:block/uuid (random-uuid)} {}]]]))))
+      (is (false?
+           (#'sync-apply/preserve-pure-system-kv-pending-wire?
+            tx-meta
+            (assoc entry :db-sync/undo-redo :undo)))))
+    (is (true?
+         (#'sync-apply/system-kv-identity-wire?
+          [[:db/add "system-kv::logseq.kv/graph-created-at"
+            :db/ident :logseq.kv/graph-created-at]])))
+    (is (false?
+         (#'sync-apply/system-kv-identity-wire?
+          [[:db/add :logseq.kv/graph-created-at :kv/value 2]])))
+    (doseq [wire [[[:db/add :logseq.kv/not-registered :kv/value 2]]
+                  [[:db/add :logseq.kv/graph-created-at :kv/value 2]
+                   [:db/add [:block/uuid (random-uuid)] :block/title "mixed"]]
+                  [[:db.fn/cas
+                    :logseq.kv/graph-created-at :kv/value 1 2]]
+                  [{:db/ident :logseq.kv/graph-created-at
+                    :kv/value 2}]]]
+      (is (false?
+           (#'sync-apply/pure-synced-system-kv-wire? wire))))))
+
+(deftest apply-remote-txs-upserts-missing-synced-kv-value-update-test
+  (testing "a duplicate old-value retract plus a new value add restores the known ident"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          old-value (:kv/value
+                     (d/entity @conn :logseq.kv/graph-created-at))
+          new-value (inc old-value)]
+      (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (#'sync-apply/apply-remote-txs!
+           test-repo
+           nil
+           [{:tx-data [[:db/retract
+                        :logseq.kv/graph-created-at
+                        :kv/value
+                        old-value]
+                       [:db/add
+                        :logseq.kv/graph-created-at
+                        :kv/value
+                        new-value]]}])
+          (is (= new-value
+                 (:kv/value
+                  (d/entity @conn :logseq.kv/graph-created-at)))))))))
+
+(deftest apply-remote-txs-does-not-recreate-kv-retracted-earlier-in-remote-batch-test
+  (testing "a later remote transaction cannot recreate a KV deleted earlier in the same batch"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          original-created-at
+          (:kv/value (d/entity @conn :logseq.kv/graph-created-at))]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (is (thrown? js/Error
+                       (with-silenced-console-error
+                         #(#'sync-apply/apply-remote-txs!
+                           test-repo
+                           nil
+                           [{:tx-data [[:db/retractEntity
+                                       :logseq.kv/graph-created-at]]}
+                            {:tx-data [[:db/add
+                                       :logseq.kv/graph-created-at
+                                       :kv/value
+                                       (inc original-created-at)]]}]))))
+          ;; The temporary remote batch is atomic, so the failed sequence must
+          ;; leave the live entity and its original value untouched.
+          (is (= original-created-at
+                 (:kv/value
+                  (d/entity @conn :logseq.kv/graph-created-at)))))))))
+
+(deftest apply-remote-txs-does-not-recover-reference-after-terminal-missing-kv-delete-test
+  (testing "a duplicate entity delete may be a no-op, but a later reference remains invalid"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
+      (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (is (thrown? js/Error
+                       (with-silenced-console-error
+                         #(#'sync-apply/apply-remote-txs!
+                           test-repo
+                           nil
+                           [{:tx-data [[:db/retractEntity
+                                       :logseq.kv/graph-created-at]
+                                      [:db/add
+                                       :logseq.kv/graph-created-at
+                                       :kv/value
+                                       1760000000123]]}]))))
+          (is (nil? (d/entity @conn :logseq.kv/graph-created-at))))))))
+
+(deftest apply-remote-txs-does-not-create-unknown-kv-ident-test
+  (testing "an arbitrary missing keyword remains an invalid remote entity reference"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (is (thrown? js/Error
+                       (with-silenced-console-error
+                         #(#'sync-apply/apply-remote-txs!
+                           test-repo
+                           nil
+                           [{:tx-data [[:db/add
+                                       :logseq.kv/not-a-system-kv
+                                       :kv/value
+                                       "invalid"]]}]))))
+          (is (nil? (d/entity @conn :logseq.kv/not-a-system-kv))))))))
+
+(deftest apply-remote-txs-does-not-recover-non-value-system-kv-op-test
+  (testing "a later unsafe item prevents bounded recovery for the whole missing-ident batch"
+    (doseq [unsafe-item [[:db/add
+                          :logseq.kv/graph-created-at
+                          :block/title
+                          "invalid"]
+                         [:db.fn/cas
+                          :logseq.kv/graph-created-at
+                          :kv/value
+                          1760000000123
+                          1760000000124]
+                         {:db/id :logseq.kv/graph-created-at
+                          :kv/value 1760000000124}
+                         [:db/add
+                          :logseq.kv/graph-created-at
+                          :kv/value
+                          1760000000124
+                          :malformed
+                          true]]]
+      (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
+        (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (is (thrown? js/Error
+                         (with-silenced-console-error
+                           #(#'sync-apply/apply-remote-txs!
+                             test-repo
+                             nil
+                             [{:tx-data [[:db/add
+                                         :logseq.kv/graph-created-at
+                                         :kv/value
+                                         1760000000123]
+                                        unsafe-item]}]))))
+            (is (nil? (d/entity @conn :logseq.kv/graph-created-at)))))))))
+
+(deftest apply-remote-txs-preserves-ordered-value-ops-after-restoring-system-kv-test
+  (testing "valid value updates preserve their order after one bounded ident restore"
+    (doseq [[remote-txs expected-value]
+            [[[{:tx-data [[:db/add
+                           :logseq.kv/graph-created-at
+                           :kv/value
+                           1760000000123]
+                          [:db/add
+                           :logseq.kv/graph-created-at
+                           :kv/value
+                           1760000000124]]}]
+              1760000000124]
+             [[{:tx-data [[:db/retract
+                           :logseq.kv/graph-created-at
+                           :kv/value
+                           1760000000122]]}
+               {:tx-data [[:db/add
+                           :logseq.kv/graph-created-at
+                           :kv/value
+                           1760000000123]]}]
+              1760000000123]]]
+      (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
+        (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (#'sync-apply/apply-remote-txs!
+             test-repo nil remote-txs)
+            (is (= expected-value
+                   (:kv/value
+                    (d/entity @conn :logseq.kv/graph-created-at)))))))))
+  (testing "an add followed by retract is preserved and converges to authoritative ident-only state"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)]
+      (d/transact! conn [[:db/retractEntity :logseq.kv/graph-created-at]])
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (#'sync-apply/apply-remote-txs!
+           test-repo
+           nil
+           [{:tx-data [[:db/add
+                        :logseq.kv/graph-created-at
+                        :kv/value
+                        1760000000123]
+                       [:db/retract
+                        :logseq.kv/graph-created-at
+                        :kv/value
+                        1760000000123]]}])
+          (let [entity (d/entity @conn :logseq.kv/graph-created-at)]
+            (is (= :logseq.kv/graph-created-at (:db/ident entity)))
+            (is (nil? (:kv/value entity)))))))))
+
+(deftest apply-remote-txs-updates-journal-title-format-test
+  (testing "remote journal title format changes apply without blocking sync"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:build/journal 20250314}}]})
+          client-ops-conn (new-client-ops-db)
+          journal (db-test/find-journal-by-journal-day @conn 20250314)
+          tx-id-before (:block/tx-id journal)
+          journal-class (d/entity @conn :logseq.class/Journal)
+          title-format "EEE, dd.MM.yyyy"
+          title "Fri, 14.03.2025"]
+      (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (#'sync-apply/apply-remote-txs!
+           test-repo
+           nil
+           [{:tx-data [[:db/add (:db/id journal-class)
+                        :logseq.property.journal/title-format title-format]
+                       [:db/add (:db/id journal) :block/title title]]}])
+          (is (= title-format
+                 (:logseq.property.journal/title-format
+                  (d/entity @conn :logseq.class/Journal))))
+          (is (= title
+                 (:block/title
+                  (db-test/find-journal-by-journal-day @conn 20250314))))
+          (is (not= tx-id-before
+                    (:block/tx-id
+                     (db-test/find-journal-by-journal-day @conn 20250314)))))))))
 
 (deftest apply-remote-txs-applies-db-migration-entry-test
   (testing "pulled db migration txs apply with migration transact semantics"
@@ -2191,6 +5624,25 @@
                   (when platform-prev
                     (platform/set-platform! platform-prev))
                   (done)))))))
+
+(deftest desktop-asset-hydration-does-not-block-remote-apply-test
+  (let [platform-prev (try
+                        (platform/current)
+                        (catch :default _ nil))
+        pending (js/Promise. (fn [_resolve _reject] nil))]
+    (try
+      (platform/set-platform! (minimal-platform :electron))
+      (is (nil?
+           (#'sync-apply/finish-owner-asset-download!
+            test-repo pending)))
+      (platform/set-platform! (minimal-platform :cli))
+      (is (identical?
+           pending
+           (#'sync-apply/finish-owner-asset-download!
+            test-repo pending)))
+      (finally
+        (when platform-prev
+          (platform/set-platform! platform-prev))))))
 
 (deftest apply-remote-txs-keeps-browser-assets-lazy-test
   (async done
@@ -2376,6 +5828,64 @@
             (db-sync/update-local-sync-checksum! test-repo tx-report)
             (is (= (client-op/get-local-checksum test-repo)
                    (sync-checksum/recompute-checksum (:db-after tx-report))))))))))
+
+(deftest normalized-local-tx-upserts-referenced-current-user-test
+  (testing "an existing local-only current user is recreated on the server before created-by is referenced"
+    (let [{:keys [conn parent]} (setup-parent-child)
+          server-before-repair (d/conn-from-db @conn)
+          server-after-repair (d/conn-from-db @conn)
+          user-uuid #uuid "11111111-1111-4111-8111-111111111111"]
+      (d/transact! conn
+                   [{:block/uuid user-uuid
+                     :block/name "cfenglv"
+                     :block/title "cfenglv"
+                     :block/tags :logseq.class/Page
+                     :block/created-at 1784725856064
+                     :block/updated-at 1784725856064
+                     :logseq.property.user/name "cfenglv"
+                     :logseq.property.user/email "member@example.test"}]
+                   {:persist-op? false})
+      (let [user-id (:db/id (d/entity @conn [:block/uuid user-uuid]))
+            tx-report (d/with @conn
+                              [[:db/add (:db/id parent) :block/title "edited"]
+                               [:db/add (:db/id parent) :logseq.property/created-by-ref user-id]])]
+        (with-redefs [worker-state/get-id-token (constantly "token")
+                      worker-util/parse-jwt (constantly {:sub (str user-uuid)})]
+          (let [normalized (:normalized-tx-data
+                            (sync-apply/normalize-rebased-pending-tx tx-report))
+                user-uuid-op [:db/add (str user-uuid) :block/uuid user-uuid]
+                created-by-index (first (keep-indexed
+                                         (fn [idx [_op _e attr value]]
+                                           (when (and (= :logseq.property/created-by-ref attr)
+                                                      (= [:block/uuid user-uuid] value))
+                                             idx))
+                                         normalized))
+                user-index (first (keep-indexed
+                                   (fn [idx [op e attr value]]
+                                     (when (= user-uuid-op [op e attr value])
+                                       idx))
+                                   normalized))
+                tx-entry {:tx (sqlite-util/write-transit-str normalized)
+                          :outliner-op :save-block}
+                tx-without-user (remove (fn [[_op e]]
+                                          (= (str user-uuid) e))
+                                        normalized)]
+            (is (number? user-index))
+            (is (number? created-by-index))
+            (is (< user-index created-by-index)
+                "the server must receive the user upsert before its lookup ref")
+            (is (thrown? js/Error
+                         (#'sync-handler/apply-tx-entry!
+                          server-before-repair
+                          {:tx (sqlite-util/write-transit-str tx-without-user)
+                           :outliner-op :save-block})))
+            (is (true? (#'sync-handler/apply-tx-entry! server-after-repair tx-entry)))
+            (is (= "edited"
+                   (:block/title
+                    (d/entity @server-after-repair [:block/uuid (:block/uuid parent)]))))
+            (is (= "cfenglv"
+                   (:block/title
+                    (d/entity @server-after-repair [:block/uuid user-uuid]))))))))))
 
 (deftest local-checksum-listener-updates-in-release-mode-test
   (testing "db-worker-node release keeps the stored checksum aligned incrementally"
@@ -2599,16 +6109,47 @@
             (is (= (sync-checksum/recompute-checksum @conn)
                    (sync-checksum/recompute-checksum @server-conn)))))))))
 
+(deftest explicit-sync-failure-never-blocks-local-editing-or-pending-persistence-test
+  (testing "a closed/error RTC connection remains fail-open for local editing"
+    (let [conn (db-test/create-conn)
+          client-ops-conn (new-client-ops-db)
+          page-uuid (random-uuid)
+          prev-client @worker-state/*db-sync-client
+          sync-error (ex-info "simulated remote failure"
+                              {:type :db-sync/test-failure})
+          inflight-id (random-uuid)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [inflight-id])
+                  :last-sync-error (atom sync-error)
+                  :online-users (atom [])
+                  :ws-state (atom :closed)}]
+      (reset! worker-state/*db-sync-client client)
+      (try
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (let [pending-before (count (#'sync-apply/pending-txs test-repo))]
+              (worker-page/create! conn "Edit While RTC Failed" :uuid page-uuid)
+              (is (some? (d/entity @conn [:block/uuid page-uuid]))
+                  "the local graph edit must commit")
+              (is (= (inc pending-before)
+                     (count (#'sync-apply/pending-txs test-repo)))
+                  "the edit must remain durably queued for a later reconnect")
+              (is (identical? sync-error @(:last-sync-error client)))
+              (is (= [inflight-id] @(:inflight client))))))
+        (finally
+          (reset! worker-state/*db-sync-client prev-client))))))
+
 (deftest snapshot-roundtrip-first-page-and-block-after-upload-keeps-server-checksum-in-sync-test
   (testing "freshly uploaded graph storage roundtrip keeps the first page/block tx in sync"
     (let [base-conn (db-test/create-conn)
-          local-storage (make-storage-sql)
-          server-storage (make-storage-sql)
+          local-storage (make-real-worker-storage-sql)
+          server-storage (make-real-worker-storage-sql)
           local-conn (d/conn-from-datoms (d/datoms @base-conn :eavt)
                                          (d/schema @base-conn)
                                          {:storage (sync-storage/new-sqlite-storage (:sql local-storage))})
           client-ops-conn (new-client-ops-db)
-          _ (#'sync-handler/import-snapshot-rows! (:sql server-storage) "kvs" (kvs-rows (:state local-storage)))
+          _ (#'sync-handler/import-snapshot-rows! (:sql server-storage) "kvs" (real-kvs-rows (:sql local-storage)))
           server-conn (sync-storage/open-conn (:sql server-storage))
           page-uuid (random-uuid)
           block-uuid (random-uuid)
@@ -4732,6 +8273,326 @@
               (is (empty? (non-recycle-validation-entities validation))
                   (str (:errors validation))))))))))
 
+(deftest rebase-batch-drops-missing-uuid-tempid-and-keeps-valid-pending-update-test
+  (testing "batch final commit drops one stale UUID tempid without discarding another lookup update in the pending tx"
+    (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+          deleted-uuid (:block/uuid child1)
+          kept-uuid (:block/uuid child2)
+          deleted-ref [:block/uuid deleted-uuid]
+          deleted-tempid (str deleted-uuid)
+          kept-ref [:block/uuid kept-uuid]
+          pending-tx-id (random-uuid)
+          deleted-previous-updated-at (:block/updated-at child1)
+          kept-previous-updated-at (:block/updated-at child2)
+          deleted-updated-at 1770000000200
+          kept-updated-at 1770000000300
+          local-t 536900001
+          normalized-tx-data
+          [[:db/retract kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :logseq.property/heading
+            3
+            local-t]
+           [:db/add deleted-tempid
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/add deleted-tempid
+            :block/updated-at
+            deleted-updated-at
+            local-t]]
+          reversed-tx-data
+          [[:db/retract deleted-ref
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/retract deleted-ref
+            :block/updated-at
+            deleted-updated-at
+            local-t]
+           [:db/add deleted-ref
+            :block/updated-at
+            deleted-previous-updated-at
+            local-t]
+           [:db/retract kept-ref
+            :logseq.property/heading
+            3
+            local-t]
+           [:db/retract kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]]]
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+          "the initial local database must be valid")
+      ;; Model one legacy generic pending transaction that updated many blocks.
+      ;; Its durable payload uses the same five-element datoms returned by the
+      ;; production client-op reader. Most targets are stable lookup refs, but
+      ;; an older insertion path persisted a bare UUID string tempid.
+      (d/transact! conn
+                   [[:db/add (:db/id child1)
+                     :block/updated-at
+                     deleted-updated-at]
+                    [:db/add (:db/id child1)
+                     :logseq.property/heading
+                     2]
+                    [:db/add (:db/id child2)
+                     :logseq.property/heading
+                     3]
+                    [:db/add (:db/id child2)
+                     :block/updated-at
+                     kept-updated-at]])
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id pending-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op nil
+             :db-sync/forward-outliner-ops nil
+             :db-sync/inverse-outliner-ops nil
+             :db-sync/normalized-tx-data normalized-tx-data
+             :db-sync/reversed-tx-data reversed-tx-data}])
+          (let [pending-before (#'sync-apply/pending-txs test-repo)
+                pending-tx (first pending-before)]
+            (is (= 1 (count pending-before)))
+            (is (= pending-tx-id (:tx-id pending-tx)))
+            (is (= #{deleted-tempid kept-ref}
+                   (set (map second (:tx pending-tx))))
+                "one generic pending row must mix the UUID tempid and lookup target")
+            (is (empty? (:forward-outliner-ops pending-tx))
+                "the legacy row must enter the raw transact replay fallback")
+            (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+                "the database with the mixed pending update must remain valid")
+
+            (let [apply-error
+                  (try
+                    (sync-apply/apply-remote-txs!
+                     test-repo
+                     nil
+                     [{:t 1
+                       :tx-data [[:db/retractEntity deleted-ref]]}])
+                    nil
+                    (catch :default error
+                      error))
+                  pending-after (#'sync-apply/pending-txs test-repo)
+                  validation-after (db-validate/validate-local-db! @conn)]
+              (is (nil? apply-error)
+                  (str "remote apply must not fail final validation after "
+                       "replaying a stale UUID tempid update: "
+                       (some-> apply-error ex-message)
+                       "; cause: "
+                       (some-> apply-error ex-cause ex-message)))
+              (is (nil? (d/entity @conn deleted-ref))
+                  "the remote deletion must be retained")
+              (is (= 3
+                     (:logseq.property/heading
+                      (d/entity @conn kept-ref)))
+                  "the unrelated pending update must survive replay")
+              (is (= [pending-tx-id] (mapv :tx-id pending-after))
+                  "the pending row with a still-valid update must remain")
+              (is (every? #(not= deleted-tempid (second %))
+                          (:tx (first pending-after)))
+                  "the stale target's datoms must be removed from replay")
+              (is (some #(= [:db/add
+                              kept-ref
+                              :logseq.property/heading
+                              3]
+                            (subvec % 0 4))
+                        (:tx (first pending-after)))
+                  "the valid lookup-ref update must remain uploadable")
+              (is (= 1 (aget (client-op-tx-row
+                              client-ops-conn
+                              pending-tx-id)
+                             "pending"))
+                  "the mixed row must not be cleared wholesale")
+              (is (empty? (:errors validation-after))
+                  (str "the final database must be valid: "
+                       (:errors validation-after))))))))))
+
+(deftest rebase-batch-resolves-surviving-uuid-tempid-to-existing-entity-test
+  (testing "batch final commit resolves a bare UUID tempid when its target survives the remote transaction"
+    (let [{:keys [conn client-ops-conn parent child1 child2]} (setup-parent-child)
+          target-uuid (:block/uuid child1)
+          target-ref [:block/uuid target-uuid]
+          target-tempid (str target-uuid)
+          target-id (:db/id child1)
+          kept-uuid (:block/uuid child2)
+          kept-ref [:block/uuid kept-uuid]
+          parent-ref [:block/uuid (:block/uuid parent)]
+          pending-tx-id (random-uuid)
+          target-previous-updated-at (:block/updated-at child1)
+          kept-previous-updated-at (:block/updated-at child2)
+          target-updated-at 1770000000400
+          kept-updated-at 1770000000500
+          remote-parent-title "parent remote surviving UUID target"
+          local-t 536900002
+          normalized-tx-data
+          [[:db/add target-tempid
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/add target-tempid
+            :block/updated-at
+            target-updated-at
+            local-t]
+           [:db/retract kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :logseq.property/heading
+            3
+            local-t]]
+          reversed-tx-data
+          [[:db/retract kept-ref
+            :logseq.property/heading
+            3
+            local-t]
+           [:db/retract kept-ref
+            :block/updated-at
+            kept-updated-at
+            local-t]
+           [:db/add kept-ref
+            :block/updated-at
+            kept-previous-updated-at
+            local-t]
+           [:db/retract target-ref
+            :logseq.property/heading
+            2
+            local-t]
+           [:db/retract target-ref
+            :block/updated-at
+            target-updated-at
+            local-t]
+           [:db/add target-ref
+            :block/updated-at
+            target-previous-updated-at
+            local-t]]]
+      (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+          "the initial local database must be valid")
+      ;; Model a legacy generic pending row whose reverse side is stable but
+      ;; whose replay payload mixes an old bare UUID string tempid with the
+      ;; lookup refs used by current rows.
+      (d/transact! conn
+                   [[:db/add target-id
+                     :block/updated-at
+                     target-updated-at]
+                    [:db/add target-id
+                     :logseq.property/heading
+                     2]
+                    [:db/add (:db/id child2)
+                     :block/updated-at
+                     kept-updated-at]
+                    [:db/add (:db/id child2)
+                     :logseq.property/heading
+                     3]])
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           test-repo
+           [{:db-sync/tx-id pending-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 2
+             :db-sync/outliner-op nil
+             :db-sync/forward-outliner-ops nil
+             :db-sync/inverse-outliner-ops nil
+             :db-sync/normalized-tx-data normalized-tx-data
+             :db-sync/reversed-tx-data reversed-tx-data}])
+          (let [pending-before (#'sync-apply/pending-txs test-repo)
+                pending-tx (first pending-before)]
+            (is (= [pending-tx-id] (mapv :tx-id pending-before)))
+            (is (= #{target-tempid kept-ref}
+                   (set (map second (:tx pending-tx))))
+                "the legacy row must enter rebase with mixed target formats")
+            (is (empty? (:forward-outliner-ops pending-tx))
+                "the generic row must use the raw transaction replay path")
+            (is (empty? (:errors (db-validate/validate-local-db! @conn)))
+                "the local state represented by the pending row must be valid")
+
+            (let [apply-error
+                  (try
+                    (sync-apply/apply-remote-txs!
+                     test-repo
+                     nil
+                     [{:t 2
+                       :tx-data [[:db/add
+                                  parent-ref
+                                  :block/title
+                                  remote-parent-title]]}])
+                    nil
+                    (catch :default error
+                      error))
+                  target-after (d/entity @conn target-ref)
+                  kept-after (d/entity @conn kept-ref)
+                  pending-after (#'sync-apply/pending-txs test-repo)
+                  heading-two-entity-ids
+                  (set
+                   (d/q '[:find [?e ...]
+                          :where
+                          [?e :logseq.property/heading 2]]
+                        @conn))
+                  validation-after (db-validate/validate-local-db! @conn)]
+              (is (nil? apply-error)
+                  (str "remote apply must resolve the surviving UUID tempid "
+                       "before the final batch commit: "
+                       (some-> apply-error ex-message)
+                       "; cause: "
+                       (some-> apply-error ex-cause ex-message)
+                       "; data: "
+                       (some-> apply-error ex-cause ex-data pr-str)))
+              (is (= remote-parent-title
+                     (:block/title (d/entity @conn parent-ref)))
+                  "the unrelated remote change must be retained")
+              (is (= target-id (:db/id target-after))
+                  "the bare UUID target must resolve to the original entity")
+              (is (= 2 (:logseq.property/heading target-after))
+                  "the bare-target property update must land on the original entity")
+              (is (= target-updated-at (:block/updated-at target-after))
+                  "the bare-target updated-at must land on the original entity")
+              (is (= 3 (:logseq.property/heading kept-after))
+                  "the lookup-ref update in the same pending row must survive")
+              (is (= kept-updated-at (:block/updated-at kept-after))
+                  "the lookup-ref updated-at must survive")
+              (is (= [pending-tx-id] (mapv :tx-id pending-after))
+                  "the mixed pending row must remain pending")
+              (is (some #(= [:db/add
+                              kept-ref
+                              :logseq.property/heading
+                              3]
+                            (subvec % 0 4))
+                        (:tx (first pending-after)))
+                  "the valid lookup-ref update must remain uploadable")
+              (is (= #{target-id} heading-two-entity-ids)
+                  "replay must not allocate a UUID-less heading-only ghost")
+              (is (= 1 (aget (client-op-tx-row
+                              client-ops-conn
+                              pending-tx-id)
+                             "pending"))
+                  "the mixed row must not be cleared wholesale")
+              (is (empty? (:errors validation-after))
+                  (str "the final database must be valid: "
+                       (:errors validation-after))))))))))
+
 (deftest rebase-insert-blocks-keeps-block-uuid-test
   (testing "rebased insert-blocks should preserve the original block uuid"
     (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)]
@@ -5011,6 +8872,46 @@
             (is (empty? (#'sync-apply/pending-txs test-repo)))
             (is (= 1 (client-op/get-local-tx test-repo)))))))))
 
+(deftest tx-batch-ok-advances-current-versioned-watermark-without-recompute-test
+  (testing "a normal acknowledgement does not scan the full graph"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (worker-page/create! conn "Ack Fast Path" :uuid (random-uuid))
+          (let [pending-before (#'sync-apply/pending-txs test-repo)
+                tx-ids (mapv :tx-id pending-before)
+                legacy-checksum (sync-checksum/recompute-checksum @conn)
+                server-checksum
+                (sync-checksum/recompute-server-checksum @conn)
+                raw-message
+                (js/JSON.stringify
+                 (clj->js {:type "tx/batch/ok"
+                           :t 1
+                           :checksum legacy-checksum
+                           :checksum-version
+                           sync-checksum/server-checksum-version
+                           :server-checksum server-checksum}))]
+            (client-op/update-local-checksum test-repo legacy-checksum)
+            (client-op/update-local-server-checksum
+             test-repo server-checksum)
+            (reset! (:inflight client) tx-ids)
+            (with-redefs
+              [sync-checksum/recompute-server-checksum
+               (fn [_]
+                 (throw
+                  (ex-info "ack fast path must not recompute"
+                           {:type :test/unexpected-full-recompute})))]
+              (sync-handle-message/handle-message!
+               test-repo client raw-message))
+            (is (= 1 (client-op/get-local-tx test-repo)))
+            (is (= server-checksum
+                   (client-op/get-local-server-checksum test-repo)))))))))
+
 (deftest tx-batch-ok-removes-only-inflight-acked-pending-txs-test
   (testing "tx/batch/ok should only clear pending txs tracked in inflight"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)
@@ -5036,7 +8937,7 @@
             (is (= 1 (client-op/get-local-tx test-repo)))))))))
 
 (deftest tx-batch-ok-does-not-anchor-remote-checksum-after-acked-pending-txs-test
-  (testing "tx/batch/ok compares the existing local checksum instead of anchoring the remote checksum"
+  (testing "tx/batch/ok preserves the durable pending row until a recomputed checksum verifies"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)
           remote-checksum "bad-remote-checksum"
           *captured (atom nil)
@@ -5057,17 +8958,612 @@
             (is (seq pending-before))
             (client-op/update-local-checksum test-repo local-checksum)
             (reset! (:inflight client) tx-ids)
-            (with-redefs [sync-log-state/rtc-log (fn [type payload]
-                                                   (reset! *captured {:type type
-                                                                      :payload payload}))]
-              (sync-handle-message/handle-message! test-repo client raw-message))
+            (let [error
+                  (with-redefs [sync-log-state/rtc-log
+                                (fn [type payload]
+                                  (reset! *captured {:type type
+                                                     :payload payload}))]
+                    (try
+                      (sync-handle-message/handle-message!
+                       test-repo client raw-message)
+                      nil
+                      (catch :default error
+                        error)))]
+              (is (= :db-sync/checksum-mismatch
+                     (:type (ex-data error)))))
+            (is (= tx-ids @(:inflight client)))
+            (is (= tx-ids
+                   (mapv :tx-id (#'sync-apply/pending-txs test-repo))))
+            (is (= 0 (client-op/get-local-tx test-repo)))
+            (is (= local-checksum (client-op/get-local-checksum test-repo)))
+            (is (= :rtc.log/checksum-mismatch (:type @*captured)))
+            (is (= local-checksum
+                   (get-in @*captured [:payload :recomputed-checksum])))
+            (is (= remote-checksum (get-in @*captured [:payload :remote-checksum])))))))))
+
+(deftest tx-batch-ok-heals-cached-checksum-drift-before-clearing-pending-test
+  (testing "tx/batch/ok recomputes both projections before publishing the ack"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          captured* (atom nil)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (worker-page/create! conn "Ack Cached Drift" :uuid (random-uuid))
+          (let [pending-before (#'sync-apply/pending-txs test-repo)
+                tx-ids (mapv :tx-id pending-before)
+                expected-legacy (sync-checksum/recompute-checksum @conn)
+                expected-server-v2
+                (sync-checksum/recompute-server-checksum @conn)
+                raw-message
+                (js/JSON.stringify
+                 (clj->js {:type "tx/batch/ok"
+                           :t 1
+                           :checksum expected-legacy
+                           :checksum-version
+                           sync-checksum/server-checksum-version
+                           :server-checksum expected-server-v2}))]
+            (client-op/update-local-checksum
+             test-repo "stale-legacy-cache")
+            (client-op/update-local-server-checksum
+             test-repo "stale-server-v2-cache")
+            (reset! (:inflight client) tx-ids)
+            (with-redefs
+              [sync-log-state/rtc-log
+               (fn [type payload]
+                 (reset! captured* {:type type :payload payload}))
+               shared-service/broadcast-to-clients! (fn [& _] nil)
+               sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+              (sync-handle-message/handle-message!
+               test-repo client raw-message))
             (is (= [] @(:inflight client)))
             (is (empty? (#'sync-apply/pending-txs test-repo)))
             (is (= 1 (client-op/get-local-tx test-repo)))
-            (is (= local-checksum (client-op/get-local-checksum test-repo)))
-            (is (= :rtc.log/checksum-mismatch (:type @*captured)))
-            (is (= local-checksum (get-in @*captured [:payload :local-checksum])))
-            (is (= remote-checksum (get-in @*captured [:payload :remote-checksum])))))))))
+            (is (= expected-legacy
+                   (client-op/get-local-checksum test-repo)))
+            (is (= expected-server-v2
+                   (client-op/get-local-server-checksum test-repo)))
+            (is (= :rtc.log/checksum-cache-repaired
+                   (:type @captured*)))
+            (is (= :db-sync/checksum-cache-repaired
+                   (get-in @captured* [:payload :type])))
+            (is (true?
+                 (get-in @captured*
+                         [:payload :cache-only-drift?])))))))))
+
+(deftest tx-batch-ok-rebuilds-rebased-pending-from-the-acked-frozen-wire-test
+  (testing "an ACK can replace a rebased optimistic projection only when the exact sent wire verifies"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          child-uuid (:block/uuid child1)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :upload-request (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (let [base-db @conn]
+            (ldb/transact!
+             conn
+             [[:db/add [:block/uuid child-uuid]
+               :block/title "accepted frozen wire"]]
+             {:outliner-op :save-block})
+            (let [sent-entry (first (#'sync-apply/pending-txs test-repo))
+                  tx-id (:tx-id sent-entry)
+                  wire-tx-data (vec (:tx sent-entry))
+                  wire-entry {:tx-data wire-tx-data
+                              :large-title-logical-tx-data wire-tx-data
+                              :outliner-op (:outliner-op sent-entry)}
+                  server-conn (d/conn-from-db base-db)]
+              (#'sync-apply/persist-frozen-upload-wire!
+               test-repo
+               (assoc sent-entry :tx-data wire-tx-data)
+               wire-entry)
+              (ldb/transact!
+               server-conn
+               (:tx-data wire-entry)
+               {:rtc-tx? true})
+
+              ;; A concurrent pull can rebase the same logical pending tx after
+              ;; its immutable wire has already been sent. Model the resulting
+              ;; optimistic projection while retaining the original tx id and
+              ;; durable frozen wire.
+              (reset! conn base-db)
+              (ldb/transact!
+               conn
+               [[:db/add [:block/uuid child-uuid]
+                 :block/title "locally rebased projection"]]
+               {:outliner-op :rebase
+                :original-outliner-op :save-block
+                :db-sync/rebased-local? true
+                :db-sync/tx-id tx-id})
+              (let [server-legacy (sync-checksum/recompute-checksum @server-conn)
+                    server-v2 (sync-checksum/recompute-server-checksum @server-conn)
+                    local-before (sync-checksum/recompute-server-checksum @conn)
+                    raw-message
+                    (js/JSON.stringify
+                     (clj->js {:type "tx/batch/ok"
+                               :t 1
+                               :checksum server-legacy
+                               :checksum-version
+                               sync-checksum/server-checksum-version
+                               :server-checksum server-v2}))]
+                (is (not= local-before server-v2))
+                (client-op/update-local-checksum
+                 test-repo (sync-checksum/recompute-checksum @conn))
+                (client-op/update-local-server-checksum test-repo local-before)
+                (reset! (:inflight client) [tx-id])
+                (reset! (:upload-request client)
+                        {:tx-ids [tx-id]
+                         :large-upload-progress []
+                         :large-title-marker-tx-entries []
+                         :t-before 0})
+
+                (let [db-before @conn
+                      refused
+                      (sync-apply/recover-acked-frozen-wire!
+                       test-repo
+                       {:upload-request @(:upload-request client)
+                        :completed-tx-ids [tx-id]
+                        :inflight-tx-ids [tx-id]
+                        :basis-local-t 0
+                        :post-ack-ready? true}
+                       {:checksum server-legacy
+                        :server-checksum (str server-v2 "-forged")
+                        :checksum-version
+                        sync-checksum/server-checksum-version})]
+                  (is (nil? refused))
+                  (is (identical? db-before @conn))
+                  (is (= "locally rebased projection"
+                         (:block/title
+                          (d/entity @conn [:block/uuid child-uuid]))))
+                  (is (= [tx-id]
+                         (mapv :tx-id
+                               (#'sync-apply/pending-txs test-repo)))))
+
+                (sync-handle-message/handle-message!
+                 test-repo client raw-message)
+
+                (is (= "accepted frozen wire"
+                       (:block/title
+                        (d/entity @conn [:block/uuid child-uuid]))))
+                (is (= server-legacy
+                       (sync-checksum/recompute-checksum @conn)))
+                (is (= server-v2
+                       (sync-checksum/recompute-server-checksum @conn)))
+                (is (= 1 (client-op/get-local-tx test-repo)))
+                (is (= [] @(:inflight client)))
+                (is (empty? (#'sync-apply/pending-txs test-repo)))
+                (is (nil?
+                     (client-op/get-client-tx-upload-state
+                     test-repo tx-id)))))))))))
+
+(deftest tx-batch-ok-replaces-optimistic-state-with-worker-canonical-delta-test
+  (testing "an opted-in ACK replaces a divergent optimistic projection with the committed delta"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          child-uuid (:block/uuid child1)
+          base-db @conn
+          server-conn (d/conn-from-db base-db)
+          canonical-tx* (atom nil)
+          mismatch-log* (atom nil)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :upload-request (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (d/listen! server-conn ::canonical-ack-capture
+                 (fn [{:keys [db-after db-before tx-data]}]
+                   (when (seq tx-data)
+                     (reset! canonical-tx*
+                             (db-normalize/normalize-tx-data
+                              db-after db-before tx-data)))))
+      (try
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (ldb/transact!
+             conn
+             [[:db/add [:block/uuid child-uuid]
+               :block/title "optimistic-order"]]
+             {:outliner-op :move-blocks})
+            (let [pending (vec (#'sync-apply/pending-txs test-repo))
+                  tx-id (:tx-id (first pending))]
+              (is (= 1 (count pending)))
+              (ldb/transact!
+               server-conn
+               [[:db/add [:block/uuid child-uuid]
+                 :block/title "worker-canonical-order"]]
+               {:rtc-tx? true
+                :outliner-op :move-blocks})
+              (let [server-legacy
+                    (sync-checksum/recompute-checksum @server-conn)
+                    server-v2
+                    (sync-checksum/recompute-server-checksum @server-conn)
+                    raw-message
+                    (js/JSON.stringify
+                     (clj->js
+                      {:type "tx/batch/ok"
+                       :t 1
+                       :canonical-basis-t 0
+                       :canonical-tx-ids [(str tx-id)]
+                       :canonical-txs
+                       [{:t 1
+                         :tx-id (str tx-id)
+                         :tx (sqlite-util/write-transit-str @canonical-tx*)
+                         :outliner-op :move-blocks}]
+                       :checksum server-legacy
+                       :checksum-version
+                       sync-checksum/server-checksum-version
+                       :server-checksum server-v2}))]
+                (client-op/update-local-checksum
+                 test-repo (sync-checksum/recompute-checksum @conn))
+                (client-op/update-local-server-checksum
+                 test-repo (sync-checksum/recompute-server-checksum @conn))
+                (reset! (:inflight client) [tx-id])
+                (reset! (:upload-request client)
+                        {:tx-ids [tx-id]
+                         :large-upload-progress []
+                         :large-title-marker-tx-entries []
+                         :t-before 0})
+                (with-redefs
+                  [sync-log-state/rtc-log
+                   (fn [type payload]
+                     (when (= :rtc.log/checksum-mismatch type)
+                       (reset! mismatch-log* payload)))
+                   shared-service/broadcast-to-clients! (fn [& _] nil)
+                   sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+                  (sync-handle-message/handle-message!
+                   test-repo client raw-message))
+                (is (= "worker-canonical-order"
+                       (:block/title
+                        (d/entity @conn [:block/uuid child-uuid]))))
+                (is (= server-v2
+                       (sync-checksum/recompute-server-checksum @conn)))
+                (is (= 1 (client-op/get-local-tx test-repo)))
+                (is (empty? (#'sync-apply/pending-txs test-repo)))
+                (is (= [] @(:inflight client)))
+                (is (nil? @mismatch-log*))))))
+        (finally
+          (d/unlisten! server-conn ::canonical-ack-capture))))))
+
+(deftest tx-batch-ok-does-not-rewrite-an-authoritative-duplicate-order-basis-test
+  (testing "a fully acknowledged canonical basis is not changed by a private client order fix"
+    (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+          child1-uuid (:block/uuid child1)
+          child2-order (:block/order child2)
+          base-db @conn
+          server-conn (d/conn-from-db base-db)
+          canonical-tx* (atom nil)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :upload-request (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (d/listen! server-conn ::canonical-duplicate-order-capture
+                 (fn [{:keys [db-after db-before tx-data]}]
+                   (when (seq tx-data)
+                     (reset! canonical-tx*
+                             (db-normalize/normalize-tx-data
+                              db-after db-before tx-data)))))
+      (try
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (ldb/transact!
+             conn
+             [[:db/add [:block/uuid child1-uuid]
+               :block/order "optimistic-client-order"]]
+             {:outliner-op :move-blocks})
+            (let [pending (vec (#'sync-apply/pending-txs test-repo))
+                  tx-id (:tx-id (first pending))]
+              (is (= 1 (count pending)))
+              (ldb/transact!
+               server-conn
+               [[:db/add [:block/uuid child1-uuid]
+                 :block/order child2-order]]
+               {:rtc-tx? true
+                :outliner-op :move-blocks})
+              (let [server-legacy
+                    (sync-checksum/recompute-checksum @server-conn)
+                    server-v2
+                    (sync-checksum/recompute-server-checksum @server-conn)
+                    raw-message
+                    (js/JSON.stringify
+                     (clj->js
+                      {:type "tx/batch/ok"
+                       :t 1
+                       :canonical-basis-t 0
+                       :canonical-tx-ids [(str tx-id)]
+                       :canonical-txs
+                       [{:t 1
+                         :tx-id (str tx-id)
+                         :tx (sqlite-util/write-transit-str @canonical-tx*)
+                         :outliner-op :move-blocks}]
+                       :checksum server-legacy
+                       :checksum-version
+                       sync-checksum/server-checksum-version
+                       :server-checksum server-v2}))]
+                (client-op/update-local-checksum
+                 test-repo (sync-checksum/recompute-checksum @conn))
+                (client-op/update-local-server-checksum
+                 test-repo (sync-checksum/recompute-server-checksum @conn))
+                (reset! (:inflight client) [tx-id])
+                (reset! (:upload-request client)
+                        {:tx-ids [tx-id]
+                         :large-upload-progress []
+                         :large-title-marker-tx-entries []
+                         :t-before 0})
+                (with-redefs
+                  [shared-service/broadcast-to-clients! (fn [& _] nil)
+                   sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+                  (sync-handle-message/handle-message!
+                   test-repo client raw-message))
+                (is (= server-legacy
+                       (sync-checksum/recompute-checksum @conn)))
+                (is (= server-v2
+                       (sync-checksum/recompute-server-checksum @conn)))
+                (is (= child2-order
+                       (:block/order
+                        (d/entity @conn [:block/uuid child1-uuid]))))
+                (is (empty? (#'sync-apply/pending-txs test-repo)))
+                (is (= [] @(:inflight client)))))))
+        (finally
+          (d/unlisten! server-conn ::canonical-duplicate-order-capture))))))
+
+(deftest tx-batch-ok-rebases-newer-local-input-over-worker-canonical-delta-test
+  (testing "canonical convergence changes the basis without discarding newer user input"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          child-uuid (:block/uuid child1)
+          base-db @conn
+          server-conn (d/conn-from-db base-db)
+          canonical-tx* (atom nil)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :upload-request (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (d/listen! server-conn ::canonical-ack-overlay-capture
+                 (fn [{:keys [db-after db-before tx-data]}]
+                   (when (seq tx-data)
+                     (reset! canonical-tx*
+                             (db-normalize/normalize-tx-data
+                              db-after db-before tx-data)))))
+      (try
+        (with-datascript-conns
+          conn client-ops-conn
+          (fn []
+            (ldb/transact!
+             conn
+             [[:db/add [:block/uuid child-uuid]
+               :block/title "optimistic-A"]]
+             {:outliner-op :move-blocks})
+            (let [acked-tx-id
+                  (:tx-id (first (#'sync-apply/pending-txs test-repo)))]
+              ;; This edit races after the first wire was sent and must remain
+              ;; visible/pending while the acknowledged basis is replaced.
+              (ldb/transact!
+               conn
+               [[:db/add [:block/uuid child-uuid]
+                 :block/title "newer-user-input-C"]]
+               {:outliner-op :save-block})
+              (let [pending-before
+                    (vec (#'sync-apply/pending-txs test-repo))
+                    newer-tx-id (:tx-id (second pending-before))]
+                (is (= [acked-tx-id newer-tx-id]
+                       (mapv :tx-id pending-before)))
+                (ldb/transact!
+                 server-conn
+                 [[:db/add [:block/uuid child-uuid]
+                   :block/title "worker-basis-B"]]
+                 {:rtc-tx? true
+                  :outliner-op :move-blocks})
+                (let [server-legacy
+                      (sync-checksum/recompute-checksum @server-conn)
+                      server-v2
+                      (sync-checksum/recompute-server-checksum @server-conn)
+                      raw-message
+                      (js/JSON.stringify
+                       (clj->js
+                        {:type "tx/batch/ok"
+                         :t 1
+                         :canonical-basis-t 0
+                         :canonical-tx-ids [(str acked-tx-id)]
+                         :canonical-txs
+                         [{:t 1
+                           :tx-id (str acked-tx-id)
+                           :tx (sqlite-util/write-transit-str @canonical-tx*)
+                           :outliner-op :move-blocks}]
+                         :checksum server-legacy
+                         :checksum-version
+                         sync-checksum/server-checksum-version
+                         :server-checksum server-v2}))]
+                  (client-op/update-local-checksum
+                   test-repo (sync-checksum/recompute-checksum @conn))
+                  (client-op/update-local-server-checksum
+                   test-repo (sync-checksum/recompute-server-checksum @conn))
+                  (reset! (:inflight client) [acked-tx-id])
+                  (reset! (:upload-request client)
+                          {:tx-ids [acked-tx-id]
+                           :large-upload-progress []
+                           :large-title-marker-tx-entries []
+                           :t-before 0})
+                  (with-redefs
+                    [shared-service/broadcast-to-clients! (fn [& _] nil)
+                     sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+                    (sync-handle-message/handle-message!
+                     test-repo client raw-message))
+                  (is (= "newer-user-input-C"
+                         (:block/title
+                          (d/entity @conn [:block/uuid child-uuid]))))
+                  (is (= [newer-tx-id]
+                         (mapv :tx-id
+                               (#'sync-apply/pending-txs test-repo))))
+                  (is (= 1 (client-op/get-local-tx test-repo)))
+                  (is (= [] @(:inflight client))))))))
+        (finally
+          (d/unlisten! server-conn ::canonical-ack-overlay-capture))))))
+
+(deftest tx-batch-ok-rejects-truncated-canonical-delta-without-touching-user-state-test
+  (testing "a malformed canonical ACK leaves optimistic state, pending rows, and cursor intact"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          child-uuid (:block/uuid child1)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :upload-request (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (ldb/transact!
+           conn
+           [[:db/add [:block/uuid child-uuid]
+             :block/title "must-stay-visible"]]
+           {:outliner-op :move-blocks})
+          (let [pending-before (vec (#'sync-apply/pending-txs test-repo))
+                tx-id (:tx-id (first pending-before))
+                db-before @conn
+                raw-message
+                (js/JSON.stringify
+                 (clj->js
+                  {:type "tx/batch/ok"
+                   :t 1
+                   :canonical-basis-t 0
+                   :canonical-tx-ids [(str tx-id)]
+                   ;; t=1 requires one row. An empty vector is a truncated
+                   ;; acknowledgement and must fail before any reversal.
+                   :canonical-txs []}))]
+            (reset! (:inflight client) [tx-id])
+            (reset! (:upload-request client)
+                    {:tx-ids [tx-id]
+                     :large-upload-progress []
+                     :large-title-marker-tx-entries []
+                     :t-before 0})
+            (let [error (try
+                          (sync-handle-message/handle-message!
+                           test-repo client raw-message)
+                          nil
+                          (catch :default error error))]
+              (is (= :db-sync/invalid-canonical-ack
+                     (:type (ex-data error))))
+              (is (identical? db-before @conn))
+              (is (= "must-stay-visible"
+                     (:block/title
+                      (d/entity @conn [:block/uuid child-uuid]))))
+              (is (= pending-before
+                     (vec (#'sync-apply/pending-txs test-repo))))
+              (is (= [tx-id] @(:inflight client)))
+              (is (= 0 (client-op/get-local-tx test-repo))))))))))
+
+(deftest tx-batch-ok-converges-after-remote-insert-rebases-duplicate-orders-test
+  (testing "an ACK converges after a remote sibling insert rebases locally pending inserts"
+    (doseq [[local-uuid remote-uuid]
+            [[(uuid "00000000-0000-0000-0000-000000000004")
+              (uuid "00000000-0000-0000-0000-000000000001")]
+             [(uuid "00000000-0000-0000-0000-000000000001")
+              (uuid "00000000-0000-0000-0000-000000000004")]]]
+      (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+            base-db @conn
+            page-uuid (:block/uuid (:block/page parent))
+            server-conn (d/conn-from-db base-db)
+            remote-tx* (atom nil)
+            client {:repo test-repo
+                    :graph-id "graph-1"
+                    :inflight (atom [])
+                    :upload-request (atom nil)
+                    :online-users (atom [])
+                    :ws-state (atom :open)}]
+        (try
+          (with-datascript-conns
+            conn client-ops-conn
+            (fn []
+              (outliner-core/insert-blocks!
+               conn
+               [{:block/title "local concurrent sibling"
+                 :block/uuid local-uuid}]
+               parent
+               {:sibling? true
+                :keep-uuid? true})
+              (let [local-block (d/entity @conn [:block/uuid local-uuid])
+                    remote-tx [[:db/add -1 :block/uuid remote-uuid]
+                               [:db/add -1 :block/title "remote concurrent sibling"]
+                               [:db/add -1 :block/parent [:block/uuid page-uuid]]
+                               [:db/add -1 :block/page [:block/uuid page-uuid]]
+                               [:db/add -1 :block/order (:block/order local-block)]
+                               [:db/add -1 :block/updated-at 1768308019312]
+                               [:db/add -1 :block/created-at 1768308019312]]]
+                (reset! remote-tx* remote-tx)
+                (ldb/transact! server-conn remote-tx {:rtc-tx? true})
+                (#'sync-apply/apply-remote-tx! test-repo nil remote-tx)
+                (let [pending (vec (#'sync-apply/pending-txs test-repo))
+                      tx-ids (mapv :tx-id pending)
+                      frozen-wires
+                      (mapv
+                       (fn [{:keys [tx outliner-op] :as entry}]
+                         (let [tx-data (vec tx)
+                               wire {:tx-data tx-data
+                                     :large-title-logical-tx-data tx-data
+                                     :outliner-op outliner-op}]
+                           (#'sync-apply/persist-frozen-upload-wire!
+                            test-repo (assoc entry :tx-data tx-data) wire)
+                           wire))
+                       pending)]
+                  (is (seq pending))
+                  (doseq [wire frozen-wires]
+                    (when-let [tx-data
+                               (seq (#'sync-apply/acked-wire-server-tx-data
+                                     @server-conn wire))]
+                      (ldb/transact!
+                       server-conn tx-data
+                       {:rtc-tx? true
+                        :outliner-op (:outliner-op wire)})))
+                  (let [server-legacy
+                        (sync-checksum/recompute-checksum @server-conn)
+                        server-v2
+                        (sync-checksum/recompute-server-checksum @server-conn)
+                        raw-message
+                        (js/JSON.stringify
+                         (clj->js {:type "tx/batch/ok"
+                                   :t (+ 1 (count pending))
+                                   :checksum server-legacy
+                                   :checksum-version
+                                   sync-checksum/server-checksum-version
+                                   :server-checksum server-v2}))]
+                    (client-op/update-local-tx test-repo 1)
+                    (client-op/update-local-checksum
+                     test-repo (sync-checksum/recompute-checksum @conn))
+                    (client-op/update-local-server-checksum
+                     test-repo (sync-checksum/recompute-server-checksum @conn))
+                    (reset! (:inflight client) tx-ids)
+                    (reset! (:upload-request client)
+                            {:tx-ids tx-ids
+                             :large-upload-progress []
+                             :large-title-marker-tx-entries []
+                             :t-before 1})
+                    (with-redefs
+                      [shared-service/broadcast-to-clients! (fn [& _] nil)
+                       sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+                      (sync-handle-message/handle-message!
+                       test-repo client raw-message))
+                    (is (= server-legacy
+                           (sync-checksum/recompute-checksum @conn)))
+                    (is (= server-v2
+                           (sync-checksum/recompute-server-checksum @conn)))
+                    (is (= [] @(:inflight client)))
+                    (is (empty? (#'sync-apply/pending-txs test-repo))))))))
+          (finally
+            (reset! remote-tx* nil)
+            (reset! server-conn nil)))))))
 
 (deftest apply-remote-tx-does-not-clear-pending-without-ack-test
   (testing "apply-remote-tx should not clear local pending txs before tx/batch/ok ack"
@@ -5148,8 +9644,8 @@
               (reset! db-sync/*repo->latest-remote-tx latest-tx-prev)
               (reset! db-sync/*repo->latest-remote-checksum latest-checksum-prev))))))))
 
-(deftest tx-batch-ok-real-checksum-mismatch-logs-warning-test
-  (testing "tx/batch/ok logs warning on true checksum mismatch without throwing"
+(deftest tx-batch-ok-real-checksum-mismatch-requires-repair-test
+  (testing "tx/batch/ok rejects a true checksum mismatch"
     (let [{:keys [conn client-ops-conn]} (setup-parent-child)
           stale-checksum "0000000000000000"
           remote-checksum "ffffffffffffffff"
@@ -5164,12 +9660,14 @@
       (with-datascript-conns conn client-ops-conn
         (fn []
           (client-op/update-local-checksum test-repo stale-checksum)
-          (is (= :ok
-                 (try
-                   (sync-handle-message/handle-message! test-repo client raw-message)
-                   :ok
-                   (catch :default _error
-                     :thrown)))))))))
+          (let [error (try
+                        (sync-handle-message/handle-message!
+                         test-repo client raw-message)
+                        nil
+                        (catch :default error
+                          error))]
+            (is (= :db-sync/checksum-mismatch
+                   (:type (ex-data error))))))))))
 
 (deftest local-checksum-stays-in-sync-after-undo-redo-sequence-test
   (testing "insert/delete/indent/outdent with undo-all/redo-all keeps cached checksum aligned"
@@ -5322,6 +9820,160 @@
               (is (empty? pending-after))
               (is (some? tx-ent-after))
               (is (= 0 (aget tx-ent-after "pending"))))))))))
+
+(deftest rebase-transact-drops-stale-targets-without-dropping-valid-target-test
+  (testing "legacy numeric and bare UUID targets cannot break a mixed tx after remote delete"
+    (let [{:keys [conn child1 child2]} (setup-parent-child)
+          deleted-id (:db/id child1)
+          deleted-uuid (:block/uuid child1)
+          surviving-uuid (:block/uuid child2)
+          rebase-db-before @conn]
+      ;; Match the production worker: the per-test fixture otherwise removes
+      ;; the registered pipeline.
+      (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+      (ldb/batch-transact-with-temp-conn!
+       conn
+       {:rtc-tx? true}
+       (fn [temp-conn]
+         (ldb/transact! temp-conn
+                        [[:db/retractEntity [:block/uuid deleted-uuid]]]
+                        {:transact-remote? true})
+         (#'sync-apply/replay-canonical-outliner-op!
+          temp-conn
+          [:transact
+           [[[:db/add deleted-id :block/updated-at 1770000000000]
+             [:db/add (str deleted-uuid) :logseq.property/heading 3]
+             [:db/add (str deleted-uuid)
+              :logseq.property.node/display-type
+              :math]
+             [:db/add [:block/uuid surviving-uuid]
+              :block/title
+              "surviving local change"]]
+            {:outliner-op :rebase
+             :db-sync/rebased-local? true}]]
+          rebase-db-before)))
+      (is (nil? (d/entity @conn [:block/uuid deleted-uuid])))
+      (is (= "surviving local change"
+             (:block/title (d/entity @conn [:block/uuid surviving-uuid]))))
+      (is (empty?
+           (d/q '[:find [?e ...]
+                  :where
+                  [?e :logseq.property/heading 3]
+                  [(missing? $ ?e :block/uuid)]]
+                @conn)))
+      (let [validation (db-validate/validate-local-db! @conn)]
+        (is (empty? (:errors validation))
+            (str (:errors validation)))))))
+
+(deftest rebase-transact-resolves-existing-bare-uuid-target-test
+  (testing "legacy bare UUID targets update the existing block in a mixed tx"
+    (let [{:keys [conn parent child1 child2]} (setup-parent-child)
+          existing-uuid (:block/uuid child1)
+          surviving-uuid (:block/uuid child2)
+          parent-uuid (:block/uuid parent)
+          page-uuid (:block/uuid (:block/page parent))
+          inserted-uuid (random-uuid)
+          inserted-tempid (str (random-uuid))
+          numeric-inserted-uuid (random-uuid)
+          numeric-inserted-tempid -1
+          rebase-db-before @conn
+          legacy-t 536870917]
+      ;; The legacy client-op row stores the existing block UUID as a bare
+      ;; string entity id. DataScript otherwise treats that string as a fresh
+      ;; tempid and the worker pipeline rejects the resulting UUID-less block.
+      (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+      (ldb/batch-transact-with-temp-conn!
+       conn
+       {:rtc-tx? true}
+       (fn [temp-conn]
+         (ldb/transact! temp-conn
+                        [[:db/add [:block/uuid surviving-uuid]
+                          :block/updated-at
+                          1770000000000]]
+                        {:transact-remote? true})
+         (#'sync-apply/replay-canonical-outliner-op!
+          temp-conn
+          [:transact
+           [[[:db/add (str existing-uuid)
+              :block/updated-at
+              1770000000001
+              legacy-t]
+             [:db/add (str existing-uuid)
+              :logseq.property/heading
+              3
+              legacy-t]
+             [:db/add (str existing-uuid)
+              :logseq.property.node/display-type
+              :math
+              legacy-t]
+             [:db/add [:block/uuid surviving-uuid]
+              :block/title
+              "surviving local change"
+              legacy-t]
+             [:db/add inserted-tempid :block/uuid inserted-uuid legacy-t]
+             [:db/add inserted-tempid :block/title "new local block" legacy-t]
+             [:db/add inserted-tempid
+              :block/parent
+              [:block/uuid parent-uuid]
+              legacy-t]
+             [:db/add inserted-tempid
+              :block/page
+              [:block/uuid page-uuid]
+              legacy-t]
+             [:db/add inserted-tempid :block/order "a4" legacy-t]
+             [:db/add inserted-tempid :block/created-at 1770000000001 legacy-t]
+             [:db/add inserted-tempid
+              :block/updated-at
+              1770000000001
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/uuid
+              numeric-inserted-uuid
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/title
+              "new numeric-tempid block"
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/parent
+              [:block/uuid parent-uuid]
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/page
+              [:block/uuid page-uuid]
+              legacy-t]
+             [:db/add numeric-inserted-tempid :block/order "a5" legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/created-at
+              1770000000001
+              legacy-t]
+             [:db/add numeric-inserted-tempid
+              :block/updated-at
+              1770000000001
+              legacy-t]]
+            {:outliner-op :rebase
+             :db-sync/rebased-local? true}]]
+          rebase-db-before)))
+      (let [existing (d/entity @conn [:block/uuid existing-uuid])]
+        (is (= 1770000000001 (:block/updated-at existing)))
+        (is (= 3 (:logseq.property/heading existing)))
+        (is (= :math (:logseq.property.node/display-type existing))))
+      (is (= "surviving local change"
+             (:block/title (d/entity @conn [:block/uuid surviving-uuid]))))
+      (is (= "new local block"
+             (:block/title (d/entity @conn [:block/uuid inserted-uuid]))))
+      (is (= "new numeric-tempid block"
+             (:block/title
+              (d/entity @conn [:block/uuid numeric-inserted-uuid]))))
+      (is (empty?
+           (d/q '[:find [?e ...]
+                  :where
+                  [?e :logseq.property/heading 3]
+                  [(missing? $ ?e :block/uuid)]]
+                @conn)))
+      (let [validation (db-validate/validate-local-db! @conn)]
+        (is (empty? (:errors validation))
+            (str (:errors validation)))))))
 
 (deftest missing-parent-after-remote-delete-removes-descendants-test
   (testing "remote hard delete tx removes descendants when full delete tx-data is provided"
@@ -6074,6 +10726,75 @@
                    (:block/title (d/entity @conn [:block/uuid child-uuid]))))
             (is (= :fix (:outliner-op pending-after)))))))))
 
+(deftest rebase-replays-fix-pending-tx-with-reverse-data-test
+  (testing "an applied order fix remains reflected locally while a remote tx rebases pending state"
+    (let [{:keys [conn client-ops-conn child1 child2]}
+          (setup-parent-child)
+          child1-uuid (:block/uuid child1)
+          child2-uuid (:block/uuid child2)
+          original-order (:block/order child1)
+          fixed-order (str original-order "z")]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (ldb/transact!
+           conn
+           [[:db/add [:block/uuid child1-uuid] :block/order fixed-order]]
+           {:outliner-op :fix
+            :gen-undo-ops? false})
+          (let [fix-before (first (#'sync-apply/pending-txs test-repo))]
+            (is (= :fix (:outliner-op fix-before)))
+            (is (seq (:reversed-tx fix-before))
+                "a real duplicate-order fix carries enough data to reverse")
+            (#'sync-apply/apply-remote-txs!
+             test-repo
+             nil
+             [{:tx-data
+               [[:db/add [:block/uuid child2-uuid]
+                 :block/title "remote child title"]]}])
+            (let [fix-after
+                  (#'sync-apply/pending-tx-by-id test-repo (:tx-id fix-before))]
+              (is (= fixed-order
+                     (:block/order
+                      (d/entity @conn [:block/uuid child1-uuid])))
+                  "remote rebase must not silently undo the still-pending fix")
+              (is (= "remote child title"
+                     (:block/title
+                      (d/entity @conn [:block/uuid child2-uuid]))))
+              (is (= :fix (:outliner-op fix-after)))
+              (is (= (:tx fix-before) (:tx fix-after))))))))))
+
+(deftest rebase-drops-fix-when-remote-deletes-its-target-test
+  (testing "a derived order repair cannot resurrect a block deleted remotely"
+    (let [{:keys [conn client-ops-conn child1 child2]}
+          (setup-parent-child)
+          child1-uuid (:block/uuid child1)
+          child2-uuid (:block/uuid child2)
+          fixed-order (str (:block/order child1) "z")]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (ldb/transact!
+           conn
+           [[:db/add [:block/uuid child1-uuid] :block/order fixed-order]]
+           {:outliner-op :fix
+            :gen-undo-ops? false})
+          (let [fix-before (first (#'sync-apply/pending-txs test-repo))]
+            (is (seq (:reversed-tx fix-before)))
+            (#'sync-apply/apply-remote-txs!
+             test-repo
+             nil
+             [{:tx-data
+               [[:db/retractEntity [:block/uuid child1-uuid]]
+                [:db/add [:block/uuid child2-uuid]
+                 :block/title "remote survivor"]]}])
+            (is (nil? (d/entity @conn [:block/uuid child1-uuid])))
+            (is (= "remote survivor"
+                   (:block/title
+                    (d/entity @conn [:block/uuid child2-uuid]))))
+            (is (not-any?
+                 #(= (:tx-id fix-before) (:tx-id %))
+                 (#'sync-apply/pending-txs test-repo))
+                "the stale derived repair must not remain uploadable")))))))
+
 (deftest rebase-keeps-no-op-fix-pending-tx-with-empty-reversed-data-test
   (testing "schema fix txs with no reverse data should stay upload-only even when remote already applied the same tx"
     (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
@@ -6451,6 +11172,512 @@
                  (set (concat (sync-conflict-rows client-ops-conn block-uuid)
                               (sync-conflict-rows client-ops-conn page-uuid))))))))))
 
+(deftest rebase-preserves-created-by-ref-on-locally-created-block-test
+  (testing "a remote tx must not strip the creator from a pending local block creation"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          clock (atom 1784725856000)]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    common-util/time-ms (fn [] @clock)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title "pending created-by block"}]
+             parent
+             {:sibling? false})
+            (let [block-before (db-test/find-block-by-content @conn "pending created-by block")
+                  block-uuid (:block/uuid block-before)
+                  creator-before (:logseq.property/created-by-ref block-before)
+                  creator-id-before (:db/id creator-before)
+                  created-at-before (:block/created-at block-before)
+                  updated-at-before (:block/updated-at block-before)]
+              (is (= created-by-rebase-test-user-uuid
+                     (:block/uuid creator-before)))
+              (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+              (reset! clock 1784725956000)
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725857000]])
+              (let [block-after (d/entity @conn [:block/uuid block-uuid])
+                    creator-after (:logseq.property/created-by-ref block-after)
+                    creator-by-uuid (d/entity @conn
+                                              [:block/uuid created-by-rebase-test-user-uuid])]
+                (is (= "pending created-by block" (:block/title block-after)))
+                (is (= created-by-rebase-test-user-uuid
+                       (:block/uuid creator-after))
+                    "rebase must preserve the logical creator UUID")
+                (is (= creator-id-before (:db/id creator-after))
+                    "rebase must keep the ref on the same user entity")
+                (is (= (:db/id creator-by-uuid) (:db/id creator-after))
+                    "the creator ref must resolve through the user's UUID")
+                (is (= created-at-before (:block/created-at block-after))
+                    "rebase must not rewrite the block's original creation time")
+                (is (= updated-at-before (:block/updated-at block-after))
+                    "rebase must not replace the original update time with its wall clock")
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))))))))))
+
+(deftest rebase-preserves-created-by-and-timestamps-on-pending-local-block-tree-test
+  (testing "a pending three-level local tree keeps creator and timestamps through remote rebase"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          root-uuid #uuid "22222222-2222-4222-8222-222222222221"
+          child-uuid #uuid "22222222-2222-4222-8222-222222222222"
+          grandchild-uuid #uuid "22222222-2222-4222-8222-222222222223"
+          block-uuids [root-uuid child-uuid grandchild-uuid]
+          clock (atom 1784725856000)]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    common-util/time-ms (fn [] @clock)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/uuid root-uuid
+               :block/title "pending tree root"}
+              {:block/uuid child-uuid
+               :block/title "pending tree child"
+               :block/parent [:block/uuid root-uuid]}
+              {:block/uuid grandchild-uuid
+               :block/title "pending tree grandchild"
+               :block/parent [:block/uuid child-uuid]}]
+             parent
+             {:sibling? false
+              :keep-uuid? true})
+            (let [blocks-before (mapv #(d/entity @conn [:block/uuid %])
+                                      block-uuids)
+                  timestamps-before
+                  (mapv #(select-keys % [:block/created-at :block/updated-at])
+                        blocks-before)]
+              (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+              (is (= [created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid]
+                     (mapv created-by-ref-uuid blocks-before)))
+              (reset! clock 1784725956000)
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725955000]])
+              (let [blocks-after (mapv #(d/entity @conn [:block/uuid %])
+                                       block-uuids)
+                    timestamps-after
+                    (mapv #(select-keys % [:block/created-at :block/updated-at])
+                          blocks-after)]
+                (is (= ["pending tree root"
+                        "pending tree child"
+                        "pending tree grandchild"]
+                       (mapv :block/title blocks-after)))
+                (is (= [(:block/uuid parent) root-uuid child-uuid]
+                       (mapv #(some-> % :block/parent :block/uuid) blocks-after))
+                    "rebase must keep the local tree hierarchy")
+                (is (= [created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid]
+                       (mapv created-by-ref-uuid blocks-after)))
+                (is (= timestamps-before timestamps-after)
+                    (str {:before timestamps-before
+                          :after timestamps-after
+                          :rebase-wall-clock @clock}))
+                (is (every? #(not= @clock (:block/created-at %)) blocks-after)
+                    "created-at must not be replaced by the rebase wall clock")
+                (is (every? #(not= @clock (:block/updated-at %)) blocks-after)
+                    "updated-at must not be replaced by the rebase wall clock")
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))))))))))
+
+(deftest rebase-preserves-created-by-ref-across-multiple-pending-ops-test
+  (testing "mixed local creates and an empty-block edit keep their creators through one remote rebase"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "created-by mixed page"}
+                   :blocks [{:block/title "created-by mixed parent"
+                             :build/children [{:block/title ""}]}]}]})
+          client-ops-conn (new-client-ops-db)
+          parent (db-test/find-block-by-content @conn "created-by mixed parent")
+          empty-block (first (:block/_parent parent))]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title "first pending creator"}]
+             parent
+             {:sibling? false})
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title "second pending creator"}]
+             parent
+             {:sibling? false})
+            (apply-ops!
+             conn
+             [[:save-block [{:block/uuid (:block/uuid empty-block)
+                             :block/title "filled pending creator"} nil]]]
+             local-tx-meta)
+            (let [titles ["first pending creator"
+                          "second pending creator"
+                          "filled pending creator"]
+                  block-uuids (mapv (fn [title]
+                                      (:block/uuid
+                                       (db-test/find-block-by-content @conn title)))
+                                    titles)
+                  uuid-entity-count-before
+                  (d/q '[:find (count ?e) .
+                         :where
+                         [?e :block/uuid]]
+                       @conn)]
+              (is (= 3 (count (#'sync-apply/pending-txs test-repo))))
+              (is (= [created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid
+                      created-by-rebase-test-user-uuid]
+                     (mapv (fn [block-uuid]
+                             (created-by-ref-uuid
+                              (d/entity @conn [:block/uuid block-uuid])))
+                           block-uuids)))
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725858000]])
+              (let [blocks-after (mapv #(d/entity @conn [:block/uuid %])
+                                       block-uuids)
+                    creator (d/entity @conn
+                                      [:block/uuid created-by-rebase-test-user-uuid])
+                    uuid-entity-count-after
+                    (d/q '[:find (count ?e) .
+                           :where
+                           [?e :block/uuid]]
+                         @conn)]
+                (is (= titles (mapv :block/title blocks-after)))
+                (is (= [created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid
+                        created-by-rebase-test-user-uuid]
+                       (mapv created-by-ref-uuid blocks-after))
+                    "every pending operation must retain its creator after rebase")
+                (is (= "rebase-test-user"
+                       (:logseq.property.user/name creator)))
+                (is (= uuid-entity-count-before uuid-entity-count-after)
+                    "an unrelated remote tx must not create or remove UUID entities")
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))))))))))
+
+(deftest rebase-create-then-delete-does-not-revive-created-entity-test
+  (testing "a local create followed by delete stays absent after a remote rebase"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          title "transient created-by block"]
+      (seed-created-by-rebase-test-user! conn)
+      (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                    worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                    db-sync/enqueue-local-tx!
+                    (let [orig db-sync/enqueue-local-tx!]
+                      (fn [repo tx-report]
+                        (when-not (:rtc-tx? (:tx-meta tx-report))
+                          (orig repo tx-report))))]
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+            (outliner-core/insert-blocks!
+             conn
+             [{:block/title title}]
+             parent
+             {:sibling? false})
+            (let [block (db-test/find-block-by-content @conn title)
+                  block-uuid (:block/uuid block)]
+              (is (= created-by-rebase-test-user-uuid
+                     (created-by-ref-uuid block)))
+              (outliner-core/delete-blocks! conn [block] {})
+              (is (nil? (d/entity @conn [:block/uuid block-uuid])))
+              (is (= 2 (count (#'sync-apply/pending-txs test-repo))))
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               [[:db/add (:db/id parent) :block/updated-at 1784725859000]])
+              (is (nil? (d/entity @conn [:block/uuid block-uuid])))
+              (is (empty? (entity-ids-with-title @conn title))
+                  "the deleted node must not return under a UUID-less tempid")
+              (is (= created-by-rebase-test-user-uuid
+                     (:block/uuid
+                      (d/entity @conn
+                                [:block/uuid created-by-rebase-test-user-uuid]))))
+              (is (empty? (uuid-less-rebase-entities @conn))
+                  (str (uuid-less-rebase-entities @conn))))))))))
+
+(defn- large-explicit-delete-graph
+  []
+  {:pages-and-blocks
+   [{:page {:block/title "large explicit delete page"}
+     :blocks
+     (into
+      [{:block/title "large explicit delete root"
+        :build/children
+        [{:block/title "large explicit delete child"
+          :build/children
+          [{:block/title "large explicit delete grandchild"}]}]}]
+      (mapv (fn [idx]
+              {:block/title (str "large explicit delete sibling " idx)})
+            (range 518)))}]})
+
+(defn- large-delete-target-uuids
+  [db target-order]
+  (let [root-uuid (:block/uuid
+                   (db-test/find-block-by-content
+                    db
+                    "large explicit delete root"))
+        child-uuid (:block/uuid
+                    (db-test/find-block-by-content
+                     db
+                     "large explicit delete child"))
+        grandchild-uuid (:block/uuid
+                         (db-test/find-block-by-content
+                          db
+                          "large explicit delete grandchild"))
+        sibling-uuids
+        (mapv (fn [idx]
+                (:block/uuid
+                 (db-test/find-block-by-content
+                  db
+                  (str "large explicit delete sibling " idx))))
+              (range 518))]
+    (case target-order
+      :ancestor-first
+      (vec (concat [root-uuid] sibling-uuids [child-uuid grandchild-uuid]))
+
+      :descendant-first
+      (vec (concat [grandchild-uuid child-uuid] sibling-uuids [root-uuid])))))
+
+(deftest remote-rebase-large-delete-upload-keeps-delete-semantics-test
+  (doseq [target-order [:ancestor-first :descendant-first]]
+    (testing (str "521 explicit multi-level targets apply atomically after remote rebase: "
+                  (name target-order))
+      (let [conn (db-test/create-conn-with-blocks (large-explicit-delete-graph))
+            client-ops-conn (new-client-ops-db)
+            target-uuids (large-delete-target-uuids @conn target-order)
+            target-refs (mapv #(vector :block/uuid %) target-uuids)
+            expected-delete-tx
+            (mapv (fn [target-ref]
+                    [:db/retractEntity target-ref])
+                  target-refs)
+            page (db-test/find-page-by-title @conn "large explicit delete page")
+            page-uuid (:block/uuid page)
+            grandchild-uuid
+            (:block/uuid
+             (db-test/find-block-by-content
+              @conn
+              "large explicit delete grandchild"))
+            server-only-descendant-uuid (random-uuid)
+            server-conn (d/conn-from-db @conn)
+            remote-tx
+            [[:db/add [:block/uuid page-uuid]
+              :block/updated-at
+              1785388800000]]]
+        (d/transact!
+         server-conn
+         [{:block/uuid server-only-descendant-uuid
+           :block/title "server-only delete descendant"
+           :block/page [:block/uuid page-uuid]
+           :block/parent [:block/uuid grandchild-uuid]
+           :block/order "a0"
+           :block/created-at 1785388799000
+           :block/updated-at 1785388799000}])
+        (d/transact! server-conn remote-tx)
+        (with-datascript-conns conn client-ops-conn
+          (fn []
+            (ldb/transact!
+             conn
+             expected-delete-tx
+             {:local-tx? true
+              :outliner-op :delete-blocks
+              :outliner-ops
+              [[:delete-blocks [target-uuids {}]]]})
+            (let [pending-before (first (#'sync-apply/pending-txs test-repo))
+                  delete-tx-id (:tx-id pending-before)]
+              (is (= 521 (count target-uuids)))
+              (is (= :delete-blocks (:outliner-op pending-before)))
+              (is (= [[:delete-blocks [target-uuids {}]]]
+                     (:forward-outliner-ops pending-before)))
+              (is (= 521 (count (:tx pending-before))))
+              (is (true? (= (frequencies expected-delete-tx)
+                            (frequencies (:tx pending-before))))
+                  "the normalized tx must contain every explicit target exactly once")
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               remote-tx)
+              (let [pending-after (first (#'sync-apply/pending-txs test-repo))
+                    {:keys [tx-entries drop-tx-ids]}
+                    (sync-apply/prepare-upload-tx-entries
+                     test-repo
+                     conn
+                     [pending-after])
+                    prepared-entry (first tx-entries)
+                    payload
+                    {:tx-id (str (:tx-id prepared-entry))
+                     :tx (sqlite-util/write-transit-str
+                          (:tx-data prepared-entry))
+                     :outliner-op (:outliner-op prepared-entry)}
+                    capped (#'sync-apply/cap-upload-request-bytes
+                            {:type "tx/batch"
+                             :client-revision "large-delete-rebase-test"
+                             :t-before 0}
+                            [prepared-entry]
+                            [payload])
+                    wire-entry (first (get-in capped [:message :txs]))
+                    uploaded-delete
+                    (sqlite-util/read-transit-str (:tx wire-entry))
+                    server-tx-metas (atom [])
+                    apply-result
+                    (try
+                      (d/listen! server-conn
+                                 ::large-rebased-delete-server-apply
+                                 (fn [{:keys [tx-meta]}]
+                                   (swap! server-tx-metas conj tx-meta)))
+                      {:value
+                       (with-redefs [cljs.core/prn (fn [& _] nil)]
+                         (#'sync-handler/apply-tx-entry!
+                          server-conn
+                          wire-entry))}
+                      (catch :default error
+                        {:error error})
+                      (finally
+                        (d/unlisten! server-conn
+                                     ::large-rebased-delete-server-apply)))
+                    client-validation (db-validate/validate-local-db! @conn)
+                    server-validation
+                    (db-validate/validate-local-db! @server-conn)]
+                (is (= delete-tx-id (:tx-id pending-after))
+                    "remote rebase must update the durable row in place")
+                (let [rebased-target-uuids
+                      (get-in pending-after
+                              [:forward-outliner-ops 0 1 0])]
+                  (is (= :delete-blocks
+                         (ffirst (:forward-outliner-ops pending-after))))
+                  (is (= 521 (count rebased-target-uuids)))
+                  (is (true? (= (frequencies target-uuids)
+                                (frequencies rebased-target-uuids)))
+                      "rebase may reorder semantic targets but must not drop or duplicate one"))
+                (is (empty? drop-tx-ids))
+                (is (= 1 (count tx-entries)))
+                (is (= :delete-blocks (:outliner-op prepared-entry))
+                    "the server must receive delete semantics, not generic rebase semantics")
+                (is (= 521 (count (:tx-data prepared-entry))))
+                (is (true? (= (frequencies expected-delete-tx)
+                              (frequencies (:tx-data prepared-entry)))))
+                (is (= 1 (count (:tx-entries capped)))
+                    "the quantity and byte caps must not truncate the tx entry")
+                (is (= 1 (count (get-in capped [:message :txs]))))
+                (is (= 521 (count uploaded-delete)))
+                (is (= (:tx-data prepared-entry) uploaded-delete)
+                    "the byte cap must preserve the prepared tx byte-for-byte")
+                (is (true?
+                     (every? nil?
+                             (map #(d/entity @conn %) target-refs))))
+                (is (empty? (uuid-less-rebase-entities @conn))
+                    (str (uuid-less-rebase-entities @conn)))
+                (is (empty? (non-recycle-validation-entities
+                             client-validation))
+                    (str (:errors client-validation)))
+                (if-let [apply-error (:error apply-result)]
+                  (let [error-data (ex-data apply-error)
+                        cause-data (some-> apply-error ex-cause ex-data)]
+                    (is (= :ok :server-apply-failed)
+                        (pr-str
+                         {:message (.-message apply-error)
+                          :type (:type error-data)
+                          :error (:error error-data)
+                          :cause-type (:type cause-data)
+                          :cause-error (:error cause-data)})))
+                  (do
+                    (is (true? (:value apply-result)))
+                    (is (seq @server-tx-metas))
+                    (is (every? #(= :apply-client-tx (:op %))
+                                @server-tx-metas))
+                    (is (not-any? :skip-validate-db? @server-tx-metas)
+                        "server apply must use strict validation")
+                    (is (true?
+                         (every? nil?
+                                 (map #(d/entity @server-conn %)
+                                      target-refs))))
+                    (is (nil? (d/entity @server-conn
+                                        [:block/uuid
+                                         server-only-descendant-uuid]))
+                        "delete semantics must expand to a descendant omitted from the wire tx")
+                    (is (empty? (uuid-less-rebase-entities @server-conn))
+                        (str (uuid-less-rebase-entities @server-conn)))
+                    (is (empty? (non-recycle-validation-entities
+                                 server-validation))
+                        (str (:errors server-validation)))))))))))))
+
+(deftest rebase-remote-delete-does-not-revive-created-by-entity-test
+  (testing "a remote delete wins over a pending local edit without reviving the block or its creator ref"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          block-uuid (:block/uuid child1)
+          block-id (:db/id child1)
+          local-title "locally edited before remote delete"]
+      (seed-created-by-rebase-test-user! conn)
+      (d/transact! conn
+                   [[:db/add block-id
+                     :logseq.property/created-by-ref
+                     (:db/id
+                      (d/entity @conn
+                                [:block/uuid created-by-rebase-test-user-uuid]))]])
+      (let [remote-delete-tx
+            (:tx-data
+             (outliner-core/delete-blocks @conn [(d/entity @conn block-id)] {}))]
+        (with-redefs [worker-state/get-id-token (constantly "created-by-rebase-test-token")
+                      worker-util/parse-jwt (constantly created-by-rebase-test-user-claims)
+                      db-sync/enqueue-local-tx!
+                      (let [orig db-sync/enqueue-local-tx!]
+                        (fn [repo tx-report]
+                          (when-not (:rtc-tx? (:tx-meta tx-report))
+                            (orig repo tx-report))))]
+          (with-datascript-conns conn client-ops-conn
+            (fn []
+              (reset! ldb/*transact-pipeline-fn worker-pipeline/transact-pipeline)
+              (apply-ops!
+               conn
+               [[:save-block [{:block/uuid block-uuid
+                               :block/title local-title} nil]]]
+               local-tx-meta)
+              (is (= created-by-rebase-test-user-uuid
+                     (created-by-ref-uuid
+                      (d/entity @conn [:block/uuid block-uuid]))))
+              (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+              (#'sync-apply/apply-remote-tx!
+               test-repo
+               nil
+               remote-delete-tx)
+              (is (nil? (d/entity @conn [:block/uuid block-uuid])))
+              (is (empty? (entity-ids-with-title @conn local-title))
+                  "a failed stale rebase must not recreate the block anonymously")
+              (is (= created-by-rebase-test-user-uuid
+                     (:block/uuid
+                      (d/entity @conn
+                                [:block/uuid created-by-rebase-test-user-uuid]))))
+              (is (empty? (uuid-less-rebase-entities @conn))
+                  (str (uuid-less-rebase-entities @conn))))))))))
+
 (deftest rebase-does-not-leave-anonymous-created-by-entities-test
   (testing "rebase should not leave entities with timestamps/created-by but without identity attrs"
     (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)
@@ -6481,6 +11708,53 @@
                                                   (select-keys ent [:db/id :block/created-at :block/updated-at :logseq.property/created-by-ref]))))))
                   validation (db-validate/validate-local-db! @conn)]
               (is (empty? anonymous-ents) (str anonymous-ents))
+              (is (empty? (non-recycle-validation-entities validation))
+                  (str (:errors validation))))))))))
+
+(deftest rebase-preserves-pending-insert-created-metadata-test
+  (testing "semantic replay keeps the original timestamps and creator attribution"
+    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+          block-uuid (random-uuid)
+          creator-id (:db/id (:block/page parent))]
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (outliner-core/insert-blocks!
+           conn
+           [{:block/uuid block-uuid
+             :block/title "attributed pending insert"
+             :logseq.property/created-by-ref creator-id}]
+           parent
+           {:sibling? false
+            :keep-uuid? true})
+          (let [block-before (d/entity @conn [:block/uuid block-uuid])
+                created-at-before (:block/created-at block-before)
+                updated-at-before (:block/updated-at block-before)
+                creator-uuid-before (some-> block-before
+                                            :logseq.property/created-by-ref
+                                            :block/uuid)
+                pending-before (first (#'sync-apply/pending-txs test-repo))]
+            (is (= 1 (count (#'sync-apply/pending-txs test-repo))))
+            (is (some (fn [[_op _e attr]]
+                        (= :logseq.property/created-by-ref attr))
+                      (:tx pending-before)))
+            (is (nil? (get-in pending-before
+                              [:forward-outliner-ops 0 1 0 0
+                               :logseq.property/created-by-ref])))
+            (loop []
+              (when (<= (.now js/Date) updated-at-before)
+                (recur)))
+            (#'sync-apply/apply-remote-tx!
+             test-repo
+             nil
+             [[:db/add (:db/id parent) :block/title "parent remote metadata"]])
+            (let [block-after (d/entity @conn [:block/uuid block-uuid])
+                  validation (db-validate/validate-local-db! @conn)]
+              (is (= created-at-before (:block/created-at block-after)))
+              (is (= updated-at-before (:block/updated-at block-after)))
+              (is (= creator-uuid-before
+                     (some-> block-after
+                             :logseq.property/created-by-ref
+                             :block/uuid)))
               (is (empty? (non-recycle-validation-entities validation))
                   (str (:errors validation))))))))))
 
@@ -6844,8 +12118,8 @@
                         (d/unlisten! conn :frontend.worker.db-listener/listen-db-changes!)
                         (done))))))))
 
-(deftest apply-remote-txs-delays-retry-when-local-txs-keep-changing-test
-  (testing "remote apply waits for a stable pending-tx snapshot instead of reporting failure"
+(deftest apply-remote-txs-defers-after-bounded-retries-while-local-txs-keep-changing-test
+  (testing "remote apply releases its queue after bounded retries and never skips the remote cursor"
     (async done
       (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
             child1-uuid (:block/uuid child1)
@@ -6870,7 +12144,7 @@
                                                           :before-commit
                                                           (fn []
                                                             (when (and (:with-local-changes? tx-meta)
-                                                                       (< @drift-count 4))
+                                                                       (< @drift-count 9))
                                                               (swap! drift-count inc)
                                                               (d/transact!
                                                                conn
@@ -6880,16 +12154,22 @@
                                                               (before-commit))))]
                                      (apply original-batch-transact-with-temp-conn!
                                             conn' tx-meta batch-tx-fn [opts-map'])))]
-                   (p/let [_ (#'sync-apply/apply-remote-txs!
-                              test-repo
-                              (test-sync-client)
-                              [{:tx-data [[:db/retract [:block/uuid child1-uuid] :block/order order-before]
-                                          [:db/add [:block/uuid child1-uuid] :block/order "a1"]]}])
+                   (p/let [result
+                           (-> (#'sync-apply/apply-remote-txs!
+                                test-repo
+                                (test-sync-client)
+                                [{:tx-data [[:db/retract [:block/uuid child1-uuid] :block/order order-before]
+                                            [:db/add [:block/uuid child1-uuid] :block/order "a1"]]}])
+                               (p/then (fn [_] {:completed? true}))
+                               (p/catch (fn [error]
+                                          {:error-data (ex-data error)})))
                            _ (p/delay remote-apply-test-settle-ms)]
-                     (is (= 4 @drift-count))
-                     (is (= "a1"
+                     (is (= :db-sync/remote-apply-deferred
+                            (get-in result [:error-data :type])))
+                     (is (= 7 @drift-count))
+                     (is (= order-before
                             (:block/order (d/entity @conn [:block/uuid child1-uuid]))))
-                     (is (= 5 (count (#'sync-apply/pending-txs test-repo))))
+                     (is (= 8 (count (#'sync-apply/pending-txs test-repo))))
                      (let [validation (db-validate/validate-local-db! @conn)]
                        (is (empty? (non-recycle-validation-entities validation))
                            (str (:errors validation)))))))))
@@ -6961,7 +12241,7 @@
             (.finally done))))))
 
 (deftest rebase-persisted-row-contains-forward-and-inverse-outliner-ops-test
-  (testing "rebased pending tx should always persist both forward and inverse outliner ops"
+  (testing "rebased pending deletes persist their semantic upload tag and both history directions"
     (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)
           tx-id-holder (atom nil)]
       (with-datascript-conns conn client-ops-conn
@@ -6980,7 +12260,7 @@
 
           (let [pending-after (#'sync-apply/pending-tx-by-id test-repo @tx-id-holder)]
             (is (some? pending-after))
-            (is (= :rebase (:outliner-op pending-after)))
+            (is (= :delete-blocks (:outliner-op pending-after)))
             (is (seq (:forward-outliner-ops pending-after)))
             (is (seq (:inverse-outliner-ops pending-after)))))))))
 
@@ -7066,6 +12346,35 @@
                  (p/catch (fn [e]
                             (is false (str e))))
                  (p/finally done))))))
+
+(deftest server-checksum-normalization-is-narrow-test
+  (let [large-title (apply str (repeat 5000 "a"))
+        conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "legacy-checksum-page"}
+                 :blocks [{:block/title large-title}]}]})
+        block (db-test/find-block-by-content @conn large-title)
+        block-id (:db/id block)
+        object (v2-large-title-object "versioned-title-2" "a")]
+    (d/transact! conn [[:db/add block-id
+                        :logseq.property.sync/large-title-object
+                        object]])
+    (let [placeholder-db (-> (d/with @conn
+                                     [[:db/add block-id :block/title ""]])
+                             :db-after)]
+      (is (= (sync-checksum/recompute-server-checksum placeholder-db)
+             (sync-checksum/recompute-server-checksum @conn)))
+      (is (= (sync-checksum/recompute-checksum placeholder-db)
+             (sync-checksum/recompute-checksum @conn))))
+    (d/transact! conn [[:db/add block-id :block/title "short"]])
+    (let [placeholder-db (-> (d/with @conn
+                                     [[:db/add block-id :block/title ""]])
+                             :db-after)]
+      (is (not= (sync-checksum/recompute-server-checksum placeholder-db)
+                (sync-checksum/recompute-server-checksum @conn))
+          "a stale object marker on a short title must not suppress divergence")
+      (is (not= (sync-checksum/recompute-checksum placeholder-db)
+                (sync-checksum/recompute-checksum @conn))))))
 
 (deftest offload-small-title-test
   (testing "small titles are not offloaded"
@@ -7235,17 +12544,23 @@
                      (js/Promise.resolve #js {:ok true})))
              (reset! worker-state/*db-sync-config {:http-base "https://example.com"})
              (-> (p/let [aes-key (crypt/<generate-aes-key)
-                         _ (sync-large-title/upload-large-title!
-                            {:repo test-repo
-                             :graph-id "graph-1"
-                             :title title
-                             :aes-key aes-key
-                             :http-base "https://example.com"
-                             :auth-headers nil
-                             :fail-fast-f db-sync/fail-fast
-                             :encrypt-text-value-f sync-crypt/<encrypt-text-value})
+                         obj (sync-large-title/upload-large-title!
+                              {:repo test-repo
+                               :graph-id "graph-1"
+                               :title title
+                               :aes-key aes-key
+                               :http-base "https://example.com"
+                               :auth-headers nil
+                               :fail-fast-f db-sync/fail-fast
+                               :encrypt-text-value-f
+                               sync-crypt/<encrypt-text-value})
                          body @captured-body]
                    (is (instance? js/Uint8Array body))
+                   (is (sync-large-title/large-title-object-v2? obj))
+                   (is (= sync-large-title/large-title-encrypted-payload-format
+                          (:payload-format obj)))
+                   (p/let [digest (sync-large-title/<sha256-hex body)]
+                     (is (= digest (:payload-digest obj))))
                    (let [payload-str (.decode (js/TextDecoder.) body)]
                      (p/let [title' (sync-crypt/<decrypt-text-value aes-key payload-str)]
                        (is (= title title')))))
@@ -7254,6 +12569,45 @@
                      (set! js/fetch fetch-prev)
                      (reset! worker-state/*db-sync-config config-prev)
                      (done))))))))
+
+(deftest download-large-title-rejects-payload-digest-mismatch-test
+  (async done
+         (let [fetch-prev js/fetch
+               payload (.encode (js/TextEncoder.) "corrupted title")
+               obj {:asset-uuid "corrupt-title"
+                    :asset-type "txt"
+                    :payload-format "utf8-plain-v1"
+                    :payload-digest-alg "sha256-v1"
+                    :payload-digest (apply str (repeat 64 "0"))}]
+           (set! js/fetch
+                 (fn [& _]
+                   (p/resolved
+                    #js {:ok true
+                         :status 200
+                         :arrayBuffer
+                         (fn [] (p/resolved (.-buffer payload)))})))
+           (->
+            (sync-large-title/download-large-title!
+             {:repo test-repo
+              :graph-id "graph-1"
+              :obj obj
+              :aes-key nil
+              :http-base "https://example.com"
+              :auth-headers nil
+              :fail-fast-f db-sync/fail-fast
+              :decrypt-text-value-f sync-crypt/<decrypt-text-value
+              :strict-decrypt-text-value-f
+              sync-crypt/<decrypt-text-value-strict})
+            (p/then (fn [_]
+                      (is false "corrupted payload must not rehydrate")))
+            (p/catch
+             (fn [error]
+               (is (= :db-sync/large-title-integrity-failed
+                      (:type (ex-data error))))))
+            (p/finally
+             (fn []
+               (set! js/fetch fetch-prev)
+               (done)))))))
 
 (deftest ^:fix-me download-large-title-decrypts-transit-payload-test
   (testing "encrypted large title downloads transit-encoded payload"
@@ -7289,24 +12643,32 @@
                      (done))))))))
 
 (deftest rehydrate-large-title-test
-  (testing "rehydrate fills empty title from object storage"
+  (testing "rehydrate restores the logical checksum after snapshot offload"
     (async done
-           (let [conn (db-test/create-conn-with-blocks
+           (let [large-title (apply str (repeat 5000 "a"))
+                 conn (db-test/create-conn-with-blocks
                        {:pages-and-blocks
                         [{:page {:block/title "rehydrate-page"}
-                          :blocks [{:block/title "rehydrate-block"}]}]})
-                 block (db-test/find-block-by-content @conn "rehydrate-block")
+                          :blocks [{:block/title large-title}]}]})
+                 block (db-test/find-block-by-content @conn large-title)
                  block-id (:db/id block)
+                 logical-checksum (sync-checksum/recompute-checksum @conn)
                  tx-data [[:db/add block-id :block/title ""]
                           [:db/add block-id :logseq.property.sync/large-title-object
                            {:asset-uuid "title-1" :asset-type "txt"}]]
+                 transport-checksum* (atom nil)
                  download-calls (atom [])
                  download-fn (fn [_repo _graph-id obj _aes-key]
                                (swap! download-calls conj obj)
-                               (p/resolved "rehydrated-title"))]
+                               (p/resolved large-title))]
              (with-datascript-conns conn nil
                (fn []
                  (d/transact! conn tx-data)
+                 (reset! transport-checksum*
+                         (sync-checksum/recompute-checksum @conn))
+                 (is (not= logical-checksum
+                           @transport-checksum*)
+                     "adding an offload marker advances the legacy checksum to the transport view")
                  (is (some? (worker-state/get-datascript-conn test-repo)))
                  (let [obj-datoms (filter #(= :logseq.property.sync/large-title-object (:a %))
                                           (d/datoms @conn :eavt))
@@ -7337,7 +12699,12 @@
                              _ (is (some? result))
                              block (d/entity @conn block-id)]
                        (is (= [{:asset-uuid "title-1" :asset-type "txt"}] @download-calls))
-                       (is (= "rehydrated-title" (:block/title block))))
+                       (is (= large-title (:block/title block)))
+                       (is (= @transport-checksum*
+                              (sync-checksum/recompute-checksum @conn))
+                           "rehydration must retain the old server checksum")
+                       (is (not= logical-checksum
+                                 (sync-checksum/recompute-checksum @conn))))
                      (p/finally done))))))))
 
 (deftest rehydrate-large-title-tempid-test
@@ -7766,3 +13133,4057 @@
               (is (not= template-3-uuid redone-ref-uuid)))
             (finally
               (reset! undo-redo/*apply-history-action! prev-apply-action))))))))
+
+(defn- install-legacy-built-in-value-without-type!
+  [conn block property-ident value]
+  (let [property (d/entity @conn property-ident)
+        property-type (:logseq.property/type property)]
+    (is (= property-ident (:db/ident property)))
+    (is (some? property-type)
+        (str property-ident " must start as a complete built-in fixture"))
+    ;; Reproduce an on-disk graph written by an older client: the built-in
+    ;; attribute and value exist, but the built-in property entity is missing
+    ;; its newer schema/type datom.
+    (d/transact! conn [[:db/retract property-ident :logseq.property/type property-type]
+                       [:db/add (:db/id block) property-ident value]])
+    (is (nil? (:logseq.property/type (d/entity @conn property-ident))))
+    (is (= value (get (d/entity @conn (:db/id block)) property-ident)))))
+
+(defn- changed-block-validation
+  [conn block]
+  (try
+    (let [tx-report (d/with @conn
+                            [[:db/add (:db/id block)
+                              :block/updated-at
+                              1770000000000]])
+          [valid? errors] (db-validate/validate-tx-report tx-report nil)]
+      {:valid? valid?
+       :errors errors})
+    (catch :default error
+      {:error error})))
+
+(defn- pending-forward-semantics
+  [pending-txs]
+  (mapv (fn [{:keys [tx-id tx]}]
+          {:tx-id tx-id
+           :tx (mapv (fn [item]
+                       ;; DataScript allocates a fresh transaction id whenever
+                       ;; the same e/a/v is replayed during rebase. It is not
+                       ;; part of the pending user operation's semantics.
+                       (if (and (vector? item) (= 5 (count item)))
+                         (subvec item 0 4)
+                         item))
+                     tx)})
+        pending-txs))
+
+(deftest legacy-built-in-property-values-validate-without-stored-property-type-test
+  (testing "known legacy built-ins derive their validation contract without mutating the property entity"
+    (doseq [[label property-ident value]
+            [["heading" :logseq.property/heading 3]
+             ["math display" :logseq.property.node/display-type :math]]]
+      (let [{:keys [conn child1]} (setup-parent-child)]
+        (install-legacy-built-in-value-without-type!
+         conn child1 property-ident value)
+        (let [{:keys [valid? errors error]} (changed-block-validation conn child1)]
+          (is (nil? error)
+              (str label " raised instead of validating: "
+                   (some-> error ex-message)
+                   " "
+                   (some-> error ex-data)))
+          (is valid? (str label " was rejected: " errors))
+          (is (nil? (:logseq.property/type
+                     (d/entity @conn property-ident)))
+              "validation must not silently rewrite legacy graph state"))))))
+
+(deftest legacy-built-in-property-compatibility-keeps-strict-value-validation-test
+  (testing "a missing stored type does not make an invalid known built-in value valid"
+    (let [{:keys [conn child1]} (setup-parent-child)]
+      (install-legacy-built-in-value-without-type!
+       conn child1 :logseq.property.node/display-type "math")
+      (let [{:keys [valid? error]} (changed-block-validation conn child1)]
+        (is (or error (false? valid?))
+            "display-type must remain keyword-only"))))
+
+  (testing "an unknown incomplete property is not accepted by a broad nil-type fallback"
+    (let [{:keys [conn child1]} (setup-parent-child)
+          property-ident :logseq.property/not-a-built-in]
+      (d/transact! conn [{:db/id -100
+                          :db/ident property-ident}
+                         [:db/add (:db/id child1)
+                          property-ident
+                          "unexpected"]])
+      (let [{:keys [valid? error]} (changed-block-validation conn child1)]
+        (is (or error (false? valid?))
+            "only recognized legacy built-ins may use compatibility validation")))))
+
+(deftest legacy-built-in-properties-survive-remote-rebase-with-pending-local-txs-test
+  (testing "ordinary remote apply preserves pending local order/content for valid legacy built-in values"
+    (doseq [[label property-ident value]
+            [["heading" :logseq.property/heading 3]
+             ["math display" :logseq.property.node/display-type :math]]]
+      (let [{:keys [conn client-ops-conn parent child1 child2]}
+            (setup-parent-child)
+            client {:repo test-repo
+                    :inflight (atom [])
+                    :last-sync-error (atom nil)
+                    :online-users (atom [])
+                    :pending-pull-since (atom nil)
+                    :ws-state (atom :open)}]
+        (with-datascript-conns
+          conn
+          client-ops-conn
+          (fn []
+            ;; Produce the durable pending queue through the same listener used
+            ;; by normal local writes while the built-in metadata is complete.
+            (ldb/transact! conn
+                           [[:db/add (:db/id child1)
+                             :block/title
+                             "child 1 pending"]])
+            (ldb/transact! conn
+                           [[:db/add (:db/id child2)
+                             :block/title
+                             "child 2 pending"]])
+            (let [pending-before (#'sync-apply/pending-txs test-repo)
+                  tx-ids-before (mapv :tx-id pending-before)
+                  forward-semantics-before
+                  (pending-forward-semantics pending-before)]
+              (is (= 2 (count pending-before)) label)
+              (is (= 2 (count (distinct tx-ids-before))) label)
+
+              ;; Model legacy persisted metadata without recording the fixture
+              ;; preparation itself as a third local user transaction.
+              (d/unlisten! conn ::listen-db)
+              (install-legacy-built-in-value-without-type!
+               conn child1 property-ident value)
+
+              (let [apply-error
+                    (try
+                      (sync-apply/apply-remote-txs!
+                       test-repo
+                       client
+                       [{:t 1
+                         :tx-data [[:db/add (:db/id parent)
+                                    :block/updated-at
+                                    1770000000100]]}])
+                      nil
+                      (catch :default error
+                        error))
+                    pending-after (#'sync-apply/pending-txs test-repo)]
+                (when apply-error
+                  (with-redefs [shared-service/broadcast-to-clients!
+                                (fn [& _] nil)]
+                    (#'db-sync/handle-runtime-sync-failure!
+                     test-repo client nil nil apply-error :receive)))
+                (is (nil? apply-error)
+                    (str label
+                         " entered the remote-apply failure path: "
+                         (some-> apply-error ex-message)
+                         " "
+                         (some-> apply-error ex-data)))
+                (is (= :open @(:ws-state client))
+                    "a compatible legacy value must not require sync repair")
+                (is (= tx-ids-before (mapv :tx-id pending-after))
+                    "pending local transaction order/identity must be stable")
+                (is (= forward-semantics-before
+                       (pending-forward-semantics pending-after))
+                    "pending local transaction e/a/v content must not be lost")
+                (is (= "child 1 pending"
+                       (:block/title
+                        (d/entity @conn [:block/uuid (:block/uuid child1)]))))
+                (is (= "child 2 pending"
+                       (:block/title
+                        (d/entity @conn [:block/uuid (:block/uuid child2)]))))
+                (is (= value
+                       (get (d/entity @conn
+                                      [:block/uuid (:block/uuid child1)])
+                            property-ident)))
+                (is (= 1770000000100
+                       (:block/updated-at
+                        (d/entity @conn [:block/uuid (:block/uuid parent)]))))))))))))
+
+(defn- parse-loopback-message
+  [raw]
+  (js->clj (js/JSON.parse raw) :keywordize-keys true))
+
+(defn- <settle-loopback-client!
+  [client]
+  ;; A server response enters the receive queue, and hello/pull handling can
+  ;; enqueue more work on the send queue. Drain both public connection queues
+  ;; repeatedly so the test observes a stable protocol state rather than one
+  ;; promise turn in the middle of the handshake.
+  (p/loop [remaining 12]
+    (if (zero? remaining)
+      nil
+      (p/let [_ (p/delay 0)
+              _ (when-let [queue (:receive-queue client)]
+                  @queue)
+              _ (when-let [queue (:send-queue client)]
+                  @queue)]
+        (p/recur (dec remaining))))))
+
+(defn- loopback-client-diagnostic
+  [client]
+  {:ws-state @(:ws-state client)
+   :inflight (vec @(:inflight client))
+   :last-error (some-> @(:last-sync-error client) ex-data)
+   :receive-queue-present? (some? (:receive-queue client))
+   :send-queue-present? (some? (:send-queue client))})
+
+(defn- <wait-for-loopback-open!
+  [client timeout-ms]
+  (let [deadline (+ (js/Date.now) timeout-ms)]
+    (p/loop []
+      (p/let [_ (when-let [queue (:receive-queue client)] @queue)
+              _ (when-let [queue (:send-queue client)] @queue)]
+        (if (or (= :open @(:ws-state client))
+                (>= (js/Date.now) deadline))
+          (loopback-client-diagnostic client)
+          (p/let [_ (p/delay 25)]
+            (p/recur)))))))
+
+(defn- make-sync-loopback
+  [server-self failure-mode]
+  (let [client-messages* (atom [])
+        server-messages* (atom [])
+        sockets* (atom [])
+        dropped-batch-ack?* (atom false)
+        failed-batch-send?* (atom false)]
+    (aset
+     server-self
+     "state"
+     #js {:getWebSockets
+          (fn []
+            (to-array (map :server-ws @sockets*)))})
+    {:client-messages* client-messages*
+     :server-messages* server-messages*
+     :sockets* sockets*
+     :dropped-batch-ack?* dropped-batch-ack?*
+     :failed-batch-send?* failed-batch-send?*
+     :connect
+     (fn [_url]
+       (let [client-ws (js-obj)
+             server-ws (js-obj)
+             connection-number (inc (count @sockets*))
+             network-close!
+             (fn []
+               (when-not (= 3 (.-readyState client-ws))
+                 (set! (.-readyState client-ws) 3)
+                 (set! (.-readyState server-ws) 3)
+                 (when-let [onclose (.-onclose client-ws)]
+                   (onclose #js {}))))
+             deliver-server-message!
+             (fn [raw]
+               (let [message (parse-loopback-message raw)]
+                 (swap! server-messages*
+                        conj
+                        {:connection connection-number
+                         :message message})
+                 (if (and (contains? #{:drop-first-batch-ack
+                                      :drop-first-batch-ack-forget-wire}
+                                    failure-mode)
+                          (= "tx/batch/ok" (:type message))
+                          (compare-and-set! dropped-batch-ack?* false true))
+                   ;; The server has already committed before its socket sends
+                   ;; this response. Lose only the acknowledgement, then model
+                   ;; the transport closing and let the public client reconnect.
+                   (js/queueMicrotask network-close!)
+                   (js/queueMicrotask
+                    (fn []
+                      (when (and (= 1 (.-readyState client-ws))
+                                 (fn? (.-onmessage client-ws)))
+                        ((.-onmessage client-ws) #js {:data raw})))))))
+             send-client-message!
+             (fn [raw]
+               (let [message (parse-loopback-message raw)]
+                 (swap! client-messages*
+                        conj
+                        {:connection connection-number
+                         :message message})
+                 (if (and (= :fail-first-batch-send failure-mode)
+                          (= "tx/batch" (:type message))
+                          (compare-and-set! failed-batch-send?* false true))
+                   ;; No server handler call: this failure is observably before
+                   ;; commit, not a committed request whose response was lost.
+                   (throw (js/Error. "loopback send failed before server commit"))
+                   (sync-ws-handler/handle-ws-message!
+                    server-self server-ws raw))))]
+         (set! (.-readyState client-ws) 0)
+         (set! (.-readyState server-ws) 1)
+         (set! (.-send client-ws) send-client-message!)
+         (set! (.-send server-ws) deliver-server-message!)
+         (set! (.-close client-ws)
+               (fn [& _]
+                 (set! (.-readyState client-ws) 3)
+                 (set! (.-readyState server-ws) 3)))
+         (set! (.-close server-ws)
+               (fn [& _]
+                 (js/queueMicrotask network-close!)))
+         (swap! sockets* conj
+                {:connection connection-number
+                 :client-ws client-ws
+                 :server-ws server-ws})
+         client-ws))}))
+
+(defn- install-memory-asset-fetch!
+  [assets* requests* server-self]
+  (fn [url opts]
+    (let [method (or (some-> opts .-method) "GET")
+          url* (str url)
+          control-request?
+          (= "/sync/graph-1/checksum/large-title-markers"
+             (.-pathname (js/URL. url*)))
+          request (when control-request?
+                    (js/Request. url* opts))
+          authorization
+          (when request
+            (.get (.-headers request) "authorization"))]
+      (swap! requests* conj
+             (cond-> {:method method :url url*}
+               control-request?
+               (assoc :authorization authorization)))
+      (if control-request?
+        ;; Exercise the production Durable Object route. The public Worker
+        ;; authenticates before forwarding this request; the loopback records
+        ;; and asserts the Authorization header produced by the real client.
+        (if (= "Bearer loopback-token" authorization)
+          (sync-handler/handle-http server-self request)
+          (p/resolved
+           (js/Response.
+            (js/JSON.stringify #js {:error "unauthorized"})
+            #js {:status 401
+                 :headers #js {"content-type" "application/json"}})))
+        (case method
+          "PUT"
+          (let [payload (js/Uint8Array. (.-body opts))]
+            (swap! assets* assoc url* payload)
+            (p/resolved #js {:ok true :status 200}))
+
+          "GET"
+          (if-let [payload (get @assets* url*)]
+            (let [copy (js/Uint8Array. payload)]
+              (p/resolved
+               #js {:ok true
+                    :status 200
+                    :arrayBuffer (fn [] (p/resolved (.-buffer copy)))}))
+            (p/resolved #js {:ok false :status 404}))
+
+          (p/resolved #js {:ok false :status 405}))))))
+
+(defn- open-current-loopback-client!
+  []
+  (let [client @worker-state/*db-sync-client
+        ws (:ws client)]
+    (set! (.-readyState ws) 1)
+    ((.-onopen ws) #js {})
+    client))
+
+(defn- <run-e2ee-large-title-retry-scenario
+  [failure-mode]
+  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+        block-uuid (:block/uuid child1)
+        _ (ldb/transact!
+           conn
+           [(ldb/kv :logseq.kv/graph-rtc-e2ee? true)]
+           {:persist-op? false})
+        original-server-db @conn
+        server-seed-storage (make-real-worker-storage-sql)
+        _ (d/conn-from-datoms
+           (d/datoms original-server-db :eavt)
+           (d/schema original-server-db)
+           {:storage
+            (sync-storage/new-sqlite-storage
+             (:sql server-seed-storage))})
+        server-storage (make-real-worker-storage-sql)
+        _ (#'sync-handler/import-snapshot-rows!
+           (:sql server-storage)
+           "kvs"
+           (real-kvs-rows (:sql server-seed-storage)))
+        ;; open-conn installs the same storage-update listener used by the
+        ;; deployed sync server, so a successful tx/batch advances durable
+        ;; t/checksum metadata before its acknowledgement is delivered.
+        server-conn (sync-storage/open-conn (:sql server-storage))
+        server-self #js {:sql (:sql server-storage)
+                         :conn server-conn
+                         :schema-ready false}
+        loopback (make-sync-loopback server-self failure-mode)
+        assets* (atom {})
+        asset-requests* (atom [])
+        large-title (str (apply str (repeat 1535 "汉"))
+                         " ack-loss-retry")
+        ;; Model the observed upgraded graph: a durable legacy snapshot base
+        ;; can have a non-zero cursor with no retained incremental history.
+        initial-t 2733
+        fetch-prev js/fetch
+        worker-state-prev @worker-state/*state
+        client-prev @worker-state/*db-sync-client
+        config-prev @worker-state/*db-sync-config
+        start-inflight-prev @db-sync/*start-inflight
+        latest-tx-prev @sync-apply/*repo->latest-remote-tx
+        latest-checksum-prev @sync-apply/*repo->latest-remote-checksum
+        latest-version-prev @sync-apply/*repo->latest-remote-checksum-version
+        platform-prev (try
+                        (platform/current)
+                        (catch :default _ nil))]
+    (sync-storage/set-t! (:sql server-storage) initial-t)
+    (reset! worker-state/*db-sync-config
+            {:ws-url "wss://sync.example.test/sync/%s"
+             :http-base "https://sync.example.test"})
+    (reset! worker-state/*state
+            (assoc worker-state-prev
+                   :auth/id-token "loopback-token"))
+    (reset! worker-state/*db-sync-client nil)
+    (reset! db-sync/*start-inflight nil)
+    (reset! sync-apply/*repo->latest-remote-tx {})
+    (reset! sync-apply/*repo->latest-remote-checksum {})
+    (reset! sync-apply/*repo->latest-remote-checksum-version {})
+    (set! js/fetch
+          (install-memory-asset-fetch!
+           assets* asset-requests* server-self))
+    (platform/set-platform!
+     (assoc (minimal-platform :node)
+            :websocket {:connect (:connect loopback)}))
+    (->
+     (p/let [aes-key (crypt/<generate-aes-key)]
+       (with-datascript-conns
+         conn
+         client-ops-conn
+         (fn []
+           (p/with-redefs
+             [worker-state/online? (constantly true)
+              db-sync/<resolve-ws-token (fn [] (p/resolved "loopback-token"))
+              sync-crypt/graph-e2ee? (constantly true)
+              sync-crypt/<ensure-graph-aes-key
+              (fn [_repo _graph-id] (p/resolved aes-key))
+              sync-assets/enqueue-asset-sync! (fn [& _] nil)
+              shared-service/broadcast-to-clients! (fn [& _] nil)]
+             (client-op/update-graph-uuid test-repo "graph-1")
+             (client-op/update-local-tx test-repo initial-t)
+             (client-op/update-local-checksum
+              test-repo
+              (sync-checksum/recompute-checksum @conn))
+             (client-op/update-local-server-checksum
+              test-repo
+              (sync-checksum/recompute-server-checksum @conn))
+
+             ;; Use the production DB listener for the local edit so the
+             ;; pending transaction and both checksum representations originate
+             ;; from the same path as the desktop/db-worker runtime.
+             (d/unlisten! conn ::listen-db)
+             (db-listener/listen-db-changes!
+              test-repo conn :handler-keys [:db-sync])
+             (ldb/transact!
+              conn
+              [[:db/add (:db/id child1) :block/title large-title]]
+              {:outliner-op :save-block})
+
+             (p/let [_ (db-sync/start! test-repo)
+                     first-client (open-current-loopback-client!)
+                     _ (<settle-loopback-client! first-client)
+                     first-observation
+                     {:server-t-after-first
+                      (sync-handler/t-now server-self)
+                      :local-t-after-first
+                      (client-op/get-local-tx test-repo)
+                      :pending-after-first
+                      (client-op/get-pending-local-tx-count test-repo)
+                      :first-ws-state @(:ws-state first-client)
+                      :server-marker-after-first
+                      (get
+                       (d/entity @server-conn
+                                 [:block/uuid block-uuid])
+                       sync-large-title/large-title-object-attr)}
+                     _ (when (= :drop-first-batch-ack-forget-wire
+                                failure-mode)
+                         (when-let [tx-id
+                                    (some-> (sync-apply/pending-txs
+                                             test-repo {:limit 1})
+                                            first
+                                            :tx-id)]
+                           (client-op/delete-client-tx-upload-state!
+                            test-repo tx-id)))
+                     _ (db-sync/start! test-repo)
+                     second-client (open-current-loopback-client!)
+                     retry-diagnostic-1s
+                     (<wait-for-loopback-open! second-client 1000)
+                     retry-diagnostic-5s
+                     (if (= :open (:ws-state retry-diagnostic-1s))
+                       retry-diagnostic-1s
+                       (<wait-for-loopback-open! second-client 4000))
+                     second-observation
+                     {:server-t-after-retry
+                      (sync-handler/t-now server-self)
+                      :local-t-after-retry
+                      (client-op/get-local-tx test-repo)
+                      :pending-after-retry
+                      (client-op/get-pending-local-tx-count test-repo)
+                      :retry-ws-state @(:ws-state second-client)
+                      :retry-diagnostic-1s retry-diagnostic-1s
+                      :retry-diagnostic-5s retry-diagnostic-5s}
+                     _ (db-sync/rehydrate-large-titles-from-db!
+                        test-repo "graph-1")
+                     _ (db-sync/stop!)
+                     _ (db-sync/start! test-repo)
+                     restarted-client (open-current-loopback-client!)
+                     _ (<settle-loopback-client! restarted-client)]
+               (let [local-entity
+                     (d/entity @conn [:block/uuid block-uuid])
+                     server-entity
+                     (d/entity @server-conn [:block/uuid block-uuid])
+                     local-marker
+                     (get local-entity
+                          sync-large-title/large-title-object-attr)
+                     server-marker
+                     (get server-entity
+                          sync-large-title/large-title-object-attr)
+                     marker-url
+                     (when local-marker
+                       (sync-large-title/asset-url
+                        "https://sync.example.test"
+                        "graph-1"
+                        (:asset-uuid local-marker)
+                        (:asset-type local-marker)))]
+                 (d/unlisten! conn ::db-listener/listen-db-changes!)
+                 (merge
+                  first-observation
+                  second-observation
+                  {:restart-ws-state @(:ws-state restarted-client)
+                   :restart-last-error @(:last-sync-error restarted-client)
+                   :local-t (client-op/get-local-tx test-repo)
+                   :server-t (sync-handler/t-now server-self)
+                   :pending
+                   (client-op/get-pending-local-tx-count test-repo)
+                   :large-title large-title
+                   :local-title (:block/title local-entity)
+                   :local-marker local-marker
+                   :server-marker server-marker
+                   :local-legacy
+                   (sync-checksum/recompute-checksum @conn)
+                   :server-legacy
+                   (sync-checksum/recompute-checksum @server-conn)
+                   :local-v2
+                   (sync-checksum/recompute-server-checksum @conn)
+                   :server-v2
+                   (sync-checksum/recompute-server-checksum @server-conn)
+                   :marker-asset-present? (contains? @assets* marker-url)
+                   :asset-requests @asset-requests*
+                   :asset-count (count @assets*)
+                   :client-messages @(:client-messages* loopback)
+                   :server-messages @(:server-messages* loopback)
+                   :dropped-batch-ack?
+                   @(:dropped-batch-ack?* loopback)
+                   :failed-batch-send?
+                   @(:failed-batch-send?* loopback)})))))))
+     (p/finally
+      (fn []
+        (db-sync/stop!)
+        (reset! worker-state/*db-sync-client client-prev)
+        (reset! worker-state/*db-sync-config config-prev)
+        (reset! worker-state/*state worker-state-prev)
+        (reset! db-sync/*start-inflight start-inflight-prev)
+        (reset! sync-apply/*repo->latest-remote-tx latest-tx-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum
+                latest-checksum-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum-version
+                latest-version-prev)
+        (set! js/fetch fetch-prev)
+        (.close (:db server-storage))
+        (.close (:db server-seed-storage))
+        (platform/set-platform!
+         (or platform-prev (minimal-platform :browser))))))))
+
+(defn- <run-existing-e2ee-marker-mismatch-scenario
+  [pending-local-edit?]
+  (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+        block-uuid (:block/uuid child1)
+        _ (ldb/transact!
+           conn
+           [(ldb/kv :logseq.kv/graph-rtc-e2ee? true)]
+           {:persist-op? false})
+        server-seed-storage (make-real-worker-storage-sql)
+        _ (d/conn-from-datoms
+           (d/datoms @conn :eavt)
+           (d/schema @conn)
+           {:storage
+            (sync-storage/new-sqlite-storage
+             (:sql server-seed-storage))})
+        server-storage (make-real-worker-storage-sql)
+        _ (#'sync-handler/import-snapshot-rows!
+           (:sql server-storage)
+           "kvs"
+           (real-kvs-rows (:sql server-seed-storage)))
+        server-conn (sync-storage/open-conn (:sql server-storage))
+        server-self #js {:sql (:sql server-storage)
+                         :conn server-conn
+                         :schema-ready true}
+        loopback (make-sync-loopback server-self nil)
+        assets* (atom {})
+        asset-requests* (atom [])
+        large-title (str (apply str (repeat 1535 "汉"))
+                         " existing-marker-split")
+        cursor 1
+        fetch-prev js/fetch
+        worker-state-prev @worker-state/*state
+        client-prev @worker-state/*db-sync-client
+        config-prev @worker-state/*db-sync-config
+        start-inflight-prev @db-sync/*start-inflight
+        latest-tx-prev @sync-apply/*repo->latest-remote-tx
+        latest-checksum-prev @sync-apply/*repo->latest-remote-checksum
+        latest-version-prev @sync-apply/*repo->latest-remote-checksum-version
+        platform-prev (try
+                        (platform/current)
+                        (catch :default _ nil))]
+    (reset! worker-state/*db-sync-config
+            {:ws-url "wss://sync.example.test/sync/%s"
+             :http-base "https://sync.example.test"})
+    (reset! worker-state/*state
+            (assoc worker-state-prev
+                   :auth/id-token "loopback-token"))
+    (reset! worker-state/*db-sync-client nil)
+    (reset! db-sync/*start-inflight nil)
+    (reset! sync-apply/*repo->latest-remote-tx {})
+    (reset! sync-apply/*repo->latest-remote-checksum {})
+    (reset! sync-apply/*repo->latest-remote-checksum-version {})
+    (set! js/fetch
+          (install-memory-asset-fetch!
+           assets* asset-requests* server-self))
+    (platform/set-platform!
+     (assoc (minimal-platform :node)
+            :websocket {:connect (:connect loopback)}))
+    (->
+     (p/let [aes-key (crypt/<generate-aes-key)
+             marker-a
+             (sync-large-title/upload-large-title!
+              {:repo test-repo
+               :graph-id "graph-1"
+               :title large-title
+               :aes-key aes-key
+               :http-base "https://sync.example.test"
+               :auth-headers nil
+               :fail-fast-f db-sync/fail-fast
+               :encrypt-text-value-f sync-crypt/<encrypt-text-value})
+             marker-b
+             (sync-large-title/upload-large-title!
+              {:repo test-repo
+               :graph-id "graph-1"
+               :title large-title
+               :aes-key aes-key
+               :http-base "https://sync.example.test"
+               :auth-headers nil
+               :fail-fast-f db-sync/fail-fast
+               :encrypt-text-value-f sync-crypt/<encrypt-text-value})]
+       (with-datascript-conns
+         conn
+         client-ops-conn
+         (fn []
+           (p/with-redefs
+             [worker-state/online? (constantly true)
+              db-sync/<resolve-ws-token (fn [] (p/resolved "loopback-token"))
+              sync-crypt/<ensure-graph-aes-key
+              (fn [_repo _graph-id] (p/resolved aes-key))
+              shared-service/broadcast-to-clients! (fn [& _] nil)]
+             ;; Construct the observed durable state: the server retained
+             ;; attempt A's transport marker while the client retained
+             ;; attempt B's marker and rehydrated logical title.
+             (d/transact!
+              server-conn
+              [[:db/add
+                [:block/uuid block-uuid]
+                :block/title
+                ""]
+               [:db/add
+                [:block/uuid block-uuid]
+                sync-large-title/large-title-object-attr
+                marker-a]])
+             (ldb/transact!
+              conn
+              [[:db/add
+                [:block/uuid block-uuid]
+                :block/title
+                large-title]
+               [:db/add
+                [:block/uuid block-uuid]
+                sync-large-title/large-title-object-attr
+                marker-b]]
+              {:rtc-tx? true
+               :persist-op? false})
+             (sync-storage/set-t! (:sql server-storage) cursor)
+             (client-op/update-graph-uuid test-repo "graph-1")
+             (client-op/update-local-tx test-repo cursor)
+             (client-op/update-local-checksum
+              test-repo
+              (sync-checksum/recompute-checksum @conn))
+             (client-op/update-local-server-checksum
+              test-repo
+              (sync-checksum/recompute-server-checksum @conn))
+             (when pending-local-edit?
+               (ldb/transact!
+                conn
+                [[:db/add
+                  [:block/uuid (:block/uuid child2)]
+                  :block/title
+                  "pending edit during marker split"]]
+                {:outliner-op :save-block}))
+
+             (let [legacy-before-local
+                   (sync-checksum/recompute-checksum @conn)
+                   legacy-before-server
+                   (sync-checksum/recompute-checksum @server-conn)
+                   v2-before-local
+                   (sync-checksum/recompute-server-checksum @conn)
+                   v2-before-server
+                   (sync-checksum/recompute-server-checksum @server-conn)]
+               (p/let [_ (db-sync/start! test-repo)
+                       client (open-current-loopback-client!)
+                       _ (<settle-loopback-client! client)
+                       first-state @(:ws-state client)
+                       first-error @(:last-sync-error client)
+                       pending-before-restart
+                        (client-op/get-pending-local-tx-count test-repo)
+                       local-t-before-restart
+                        (client-op/get-local-tx test-repo)
+                       server-t-before-restart
+                        (sync-handler/t-now server-self)
+                       local-marker-before-restart
+                        (get
+                         (d/entity @conn [:block/uuid block-uuid])
+                         sync-large-title/large-title-object-attr)
+                       server-marker-before-restart
+                        (get
+                         (d/entity @server-conn
+                                   [:block/uuid block-uuid])
+                         sync-large-title/large-title-object-attr)
+                       local-v2-before-restart
+                        (sync-checksum/recompute-server-checksum @conn)
+                       server-v2-before-restart
+                        (sync-checksum/recompute-server-checksum
+                         @server-conn)
+                       _ (db-sync/stop!)
+                       _ (db-sync/start! test-repo)
+                       restarted-client (open-current-loopback-client!)
+                       _ (<settle-loopback-client! restarted-client)
+                       result
+                       (let [local-entity
+                             (d/entity @conn [:block/uuid block-uuid])
+                             server-entity
+                             (d/entity @server-conn
+                                       [:block/uuid block-uuid])]
+                         {:legacy-before-local legacy-before-local
+                          :legacy-before-server legacy-before-server
+                          :v2-before-local v2-before-local
+                          :v2-before-server v2-before-server
+                          :first-state first-state
+                          :first-error first-error
+                          :pending-before-restart pending-before-restart
+                          :local-t-before-restart local-t-before-restart
+                          :server-t-before-restart server-t-before-restart
+                          :local-marker-before-restart
+                          local-marker-before-restart
+                          :server-marker-before-restart
+                          server-marker-before-restart
+                          :local-v2-before-restart
+                          local-v2-before-restart
+                          :server-v2-before-restart
+                          server-v2-before-restart
+                          :restart-state @(:ws-state restarted-client)
+                          :restart-error @(:last-sync-error restarted-client)
+                          :local-t (client-op/get-local-tx test-repo)
+                          :server-t (sync-handler/t-now server-self)
+                          :pending
+                          (client-op/get-pending-local-tx-count test-repo)
+                          :large-title large-title
+                          :local-title (:block/title local-entity)
+                          :local-marker
+                          (get local-entity
+                               sync-large-title/large-title-object-attr)
+                          :server-marker
+                          (get server-entity
+                               sync-large-title/large-title-object-attr)
+                          :local-legacy
+                          (sync-checksum/recompute-checksum @conn)
+                          :server-legacy
+                          (sync-checksum/recompute-checksum @server-conn)
+                          :local-v2
+                          (sync-checksum/recompute-server-checksum @conn)
+                          :server-v2
+                          (sync-checksum/recompute-server-checksum @server-conn)
+                          :asset-requests @asset-requests*
+                          :client-messages
+                          @(:client-messages* loopback)})
+                       _ (db-sync/stop!)]
+                 result))))))
+     (p/finally
+      (fn []
+        (db-sync/stop!)
+        (reset! worker-state/*db-sync-client client-prev)
+        (reset! worker-state/*db-sync-config config-prev)
+        (reset! worker-state/*state worker-state-prev)
+        (reset! db-sync/*start-inflight start-inflight-prev)
+        (reset! sync-apply/*repo->latest-remote-tx latest-tx-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum
+                latest-checksum-prev)
+        (reset! sync-apply/*repo->latest-remote-checksum-version
+                latest-version-prev)
+        (set! js/fetch fetch-prev)
+        (platform/set-platform!
+         (or platform-prev (minimal-platform :browser))))))))
+
+(deftest existing-e2ee-marker-only-mismatch-recovers-through-client-sync-test
+  (async done
+         (->
+          (<run-existing-e2ee-marker-mismatch-scenario false)
+          (p/then
+           (fn [{:keys [legacy-before-local
+                        legacy-before-server
+                        v2-before-local
+                        v2-before-server
+                        first-state
+                        first-error
+                        restart-state
+                        restart-error
+                        local-t
+                        server-t
+                        pending
+                        large-title
+                        local-title
+                        local-marker
+                        server-marker
+                        local-legacy
+                        server-legacy
+                        local-v2
+                        server-v2
+                        asset-requests
+                        client-messages]}]
+             (is (= legacy-before-local legacy-before-server)
+                 "the fixture must match the observed legacy checksum")
+             (is (not= v2-before-local v2-before-server)
+                 "only the randomized transport marker may differ")
+             (is (= :open first-state)
+                 "the real hello path must reconcile a marker-only split")
+             (is (nil? first-error))
+             (is (= :open restart-state)
+                 "a fresh hello must verify the durable recovery")
+             (is (nil? restart-error))
+             (is (= 1 local-t server-t))
+             (is (zero? pending))
+             (is (= large-title local-title))
+             (is (= local-marker server-marker))
+             (is (= local-legacy server-legacy))
+             (is (= local-v2 server-v2))
+             (let [marker-state-requests
+                   (filterv
+                    #(string/includes?
+                      (:url %)
+                      "/sync/graph-1/checksum/large-title-markers")
+                    asset-requests)
+                   marker-asset-downloads
+                   (filterv
+                    #(and (= "GET" (:method %))
+                          (string/includes?
+                           (:url %)
+                           "/assets/graph-1/"))
+                    asset-requests)]
+               (is (= 1 (count marker-state-requests))
+                   "recovery must use the additive marker control route")
+               (is (every?
+                    #(= "Bearer loopback-token"
+                        (:authorization %))
+                    marker-state-requests)
+                   "the production client must authenticate marker recovery")
+               (is (= 1 (count marker-asset-downloads))
+                   "recovery must authenticate and verify the server marker payload")
+               (is (not-any?
+                    #(string/includes? (:url %) "/snapshot/")
+                    asset-requests)
+                   "marker recovery must not use snapshot upload/download")
+               (is (not-any?
+                    #(= "tx/batch" (get-in % [:message :type]))
+                    client-messages)
+                   "marker recovery must not mutate the server DB"))))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
+
+(deftest same-cursor-hello-with-pending-edit-does-not-report-ready-test
+  (let [{:keys [conn client-ops-conn child2]} (setup-parent-child)
+        cursor 2734
+        success-count* (atom 0)
+        flush-count* (atom 0)
+        client {:repo test-repo
+                :graph-id "graph-1"
+                :inflight (atom [])
+                :online-users (atom [])
+                :ws-state (atom :syncing)
+                :sync-succeeded-f
+                (fn [] (swap! success-count* inc))}
+        raw-message
+        (js/JSON.stringify
+         (clj->js
+          {:type "hello"
+           :t cursor
+           :checksum "server-legacy-before-pending-edit"
+           :checksum-version sync-checksum/server-checksum-version
+           :server-checksum "server-v2-before-pending-edit"}))]
+    (with-datascript-conns
+      conn
+      client-ops-conn
+      (fn []
+        (client-op/update-local-tx test-repo cursor)
+        (ldb/transact!
+         conn
+         [[:db/add
+           [:block/uuid (:block/uuid child2)]
+           :block/title
+           "pending edit before hello"]]
+         {:outliner-op :save-block})
+        (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
+        (with-redefs
+          [shared-service/broadcast-to-clients! (fn [& _] nil)
+           sync-apply/enqueue-flush-pending!
+           (fn [& _] (swap! flush-count* inc))
+           sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+          (sync-handle-message/handle-message!
+           test-repo client raw-message))
+        (is (zero? @success-count*)
+            "hello must not report ready while checksum comparison is deferred")
+        (is (= 1 @flush-count*)
+            "the pending edit still needs to advance through the normal upload path")
+        (is (= 1 (client-op/get-pending-local-tx-count test-repo)))))))
+
+(deftest tx-batch-ok-awaits-async-checksum-recovery-before-ready-test
+  (async done
+         (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+               tx-id (random-uuid)
+               resolve-verification* (atom nil)
+               verification
+               (p/create
+                (fn [resolve _reject]
+                  (reset! resolve-verification* resolve)))
+               success-count* (atom 0)
+               flush-count* (atom 0)
+               client {:repo test-repo
+                       :graph-id "graph-1"
+                       :inflight (atom [tx-id])
+                       :online-users (atom [])
+                       :ws-state (atom :syncing)
+                       :last-sync-error (atom nil)
+                       :sync-succeeded-f
+                       (fn [] (swap! success-count* inc))}
+               raw-message
+               (js/JSON.stringify
+                (clj->js
+                 {:type "tx/batch/ok"
+                  :t 2735
+                  :checksum "legacy-after-upload"
+                  :checksum-version sync-checksum/server-checksum-version
+                  :server-checksum "server-v2-after-upload"}))]
+           (with-datascript-conns
+             conn
+             client-ops-conn
+             (fn []
+               (client-op/update-local-tx test-repo 2734)
+               (seed-client-op-txs!
+                test-repo
+                [{:db-sync/tx-id tx-id
+                  :db-sync/created-at 1
+                  :db-sync/pending? true}])
+               (->
+                (p/with-redefs
+                  [sync-handle-message/verify-sync-checksum!
+                   (fn [& _] verification)
+                   shared-service/broadcast-to-clients! (fn [& _] nil)
+                   sync-apply/enqueue-flush-pending!
+                   (fn [& _] (swap! flush-count* inc))]
+                  (let [result
+                        (sync-handle-message/handle-message!
+                         test-repo client raw-message)]
+                    (is (p/promise? result)
+                        "receive queue must observe the async recovery")
+                    (is (zero? @success-count*))
+                    (is (zero? @flush-count*))
+                    (is (= 1
+                           (client-op/get-pending-local-tx-count
+                            test-repo)))
+                    (is (= [tx-id] @(:inflight client)))
+                    (is (= 2734 (client-op/get-local-tx test-repo)))
+                    (@resolve-verification* true)
+                    result))
+                (p/then
+                 (fn [_]
+                   (is (= 1 @success-count*))
+                   (is (= 1 @flush-count*))
+                   (is (zero?
+                        (client-op/get-pending-local-tx-count
+                         test-repo)))
+                   (is (= [] @(:inflight client)))
+                   (is (= 2735
+                          (client-op/get-local-tx test-repo)))))
+                (p/catch
+                 (fn [error]
+                   (is false (str "unexpected async failure: " error))))
+                (p/finally done)))))))
+
+(deftest pending-local-edit-and-existing-marker-split-converge-before-restart-test
+  (async done
+         (->
+          (<run-existing-e2ee-marker-mismatch-scenario true)
+          (p/then
+           (fn [{:keys [first-state
+                        first-error
+                        pending-before-restart
+                        local-t-before-restart
+                        server-t-before-restart
+                        local-marker-before-restart
+                        server-marker-before-restart
+                        local-v2-before-restart
+                        server-v2-before-restart
+                        client-messages]}]
+             (is (= :open first-state)
+                 "the first connection must converge without repair or restart")
+             (is (nil? first-error))
+             (is (zero? pending-before-restart))
+             (is (= 2
+                    local-t-before-restart
+                    server-t-before-restart))
+             (is (= local-marker-before-restart
+                    server-marker-before-restart))
+             (is (= local-v2-before-restart
+                    server-v2-before-restart))
+             (is (= 1
+                    (count
+                     (filter
+                      #(= "tx/batch" (get-in % [:message :type]))
+                      client-messages)))
+                 "the pending edit must upload exactly once")))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
+
+(deftest same-cursor-non-marker-divergence-remains-fail-closed-test
+  (testing "ordinary content divergence must not use marker reconciliation"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          cursor 2734
+          server-db @conn
+          remote-legacy
+          (sync-checksum/recompute-checksum server-db)
+          remote-v2
+          (sync-checksum/recompute-server-checksum server-db)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :last-sync-error (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}
+          raw-message
+          (js/JSON.stringify
+           (clj->js
+            {:type "hello"
+             :t cursor
+             :checksum remote-legacy
+             :checksum-version
+             sync-checksum/server-checksum-version
+             :server-checksum remote-v2}))]
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (client-op/update-local-tx test-repo cursor)
+          (ldb/transact!
+           conn
+           [[:db/add
+             [:block/uuid (:block/uuid child1)]
+             :block/title
+             "true non-marker divergence"]]
+           {:rtc-tx? true
+            :persist-op? false})
+          (let [local-legacy
+                (sync-checksum/recompute-checksum @conn)
+                local-v2
+                (sync-checksum/recompute-server-checksum @conn)]
+            (client-op/update-local-checksum test-repo local-legacy)
+            (client-op/update-local-server-checksum test-repo local-v2)
+            (let [error
+                  (try
+                    (with-redefs
+                      [shared-service/broadcast-to-clients!
+                       (fn [& _] nil)
+                       sync-assets/enqueue-asset-sync!
+                       (fn [& _] nil)]
+                      (sync-handle-message/handle-message!
+                       test-repo client raw-message))
+                    nil
+                    (catch :default error
+                      error))]
+              (is (nil?
+                   (get
+                    (d/entity @conn
+                              [:block/uuid (:block/uuid child1)])
+                    sync-large-title/large-title-object-attr))
+                  "the divergent entity must not carry a title marker")
+              (is (not= local-legacy remote-legacy))
+              (is (not= local-v2 remote-v2))
+              (is (= :db-sync/checksum-mismatch
+                     (:type (ex-data error))))
+              (is (= cursor (client-op/get-local-tx test-repo)))
+              (is (zero?
+                   (client-op/get-pending-local-tx-count test-repo))))))))))
+
+(deftest v1-hello-retains-legacy-checksum-compatibility-test
+  (testing "a v1 server without versioned fields remains governed by legacy checksum"
+    (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+          cursor 2734
+          legacy (sync-checksum/recompute-checksum @conn)
+          client {:repo test-repo
+                  :graph-id "graph-1"
+                  :inflight (atom [])
+                  :last-sync-error (atom nil)
+                  :online-users (atom [])
+                  :ws-state (atom :open)}
+          raw-message
+          (js/JSON.stringify
+           (clj->js {:type "hello"
+                     :t cursor
+                     :checksum legacy}))]
+      (with-datascript-conns
+        conn
+        client-ops-conn
+        (fn []
+          (client-op/update-local-tx test-repo cursor)
+          (client-op/update-local-checksum test-repo legacy)
+          ;; This intentionally cannot match any advertised v2 value. A v1
+          ;; hello must not accidentally consult it.
+          (client-op/update-local-server-checksum
+           test-repo
+           "ffffffffffffffff")
+          (with-redefs
+            [shared-service/broadcast-to-clients! (fn [& _] nil)
+             sync-apply/enqueue-flush-pending! (fn [& _] nil)
+             sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+            (is (nil?
+                 (sync-handle-message/handle-message!
+                  test-repo client raw-message))))
+          (is (= :open @(:ws-state client)))
+          (is (nil? @(:last-sync-error client)))
+          (is (= cursor (client-op/get-local-tx test-repo))))))))
+
+(deftest e2ee-large-title-commit-with-lost-ack-converges-through-reconnect-test
+  (async done
+         (->
+          (<run-e2ee-large-title-retry-scenario :drop-first-batch-ack)
+          (p/then
+           (fn [{:keys [server-t-after-first
+                        local-t-after-first
+                        pending-after-first
+                        first-ws-state
+                        server-marker-after-first
+                        server-t-after-retry
+                        local-t-after-retry
+                        pending-after-retry
+                        retry-ws-state
+                        retry-diagnostic-1s
+                        retry-diagnostic-5s
+                        restart-ws-state
+                        restart-last-error
+                        local-t
+                        server-t
+                        pending
+                        large-title
+                        local-title
+                        local-marker
+                        server-marker
+                        local-legacy
+                        server-legacy
+                        local-v2
+                        server-v2
+                        marker-asset-present?
+                        asset-requests
+                        asset-count
+                        client-messages
+                        dropped-batch-ack?]}]
+             (is dropped-batch-ack?
+                 "the first server commit acknowledgement must be lost")
+             (is (= 2734 server-t-after-first)
+                 "the first attempt must commit exactly once before disconnect")
+             (is (= 2733 local-t-after-first)
+                 "a lost acknowledgement must not fabricate local cursor progress")
+             (is (= 1 pending-after-first)
+                 "the unacknowledged logical edit remains durable")
+             (is (= :closed first-ws-state))
+             (is (sync-large-title/large-title-object-v2?
+                  server-marker-after-first))
+             (is (= server-t-after-retry local-t-after-retry)
+                 "the public retry path must finish on one authoritative cursor")
+             (is (= 2734 server-t-after-retry)
+                 "an exact retry must be acknowledged without a second commit")
+             (is (zero? pending-after-retry))
+             (is (= :open retry-ws-state)
+                 (str "exact-once reconciliation must reach open; 1s="
+                      retry-diagnostic-1s
+                      ", 5s=" retry-diagnostic-5s))
+             (is (= :open restart-ws-state)
+                 "the reconciled state must survive a fresh hello")
+             (is (nil? restart-last-error))
+             (is (= local-t server-t))
+             (is (zero? pending))
+             (is (= large-title local-title)
+                 "reconciliation must preserve the logical E2EE title")
+             (is (= local-marker server-marker)
+                 "the durable marker must converge to the server marker")
+             (is (= server-marker-after-first server-marker)
+                 (str "an acknowledged retry must retain the exact-once "
+                      "committed randomized E2EE wire body"))
+             (is (= local-legacy server-legacy))
+             (is (= local-v2 server-v2))
+             (is (sync-large-title/large-title-object-v2? local-marker))
+             (is marker-asset-present?
+                 "the converged marker must still resolve to uploaded ciphertext")
+             (is (= 1 asset-count)
+                 "a frozen retry must not create a second E2EE asset")
+             (is (not-any?
+                  #(string/includes? (:url %) "/snapshot/")
+                  asset-requests)
+                 "automatic recovery must not use snapshot upload/download")
+             (is (every?
+                  #(or (not
+                        (string/includes?
+                         (:url %)
+                         "/checksum/large-title-markers"))
+                       (= "Bearer loopback-token"
+                          (:authorization %)))
+                  asset-requests)
+                 "any marker control request must be authenticated")
+             (is (some #(= "pull" (get-in % [:message :type]))
+                       client-messages)
+                 "the reconnect must catch up through the sync protocol")))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
+
+(deftest e2ee-large-title-legacy-lost-ack-identity-conflict-converges-test
+  (testing "an upgrade without a frozen wire proves the committed marker before acknowledging the logical tx"
+    (async done
+           (->
+            (<run-e2ee-large-title-retry-scenario
+             :drop-first-batch-ack-forget-wire)
+            (p/then
+             (fn [{:keys [server-t-after-first
+                          server-t-after-retry
+                          local-t-after-retry
+                          pending-after-retry
+                          retry-ws-state
+                          restart-ws-state
+                          restart-last-error
+                          server-marker-after-first
+                          local-marker
+                          server-marker
+                          local-legacy
+                          server-legacy
+                          local-v2
+                          server-v2
+                          asset-count]}]
+               (is (= 2734 server-t-after-first))
+               (is (= 2734 server-t-after-retry)
+                   "identity-conflict recovery must not apply a second tx")
+               (is (= server-t-after-retry local-t-after-retry))
+               (is (zero? pending-after-retry))
+               (is (= :open retry-ws-state))
+               (is (= :open restart-ws-state))
+               (is (nil? restart-last-error))
+               (is (= server-marker-after-first server-marker)
+                   "the first committed wire remains authoritative")
+               (is (= local-marker server-marker))
+               (is (= local-legacy server-legacy))
+               (is (= local-v2 server-v2))
+               (is (<= 2 asset-count)
+                   "the rejected regenerated wire may upload one orphan asset")))
+            (p/catch
+             (fn [error]
+               (is false (str "unexpected legacy recovery failure: " error))))
+            (p/finally done)))))
+
+(deftest e2ee-large-title-send-failure-before-commit-retries-without-data-loss-test
+  (async done
+         (->
+          (<run-e2ee-large-title-retry-scenario :fail-first-batch-send)
+          (p/then
+           (fn [{:keys [server-t-after-first
+                        local-t-after-first
+                        pending-after-first
+                        server-t-after-retry
+                        local-t-after-retry
+                        pending-after-retry
+                        retry-ws-state
+                        restart-ws-state
+                        large-title
+                        local-title
+                        local-marker
+                        server-marker
+                        local-v2
+                        server-v2
+                        marker-asset-present?
+                        failed-batch-send?]}]
+             (is failed-batch-send?)
+             (is (= 2733 server-t-after-first)
+                 "a send failure before the server handler must not commit")
+             (is (= 2733 local-t-after-first))
+             (is (= 1 pending-after-first))
+             (is (= 2734 server-t-after-retry))
+             (is (= server-t-after-retry local-t-after-retry))
+             (is (zero? pending-after-retry))
+             (is (= :open retry-ws-state))
+             (is (= :open restart-ws-state))
+             (is (= large-title local-title))
+             (is (= local-marker server-marker))
+             (is (= local-v2 server-v2))
+             (is marker-asset-present?)))
+          (p/catch
+           (fn [error]
+             (is false (str "unexpected scenario failure: " error))))
+          (p/finally done))))
+
+(defn- test-sha256-hex
+  [value]
+  (-> (.createHash node-crypto "sha256")
+      (.update value "utf8")
+      (.digest "hex")))
+
+(defn- expected-upload-session-id
+  [logical-tx-id outliner-op full-tx-data]
+  (test-sha256-hex
+   (sync-protocol/tx->transit
+    [:client-tx-upload-session-v1
+     logical-tx-id
+     outliner-op
+     full-tx-data])))
+
+(defn- expected-chunk-tx-id
+  [logical-tx-id upload-session-id chunk-index chunk-final?]
+  (let [raw (test-sha256-hex
+             (str "logseq-tx-chunk-v2/"
+                  logical-tx-id "/"
+                  upload-session-id "/"
+                  chunk-index "/"
+                  (if chunk-final? "final" "more")))
+        versioned (str (subs raw 0 12)
+                       "5"
+                       (subs raw 13 16)
+                       "8"
+                       (subs raw 17 32))]
+    (uuid (str (subs versioned 0 8) "-"
+               (subs versioned 8 12) "-"
+               (subs versioned 12 16) "-"
+               (subs versioned 16 20) "-"
+               (subs versioned 20 32)))))
+
+(deftest nonfinal-large-upload-chunk-has-stable-idempotency-id-test
+  (testing "a lost ACK resends the same nonfinal chunk with the same server-visible identity"
+    (let [{:keys [conn child1]} (setup-parent-child)
+          repo "large-chunk-idempotency-repo"
+          logical-tx-id (random-uuid)
+          tx-data (vec
+                   (map (fn [idx]
+                          [:db/add [:block/uuid (:block/uuid child1)]
+                           :block/title (str "large-value-" idx)])
+                        (range 5001)))
+          pending [{:tx-id logical-tx-id
+                    :tx tx-data
+                    :outliner-op :save-block}]
+          first-entry (-> (sync-apply/prepare-upload-tx-entries
+                           repo conn pending)
+                          :tx-entries first)
+          retry-entry (-> (sync-apply/prepare-upload-tx-entries
+                           repo conn pending)
+                          :tx-entries first)]
+      (is (false? (:large-upload-final? first-entry)))
+      (is (false? (:chunk-final? first-entry)))
+      (is (= 0 (:chunk-index first-entry)))
+      (is (= logical-tx-id (:logical-tx-id first-entry)))
+      (is (= (expected-upload-session-id
+              logical-tx-id :save-block tx-data)
+             (:upload-session-id first-entry)))
+      (is (re-matches #"[0-9a-f]{64}" (:upload-session-id first-entry)))
+      (is (uuid? (:tx-id first-entry))
+          "every transmitted nonfinal chunk needs an idempotency identity")
+      (is (not= logical-tx-id (:tx-id first-entry))
+          "wire identity stays distinct from logical identity")
+      (is (= (expected-chunk-tx-id
+              logical-tx-id (:upload-session-id first-entry) 0 false)
+             (:tx-id first-entry)))
+      (is (not (contains? first-entry :chunk-next-index)))
+      (is (= (:tx-id first-entry) (:tx-id retry-entry))
+          "retrying before ACK must derive exactly the same chunk identity")
+      (is (= (:upload-session-id first-entry)
+             (:upload-session-id retry-entry)))
+      (is (= (:tx-data first-entry) (:tx-data retry-entry))))))
+
+(deftest e2ee-ack-loss-retry-reuses-identical-wire-payload-test
+  (testing "randomized encryption is performed once per identity, not once per retry"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 repo test-repo
+                 tx-id (random-uuid)
+                 block-uuid (:block/uuid child1)
+                 logical-plaintext
+                 (mapv (fn [idx]
+                         [:db/add [:block/uuid block-uuid]
+                          :block/title (str "logical-plaintext-" idx)])
+                       (range 5001))
+                 encrypt-call (atom 0)
+                 sent (atom [])
+                 client (assoc
+                         (#'db-sync/ensure-client-state! repo)
+                         :graph-id "graph-1"
+                         :ws (doto (js-obj)
+                               (aset "readyState" 1)
+                               (aset "send"
+                                     (fn [raw]
+                                       (swap! sent conj
+                                              (js->clj (js/JSON.parse raw)
+                                                       :keywordize-keys true))))))
+                 previous-remote @sync-apply/*repo->latest-remote-tx]
+             (-> (with-datascript-conns
+                   conn client-ops-conn
+                   (fn []
+                     (sync-apply/set-server-capabilities!
+                      repo ["tx-upload-staged-v1"])
+                     (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                     (client-op/update-local-tx repo 0)
+                     (seed-client-op-txs!
+                      repo
+                      [{:db-sync/tx-id tx-id
+                        :db-sync/pending? true
+                        :db-sync/created-at 1
+                        :db-sync/outliner-op :save-block
+                        :db-sync/normalized-tx-data logical-plaintext}])
+                     (p/with-redefs
+                       [worker-state/online? (constantly true)
+                        sync-crypt/graph-e2ee? (constantly true)
+                        sync-crypt/<ensure-graph-aes-key
+                        (fn [& _] (p/resolved #js {:test-key true}))
+                        sync-crypt/<encrypt-tx-data
+                        (fn [_key tx-data]
+                          (let [nonce (swap! encrypt-call inc)]
+                            (p/resolved
+                             (mapv (fn [idx datom]
+                                     (assoc datom 3
+                                            (str "ciphertext-nonce-"
+                                                 nonce "-" idx)))
+                                   (range)
+                                   tx-data))))
+                        sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                        sync-assets/enqueue-asset-sync! (fn [& _] nil)
+                        shared-service/broadcast-to-clients! (fn [& _] nil)]
+                       (p/let [_ (sync-handle-message/handle-message!
+                                  repo client
+                                  (js/JSON.stringify
+                                   (clj->js
+                                    {:type "hello"
+                                     :t 0
+                                     :capabilities
+                                     ["tx-upload-staged-v1"]})))
+                               _ (#'sync-apply/flush-pending! repo client)
+                               first-wire (first @sent)
+                               _ (do
+                                   (sync-apply/clear-upload-response-timeout! client)
+                                   (reset! (:inflight client) []))
+                               _ (#'sync-apply/flush-pending! repo client)
+                               second-wire (second @sent)
+                               first-entry (first (:txs first-wire))
+                               second-entry (first (:txs second-wire))]
+                         (is (= 2 (count @sent)))
+                         (is (= 1 @encrypt-call)
+                             "randomized encryption runs once for an ACK-loss retry")
+                         (is (not (contains? first-entry :payload-digest))
+                             "modern wire identity never trusts a client-declared digest")
+                         (is (= #{:tx :tx-id :logical-tx-id :upload-session-id
+                                  :chunk-index :chunk-final? :outliner-op}
+                                (set/intersection
+                                 #{:tx :tx-id :logical-tx-id :upload-session-id
+                                   :chunk-index :chunk-final? :outliner-op}
+                                 (set (keys first-entry))))
+                             "nonfinal E2EE wire chunks carry the complete modern identity")
+                         (is (= (str tx-id) (:logical-tx-id first-entry)))
+                         (is (= 0 (:chunk-index first-entry)))
+                         (is (false? (:chunk-final? first-entry)))
+                         (is (= (expected-upload-session-id
+                                 tx-id :save-block logical-plaintext)
+                                (:upload-session-id first-entry)))
+                         (is (= (str (expected-chunk-tx-id
+                                     tx-id (:upload-session-id first-entry) 0 false))
+                                (:tx-id first-entry)))
+                         (is (not (contains? first-entry :chunk-next-index)))
+                         (is (= first-entry second-entry)
+                             "the complete transmitted entry is byte-stable across retry")
+                         (is (= (:tx first-entry) (:tx second-entry))
+                             "ACK-loss retry must reuse identical ciphertext bytes")
+                         (is (= (:outliner-op first-entry)
+                                (:outliner-op second-entry)))))))
+                 (p/catch (fn [error]
+                            (is false (str error))))
+                 (p/finally
+                  (fn []
+                    (sync-apply/clear-upload-response-timeout! client)
+                    (reset! sync-apply/*repo->latest-remote-tx previous-remote)
+                    (#'sync-apply/set-upload-stopped! repo false)
+                    (done))))))))
+
+(deftest frozen-single-tx-retry-is-isolated-from-following-pending-work-test
+  (testing "a retry with a durable wire identity cannot share an ambiguous reject batch"
+    (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+          repo test-repo
+          frozen-tx-id (random-uuid)
+          following-tx-id (random-uuid)
+          frozen-tx [[:db/add [:block/uuid (:block/uuid child1)]
+                      :block/title "frozen-lost-ack"]]
+          following-tx [[:db/add [:block/uuid (:block/uuid child2)]
+                         :block/title "following-pending"]]
+          frozen-wire {:tx-data frozen-tx
+                       :large-title-logical-tx-data frozen-tx
+                       :outliner-op :save-block}
+          frozen-state
+          {:wire-version 1
+           :wire-kind :single-tx
+           :source-digest
+           (sync-protocol/tx-upload-session-id
+            frozen-tx-id :save-block frozen-tx)
+           :wire-entry frozen-wire}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (client-op/put-client-tx-upload-state!
+           repo frozen-tx-id frozen-state)
+          (let [{:keys [tx-entries]}
+                (sync-apply/prepare-upload-tx-entries
+                 repo conn
+                 [{:tx-id frozen-tx-id
+                   :tx frozen-tx
+                   :outliner-op :save-block}
+                  {:tx-id following-tx-id
+                   :tx following-tx
+                   :outliner-op :save-block}])]
+            (is (= [frozen-tx-id] (mapv :tx-id tx-entries))
+                "the first identity-conflict response must identify one logical retry")
+            (is (= frozen-state
+                   (client-op/get-client-tx-upload-state
+                    repo frozen-tx-id)))))))))
+
+(deftest malformed-frozen-wire-cannot-override-upload-envelope-test
+  (testing "durable retry state is strict data, not a way to inject envelope identity"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 repo test-repo
+                 tx-id (random-uuid)
+                 injected-tx-id (random-uuid)
+                 tx-data [[:db/add [:block/uuid (:block/uuid child1)]
+                           :block/title "strict-frozen-wire"]]
+                 malformed-state
+                 {:wire-version 1
+                  :wire-kind :single-tx
+                  :source-digest
+                  (sync-protocol/tx-upload-session-id tx-id :save-block tx-data)
+                  :wire-entry {:tx-id injected-tx-id
+                               :tx-data tx-data
+                               :large-title-logical-tx-data tx-data
+                               :outliner-op :save-block}}
+                 sent* (atom [])
+                 ws (doto (js-obj)
+                      (aset "readyState" 1)
+                      (aset "send" (fn [raw] (swap! sent* conj raw))))
+                 client (assoc (#'db-sync/ensure-client-state! repo)
+                               :graph-id "graph-1"
+                               :ws ws)
+                 previous-remote @sync-apply/*repo->latest-remote-tx]
+             (-> (with-datascript-conns
+                   conn client-ops-conn
+                   (fn []
+                     (client-op/update-local-tx repo 0)
+                     (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                     (#'sync-apply/set-upload-stopped! repo false)
+                     (reset! (:inflight client) [])
+                     (reset! (:last-sync-error client) nil)
+                     (seed-client-op-txs!
+                      repo
+                      [{:db-sync/tx-id tx-id
+                        :db-sync/pending? true
+                        :db-sync/created-at 1
+                        :db-sync/outliner-op :save-block
+                        :db-sync/normalized-tx-data tx-data}])
+                     (client-op/put-client-tx-upload-state!
+                      repo tx-id malformed-state)
+                     (p/with-redefs
+                       [worker-state/online? (constantly true)
+                        sync-crypt/graph-e2ee? (constantly false)
+                        sync-assets/enqueue-asset-sync! (fn [& _] nil)
+                        shared-service/broadcast-to-clients! (fn [& _] nil)]
+                       (p/let [_ (do
+                                  (is (= [tx-id]
+                                         (mapv :tx-id
+                                               (sync-apply/pending-txs repo))))
+                                  (let [flush-result
+                                        (#'sync-apply/flush-pending! repo client)]
+                                    (is (promise-like? flush-result))
+                                    flush-result))]
+                         (let [stored-state
+                               (client-op/get-client-tx-upload-state repo tx-id)]
+                           (is (= #{:tx-id
+                                    :tx-data
+                                    :large-title-logical-tx-data
+                                    :outliner-op}
+                                  (set (keys (:wire-entry stored-state)))))
+                           (is (nil? (#'sync-apply/normalize-frozen-upload-wire
+                                      stored-state)))
+                           (is (empty? @sent*)
+                               "malformed durable state cannot reach the wire")
+                           (is (= :invalid-frozen-upload-wire
+                                  (:code @(:last-sync-error client))))
+                           (is (= 1 (client-op/get-pending-local-tx-count repo))
+                               "the unsent logical edit remains pending")
+                           (is (= malformed-state stored-state)
+                               "ambiguous durable evidence stays available for repair tooling"))))))
+                 (p/catch (fn [error]
+                            (is false (str error))))
+                 (p/finally
+                  (fn []
+                    (sync-apply/clear-upload-response-timeout! client)
+                    (reset! sync-apply/*repo->latest-remote-tx previous-remote)
+                    (#'sync-apply/set-upload-stopped! repo false)
+                    (done))))))))
+
+(deftest rebase-after-nonfinal-ack-does-not-use-stale-positional-progress-test
+  (testing "a stale ACK cannot advance a rewritten pending transaction's new session"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          repo test-repo
+          tx-id (random-uuid)
+          block-uuid (:block/uuid child1)
+          original-tx
+          (mapv (fn [idx]
+                  [:db/add [:block/uuid block-uuid]
+                   :block/title (str "original-" idx)])
+                (range 5001))
+          pending {:tx-id tx-id
+                   :tx original-tx
+                   :outliner-op :save-block}
+          first-entry
+          (-> (sync-apply/prepare-upload-tx-entries repo conn [pending])
+              :tx-entries first)
+          progress-keys [:large-upload-original-tx-id
+                         :large-upload-next-index
+                         :large-upload-final?
+                         :logical-tx-id
+                         :upload-session-id
+                         :chunk-index
+                         :chunk-final?]
+          old-progress (select-keys first-entry progress-keys)
+          server-after-remote (d/conn-from-db @conn)
+          remote-tx [[:db/add [:block/uuid block-uuid]
+                      :block/updated-at 42]]
+          _ (d/transact! server-after-remote remote-tx)
+          expected-server (d/conn-from-db @server-after-remote)
+          required-rebased-datom
+          [:db/add [:block/uuid block-uuid] :block/updated-at 999999]
+          rewritten-tx (into [required-rebased-datom] original-tx)
+          rewritten-pending {:tx-id tx-id
+                             :tx rewritten-tx
+                             :outliner-op :rebase}
+          rebased-before-old-ack
+          (-> (sync-apply/prepare-upload-tx-entries
+               repo conn [rewritten-pending])
+              :tx-entries first)]
+      (is (false? (:large-upload-final? first-entry)))
+      (is (false? (:chunk-final? first-entry)))
+      (is (= 0 (:chunk-index first-entry)))
+      (is (not= (:upload-session-id first-entry)
+                (:upload-session-id rebased-before-old-ack))
+          "rewriting normalized tx data creates a new content session")
+      (is (= 0 (:chunk-index rebased-before-old-ack))
+          "a new upload session always starts at staged offset zero")
+      (is (some #(= required-rebased-datom %)
+                (:tx-data rebased-before-old-ack)))
+      (sync-apply/commit-upload-response!
+       repo {:large-upload-progress [old-progress]} nil)
+      (let [rebased-after-old-ack
+            (-> (sync-apply/prepare-upload-tx-entries
+                 repo conn [rewritten-pending])
+                :tx-entries first)
+            new-progress (select-keys rebased-after-old-ack progress-keys)]
+        (is (= (:upload-session-id rebased-before-old-ack)
+               (:upload-session-id rebased-after-old-ack)))
+        (is (= 0 (:chunk-index rebased-after-old-ack))
+            "the old session ACK must not advance the new session")
+        (is (= (:tx-id rebased-before-old-ack)
+               (:tx-id rebased-after-old-ack))
+            "the new session's first chunk remains byte-identical")
+        (is (some #(= required-rebased-datom %) (:tx-data rebased-after-old-ack))
+            "stale positional progress cannot skip a newly inserted first datom")
+
+        (sync-apply/commit-upload-response!
+         repo {:large-upload-progress [new-progress]} nil)
+        (let [final-entry
+              (-> (sync-apply/prepare-upload-tx-entries
+                   repo conn [rewritten-pending])
+                  :tx-entries first)]
+          (is (= 1 (:chunk-index final-entry))
+              "the next wire ordinal is independent of the source slice size")
+          (is (= (count rewritten-tx)
+                 (:large-upload-next-index final-entry))
+              "the separate source cursor reaches the full logical tx")
+          (is (true? (:chunk-final? final-entry)))
+          (is (= (expected-chunk-tx-id
+                  tx-id (:upload-session-id final-entry) 1 true)
+                 (:tx-id final-entry))
+              "final wire identity binds logical/session/ordinal/final")
+          (is (not= tx-id (:tx-id final-entry)))
+          (is (not (contains? final-entry :chunk-next-index)))
+          (is (= (:upload-session-id rebased-after-old-ack)
+                 (:upload-session-id final-entry)))
+
+          ;; Model the server contract: no nonfinal chunk touched the graph;
+          ;; final completion applies the entire rewritten logical tx once.
+          (d/transact! expected-server rewritten-tx)
+          (d/transact! server-after-remote rewritten-tx)
+        (is (= (sync-checksum/recompute-server-checksum @expected-server)
+                 (sync-checksum/recompute-server-checksum @server-after-remote))
+              "final application converges with every rebased datom present")
+
+          (with-datascript-conns
+            conn client-ops-conn
+            (fn []
+              (seed-client-op-txs!
+               repo
+               [{:db-sync/tx-id tx-id
+                 :db-sync/pending? true
+                 :db-sync/created-at 1
+                 :db-sync/outliner-op :rebase
+                 :db-sync/normalized-tx-data rewritten-tx}])
+              (sync-apply/commit-upload-response!
+               repo
+               {:large-upload-progress
+                [(select-keys final-entry progress-keys)]}
+               nil)
+              (sync-apply/mark-pending-txs-false! repo [tx-id])
+              (is (empty? (#'sync-apply/pending-txs repo))
+                  "final ACK clears the rewritten pending operation"))))))))
+
+(defn- <observe-upload-after-server-capabilities
+  [capabilities tx-count]
+  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+        repo test-repo
+        logical-tx-id (random-uuid)
+        tx-data (mapv (fn [idx]
+                        [:db/add [:block/uuid (:block/uuid child1)]
+                         :block/title (str "capability-upload-" idx)])
+                      (range tx-count))
+        sent* (atom [])
+        ws (doto (js-obj)
+             (aset "readyState" 1)
+             (aset "send"
+                   (fn [raw]
+                     (swap! sent* conj
+                            (js->clj (js/JSON.parse raw)
+                                     :keywordize-keys true)))))
+        client (assoc (#'db-sync/ensure-client-state! repo)
+                      :graph-id "graph-1"
+                      :ws ws)
+        hello (cond-> {:type "hello" :t 0}
+                (some? capabilities) (assoc :capabilities capabilities))]
+    (with-datascript-conns
+      conn client-ops-conn
+      (fn []
+        (client-op/update-local-tx repo 0)
+        (seed-client-op-txs!
+         repo
+         [{:db-sync/tx-id logical-tx-id
+           :db-sync/pending? true
+           :db-sync/created-at 1
+           :db-sync/outliner-op :save-block
+           :db-sync/normalized-tx-data tx-data}])
+        (p/with-redefs
+          [worker-state/online? (constantly true)
+           shared-service/broadcast-to-clients! (fn [& _] nil)
+           sync-assets/enqueue-asset-sync! (fn [& _] nil)
+           ;; Observe capability negotiation independently from the hello
+           ;; handler's eager scheduling, then invoke the real upload path.
+           sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+          (p/let [_ (sync-handle-message/handle-message!
+                     repo client
+                     (js/JSON.stringify (clj->js hello)))
+                  _ (#'sync-apply/flush-pending! repo client)]
+            (sync-apply/clear-upload-response-timeout! client)
+            {:messages @sent*
+             :pending-count (client-op/get-pending-local-tx-count repo)
+             :inflight @(:inflight client)
+             :last-error @(:last-sync-error client)
+             :logical-tx-id logical-tx-id}))))))
+
+(deftest staged-upload-requires-observed-capability-test
+  (testing "unknown capabilities are ignored while the staged token enables modern fields"
+    (async done
+           (->
+            (p/let [{capable-messages :messages
+                     capable-pending :pending-count
+                     logical-tx-id :logical-tx-id}
+                    (<observe-upload-after-server-capabilities
+                     ["future-capability" "tx-upload-staged-v1"] 5001)
+                    entry (-> capable-messages first :txs first)]
+              (is (= 1 (count capable-messages)))
+              (is (= 1 capable-pending))
+              (is (= (str logical-tx-id) (:logical-tx-id entry)))
+              (is (= 0 (:chunk-index entry)))
+              (is (false? (:chunk-final? entry)))
+              (is (not (contains? entry :chunk-next-index)))
+              (is (string? (:upload-session-id entry)))
+              (is (string? (:tx-id entry))))
+            (p/catch (fn [error]
+                       (is false (str error))))
+            (p/finally done)))))
+
+(deftest old-or-unknown-server-blocks-oversized-logical-tx-locally-test
+  (testing "missing, empty, and unknown capabilities never silently legacy-split a large tx"
+    (async done
+           (->
+            (p/let [missing (<observe-upload-after-server-capabilities nil 5001)
+                    empty-capabilities
+                    (<observe-upload-after-server-capabilities [] 5001)
+                    unknown (<observe-upload-after-server-capabilities
+                             ["future-capability"] 5001)]
+              (doseq [[label observation]
+                      [[:missing missing]
+                       [:empty empty-capabilities]
+                       [:unknown unknown]]]
+                (is (empty? (:messages observation))
+                    (str label " server receives no tx/batch write"))
+                (is (= 1 (:pending-count observation))
+                    (str label " keeps the original logical tx pending"))
+                (is (empty? (:inflight observation)))
+                (is (= :db-sync/staged-tx-upload-unsupported
+                       (:type (ex-data (:last-error observation)))))))
+            (p/catch (fn [error]
+                       (is false (str error))))
+            (p/finally done)))))
+
+(deftest old-server-keeps-ordinary-tx-on-original-envelope-test
+  (testing "ordinary transactions remain deploy-server-first compatible"
+    (async done
+           (->
+            (p/let [{:keys [messages pending-count logical-tx-id last-error]}
+                    (<observe-upload-after-server-capabilities nil 1)
+                    entry (-> messages first :txs first)]
+              (is (= 1 (count messages)))
+              (is (= 1 pending-count))
+              (is (nil? last-error))
+              (is (= (str logical-tx-id) (:tx-id entry)))
+              (is (= #{:tx :tx-id :outliner-op}
+                     (set (keys entry))))
+              (is (not (contains? entry :logical-tx-id)))
+              (is (not (contains? entry :upload-session-id)))
+              (is (not (contains? entry :chunk-index)))
+              (is (not (contains? entry :chunk-final?))))
+            (p/catch (fn [error]
+                       (is false (str error))))
+            (p/finally done)))))
+
+(deftest rejected-modern-chunk-maps-back-to-logical-pending-row-test
+  (testing "server chunk ids never create or strand phantom local pending rows"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          repo test-repo
+          logical-tx-id (random-uuid)
+          tx-data (mapv (fn [idx]
+                          [:db/add [:block/uuid (:block/uuid child1)]
+                           :block/title (str "reject-modern-" idx)])
+                        (range 5001))
+          entry (-> (sync-apply/prepare-upload-tx-entries
+                     repo conn [{:tx-id logical-tx-id
+                                 :tx tx-data
+                                 :outliner-op :save-block}])
+                    :tx-entries first)
+          chunk-tx-id (:tx-id entry)
+          progress (select-keys
+                    entry
+                    [:large-upload-original-tx-id
+                     :large-upload-next-index
+                     :large-upload-final?
+                     :logical-tx-id
+                     :upload-session-id
+                     :chunk-index
+                     :chunk-final?])
+          client {:repo repo
+                  :graph-id "graph-1"
+                  :inflight (atom [chunk-tx-id])
+                  :upload-request (atom {:large-upload-progress [progress]})
+                  :online-users (atom [])
+                  :ws-state (atom :open)}
+          raw (js/JSON.stringify
+               (clj->js {:type "tx/reject"
+                         :reason "db transact failed"
+                         :t 0
+                         :failed-tx-id (str chunk-tx-id)}))]
+      (is (not= logical-tx-id chunk-tx-id))
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          ;; Empty replay data makes the assertion specifically about the
+          ;; transport-id -> logical-id mapping, not outliner rollback details.
+          (seed-client-op-txs!
+           repo
+           [{:db-sync/tx-id logical-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1}])
+          (client-op/update-local-tx repo 0)
+          (let [error
+                (with-redefs [sync-apply/enqueue-flush-pending!
+                              (fn [& _] nil)]
+                  (try
+                    (with-silenced-console-error
+                      #(sync-handle-message/handle-message! repo client raw))
+                    nil
+                    (catch :default e e)))
+                logical-row (client-op-tx-row client-ops-conn logical-tx-id)
+                chunk-row (client-op-tx-row client-ops-conn chunk-tx-id)]
+            (is (= :db-sync/tx-rejected (:type (ex-data error))))
+            (is (= 0 (aget logical-row "pending")))
+            (is (= 1 (aget logical-row "failed")))
+            (is (nil? chunk-row)
+                "wire chunk identity is never materialized as a client op")))))))
+
+(defn- clear-all-process-upload-state!
+  "Model a true worker-process restart without coupling the test to future
+  private wire-cache var names. Every resettable upload/wire atom in the
+  production apply namespace is discarded."
+  []
+  (when-let [namespace-object
+             (.getObjectByName js/goog "frontend.worker.sync.apply_txs")]
+    (doseq [key (array-seq (js/Object.keys namespace-object))
+            :let [key* (string/lower-case key)
+                  candidate (aget namespace-object key)]
+            :when (or (string/includes? key* "upload")
+                      (string/includes? key* "wire"))
+            :when (some? candidate)
+            :when (some?
+                   (aget candidate
+                         "cljs$core$IReset$_reset_BANG_$arity$2"))]
+      (reset! candidate {}))))
+
+(defn- manual-modern-client
+  [repo sent*]
+  (let [ws (doto (js-obj)
+             (aset "readyState" 1)
+             (aset "send" (fn [raw] (swap! sent* conj raw))))]
+    (-> (#'db-sync/ensure-client-state! repo)
+        ;; Direct sends make the test's request/response boundary explicit.
+        (dissoc :send-queue)
+        (assoc :graph-id "graph-1" :ws ws))))
+
+(defn- <server-ws-roundtrip!
+  [server-self server-ws server-response* raw]
+  (reset! server-response* nil)
+  (p/let [_ (sync-ws-handler/handle-ws-message!
+             server-self server-ws raw)]
+    (or @server-response*
+        (throw (js/Error. "server websocket handler produced no response")))))
+
+(defn- <observe-real-server-hello!
+  [repo client server-self server-ws server-response*]
+  (p/let [raw (<server-ws-roundtrip!
+               server-self server-ws server-response*
+               (sync-protocol/encode-message
+                {:type "hello" :client repo}))]
+    (p/with-redefs
+      [sync-apply/enqueue-flush-pending! (fn [& _] nil)
+       sync-assets/enqueue-asset-sync! (fn [& _] nil)
+       shared-service/broadcast-to-clients! (fn [& _] nil)]
+      (sync-handle-message/handle-message! repo client raw))))
+
+(defn- <exchange-one-real-upload!
+  [repo client sent* server-self server-ws server-response* deliver-ack?]
+  (reset! sent* [])
+  (p/let [_ (#'sync-apply/flush-pending! repo client)
+          request-raw (or (first @sent*)
+                          (throw (js/Error. "real client emitted no upload request")))
+          request (js->clj (js/JSON.parse request-raw)
+                           :keywordize-keys true)
+          response-raw (<server-ws-roundtrip!
+                        server-self server-ws server-response* request-raw)
+          response (js->clj (js/JSON.parse response-raw)
+                            :keywordize-keys true)
+          _ (when deliver-ack?
+              (p/with-redefs
+                [sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                 sync-assets/enqueue-asset-sync! (fn [& _] nil)
+                 shared-service/broadcast-to-clients! (fn [& _] nil)]
+                (sync-handle-message/handle-message!
+                 repo client response-raw)))]
+    {:request request
+     :response response
+     :request-raw request-raw
+     :response-raw response-raw}))
+
+(deftest ordinary-canonical-ack-roundtrips-through-real-client-and-worker-test
+  (testing "the emitted .6 request and real Worker ACK converge without a checksum repair"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 repo test-repo
+                 block-uuid (:block/uuid child1)
+                 server-seed-storage (make-real-worker-storage-sql)
+                 _ (d/conn-from-datoms
+                    (d/datoms @conn :eavt)
+                    (d/schema @conn)
+                    {:storage
+                     (sync-storage/new-sqlite-storage
+                      (:sql server-seed-storage))})
+                 server-storage (make-real-worker-storage-sql)
+                 _ (#'sync-handler/import-snapshot-rows!
+                    (:sql server-storage)
+                    "kvs"
+                    (real-kvs-rows (:sql server-seed-storage)))
+                 server-conn (sync-storage/open-conn (:sql server-storage))
+                 server-self #js {:sql (:sql server-storage)
+                                  :conn server-conn
+                                  :schema-ready false}
+                 server-response* (atom nil)
+                 server-ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [raw]
+                                            (reset! server-response* raw))))
+                 sent* (atom [])
+                 client (manual-modern-client repo sent*)]
+             (->
+              (with-datascript-conns
+                conn client-ops-conn
+                (fn []
+                  (client-op/update-graph-uuid repo "graph-1")
+                  (client-op/update-local-tx repo 0)
+                  (client-op/update-local-checksum
+                   repo (sync-checksum/recompute-checksum @conn))
+                  (client-op/update-local-server-checksum
+                   repo (sync-checksum/recompute-server-checksum @conn))
+                  (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                  (ldb/transact!
+                   conn
+                   [[:db/add [:block/uuid block-uuid]
+                     :block/title "real canonical roundtrip"]]
+                   {:outliner-op :move-blocks})
+                  (p/with-redefs
+                    [worker-state/online? (constantly true)
+                     sync-crypt/graph-e2ee? (constantly false)
+                     shared-service/broadcast-to-clients! (fn [& _] nil)
+                     sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                    (p/let [_ (<observe-real-server-hello!
+                              repo client server-self server-ws
+                              server-response*)
+                            exchange (<exchange-one-real-upload!
+                                      repo client sent* server-self server-ws
+                                      server-response* true)]
+                      (is (true? (-> exchange :request :canonical-ack?)))
+                      (is (= 0 (-> exchange :response :canonical-basis-t)))
+                      (is (= 1 (count (-> exchange :response :canonical-txs))))
+                      (is (= (-> exchange :request :txs first :tx-id)
+                             (-> exchange :response :canonical-tx-ids first)))
+                      (is (= "real canonical roundtrip"
+                             (:block/title
+                              (d/entity @server-conn
+                                        [:block/uuid block-uuid]))))
+                      (is (= (sync-checksum/recompute-server-checksum @conn)
+                             (sync-checksum/recompute-server-checksum
+                              @server-conn)))
+                      (is (= 1 (client-op/get-local-tx repo)))
+                      (is (zero? (client-op/get-pending-local-tx-count repo)))))))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (sync-apply/clear-upload-response-timeout! client)
+                 (.close (:sql server-seed-storage))
+                 (.close (:sql server-storage))
+                 (done))))))))
+
+(deftest canonical-structural-move-roundtrips-through-real-client-and-worker-test
+  (testing "a local move is recomputed by the Worker and converges through its canonical ACK"
+    (async done
+           (let [{:keys [conn client-ops-conn parent-a b-child-1]}
+                 (setup-two-parents)
+                 repo test-repo
+                 child-uuid (:block/uuid b-child-1)
+                 parent-a-uuid (:block/uuid parent-a)
+                 server-seed-storage (make-real-worker-storage-sql)
+                 _ (d/conn-from-datoms
+                    (d/datoms @conn :eavt)
+                    (d/schema @conn)
+                    {:storage
+                     (sync-storage/new-sqlite-storage
+                      (:sql server-seed-storage))})
+                 server-storage (make-real-worker-storage-sql)
+                 _ (#'sync-handler/import-snapshot-rows!
+                    (:sql server-storage)
+                    "kvs"
+                    (real-kvs-rows (:sql server-seed-storage)))
+                 server-conn (sync-storage/open-conn (:sql server-storage))
+                 server-self #js {:sql (:sql server-storage)
+                                  :conn server-conn
+                                  :schema-ready false}
+                 server-response* (atom nil)
+                 server-ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [raw]
+                                            (reset! server-response* raw))))
+                 sent* (atom [])
+                 client (manual-modern-client repo sent*)]
+             (->
+              (with-datascript-conns
+                conn client-ops-conn
+                (fn []
+                  (client-op/update-graph-uuid repo "graph-1")
+                  (client-op/update-local-tx repo 0)
+                  (client-op/update-local-checksum
+                   repo (sync-checksum/recompute-checksum @conn))
+                  (client-op/update-local-server-checksum
+                   repo (sync-checksum/recompute-server-checksum @conn))
+                  (reset! sync-apply/*repo->latest-remote-tx {repo 0})
+                  (outliner-core/move-blocks!
+                   conn
+                   [(d/entity @conn [:block/uuid child-uuid])]
+                   (d/entity @conn [:block/uuid parent-a-uuid])
+                   {:sibling? false})
+                  (p/with-redefs
+                    [worker-state/online? (constantly true)
+                     sync-crypt/graph-e2ee? (constantly false)
+                     shared-service/broadcast-to-clients! (fn [& _] nil)
+                     sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                    (p/let [_ (<observe-real-server-hello!
+                              repo client server-self server-ws
+                              server-response*)
+                            exchange (<exchange-one-real-upload!
+                                      repo client sent* server-self server-ws
+                                      server-response* true)
+                            request-entry (-> exchange :request :txs first)
+                            server-child
+                            (d/entity @server-conn [:block/uuid child-uuid])
+                            client-child
+                            (d/entity @conn [:block/uuid child-uuid])]
+                      (is (= "move-blocks" (:outliner-op request-entry)))
+                      (is (string? (:semantic-op request-entry)))
+                      (is (true? (-> exchange :request :canonical-ack?)))
+                      (is (= "tx/batch/ok" (-> exchange :response :type)))
+                      (is (= 1 (count (-> exchange :response :canonical-txs))))
+                      (is (= parent-a-uuid
+                             (some-> server-child :block/parent :block/uuid)))
+                      (is (= parent-a-uuid
+                             (some-> client-child :block/parent :block/uuid)))
+                      (is (= (sync-checksum/recompute-server-checksum @conn)
+                             (sync-checksum/recompute-server-checksum
+                              @server-conn)))
+                      (is (= 1 (client-op/get-local-tx repo)))
+                      (is (zero? (client-op/get-pending-local-tx-count repo)))))))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (sync-apply/clear-upload-response-timeout! client)
+                 (.close (:sql server-seed-storage))
+                 (.close (:sql server-storage))
+                 (done))))))))
+
+(deftest modern-e2ee-upload-survives-two-true-cold-restarts-test
+  (testing "mid-session restart and final-ACK-loss restart converge through real client/server handlers"
+    (async done
+           (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+                 repo test-repo
+                 block-uuid (:block/uuid child1)
+                 _ (ldb/transact!
+                    conn
+                    [(ldb/kv :logseq.kv/graph-rtc-e2ee? true)]
+                    {:persist-op? false})
+                 server-seed-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-seed-storage))
+                 _ (d/conn-from-datoms
+                    (d/datoms @conn :eavt)
+                    (d/schema @conn)
+                    {:storage
+                     (sync-storage/new-sqlite-storage
+                      (:sql server-seed-storage))})
+                 server-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-storage))
+                 _ (#'sync-handler/import-snapshot-rows!
+                    (:sql server-storage)
+                    "kvs"
+                    (real-kvs-rows (:sql server-seed-storage)))
+                 server-conn (sync-storage/open-conn (:sql server-storage))
+                 server-self #js {:sql (:sql server-storage)
+                                  :conn server-conn
+                                  ;; Let the real websocket handler initialize
+                                  ;; every current server schema table, including
+                                  ;; staged-upload durability tables.
+                                  :schema-ready false}
+                 server-t0 (sync-handler/t-now server-self)
+                 server-response* (atom nil)
+                 server-ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [raw]
+                                            (reset! server-response* raw))))
+                 logical-tx-id (random-uuid)
+                 large-title (str (apply str (repeat 1535 "冷"))
+                                  " staged-cold-restart")
+                 logical-tx
+                 (into [[:db/add [:block/uuid block-uuid]
+                         :block/title large-title]]
+                       (map (fn [idx]
+                              [:db/add [:block/uuid block-uuid]
+                               :block/updated-at idx])
+                            (range 4999)))
+                 ;; Apply before installing the db-sync listener below. The
+                 ;; durable pending row is seeded explicitly as one logical op.
+                 _ (d/transact! conn logical-tx)
+                 assets* (atom {})
+                 asset-requests* (atom [])
+                 first-sent* (atom [])
+                 second-sent* (atom [])
+                 third-sent* (atom [])
+                 first-client (manual-modern-client repo first-sent*)
+                 fetch-prev js/fetch
+                 config-prev @worker-state/*db-sync-config]
+             (sync-storage/set-t! (:sql server-storage) server-t0)
+             (reset! worker-state/*db-sync-config
+                     {:http-base "https://sync.example.test"})
+             (set! js/fetch
+                   (install-memory-asset-fetch!
+                    assets* asset-requests* server-self))
+             (->
+              (p/let [aes-key (crypt/<generate-aes-key)]
+                (with-datascript-conns
+                  conn client-ops-conn
+                  (fn []
+                    (client-op/update-graph-uuid repo "graph-1")
+                    (client-op/update-local-tx repo server-t0)
+                    ;; A real local edit is already visible locally while its
+                    ;; one logical pending operation awaits upload.
+                    (client-op/update-local-checksum
+                     repo (sync-checksum/recompute-checksum @conn))
+                    (client-op/update-local-server-checksum
+                     repo (sync-checksum/recompute-server-checksum @conn))
+                    (seed-client-op-txs!
+                     repo
+                     [{:db-sync/tx-id logical-tx-id
+                       :db-sync/pending? true
+                       :db-sync/created-at 1
+                       :db-sync/outliner-op :save-block
+                       :db-sync/normalized-tx-data logical-tx}])
+                    (reset! sync-apply/*repo->latest-remote-tx {repo server-t0})
+                    (p/with-redefs
+                      [worker-state/online? (constantly true)
+                       sync-crypt/graph-e2ee? (constantly true)
+                       sync-crypt/<ensure-graph-aes-key
+                       (fn [& _] (p/resolved aes-key))
+                       shared-service/broadcast-to-clients! (fn [& _] nil)
+                       sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                      (p/let [_ (<observe-real-server-hello!
+                                repo first-client server-self server-ws
+                                server-response*)
+                              first-exchange
+                              (<exchange-one-real-upload!
+                               repo first-client first-sent*
+                               server-self server-ws server-response* true)
+                              first-entry (-> first-exchange :request :txs first)
+                              _ (do
+                                  (is (= 0 (:chunk-index first-entry)))
+                                  (is (false? (:chunk-final? first-entry)))
+                                  (is (= 5000
+                                         (count
+                                          (sync-protocol/transit->tx
+                                           (:tx first-entry))))
+                                      "offload expands 5000 logical datoms to a full first wire chunk")
+                                  (is (not (contains? first-entry
+                                                      :chunk-next-index)))
+                                  (is (= "tx/batch/ok"
+                                         (-> first-exchange :response :type)))
+                                  (is (= server-t0 (sync-handler/t-now server-self))
+                                      "nonfinal ACK has no visible server commit")
+                                  (is (= 1 (client-op/get-pending-local-tx-count repo))))
+
+                              ;; Cold restart #1: discard all in-process upload
+                              ;; progress/wire state and create a fresh client.
+                              _ (do
+                                  (sync-apply/clear-upload-response-timeout!
+                                   first-client)
+                                  (clear-all-process-upload-state!))
+                              second-client (manual-modern-client repo second-sent*)
+                              _ (<observe-real-server-hello!
+                                 repo second-client server-self server-ws
+                                 server-response*)
+                              final-attempt (<exchange-one-real-upload!
+                                             repo second-client second-sent*
+                                             server-self server-ws
+                                             server-response* false)
+                              final-entry (-> final-attempt :request :txs first)
+                              _ (do
+                                  (is (= (:logical-tx-id first-entry)
+                                         (:logical-tx-id final-entry)))
+                                  (is (= (:upload-session-id first-entry)
+                                         (:upload-session-id final-entry)))
+                                  (is (= 1 (:chunk-index final-entry)))
+                                  (is (true? (:chunk-final? final-entry)))
+                                  (is (= 1
+                                         (count
+                                          (sync-protocol/transit->tx
+                                           (:tx final-entry))))
+                                      "the offload marker remainder is final ordinal one")
+                                  (is (not (contains? final-entry
+                                                      :chunk-next-index)))
+                                  (is (= "tx/batch/ok"
+                                         (-> final-attempt :response :type)))
+                                  (is (= (inc server-t0)
+                                         (sync-handler/t-now server-self))
+                                      "server committed final exactly once")
+                                  (is (= 1 (client-op/get-pending-local-tx-count repo))
+                                      "lost final ACK keeps original pending durable"))
+
+                              ;; Cold restart #2: the completed server session
+                              ;; must not permanently reject the original op.
+                              _ (do
+                                  (sync-apply/clear-upload-response-timeout!
+                                   second-client)
+                                  (reset! (:inflight second-client) [])
+                                  (clear-all-process-upload-state!))
+                              third-client (manual-modern-client repo third-sent*)
+                              _ (<observe-real-server-hello!
+                                 repo third-client server-self server-ws
+                                 server-response*)
+                              pull-raw
+                              (sync-protocol/encode-message
+                               (sync-handler/pull-response server-self server-t0))
+                              _ (p/with-redefs
+                                  [sync-apply/enqueue-flush-pending!
+                                   (fn [& _] nil)
+                                   sync-assets/enqueue-asset-sync!
+                                   (fn [& _] nil)
+                                   shared-service/broadcast-to-clients!
+                                   (fn [& _] nil)]
+                                  (sync-handle-message/handle-message!
+                                   repo third-client pull-raw))
+                              _ (is (= 1 (client-op/get-pending-local-tx-count repo))
+                                    "lost final ACK remains durable after pull")
+                              _ (reset! third-sent* [])
+                              completed-retry
+                              (<exchange-one-real-upload!
+                               repo third-client third-sent*
+                               server-self server-ws server-response* true)]
+                        (is (true? (-> completed-retry :request :txs first
+                                        :chunk-final?)))
+                        (is (= (-> final-attempt :request :txs first)
+                               (-> completed-retry :request :txs first))
+                            "lost final is retried with the original wire bytes")
+                        (is (= "tx/batch/ok"
+                               (-> completed-retry :response :type)))
+                        (is (zero? (client-op/get-pending-local-tx-count repo))
+                            "original logical pending row eventually clears")
+                        (is (= (inc server-t0)
+                               (sync-handler/t-now server-self))
+                            "completed-session retry never double-commits")
+                        (is (= large-title
+                               (:block/title
+                                (d/entity @conn [:block/uuid block-uuid])))
+                            "local logical E2EE title survives both restarts"))))))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (doseq [client [first-client
+                                 @worker-state/*db-sync-client]]
+                   (when (map? client)
+                     (sync-apply/clear-upload-response-timeout! client)))
+                 (set! js/fetch fetch-prev)
+                 (reset! worker-state/*db-sync-config config-prev)
+                 (clear-all-process-upload-state!)
+                 (.close (:sql server-seed-storage))
+                 (.close (:sql server-storage))
+                 (done))))))))
+
+(def ^:private client-checksum-contract-deadline-ms 1500)
+
+(defn- checksum-contract-client
+  [repo]
+  {:repo repo
+   :graph-id "synthetic-checksum-graph"
+   :inflight (atom [])
+   :last-sync-error (atom nil)
+   :online-users (atom [])
+   :pending-pull-since (atom nil)
+   :sync-ready? (atom false)
+   :ws-state (atom :open)})
+
+(defn- checksum-hello-message
+  ([t db]
+   (checksum-hello-message t db true))
+  ([t db versioned?]
+   (js/JSON.stringify
+    (clj->js
+     (cond-> {:type "hello"
+              :t t
+              :checksum (sync-checksum/recompute-checksum db)}
+       versioned?
+       (assoc :checksum-version sync-checksum/server-checksum-version
+              :server-checksum
+              (sync-checksum/recompute-server-checksum db)))))))
+
+(defn- clear-client-checksum-sidecar!
+  [^js client-ops-conn]
+  (let [^js statement
+        (.prepare
+         client-ops-conn
+         (str "delete from sync_meta where key in ("
+              "'checksum',"
+              "'server-checksum-v2',"
+              "'server-checksum-v2-t',"
+              "'server-checksum-v2-legacy-checksum')"))]
+    (.run statement)))
+
+(defn- <observe-checksum-operation!
+  [operation]
+  (let [result
+        (js/Promise.
+         (fn [resolve _reject]
+           (try
+             (.then (js/Promise.resolve (operation))
+                    (fn [value]
+                      (resolve {:value value}))
+                    (fn [error]
+                      (resolve {:error error})))
+             (catch :default error
+               (resolve {:error error})))))]
+    (js/Promise.race
+     #js [result
+          (p/let [_ (p/delay client-checksum-contract-deadline-ms)]
+            {:timeout? true})])))
+
+(defn- <observe-checksum-message!
+  [repo client raw-message]
+  (<observe-checksum-operation!
+   #(sync-handle-message/handle-message! repo client raw-message)))
+
+(deftest cached-only-legacy-checksum-drift-heals-without-repair-test
+  (testing "a v1 cache mismatch is recomputed from the stable DB before repair"
+    (async done
+      (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+            cursor 4101
+            actual-checksum (sync-checksum/recompute-checksum @conn)
+            stale-checksum "0000000000000000"
+            client (checksum-contract-client test-repo)
+            raw-message (checksum-hello-message cursor @conn false)
+            logs* (atom [])]
+        (is (not= stale-checksum actual-checksum))
+        (->
+         (with-datascript-conns
+           conn client-ops-conn
+           (fn []
+             (client-op/update-local-tx test-repo cursor)
+             (client-op/update-local-checksum test-repo stale-checksum)
+             (p/with-redefs
+               [shared-service/broadcast-to-clients! (fn [& _] nil)
+                sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                sync-assets/enqueue-asset-sync! (fn [& _] nil)
+                sync-log-state/rtc-log
+                (fn [type payload]
+                  (swap! logs* conj {:type type :payload payload}))]
+               (p/let [observed
+                       (<observe-checksum-message!
+                        test-repo client raw-message)]
+                 (is (not (:timeout? observed)))
+                 (is (nil? (:error observed))
+                     "cached-only legacy drift must not request repair")
+                 (is (= actual-checksum
+                        (client-op/get-local-checksum test-repo)))
+                 (is (= cursor (client-op/get-local-tx test-repo)))
+                 (is (not-any? #(= :rtc.log/checksum-mismatch (:type %))
+                               @logs*))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally done))))))
+
+(deftest cached-only-versioned-checksum-drift-heals-both-projections-test
+  (testing "a v2 cache mismatch repairs legacy, server-v2, and watermark together"
+    (async done
+      (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+            cursor 4102
+            actual-legacy (sync-checksum/recompute-checksum @conn)
+            actual-v2 (sync-checksum/recompute-server-checksum @conn)
+            client (checksum-contract-client test-repo)
+            raw-message (checksum-hello-message cursor @conn)]
+        (->
+         (with-datascript-conns
+           conn client-ops-conn
+           (fn []
+             (client-op/update-local-tx test-repo cursor)
+             (client-op/update-local-checksum
+              test-repo "1111111111111111")
+             (client-op/update-local-server-checksum
+              test-repo "2222222222222222")
+             (p/with-redefs
+               [shared-service/broadcast-to-clients! (fn [& _] nil)
+                sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+               (p/let [observed
+                       (<observe-checksum-message!
+                        test-repo client raw-message)]
+                 (is (not (:timeout? observed)))
+                 (is (nil? (:error observed))
+                     "cached-only v2 drift must not request repair")
+                 (is (= actual-legacy
+                        (client-op/get-local-checksum test-repo)))
+                 (is (= actual-v2
+                        (client-op/get-local-server-checksum test-repo))
+                     "the v2 getter proves checksum, cursor watermark, and legacy binding were committed")
+                 (is (= cursor (client-op/get-local-tx test-repo)))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally done))))))
+
+(deftest recomputed-content-divergence-remains-fail-closed-and-content-free-test
+  (testing "real DB divergence remains repair-required and diagnostics omit graph content"
+    (async done
+      (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+            cursor 4103
+            remote-db @conn
+            raw-message (checksum-hello-message cursor remote-db)
+            secret-title
+            "PRIVATE-CHECKSUM-CONTENT-7f91d83b-never-log-this"
+            client (checksum-contract-client test-repo)
+            logs* (atom [])]
+        (->
+         (with-datascript-conns
+           conn client-ops-conn
+           (fn []
+             (client-op/update-local-tx test-repo cursor)
+             (ldb/transact!
+              conn
+              [[:db/add
+                [:block/uuid (:block/uuid child1)]
+                :block/title secret-title]]
+              {:rtc-tx? true :persist-op? false})
+             (let [local-legacy
+                   (sync-checksum/recompute-checksum @conn)
+                   local-v2
+                   (sync-checksum/recompute-server-checksum @conn)]
+               (client-op/update-local-checksum test-repo local-legacy)
+               (client-op/update-local-server-checksum test-repo local-v2)
+               (p/with-redefs
+                 [shared-service/broadcast-to-clients! (fn [& _] nil)
+                  sync-log-state/rtc-log
+                  (fn [type payload]
+                    (swap! logs* conj {:type type :payload payload}))]
+                 (-> (p/let [_ (sync-handle-message/handle-message!
+                                test-repo client raw-message)]
+                       (is false
+                           "actual content divergence must be rejected"))
+                     (p/catch
+                      (fn [error]
+                        (is (= :db-sync/checksum-mismatch
+                               (:type (ex-data error)))
+                            "recomputation must not heal actual content divergence")
+                        (is (= local-legacy
+                               (client-op/get-local-checksum test-repo)))
+                        (is (= local-v2
+                               (client-op/get-local-server-checksum test-repo)))
+                        (is (not (string/includes?
+                                  (pr-str {:logs @logs*
+                                           :error-data (ex-data error)})
+                                  secret-title))
+                            "checksum diagnostics must never include graph content"))))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally done))))))
+
+(deftest checksum-recompute-retries-after-connection-identity-change-test
+  (testing "a recompute result from a replaced connection cannot repair the new connection's sidecar"
+    (async done
+      (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+            conn-a conn
+            conn-b (d/conn-from-db @conn-a)
+            _ (ldb/transact!
+               conn-b
+               [[:db/add
+                 [:block/uuid (:block/uuid child1)]
+                 :block/title "connection-b-authoritative"]]
+               {:rtc-tx? true :persist-op? false})
+            cursor 4104
+            raw-message (checksum-hello-message cursor @conn-b)
+            expected-legacy (sync-checksum/recompute-checksum @conn-b)
+            expected-v2 (sync-checksum/recompute-server-checksum @conn-b)
+            client (checksum-contract-client test-repo)
+            live-conn* (atom conn-a)
+            swapped? (atom false)
+            recomputes* (atom 0)
+            original-legacy sync-checksum/recompute-checksum
+            original-v2 sync-checksum/recompute-server-checksum
+            observe-projection
+            (fn [projection db]
+              (let [value (projection db)]
+                (swap! recomputes* inc)
+                (when (compare-and-set! swapped? false true)
+                  (reset! live-conn* conn-b))
+                value))]
+        (->
+         (with-datascript-conns
+           conn-a client-ops-conn
+           (fn []
+             (client-op/update-local-tx test-repo cursor)
+             (clear-client-checksum-sidecar! client-ops-conn)
+             (p/with-redefs
+               [worker-state/get-datascript-conn
+                (fn [repo]
+                  (when (= test-repo repo) @live-conn*))
+                sync-checksum/recompute-checksum
+                (fn [db] (observe-projection original-legacy db))
+                sync-checksum/recompute-server-checksum
+                (fn [db] (observe-projection original-v2 db))
+                shared-service/broadcast-to-clients! (fn [& _] nil)
+                sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+               (p/let [observed
+                       (<observe-checksum-message!
+                        test-repo client raw-message)]
+                 (is (not (:timeout? observed)))
+                 (is @swapped?)
+                 (is (<= 1 @recomputes* 12)
+                     "connection retries must remain bounded")
+                 (is (nil? (:error observed))
+                     "the stable replacement connection matches the Worker")
+                 (is (= expected-legacy
+                        (client-op/get-local-checksum test-repo)))
+                 (is (= expected-v2
+                        (client-op/get-local-server-checksum test-repo)))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally done))))))
+
+(deftest checksum-recompute-retries-after-db-basis-change-test
+  (testing "legacy and v2 projections cannot be mixed across two DB snapshots"
+    (async done
+      (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+            expected-conn (d/conn-from-db @conn)
+            tx [[:db/add
+                 [:block/uuid (:block/uuid child1)]
+                 :block/title "stable-db-basis-b"]]
+            _ (ldb/transact!
+               expected-conn tx {:rtc-tx? true :persist-op? false})
+            cursor 4105
+            raw-message (checksum-hello-message cursor @expected-conn)
+            expected-legacy
+            (sync-checksum/recompute-checksum @expected-conn)
+            expected-v2
+            (sync-checksum/recompute-server-checksum @expected-conn)
+            client (checksum-contract-client test-repo)
+            mutated? (atom false)
+            recomputes* (atom 0)
+            original-legacy sync-checksum/recompute-checksum
+            original-v2 sync-checksum/recompute-server-checksum
+            observe-projection
+            (fn [projection db]
+              (let [value (projection db)]
+                (swap! recomputes* inc)
+                (when (compare-and-set! mutated? false true)
+                  (ldb/transact!
+                   conn tx {:rtc-tx? true :persist-op? false}))
+                value))]
+        (->
+         (with-datascript-conns
+           conn client-ops-conn
+           (fn []
+             (client-op/update-local-tx test-repo cursor)
+             (clear-client-checksum-sidecar! client-ops-conn)
+             (p/with-redefs
+               [sync-checksum/recompute-checksum
+                (fn [db] (observe-projection original-legacy db))
+                sync-checksum/recompute-server-checksum
+                (fn [db] (observe-projection original-v2 db))
+                shared-service/broadcast-to-clients! (fn [& _] nil)
+                sync-apply/enqueue-flush-pending! (fn [& _] nil)
+                sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+               (p/let [observed
+                       (<observe-checksum-message!
+                        test-repo client raw-message)]
+                 (is (not (:timeout? observed)))
+                 (is @mutated?)
+                 (is (<= 1 @recomputes* 12)
+                     "DB-basis retries must remain bounded")
+                 (is (nil? (:error observed))
+                     "a stable retry should heal against the new DB basis")
+                 (is (= expected-legacy
+                        (client-op/get-local-checksum test-repo)))
+                 (is (= expected-v2
+                        (client-op/get-local-server-checksum test-repo)))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally done))))))
+
+(deftest checksum-recompute-refuses-continuously-changing-local-cursor-test
+  (testing "a moving local cursor settles within a bound without repair or partial cache publication"
+    (async done
+      (let [{:keys [conn client-ops-conn]} (setup-parent-child)
+            cursor 4106
+            raw-message (checksum-hello-message cursor @conn)
+            client (checksum-contract-client test-repo)
+            recomputes* (atom 0)
+            mismatch-logs* (atom [])
+            original-legacy sync-checksum/recompute-checksum
+            original-v2 sync-checksum/recompute-server-checksum
+            move-cursor
+            (fn [projection db]
+              (let [value (projection db)]
+                (swap! recomputes* inc)
+                (client-op/update-local-tx
+                 test-repo
+                 (inc (client-op/get-local-tx test-repo)))
+                value))]
+        (.then
+         (<observe-checksum-operation!
+          #(with-datascript-conns
+             conn client-ops-conn
+             (fn []
+               (client-op/update-local-tx test-repo cursor)
+               (clear-client-checksum-sidecar! client-ops-conn)
+               (with-redefs
+                 [sync-checksum/recompute-checksum
+                  (fn [db]
+                    (move-cursor original-legacy db))
+                  sync-checksum/recompute-server-checksum
+                  (fn [db]
+                    (move-cursor original-v2 db))
+                  shared-service/broadcast-to-clients!
+                  (fn [& _] nil)
+                  sync-log-state/rtc-log
+                  (fn [type payload]
+                    (when (= :rtc.log/checksum-mismatch type)
+                      (swap! mismatch-logs* conj payload)))]
+                 (sync-handle-message/handle-message!
+                  test-repo client raw-message)))))
+         (fn [observed]
+           (let [error (:error observed)
+                 sidecar
+                 (with-datascript-conns
+                   conn client-ops-conn
+                   (fn []
+                     {:legacy (client-op/get-local-checksum test-repo)
+                      :server-v2
+                      (client-op/get-local-server-checksum test-repo)}))]
+             (is (not (:timeout? observed))
+                 "continuous cursor drift must not create an unbounded retry")
+             (is (<= 1 @recomputes* 16)
+                 "cursor-bound recomputation must have a finite retry budget")
+             (is (= {:type :db-sync/checksum-basis-unstable
+                     :attempts 3}
+                    (select-keys (ex-data error) [:type :attempts]))
+                 "the stale hello must be refused after its cursor changes")
+             (is (not= :db-sync/checksum-mismatch
+                       (:type (ex-data error)))
+                 "a local concurrency race is not content divergence")
+             (is (empty? @mismatch-logs*))
+             (is (nil? (:legacy sidecar))
+                 "a refused attempt must not publish half of the sidecar")
+             (is (nil? (:server-v2 sidecar)))
+             (done)))
+         (fn [error]
+           (is false (str error))
+           (done)))))))
+
+(deftest pull-checksum-failure-keeps-previous-cursor-and-sidecar-test
+  (testing "pull publication waits for remote apply and both checksum projections"
+    (async done
+      (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+            child-uuid (:block/uuid child1)
+            remote-tx
+            [[:db/add
+              [:block/uuid child-uuid]
+              :block/title
+              "synthetic-pull-before-checksum-commit"]]
+            client (checksum-contract-client test-repo)
+            raw-message
+            (js/JSON.stringify
+             (clj->js
+              {:type "pull/ok"
+               :t 1
+               :txs [{:t 1
+                      :outliner-op :save-block
+                      :tx (sync-protocol/tx->transit remote-tx)}]
+               :checksum "0000000000000000"
+               :checksum-version sync-checksum/server-checksum-version
+               :server-checksum "ffffffffffffffff"}))]
+        (->
+         (with-datascript-conns
+           conn client-ops-conn
+           (fn []
+             (client-op/update-local-tx test-repo 0)
+             (clear-client-checksum-sidecar! client-ops-conn)
+             (p/with-redefs
+               [sync-crypt/graph-e2ee? (constantly false)
+                sync-crypt/<ensure-graph-aes-key
+                (fn [& _] (p/resolved nil))
+                shared-service/broadcast-to-clients! (fn [& _] nil)
+                sync-apply/enqueue-flush-pending! (fn [& _] nil)]
+               (p/let [observed
+                       (<observe-checksum-message!
+                        test-repo client raw-message)]
+                 (is (not (:timeout? observed)))
+                 (is (= :db-sync/checksum-mismatch
+                        (:type (ex-data (:error observed))))
+                     "the fixture must fail after applying the remote tx")
+                 (is (= "synthetic-pull-before-checksum-commit"
+                        (:block/title
+                         (d/entity @conn [:block/uuid child-uuid]))))
+                 (is (= 0 (client-op/get-local-tx test-repo))
+                     "a failed checksum gate must not publish the pull cursor")
+                 (is (nil? (client-op/get-local-checksum test-repo))
+                     "legacy sidecar publication must roll back with the cursor")
+                 (is (nil? (client-op/get-local-server-checksum test-repo))
+                     "v2 sidecar publication must roll back with the cursor")))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally done))))))
+
+(deftest pull-apply-failure-does-not-advance-visible-cursor-or-sidecar-test
+  (testing "a rejected remote apply leaves the previous durable cursor and checksum sidecar"
+    (async done
+      (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+            initial-legacy (sync-checksum/recompute-checksum @conn)
+            initial-v2 (sync-checksum/recompute-server-checksum @conn)
+            original-error
+            (ex-info "synthetic remote apply rejection"
+                     {:type :test/remote-apply-rejected})
+            client (checksum-contract-client test-repo)
+            raw-message
+            (js/JSON.stringify
+             (clj->js
+              {:type "pull/ok"
+               :t 1
+               :txs [{:t 1
+                      :outliner-op :save-block
+                      :tx (sync-protocol/tx->transit
+                           [[:db/add
+                             [:block/uuid (:block/uuid child1)]
+                             :block/title "must-not-apply"]])}]
+               :checksum initial-legacy
+               :checksum-version sync-checksum/server-checksum-version
+               :server-checksum initial-v2}))]
+        (->
+         (with-datascript-conns
+           conn client-ops-conn
+           (fn []
+             (client-op/update-local-tx test-repo 0)
+             (client-op/update-local-checksum test-repo initial-legacy)
+             (client-op/update-local-server-checksum test-repo initial-v2)
+             (p/with-redefs
+               [sync-crypt/graph-e2ee? (constantly false)
+                sync-crypt/<ensure-graph-aes-key
+                (fn [& _] (p/resolved nil))
+                sync-apply/apply-remote-txs!
+                (fn [& _] (throw original-error))]
+               (p/let [observed
+                       (<observe-checksum-message!
+                        test-repo client raw-message)]
+                 (is (not (:timeout? observed)))
+                 (is (identical? original-error (:error observed)))
+                 (is (= 0 (client-op/get-local-tx test-repo)))
+                 (is (= initial-legacy
+                        (client-op/get-local-checksum test-repo)))
+                 (is (= initial-v2
+                        (client-op/get-local-server-checksum test-repo)))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally done))))))
+
+(deftest synthetic-clients-a-b-c-converge-after-cache-only-drift-test
+  (testing "cache drift heals, content divergence stays closed, and a frozen replacement converges"
+    (async done
+      (let [{:keys [conn child1]} (setup-parent-child)
+            repos ["synthetic-client-a"
+                   "synthetic-client-b"
+                   "synthetic-client-c"]
+            worker-db @conn
+            conn-a (d/conn-from-db worker-db)
+            conn-b (d/conn-from-db worker-db)
+            _ (ldb/transact!
+               conn-b
+               [[:db/add
+                 [:block/uuid (:block/uuid child1)]
+                 :block/title "synthetic-client-b-divergent-content"]]
+               {:rtc-tx? true :persist-op? false})
+            conn-c (d/conn-from-db worker-db)
+            conns {"synthetic-client-a" conn-a
+                   "synthetic-client-b" conn-b
+                   "synthetic-client-c" conn-c}
+            ops-conns (zipmap repos (repeatedly 3 new-client-ops-db))
+            clients (into {} (map (fn [repo]
+                                    [repo (checksum-contract-client repo)]))
+                          repos)
+            cursor 4107
+            expected-legacy (sync-checksum/recompute-checksum worker-db)
+            expected-v2 (sync-checksum/recompute-server-checksum worker-db)
+            divergent-legacy (sync-checksum/recompute-checksum @conn-b)
+            divergent-v2 (sync-checksum/recompute-server-checksum @conn-b)
+            raw-message (checksum-hello-message cursor worker-db)
+            db-conns-before @worker-state/*datascript-conns
+            ops-conns-before @worker-state/*client-ops-conns
+            original-fetch js/fetch
+            fetches* (atom [])]
+        (reset! worker-state/*datascript-conns conns)
+        (reset! worker-state/*client-ops-conns ops-conns)
+        (doseq [repo repos]
+          (client-op/update-local-tx repo cursor))
+        (client-op/update-local-checksum
+         "synthetic-client-a" "aaaaaaaaaaaaaaaa")
+        (client-op/update-local-server-checksum
+         "synthetic-client-a" "1111111111111111")
+        (client-op/update-local-checksum
+         "synthetic-client-b" divergent-legacy)
+        (client-op/update-local-server-checksum
+         "synthetic-client-b" divergent-v2)
+        (client-op/update-local-checksum
+         "synthetic-client-c" expected-legacy)
+        (client-op/update-local-server-checksum
+         "synthetic-client-c" expected-v2)
+        (set! js/fetch
+              (fn [input & _]
+                (swap! fetches* conj (str input))
+                (p/rejected
+                 (js/Error. "cache healing must not download a snapshot"))))
+        (->
+         (p/with-redefs
+           [shared-service/broadcast-to-clients! (fn [& _] nil)
+            sync-apply/enqueue-flush-pending! (fn [& _] nil)
+            sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+           (p/let [observed
+                   (p/all
+                    (mapv
+                     (fn [repo]
+                       (<observe-checksum-message!
+                        repo (get clients repo) raw-message))
+                     repos))]
+             (let [[result-a result-b result-c] observed]
+               (doseq [[repo result] (map vector repos observed)]
+                 (is (not (:timeout? result)) repo))
+               (is (nil? (:error result-a))
+                   "client A must heal cache-only drift")
+               (is (= expected-legacy
+                      (client-op/get-local-checksum
+                       "synthetic-client-a")))
+               (is (= expected-v2
+                      (client-op/get-local-server-checksum
+                       "synthetic-client-a")))
+               (is (= :db-sync/checksum-mismatch
+                      (:type (ex-data (:error result-b))))
+                   "client B actual divergence must remain fail-closed")
+               (is (= divergent-legacy
+                      (client-op/get-local-checksum
+                       "synthetic-client-b")))
+               (is (= divergent-v2
+                      (client-op/get-local-server-checksum
+                       "synthetic-client-b")))
+               (is (nil? (:error result-c))
+                   "fresh client C must remain converged")
+               (is (= expected-legacy
+                      (client-op/get-local-checksum
+                       "synthetic-client-c")))
+               (is (= expected-v2
+                      (client-op/get-local-server-checksum
+                       "synthetic-client-c")))
+               (is (empty? @fetches*)
+                   "client A cache healing must not download a snapshot")
+               (let [frozen-snapshot-conn (d/conn-from-db worker-db)
+                     _ (swap! worker-state/*datascript-conns
+                              assoc
+                              "synthetic-client-b"
+                              frozen-snapshot-conn)
+                     _ (clear-client-checksum-sidecar!
+                        (get ops-conns "synthetic-client-b"))
+                     _ (client-op/update-local-tx
+                        "synthetic-client-b" cursor)]
+                 (p/let [recovered-b
+                         (<observe-checksum-message!
+                          "synthetic-client-b"
+                          (get clients "synthetic-client-b")
+                          raw-message)]
+                   (is (not (:timeout? recovered-b)))
+                   (is (nil? (:error recovered-b))
+                       "client B must accept one valid frozen replacement")
+                   (is (= expected-legacy
+                          (client-op/get-local-checksum
+                           "synthetic-client-b")))
+                   (is (= expected-v2
+                          (client-op/get-local-server-checksum
+                           "synthetic-client-b")))
+                   (doseq [repo repos]
+                     (is (= expected-legacy
+                            (sync-checksum/recompute-checksum
+                             @(worker-state/get-datascript-conn repo)))
+                         (str repo " legacy convergence"))
+                     (is (= expected-v2
+                            (sync-checksum/recompute-server-checksum
+                             @(worker-state/get-datascript-conn repo)))
+                         (str repo " v2 convergence"))))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally
+          (fn []
+            (set! js/fetch original-fetch)
+            (doseq [repo repos]
+              (swap! client-op/*repo->pending-local-tx-count dissoc repo)
+              (swap! sync-apply/*repo->latest-remote-tx dissoc repo)
+              (swap! sync-apply/*repo->latest-remote-checksum dissoc repo)
+              (swap! sync-apply/*repo->latest-remote-checksum-version
+                     dissoc repo))
+            (doseq [client-ops-conn (vals ops-conns)]
+              (.close client-ops-conn))
+            (reset! worker-state/*datascript-conns db-conns-before)
+            (reset! worker-state/*client-ops-conns ops-conns-before)
+            (done))))))))
+
+(deftest selfhost-five-divergence-upgrade-performs-one-bounded-snapshot-repair-test
+  (testing "a .5 sidecar with real content divergence is replaced once and only becomes ready after both checksum projections converge"
+    (async done
+      (let [{:keys [conn child1]} (setup-parent-child)
+            server-db @conn
+            divergent-conn (d/conn-from-db server-db)
+            _ (ldb/transact!
+               divergent-conn
+               [[:db/add
+                 [:block/uuid (:block/uuid child1)]
+                 :block/title "selfhost-five-divergent-local-title"]]
+               {:rtc-tx? true :persist-op? false})
+            replacement-conn (d/conn-from-db server-db)
+            ops-db (new-client-ops-db)
+            repo "selfhost-five-upgrade-repair"
+            graph-id "synthetic-graph"
+            cursor 6205
+            expected-legacy (sync-checksum/recompute-checksum server-db)
+            expected-v2 (sync-checksum/recompute-server-checksum server-db)
+            divergent-legacy (sync-checksum/recompute-checksum @divergent-conn)
+            divergent-v2
+            (sync-checksum/recompute-server-checksum @divergent-conn)
+            prev-db-conns @worker-state/*datascript-conns
+            prev-ops-conns @worker-state/*client-ops-conns
+            prev-client @worker-state/*db-sync-client
+            downloads* (atom 0)
+            ws #js {:readyState 1 :close (fn [] nil)}
+            client {:repo repo
+                    :graph-id graph-id
+                    :ws ws
+                    :ws-state (atom :open)
+                    :sync-ready? (atom true)
+                    :last-sync-error (atom nil)
+                    :last-ws-message-ts (atom (js/Date.now))
+                    :inflight (atom [])
+                    :online-users (atom [])
+                    :reconnect (atom {:attempt 0 :timer nil})
+                    :stale-kill-timer (atom nil)}
+            mismatch (ex-info "checksum mismatch"
+                              {:type :db-sync/checksum-mismatch})]
+        (reset! worker-state/*datascript-conns {repo divergent-conn})
+        (reset! worker-state/*client-ops-conns {repo ops-db})
+        (reset! worker-state/*db-sync-client client)
+        (client-op/update-local-tx repo cursor)
+        (client-op/update-local-checksum repo divergent-legacy)
+        (client-op/update-local-server-checksum repo divergent-v2)
+        (->
+         (p/with-redefs
+           [shared-service/broadcast-to-clients! (fn [& _] nil)
+            client-op/get-unpushed-asset-ops-count (constantly 0)
+            sync-assets/get-missing-asset-upload-files (constantly [])
+            sync-crypt/graph-e2ee? (constantly false)
+            sync-download/download-graph-by-id!
+            (fn [actual-repo actual-graph-id _graph-e2ee? opts]
+              (is (= [repo graph-id] [actual-repo actual-graph-id]))
+              (swap! downloads* inc)
+              ((:activation-preflight-f opts))
+              ;; Model the successful, already separately-tested atomic
+              ;; snapshot activation: .5 had no circuit receipt, and the
+              ;; replacement sidecar starts from a fresh sync_meta table.
+              (.exec ops-db "delete from sync_meta")
+              (reset! worker-state/*datascript-conns
+                      {repo replacement-conn})
+              ((:post-activation-precommit-f opts))
+              (p/resolved :snapshot-activated))
+            db-sync/start!
+            (fn [actual-repo]
+              (is (= repo actual-repo))
+              (is (some? (client-op/get-auto-repair-attempt repo))
+                  "the one-shot circuit remains armed after sidecar replacement")
+              (let [actual-db @(worker-state/get-datascript-conn repo)
+                    actual-legacy
+                    (sync-checksum/recompute-checksum actual-db)
+                    actual-v2
+                    (sync-checksum/recompute-server-checksum actual-db)]
+                (when-not (and (= expected-legacy actual-legacy)
+                               (= expected-v2 actual-v2))
+                  (throw
+                   (ex-info "replacement did not converge"
+                            {:type :test/replacement-not-converged})))
+                (client-op/update-local-tx repo cursor)
+                (client-op/update-local-checksum repo actual-legacy)
+                (client-op/update-local-server-checksum repo actual-v2)
+                (client-op/clear-auto-repair-attempt! repo)
+                (reset! (:sync-ready? client) true)
+                (reset! (:ws-state client) :open)
+                (p/resolved :ready)))]
+           (#'db-sync/handle-runtime-sync-failure!
+            repo client ws "wss://sync.example.test/sync/synthetic-graph"
+            mismatch :message-failed)
+           (p/let [_ (:promise @db-sync/*auto-repair-inflight)]
+             (is (= 1 @downloads*))
+             (is (= :open @(:ws-state client)))
+             (is (true? @(:sync-ready? client)))
+             (is (nil? (client-op/get-auto-repair-attempt repo))
+                 "only proven convergence clears the automatic repair receipt")
+             (is (= expected-legacy
+                    (client-op/get-local-checksum repo)))
+             (is (= expected-v2
+                    (client-op/get-local-server-checksum repo)))
+             (is (= (:block/title (d/entity server-db
+                                             [:block/uuid
+                                              (:block/uuid child1)]))
+                    (:block/title
+                     (d/entity @(worker-state/get-datascript-conn repo)
+                               [:block/uuid (:block/uuid child1)]))))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally
+          (fn []
+            (reset! db-sync/*auto-repair-inflight nil)
+            (reset! worker-state/*db-sync-client prev-client)
+            (reset! worker-state/*datascript-conns prev-db-conns)
+            (reset! worker-state/*client-ops-conns prev-ops-conns)
+            (.close ops-db)
+            (done))))))))
+
+(deftest automatic-repair-forks-conflicting-title-and-replays-independent-title-test
+  (testing "repair preserves both users' text without letting stale pending input overwrite canonical state"
+    (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+          child1-uuid (:block/uuid child1)
+          child2-uuid (:block/uuid child2)
+          child1-tx-id (random-uuid)
+          child2-draft-tx-id (random-uuid)
+          child2-final-tx-id (random-uuid)
+          captured
+          [{:tx-id child1-tx-id
+            :created-at 1
+            :outliner-op :save-block
+            :db-sync/undo-redo :none
+            :forward-outliner-ops
+            [[:save-block [{:block/uuid child1-uuid
+                            :block/title "user 1 block 1"} {}]]]
+            :inverse-outliner-ops
+            [[:save-block [{:block/uuid child1-uuid
+                            :block/title "child 1"} {}]]]
+            :inferred-outliner-ops? false
+            :tx []
+            :reversed-tx []}
+           {:tx-id child2-draft-tx-id
+            :created-at 2
+            :outliner-op :save-block
+            :db-sync/undo-redo :undo
+            :forward-outliner-ops
+            [[:save-block [{:block/uuid child2-uuid
+                            :block/title "user 1 block 2 draft"} {}]]]
+            :inverse-outliner-ops
+            [[:save-block [{:block/uuid child2-uuid
+                            :block/title "child 2"} {}]]]
+            :inferred-outliner-ops? false
+            :tx []
+            :reversed-tx []}
+           {:tx-id child2-final-tx-id
+            :created-at 3
+            :outliner-op :save-block
+            :db-sync/undo-redo :none
+            :forward-outliner-ops
+            [[:save-block [{:block/uuid child2-uuid
+                            :block/title "user 1 block 2"} {}]]]
+            :inverse-outliner-ops
+            [[:save-block [{:block/uuid child2-uuid
+                            :block/title "user 1 block 2 draft"} {}]]]
+            :inferred-outliner-ops? false
+            :tx []
+            :reversed-tx []}]]
+      ;; This is the canonical snapshot downloaded during repair: user 2 left
+      ;; block 1 unchanged and concurrently edited block 2.
+      (ldb/transact! conn
+                     [[:db/add [:block/uuid child2-uuid]
+                       :block/title
+                       "user 2 block 2"]]
+                     {:rtc-tx? true :persist-op? false})
+      (with-datascript-conns conn client-ops-conn
+        (fn []
+          (client-op/update-local-tx test-repo 42)
+          (is (sync-apply/repairable-automatic-repair-overlay? captured))
+          (let [{:keys [rebase-results recovery-blocks]}
+                (sync-apply/restore-automatic-repair-overlay! test-repo captured)
+                repaired-db @conn
+                block1-after (d/entity repaired-db [:block/uuid child1-uuid])
+                block2-after (d/entity repaired-db [:block/uuid child2-uuid])
+                recovery-uuid (:recovery-block-uuid (first recovery-blocks))
+                recovery-block (d/entity repaired-db [:block/uuid recovery-uuid])
+                pending (sync-apply/pending-txs test-repo)]
+            (is (= "user 1 block 1" (:block/title block1-after))
+                "a one-sided local edit is replayed without user involvement")
+            (is (= "user 2 block 2" (:block/title block2-after))
+                "canonical concurrent content is never silently overwritten")
+            (is (= "user 1 block 2" (:block/title recovery-block))
+                "the conflicting local content becomes a real recoverable block")
+            (is (= (some-> block2-after :block/parent :block/uuid)
+                   (some-> recovery-block :block/parent :block/uuid)))
+            (is (= (some-> block2-after :block/page :block/uuid)
+                   (some-> recovery-block :block/page :block/uuid)))
+            (is (some #(= child1-tx-id (:tx-id %)) pending)
+                "the nonconflicting block1 edit remains pending for an authoritative ACK")
+            (is (= 2 (count pending))
+                "the stale block2 tx is replaced by exactly one real recovery-block tx")
+            (is (not-any? #(contains? #{child2-draft-tx-id child2-final-tx-id}
+                                       (:tx-id %))
+                          pending))
+            (is (= :undo (:db-sync/undo-redo
+                          (client-op/get-local-tx-entry test-repo child2-draft-tx-id)))
+                "retired history still retains its original undo/redo provenance")
+            (is (= ["user 1 block 2"]
+                   (mapv :value (client-op/get-sync-conflicts test-repo child2-uuid))))
+            (is (= [:rebased :fork :fork] (mapv :status rebase-results))
+                "continuous typing is folded into one recovery block without losing history")
+            (is (= 2 (client-op/get-durable-pending-local-tx-count test-repo)))))))))
+
+(deftest automatic-repair-entrypoint-preserves-both-users-content-test
+  (testing "repair-required downloads canonical state and turns a true title conflict into a sibling block"
+    (async done
+      (let [{:keys [conn client-ops-conn child1 child2]} (setup-parent-child)
+            base-db @conn
+            local-conn (d/conn-from-db base-db)
+            canonical-conn (d/conn-from-db base-db)
+            replacement-ops (new-client-ops-db)
+            repo test-repo
+            graph-id "synthetic-graph"
+            child1-uuid (:block/uuid child1)
+            child2-uuid (:block/uuid child2)
+            prev-db-conns @worker-state/*datascript-conns
+            prev-ops-conns @worker-state/*client-ops-conns
+            prev-client @worker-state/*db-sync-client
+            preserved* (atom nil)
+            starts* (atom 0)
+            ws #js {:readyState 1 :close (fn [] nil)}
+            client {:repo repo
+                    :graph-id graph-id
+                    :ws ws
+                    :ws-state (atom :open)
+                    :sync-ready? (atom true)
+                    :last-sync-error (atom nil)
+                    :last-ws-message-ts (atom (js/Date.now))
+                    :inflight (atom [])
+                    :online-users (atom [])
+                    :reconnect (atom {:attempt 0 :timer nil})
+                    :stale-kill-timer (atom nil)}
+            mismatch (ex-info "checksum mismatch"
+                              {:type :db-sync/checksum-mismatch})]
+        (ldb/transact! canonical-conn
+                       [[:db/add [:block/uuid child2-uuid]
+                         :block/title
+                         "user 2 canonical block 2"]]
+                       {:rtc-tx? true :persist-op? false})
+        (reset! worker-state/*datascript-conns {repo local-conn})
+        (reset! worker-state/*client-ops-conns {repo client-ops-conn})
+        (reset! worker-state/*db-sync-client client)
+        (d/listen! local-conn ::auto-repair-title-overlay
+                   (fn [tx-report]
+                     (db-sync/enqueue-local-tx! repo tx-report)))
+        (apply-ops! local-conn
+                    [[:save-block [{:block/uuid child1-uuid
+                                    :block/title "user 1 local block 1"} {}]]]
+                    local-tx-meta)
+        (apply-ops! local-conn
+                    [[:save-block [{:block/uuid child2-uuid
+                                    :block/title "user 1 local block 2"} {}]]]
+                    local-tx-meta)
+        (let [captured-before (sync-apply/pending-txs repo)
+              captured-ids (mapv :tx-id captured-before)]
+          (is (= 2 (count captured-before)))
+          (is (sync-apply/repairable-automatic-repair-overlay?
+               captured-before))
+          (-> (p/with-redefs
+                [shared-service/broadcast-to-clients! (fn [& _] nil)
+                 client-op/get-unpushed-asset-ops-count (constantly 0)
+                 sync-assets/get-missing-asset-upload-files (constantly [])
+                 sync-crypt/graph-e2ee? (constantly false)
+                 client-op/claim-auto-repair-attempt! (fn [& _] true)
+                 client-op/get-auto-repair-attempt
+                 (fn [_]
+                   {:attempt-id "content-repair-attempt"
+                    :error-type :db-sync/checksum-mismatch
+                    :graph-id graph-id
+                    :started-at 1
+                    :status :started})
+                 client-op/preserve-auto-repair-attempt!
+                 (fn [_ receipt]
+                   (reset! preserved* receipt)
+                   true)
+                 sync-download/download-graph-by-id!
+                 (fn [_repo _graph-id _e2ee? opts]
+                   ((:activation-preflight-f opts))
+                   ((:post-backup-pre-reset-f opts))
+                   (d/unlisten! local-conn ::auto-repair-title-overlay)
+                   (reset! worker-state/*datascript-conns
+                           {repo canonical-conn})
+                   (reset! worker-state/*client-ops-conns
+                           {repo replacement-ops})
+                   (client-op/update-local-tx repo 42)
+                   (client-op/update-local-checksum
+                    repo (sync-checksum/recompute-checksum @canonical-conn))
+                   (client-op/update-local-server-checksum
+                    repo (sync-checksum/recompute-server-checksum @canonical-conn))
+                   (d/listen! canonical-conn ::auto-repair-title-replacement
+                              (fn [tx-report]
+                                (db-sync/enqueue-local-tx! repo tx-report)))
+                   ((:post-activation-precommit-f opts))
+                   (p/resolved :activated))
+                 db-sync/start!
+                 (fn [_]
+                   (swap! starts* inc)
+                   (p/resolved :started))]
+                (#'db-sync/handle-runtime-sync-failure!
+                 repo client ws "wss://sync.example.test/sync/synthetic-graph"
+                 mismatch :message-failed)
+                (p/let [_ (:promise @db-sync/*auto-repair-inflight)]
+                  (let [repaired-db @canonical-conn
+                        block1-after (d/entity repaired-db [:block/uuid child1-uuid])
+                        block2-after (d/entity repaired-db [:block/uuid child2-uuid])
+                        recovery-block
+                        (db-test/find-block-by-content repaired-db
+                                                       "user 1 local block 2")
+                        pending-after (sync-apply/pending-txs repo)]
+                    (is (= 1 @starts*))
+                    (is (= "user 1 local block 1" (:block/title block1-after)))
+                    (is (= "user 2 canonical block 2" (:block/title block2-after)))
+                    (is (some? recovery-block))
+                    (is (= (some-> block2-after :block/parent :block/uuid)
+                           (some-> recovery-block :block/parent :block/uuid)))
+                    (is (= 2 (count pending-after)))
+                    (is (= (mapv str captured-ids)
+                           (:overlay-tx-ids @preserved*)))
+                    (is (not= :open @(:ws-state client))))))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (d/unlisten! canonical-conn ::auto-repair-title-replacement)
+                 (reset! db-sync/*auto-repair-inflight nil)
+                 (reset! worker-state/*db-sync-client prev-client)
+                 (reset! worker-state/*datascript-conns prev-db-conns)
+                 (reset! worker-state/*client-ops-conns prev-ops-conns)
+                 (.close replacement-ops)
+                 (done)))))))))
+
+(deftest automatic-repair-accepts-real-persisted-title-history-test
+  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+        block-uuid (:block/uuid child1)]
+    (with-datascript-conns conn client-ops-conn
+      (fn []
+        (apply-ops! conn
+                    [[:save-block [{:block/uuid block-uuid
+                                    :block/title "first local draft"} {}]]]
+                    local-tx-meta)
+        (apply-ops! conn
+                    [[:save-block [{:block/uuid block-uuid
+                                    :block/title "final local draft"} {}]]]
+                    local-tx-meta)
+        (let [captured (sync-apply/pending-txs test-repo)]
+          (is (= 2 (count captured)))
+          (is (= ["child 1" "first local draft"]
+                 (mapv #(get-in % [:inverse-outliner-ops 0 1 0 :block/title])
+                       captured)))
+          (is (= ["first local draft" "final local draft"]
+                 (mapv #(get-in % [:forward-outliner-ops 0 1 0 :block/title])
+                       captured)))
+          (is (sync-apply/repairable-automatic-repair-overlay? captured)))))))
+
+(deftest automatic-repair-rejects-broken-title-history-test
+  (let [block-uuid (random-uuid)
+        first-tx-id (random-uuid)
+        second-tx-id (random-uuid)
+        title-entry
+        (fn [tx-id created-at base-title local-title]
+          {:tx-id tx-id
+           :created-at created-at
+           :outliner-op :save-block
+           :db-sync/undo-redo :none
+           :forward-outliner-ops
+           [[:save-block [{:block/uuid block-uuid
+                           :block/title local-title} {}]]]
+           :inverse-outliner-ops
+           [[:save-block [{:block/uuid block-uuid
+                           :block/title base-title} {}]]]
+           :tx []
+           :reversed-tx []})]
+    (is (sync-apply/repairable-automatic-repair-overlay?
+         [(title-entry first-tx-id 1 "base" "first")
+          (title-entry second-tx-id 2 "first" "second")]))
+    (is (false?
+         (sync-apply/repairable-automatic-repair-overlay?
+          [(title-entry first-tx-id 1 "base" "first")
+           (title-entry second-tx-id 2 "unrelated base" "second")])))))
+
+(deftest automatic-repair-drops-canonicalized-title-prefix-before-replaying-tail-test
+  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+        block-uuid (:block/uuid child1)
+        first-tx-id (random-uuid)
+        second-tx-id (random-uuid)
+        captured
+        [{:tx-id first-tx-id
+          :created-at 1
+          :outliner-op :save-block
+          :db-sync/undo-redo :none
+          :forward-outliner-ops
+          [[:save-block [{:block/uuid block-uuid
+                          :block/title "shared intermediate"} {}]]]
+          :inverse-outliner-ops
+          [[:save-block [{:block/uuid block-uuid
+                          :block/title "child 1"} {}]]]
+          :tx [] :reversed-tx []}
+         {:tx-id second-tx-id
+          :created-at 2
+          :outliner-op :save-block
+          :db-sync/undo-redo :none
+          :forward-outliner-ops
+          [[:save-block [{:block/uuid block-uuid
+                          :block/title "local final"} {}]]]
+          :inverse-outliner-ops
+          [[:save-block [{:block/uuid block-uuid
+                          :block/title "shared intermediate"} {}]]]
+          :tx [] :reversed-tx []}]]
+    (ldb/transact! conn
+                   [[:db/add [:block/uuid block-uuid]
+                     :block/title
+                     "shared intermediate"]]
+                   {:rtc-tx? true :persist-op? false})
+    (with-datascript-conns conn client-ops-conn
+      (fn []
+        (let [{:keys [rebase-results recovery-blocks]}
+              (sync-apply/restore-automatic-repair-overlay! test-repo captured)]
+          (is (= [:drop :rebased] (mapv :status rebase-results)))
+          (is (empty? recovery-blocks))
+          (is (= "local final"
+                 (:block/title (d/entity @conn [:block/uuid block-uuid]))))
+          (is (= [second-tx-id]
+                 (mapv :tx-id (sync-apply/pending-txs test-repo))))
+          (is (empty? (client-op/get-sync-conflicts test-repo block-uuid))))))))
+
+(deftest automatic-repair-recovery-block-preserves-large-title-verbatim-test
+  (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+        block-uuid (:block/uuid child1)
+        local-title (str "local-large:" (apply str (repeat 5000 "文")))
+        captured [{:tx-id (random-uuid)
+                   :created-at 1
+                   :outliner-op :save-block
+                   :db-sync/undo-redo :none
+                   :forward-outliner-ops
+                   [[:save-block [{:block/uuid block-uuid
+                                   :block/title local-title} {}]]]
+                   :inverse-outliner-ops
+                   [[:save-block [{:block/uuid block-uuid
+                                   :block/title "child 1"} {}]]]
+                   :tx [] :reversed-tx []}]]
+    (ldb/transact! conn
+                   [[:db/add [:block/uuid block-uuid]
+                     :block/title
+                     "remote-large-conflict"]]
+                   {:rtc-tx? true :persist-op? false})
+    (with-datascript-conns conn client-ops-conn
+      (fn []
+        (let [{:keys [recovery-blocks]}
+              (sync-apply/restore-automatic-repair-overlay! test-repo captured)
+              recovery-uuid (:recovery-block-uuid (first recovery-blocks))
+              recovery-block (d/entity @conn [:block/uuid recovery-uuid])]
+          (is (sync-large-title/large-title? local-title))
+          (is (= local-title (:block/title recovery-block)))
+          (is (= (count local-title) (count (:block/title recovery-block)))))))))
+
+(deftest automatic-repair-rebases-structural-overlay-without-rolling-back-input-test
+  (testing "repair replaces only the canonical base and preserves a pending structural move as an overlay"
+    (async done
+      (let [{:keys [conn client-ops-conn parent-b a-child-1]}
+            (setup-two-parents)
+            canonical-db @conn
+            local-conn (d/conn-from-db canonical-db)
+            replacement-conn (d/conn-from-db canonical-db)
+            replacement-ops (new-client-ops-db)
+            repo test-repo
+            graph-id "synthetic-graph"
+            child-uuid (:block/uuid a-child-1)
+            target-uuid (:block/uuid parent-b)
+            prev-db-conns @worker-state/*datascript-conns
+            prev-ops-conns @worker-state/*client-ops-conns
+            prev-client @worker-state/*db-sync-client
+            preserved* (atom nil)
+            starts* (atom 0)
+            ws #js {:readyState 1 :close (fn [] nil)}
+            client {:repo repo
+                    :graph-id graph-id
+                    :ws ws
+                    :ws-state (atom :open)
+                    :sync-ready? (atom true)
+                    :last-sync-error (atom nil)
+                    :last-ws-message-ts (atom (js/Date.now))
+                    :inflight (atom [])
+                    :online-users (atom [])
+                    :reconnect (atom {:attempt 0 :timer nil})
+                    :stale-kill-timer (atom nil)}
+            mismatch (ex-info "checksum mismatch"
+                              {:type :db-sync/checksum-mismatch})]
+        (reset! worker-state/*datascript-conns {repo local-conn})
+        (reset! worker-state/*client-ops-conns {repo client-ops-conn})
+        (reset! worker-state/*db-sync-client client)
+        (d/listen! local-conn ::auto-repair-overlay
+                   (fn [tx-report]
+                     (db-sync/enqueue-local-tx! repo tx-report)))
+        (apply-ops!
+         local-conn
+         [[:move-blocks [[child-uuid]
+                         target-uuid
+                         {:sibling? false :bottom? true}]]]
+         (assoc local-tx-meta :outliner-op :move-blocks))
+        (let [captured (first (sync-apply/pending-txs repo))
+              captured-id (:tx-id captured)]
+          (is (sync-apply/repairable-automatic-repair-overlay? [captured]))
+          (is (= target-uuid
+                 (some-> (d/entity @local-conn [:block/uuid child-uuid])
+                         :block/parent :block/uuid)))
+          (-> (p/with-redefs
+                [shared-service/broadcast-to-clients! (fn [& _] nil)
+                 client-op/get-unpushed-asset-ops-count (constantly 0)
+                 sync-assets/get-missing-asset-upload-files (constantly [])
+                 sync-crypt/graph-e2ee? (constantly false)
+                 client-op/claim-auto-repair-attempt! (fn [& _] true)
+                 client-op/get-auto-repair-attempt
+                 (fn [_]
+                   {:attempt-id "overlay-repair-attempt"
+                    :error-type :db-sync/checksum-mismatch
+                    :graph-id graph-id
+                    :started-at 1
+                    :status :started})
+                 client-op/preserve-auto-repair-attempt!
+                 (fn [_ receipt]
+                   (reset! preserved* receipt)
+                   true)
+                 sync-download/download-graph-by-id!
+                 (fn [_repo _graph-id _e2ee? opts]
+                   ((:activation-preflight-f opts))
+                   ((:post-backup-pre-reset-f opts))
+                   (d/unlisten! local-conn ::auto-repair-overlay)
+                   (reset! worker-state/*datascript-conns
+                           {repo replacement-conn})
+                   (reset! worker-state/*client-ops-conns
+                           {repo replacement-ops})
+                   (client-op/update-local-tx repo 27)
+                   (client-op/update-local-checksum
+                    repo (sync-checksum/recompute-checksum canonical-db))
+                   (client-op/update-local-server-checksum
+                    repo (sync-checksum/recompute-server-checksum canonical-db))
+                   (d/listen! replacement-conn ::auto-repair-overlay-replacement
+                              (fn [tx-report]
+                                (db-sync/enqueue-local-tx! repo tx-report)))
+                   ((:post-activation-precommit-f opts))
+                   (p/resolved :activated))
+                 db-sync/start!
+                 (fn [_]
+                   (swap! starts* inc)
+                   (p/resolved :started))]
+                (#'db-sync/handle-runtime-sync-failure!
+                 repo client ws "wss://sync.example.test/sync/synthetic-graph"
+                 mismatch :message-failed)
+                (p/let [_ (:promise @db-sync/*auto-repair-inflight)]
+                  (let [pending (sync-apply/pending-txs repo)
+                        repaired-child
+                        (d/entity @(worker-state/get-datascript-conn repo)
+                                  [:block/uuid child-uuid])]
+                    (is (= 1 @starts*))
+                    (is (= [captured-id] (mapv :tx-id pending))
+                        "repair preserves one logical pending op and its tx identity")
+                    (is (= target-uuid
+                           (some-> repaired-child
+                                   :block/parent :block/uuid))
+                        "the local structural intent is rebased onto the canonical replacement")
+                    (is (= [(str captured-id)] (:overlay-tx-ids @preserved*))
+                        "the circuit receipt stays armed until this exact overlay is acknowledged")
+                    (is (= 1 (client-op/get-durable-pending-local-tx-count repo)))
+                    (is (not= :open @(:ws-state client))
+                        "repair cannot announce health before the rebased overlay is acknowledged"))))
+              (p/catch (fn [error]
+                         (is false (str "unexpected overlay repair error: " error))))
+              (p/finally
+               (fn []
+                 (d/unlisten! local-conn ::auto-repair-overlay)
+                 (d/unlisten! replacement-conn
+                              ::auto-repair-overlay-replacement)
+                 (reset! db-sync/*auto-repair-inflight nil)
+                 (reset! worker-state/*db-sync-client prev-client)
+                 (reset! worker-state/*datascript-conns prev-db-conns)
+                 (reset! worker-state/*client-ops-conns prev-ops-conns)
+                 (.close client-ops-conn)
+                 (.close replacement-ops)
+                 (done)))))))))
+
+(deftest failed-automatic-repair-keeps-the-original-graph-editable-without-looping-test
+  (testing "a failed repair parks RTC but never turns the local graph into a rollback loop"
+    (async done
+      (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+            repo "failed-repair-editable-repo"
+            graph-id "synthetic-graph"
+            original-title (:block/title child1)
+            prev-db-conns @worker-state/*datascript-conns
+            prev-ops-conns @worker-state/*client-ops-conns
+            prev-client @worker-state/*db-sync-client
+            downloads* (atom 0)
+            ws #js {:readyState 1 :close (fn [] nil)}
+            client {:repo repo
+                    :graph-id graph-id
+                    :ws ws
+                    :ws-state (atom :open)
+                    :sync-ready? (atom true)
+                    :last-sync-error (atom nil)
+                    :last-ws-message-ts (atom (js/Date.now))
+                    :inflight (atom [])
+                    :online-users (atom [])
+                    :reconnect (atom {:attempt 0 :timer nil})
+                    :stale-kill-timer (atom nil)}
+            mismatch (ex-info "checksum mismatch"
+                              {:type :db-sync/checksum-mismatch})]
+        (reset! worker-state/*datascript-conns {repo conn})
+        (reset! worker-state/*client-ops-conns {repo client-ops-conn})
+        (reset! worker-state/*db-sync-client client)
+        (client-op/update-local-tx repo 9)
+        (client-op/update-local-checksum
+         repo (sync-checksum/recompute-checksum @conn))
+        (client-op/update-local-server-checksum
+         repo (sync-checksum/recompute-server-checksum @conn))
+        (->
+         (p/with-redefs
+           [shared-service/broadcast-to-clients! (fn [& _] nil)
+            client-op/get-unpushed-asset-ops-count (constantly 0)
+            sync-assets/get-missing-asset-upload-files (constantly [])
+            sync-crypt/graph-e2ee? (constantly false)
+            sync-download/download-graph-by-id!
+            (fn [& _]
+              (swap! downloads* inc)
+              (p/rejected
+               (ex-info "snapshot unavailable"
+                        {:type :db-sync/snapshot-download-failed})))]
+           (#'db-sync/handle-runtime-sync-failure!
+            repo client ws "wss://sync.example.test/sync/synthetic-graph"
+            mismatch :message-failed)
+           (let [first-attempt (:promise @db-sync/*auto-repair-inflight)]
+             (p/let [_ first-attempt]
+               (is (= :repair-required @(:ws-state client)))
+               (is (= 1 @downloads*))
+               (is (identical? conn
+                               (worker-state/get-datascript-conn repo))
+                   "the failed network/staging attempt never replaced the local conn")
+               (is (= original-title
+                      (:block/title
+                       (d/entity @conn [:block/uuid (:block/uuid child1)]))))
+               (ldb/transact!
+                conn
+                [[:db/add
+                  [:block/uuid (:block/uuid child1)]
+                  :block/title "editable-after-failed-repair"]]
+                {:rtc-tx? false :persist-op? false})
+               (is (= "editable-after-failed-repair"
+                      (:block/title
+                       (d/entity @conn [:block/uuid (:block/uuid child1)])))
+                   "repair-required stops transport, not local editing")
+               (#'db-sync/handle-runtime-sync-failure!
+                repo client nil "wss://sync.example.test/sync/synthetic-graph"
+                mismatch :message-failed)
+               (p/delay 0)
+               (is (= 1 @downloads*)
+                   "the persisted receipt prevents a repeated automatic rollback"))))
+         (p/catch (fn [error]
+                    (is false (str error))))
+         (p/finally
+          (fn []
+            (reset! db-sync/*auto-repair-inflight nil)
+            (reset! worker-state/*db-sync-client prev-client)
+            (reset! worker-state/*datascript-conns prev-db-conns)
+            (reset! worker-state/*client-ops-conns prev-ops-conns)
+            (.close client-ops-conn)
+            (done))))))))
+
+(defn- write-client-upload-session!
+  [^js client-ops-db logical-tx-id session-data]
+  (let [^js stmt
+        (.prepare
+         client-ops-db
+         (str "insert into client_tx_upload_state "
+              "(logical_tx_id, session_data, updated_at) values (?, ?, ?) "
+              "on conflict(logical_tx_id) do update set "
+              "session_data = excluded.session_data, "
+              "updated_at = excluded.updated_at"))]
+    (.run stmt
+          (str logical-tx-id)
+          (sqlite-util/write-transit-str session-data)
+          1)))
+
+(defn- read-client-upload-session
+  [client-ops-db logical-tx-id]
+  (some-> (sqlite-get-row
+           client-ops-db
+           (str "select session_data from client_tx_upload_state "
+                "where logical_tx_id = ? limit 1")
+           (str logical-tx-id))
+          (aget "session_data")
+          sqlite-util/read-transit-str))
+
+(defn- cursor-restart-test-tx
+  [block-uuid]
+  (mapv (fn [idx]
+          [:db/add [:block/uuid block-uuid]
+           :block/title (str "cursor-restart-" idx)])
+        (range 5001)))
+
+(deftest cold-client-rebuilds-every-invalid-persisted-upload-cursor-shape-test
+  (testing "legacy, partial, negative, and non-integral cursor state restarts from source zero and ordinal zero"
+    (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
+          repo test-repo
+          logical-tx-id (random-uuid)
+          tx-data (cursor-restart-test-tx (:block/uuid child1))
+          pending {:tx-id logical-tx-id
+                   :tx tx-data
+                   :outliner-op :save-block}]
+      (with-datascript-conns
+        conn client-ops-conn
+        (fn []
+          (seed-client-op-txs!
+           repo
+           [{:db-sync/tx-id logical-tx-id
+             :db-sync/pending? true
+             :db-sync/created-at 1
+             :db-sync/outliner-op :save-block
+             :db-sync/normalized-tx-data tx-data}])
+          (clear-all-process-upload-state!)
+          (sync-apply/prepare-upload-tx-entries repo conn [pending])
+          (let [valid-session (read-client-upload-session
+                               client-ops-conn logical-tx-id)
+                source-digest (:source-digest valid-session)
+                invalid-sessions
+                [["legacy next-index only"
+                  {:source-digest source-digest
+                   :next-index 5000}]
+                 ["missing source cursor"
+                  (dissoc valid-session :source-next-index)]
+                 ["missing ordinal cursor"
+                  (dissoc valid-session :chunk-seq)]
+                 ["negative source cursor"
+                  (assoc valid-session :source-next-index -1)]
+                 ["negative ordinal cursor"
+                  (assoc valid-session :chunk-seq -1)]
+                 ["fractional source cursor"
+                  (assoc valid-session :source-next-index 0.5)]
+                 ["string ordinal cursor"
+                  (assoc valid-session :chunk-seq "0")]]]
+            (is (string? source-digest)
+                "the control session must expose the current source digest")
+            (is (some? (:source-next-index valid-session))
+                "the current durable shape has an explicit source cursor")
+            (is (some? (:chunk-seq valid-session))
+                "the current durable shape has an explicit wire ordinal")
+            (doseq [[label invalid-session] invalid-sessions]
+              (testing label
+                (write-client-upload-session!
+                 client-ops-conn logical-tx-id invalid-session)
+                (clear-all-process-upload-state!)
+                (let [entry
+                      (-> (sync-apply/prepare-upload-tx-entries
+                           repo conn [pending])
+                          :tx-entries first)
+                      rebuilt-session
+                      (read-client-upload-session
+                       client-ops-conn logical-tx-id)]
+                  (is (= 0 (:chunk-index entry))
+                      "invalid durable state must never leak a nil/stale ordinal")
+                  (is (false? (:chunk-final? entry)))
+                  (is (= 5000 (count (:tx-data entry))))
+                  (is (= (first tx-data) (first (:tx-data entry)))
+                      "rebuilt upload starts at source index zero")
+                  (is (= (nth tx-data 4999) (last (:tx-data entry)))
+                      "rebuilt first chunk ends at the expected source boundary")
+                  (is (= source-digest (:source-digest rebuilt-session)))
+                  (is (= 0 (:source-next-index rebuilt-session)))
+                  (is (= 0 (:chunk-seq rebuilt-session)))
+                  (is (not (contains? rebuilt-session :next-index))
+                      "legacy positional cursor is discarded, not migrated ambiguously"))))))))))
+
+(defn- shared-tempid-5001-tx
+  [tempid block-uuid parent-uuid page-uuid]
+  (into [[:db/add tempid :block/uuid block-uuid]
+         [:db/add tempid :block/title "valid shared-tempid block"]
+         [:db/add tempid :block/parent [:block/uuid parent-uuid]]
+         [:db/add tempid :block/page [:block/uuid page-uuid]]
+         [:db/add tempid :block/order "zzzz-shared-tempid"]
+         [:db/add tempid :block/created-at 100]
+         [:db/add tempid :block/updated-at 100]]
+        (map (fn [idx]
+               [:db/add tempid
+                (keyword "large-upload.group" (str "attr-" idx))
+                idx])
+             (range 4994))))
+
+(deftest e2e-shared-tempid-group-uses-empty-final-and-retries-it-after-cold-ack-loss-test
+  (testing "real client and strict server preserve an indivisible 5001-datom group behind an empty final terminator"
+    (async done
+           (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+                 repo test-repo
+                 logical-tx-id (random-uuid)
+                 block-uuid (random-uuid)
+                 parent-uuid (:block/uuid parent)
+                 page-uuid (some-> parent :block/page :block/uuid)
+                 logical-tx (shared-tempid-5001-tx
+                             "shared-tempid-empty-final"
+                             block-uuid parent-uuid page-uuid)
+                 server-seed-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-seed-storage))
+                 _ (d/conn-from-datoms
+                    (d/datoms @conn :eavt)
+                    (d/schema @conn)
+                    {:storage
+                     (sync-storage/new-sqlite-storage
+                      (:sql server-seed-storage))})
+                 server-storage (make-real-storage-sql)
+                 _ (sync-storage/init-schema! (:sql server-storage))
+                 _ (#'sync-handler/import-snapshot-rows!
+                    (:sql server-storage)
+                    "kvs"
+                    (real-kvs-rows (:sql server-seed-storage)))
+                 server-conn (sync-storage/open-conn (:sql server-storage))
+                 server-self #js {:sql (:sql server-storage)
+                                  :conn server-conn
+                                  :schema-ready false}
+                 server-t0 (sync-handler/t-now server-self)
+                 server-legacy-checksum0
+                 (sync-checksum/recompute-checksum @server-conn)
+                 server-checksum0
+                 (sync-checksum/recompute-server-checksum @server-conn)
+                 _ (sync-storage/set-checksum!
+                    (:sql server-storage) server-legacy-checksum0)
+                 _ (sync-storage/set-server-checksum!
+                    (:sql server-storage) server-checksum0 server-t0)
+                 server-response* (atom nil)
+                 server-ws (doto (js-obj)
+                             (aset "readyState" 1)
+                             (aset "send" (fn [raw]
+                                            (reset! server-response* raw))))
+                 _ (d/transact! conn logical-tx)
+                 expected-legacy-checksum
+                 (sync-checksum/recompute-checksum @conn)
+                 expected-checksum
+                 (sync-checksum/recompute-server-checksum @conn)
+                 first-sent* (atom [])
+                 second-sent* (atom [])
+                 first-client (manual-modern-client repo first-sent*)]
+             (sync-storage/set-t! (:sql server-storage) server-t0)
+             (->
+              (with-datascript-conns
+                conn client-ops-conn
+                (fn []
+                  (client-op/update-graph-uuid repo "graph-1")
+                  (client-op/update-local-tx repo server-t0)
+                  (client-op/update-local-checksum
+                   repo (sync-checksum/recompute-checksum @conn))
+                  (client-op/update-local-server-checksum
+                   repo expected-checksum)
+                  (seed-client-op-txs!
+                   repo
+                   [{:db-sync/tx-id logical-tx-id
+                     :db-sync/pending? true
+                     :db-sync/created-at 1
+                     :db-sync/outliner-op :save-block
+                     :db-sync/normalized-tx-data logical-tx}])
+                  (reset! sync-apply/*repo->latest-remote-tx {repo server-t0})
+                  (let [pending {:tx-id logical-tx-id
+                                 :tx logical-tx
+                                 :outliner-op :save-block}]
+                    ;; Build a valid current record only to obtain its exact
+                    ;; source digest, then replace it with the old persisted
+                    ;; shape and discard every process-local generation/cache.
+                    (sync-apply/prepare-upload-tx-entries repo conn [pending])
+                    (let [source-digest
+                          (:source-digest
+                           (read-client-upload-session
+                            client-ops-conn logical-tx-id))]
+                      (is (string? source-digest))
+                      (write-client-upload-session!
+                       client-ops-conn logical-tx-id
+                       {:source-digest source-digest
+                        :next-index 5000})
+                      (clear-all-process-upload-state!))
+                    (p/with-redefs
+                      [worker-state/online? (constantly true)
+                       sync-crypt/graph-e2ee? (constantly false)
+                       shared-service/broadcast-to-clients! (fn [& _] nil)
+                       sync-assets/enqueue-asset-sync! (fn [& _] nil)]
+                      (p/let [_ (<observe-real-server-hello!
+                                repo first-client server-self server-ws
+                                server-response*)
+                              first-exchange
+                              (<exchange-one-real-upload!
+                               repo first-client first-sent*
+                               server-self server-ws server-response* true)
+                              first-entry (-> first-exchange :request :txs first)
+                              first-wire-tx
+                              (sync-protocol/transit->tx (:tx first-entry))
+                              _ (do
+                                  (is (= 0 (:chunk-index first-entry)))
+                                  (is (false? (:chunk-final? first-entry)))
+                                  (is (= 5001 (count first-wire-tx)))
+                                  (is (= (test-sha256-hex
+                                          (sync-protocol/tx->transit logical-tx))
+                                         (test-sha256-hex
+                                          (sync-protocol/tx->transit first-wire-tx)))
+                                      "ordinal zero carries the indivisible group intact")
+                                  (is (= "tx/batch/ok"
+                                         (-> first-exchange :response :type)))
+                                  (is (= server-t0
+                                         (sync-handler/t-now server-self)))
+                                  (is (= server-checksum0
+                                         (sync-checksum/recompute-server-checksum
+                                          @server-conn)))
+                                  (is (nil? (d/entity @server-conn
+                                                      [:block/uuid block-uuid])))
+                                  (is (= 1
+                                         (client-op/get-pending-local-tx-count
+                                          repo))))
+                              final-attempt
+                              (<exchange-one-real-upload!
+                               repo first-client first-sent*
+                               server-self server-ws server-response* false)
+                              final-entry (-> final-attempt :request :txs first)
+                              _ (do
+                                  (is (= 1 (:chunk-index final-entry)))
+                                  (is (true? (:chunk-final? final-entry)))
+                                  (is (empty?
+                                       (sync-protocol/transit->tx
+                                        (:tx final-entry)))
+                                      "ordinal one is the explicit empty terminator")
+                                  (is (= "tx/batch/ok"
+                                         (-> final-attempt :response :type)))
+                                  (is (= (inc server-t0)
+                                         (sync-handler/t-now server-self)))
+                                  (is (= expected-checksum
+                                         (sync-checksum/recompute-server-checksum
+                                          @server-conn)
+                                         (sync-storage/get-server-checksum
+                                          (:sql server-storage))))
+                                  (is (= expected-legacy-checksum
+                                         (sync-storage/get-checksum
+                                          (:sql server-storage))))
+                                  (is (= (inc server-t0)
+                                         (sync-storage/get-server-checksum-t
+                                          (:sql server-storage))))
+                                  (let [server-entity
+                                        (d/entity @server-conn
+                                                  [:block/uuid block-uuid])]
+                                    (is (some? server-entity))
+                                    (is (= 5001
+                                           (count
+                                            (d/datoms @server-conn :eavt
+                                                      (:db/id server-entity))))
+                                        "all 5001 staged datoms become visible together"))
+                                  (is (= 1
+                                         (client-op/get-pending-local-tx-count
+                                          repo))
+                                      "lost final ACK leaves the logical op pending"))
+                              _ (do
+                                  (sync-apply/clear-upload-response-timeout!
+                                   first-client)
+                                  (reset! (:inflight first-client) [])
+                                  (clear-all-process-upload-state!))
+                              second-client
+                              (manual-modern-client repo second-sent*)
+                              _ (<observe-real-server-hello!
+                                 repo second-client server-self server-ws
+                                 server-response*)
+                              _ (reset! second-sent* [])
+                              _ (#'sync-apply/flush-pending!
+                                 repo second-client)
+                              direct-request-raw (first @second-sent*)
+                              resolution
+                              (if direct-request-raw
+                                (p/let [request
+                                        (js->clj
+                                         (js/JSON.parse direct-request-raw)
+                                         :keywordize-keys true)
+                                        response-raw
+                                        (<server-ws-roundtrip!
+                                         server-self server-ws
+                                         server-response* direct-request-raw)
+                                        response
+                                        (js->clj (js/JSON.parse response-raw)
+                                                 :keywordize-keys true)
+                                        _ (p/with-redefs
+                                            [sync-apply/enqueue-flush-pending!
+                                             (fn [& _] nil)
+                                             sync-assets/enqueue-asset-sync!
+                                             (fn [& _] nil)
+                                             shared-service/broadcast-to-clients!
+                                             (fn [& _] nil)]
+                                            (sync-handle-message/handle-message!
+                                             repo second-client response-raw))]
+                                  {:mode :direct-empty-final-retry
+                                   :request request
+                                   :response response})
+                                (p/let [pull-raw
+                                        (sync-protocol/encode-message
+                                         (sync-handler/pull-response
+                                          server-self server-t0))
+                                        _ (p/with-redefs
+                                            [sync-apply/enqueue-flush-pending!
+                                             (fn [& _] nil)
+                                             sync-assets/enqueue-asset-sync!
+                                             (fn [& _] nil)
+                                             shared-service/broadcast-to-clients!
+                                             (fn [& _] nil)]
+                                            (sync-handle-message/handle-message!
+                                             repo second-client pull-raw))
+                                        _ (reset! second-sent* [])
+                                        _ (#'sync-apply/flush-pending!
+                                           repo second-client)]
+                                  {:mode :pull-reconciled
+                                   :post-pull-messages @second-sent*}))]
+                        (case (:mode resolution)
+                          :direct-empty-final-retry
+                          (do
+                            (is (= final-entry
+                                   (-> resolution :request :txs first))
+                                "a schedulable direct retry reuses the identical empty final entry")
+                            (is (= "tx/batch/ok"
+                                   (-> resolution :response :type))))
+
+                          :pull-reconciled
+                          (is (empty? (:post-pull-messages resolution))
+                              "pull reconciliation clears the committed op without another upload"))
+                        (is (zero?
+                             (client-op/get-pending-local-tx-count repo)))
+                        (is (nil? (read-client-upload-session
+                                  client-ops-conn logical-tx-id))
+                            "either safe completion path clears durable upload state")
+                        (is (= (inc server-t0)
+                               (sync-handler/t-now server-self)))
+                        (is (= expected-checksum
+                               (sync-checksum/recompute-server-checksum
+                                @server-conn)
+                               (sync-storage/get-server-checksum
+                                (:sql server-storage))))
+                        (is (= expected-legacy-checksum
+                               (sync-storage/get-checksum
+                                (:sql server-storage)))))))))
+              (p/catch (fn [error]
+                         (is false (str error))))
+              (p/finally
+               (fn []
+                 (doseq [client [first-client
+                                 @worker-state/*db-sync-client]]
+                   (when (map? client)
+                     (sync-apply/clear-upload-response-timeout! client)))
+                 (clear-all-process-upload-state!)
+                 (.close (:sql server-seed-storage))
+                 (.close (:sql server-storage))
+                 (done))))))))

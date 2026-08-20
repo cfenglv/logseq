@@ -15,11 +15,18 @@
    [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
    [frontend.worker.sync.util :refer [fail-fast] :as sync-util]
    [lambdaisland.glogi :as log]
+   [logseq.db-sync.checksum :as sync-checksum]
    [logseq.db-sync.snapshot :as snapshot]
    [logseq.db.common.sqlite :as common-sqlite]
    [logseq.db.frontend.schema :as db-schema]
    [promesa.core :as p]
    [logseq.db :as ldb]))
+
+(defonce ^:private *snapshot-failure-handler (atom nil))
+
+(defn register-snapshot-failure-handler!
+  [handler]
+  (reset! *snapshot-failure-handler handler))
 
 (defn- ->uint8 [data]
   (cond
@@ -72,8 +79,15 @@
         (p/catch (fn [_] false))
         (p/finally (fn []
                      (try
-                       (.releaseLock reader)
-                       (catch :default _)))))))
+                       ;; `tee` buffers unread data independently for both
+                       ;; branches. Cancel the one-chunk probe so a large
+                       ;; snapshot cannot accumulate behind an abandoned
+                       ;; reader while the payload branch is consumed.
+                       (.cancel reader)
+                       ;; A tee-branch cancel promise may not resolve until the
+                       ;; sibling finishes; do not make probing wait for it.
+                       nil
+                       (catch :default _ nil)))))))
 
 (defn- <response-body-stream
   [^js resp]
@@ -158,32 +172,42 @@
 
 (defonce ^:private *import-state (atom nil))
 (def ^:private snapshot-import-datoms-batch-size 10000)
+(def ^:private max-legacy-snapshot-attempts 3)
 
 (defn complete-datoms-import!
-  [repo graph-id remote-tx]
-  (-> (p/do!
-       (when-let [search-db (worker-state/get-sqlite-conn repo :search)]
-         (search/truncate-table! search-db))
-       (rtc-log-and-state/rtc-log :rtc.log/download
-                                  {:sub-type :download-progress
-                                   :graph-uuid graph-id
-                                   :message "Saving data to DB"})
-       (->
-        (if-let [rehydrate-f (@thread-api/*thread-apis :thread-api/db-sync-rehydrate-large-titles)]
+  ([repo graph-id remote-tx]
+   (complete-datoms-import! repo graph-id remote-tx nil))
+  ([repo graph-id remote-tx after-rehydrate-f]
+   (-> (p/do!
+        (when-let [search-db (worker-state/get-sqlite-conn repo :search)]
+          (search/truncate-table! search-db))
+        (rtc-log-and-state/rtc-log :rtc.log/download
+                                   {:sub-type :download-progress
+                                    :graph-uuid graph-id
+                                    :message "Saving data to DB"})
+        (if-let [rehydrate-f
+                 (@thread-api/*thread-apis
+                  :thread-api/db-sync-rehydrate-large-titles)]
           (rehydrate-f repo graph-id)
-          (fail-fast :db-sync/missing-field {:field :thread-api/db-sync-rehydrate-large-titles}))
-        (p/catch (fn [error]
-                   (log/error ::rehydrate-large-title-failed error))))
-       (rtc-log-and-state/rtc-log :rtc.log/download
-                                  {:sub-type :download-completed
-                                   :graph-uuid graph-id
-                                   :message "Graph is ready!"})
-       (when-let [^js db (worker-state/get-sqlite-conn repo :db)]
-         (.exec db "PRAGMA wal_checkpoint(TRUNCATE)"))
-       (client-op/update-local-tx repo remote-tx)
-       (shared-service/broadcast-to-clients! :add-repo {:repo repo}))
-      (p/catch (fn [error]
-                 (js/console.error error)))))
+          (fail-fast
+           :db-sync/missing-field
+           {:field :thread-api/db-sync-rehydrate-large-titles}))
+        (when after-rehydrate-f
+          (after-rehydrate-f))
+        (rtc-log-and-state/rtc-log :rtc.log/download
+                                   {:sub-type :download-completed
+                                    :graph-uuid graph-id
+                                    :message "Graph is ready!"})
+        (when-let [^js db (worker-state/get-sqlite-conn repo :db)]
+          (.exec db "PRAGMA wal_checkpoint(TRUNCATE)"))
+        (client-op/update-local-tx repo remote-tx)
+        (shared-service/broadcast-to-clients! :add-repo {:repo repo}))
+       (p/catch (fn [error]
+                  (log/error ::complete-datoms-import-failed
+                             {:repo repo
+                              :graph-id graph-id
+                              :error-name (or (.-name error) "Error")})
+                  (throw error))))))
 
 (defn- require-thread-api-f!
   [k]
@@ -200,18 +224,28 @@
             :import-id import-id}))
 
 (defn- import-temp-pool-name
-  [repo]
-  (worker-util/get-pool-name (str "download-import-" repo)))
+  [repo import-id]
+  ;; A previous pool removal is asynchronous on Node. Use an import-scoped
+  ;; name so a delayed cleanup can never delete the next import's database.
+  (worker-util/get-pool-name
+   (str "download-import-" repo "-" import-id)))
 
 (defn- close-import-state!
-  [{:keys [rows-db rows-pool]}]
+  [{:keys [import-id repo rows-db rows-pool]}]
   (when rows-db
     (try
       (.close rows-db)
       (catch :default _)))
-  (when rows-pool
+  (if rows-pool
     (-> (platform/remove-storage-pool! (platform/current) rows-pool)
-        (p/catch (fn [_] nil)))))
+        (p/catch
+         (fn [error]
+           (log/warn :db-sync/import-pool-cleanup-failed
+                     {:repo repo
+                      :import-id import-id
+                      :error-name (or (some-> error .-name) "Error")})
+           nil)))
+    (p/resolved nil)))
 
 (defn close-import-state-for-repo!
   [repo]
@@ -261,10 +295,10 @@
   (count rows))
 
 (defn- <create-import-temp-db!
-  [repo]
+  [repo import-id]
   (if-let [sqlite @worker-state/*sqlite]
     (let [current-platform (platform/current)
-          pool-name (import-temp-pool-name repo)]
+          pool-name (import-temp-pool-name repo import-id)]
       (p/let [pool (platform/install-storage-pool current-platform sqlite pool-name)
               path (platform/resolve-db-path current-platform pool-name pool "/download-import.sqlite")
               db (platform/sqlite-open current-platform
@@ -282,7 +316,8 @@
   [{:keys [import-id repo rows-db] :as state}]
   (if rows-db
     (p/resolved state)
-    (p/let [{:keys [rows-db rows-path rows-pool]} (<create-import-temp-db! repo)]
+    (p/let [{:keys [rows-db rows-path rows-pool]}
+            (<create-import-temp-db! repo import-id)]
       (swap! *import-state
              (fn [current]
                (if (= import-id (:import-id current))
@@ -385,32 +420,69 @@
               (p/recur remaining')))
           (p/resolved nil))))))
 
+(defn- <validate-imported-snapshot!
+  [{:keys [rows-db]} expected-row-count]
+  (when (integer? expected-row-count)
+    (let [actual-row-count
+          (if rows-db
+            (or (some-> (.exec rows-db #js {:sql "select count(*) as row_count from kvs"
+                                            :rowMode "object"})
+                        first
+                        (aget "row_count"))
+                0)
+            0)]
+      (when (and (integer? expected-row-count)
+                 (not= expected-row-count actual-row-count))
+        (throw (ex-info "downloaded snapshot row count mismatch"
+                        {:type :db-sync/snapshot-row-count-mismatch
+                         :expected-row-count expected-row-count
+                         :actual-row-count actual-row-count}))))))
+
+(defn- <open-import-target!
+  [repo reset?]
+  (p/let [reset-target-f
+          (when reset?
+            (require-thread-api-f!
+             :thread-api/db-sync-reset-target-preserving-backup))
+          recreate-lock-f (require-thread-api-f! :thread-api/db-sync-recreate-lock)
+          invalidate-search-db-f (require-thread-api-f! :thread-api/db-sync-invalidate-search-db)
+          create-or-open-db-f (require-thread-api-f! :thread-api/create-or-open-db)
+          _ (when reset?
+              (reset-target-f repo))
+          _ (when reset? (recreate-lock-f repo))
+          _ (create-or-open-db-f repo {:close-other-db? true
+                                      :sync-download-graph? true})
+          ;; Reset after the main/search/vector handles are open so both the
+          ;; SQLite search tables and any persistent vector index are cleared.
+          _ (when reset? (invalidate-search-db-f repo))
+          conn (worker-state/get-datascript-conn repo)
+          _ (when-not conn
+              (fail-fast :db-sync/missing-field {:repo repo :field :datascript-conn}))]
+    conn))
+
 (defn prepare-import!
-  [repo reset? graph-id graph-e2ee? & [total-datoms]]
-  (let [graph-e2ee? (if (nil? graph-e2ee?) true (true? graph-e2ee?))]
-    (-> (p/let [close-db-f (require-thread-api-f! :thread-api/db-sync-close-db)
-                unlink-db-f (require-thread-api-f! :thread-api/unsafe-unlink-db)
-                recreate-lock-f (require-thread-api-f! :thread-api/db-sync-recreate-lock)
-                invalidate-search-db-f (require-thread-api-f! :thread-api/db-sync-invalidate-search-db)
-                create-or-open-db-f (require-thread-api-f! :thread-api/create-or-open-db)
-                _ (when-let [state @*import-state]
-                    (close-import-state! state)
-                    (close-db-f (:repo state)))
-                _ (reset! *import-state nil)
-                _ (when reset? (close-db-f repo))
-                _ (when reset? (unlink-db-f repo))
-                _ (when reset? (recreate-lock-f repo))
-                _ (when reset? (invalidate-search-db-f repo))
-                import-id (str (random-uuid))
-                aes-key (when graph-e2ee?
-                          (sync-crypt/<fetch-graph-aes-key-for-download graph-id))
+  [repo reset? graph-id graph-e2ee? & [total-datoms opts]]
+  (let [graph-e2ee? (if (nil? graph-e2ee?) true (true? graph-e2ee?))
+        defer-target? (true? (:defer-target? opts))]
+    (-> (p/let [aes-key (if (contains? opts :aes-key)
+                          (:aes-key opts)
+                          (when graph-e2ee?
+                            (sync-crypt/<fetch-graph-aes-key-for-download graph-id)))
                 _ (when (and graph-e2ee? (nil? aes-key))
                     (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
-                _ (create-or-open-db-f repo {:close-other-db? true
-                                             :sync-download-graph? true})
-                conn (worker-state/get-datascript-conn repo)
-                _ (when-not conn
-                    (fail-fast :db-sync/missing-field {:repo repo :field :datascript-conn}))]
+                previous-state @*import-state
+                close-db-f (when (and previous-state
+                                      (not defer-target?)
+                                      (not= false (:target-prepared? previous-state)))
+                             (require-thread-api-f! :thread-api/db-sync-close-db))
+                _ (when previous-state
+                    (close-import-state! previous-state)
+                    (when close-db-f
+                      (close-db-f (:repo previous-state))))
+                _ (reset! *import-state nil)
+                import-id (str (random-uuid))
+                conn (when-not defer-target?
+                       (<open-import-target! repo reset?))]
           (reset! *import-state {:aes-key aes-key
                                  :conn conn
                                  :graph-e2ee? graph-e2ee?
@@ -422,6 +494,9 @@
                                  :rows-path nil
                                  :rows-pool nil
                                  :repo repo
+                                 :reset? reset?
+                                 :local-backup nil
+                                 :target-prepared? (not defer-target?)
                                  :total-datoms total-datoms})
           {:import-id import-id})
         (p/catch (fn [error]
@@ -444,18 +519,96 @@
                    (clear-import-state! import-id))
                  (throw error)))))
 
-(defn finalize-import!
-  [repo graph-id remote-tx import-id]
-  (-> (p/let [state (require-import-state! repo graph-id import-id)
-              _ (when (:rows-imported? state)
-                  (<replay-imported-rows! state))
-              result (complete-datoms-import! repo graph-id remote-tx)
-              _ (clear-import-state! import-id)]
-        result)
-      (p/catch (fn [error]
-                 (when-not (= :db-sync/stale-import (:type (ex-data error)))
-                   (clear-import-state! import-id))
-                 (throw error)))))
+(defn- <activate-import-target!
+  [{:keys [import-id repo reset?] :as state} opts]
+  (p/let [_ (require-import-state! repo (:graph-id state) import-id)
+          export-backup-f
+          (when reset?
+            (require-thread-api-f!
+             :thread-api/db-sync-export-local-backup))
+          local-backup (when export-backup-f
+                         (export-backup-f repo))
+          state-with-backup (assoc state :local-backup local-backup)
+          _ (swap! *import-state
+                   (fn [current]
+                     (if (= import-id (:import-id current))
+                       state-with-backup
+                       current)))
+          _ (when-let [post-backup-pre-reset-f
+                       (:post-backup-pre-reset-f opts)]
+              (post-backup-pre-reset-f))
+          conn (<open-import-target! repo reset?)
+          state' (assoc state-with-backup
+                        :conn conn
+                        :target-prepared? true)]
+    (swap! *import-state
+           (fn [current]
+             (if (= import-id (:import-id current))
+               state'
+               current)))
+    (require-import-state! repo (:graph-id state) import-id)))
+
+(defn- <restore-local-backup!
+  [state original-error]
+  (if-let [local-backup (:local-backup state)]
+    (let [restore-backup-f
+          (require-thread-api-f!
+           :thread-api/db-sync-restore-local-backup)]
+      (-> (restore-backup-f (:repo state) local-backup)
+          (p/catch
+           (fn [restore-error]
+             (throw
+              (ex-info "snapshot activation failed and local backup restore failed"
+                       {:type :db-sync/local-backup-restore-failed
+                        :repo (:repo state)
+                        :graph-id (:graph-id state)
+                        :activation-error-name
+                        (or (some-> original-error .-name)
+                            "Error")
+                        :restore-error-name
+                        (or (some-> restore-error .-name)
+                            "Error")}
+                       restore-error))))))
+    (p/resolved nil)))
+
+(defn- <discard-local-backup!
+  [state original-error]
+  (if-let [local-backup (:local-backup state)]
+    (let [discard-backup-f
+          (require-thread-api-f!
+           :thread-api/db-sync-discard-local-backup)]
+      (-> (discard-backup-f (:repo state) local-backup)
+          (p/catch
+           (fn [discard-error]
+             (throw
+              (ex-info "snapshot activation stopped before reset but backup cleanup failed"
+                       {:type :db-sync/local-backup-discard-failed
+                        :repo (:repo state)
+                        :graph-id (:graph-id state)
+                        :activation-error-name
+                        (or (some-> original-error .-name) "Error")
+                        :cleanup-error-name
+                        (or (some-> discard-error .-name) "Error")}
+                       discard-error))))))
+    (p/resolved nil)))
+
+(defn- <discard-failed-target!
+  [state original-error]
+  (let [unlink-target-f
+        (require-thread-api-f! :thread-api/db-sync-discard-failed-target)]
+    (-> (unlink-target-f (:repo state))
+        (p/catch
+         (fn [discard-error]
+           (throw
+            (ex-info "snapshot activation failed and partial target cleanup failed"
+                     {:type :db-sync/partial-target-cleanup-failed
+                      :repo (:repo state)
+                      :graph-id (:graph-id state)
+                      :activation-error-name
+                      (or (some-> original-error .-name) "Error")
+                      :cleanup-error-name
+                      (or (some-> discard-error .-name) "Error")}
+                     discard-error)))))))
 
 (defn- set-graph-sync-metadata!
   [conn graph-id graph-e2ee?]
@@ -465,98 +618,389 @@
                        (ldb/kv :logseq.kv/graph-rtc-e2ee? (true? graph-e2ee?))]
     {:persist-op? false}))
 
+(defn finalize-import!
+  [repo graph-id remote-tx import-id & [expected-checksum expected-row-count opts]]
+  (let [release-activation* (atom nil)]
+    (-> (p/let [state (require-import-state! repo graph-id import-id)
+              _ (<validate-imported-snapshot!
+                 state expected-row-count)
+              _ (when (false? (:target-prepared? state))
+                  (let [{:keys [release!]}
+                        (worker-state/acquire-snapshot-activation-gate! repo)]
+                    (reset! release-activation* release!)))
+              _ (when-let [preflight-f (:activation-preflight-f opts)]
+                  (preflight-f))
+              state (if (false? (:target-prepared? state))
+                      (<activate-import-target! state opts)
+                      state)
+              _ (when (:rows-imported? state)
+                  (<replay-imported-rows! state))
+              conn (:conn state)
+              _ (when (string? expected-checksum)
+                  (set-graph-sync-metadata!
+                   conn (uuid graph-id) (:graph-e2ee? state)))
+              result
+              (complete-datoms-import!
+               repo
+               graph-id
+               remote-tx
+               (when (string? expected-checksum)
+                 (fn []
+                   (let [local-checksum
+                         (sync-checksum/recompute-checksum @conn)]
+                     (when-not (= expected-checksum local-checksum)
+                       (throw
+                        (ex-info
+                         "downloaded snapshot checksum mismatch"
+                         {:type :db-sync/snapshot-checksum-mismatch
+                          :repo repo
+                          :graph-id graph-id
+                          :expected-checksum expected-checksum
+                          :actual-checksum local-checksum})))
+                     (client-op/update-local-checksum
+                      repo local-checksum)
+                     (client-op/update-local-server-checksum
+                      repo
+                      (sync-checksum/recompute-server-checksum @conn))))))
+              _ (when-let [post-activation-precommit-f
+                           (:post-activation-precommit-f opts)]
+                  (post-activation-precommit-f))
+              commit-backup-f
+              (when (and (:local-backup state)
+                         (not= false
+                               (get-in state
+                                       [:local-backup :source-existed?])))
+                (require-thread-api-f!
+                 :thread-api/db-sync-commit-local-backup))
+              _ (when commit-backup-f
+                  (commit-backup-f repo (:local-backup state)))
+              _ (clear-import-state! import-id)]
+        result)
+      (p/catch (fn [error]
+                 (let [state @*import-state
+                       current-import? (= import-id (:import-id state))
+                       stale? (= :db-sync/stale-import (:type (ex-data error)))
+                       local-backup (:local-backup state)
+                       source-existed?
+                       (and local-backup
+                            (not= false (:source-existed? local-backup)))
+                       source-absent?
+                       (false? (:source-existed? local-backup))
+                       restore? (and current-import?
+                                     source-existed?
+                                     (:target-prepared? state)
+                                     (not stale?))
+                       discard-backup? (and current-import?
+                                            source-existed?
+                                            (not (:target-prepared? state))
+                                            (not stale?))
+                       discard? (and current-import?
+                                     (:reset? state)
+                                     (:target-prepared? state)
+                                     source-absent?
+                                     (not stale?))]
+                   (-> (cond
+                         restore?
+                         (<restore-local-backup! state error)
+
+                         discard-backup?
+                         (<discard-local-backup! state error)
+
+                         discard?
+                         (<discard-failed-target! state error)
+
+                         :else
+                         (p/resolved nil))
+                       (p/then
+                        (fn []
+                          (when-not stale?
+                            (clear-import-state! import-id))
+                          (throw error)))))))
+        (p/finally
+         (fn []
+           (when-let [release! @release-activation*]
+             (release!)))))))
+
+(defn- <resolve-snapshot-remote-tx
+  [snapshot-resp legacy-remote-tx]
+  (if (integer? (:t snapshot-resp))
+    (p/resolved (:t snapshot-resp))
+    ;; Compatibility with servers deployed before snapshot metadata included
+    ;; its transaction watermark. Capture the fallback before requesting the
+    ;; snapshot so a concurrent transaction cannot be skipped.
+    (p/resolved legacy-remote-tx)))
+
+(defn- <fetch-snapshot-metadata!
+  [base graph-id]
+  (letfn [(fetch-version [v2?]
+            (p/let [snapshot-resp
+                    (fetch-json
+                     (str base
+                          "/sync/"
+                          graph-id
+                          (if v2?
+                            "/snapshot/download-v2"
+                            "/snapshot/download"))
+                     {:method "GET"}
+                     :sync/snapshot-download)]
+              {:snapshot-resp snapshot-resp
+               :v2? v2?}))]
+    (-> (fetch-version true)
+        (p/catch
+         (fn [error]
+           (if (= 404 (:status (ex-data error)))
+             (p/let [legacy-info (fetch-version false)]
+               (assoc legacy-info
+                      :fallback-reason :v2-metadata-404))
+             (p/rejected error)))))))
+
+(defn- snapshot-download-id
+  [snapshot-info]
+  (when (:v2? snapshot-info)
+    (some-> (:snapshot-resp snapshot-info)
+            :url
+            js/URL.
+            .-searchParams
+            (.get "download-id"))))
+
+(defn- <cancel-snapshot-download!
+  [base graph-id snapshot-info]
+  (if-let [download-id (snapshot-download-id snapshot-info)]
+    (-> (js/fetch
+         (str base
+              "/sync/"
+              graph-id
+              "/snapshot/download-v2?download-id="
+              (js/encodeURIComponent download-id))
+         (clj->js (with-auth-headers {:method "DELETE"})))
+        (p/then (fn [_] nil))
+        ;; Cancellation is best-effort cleanup and must not hide the original
+        ;; download failure.
+        (p/catch (fn [_] nil)))
+    (p/resolved nil)))
+
+(defn- <fetch-snapshot-stream!
+  ([base graph-id snapshot-info]
+   (<fetch-snapshot-stream! base graph-id snapshot-info false nil))
+  ([base graph-id snapshot-info refreshed-expired?]
+   (<fetch-snapshot-stream!
+    base graph-id snapshot-info refreshed-expired? nil))
+  ([base graph-id {:keys [snapshot-resp v2?] :as snapshot-info}
+    refreshed-expired? on-metadata]
+   (p/let [resp (js/fetch (:url snapshot-resp)
+                          (clj->js (with-auth-headers {:method "GET"})))]
+     (cond
+       (and v2? (= 404 (.-status resp)))
+       ;; A rolling deployment can route v2 metadata to a new instance and the
+       ;; stream request to an old one. Restart with the legacy metadata before
+       ;; any local import has begun.
+       (p/let [_ (<cancel-snapshot-download! base graph-id snapshot-info)
+               legacy-info
+               (fetch-json
+                (str base "/sync/" graph-id "/snapshot/download")
+                {:method "GET"}
+                :sync/snapshot-download)
+               legacy-resp
+               (js/fetch (:url legacy-info)
+                         (clj->js (with-auth-headers {:method "GET"})))]
+         {:snapshot-resp legacy-info
+          :v2? false
+          :fallback-reason :v2-stream-404
+          :resp legacy-resp})
+
+       (and v2?
+            (= 410 (.-status resp))
+            (not refreshed-expired?))
+       (p/let [_ (<cancel-snapshot-download! base graph-id snapshot-info)
+               fresh-info (<fetch-snapshot-metadata! base graph-id)
+               ;; Publish the fresh reservation before its stream request.
+               ;; If fetch rejects at the network layer, the caller can still
+               ;; cancel this exact download id.
+               _ (when on-metadata
+                   (on-metadata fresh-info))]
+         (<fetch-snapshot-stream!
+          base graph-id fresh-info true on-metadata))
+
+       :else
+       (assoc snapshot-info :resp resp)))))
+
+(defn- <handle-download-graph-failure!
+  [base repo graph-id graph-e2ee? stage snapshot-info import-id log-f
+   failure-handler error]
+  (let [failure
+        (ex-info
+         "db-sync download failed"
+         {:type :db-sync/snapshot-download-failed
+          :repo repo
+          :graph-id graph-id
+          :graph-e2ee? graph-e2ee?
+          :stage stage
+          :error-message (or (ex-message error)
+                             (when (instance? js/Error error)
+                               (.-message error)))
+          :error-cause (when (instance? js/Error error)
+                         (some-> (.-cause error)
+                                 (.-message)))}
+         error)]
+    (p/let [_ (-> (<cancel-snapshot-download! base graph-id snapshot-info)
+                  (p/catch
+                   (fn [cancel-error]
+                     (log/warn :db-sync/snapshot-cancel-after-failure-failed
+                               {:repo repo
+                                :graph-id graph-id
+                                :diagnostic
+                                (dissoc
+                                 (sync-util/error->diagnostic cancel-error)
+                                 :at)})
+                     nil)))
+            _ (when failure-handler
+                (failure-handler repo graph-id failure))]
+      (when import-id
+        (clear-import-state! import-id))
+      (log-f {:sub-type :download-failed
+              :graph-uuid graph-id
+              :message "Graph snapshot download failed"})
+      (log/error :db-sync/download-graph-by-id-failed
+                 {:repo repo
+                  :graph-id graph-id
+                  :graph-e2ee? graph-e2ee?
+                  :stage stage
+                  :diagnostic
+                  (dissoc
+                   (sync-util/error->diagnostic error)
+                   :at)})
+      (throw failure))))
+
 (defn download-graph-by-id!
-  [repo graph-id graph-e2ee?]
-  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+  ([repo graph-id graph-e2ee?]
+   (download-graph-by-id! repo graph-id graph-e2ee? nil))
+  ([repo graph-id graph-e2ee? opts]
+   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)
+         failure-handler (or (:failure-handler opts)
+                             @*snapshot-failure-handler)]
     (if (and (seq repo) (seq graph-id) (seq base))
       (let [stage* (atom :init)
             import-id* (atom nil)
+            snapshot-info* (atom nil)
             log-f (fn [payload]
                     (rtc-log-and-state/rtc-log :rtc.log/download payload))]
-        (-> (p/let [_ (log-f {:sub-type :download-progress
-                              :graph-uuid graph-id
-                              :message "Preparing graph snapshot download"})
-                    _ (reset! stage* :fetch-pull)
-                    pull-resp (fetch-json (str base "/sync/" graph-id "/pull")
-                                          {:method "GET"}
-                                          :sync/pull)
-                    remote-tx (:t pull-resp)
-                    _ (when-not (integer? remote-tx)
-                        (throw (ex-info "non-integer remote-tx when downloading graph"
-                                        {:repo repo
-                                         :remote-tx remote-tx})))
-                    _ (reset! stage* :fetch-snapshot-download)
-                    snapshot-resp (fetch-json (str base "/sync/" graph-id "/snapshot/download")
-                                              {:method "GET"}
-                                              :sync/snapshot-download)
-                    _ (when graph-e2ee?
-                        (reset! stage* :prepare-e2ee)
-                        (sync-crypt/<fetch-graph-aes-key-for-download graph-id))
-                    _ (reset! stage* :fetch-snapshot-stream)
-                    resp (js/fetch (:url snapshot-resp)
-                                   (clj->js (with-auth-headers {:method "GET"})))
-                    _ (log-f {:sub-type :download-progress
-                              :graph-uuid graph-id
-                              :message "Start downloading graph snapshot"})]
-              (when-not (.-ok resp)
-                (throw (ex-info "snapshot download failed"
-                                {:repo repo
-                                 :status (.-status resp)})))
-              (let [ensure-import! (fn []
-                                     (if-let [import-id @import-id*]
-                                       (p/resolved import-id)
-                                       (p/let [_ (reset! stage* :prepare-import)
-                                               {:keys [import-id]} (prepare-import! repo true graph-id graph-e2ee?)]
-                                         (reset! import-id* import-id)
-                                         import-id)))]
-                (p/let [_ (do
-                            (reset! stage* :stream-snapshot)
-                            (<stream-snapshot-row-batches!
-                             resp
-                             25000
-                             (fn [rows]
-                               (p/let [import-id (ensure-import!)]
-                                 (import-rows-chunk! rows graph-id import-id)))))
-                        _ (log-f {:sub-type :download-completed
-                                  :graph-uuid graph-id
-                                  :message "Graph snapshot downloaded"})
-                        _ (when-let [import-id @import-id*]
-                            (reset! stage* :finalize-import)
-                            (finalize-import! repo graph-id remote-tx import-id))]
-                  (when-let [conn (worker-state/get-datascript-conn repo)]
-                    (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?))
-                  {:repo repo
-                   :graph-id graph-id
-                   :remote-tx remote-tx
-                   :graph-e2ee? graph-e2ee?})))
-            (p/catch (fn [error]
-                       (when-let [import-id @import-id*]
-                         (clear-import-state! import-id))
-                       (log-f {:sub-type :download-completed
-                               :graph-uuid graph-id
-                               :message "Graph snapshot download failed"})
-                       (log/error :db-sync/download-graph-by-id-failed
-                                  {:repo repo
-                                   :graph-id graph-id
-                                   :graph-e2ee? graph-e2ee?
-                                   :stage @stage*
-                                   :error error
-                                   :error-stack (when (instance? js/Error error)
-                                                  (.-stack error))
-                                   :error-cause (when (instance? js/Error error)
-                                                  (some-> (.-cause error) (.-message)))})
-                       (throw (ex-info "db-sync download failed"
+        (letfn [(download-attempt! [legacy-attempt]
+                  (p/let [_ (log-f {:sub-type :download-progress
+                                    :graph-uuid graph-id
+                                    :message "Preparing graph snapshot download"})
+                          _ (reset! stage* :fetch-pull)
+                          pull-resp (fetch-json (str base "/sync/" graph-id "/pull")
+                                                {:method "GET"}
+                                                :sync/pull)
+                          legacy-remote-tx (:t pull-resp)
+                          _ (reset! stage* :fetch-snapshot-download)
+                          snapshot-info (<fetch-snapshot-metadata! base graph-id)
+                          _ (reset! snapshot-info* snapshot-info)
+                          aes-key (when graph-e2ee?
+                                    (reset! stage* :prepare-e2ee)
+                                    (sync-crypt/<fetch-graph-aes-key-for-download graph-id))
+                          _ (reset! stage* :fetch-snapshot-stream)
+                          {:keys [snapshot-resp resp v2? fallback-reason] :as stream-info}
+                          (<fetch-snapshot-stream!
+                           base
+                           graph-id
+                           snapshot-info
+                           false
+                           (fn [fresh-info]
+                             (reset! snapshot-info* fresh-info)))
+                          _ (reset! snapshot-info* stream-info)
+                          remote-tx (<resolve-snapshot-remote-tx
+                                     snapshot-resp legacy-remote-tx)
+                          _ (when-not (integer? remote-tx)
+                              (throw (ex-info "non-integer remote-tx when downloading graph"
+                                              {:repo repo
+                                               :remote-tx remote-tx})))
+                          _ (log-f {:sub-type :download-progress
+                                    :graph-uuid graph-id
+                                    :message "Start downloading graph snapshot"})]
+                    (when-not (.-ok resp)
+                      (throw (ex-info "snapshot download failed"
                                       {:repo repo
-                                       :graph-id graph-id
-                                       :graph-e2ee? graph-e2ee?
-                                       :stage @stage*
-                                       :error-message (or (ex-message error)
-                                                           (when (instance? js/Error error)
-                                                             (.-message error)))
-                                       :error-cause (when (instance? js/Error error)
-                                                      (some-> (.-cause error) (.-message)))}
-                                       error))))))
+                                       :status (.-status resp)})))
+                    (p/let [_ (reset! stage* :prepare-import)
+                            {:keys [import-id]} (prepare-import!
+                                                 repo
+                                                 true
+                                                 graph-id
+                                                 graph-e2ee?
+                                                 nil
+                                                 {:defer-target? true
+                                                  :aes-key aes-key})
+                            _ (reset! import-id* import-id)
+                            _ (do
+                                (reset! stage* :stream-snapshot)
+                                (<stream-snapshot-row-batches!
+                                 resp
+                                 25000
+                                 (fn [rows]
+                                   (import-rows-chunk! rows graph-id import-id))))
+                            postflight-resp
+                            (when-not v2?
+                              (reset! stage* :verify-legacy-snapshot-watermark)
+                              (fetch-json
+                               (str base "/sync/" graph-id "/pull")
+                               {:method "GET"}
+                               :sync/pull))
+                            postflight-t (:t postflight-resp)
+                            legacy-stable?
+                            (or v2? (= remote-tx postflight-t))]
+                      (if-not legacy-stable?
+                        (do
+                          (clear-import-state! import-id)
+                          (reset! import-id* nil)
+                          (log/warn :db-sync/retry-unstable-legacy-snapshot
+                                    {:graph-id graph-id
+                                     :snapshot-protocol :v1-live
+                                     :fallback-reason fallback-reason
+                                     :preflight-t remote-tx
+                                     :postflight-t postflight-t
+                                     :attempt (inc legacy-attempt)})
+                          (if (< (inc legacy-attempt)
+                                 max-legacy-snapshot-attempts)
+                            (download-attempt! (inc legacy-attempt))
+                            (throw
+                             (ex-info
+                              "legacy snapshot changed while streaming"
+                              {:type :db-sync/unstable-legacy-snapshot
+                               :repo repo
+                               :graph-id graph-id
+                               :snapshot-protocol :v1-live
+                               :fallback-reason fallback-reason
+                               :preflight-t remote-tx
+                               :postflight-t postflight-t
+                               :attempts max-legacy-snapshot-attempts}))))
+                        (p/let [_ (log-f {:sub-type :download-completed
+                                         :graph-uuid graph-id
+                                         :message "Graph snapshot downloaded"})
+                                _ (reset! stage* :finalize-import)
+                                _ (finalize-import!
+                                   repo
+                                   graph-id
+                                   remote-tx
+                                   import-id
+                                   (:checksum snapshot-resp)
+                                   (:row-count snapshot-resp)
+                                   opts)]
+                          (when-let [conn (worker-state/get-datascript-conn repo)]
+                            (set-graph-sync-metadata! conn (uuid graph-id) graph-e2ee?))
+                          {:repo repo
+                           :graph-id graph-id
+                           :remote-tx remote-tx
+                           :graph-e2ee? graph-e2ee?
+                           :snapshot-protocol (if v2? :v2-frozen :v1-live)
+                           :snapshot-fallback-reason fallback-reason})))))]
+          (-> (download-attempt! 0)
+            (p/catch
+             (fn [error]
+               (<handle-download-graph-failure!
+                base repo graph-id graph-e2ee? @stage* @snapshot-info*
+                @import-id* log-f failure-handler error))))))
       (p/rejected (ex-info "db-sync missing graph download info"
                            {:repo repo
                             :graph-id graph-id
-                            :base base})))))
+                            :base base}))))))

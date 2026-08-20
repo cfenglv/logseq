@@ -11,6 +11,7 @@
             [logseq.db.frontend.content :as db-content]
             [logseq.db.frontend.property :as db-property]
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.outliner.tree :as otree]))
 
 (defn- indented-block-content
@@ -246,7 +247,7 @@
 
 (defn- displayed-math-content
   [content]
-  (str "$$\n" content "\n$$"))
+  (str "$$\n" (gp-mldoc/canonical-displayed-math-title content) "\n$$"))
 
 (defn- format-markdown-block-content
   [b content level heading-to-list?]

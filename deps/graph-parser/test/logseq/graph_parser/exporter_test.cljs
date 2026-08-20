@@ -24,6 +24,7 @@
             [logseq.db.test.helper :as db-test]
             [logseq.graph-parser.block :as gp-block]
             [logseq.graph-parser.exporter :as gp-exporter]
+            [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.graph-parser.test.docs-graph-helper :as docs-graph-helper]
             [logseq.graph-parser.test.helper :as test-helper :include-macros true :refer [deftest-async]]
             [logseq.outliner.db-pipeline :as db-pipeline]
@@ -65,6 +66,55 @@
   {:title (:block/title block)
    :properties (dissoc (db-test/readable-properties block) :block/tags)
    :children (mapv block-tree-with-properties (ordered-children block))})
+
+(defn- imported-math-block
+  [title]
+  (#'gp-exporter/handle-math
+   {:block/title title
+    :block.temp/ast-blocks (mapv first (gp-mldoc/->db-edn title :markdown))}))
+
+(declare write-temp-graph-file import-files-to-db)
+
+(deftest handle-math-uses-the-whole-displayed-math-ast-test
+  (testing "non-empty and exact empty display Math import to the same canonical shape"
+    (are [title bare-title]
+        (= {:block/title bare-title
+            :logseq.property.node/display-type :math
+            :block/tags [:logseq.class/Math-block]}
+           (dissoc (imported-math-block title) :block.temp/ast-blocks))
+      "$$x$$" "x"
+      "$$$$" ""))
+  (testing "mixed or multiple ASTs remain ordinary text"
+    (doseq [title ["prefix $$x$$"
+                   "$$x$$ suffix"
+                   "$$x$$\n$$y$$"]]
+      (is (= title (:block/title (imported-math-block title))) title)
+      (is (nil? (:logseq.property.node/display-type
+                 (imported-math-block title)))))))
+
+(deftest-async imported-display-math-survives-db-reopen
+  (p/let [file (write-temp-graph-file
+                 "pages/math-reopen.md"
+                 "- $$x + y$$\n- $$$$\n")
+          conn (db-test/create-conn)
+          _ (db-pipeline/add-listener conn)
+          _ (import-files-to-db [file] conn {})
+          nonempty (db-test/find-block-by-content @conn #"^x \+ y$")
+          empty-math (->> (d/datoms @conn :avet :logseq.property.node/display-type :math)
+                          (map #(d/entity @conn (:e %)))
+                          (filter #(= "" (:block/title %)))
+                          first)
+          reopened @(d/conn-from-datoms (d/datoms @conn :eavt) (:schema @conn))
+          reopened-nonempty (d/entity reopened [:block/uuid (:block/uuid nonempty)])
+          reopened-empty (d/entity reopened [:block/uuid (:block/uuid empty-math)])]
+    (is (= ["x + y" :math]
+           [(:block/title reopened-nonempty)
+            (:logseq.property.node/display-type reopened-nonempty)]))
+    (is (= ["" :math]
+           [(:block/title reopened-empty)
+            (:logseq.property.node/display-type reopened-empty)]))
+    (is (= (:block/tags nonempty) (:block/tags reopened-nonempty))
+        "Import must persist the Math class/type shape, not leave a parser-only projection")))
 
 (defn- find-template-by-title
   [db title]

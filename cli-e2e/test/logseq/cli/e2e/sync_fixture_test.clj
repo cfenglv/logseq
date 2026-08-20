@@ -3,6 +3,7 @@
             [clojure.java.shell :as shell]
             [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]
+            [logseq.cli.e2e.paths :as paths]
             [logseq.cli.e2e.sync-fixture :as sync-fixture]))
 
 (defn- free-port []
@@ -13,7 +14,7 @@
   (let [tmp-dir (fs/create-temp-dir {:prefix "logseq-cli-sync-config-test-"})
         auth-path (fs/path tmp-dir "auth.json")
         config-path (fs/path tmp-dir "cli.edn")
-        script (fs/path "cli-e2e" "scripts" "prepare_sync_config.py")
+        script (paths/cli-e2e-path "scripts" "prepare_sync_config.py")
         result (do
                  (spit (str auth-path) "{\"refresh-token\":\"refresh-token\"}\n")
                  (shell/sh "python3" (str script)
@@ -150,7 +151,7 @@
         log-file (fs/path tmp-dir "server.log")
         data-dir (fs/path tmp-dir "server-data")
         node-path-file (fs/path tmp-dir "node-path.txt")
-        script (fs/path "cli-e2e" "scripts" "db_sync_server.py")
+        script (paths/cli-e2e-path "scripts" "db_sync_server.py")
         port (free-port)]
     (try
       (fs/create-dirs (fs/parent entry))

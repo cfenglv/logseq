@@ -223,6 +223,12 @@
 
 (defonce *resizing-image? (atom false))
 
+(defn- consume-block-math-action!
+  ([boundary action]
+   (editor-handler/run-math-transition-action! boundary action))
+  ([boundary options action]
+   (editor-handler/run-math-transition-action! boundary options action)))
+
 (hsx/defc ^:large-vars/cleanup-todo asset-container
   [asset-block src title metadata {:keys [breadcrumb? positioned? local? full-text gallery-view?]}]
   (let [asset-width (:logseq.property.asset/width asset-block)
@@ -242,6 +248,7 @@
        (fn []))
      [])
     (let [*el-ref (hooks/use-ref nil)
+          [asset-actions-open? set-asset-actions-open!] (hooks/use-state false)
           image-src (when (seq src)
                       (fs/asset-path-normalize src))
           src' (if (and (seq src)
@@ -256,7 +263,9 @@
         :on-click (fn [e]
                     (util/stop e)
                     (when (= "IMG" (some-> (.-target e) (.-nodeName)))
-                      (open-lightbox! e)))
+                      (consume-block-math-action!
+                       :asset-lightbox-open {:event e}
+                       #(open-lightbox! e))))
         :ref *el-ref}
        [:img.rounded-sm.relative.fade-in.fade-in-faster
         (merge
@@ -300,42 +309,64 @@
                 handle-delete!
                 (fn [_e]
                   (when-let [block-id (get-blockid)]
-                    (let [*local-selected? (atom local?)]
-                      (-> (shui/dialog-confirm!
-                           [:div.text-xs.opacity-60.-my-2
-                            (when (and local? (not= (:block/uuid asset-block) block-id))
-                              [:label.flex.gap-1.items-center
-                               (shui/checkbox
-                                {:default-checked @*local-selected?
-                                 :on-checked-change #(reset! *local-selected? %)})
-                               (t :asset/physical-delete)])]
-                           {:title (t :asset/confirm-delete-image)
-                            :outside-cancel? true
-                            :cancel-label (t :ui/cancel)
-                            :ok-label (t :ui/confirm)})
-                          (p/then (fn []
-                                    (shui/dialog-close!)
-                                    (editor-handler/delete-asset-of-block!
-                                     {:block-id block-id
-                                      :asset-block asset-block
-                                      :local? local?
-                                      :delete-local? @*local-selected?
-                                      :repo (state/get-current-repo)
-                                      :href src
-                                      :title title
-                                      :full-text full-text})))))))
+                    (consume-block-math-action!
+                     :asset-delete
+                     (fn []
+                       (let [*local-selected? (atom local?)]
+                         (-> (shui/dialog-confirm!
+                              [:div.text-xs.opacity-60.-my-2
+                               (when (and local? (not= (:block/uuid asset-block) block-id))
+                                 [:label.flex.gap-1.items-center
+                                  (shui/checkbox
+                                   {:default-checked @*local-selected?
+                                    :on-checked-change #(reset! *local-selected? %)})
+                                  (t :asset/physical-delete)])]
+                              {:title (t :asset/confirm-delete-image)
+                               :outside-cancel? true
+                               :cancel-label (t :ui/cancel)
+                               :ok-label (t :ui/confirm)})
+                             (p/then
+                              (fn []
+                                ;; Confirmation is a distinct user action. A
+                                ;; transition can begin while the dialog is
+                                ;; open, so acquire a fresh barrier here.
+                                (consume-block-math-action!
+                                 :asset-delete-confirmed
+                                 (fn []
+                                   (shui/dialog-close!)
+                                   (editor-handler/delete-asset-of-block!
+                                    {:block-id block-id
+                                     :asset-block asset-block
+                                     :local? local?
+                                     :delete-local? @*local-selected?
+                                     :repo (state/get-current-repo)
+                                     :href src
+                                     :title title
+                                     :full-text full-text})))))))))))
                 handle-set-align!
                 (fn [align]
                   (when-let [asset-id (:block/uuid asset-block)]
-                    (property-handler/set-block-property! asset-id
-                                                          :logseq.property.asset/align
-                                                          align)))]
+                    (consume-block-math-action!
+                     :asset-align
+                     #(property-handler/set-block-property! asset-id
+                                                            :logseq.property.asset/align
+                                                            align))))]
             (when asset-block
               [:.asset-action-bar {:aria-hidden "true"}
                (shui/dropdown-menu
-                {:on-pointer-down util/stop}
+                {:open asset-actions-open?
+                 :on-open-change set-asset-actions-open!}
                 (shui/dropdown-menu-trigger
-                 {:as-child true}
+                 {:as-child true
+                  :on-pointer-down
+                  (fn [e]
+                    (let [source-uuid (some-> (state/get-edit-block) :block/uuid)
+                          replay? (editor-handler/math-transition-pending? source-uuid)]
+                      (consume-block-math-action!
+                       :asset-action-bar-trigger
+                       {:source-uuid source-uuid :event e}
+                       #(when replay?
+                          (set-asset-actions-open! true)))))}
                  (shui/button
                   {:variant :outline
                    :size :icon
@@ -1077,16 +1108,16 @@
         title-or-path])]))
 
 (defn- maybe-request-asset-download!
-  [file-exists? requested? block]
-  (let [repo (state/get-current-repo)
-        asset-file-write-finish @(get @state/state :assets/asset-file-write-finish)
-        asset-file-write-finished? (get-in asset-file-write-finish [repo (str (:block/uuid block))])
-        file-ready? (or file-exists? asset-file-write-finished?)]
-    (when (and (true? @requested?) file-ready?)
-      (reset! requested? false))
-    (when (and (not @requested?)
-               (assets-handler/maybe-request-remote-asset-download! repo block file-ready?))
-      (reset! requested? true))))
+  [file-exists? requested? block on-retry]
+  (let [repo (state/get-current-repo)]
+    (when-let [request
+               (assets-handler/request-remote-asset-download-once!
+                repo block (true? file-exists?) requested?)]
+      (p/then request
+              (fn [downloaded?]
+                (when-not downloaded?
+                  (on-retry))
+                downloaded?)))))
 
 (defn- retry-missing-asset-upload!
   [repo block file-exists?*]
@@ -1109,49 +1140,66 @@
       (ui/icon "refresh" {:size 14})
       (t :asset/reload-file))]))
 
+(defn- asset-transfer-progress
+  [direction loaded total]
+  (when (and (number? loaded) (number? total) (pos? total) (not= loaded total))
+    (let [percent (int (* 100 (/ loaded total)))
+          label (case direction
+                  :upload (t :asset/uploading)
+                  :download (t :asset/downloading)
+                  (t :asset/syncing))]
+      {:label label
+       :view [:div.asset-transfer-progress
+              [:div.asset-transfer-progress-label (str label " " percent "%")]
+              [:div.asset-transfer-progress-bar
+               [:span {:style {:width (str percent "%")}}]]]})))
+
+(defn- asset-image-render-data
+  [block image?]
+  (when image?
+    (let [resize-width (get-in block [:logseq.property.asset/resize-metadata :width])
+          asset-width (:logseq.property.asset/width block)
+          asset-height (:logseq.property.asset/height block)
+          width (or resize-width 250 asset-width)
+          aspect-ratio (when (and asset-width asset-height)
+                         (/ asset-width asset-height))
+          metadata (merge
+                    (when width {:width width})
+                    (when (and width aspect-ratio)
+                      {:height (/ width aspect-ratio)}))]
+      {:metadata metadata
+       :placeholder [:div.img-placeholder.asset-container
+                     {:style metadata}]})))
+
 (hsx/defc asset-cp
   [config block]
   (let [asset-type (:logseq.property.asset/type block)
         file (block-asset/asset-file-name block)
         file-exists?* (hooks/use-memo #(atom nil) [(:block/uuid block) asset-type])
         requested?* (hooks/use-memo #(atom false) [(:block/uuid block)])
+        retry-attempt* (hooks/use-memo #(atom 0) [(:block/uuid block)])
+        retry-timer* (hooks/use-memo #(atom nil) [(:block/uuid block)])
+        connectivity* (hooks/use-memo #(atom nil) [(:block/uuid block)])
+        [retry-tick set-retry-tick!] (hooks/use-state 0)
         [file-exists?] (hooks/use-atom file-exists?*)
         repo (state/get-current-repo)
+        online? (state/use-sub :network/online?)
+        rtc-ws-state (state/use-sub :rtc/state
+                                    :path-in-sub-atom [:rtc-state :ws-state])
         asset-file-write-finished? (state/use-sub :assets/asset-file-write-finish
                                                   :path-in-sub-atom [repo (str (:block/uuid block))])
-        file-ready? (or file-exists? asset-file-write-finished?)
+        ;; The write-finish timestamp is an invalidation signal, not proof that
+        ;; the file still exists. It can outlive graph removal and restoration.
+        file-ready? (true? file-exists?)
         progress-entry (state/use-sub :rtc/asset-upload-download-progress
                                       :path-in-sub-atom [repo (str (:block/uuid block))])
         {:keys [direction loaded total]} progress-entry
-        in-progress? (and (number? loaded) (number? total) (pos? total) (not= loaded total))
-        percent (when in-progress?
-                  (int (* 100 (/ loaded total))))
-        label (case direction
-                :upload (t :asset/uploading)
-                :download (t :asset/downloading)
-                (t :asset/syncing))
-        progress-view (when in-progress?
-                        [:div.asset-transfer-progress
-                         [:div.asset-transfer-progress-label (str label " " percent "%")]
-                         [:div.asset-transfer-progress-bar
-                          [:span {:style {:width (str percent "%")}}]]])
+        {progress-label :label progress-view :view}
+        (asset-transfer-progress direction loaded total)
         image? (contains? (common-config/img-formats) (keyword asset-type))
         gallery-image? (and (:gallery-view? config) image?)
-        width (get-in block [:logseq.property.asset/resize-metadata :width])
-        asset-width (:logseq.property.asset/width block)
-        asset-height (:logseq.property.asset/height block)
-        img-metadata (when image?
-                       (let [width (or width 250 asset-width)
-                             aspect-ratio (when (and asset-width asset-height)
-                                            (/ asset-width asset-height))]
-                         (merge
-                          (when width
-                            {:width width})
-                          (when (and width aspect-ratio)
-                            {:height (/ width aspect-ratio)}))))
-        img-placeholder (when image?
-                          [:div.img-placeholder.asset-container
-                           {:style img-metadata}])
+        {img-metadata :metadata img-placeholder :placeholder}
+        (asset-image-render-data block image?)
         ;; When external-url is set, use it as the render path so
         ;; plugin-sandboxed assets (./assets/storages/<plugin-id>/...)
         ;; resolve correctly; <make-asset-url handles both remote URLs
@@ -1167,9 +1215,36 @@
                                 true
                                 (fs/file-exists? (config/get-repo-dir (state/get-current-repo)) path))]
                  (reset! file-exists?* result))))
-           [file])
+           [file asset-file-write-finished?])
         _ (hooks/use-effect!
-           #(maybe-request-asset-download! file-exists? requested?* block))
+           (fn []
+             (let [connectivity [online? rtc-ws-state]
+                   connectivity-changed? (not= connectivity @connectivity*)]
+               (when connectivity-changed?
+                 (reset! connectivity* connectivity)
+                 (reset! retry-attempt* 0)
+                 (assets-handler/cancel-remote-asset-download-retry!
+                  retry-timer*))
+               (if file-ready?
+                 (do
+                   (reset! retry-attempt* 0)
+                   (assets-handler/cancel-remote-asset-download-retry!
+                    retry-timer*))
+                 (when online?
+                   (maybe-request-asset-download!
+                    file-exists?
+                    requested?*
+                    block
+                    #(assets-handler/schedule-remote-asset-download-retry!
+                      retry-timer*
+                      retry-attempt*
+                      (fn [] (set-retry-tick! (inc retry-tick)))))))))
+           [file-exists? online? rtc-ws-state retry-tick])
+        _ (hooks/use-effect!
+           (fn []
+             #(assets-handler/cancel-remote-asset-download-retry!
+               retry-timer*))
+           [])
         content (cond
                   (or file-ready? gallery-image?)
                   (asset-link (cond-> (assoc config :asset-block block)
@@ -1189,7 +1264,7 @@
     (if progress-view
       [:div.asset-transfer-shell
        (or content
-           [:div.asset-transfer-placeholder (t :asset/transfer-placeholder label)])
+           [:div.asset-transfer-placeholder (t :asset/transfer-placeholder progress-label)])
        progress-view]
       content)))
 
@@ -2531,6 +2606,21 @@
            (ui/icon "alert-triangle"))
           [:div.opacity-75 message])))]))
 
+(defn empty-math-read-placeholder-props
+  "Read-mode guidance for an empty Math block. Editing remains owned by the
+  block pointer handler, so this marker must not become an inert tab stop."
+  []
+  {:data-math-empty "true"
+   :class "inline-flex min-w-8 cursor-text items-center justify-center rounded px-1 opacity-50"
+   :style {:min-height "1.5em"}})
+
+(defn empty-math-read-placeholder
+  []
+  [:span.math-block-empty-placeholder
+   (empty-math-read-placeholder-props)
+   [:span.sr-only (t :editor/empty-math-block)]
+   [:span {:aria-hidden true} "$$"]])
+
 (hsx/defc block-title
   [config block {:keys [*show-query?]}]
   (let [block' (db/entity (:db/id block))
@@ -2561,8 +2651,11 @@
 
       ;; TODO: switched to https://cortexjs.io/mathlive/ for editing
       (= :math node-display-type)
-      [:div.math-block
-       (latex/latex (:block/title block) true true)]
+      (let [title (gp-mldoc/canonical-displayed-math-title (:block/title block))]
+        [:div.math-block
+         (if (string/blank? title)
+           (empty-math-read-placeholder)
+           (latex/latex title true true))])
 
       (seq (:logseq.property/_query block'))
       (query-builder-component/builder block' {})
@@ -2675,32 +2768,39 @@
 
                 :else
                 (let [block (or (db/entity [:block/uuid (:block/uuid block)]) block)]
-                  (mobile-util/mobile-focus-hidden-input)
-                  (editor-handler/clear-selection!)
-                  (editor-handler/unhighlight-blocks!)
-                  (when-let [editing-block (state/get-edit-block)]
-                    (when-not (= (:block/uuid editing-block) (:block/uuid block))
-                      (editor-handler/save-current-block!)))
-                  (p/do!
-                   (state/pub-event! [:editor/save-code-editor])
+                  (editor-handler/run-math-transition-action!
+                   :block-pointer
+                   {:event e}
+                   (fn []
+                    (p/do!
+                     ;; The central action protocol settles or rolls back the
+                     ;; old UUID before either pointer route can save or switch.
+                     (mobile-util/mobile-focus-hidden-input)
+                    (editor-handler/clear-selection!)
+                    (editor-handler/unhighlight-blocks!)
+                    (when-let [editing-block (state/get-edit-block)]
+                      (when-not (= (:block/uuid editing-block) (:block/uuid block))
+                        (editor-handler/save-current-block!)))
 
-                   (when-not (:block.temp/load-status (db/entity (:db/id block)))
-                     (db-async/<get-block (state/get-current-repo) (:db/id block) {:children? false}))
+                    (state/pub-event! [:editor/save-code-editor])
 
-                   (let [cursor-range (if mobile? mobile-range (get-cursor-range))
-                         block (db/entity (:db/id block))
-                         content (:block/title block)]
+                    (when-not (:block.temp/load-status (db/entity (:db/id block)))
+                      (db-async/<get-block (state/get-current-repo) (:db/id block) {:children? false}))
 
-                     (state/set-editing!
-                      edit-input-id
-                      content
-                      block
-                      cursor-range
-                      {:db (db/get-db)
-                       :move-cursor? false
-                       :container-id (:container-id config)}))
+                    (let [cursor-range (if mobile? mobile-range (get-cursor-range))
+                          block (db/entity (:db/id block))
+                          content (:block/title block)]
 
-                   (state/set-selection-start-block! block-dom-element)))))))))))
+                      (state/set-editing!
+                       edit-input-id
+                       content
+                       block
+                       cursor-range
+                       {:db (db/get-db)
+                        :move-cursor? false
+                        :container-id (:container-id config)}))
+
+                     (state/set-selection-start-block! block-dom-element)))))))))))))
 
 (hsx/defc dnd-separator-wrapper
   [_block block-id top?]
@@ -2767,25 +2867,39 @@
          :on-context-menu
          (fn [e]
            (util/stop e)
-           (shui/popup-show! e
-                             (fn []
-                               [:<>
-                                (shui/dropdown-menu-item
-                                 {:key "Go to tag"
-                                  :on-click #(route-handler/redirect-to-page! (:block/uuid tag))}
-                                 (str "Go to #" (:block/title tag))
-                                 (ui/dropdown-shortcut "mod+click"))
-                                (shui/dropdown-menu-item
-                                 {:key "Open tag in sidebar"
-                                  :on-click #(state/sidebar-add-block! (state/get-current-repo) (:db/id tag) :page)}
-                                 "Open in sidebar"
-                                 (ui/dropdown-shortcut "shift+click"))
-                                (when-not (ldb/private-tags (:db/ident tag))
-                                  (shui/dropdown-menu-item
-                                   {:key "Remove tag"
-                                    :on-click #(db-property-handler/delete-property-value! (:db/id block) :block/tags (:db/id tag))}
-                                   (t :block/remove-tag)))])
-                             popup-opts))}
+           (consume-block-math-action!
+            :tag-context-menu
+            {:event e}
+            (fn []
+              (shui/popup-show!
+               e
+               (fn []
+                [:<>
+                 (shui/dropdown-menu-item
+                  {:key "Go to tag"
+                   :on-click #(consume-block-math-action!
+                               :tag-context-route
+                               (fn [] (route-handler/redirect-to-page! (:block/uuid tag))))}
+                  (str "Go to #" (:block/title tag))
+                  (ui/dropdown-shortcut "mod+click"))
+                 (shui/dropdown-menu-item
+                  {:key "Open tag in sidebar"
+                   :on-click #(consume-block-math-action!
+                               :tag-context-sidebar
+                               (fn []
+                                 (state/sidebar-add-block! (state/get-current-repo) (:db/id tag) :page)))}
+                  "Open in sidebar"
+                  (ui/dropdown-shortcut "shift+click"))
+                 (when-not (ldb/private-tags (:db/ident tag))
+                   (shui/dropdown-menu-item
+                    {:key "Remove tag"
+                     :on-click #(consume-block-math-action!
+                                 :tag-context-remove
+                                 (fn []
+                                   (db-property-handler/delete-property-value!
+                                    (:db/id block) :block/tags (:db/id tag))))}
+                    (t :block/remove-tag)))])
+               popup-opts)))) }
                 (if (and hover? (not private-tag?) (not config/publishing?))
           [:a.inline-flex.text-muted-foreground
              {:title (t :block/remove-this-tag)
@@ -2795,7 +2909,11 @@
             :on-pointer-down
             (fn [e]
               (util/stop e)
-              (db-property-handler/delete-property-value! (:db/id block) :block/tags (:db/id tag)))}
+              (consume-block-math-action!
+               :tag-remove
+               {:event e}
+               #(db-property-handler/delete-property-value!
+                 (:db/id block) :block/tags (:db/id tag))))}
            (ui/icon "x" {:size 13})]
           [:a.hash-symbol.select-none.flex
            "#"])
@@ -2831,22 +2949,31 @@
              [block-tag block tag config popup-opts])]
           [:div.block-tags.cursor-pointer
            {:on-pointer-down (fn [e]
-                               (shui/popup-show! e
-                                                 (fn []
-                                                   (for [tag block-tags]
-                                                     [:div.flex.flex-row.items-center.gap-1
-                                                      (when-not (ldb/private-tags (:db/ident tag))
-                                                        (shui/button
-                                                         {:title (t :block/remove-tag)
-                                                          :variant :ghost
-                                                          :class "!p-1 text-muted-foreground"
-                                                          :size :sm
-                                                          :on-click #(db-property-handler/delete-property-value! (:db/id block) :block/tags (:db/id tag))}
-                                                         (ui/icon "X" {:size 14})))
-                                                      (page-cp (assoc config
-                                                                      :tag? true
-                                                                      :disable-preview? true) tag)]))
-                                                 popup-opts))}
+                               (util/stop e)
+                               (consume-block-math-action!
+                                :collapsed-tags-open {:event e}
+                                #(shui/popup-show! e
+                                                   (fn []
+                                                     (for [tag block-tags]
+                                                       [:div.flex.flex-row.items-center.gap-1
+                                                        (when-not (ldb/private-tags (:db/ident tag))
+                                                          (shui/button
+                                                           {:title (t :block/remove-tag)
+                                                            :variant :ghost
+                                                            :class "!p-1 text-muted-foreground"
+                                                            :size :sm
+                                                            :on-click (fn [e]
+                                                                        (util/stop e)
+                                                                        (consume-block-math-action!
+                                                                         :collapsed-tag-remove {:event e}
+                                                                         (fn []
+                                                                           (db-property-handler/delete-property-value!
+                                                                            (:db/id block) :block/tags (:db/id tag)))))}
+                                                           (ui/icon "X" {:size 14})))
+                                                        (page-cp (assoc config
+                                                                        :tag? true
+                                                                        :disable-preview? true) tag)]))
+                                                   popup-opts)))}
            (for [tag (take 2 block-tags)]
              [:div.block-tag.pl-2
               {:key (str "tag-" (:db/id tag))}
@@ -2892,6 +3019,12 @@
       (.click trigger))
     true))
 
+(defn- event-bottom-property-pill
+  [e]
+  (let [^js current-target (.-currentTarget e)]
+    (when (fn? (.-closest current-target))
+      (.closest current-target ".bottom-property-pill"))))
+
 (defn- focus-block-editor-from-bottom-row!
   [^js row]
   (when-let [^js current-block (.closest row ".ls-block")]
@@ -2913,6 +3046,10 @@
 
     nil))
 
+(defn- consume-bottom-property-action!
+  [boundary action]
+  (editor-handler/run-math-transition-action! boundary action))
+
 (defn- handle-bottom-properties-row-key-down!
   [e]
   (let [key (util/ekey e)
@@ -2922,22 +3059,28 @@
       (= "ArrowUp" key)
       (do
         (util/stop e)
-        (handle-bottom-row-vertical-nav! row key))
+        (consume-bottom-property-action!
+         :bottom-property-navigation
+         #(handle-bottom-row-vertical-nav! row key)))
 
       (= "ArrowDown" key)
       (do
         (util/stop e)
-        (handle-bottom-row-vertical-nav! row key))
+        (consume-bottom-property-action!
+         :bottom-property-navigation
+         #(handle-bottom-row-vertical-nav! row key)))
 
       (contains? #{"ArrowLeft" "ArrowRight"} key)
       (do
         (util/stop e)
-        (if (and active-el
-                 (= "true" (.getAttribute active-el "data-bottom-row-nav")))
-          (move-bottom-row-focus! active-el (if (= key "ArrowLeft") :prev :next))
-          (let [items (bottom-row-focus-elements row)]
-            (when (seq items)
-              (.focus (first items))))))
+        (consume-bottom-property-action!
+         :bottom-property-focus
+         #(if (and active-el
+                   (= "true" (.getAttribute active-el "data-bottom-row-nav")))
+            (move-bottom-row-focus! active-el (if (= key "ArrowLeft") :prev :next))
+            (let [items (bottom-row-focus-elements row)]
+              (when (seq items)
+                (.focus (first items)))))))
 
       :else
       nil)))
@@ -2950,14 +3093,18 @@
       (contains? #{"ArrowUp" "ArrowDown"} key)
       (do
         (util/stop e)
-        (some-> pill
-                (.closest ".bottom-properties-row")
-                (handle-bottom-row-vertical-nav! key)))
+        (consume-bottom-property-action!
+         :bottom-property-navigation
+         #(some-> pill
+                  (.closest ".bottom-properties-row")
+                  (handle-bottom-row-vertical-nav! key))))
 
       (contains? #{" " "Enter"} key)
       (do
         (util/stop e)
-        (trigger-bottom-pill-edit! pill))
+        (consume-bottom-property-action!
+         :bottom-property-edit
+         #(trigger-bottom-pill-edit! pill)))
 
       :else
       nil)))
@@ -2989,10 +3136,18 @@
       [:button.bottom-property-edit-icon.select-none
        {:type "button"
         :on-click (fn [e]
-                    (util/stop e)
-                    (some-> (.-currentTarget e)
-                            (.closest ".bottom-property-pill")
-                            trigger-bottom-pill-edit!))}
+                    (let [pill (event-bottom-property-pill e)]
+                      (util/stop e)
+                      (consume-bottom-property-action!
+                       :bottom-date-edit
+                       #(trigger-bottom-pill-edit! pill))))
+        :on-key-down (fn [e]
+                       (when (contains? #{"Enter" " "} (util/ekey e))
+                         (let [pill (event-bottom-property-pill e)]
+                           (util/stop e)
+                           (consume-bottom-property-action!
+                            :bottom-date-edit
+                            #(trigger-bottom-pill-edit! pill)))))}
        (ui/icon "edit" {:size 15})])]]))
 
 (defn- bottom-property-pill-items
@@ -3023,7 +3178,15 @@
       :aria-expanded (str expanded?)
       :on-click (fn [e]
                   (util/stop e)
-                  (set-expanded! (not expanded?)))}
+                  (consume-bottom-property-action!
+                   :bottom-properties-expand
+                   #(set-expanded! (not expanded?))))
+      :on-key-down (fn [e]
+                     (when (contains? #{"Enter" " "} (util/ekey e))
+                       (util/stop e)
+                       (consume-bottom-property-action!
+                        :bottom-properties-expand
+                        #(set-expanded! (not expanded?)))))}
      (ui/icon (if expanded? "chevron-up" "chevron-down")
               {:size 16 :class "bottom-property-action-icon"})
      label)))
@@ -3146,22 +3309,28 @@
                        (:db/id (db/entity repo [:block/uuid user-id]))))
         summary (reaction/summarize reactions user-db-id)
         read-only? config/publishing?
-        on-pick (fn [popup-id emoji]
-                  (reaction-handler/toggle-reaction! (:block/uuid block) (:id emoji))
-                  (shui/popup-hide! popup-id))
+        on-pick (fn [popup-id e emoji]
+                  (consume-block-math-action!
+                   :reaction-picker-select {:event e}
+                   #(do
+                      (reaction-handler/toggle-reaction! (:block/uuid block) (:id emoji))
+                      (shui/popup-hide! popup-id))))
         open-picker! (fn [^js e]
                        (util/stop e)
-                       (shui/popup-show!
-                        (.-target e)
-                        (fn [{:keys [id]}]
-                          (icon-component/icon-search
-                           {:on-chosen (fn [_emoji-event emoji _keep-popup?] (on-pick id emoji))
-                            :tabs [[:emoji "Emojis"]]
-                            :default-tab :emoji
-                            :show-used? true
-                            :icon-value nil}))
-                        {:align :start
-                         :content-props {:class "ls-icon-picker"}}))]
+                       (consume-block-math-action!
+                        :reaction-picker-open {:event e}
+                        #(shui/popup-show!
+                          (.-target e)
+                          (fn [{:keys [id]}]
+                            (icon-component/icon-search
+                             {:on-chosen (fn [emoji-event emoji _keep-popup?]
+                                           (on-pick id emoji-event emoji))
+                              :tabs [[:emoji "Emojis"]]
+                              :default-tab :emoji
+                              :show-used? true
+                              :icon-value nil}))
+                          {:align :start
+                           :content-props {:class "ls-icon-picker"}})))]
     (when (seq summary)
       [:div.ls-block-reactions.flex.flex-row.flex-wrap.items-center.mt-1
        (for [{:keys [emoji-id count reacted-by-me? usernames]} summary]
@@ -3177,7 +3346,9 @@
                      :on-click (fn [e]
                                  (when-not read-only?
                                    (util/stop e)
-                                   (reaction-handler/toggle-reaction! (:block/uuid block) emoji-id)))}
+                                   (consume-block-math-action!
+                                    :reaction-toggle {:event e}
+                                    #(reaction-handler/toggle-reaction! (:block/uuid block) emoji-id))))}
                     [:span.text-sm.leading-none
                      [:em-emoji {:id emoji-id
                                  :style {:line-height 1}}]]
@@ -4365,16 +4536,18 @@
                                              :id "letter-p"})))]
                         [:div.ls-page-icon.flex.self-start
                          (icon-component/icon-picker icon
-                           {:on-chosen (fn [_e icon]
-                                         (if icon
-                                           (db-property-handler/set-block-property!
-                                             (:db/id block)
-                                             :logseq.property/icon
-                                             (select-keys icon [:id :type :color]))
-                                           ;; del
-                                           (db-property-handler/remove-block-property!
-                                             (:db/id block)
-                                             :logseq.property/icon)))
+                           {:on-chosen (fn [e icon]
+                                         (consume-block-math-action!
+                                          :page-icon-select {:event e}
+                                          #(if icon
+                                             (db-property-handler/set-block-property!
+                                               (:db/id block)
+                                               :logseq.property/icon
+                                               (select-keys icon [:id :type :color]))
+                                             ;; del
+                                             (db-property-handler/remove-block-property!
+                                               (:db/id block)
+                                               :logseq.property/icon))))
                             :del-btn? (boolean icon')
                             :icon-props {:style {:width "1lh"
                                                  :height "1lh"
@@ -4920,11 +5093,21 @@
                       :input-default-placeholder (t :editor/code-language-placeholder)
                       :on-chosen
                       (fn [chosen _ _ e]
-                        (let [lang (:value chosen)]
-                          (when (and (= :code (:logseq.property.node/display-type block))
-                                     (not= lang (:logseq.property.code/lang block)))
-                            (on-select! lang e)))
-                        (shui/popup-hide!))}))))
+                        (consume-block-math-action!
+                         :code-language-choice {:event e}
+                         #(let [lang (:value chosen)
+                                selection
+                                (when (and (= :code (:logseq.property.node/display-type block))
+                                           (not= lang (:logseq.property.code/lang block)))
+                                  (on-select! lang e))]
+                            (if selection
+                              (p/let [result selection]
+                                (if (= :recovery-failed (:status result))
+                                  result
+                                  (do
+                                    (shui/popup-hide!)
+                                    result)))
+                              (shui/popup-hide!)))))}))))
 
 (hsx/defc src-cp
   [config options]
@@ -4961,21 +5144,30 @@
                  :ref *mode-ref
                  :containerid (str container-id)
                  :blockid (str (:block/uuid block))
+                 :on-pointer-down (fn [e]
+                                    (consume-block-math-action!
+                                     :code-language-pointer {:event e} (fn [] nil)))
                  :on-click (fn [^js e]
                              (util/stop-propagation e)
                              (let [target (.-target e)]
-                               (shui/popup-show! target
-                                                 #(src-lang-picker block
-                                                                   (fn [lang ^js _e]
-                                                                     (when-let [^js cm (util/get-cm-instance (util/rec-get-node target "ls-block"))]
-                                                                       (if-let [mode (get-code-mode-by-lang lang)]
-                                                                         (.setOption cm "mode" mode)
-                                                                         (throw (ex-info "code mode not found"
-                                                                                         {:lang lang})))
-                                                                       (db/transact! [(ldb/kv :logseq.kv/latest-code-lang lang)])
-                                                                       (db-property-handler/set-block-property!
-                                                                        (:db/id block) :logseq.property.code/lang lang))))
-                                                 {:align :end})))}
+                               (consume-block-math-action!
+                                :code-language-popup
+                                (fn []
+                                  (shui/popup-show! target
+                                                    (fn []
+                                                      (src-lang-picker block
+                                                                       (fn [lang ^js _e]
+                                                                         (consume-block-math-action!
+                                                                          :code-language-select
+                                                                          #(when-let [^js cm (util/get-cm-instance (util/rec-get-node target "ls-block"))]
+                                                                             (if-let [mode (get-code-mode-by-lang lang)]
+                                                                               (.setOption cm "mode" mode)
+                                                                               (throw (ex-info "code mode not found"
+                                                                                               {:lang lang})))
+                                                                             (db/transact! [(ldb/kv :logseq.kv/latest-code-lang lang)])
+                                                                             (db-property-handler/set-block-property!
+                                                                              (:db/id block) :logseq.property.code/lang lang))))))
+                                                    {:align :end})))))}
                 (or language (t :editor/code-language-placeholder))
                 (ui/icon "chevron-down"))
                (shui/button

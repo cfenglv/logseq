@@ -47,35 +47,43 @@
       (restore-cursor! data)))
   (state/set-state! :history/paused? false))
 
-(let [*last-request (atom nil)]
-  (defn- undo-aux!
-    [e]
-    (when-not (:editor/code-block-context @state/state)
-      (state/set-state! :editor/op :undo)
-      (p/do!
-       @*last-request
+(defonce ^:private *history-request-tail (atom (p/resolved nil)))
+
+(defn- enqueue-history-action!
+  [f]
+  ;; Undo and redo mutate the same two worker-owned stacks. They must therefore
+  ;; share one queue. Keep the queue usable after a failed action while still
+  ;; returning the original rejection to that action's caller.
+  (let [request (p/then @*history-request-tail (fn [_] (f)))
+        settled-tail (p/catch request (fn [_] nil))]
+    (reset! *history-request-tail settled-tail)
+    request))
+
+(defn- undo-aux!
+  [e]
+  (when-not (:editor/code-block-context @state/state)
+    (enqueue-history-action!
+     (fn []
+       (state/set-state! :editor/op :undo)
        (when-let [repo (state/get-current-repo)]
          (util/stop e)
          (p/do!
           (state/set-state! [:editor/last-replace-ref-content-tx repo] nil)
           (editor/save-current-block!)
           (state/clear-editor-action!)
-          (reset! *last-request (state/<invoke-db-worker :thread-api/undo-redo-undo repo))
-          (p/let [result @*last-request]
+          (p/let [result (state/<invoke-db-worker :thread-api/undo-redo-undo repo)]
             (restore-cursor-and-state! result))))))))
 (defonce undo! (debounce undo-aux! 20))
 
-(let [*last-request (atom nil)]
-  (defn- redo-aux!
-    [e]
-    (when-not (:editor/code-block-context @state/state)
-      (state/set-state! :editor/op :redo)
-      (p/do!
-       @*last-request
+(defn- redo-aux!
+  [e]
+  (when-not (:editor/code-block-context @state/state)
+    (enqueue-history-action!
+     (fn []
+       (state/set-state! :editor/op :redo)
        (when-let [repo (state/get-current-repo)]
          (util/stop e)
          (state/clear-editor-action!)
-         (reset! *last-request (state/<invoke-db-worker :thread-api/undo-redo-redo repo))
-         (p/let [result @*last-request]
+         (p/let [result (state/<invoke-db-worker :thread-api/undo-redo-redo repo)]
            (restore-cursor-and-state! result)))))))
 (defonce redo! (debounce redo-aux! 20))

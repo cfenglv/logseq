@@ -375,6 +375,38 @@
   [content format]
   (->edn "logseq_db_repo_stub" content format))
 
+(defn whole-displayed-math-title
+  "Returns a proof map with the bare title when the complete, trimmed input is
+  exactly one Displayed_Math AST node. Empty display Math is represented by a
+  truthy map whose :title is the empty string. Parser failures, ignored input,
+  siblings and partial source coverage return nil."
+  [raw-title]
+  (when (string? raw-title)
+    (let [title (string/trim raw-title)]
+      ;; Healthy Math titles are bare TeX. Avoid invoking mldoc on the normal
+      ;; render/save path unless the value could actually be legacy-delimited.
+      (when (and (string/starts-with? title "$$")
+                 (string/ends-with? title "$$")
+                 (<= 4 (count title)))
+        (let [ast (->db-edn title :markdown)
+              [[node pos] :as entries] ast
+              [node-type node-data] node
+              source-length (.-length (utf8/encode title))]
+          (when (and (= 1 (count entries))
+                     (= "Displayed_Math" node-type)
+                     (string? node-data)
+                     (= 0 (:start_pos pos))
+                     (= source-length (:end_pos pos)))
+            {:title (string/trim node-data)}))))))
+
+(defn canonical-displayed-math-title
+  "Strips one proven outer display delimiter layer and otherwise preserves the
+  input byte-for-byte."
+  [title]
+  (if-let [proof (whole-displayed-math-title title)]
+    (:title proof)
+    title))
+
 (defn inline->edn
   [text config]
   (try
