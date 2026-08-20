@@ -36,7 +36,8 @@
 (defn- entry-response
   [response {:keys [slot-key]}]
   (if-let [group (get-in response [:groups slot-key])]
-    {:basis-rev (:basis-rev response)
+    {:projection-epoch (:projection-epoch response)
+     :basis-rev (:basis-rev response)
      :slots (select-keys (:slots response) group)}
     (throw (ex-info "Missing renderer snapshot group"
                     {:slot-key slot-key}))))

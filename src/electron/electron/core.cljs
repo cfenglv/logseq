@@ -3,7 +3,6 @@
             ["electron" :refer [BrowserWindow Menu app protocol ipcMain dialog shell] :as electron]
             ["fs-extra" :as fs]
 
-            ["os" :as os]
             ["path" :as node-path]
             [cljs-bean.core :as bean]
             [clojure.string :as string]
@@ -37,17 +36,27 @@
 (defonce EXTERNAL_PLUGIN_URL (str LSP_PROTOCOL "logseq.io/external/"))
 (defonce HOST_PLUGIN_URL (str STATIC_URL "plugins/"))
 (defonce HOST_EXTERNAL_PLUGIN_URL (str STATIC_URL "external/"))
-(defonce PLUGINS_ROOT (.join node-path (.homedir os) ".logseq/plugins"))
+(defonce PLUGINS_ROOT (.join node-path cfgs/dot-root "plugins"))
 
 (defonce *setup-fn (volatile! nil))
 (defonce *teardown-fn (volatile! nil))
 (defonce *lifecycle-op (volatile! (p/resolved nil)))
 (defonce *quit-dirty? (volatile! true))
 
+(defn- configure-qualification-command-line!
+  []
+  (when (seq (.-LOGSEQ_TEST_HOME_DIR js/process.env))
+    (.appendSwitch (.-commandLine app) "use-mock-keychain")))
+
 (defn setup-updater! [^js win]
   ;; manual/auto updater
   (init-updater {:repo   "logseq/logseq"
-                 :win    win}))
+                 :win    win
+                 :set-dirty! #(vreset! *quit-dirty? %)
+                 :quit! #(.quit app)
+                 :restart! #(do
+                              (.relaunch app)
+                              (.quit app))}))
 
 (defn open-url-handler
   "win - the main window instance (first renderer process)
@@ -335,7 +344,7 @@
 (defn- preferred-unix-cli-dir
   []
   (cli-install/preferred-unix-cli-dir
-   {:home-dir (.homedir os)
+   {:home-dir cfgs/home-root
     :path-join path-join
     :ensure-dir! ensure-dir!
     :writable-dir? writable-dir?}))
@@ -394,9 +403,10 @@
 
          (let [t0 (setup-interceptor! app')
                ^js win (win/create-main-window!)
-               _ (reset! *win win)]
-
-           (utils/<restore-proxy-settings)
+               _ (reset! *win win)
+               proxy-ready (-> (utils/<restore-proxy-settings)
+                               (p/catch (fn [error]
+                                          (logger/warn :electron/proxy-restore-failed error))))]
 
            (js-utils/disableXFrameOptions win)
 
@@ -409,20 +419,21 @@
 
            (vreset! *setup-fn
                     (fn []
-                      (let [t1 (setup-updater! win)
-                            t2 (setup-app-manager! win)
-                            t3 (handler/set-ipc-handler! win)
-                            t4 (server/setup! win)
-                            t5 (when (cfgs/semantic-search-enabled?)
-                                 (embedding-server/setup! app'))
-                            tt (exceptions/setup-exception-listeners!)]
+                      (let [t3 (handler/set-ipc-handler! win proxy-ready)]
+                        (p/let [_ proxy-ready]
+                          (let [t1 (setup-updater! win)
+                                t2 (setup-app-manager! win)
+                                t4 (server/setup! win)
+                                t5 (when (cfgs/semantic-search-enabled?)
+                                     (embedding-server/setup! app'))
+                                tt (exceptions/setup-exception-listeners!)]
 
-                        (vreset! *teardown-fn
-                                 #(-> (handler/stop-all-db-workers!)
-                                      (p/finally
-                                        (fn []
-                                          (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
-                                            (and f (f))))))))))
+                            (vreset! *teardown-fn
+                                     #(-> (handler/stop-all-db-workers!)
+                                          (p/finally
+                                            (fn []
+                                              (doseq [f [t0 t1 t2 t3 t4 t5 tt]]
+                                                (and f (f))))))))))))
 
            ;; setup effects
            (@*setup-fn)
@@ -460,6 +471,7 @@
            (.on app' "activate" #(when @*win (.show win)))))))
 
 (defn main []
+  (configure-qualification-command-line!)
   (if-not (.requestSingleInstanceLock app)
     (.quit app)
     (let [privileges {:standard        true

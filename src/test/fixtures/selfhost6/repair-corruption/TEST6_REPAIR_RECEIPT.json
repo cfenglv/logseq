@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "kind": "selfhost6.phase0.test6-repair-fixture-receipt.v1",
+  "status": "complete",
+  "result": "fixture-ready",
+  "graphUuid": "50000000-0000-4000-8000-000000000001",
+  "serverCloneIdentity": "sha256:21d0cb6b74a66f84bc6ab56057c0f8f36cd3360894f0511d0d387524a02ad09e",
+  "preflight": {
+    "membership": "isolated-fixture-owner",
+    "e2ee": "excluded-product-not-enabled"
+  },
+  "source": {
+    "role": "official-base-clean-graph",
+    "path": "clean/db.sqlite",
+    "sha256": "21d0cb6b74a66f84bc6ab56057c0f8f36cd3360894f0511d0d387524a02ad09e",
+    "byteSize": 462848
+  },
+  "transform": {
+    "id": "truncate-final-sqlite-page-v1",
+    "inputByteSize": 462848,
+    "removedBytes": 4096,
+    "outputByteSize": 458752,
+    "sha256": "8b4dbaa9dd0627fa0fc3da5e57bfd106aeedca52e9cc05432257595d7516695e"
+  },
+  "output": {
+    "role": "deterministically-corrupt-local-graph",
+    "path": "repair-corruption/corrupt-db.sqlite",
+    "sha256": "208333718ffcda73f68e79a27c1d99b556efec9e18372b3a9e915233edca054e",
+    "byteSize": 458752
+  },
+  "expectedRepairOutput": {
+    "role": "official-base-clean-graph",
+    "path": "clean/db.sqlite",
+    "sha256": "21d0cb6b74a66f84bc6ab56057c0f8f36cd3360894f0511d0d387524a02ad09e",
+    "byteSize": 462848
+  },
+  "uniqueOracle": {
+    "id": "corrupt-local-rejected-clean-clone-opens",
+    "sourceIntegrityCheck": "ok",
+    "corruptIntegrityCheck": "SQLITE_CORRUPT",
+    "repairedShaMustEqual": "21d0cb6b74a66f84bc6ab56057c0f8f36cd3360894f0511d0d387524a02ad09e"
+  }
+}

@@ -78,6 +78,7 @@
 (defn- delta
   [rev affected-keys]
   {:graph-id test-graph-id
+   :projection-epoch 0
    :rev rev
    :op-id (str "view-operation-" rev)
    :blocks {}
@@ -464,7 +465,8 @@
                                         :rows []}]
                                       [reaction-watch []])]
                                 (p/resolved
-                                 {:basis-rev (dec load-number)
+                                 {:projection-epoch 0
+                                  :basis-rev (dec load-number)
                                   :slots
                                   {[:resource resource-key]
                                    {:watch {:keys #{watch-key} :all? false}

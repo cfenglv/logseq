@@ -24,13 +24,19 @@
   [request ^js env graph-id ^js new-url]
   (let [^js namespace (.-LOGSEQ_SYNC_DO env)
         do-id (.idFromName namespace graph-id)
-        stub (.get namespace do-id)]
-    (if (common/upgrade-request? request)
-      (.fetch stub request)
-      (do
-        (.set (.-searchParams new-url) "graph-id" graph-id)
-        (let [rewritten (platform/request (.toString new-url) request)]
-          (.fetch stub rewritten))))))
+        stub (.get namespace do-id)
+        upgrade? (common/upgrade-request? request)
+        _ (when-not upgrade?
+            (.set (.-searchParams new-url) "graph-id" graph-id))
+        rewritten (platform/request (if upgrade?
+                                      (.-url request)
+                                      (.toString new-url))
+                                    request)]
+    ;; Version overrides select the outer Worker. Durable Objects have their
+    ;; own deployment assignment and reject an inherited override during a
+    ;; split deployment.
+    (.delete (.-headers rewritten) "cloudflare-workers-version-overrides")
+    (.fetch stub rewritten)))
 
 (defn- scopes [claims]
   (-> (or (some-> claims (aget "scope")) "")

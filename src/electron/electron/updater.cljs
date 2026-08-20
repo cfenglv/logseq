@@ -1,27 +1,25 @@
 (ns electron.updater
   (:require [cljs-bean.core :as bean]
+            [clojure.string :as string]
             [electron.configs :as cfgs]
+            [electron.db-worker :as db-worker]
             [electron.logger :as logger]
+            [electron.updater-config :as updater-config]
+            [electron.updater-install :as updater-install]
+            [electron.updater-macos :as updater-macos]
+            [electron.updater-target :as updater-target]
             [electron.utils :refer [*win prod?]]
             [frontend.version :refer [version]]
-            ["electron" :refer [ipcMain]]
-            ["electron-updater" :refer [autoUpdater]]))
+            [promesa.core :as p]
+            ["electron" :refer [app ipcMain]]
+            ["electron-updater" :refer [autoUpdater]]
+            ["node:path" :as node-path]))
 
 (def *update-pending (atom nil))
 (def *downloaded-update (atom nil))
+(def *downloaded-target (atom nil))
 (def debug (partial logger/debug "[updater]"))
 (def electron-version version)
-
-(defn- updater-channel
-  []
-  (let [platform (.-platform js/process)
-        arch (.-arch js/process)]
-    (case platform
-      "win32" (when (#{"x64" "arm64"} arch)
-                (str "latest-" arch))
-      "darwin" (when (#{"x64" "arm64"} arch)
-                 (str "latest-" arch))
-      nil)))
 
 (defn- emit-update!
   [^js win type payload]
@@ -47,16 +45,42 @@
   (when-let [web-contents (and @*win (. ^js @*win -webContents))]
     (.send web-contents "auto-updater-downloaded" (bean/->js payload))))
 
+(defn- downloaded-file-sha512
+  [^js info]
+  (let [downloaded-name (some-> (.-downloadedFile info) node-path/basename)
+        matches (->> (array-seq (or (.-files info) #js []))
+                     (filter (fn [^js file]
+                               (let [url-path (some-> (.-url file)
+                                                     (string/split #"[?#]" 2)
+                                                     first)]
+                                 (= downloaded-name (some-> url-path node-path/basename))))))]
+    (when (= 1 (count matches))
+      (.-sha512 ^js (first matches)))))
+
 (defn- configure-auto-updater!
   []
-  (let [channel (updater-channel)]
+  (let [platform (.-platform js/process)
+        arch (.-arch js/process)
+        {:keys [provider feed-url channel allow-prerelease? allow-downgrade?] :as options}
+        (updater-config/updater-options electron-version platform arch)]
+    (when-not options
+      (throw (ex-info "this build has no qualified update provider"
+                      {:code :unsupported-updater-build
+                       :version electron-version
+                       :platform platform
+                       :arch arch})))
+    (.setFeedURL autoUpdater
+                 (bean/->js {:provider provider
+                             :url feed-url
+                             :channel channel}))
     (when channel
       (set! (.-channel autoUpdater) channel)
-      ;; Keep the original downgrade policy even though setting channel flips it on.
-      (set! (.-allowDowngrade autoUpdater) false))
-    (debug "configure-auto-updater" {:platform (.-platform js/process)
-                                     :arch (.-arch js/process)
-                                     :channel channel}))
+      (set! (.-allowPrerelease autoUpdater) allow-prerelease?)
+      ;; Setting channel enables downgrade in electron-updater; restore policy.
+      (set! (.-allowDowngrade autoUpdater) allow-downgrade?))
+    (debug "configure-auto-updater" (assoc options
+                                           :platform platform
+                                           :arch arch)))
   (set! (.-autoInstallOnAppQuit autoUpdater) false)
   (set! (.-autoDownload autoUpdater) false))
 
@@ -81,8 +105,18 @@
 
         downloaded-handler
         (fn [info]
-          (let [payload (normalize-payload info)]
+          (let [payload (normalize-payload info)
+                signatures (.-selfhostUpdateSignatures ^js info)
+                signed-metadata (when signatures
+                                  (aget signatures (.-arch js/process)))]
             (reset! *downloaded-update payload)
+            (reset! *downloaded-target
+                    {:downloaded-file (.-downloadedFile ^js info)
+                     :signed-metadata signed-metadata
+                     :verified-archive-sha512 (downloaded-file-sha512 info)
+                     ;; electron-updater emits update-downloaded only after its
+                     ;; downloaded-file checksum validation has completed.
+                     :archive-digest-verified true})
             (logger/info "[update-downloaded]" payload)
             (emit-update! win "update-downloaded" payload)
             (emit-update-downloaded! payload)
@@ -127,15 +161,45 @@
   [^js win]
   (when (and prod? (not= false (cfgs/get-item :auto-update)))
     (debug "init-auto-updater")
-    (set! (.-autoDownload autoUpdater) true)
-    (-> (.checkForUpdates autoUpdater)
-        (.catch (fn [error]
-                  (logger/warn "[updater/auto-check]" error)
-                  (emit-update! win "error" (normalize-error error))
-                  (emit-completed! win))))))
+    (<check-for-updates! win true)))
+
+(defn- run-downloaded-install!
+  [^js win {:keys [set-dirty! restart! quit!]}]
+  (let [mac? (= "darwin" (.-platform js/process))
+        mac-attempt* (atom nil)]
+    (updater-install/run-install!
+     {:preflight! (fn []
+                    (if-let [target @*downloaded-target]
+                      (p/let [_ (updater-target/preflight-downloaded-target! target)
+                              attempt (when mac?
+                                        (updater-macos/prepare-and-verify! target (.getPath app "exe")))]
+                        (reset! mac-attempt* attempt)
+                        true)
+                      (p/rejected (ex-info "no verified update target is downloaded"
+                                           {:code :missing-downloaded-update-target}))))
+      :begin-quiesce! #(db-worker/begin-update-quiesce! db-worker/manager)
+      :stop-active! #(db-worker/stop-active-for-update! db-worker/manager %)
+      :handoff! (fn []
+                  (if mac?
+                    (updater-macos/spawn-handoff! @mac-attempt*)
+                    (do
+                      (.quitAndInstall autoUpdater false true)
+                      (p/resolved true))))
+      :commit-quiesce! (fn [token]
+                         (db-worker/commit-update-quiesce! db-worker/manager token)
+                         (when mac? (quit!)))
+      :resume-quiesce! #(db-worker/resume-update-quiesce! db-worker/manager %)
+      :set-dirty! set-dirty!
+      :restart! restart!
+      :emit-error! (fn [error]
+                     (when-let [attempt @mac-attempt*]
+                       (updater-macos/discard-attempt! attempt))
+                     (logger/warn "[updater/install]" error)
+                     (emit-update! win "error" (normalize-error error))
+                     (emit-completed! win))})))
 
 (defn init-updater
-  [{:keys [^js win] :as _opts}]
+  [{:keys [^js win set-dirty! restart! quit!] :as _opts}]
   (configure-auto-updater!)
   (let [dispose-listeners! (register-auto-updater-listeners! win)
         check-channel "check-for-updates"
@@ -147,8 +211,10 @@
                            (let [auto-download? (true? (first args))]
                              (-> (<check-for-updates! win auto-download?)
                                  (.finally #(reset! *update-pending nil))))))
-        install-listener (fn [_e _quit-app?]
-                           (.quitAndInstall autoUpdater false true))
+        install-listener (fn [_e]
+                           (run-downloaded-install! win {:set-dirty! set-dirty!
+                                                        :restart! restart!
+                                                        :quit! quit!}))
         get-downloaded-listener (fn [_e]
                                   (some-> @*downloaded-update bean/->js))]
     (init-auto-updater! win)
@@ -160,4 +226,5 @@
        (.removeHandler ipcMain install-channel)
        (.removeHandler ipcMain check-channel)
        (.removeHandler ipcMain get-downloaded-channel)
-       (reset! *update-pending nil))))
+       (reset! *update-pending nil)
+       (reset! *downloaded-target nil))))

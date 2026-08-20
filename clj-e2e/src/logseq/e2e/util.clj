@@ -43,8 +43,8 @@
 
 (defn get-editor
   []
-  (let [editor (w/-query editor-q)]
-    (when (w/visible? editor-q)
+  (let [editor (.first (w/-query editor-q))]
+    (when (w/visible? editor)
       ;; ensure cursor exists
       ;; Sometimes when the editor exists, there isn't a blinking cursor,
       ;; causing subsequent operations (like pressing Enter) to fail.
@@ -52,7 +52,7 @@
         (.focus editor)
         editor
         (catch TimeoutError error
-          (when (w/visible? editor-q)
+          (when (w/visible? editor)
             (throw error)))))))
 
 (defn get-edit-block-container
@@ -140,8 +140,13 @@
 
 (defn get-edit-content
   []
-  (when-let [editor (get-editor)]
-    (get-text editor)))
+  (let [focused (w/-query "*:focus")]
+    (if (and (w/visible? focused)
+             (some-> (.getAttribute focused "id")
+                     (string/starts-with? "edit-block-")))
+      (get-text focused)
+      (when-let [editor (get-editor)]
+        (get-text editor)))))
 
 (defn bounding-xy
   [locator]

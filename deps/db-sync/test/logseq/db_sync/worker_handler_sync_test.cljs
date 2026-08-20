@@ -4,7 +4,6 @@
             [clojure.string :as string]
             [datascript.core :as d]
             [logseq.db-sync.checksum :as sync-checksum]
-            [logseq.db-sync.common :as common]
             [logseq.db-sync.index :as index]
             [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.snapshot :as snapshot]
@@ -74,6 +73,122 @@
 (defn- json-body [response]
   (p/let [text (.text response)]
     (js->clj (js/JSON.parse text) :keywordize-keys true)))
+
+(deftest checksum-diagnostics-binds-recomputed-checksum-to-server-t-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   self #js {:sql sql :conn conn :schema-ready true}
+                   graph-id "graph-diagnostics"
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                         :block/title "diagnostic block"}])
+                   recomputed (sync-checksum/recompute-checksum @conn)
+                   _ (storage/set-checksum! sql recomputed)]
+               (-> (p/let [response (#'sync-handler/<checksum-diagnostics-response
+                                      self graph-id false)]
+                     (is (= (storage/get-t sql) (:t response)))
+                     (is (= recomputed
+                            (:checksum response)
+                            (:legacy-anchor response)
+                            (:server-recomputed-checksum response)))
+                     (is (string/includes? (:server-checkpoint-identity response)
+                                           (str graph-id ":" (:t response) ":" recomputed)))
+                     (is (string/includes? (:metadata-proof response)
+                                           (str graph-id ":" (:t response) ":"
+                                                recomputed ":" recomputed)))
+                     (is (not (contains? response :blocks))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest checksum-diagnostics-proof-only-http-response-omits-block-payload-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   self #js {:sql sql :conn conn :schema-ready true}
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                         :block/title "proof only"}])
+                   recomputed (sync-checksum/recompute-checksum @conn)
+                   _ (storage/set-checksum! sql recomputed)
+                   request (js/Request.
+                            "http://localhost/sync/graph-proof/checksum/diagnostics?proof-only=true")]
+               (-> (p/let [response (sync-handler/handle
+                                      {:self self
+                                       :request request
+                                       :route {:handler :sync/checksum-diagnostics}})
+                            body (json-body response)]
+                     (is (= 200 (.-status response)))
+                     (is (= recomputed (:server-recomputed-checksum body)))
+                     (is (= (storage/get-t sql) (:t body)))
+                     (is (not (contains? body :blocks))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest checksum-diagnostics-reconciles-stale-stored-anchor-to-recomputed-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   self #js {:sql sql :conn conn :schema-ready true}
+                   graph-id "graph-stale-anchor"
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                         :block/title "stale anchor block"}])
+                   recomputed (sync-checksum/recompute-checksum @conn)
+                   _ (storage/set-checksum! sql "0000000000000000")]
+               (-> (p/let [first-response (#'sync-handler/<checksum-diagnostics-response
+                                             self graph-id false)
+                           _ (is (= recomputed
+                                    (:legacy-anchor first-response)
+                                    (:server-recomputed-checksum first-response)))
+                           _ (is (= recomputed (storage/get-checksum sql))
+                                 "stale stored anchor must be reconciled")
+                           second-response (#'sync-handler/<checksum-diagnostics-response
+                                             self graph-id false)]
+                     (is (= recomputed
+                            (:legacy-anchor second-response)
+                            (:server-recomputed-checksum second-response)
+                            (storage/get-checksum sql))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest checksum-diagnostics-does-not-overwrite-a-newer-anchor-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            graph-id "graph-diagnostics-race"
+            _ (d/transact! conn [{:block/uuid (random-uuid)
+                                  :block/title "captured block"}])
+            captured-t (storage/get-t sql)
+            captured-anchor "0000000000000000"
+            _ (storage/set-checksum! sql captured-anchor)
+            _ (d/transact! conn [{:block/uuid (random-uuid)
+                                  :block/title "concurrent block"}])
+            current-t (storage/get-t sql)
+            current-anchor (storage/get-checksum sql)
+            error (try
+                    (#'sync-handler/reconcile-checksum-if-current!
+                     self graph-id captured-t captured-anchor "1111111111111111")
+                    nil
+                    (catch :default error
+                      error))]
+        (is (= :db-sync/checksum-diagnostics-observation-changed
+               (:type (ex-data error))))
+        (is (> current-t captured-t))
+        (is (= current-t (storage/get-t sql)))
+        (is (= current-anchor (storage/get-checksum sql))
+            "a stale diagnostics continuation must not overwrite the newer anchor")))))
 
 (deftest semantic-create-page-delegates-to-outliner-and-broadcasts-test
   (async done
@@ -1600,16 +1715,16 @@
                           (is false (str error))
                           (done)))))))
 
-(deftest ensure-schema-fallback-probes-existing-tables-test
+(deftest ensure-schema-fallback-requires-complete-schema-test
   (async done
          (let [self #js {:sql (empty-sql)}
-               schema-probes (atom [])
+               schema-checks (atom 0)
                {:keys [request url]} (request-url "/sync/graph-1/pull?graph-id=graph-1&since=0")]
            (-> (p/with-redefs [storage/init-schema! (fn [_]
                                                       (throw (js/Error. "ddl rejected")))
-                               common/sql-exec (fn [_ sql-str & _args]
-                                                 (swap! schema-probes conj sql-str)
-                                                 #js [])
+                               storage/schema-ready? (fn [_]
+                                                       (swap! schema-checks inc)
+                                                       true)
                                storage/fetch-tx-since (fn [_ _] [])
                                storage/get-t (fn [_] 7)
                                sync-handler/current-checksum (fn [_] "checksum-ok")]
@@ -1619,13 +1734,11 @@
                                                     :route {:handler :sync/pull}})
                          text (.text resp)
                          body (js->clj (js/JSON.parse text) :keywordize-keys true)
-                         probe-set (set @schema-probes)]
+                         checks @schema-checks]
                    (is (= 200 (.-status resp)))
                    (is (= 7 (:t body)))
                    (is (= "checksum-ok" (:checksum body)))
-                   (is (contains? probe-set "select 1 from kvs limit 1"))
-                   (is (contains? probe-set "select 1 from tx_log limit 1"))
-                   (is (contains? probe-set "select 1 from sync_meta limit 1"))))
+                   (is (= 1 checks))))
                (p/then (fn []
                          (done)))
                (p/catch (fn [error]
@@ -2341,6 +2454,109 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest snapshot-reset-clears-exact-once-state-atomically-test
+  (testing "replace clears ordinary receipts and incomplete upload state with the graph"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              logical-tx-id (random-uuid)
+              session-id (apply str (repeat 64 "a"))]
+          (d/transact! conn [{:block/uuid (random-uuid)
+                              :block/name "snapshot-reset-old"
+                              :block/title "snapshot-reset-old"}])
+          (storage/record-applied-client-tx! sql "tx/accepted" "digest")
+          (storage/start-client-tx-upload!
+           sql logical-tx-id session-id :save-block)
+          (storage/append-client-tx-upload-chunk!
+           sql session-id 0 (protocol/tx->transit [[:db/add -1 :block/title "pending"]])
+           "wire-digest" 1)
+          (#'sync-handler/import-snapshot! self [] true)
+          (is (empty? (storage/applied-client-tx-records
+                       sql ["tx/accepted"])))
+          (is (nil? (storage/client-tx-upload sql logical-tx-id)))
+          (is (empty? (storage/client-tx-upload-chunks sql session-id)))
+          (is (zero? (storage/get-t sql)))
+          (is (= "true"
+                 (storage/get-meta sql :snapshot-uploading?)))))))
+
+  (testing "a failed first replacement batch restores graph and receipt state"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              logical-tx-id (random-uuid)
+              session-id (apply str (repeat 64 "b"))]
+          (d/transact! conn [{:block/uuid (random-uuid)
+                              :block/name "snapshot-reset-rollback"
+                              :block/title "snapshot-reset-rollback"}])
+          (storage/record-applied-client-tx! sql "tx/rollback" "digest")
+          (storage/start-client-tx-upload!
+           sql logical-tx-id session-id :save-block)
+          (storage/append-client-tx-upload-chunk!
+           sql session-id 0 (protocol/tx->transit [[:db/add -1 :block/title "pending"]])
+           "wire-digest" 1)
+          (let [t-before (storage/get-t sql)
+                failure (try
+                          (with-redefs [sync-handler/import-snapshot-rows!
+                                        (fn [& _]
+                                          (throw (js/Error. "injected snapshot import failure")))]
+                            (#'sync-handler/import-snapshot!
+                             self [[42 "replacement" nil]] true))
+                          nil
+                          (catch :default error error))]
+            (is (some? failure))
+            (is (= t-before (storage/get-t sql)))
+            (is (= {"tx/rollback" "digest"}
+                   (storage/applied-client-tx-records
+                    sql ["tx/rollback"])))
+            (is (= session-id
+                   (:session-id
+                    (storage/client-tx-upload sql logical-tx-id))))
+            (is (= 1 (count (storage/client-tx-upload-chunks
+                             sql session-id))))))))))
+
+(deftest admin-reset-fallback-clears-exact-once-tables-test
+  (async done
+    (with-memory-sql-async
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              logical-tx-id (random-uuid)
+              session-id (apply str (repeat 64 "c"))
+              closed (atom [])
+              socket #js {:close (fn [code reason]
+                                   (swap! closed conj [code reason]))}
+              state #js {:storage #js {}
+                         :getWebSockets (fn [] #js [socket])}
+              self #js {:sql sql
+                        :conn conn
+                        :state state
+                        :schema-ready true}]
+          (storage/record-applied-client-tx! sql "tx/admin-reset" "digest")
+          (storage/start-client-tx-upload!
+           sql logical-tx-id session-id :save-block)
+          (storage/append-client-tx-upload-chunk!
+           sql session-id 0 (protocol/tx->transit [[:db/add -1 :block/title "pending"]])
+           "wire-digest" 1)
+          (-> (p/let [response (#'sync-handler/handle-sync-admin-reset self)
+                      body (json-body response)]
+                (is (= 200 (.-status response)))
+                (is (= {:ok true} body))
+                (is (storage/schema-ready? sql))
+                (is (empty? (storage/applied-client-tx-records
+                             sql ["tx/admin-reset"])))
+                (is (nil? (storage/client-tx-upload sql logical-tx-id)))
+                (is (empty? (storage/client-tx-upload-chunks sql session-id)))
+                (is (nil? (.-conn self)))
+                (is (= [[1000 "graph deleted"]] @closed)))
+              (p/then (fn [] (done)))
+              (p/catch (fn [error]
+                         (is false (str error))
+                         (done)))))))))
+
 (deftest tx-batch-rejects-when-a-tx-entry-fails-test
   (testing "db transact failure rejects the batch"
     (let [sql (test-sql/make-sql)
@@ -2994,6 +3210,276 @@
       (is (nil? (d/entity @conn [:block/uuid parent-uuid])))
       (is (nil? (d/entity @conn [:block/uuid child-a-uuid])))
       (is (nil? (d/entity @conn [:block/uuid child-b-uuid]))))))
+
+(defn- cas-title-entry
+  [block-uuid from-title to-title tx-id]
+  {:tx-id tx-id
+   :tx (protocol/tx->transit
+        [[:db.fn/cas [:block/uuid block-uuid]
+          :block/title from-title to-title]])
+   :outliner-op :save-block})
+
+(defn- staged-session-entry
+  [{:keys [logical-tx-id full-tx-data chunk-tx-data chunk-index chunk-final?
+           outliner-op]
+    :or {outliner-op :save-block}}]
+  (let [session-id (protocol/tx-upload-session-id
+                    logical-tx-id outliner-op full-tx-data)]
+    {:tx-id (protocol/tx-chunk-id
+             logical-tx-id session-id chunk-index chunk-final?)
+     :logical-tx-id logical-tx-id
+     :upload-session-id session-id
+     :chunk-index chunk-index
+     :chunk-final? chunk-final?
+     :tx (protocol/tx->transit chunk-tx-data)
+     :outliner-op outliner-op}))
+
+(defn- apply-staged-entry!
+  [self entry]
+  (with-redefs [ws/broadcast! (fn [& _] nil)]
+    (sync-handler/handle-tx-batch!
+     self nil [entry] (storage/get-t (.-sql ^js self)))))
+
+(deftest reset-after-partial-commit-retries-eleven-txs-exactly-once-test
+  (testing "a lost response can replay every stable tx id without duplicating committed work"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "ack-loss"
+                                    :block/title "state-0"
+                                    :block/created-at 1
+                                    :block/updated-at 1}])
+              initial-t (storage/get-t sql)
+              tx-ids (mapv (fn [_] (random-uuid)) (range 11))
+              entries (mapv (fn [idx tx-id]
+                              (cas-title-entry block-uuid
+                                               (str "state-" idx)
+                                               (str "state-" (inc idx))
+                                               tx-id))
+                            (range 11)
+                            tx-ids)
+              apply-entry*
+              #_{:clj-kondo/ignore [:private-call]}
+              sync-handler/apply-tx-entry!
+              apply-attempts (atom 0)
+              interrupted-response
+              (with-redefs [sync-handler/apply-tx-entry!
+                            (fn
+                              ([conn* entry]
+                               (apply-entry* conn* entry))
+                              ([self* conn* entry context]
+                               (if (= 6 (swap! apply-attempts inc))
+                                 (throw (js/Error. "simulated Durable Object reset"))
+                                 (apply-entry* self* conn* entry context))))
+                            ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 #js {:sql sql :conn conn :schema-ready true}
+                 nil entries initial-t))]
+          (is (= "tx/reject" (:type interrupted-response)))
+          (is (= (take 5 tx-ids) (:success-tx-ids interrupted-response)))
+          (is (= (nth tx-ids 5) (:failed-tx-id interrupted-response)))
+          (is (= (+ initial-t 5) (storage/get-t sql)))
+          (let [restarted-self #js {:sql sql :conn nil :schema-ready true}
+                retry-response
+                (with-redefs [ws/broadcast! (fn [& _] nil)]
+                  (sync-handler/handle-tx-batch!
+                   restarted-self nil entries (storage/get-t sql)))
+                committed (storage/fetch-tx-since sql initial-t)]
+            (is (= "tx/batch/ok" (:type retry-response)))
+            (is (= (+ initial-t 11) (:t retry-response)))
+            (is (= 11 (count committed)))
+            (is (= "state-11"
+                   (:block/title
+                    (d/entity @(.-conn restarted-self)
+                              [:block/uuid block-uuid]))))))))))
+
+(deftest same-tx-id-with-different-payload-is-rejected-test
+  (testing "an accepted ordinary identity remains bound to its server-computed digest"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              block-uuid (random-uuid)
+              tx-id (random-uuid)
+              _ (d/transact! conn [{:block/uuid block-uuid
+                                    :block/name "payload-binding"
+                                    :block/title "before"
+                                    :block/created-at 1
+                                    :block/updated-at 1}])
+              t-before (storage/get-t sql)
+              entry-a {:tx-id tx-id
+                       :tx (protocol/tx->transit
+                            [[:db/add [:block/uuid block-uuid]
+                              :block/title "payload-a"]])
+                       :outliner-op :save-block}
+              response-a (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry-a] t-before))
+              entry-b (assoc entry-a
+                             :tx (protocol/tx->transit
+                                  [[:db/add [:block/uuid block-uuid]
+                                    :block/title "payload-b"]]))
+              response-b (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch!
+                            self nil [entry-b] (:t response-a)))]
+          (is (= "tx/batch/ok" (:type response-a)))
+          (is (= "tx/reject" (:type response-b)))
+          (is (= "payload-a"
+                 (:block/title
+                  (d/entity @conn [:block/uuid block-uuid])))))))))
+
+(deftest logical-chunk-session-contiguous-sequence-and-same-chunk-retry-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            logical-tx-id (random-uuid)
+            block-uuid (random-uuid)
+            _ (d/transact! conn [{:block/uuid block-uuid
+                                  :block/name "staged-contiguous"
+                                  :block/title "before"}])
+            full-tx-data [[:db/add [:block/uuid block-uuid]
+                           :block/title "chunk-0"]
+                          [:db/add [:block/uuid block-uuid]
+                           :block/updated-at 2]
+                          [:db/add [:block/uuid block-uuid]
+                           :block/title "final-2"]]
+            t-before (storage/get-t sql)
+            checksum-before (storage/get-checksum sql)
+            chunk-0 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(nth full-tx-data 0)]
+                      :chunk-index 0
+                      :chunk-final? false})
+            response-0 (apply-staged-entry! self chunk-0)
+            retry-0 (apply-staged-entry! self chunk-0)
+            chunk-1 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(nth full-tx-data 1)]
+                      :chunk-index 1
+                      :chunk-final? false})
+            response-1 (apply-staged-entry! self chunk-1)
+            final-2 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(nth full-tx-data 2)]
+                      :chunk-index 2
+                      :chunk-final? true})]
+        (is (= "tx/batch/ok" (:type response-0) (:type retry-0)))
+        (is (= t-before (:t response-0) (:t retry-0) (:t response-1)))
+        (is (= checksum-before (storage/get-checksum sql)))
+        (is (= "before"
+               (:block/title (d/entity @conn [:block/uuid block-uuid]))))
+        (let [response-2 (apply-staged-entry! self final-2)
+              final-retry (apply-staged-entry! self final-2)
+              session (storage/client-tx-upload sql logical-tx-id)]
+          (is (= "tx/batch/ok" (:type response-2) (:type final-retry)))
+          (is (= (inc t-before) (:t response-2) (:t final-retry)))
+          (is (= "final-2"
+                 (:block/title (d/entity @conn [:block/uuid block-uuid]))))
+          (is (= 1 (count (storage/fetch-tx-since sql t-before))))
+          (is (= "completed" (:status session)))
+          (is (empty? (storage/client-tx-upload-chunks
+                       sql (:session-id session)))))))))
+
+(deftest large-staged-upload-commits-one-logical-history-entry-test
+  (testing "a staged payload larger than the live apply chunk bound advances t and tx_log once"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              self #js {:sql sql :conn conn :schema-ready true}
+              logical-tx-id (random-uuid)
+              page-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid page-uuid
+                                    :block/name "large-staged-page"
+                                    :block/title "large-staged-page"}])
+              full-tx-data (large-block-insert-tx page-uuid 120)
+              [chunk-0-data final-data] (split-at 350 full-tx-data)
+              chunk-0 (staged-session-entry
+                       {:logical-tx-id logical-tx-id
+                        :full-tx-data full-tx-data
+                        :chunk-tx-data chunk-0-data
+                        :chunk-index 0
+                        :chunk-final? false
+                        :outliner-op :insert-blocks})
+              final-1 (staged-session-entry
+                       {:logical-tx-id logical-tx-id
+                        :full-tx-data full-tx-data
+                        :chunk-tx-data final-data
+                        :chunk-index 1
+                        :chunk-final? true
+                        :outliner-op :insert-blocks})
+              t-before (storage/get-t sql)
+              response-0 (apply-staged-entry! self chunk-0)
+              response-1 (apply-staged-entry! self final-1)
+              committed (storage/fetch-tx-since sql t-before)]
+          (is (= "tx/batch/ok" (:type response-0) (:type response-1)))
+          (is (= t-before (:t response-0)))
+          (is (= (inc t-before) (:t response-1)))
+          (is (= 1 (count committed)))
+          (is (= (count full-tx-data)
+                 (count (protocol/transit->tx (:tx (first committed))))))
+          (is (= 120
+                 (block-title-prefix-count @conn "large-op-block-")))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (storage/get-checksum sql))))))))
+
+(deftest modern-staged-final-failure-rolls-back-current-and-fresh-connections-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            logical-tx-id (random-uuid)
+            block-uuid (random-uuid)
+            _ (d/transact! conn [{:block/uuid block-uuid
+                                  :block/name "staged-final-rollback"
+                                  :block/title "before"}])
+            full-tx-data [[:db/add [:block/uuid block-uuid]
+                           :block/title "must-roll-back"]
+                          [:db/add [:block/uuid block-uuid]
+                           :block/updated-at 99]]
+            chunk-0 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(first full-tx-data)]
+                      :chunk-index 0
+                      :chunk-final? false})
+            final-1 (staged-session-entry
+                     {:logical-tx-id logical-tx-id
+                      :full-tx-data full-tx-data
+                      :chunk-tx-data [(second full-tx-data)]
+                      :chunk-index 1
+                      :chunk-final? true})
+            _ (is (= "tx/batch/ok" (:type (apply-staged-entry! self chunk-0))))
+            t-before (storage/get-t sql)
+            checksum-before (storage/get-checksum sql)
+            response (with-redefs [storage/append-tx!
+                                   (fn [& _]
+                                     (throw (js/Error. "injected final tx_log failure")))
+                                   ws/broadcast! (fn [& _] nil)]
+                       (sync-handler/handle-tx-batch!
+                        self nil [final-1] t-before))
+            fresh-conn (storage/open-conn sql)
+            session (storage/client-tx-upload sql logical-tx-id)]
+        (is (= "tx/reject" (:type response)))
+        (is (= t-before (:t response) (storage/get-t sql)))
+        (is (= checksum-before (storage/get-checksum sql)))
+        (is (= "before"
+               (:block/title (d/entity @conn [:block/uuid block-uuid]))
+               (:block/title (d/entity @fresh-conn [:block/uuid block-uuid]))))
+        (is (= "active" (:status session)))
+        (is (= 1 (:next-index session)))
+        (is (= 1 (count (storage/client-tx-upload-chunks
+                         sql (:session-id session)))))))))
 
 (deftest sync-pull-is-blocked-when-graph-is-not-ready-for-use-test
   (async done

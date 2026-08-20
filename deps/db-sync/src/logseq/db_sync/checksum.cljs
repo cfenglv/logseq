@@ -1,11 +1,16 @@
 (ns logseq.db-sync.checksum
   (:require [clojure.set :as set]
             [datascript.core :as d]
-            [logseq.db :as ldb]))
+            [logseq.db :as ldb]
+            [promesa.core :as p]))
 
 (def ^:private fnv-offset 2166136261)
 (def ^:private djb-offset 5381)
 (def ^:private field-separator 31)
+(def ^:private recompute-yield-entity-count 256)
+(def ^:private large-title-byte-limit 4096)
+(def ^:private large-title-object-attr :logseq.property.sync/large-title-object)
+(def ^:private text-encoder (js/TextEncoder.))
 
 (defn- fnv-step
   [h code]
@@ -72,6 +77,19 @@
   (cond-> #{:block/uuid :block/parent :block/page :block/order}
     (not e2ee?) (into #{:block/title :block/name})))
 
+(defn- offloaded-large-title?
+  [db eid]
+  (let [entity (d/entity db eid)
+        title (:block/title entity)]
+    (or (some? (get entity large-title-object-attr))
+        (and (string? title)
+             (> (.-length (.encode text-encoder title)) large-title-byte-limit)))))
+
+(defn- entity-relevant-attrs
+  [db eid e2ee?]
+  (cond-> (relevant-attrs e2ee?)
+    (offloaded-large-title? db eid) (disj :block/title)))
+
 (defn- get-block-uuid
   [db eid]
   (:block/uuid (d/entity db eid)))
@@ -114,7 +132,7 @@
 
 (defn- entity-values
   [db eid e2ee?]
-  (let [attrs (relevant-attrs e2ee?)
+  (let [attrs (entity-relevant-attrs db eid e2ee?)
         datoms (d/datoms db :eavt eid)]
     (reduce (fn [acc datom]
               (let [attr (:a datom)]
@@ -143,7 +161,7 @@
 (defn- entity-checksum-tuples
   [db eid e2ee?]
   (when-let [entity-uuid (get-block-uuid db eid)]
-    (let [attrs (relevant-attrs e2ee?)]
+    (let [attrs (entity-relevant-attrs db eid e2ee?)]
       (->> (d/datoms db :eavt eid)
            (keep (fn [{:keys [a v]}]
                    (when (contains? attrs a)
@@ -372,6 +390,33 @@
                    (add-digest checksum-state (tuple-digest tuple)))
                  [0 0])
          state->checksum)))
+
+(defn <recompute-checksum
+  "Recompute the official legacy checksum from one immutable DB value while
+  yielding between bounded entity batches. This is for mismatch/repair cold
+  paths; normal transactions continue to use `update-checksum`."
+  [db]
+  (let [e2ee? (ldb/get-graph-rtc-e2ee? db)]
+    (p/loop [remaining (seq (d/datoms db :avet :block/uuid))
+             checksum-state [0 0]
+             processed 0]
+      (if-let [{:keys [e]} (first remaining)]
+        (let [checksum-state'
+              (reduce (fn [state tuple]
+                        (add-digest state (tuple-digest tuple)))
+                      checksum-state
+                      (or (when (checksum-eligible-entity? db e)
+                            (entity-checksum-tuples db e e2ee?))
+                          []))
+              remaining' (next remaining)
+              processed' (inc processed)]
+          (if (and remaining'
+                   (zero? (mod processed' recompute-yield-entity-count)))
+            (p/let [_ (js/Promise. (fn [resolve]
+                                     (js/setTimeout resolve 0)))]
+              (p/recur remaining' checksum-state' processed'))
+            (p/recur remaining' checksum-state' processed')))
+        (state->checksum checksum-state)))))
 
 (defn recompute-checksum-diagnostics
   [db]

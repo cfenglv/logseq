@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "releaseLineId": "selfhost-official-architecture-v1",
+  "sourceVersion": "2.0.1-selfhost.6",
+  "syntheticForwardTargetVersion": "2.0.1-selfhost.7",
+  "bundleIdentity": "com.logseq.logseq",
+  "forwardUpdateChannel": "selfhost-official-architecture-v1",
+  "provider": {
+    "kind": "generic",
+    "baseUrl": "https://github.com/cfenglv/logseq/releases/download/selfhost-official-architecture-v1",
+    "remoteMutation": "promotion-only"
+  },
+  "firstInstall": "controlled-manual-artifact",
+  "allowDowngrade": false,
+  "sameVersionUpdate": false,
+  "legacySharedLatestMutation": false,
+  "legacyChannelsAccepted": [],
+  "withdrawnArchiveSha256Denylist": [
+    "46b5ea58d82fb26b3efbf2fcf84b430bbee40b4d9307030ddebe8fcaea6f964e",
+    "5d1d46404b6b138e81fff68633c26ccf62280ae6d3b62f5a59dde0139fce51c8",
+    "7fb24acb6b76a27f1267962425bc95bbd4ca2741ea077e1c86c1dfd8c0db4a3b",
+    "82eb4bbc28e87c17db427f05ff3ef3b975c2eeda4edab9574c8de49fb8542909",
+    "95bc2f741f6004f7f096c7014acaa9477a0c5c077b7726b59559b39f882ec3f8",
+    "a226f9b633d66dc87701128ee8f6ce8696e6285c12de630230acbf0a62e46f3a",
+    "a73bfa300cc8b8826c7ccdf9004db223127905529adea64a65aad404e46c7246",
+    "f850b6e2482cdd3decf75fc117fea17a6ee48069076b204f77f3e2cf48bbf440"
+  ],
+  "readableActivationFormats": ["selfhost-activation-v1"],
+  "readableClientOpsFormats": ["official-client-ops-sqlite-v2+selfhost-upload-v1"],
+  "activationWriteFormat": "selfhost-activation-v1",
+  "clientOpsWriteFormat": "official-client-ops-sqlite-v2+selfhost-upload-v1"
+}

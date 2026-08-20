@@ -677,9 +677,11 @@
             request {:blocks [reference-block]
                      :children [journal-a]
                      :resources [page-key journals-key]}]
-        (with-redefs [worker-state/get-datascript-conn (constantly conn)]
+        (with-redefs [worker-state/get-datascript-conn (constantly conn)
+                      worker-state/get-projection-epoch (constantly 7)]
           (let [response (api test-repo request)
                 slots (:slots response)]
+            (is (= 7 (:projection-epoch response)))
             (is (= (:max-tx db) (:basis-rev response)))
             (is (= #{[:block reference-block]
                      [:children journal-a]

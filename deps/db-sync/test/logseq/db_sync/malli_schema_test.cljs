@@ -40,3 +40,16 @@
                (coerce-request :sync/tx-batch
                                (assoc (:sync/tx-batch request-samples)
                                       :client-revision 42)))))
+
+(deftest staged-upload-fields-survive-request-coercion-test
+  (let [logical-tx-id (random-uuid)
+        tx-id (random-uuid)
+        entry {:tx-id tx-id
+               :logical-tx-id logical-tx-id
+               :upload-session-id (apply str (repeat 64 "a"))
+               :chunk-index 0
+               :chunk-final? false
+               :tx "payload"
+               :outliner-op :save-block}
+        body {:t-before 0 :txs [entry]}]
+    (is (= body (coerce-request :sync/tx-batch body)))))

@@ -788,6 +788,17 @@
                    (when-let [id (:block/uuid new-block)]
                      (db-async/<get-block repo id {:children? false}))))))))))))
 
+(defn recover-deleted-dirty-draft!
+  "Keep one active dirty draft through an external deletion by inserting its
+  exact text back on the same page as one ordinary semantic operation."
+  [editing-block draft]
+  (when (and (map? editing-block)
+             (string? draft)
+             (not= draft (:block/title editing-block)))
+    (when-let [page-id (block-page-id editing-block)]
+      (api-insert-new-block! draft {:page page-id
+                                    :edit-block? true}))))
+
 (defn get-selected-blocks
   []
   (distinct (seq (state/get-selection-blocks))))

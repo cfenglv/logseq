@@ -28,39 +28,48 @@
 
 (defn save-block
   [text]
-  (assert/assert-have-count util/editor-q 1)
-  (w/click util/editor-q)
-  (w/fill util/editor-q text)
+  (assert/assert-editor-mode)
+  (util/input text)
   (assert/assert-is-visible (loc/filter util/editor-q :has-text text)))
 
 (defn- focus-new-block!
   [previous-editor-id]
-  (let [new-editor (loc/filter ".editor-wrapper"
-                               :has "textarea"
-                               :has-not (str "#" previous-editor-id))]
+  (let [new-editor (.first (loc/filter ".editor-wrapper"
+                                       :has "textarea"
+                                       :has-not (str "#" previous-editor-id)))]
     (try
       (assert/assert-is-visible new-editor)
       (catch Error _error
         (open-last-block)
         (when (= previous-editor-id
-                 (.getAttribute (w/-query ".editor-wrapper textarea") "id"))
+                 (.getAttribute (.first (w/-query util/editor-q)) "id"))
           (util/move-cursor-to-end)
           (k/enter))
-        (assert/assert-is-visible new-editor)))))
+        (assert/assert-is-visible new-editor)))
+    new-editor))
 
 (defn new-block
   [title]
   (when-not (util/get-editor)
     (open-last-block))
-  (let [last-id (.getAttribute (w/-query ".editor-wrapper textarea") "id")]
+  (let [last-id (.getAttribute (.first (w/-query util/editor-q)) "id")]
     (is (some? last-id))
     (util/move-cursor-to-end)
     (k/enter)
-    (focus-new-block! last-id)
+    (let [new-editor (focus-new-block! last-id)]
+      (.focus new-editor))
     (when (seq title)
       (util/press-seq title))
     (assert/assert-editor-mode)
-    (is (= title (util/get-edit-content)))))
+    (loop [i 20]
+      (if (= title (util/get-edit-content))
+        true
+        (if (zero? i)
+          (is (= title (util/get-edit-content))
+              "new block editor should settle on the expected content")
+          (do
+            (util/wait-timeout 50)
+            (recur (dec i))))))))
 
 ;; TODO: support tree
 (defn new-blocks

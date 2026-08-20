@@ -174,6 +174,7 @@
                            :client-ops (mk-db :client-ops)}})
        (reset! worker-state/*datascript-conns {test-repo :datascript})
        (reset! worker-state/*client-ops-conns {test-repo :client-ops})
+       (worker-state/set-projection-epoch! test-repo 7)
        (reset! worker-state/*opfs-pools
                {test-repo #js {:pauseVfs (fn [] (swap! pause-calls inc))}})
        (reset! client-op/*repo->pending-local-tx-count {test-repo 9})
@@ -183,6 +184,9 @@
        (is (= #{:db :search :client-ops} (set @closed)))
        (is (= 1 @pause-calls))
        (is (nil? (get @client-op/*repo->pending-local-tx-count test-repo)))
+       (is (zero? (worker-state/get-projection-epoch test-repo)))
+       (is (not (contains? (:worker/projection-epochs @worker-state/*state)
+                           test-repo)))
        (is (nil? (get @worker-state/*sqlite-conns test-repo)))))))
 
 (deftest close-db-checkpoints-wal-before-closing-test

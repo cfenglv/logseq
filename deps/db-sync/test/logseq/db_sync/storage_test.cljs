@@ -95,6 +95,18 @@
               {:t 3 :tx "tx-3" :outliner-op nil}]
              result)))))
 
+(deftest exact-once-schema-readiness-requires-all-columns-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (is (storage/schema-ready? sql))
+      (common/sql-exec sql "drop table client_tx_uploads")
+      (common/sql-exec
+       sql
+       (str "create table client_tx_uploads ("
+            "logical_tx_id TEXT primary key, session_id TEXT not null)"))
+      (is (false? (storage/schema-ready? sql))))))
+
 (deftest stale-checksum-no-op-transact-does-not-throw-test
   (testing "a no-op tx should not throw and should keep incremental checksum state"
     (with-memory-sql

@@ -158,5 +158,6 @@
 (def-thread-api :thread-api/get-render-snapshots
   [repo request]
   (if-let [conn (worker-state/get-datascript-conn repo)]
-    (render-snapshots @conn request {:repo repo})
+    (assoc (render-snapshots @conn request {:repo repo})
+           :projection-epoch (worker-state/get-projection-epoch repo))
     (common/fail! "Missing renderer snapshot database" {:repo repo})))

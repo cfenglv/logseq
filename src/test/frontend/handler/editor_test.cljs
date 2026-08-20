@@ -2459,3 +2459,19 @@
       (#'editor/enter-comments-area-node! comments-node)
       (is (= [comments-node] @selected)
           "Collapsed comments should be selected for keyboard shortcuts"))))
+
+(deftest deleted-dirty-draft-recovery-is-one-ordinary-page-insert-test
+  (let [calls (atom [])
+        editing-block {:block/uuid (random-uuid)
+                       :block/title "canonical title"
+                       :block/page {:db/id 42}}]
+    (with-redefs [editor/api-insert-new-block!
+                  (fn [content opts]
+                    (swap! calls conj [content opts]))]
+      (editor/recover-deleted-dirty-draft!
+       editing-block "local dirty draft")
+      (editor/recover-deleted-dirty-draft!
+       editing-block "canonical title"))
+    (is (= [["local dirty draft" {:page 42 :edit-block? true}]]
+           @calls)
+        "Only a changed draft becomes one normal semantic insert.")))

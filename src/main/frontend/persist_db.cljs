@@ -113,6 +113,10 @@
                 :reason :runtime-changed)
       (p/resolved false))))
 
+(defn- db-worker-recovery-notification-id
+  [repo]
+  (str "db-worker-runtime-recovery:" repo))
+
 (defn- <trigger-db-worker-runtime-recovery!
   [repo remote-client session-id]
   (log/warn :event :db-worker-runtime-recovering :repo repo)
@@ -135,6 +139,7 @@
                               :reason :release-skipped)))))
       (p/then (fn [client]
                 (when client
+                  (notification/clear! (db-worker-recovery-notification-id repo))
                   (log/info :event :db-worker-runtime-recovered :repo repo))))
       (p/catch (fn [error]
                  (log/error :event :db-worker-runtime-recovery-failed
@@ -143,7 +148,9 @@
                  (notification/show!
                   (t :graph/db-worker-recovery-failed-error
                      (text-util/get-graph-name-from-path repo))
-                  :error)))))
+                  :error
+                  false
+                  (db-worker-recovery-notification-id repo))))))
 
 (defn- record-active-request-failure!
   [repo session-id error]

@@ -12,6 +12,7 @@
             [frontend.components.user.login :as user.login]
             [frontend.config :as config]
             [frontend.context.i18n :as i18n]
+            [frontend.db.projection-cutover :as projection-cutover]
             [frontend.db.restore :as db-restore]
             [frontend.error :as error]
             [frontend.handler.command-palette :as command-palette]
@@ -148,9 +149,9 @@
                   (render))]
 
       (set-global-error-notification!)
+      (projection-cutover/install-probes!)
 
       (register-components-fns!)
-      (user-handler/restore-tokens-from-localstorage)
       (user.login/setup-configure!)
       (when (util/electron?)
         (el/listen!))
@@ -159,6 +160,9 @@
       (instrument/init)
 
       (events/run!)
+      ;; Cached tokens publish the login continuation synchronously, so the
+      ;; event consumer must exist before restoring them.
+      (user-handler/restore-tokens-from-localstorage)
 
       (log/info ::start-web-worker {})
 
@@ -203,5 +207,4 @@
 
 (defn quit-and-install-new-version!
   []
-  (p/let [_ (ipc/invoke "set-quit-dirty-state" false)]
-    (ipc/ipc :quitAndInstall)))
+  (ipc/invoke "install-updates"))

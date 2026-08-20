@@ -16,6 +16,7 @@
 
 (defonce *state (atom {:db/latest-transact-time {}
                        :worker/context {}
+                       :worker/projection-epochs {}
 
                        ;; FIXME: this name :config is too general
                        :config {}
@@ -83,6 +84,23 @@
 (defn set-db-latest-tx-time!
   [repo]
   (swap! *state assoc-in [:db/latest-transact-time repo] (common-util/time-ms)))
+
+(defn get-projection-epoch
+  [repo]
+  (get-in @*state [:worker/projection-epochs repo] 0))
+
+(defn set-projection-epoch!
+  [repo projection-epoch]
+  (when-not (nat-int? projection-epoch)
+    (throw (ex-info "Invalid projection epoch"
+                    {:repo repo :projection-epoch projection-epoch})))
+  (swap! *state assoc-in [:worker/projection-epochs repo] projection-epoch)
+  projection-epoch)
+
+(defn clear-projection-epoch!
+  [repo]
+  (swap! *state update :worker/projection-epochs dissoc repo)
+  nil)
 
 (defn get-context
   []

@@ -32,7 +32,7 @@
 
 (defonce *repo->pending-local-tx-count (atom {}))
 
-(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v2")
+(def ^:private sqlite-schema-ready-key "__logseq_client_ops_schema_ready_v3")
 (def ^:private sqlite-mode-key "__logseq_client_ops_sqlite_mode")
 (def ^:private sync-meta-table-sql
   "create table if not exists sync_meta (key text primary key, value text)")
@@ -72,12 +72,21 @@
        ")"))
 (def ^:private sync-conflicts-block-index-sql
   "create index if not exists idx_sync_conflicts_block_uuid on sync_conflicts(block_uuid, created_at)")
+(def ^:private client-tx-upload-state-table-sql
+  (str "create table if not exists client_tx_upload_state ("
+       "logical_tx_id text primary key,"
+       "format_version integer not null,"
+       "kind text not null,"
+       "source_digest text not null,"
+       "state text not null,"
+       "updated_at integer not null"
+       ")"))
 
 (defn- client-ops-store
   [repo]
   (worker-state/get-client-ops-conn repo))
 
-(declare ensure-sqlite-schema!)
+(declare ensure-sqlite-schema! sqlite-rows)
 
 (defn- detect-sqlite-mode
   [^js db]
@@ -120,6 +129,12 @@
       (throw (ex-info "Legacy DataScript client-op storage is unsupported. Please back up the graph and re-download it."
                       {:type :db-sync/legacy-client-ops-storage
                        :repo repo})))))
+
+(defn- legacy-client-tx-upload-state?
+  [tx]
+  (boolean
+   (some #(= "session_data" (aget % "name"))
+         (sqlite-rows tx "pragma table_info(client_tx_upload_state)" []))))
 
 (defn- parse-uuid-str
   [v]
@@ -238,6 +253,15 @@
          (sqlite-run! tx sync-meta-table-sql [])
          (sqlite-run! tx client-ops-table-sql [])
          (sqlite-run! tx sync-conflicts-table-sql [])
+         (sqlite-run! tx client-tx-upload-state-table-sql [])
+         ;; Graphs created by the legacy selfhost line (.1-.5) carry the old
+         ;; client_tx_upload_state(logical_tx_id, session_data, updated_at)
+         ;; shape. Upload state is only a resume cache, so migrate by
+         ;; rebuilding the table with the current schema; pending journal rows
+         ;; remain authoritative and re-upload stays exact-once.
+         (when (legacy-client-tx-upload-state? tx)
+           (sqlite-run! tx "drop table client_tx_upload_state" [])
+           (sqlite-run! tx client-tx-upload-state-table-sql []))
          (sqlite-run! tx pending-index-sql [])
          (sqlite-run! tx asset-index-sql [])
          (sqlite-run! tx sync-conflicts-block-index-sql [])))
@@ -245,6 +269,152 @@
         (gobj/set db sqlite-schema-ready-key true)
         (catch :default _
           nil)))))
+
+(defn read-sync-meta-value
+  "Read one reserved sync_meta value while holding the client-ops transaction."
+  [db k]
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (if-let [row (sqlite-row tx "select value from sync_meta where key = ?" [k])]
+       {:found? true :value (aget row "value")}
+       {:found? false}))))
+
+(defn insert-sync-meta-value-if-absent!
+  "Insert a reserved sync_meta value without replacing an existing row."
+  [db k encoded-value]
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (if-let [row (sqlite-row tx "select value from sync_meta where key = ?" [k])]
+       {:inserted? false :value (aget row "value")}
+       (do
+         (sqlite-run! tx
+                      "insert into sync_meta (key, value) values (?, ?)"
+                      [k encoded-value])
+         {:inserted? true :value encoded-value})))))
+
+(defn compare-and-set-sync-meta-value!
+  "Replace one whole encoded sync_meta value iff it still equals expected-value."
+  [db k expected-value replacement-value]
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (let [row (sqlite-row tx "select value from sync_meta where key = ?" [k])]
+       (if (and row (= expected-value (aget row "value")))
+         (do
+           (sqlite-run! tx
+                        "update sync_meta set value = ? where key = ?"
+                        [replacement-value k])
+           true)
+         false)))))
+
+(defn commit-repair-activation-and-sync-meta!
+  "Atomically replace the activation value and advance the two existing
+  canonical sync_meta fields to one verified repair target basis. A stale
+  activation CAS changes none of the three rows."
+  [db activation-key expected-value replacement-value remote-t checksum]
+  (when-not (and (integer? remote-t) (>= remote-t 0) (string? checksum))
+    (throw (ex-info "Invalid repair sync_meta target"
+                    {:type :db-sync/invalid-repair-sync-meta-target
+                     :remote-t remote-t})))
+  (ensure-sqlite-schema! db)
+  (sqlite-with-tx!
+   db
+   (fn [tx]
+     (let [activation-row
+           (sqlite-row tx "select value from sync_meta where key = ?"
+                       [activation-key])
+           current-t
+           (some-> (sqlite-row tx
+                               "select value from sync_meta where key = 'local-tx'"
+                               [])
+                   (aget "value")
+                   (js/parseInt 10))]
+       (if (and activation-row
+                (= expected-value (aget activation-row "value")))
+         (do
+           (when (and current-t (< remote-t current-t))
+             (throw (ex-info "Repair remote cursor would move backward"
+                             {:type :db-sync/repair-remote-cursor-regression
+                              :current-t current-t
+                              :target-t remote-t})))
+           (sqlite-run! tx
+                        "update sync_meta set value = ? where key = ?"
+                        [replacement-value activation-key])
+           (sqlite-run!
+            tx
+            (str "insert into sync_meta (key, value) values (?, ?)"
+                 " on conflict(key) do update set value = excluded.value")
+            ["local-tx" (str remote-t)])
+           (sqlite-run!
+            tx
+            (str "insert into sync_meta (key, value) values (?, ?)"
+                 " on conflict(key) do update set value = excluded.value")
+            ["checksum" checksum])
+           true)
+         false)))))
+
+(defn- repair-local-observation-in-tx
+  [tx]
+  (let [sequence-row (sqlite-row
+                      tx
+                      "select seq from sqlite_sequence where name = 'client_ops'"
+                      [])
+        journal-row (sqlite-row
+                     tx
+                     (str "select "
+                          "sum(case when kind = 'tx' and pending = 1 then 1 else 0 end) as pending_count "
+                          "from client_ops")
+                     [])
+        local-t (some-> (sqlite-row tx
+                                    "select value from sync_meta where key = 'local-tx'"
+                                    [])
+                        (aget "value")
+                        (js/parseInt 10))]
+    {:remote-t local-t
+     :journal-high-water (or (some-> sequence-row (aget "seq")) 0)
+     :pending-count (or (some-> journal-row (aget "pending_count")) 0)
+     :legacy-anchor (some-> (sqlite-row
+                             tx
+                             "select value from sync_meta where key = 'checksum'"
+                             [])
+                            (aget "value"))}))
+
+(defn read-repair-local-observation
+  "Read the journal/cursor observation used by one repair suspect check.
+  This is a cold-path read transaction; it does not create a mirrored cursor."
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx! store repair-local-observation-in-tx)))
+
+(defn read-repair-completion-observation
+  "Read the durable journal/cursor evidence used to retire one committed repair.
+  Only pending official tx rows at or below the repair membership watermark
+  prevent completion; newer rows remain owned by the normal RTC path."
+  [repo journal-high-water]
+  (when-not (and (integer? journal-high-water) (>= journal-high-water 0))
+    (throw (ex-info "Invalid repair completion high-water"
+                    {:type :db-sync/invalid-repair-completion-high-water
+                     :journal-high-water journal-high-water})))
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [observation (repair-local-observation-in-tx tx)
+             pending-row
+             (sqlite-row
+              tx
+              (str "select count(*) as pending_through_target "
+                   "from client_ops "
+                   "where kind = 'tx' and pending = 1 and id <= ?")
+              [journal-high-water])]
+         (assoc observation
+                :pending-through-target
+                (or (some-> pending-row (aget "pending_through_target")) 0)))))))
 
 (defn- sqlite-get-meta
   [db k]
@@ -329,6 +499,23 @@
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
     (sqlite-get-meta store :db-sync/checksum)))
+
+(defn read-local-checksum-and-sync-meta-value
+  "Read the existing checksum and one reserved cold-path value in the single
+  query already needed at a checksum-ready RTC boundary."
+  [repo key]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (let [rows (sqlite-rows
+                store
+                "select key, value from sync_meta where key in ('checksum', ?)"
+                [key])
+          values (into {}
+                       (map (fn [row]
+                              [(aget row "key") (aget row "value")]))
+                       rows)]
+      {:local-checksum (get values "checksum")
+       :reserved-value (get values key)})))
 
 (defn rtc-db-graph?
   "Is RTC enabled"
@@ -429,6 +616,58 @@
            (keep row->pending-local-tx)
            vec))))
 
+(defn read-repair-local-batch
+  "Capture the next repair journal watermark and its ordered pending row IDs in
+  one read transaction. Membership uses id <= high-water; bodies are decoded
+  in bounded pages without changing the official created_at ASC, id ASC order."
+  [repo]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-with-tx!
+     store
+     (fn [tx]
+       (let [observation (repair-local-observation-in-tx tx)
+             high-water (:journal-high-water observation)
+             rows (sqlite-rows
+                   tx
+                   (str "select id from client_ops "
+                        "where kind = 'tx' and pending = 1 and id <= ? "
+                        "order by created_at asc, id asc")
+                   [high-water])]
+         {:observation observation
+          :pending-ids (mapv #(aget % "id") rows)})))))
+
+(defn read-repair-local-page
+  "Decode one fixed ordered membership page captured by
+  read-repair-local-batch. Missing or malformed rows fail closed."
+  [repo ids]
+  (let [ids (vec ids)]
+    (if (seq ids)
+      (if-let [store (sqlite-store-or-throw repo)]
+        (sqlite-with-tx!
+         store
+         (fn [tx]
+           (let [placeholders (string/join "," (repeat (count ids) "?"))
+                 rows (sqlite-rows
+                       tx
+                       (str "select id, tx_id, outliner_op, undo_redo, "
+                            "forward_outliner_ops, inverse_outliner_ops, inferred_outliner_ops, "
+                            "normalized_tx_data, reversed_tx_data "
+                            "from client_ops where id in (" placeholders ")")
+                       ids)
+                 row-by-id (into {} (map (fn [row] [(aget row "id") row])) rows)
+                 pending-txs (mapv (fn [id]
+                                     (some-> (get row-by-id id)
+                                             row->pending-local-tx))
+                                   ids)]
+             (when (some nil? pending-txs)
+               (throw (ex-info "Repair journal membership changed during page read"
+                               {:type :db-sync/repair-journal-membership-changed})))
+             pending-txs)))
+        (throw (ex-info "Repair journal disappeared during page read"
+                        {:type :db-sync/repair-journal-membership-changed
+                         :repo repo})))
+      [])))
+
 (defn add-sync-conflicts!
   [repo conflicts]
   (when-let [store (sqlite-store-or-throw repo)]
@@ -500,35 +739,124 @@
                         [(str tx-id)])]
     (= 1 (some-> row (aget "pending")))))
 
+(defn- valid-client-tx-upload-state?
+  [format-version kind source-digest state]
+  (and (= 1 format-version)
+       (contains? #{:single-wire-v1 :staged-large-upload-v1} kind)
+       (string? source-digest)
+       (map? state)
+       (= format-version (:format-version state))
+       (= kind (:kind state))
+       (= source-digest (:source-digest state))
+       (case kind
+         :single-wire-v1
+         (and (keyword? (:outliner-op state))
+              (map? (:wire-entry state)))
+
+         :staged-large-upload-v1
+         (and (keyword? (:outliner-op state))
+              (string? (:session-id state))
+              (vector? (:boundaries state))
+              (integer? (:source-next-index state))
+              (integer? (:chunk-seq state)))
+
+         false)))
+
+(defn- client-tx-upload-state-row->entry
+  [row]
+  (let [logical-tx-id (parse-uuid-str (aget row "logical_tx_id"))
+        format-version (aget row "format_version")
+        kind (str->kw (aget row "kind"))
+        source-digest (aget row "source_digest")
+        state (some-> (aget row "state") sqlite-util/read-transit-str)]
+    (when-not (and logical-tx-id
+                   (valid-client-tx-upload-state?
+                    format-version kind source-digest state))
+      (throw (ex-info "Invalid client transaction upload state"
+                      {:type :db-sync/invalid-client-tx-upload-state
+                       :logical-tx-id logical-tx-id})))
+    [logical-tx-id state]))
+
+(defn get-client-tx-upload-state
+  [repo logical-tx-id]
+  (when (uuid? logical-tx-id)
+    (when-let [store (sqlite-store-or-throw repo)]
+      (when-let [row (sqlite-row store
+                                 (str "select logical_tx_id, format_version, kind, source_digest, state "
+                                      "from client_tx_upload_state where logical_tx_id = ?")
+                                 [(str logical-tx-id)])]
+        (second (client-tx-upload-state-row->entry row))))))
+
+(defn get-client-tx-upload-states
+  [repo logical-tx-ids]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (let [logical-tx-ids (->> logical-tx-ids (filter uuid?) distinct vec)]
+      (if (seq logical-tx-ids)
+        (->> (sqlite-rows
+              store
+              (str "select logical_tx_id, format_version, kind, source_digest, state "
+                   "from client_tx_upload_state where logical_tx_id in ("
+                   (string/join "," (repeat (count logical-tx-ids) "?")) ")")
+              (mapv str logical-tx-ids))
+             (map client-tx-upload-state-row->entry)
+             (into {}))
+        {}))))
+
+(defn put-client-tx-upload-state!
+  [repo logical-tx-id state]
+  {:pre [(uuid? logical-tx-id)
+         (= 1 (:format-version state))
+         (contains? #{:single-wire-v1 :staged-large-upload-v1}
+                    (:kind state))
+         (string? (:source-digest state))]}
+  (when-let [store (sqlite-store-or-throw repo)]
+    (sqlite-run! store
+                 (str "insert into client_tx_upload_state "
+                      "(logical_tx_id, format_version, kind, source_digest, state, updated_at) "
+                      "values (?, ?, ?, ?, ?, ?) "
+                      "on conflict(logical_tx_id) do update set "
+                      "format_version = excluded.format_version, "
+                      "kind = excluded.kind, "
+                      "source_digest = excluded.source_digest, "
+                      "state = excluded.state, "
+                      "updated_at = excluded.updated_at")
+                 [(str logical-tx-id)
+                  (:format-version state)
+                  (kw->str (:kind state))
+                  (:source-digest state)
+                  (sqlite-util/write-transit-str state)
+                  (.now js/Date)])
+    state))
+
+(defn- finish-pending-txs!
+  [repo tx-ids failed?]
+  (when-let [store (sqlite-store-or-throw repo)]
+    (let [tx-ids (->> tx-ids (filter uuid?) distinct vec)]
+      (sqlite-with-tx!
+       store
+       (fn [tx]
+         (let [pending-to-remove (->> tx-ids
+                                      (filter (fn [tx-id]
+                                                (pending-tx-id? tx tx-id)))
+                                      count)]
+           (doseq [tx-id tx-ids]
+             (sqlite-run! tx
+                          (if failed?
+                            "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
+                            "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?")
+                          [(str tx-id)])
+             (sqlite-run! tx
+                          "delete from client_tx_upload_state where logical_tx_id = ?"
+                          [(str tx-id)]))
+           pending-to-remove))))))
+
 (defn mark-pending-txs-false!
   [repo tx-ids]
-  (when-let [store (sqlite-store-or-throw repo)]
-    (let [tx-ids (->> tx-ids (filter uuid?) vec)
-          pending-to-remove (->> tx-ids
-                                 (filter (fn [tx-id]
-                                           (pending-tx-id? store tx-id)))
-                                 count)]
-      (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
-      pending-to-remove)))
+  (finish-pending-txs! repo tx-ids false))
 
 (defn mark-failed-txs!
   [repo tx-ids]
-  (when-let [store (sqlite-store-or-throw repo)]
-    (let [tx-ids (->> tx-ids (filter uuid?) vec)
-          pending-to-remove (->> tx-ids
-                                 (filter (fn [tx-id]
-                                           (pending-tx-id? store tx-id)))
-                                 count)]
-      (when (seq tx-ids)
-        (doseq [tx-id tx-ids]
-          (sqlite-run! store
-                       "update client_ops set pending = 0, failed = 1 where kind = 'tx' and tx_id = ?"
-                       [(str tx-id)])))
-      pending-to-remove)))
+  (finish-pending-txs! repo tx-ids true))
 
 (defn history-action-ops-by-tx-id
   [repo tx-id]
