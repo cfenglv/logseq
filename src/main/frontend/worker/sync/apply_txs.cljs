@@ -7,6 +7,7 @@
    [frontend.worker.platform :as platform]
    [frontend.worker.shared-service :as shared-service]
    [frontend.worker.state :as worker-state]
+   [frontend.worker-common.util :as worker-util]
    [frontend.worker.sync.assets :as sync-assets]
    [frontend.worker.sync.auth :as sync-auth]
    [frontend.worker.sync.client-op :as client-op]
@@ -106,12 +107,65 @@
 (defn- remove-ignored-attrs [tx-data]
   (remove (fn [d] (contains? rtc-ignored-attrs (:a d))) tx-data))
 
+(def ^:private synced-created-by-user-attrs
+  #{:block/uuid
+    :block/name
+    :block/title
+    :block/tags
+    :block/created-at
+    :block/updated-at
+    :logseq.property.user/name
+    :logseq.property.user/email})
+
+(defn- current-user-uuid
+  []
+  (try
+    (some-> (worker-state/get-id-token)
+            worker-util/parse-jwt
+            :sub
+            uuid)
+    (catch :default _
+      nil)))
+
+(defn- created-by-user-referenced?
+  [db-after tx-data user-uuid]
+  (boolean
+   (some (fn [{:keys [a v added]}]
+           (when (and added
+                      (= :logseq.property/created-by-ref a))
+             (= user-uuid
+                (some-> (d/entity db-after v) :block/uuid))))
+         tx-data)))
+
+(defn- normalize-created-by-user-upsert
+  "Return an idempotent upsert for the current graph-local user entity.
+
+  A downloaded shared graph can contain a local user entity that was created by
+  a non-persisted metadata transaction and therefore never reached the server.
+  Re-sending the small identity record alongside transactions that reference it
+  repairs those graphs and is a no-op once the server already has the entity."
+  [db-after db-before tx-data]
+  (when-let [user-uuid (current-user-uuid)]
+    (when (created-by-user-referenced? db-after tx-data user-uuid)
+      (when-let [user-id (:db/id (d/entity db-after [:block/uuid user-uuid]))]
+        (->> (d/datoms db-after :eavt user-id)
+             (filter (fn [{:keys [a]}]
+                       (contains? synced-created-by-user-attrs a)))
+             (keep (fn [datom]
+                     (when-let [normalized
+                                (db-normalize/normalize-datom db-after db-before datom)]
+                       ;; Force a tempid for the user entity. A lookup ref would
+                       ;; fail on a server that missed the original creation.
+                       (assoc normalized 1 (str user-uuid))))))))))
+
 (defn- normalize-tx-data [db-after db-before tx-data]
-  (->> tx-data
-       remove-ignored-attrs
-       (db-normalize/normalize-tx-data db-after db-before)
-       (remove (fn [[_op e]]
-                 (contains? rtc-const/ignore-entities-when-init-upload e)))))
+  (let [tx-data* (remove-ignored-attrs tx-data)
+        created-by-user-upsert (normalize-created-by-user-upsert db-after db-before tx-data*)]
+    (->> (concat created-by-user-upsert
+                 (db-normalize/normalize-tx-data db-after db-before tx-data*))
+         (remove (fn [[_op e]]
+                   (contains? rtc-const/ignore-entities-when-init-upload e)))
+         distinct)))
 
 (declare replay-canonical-outliner-op!
          invalid-rebase-op!)

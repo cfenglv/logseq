@@ -5,6 +5,7 @@
             [lambdaisland.glogi :as log]
             [logseq.db-sync.common :as common]
             [logseq.db-sync.logging :as logging]
+            [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.sentry.worker :as sentry]
             [logseq.db-sync.worker.dispatch :as dispatch]
             [logseq.db-sync.worker.handler.sync :as sync-handler]
@@ -39,7 +40,9 @@
                        (swap! presence assoc ws user))))
                  (.setWebSocketAutoResponse
                   state
-                  (js/WebSocketRequestResponsePair. "ping" "pong"))))
+                  (js/WebSocketRequestResponsePair.
+                   (protocol/encode-message {:type "ping"})
+                   (protocol/encode-message {:type "pong"})))))
 
   Object
   (fetch [this request]

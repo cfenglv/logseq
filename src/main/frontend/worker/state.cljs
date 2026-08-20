@@ -131,7 +131,10 @@
 (defn online?
   []
   (if (node-runtime?)
-    (node-online?)
+    (let [online-event @(:thread-atom/online-event @*state)]
+      (if (boolean? online-event)
+        online-event
+        (node-online?)))
     @(:thread-atom/online-event @*state)))
 
 (comment

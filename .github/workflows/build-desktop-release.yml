@@ -10,8 +10,7 @@ on:
         type: choice
         required: true
         options:
-          # NOTE: For now, we only have beta channel to be released on GitHub
-          # - stable
+          - stable
           - beta
           - nightly
           - non-release
@@ -20,6 +19,14 @@ on:
         description: "Release Git Ref (Which branch or tag to build?)"
         required: true
         default: "master"
+      desktop-platforms:
+        description: "Desktop platforms to build"
+        type: choice
+        required: true
+        options:
+          - all
+          - windows-only
+        default: "all"
       is-draft:
         description: 'Draft Release? (Beta only, Nightly will always be a non-draft)'
         type: boolean
@@ -44,7 +51,7 @@ on:
         description: 'Build Android App'
         type: boolean
         required: true
-        default: true
+        default: false
       publish-linux-stores:
         description: 'Publish Flathub and Snap'
         type: boolean
@@ -59,12 +66,15 @@ env:
   JAVA_VERSION: '21'
   OCAML_VERSION: '5.4.0'
 
+permissions:
+  contents: write
+
 jobs:
   compile-cljs:
     runs-on: ubuntu-22.04
     steps:
       - name: Check build options
-        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
+        if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
         run: |
           echo "::error title=CheckFail::Nightly, Beta and Stable Release MUST be built from master"
           exit 1
@@ -163,6 +173,7 @@ jobs:
           opam exec -- pnpm cli:release
           pnpm webpack-app-build
           pnpm desktop:prepare-runtime-js
+          pnpm desktop:verify-runtime-revisions
         env:
           LOGSEQ_SENTRY_DSN: ${{ secrets.LOGSEQ_SENTRY_DSN }}
           LOGSEQ_POSTHOG_TOKEN: ${{ secrets.LOGSEQ_POSTHOG_TOKEN }}
@@ -183,6 +194,7 @@ jobs:
           test -f ./static/js/db-worker-node.js
           test -f ./static/js/logseq-cli.js
           test -f ./static/.agents/skills/logseq-cli/SKILL.md
+          pnpm desktop:verify-runtime-revisions
 
       - name: Update APP Version
         run: |
@@ -202,6 +214,7 @@ jobs:
         working-directory: ./static
 
       - name: Upload Sentry Sourcemaps (beta only)
+        if: ${{ github.repository == 'logseq/logseq' }}
         # if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'beta' }}
         run: |
           curl -sL https://sentry.io/get-cli/ | SENTRY_CLI_VERSION=2.58.4 bash
@@ -222,6 +235,7 @@ jobs:
           include-hidden-files: true
 
   build-linux-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
     steps:
@@ -279,6 +293,7 @@ jobs:
           path: builds
 
   build-linux-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     runs-on: ubuntu-22.04
     needs: [ compile-cljs ]
     steps:
@@ -371,7 +386,8 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: ./static
 
-      - name: Build/Release Electron app
+      - name: Build/Release signed Electron app
+        if: ${{ github.repository == 'logseq/logseq' }}
         shell: pwsh
         run: |
           $signCfg = @'
@@ -395,6 +411,11 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Build/Release unsigned Electron app for forks
+        if: ${{ github.repository != 'logseq/logseq' }}
+        run: pnpm exec electron-builder --publish never
+        working-directory: ./static
 
       - name: Save Artifact
         run: |
@@ -445,7 +466,8 @@ jobs:
         run: pnpm install --frozen-lockfile
         working-directory: ./static
 
-      - name: Build/Release Electron app
+      - name: Build/Release signed Electron app
+        if: ${{ github.repository == 'logseq/logseq' }}
         shell: pwsh
         run: |
           $signCfg = @'
@@ -470,6 +492,11 @@ jobs:
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
 
+      - name: Build/Release unsigned Electron app for forks
+        if: ${{ github.repository != 'logseq/logseq' }}
+        run: pnpm exec electron-builder --win nsis zip --arm64 --publish never
+        working-directory: ./static
+
       - name: Save Artifact
         run: |
           mkdir builds
@@ -485,8 +512,11 @@ jobs:
           path: builds
 
   build-macos-x64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-15-intel
+    env:
+      APPLE_CERTIFICATES_P12: ${{ secrets.APPLE_CERTIFICATES_P12 }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -531,10 +561,10 @@ jobs:
             ${{ runner.os }}-pnpm-
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
+          p12-file-base64: ${{ env.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
 
       # - name: Cache Node Modules
@@ -545,12 +575,38 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Build/Release Electron App for x64
-        run: pnpm install --frozen-lockfile && pnpm rebuild:all && pnpm electron:make
+        run: |
+          pnpm install --frozen-lockfile --ignore-workspace
+          pnpm rebuild:all
+          if [ -n "${APPLE_CERTIFICATES_P12}" ]; then
+            pnpm electron:make
+          else
+            pnpm electron:make-unsigned --mac dmg zip --x64
+          fi
         working-directory: ./static
         env:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify fork macOS app can load Electron
+        if: ${{ env.APPLE_CERTIFICATES_P12 == '' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
+
+      - name: Verify Developer ID signature and notarization
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+          xcrun stapler validate "$app_path"
 
       - name: Save x64 artifacts
         run: |
@@ -568,8 +624,11 @@ jobs:
           path: builds
 
   build-macos-arm64:
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.desktop-platforms != 'windows-only' }}
     needs: [ compile-cljs ]
     runs-on: macos-14
+    env:
+      APPLE_CERTIFICATES_P12: ${{ secrets.APPLE_CERTIFICATES_P12 }}
     steps:
       - name: Download The Static Asset
         uses: actions/download-artifact@v4
@@ -611,10 +670,10 @@ jobs:
           python-version: '3.11'
 
       - name: Signing By Apple Developer ID
-        if: ${{ github.repository == 'logseq/logseq' }}
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
         uses: apple-actions/import-codesign-certs@v1
         with:
-          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
+          p12-file-base64: ${{ env.APPLE_CERTIFICATES_P12 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
 
       # - name: Cache Node Modules
@@ -625,16 +684,40 @@ jobs:
       #     key: ${{ runner.os }}-node-modules
 
       - name: Fetch deps
-        run: pnpm install --frozen-lockfile --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
+        run: pnpm install --frozen-lockfile --ignore-workspace --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
         working-directory: ./static
 
       - name: Build/Release Electron App for arm64
-        run: pnpm electron:make-macos-arm64
+        run: |
+          if [ -n "${APPLE_CERTIFICATES_P12}" ]; then
+            pnpm electron:make-macos-arm64
+          else
+            pnpm electron:make-unsigned --mac dmg zip --arm64
+          fi
         working-directory: ./static
         env:
           APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify fork macOS app can load Electron
+        if: ${{ env.APPLE_CERTIFICATES_P12 == '' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          expected="$(node -p "require('./static/package.json').devDependencies.electron")"
+          actual="$(ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" -e 'process.stdout.write(process.versions.electron)')"
+          test "$actual" = "$expected"
+
+      - name: Verify Developer ID signature and notarization
+        if: ${{ env.APPLE_CERTIFICATES_P12 != '' }}
+        run: |
+          app_path="$(find static/dist -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+          xcrun stapler validate "$app_path"
 
       - name: Save arm64 artifacts
         run: |
@@ -706,6 +789,7 @@ jobs:
           path: ./
 
       - name: Download Android Artifacts
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: logseq-android-builds
@@ -713,10 +797,17 @@ jobs:
 
       - name: Generate SHA256 checksums
         run: |
-          sha256sum *-darwin-* > SHA256SUMS.txt
-          sha256sum *-win-* >> SHA256SUMS.txt
-          sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          files=()
+          for pattern in '*-darwin-*' '*-win-*' '*-linux-*' '*.apk'; do
+            for file in $pattern; do
+              if [ -f "$file" ]; then files+=("$file"); fi
+            done
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No release files found" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: List files
@@ -751,6 +842,11 @@ jobs:
     outputs:
       version: ${{ steps.ref.outputs.version }}
     steps:
+      - name: Check out release notes
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref }}
+
       - name: Download MacOS x64 Artifacts
         uses: actions/download-artifact@v4
         with:
@@ -805,20 +901,27 @@ jobs:
 
       - name: Generate SHA256 checksums
         run: |
-          sha256sum *-darwin-* > SHA256SUMS.txt
-          sha256sum *-win-* >> SHA256SUMS.txt
-          sha256sum *-linux-* >> SHA256SUMS.txt
-          sha256sum *.apk >> SHA256SUMS.txt
+          files=()
+          for pattern in '*-darwin-*' '*-win-*' '*-linux-*' '*.apk'; do
+            for file in $pattern; do
+              if [ -f "$file" ]; then files+=("$file"); fi
+            done
+          done
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No release files found" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create Release Draft
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.ref.outputs.version }}
           name: ${{ github.event.inputs.build-target == 'beta' && format('Desktop APP {0} (Beta Testing)', steps.ref.outputs.version) || format('Desktop APP {0}', steps.ref.outputs.version) }}
-          body: "TODO: Fill this changelog. Sorry for the inconvenience!"
+          body_path: docs/releases/${{ steps.ref.outputs.version }}.md
           draft: ${{ github.event.inputs.is-draft }}
           prerelease: ${{ github.event.inputs.is-pre-release }}
           files: |

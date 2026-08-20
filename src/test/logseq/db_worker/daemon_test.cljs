@@ -1,5 +1,6 @@
 (ns logseq.db-worker.daemon-test
   (:require [cljs.test :refer [async deftest is]]
+            [clojure.string :as string]
             [frontend.test.node-helper :as node-helper]
             [logseq.cli.test-helper :as test-helper]
             [logseq.db-worker.daemon :as daemon]
@@ -43,6 +44,8 @@
         (is (number? (nth stdio 2))))
       (is (= "1" (get-in @captured [:opts :env :LOGSEQ_DB_WORKER_NODE_STDIO_REDIRECTED_TO_LOG])))
       (is (= "1" (get-in @captured [:opts :env :ELECTRON_RUN_AS_NODE])))
+      (is (= "1" (get-in @captured [:opts :env :NODE_USE_ENV_PROXY])))
+      (is (= "1" (get-in @captured [:opts :env :NODE_USE_SYSTEM_CA])))
       (is (= true @unref-called?))
       (finally
         (set! (.-spawn child-process) original-spawn)))))
@@ -66,6 +69,63 @@
       (is (= "inherit" (get-in @captured [:opts :stdio])))
       (is (= false @unref-called?))
       (finally
+        (set! (.-spawn child-process) original-spawn)))))
+
+(deftest spawn-server-applies-configured-http-proxy
+  (let [captured (atom nil)
+        original-spawn (.-spawn child-process)]
+    (set! (.-spawn child-process)
+          (fn [_cmd _args opts]
+            (reset! captured (js->clj opts :keywordize-keys true))
+            (js-obj "unref" (fn [] nil))))
+    (try
+      (daemon/configure-proxy-env! {:protocol "http" :host "127.0.0.1" :port "7897"})
+      (daemon/spawn-server! {:script "/tmp/db-worker-node.js"
+                             :repo "logseq_db_spawn_helper_test"
+                             :root-dir "/tmp/logseq-root"})
+      (doseq [key [:HTTP_PROXY :HTTPS_PROXY :http_proxy :https_proxy]]
+        (is (= "http://127.0.0.1:7897" (get-in @captured [:env key]))))
+      (doseq [key [:NO_PROXY :no_proxy]]
+        (let [bypass (set (string/split (get-in @captured [:env key]) #","))]
+          (is (every? bypass ["localhost" "127.0.0.1" "::1"]))
+          (is (not (contains? bypass "*")))))
+      (doseq [key [:ALL_PROXY :all_proxy]]
+        (is (nil? (get-in @captured [:env key]))))
+      (is (= "1" (get-in @captured [:env :NODE_USE_ENV_PROXY])))
+      (is (= "1" (get-in @captured [:env :NODE_USE_SYSTEM_CA])))
+      (finally
+        (daemon/configure-proxy-env! :inherit)
+        (set! (.-spawn child-process) original-spawn)))))
+
+(deftest configured-http-proxy-preserves-specific-bypass-rules
+  (try
+    (daemon/configure-proxy-env! {:protocol "http" :host "proxy.example" :port 8080})
+    (let [env #js {:NO_PROXY "*.corp.example,*,internal.example"}
+          result (call-private 'apply-proxy-env! env)
+          bypass (set (string/split (aget result "NO_PROXY") #","))]
+      (is (every? bypass ["*.corp.example" "internal.example"
+                          "localhost" "127.0.0.1" "::1"]))
+      (is (not (contains? bypass "*"))))
+    (finally
+      (daemon/configure-proxy-env! :inherit))))
+
+(deftest spawn-server-direct-mode-clears-inherited-proxy-environment
+  (let [captured (atom nil)
+        original-spawn (.-spawn child-process)]
+    (set! (.-spawn child-process)
+          (fn [_cmd _args opts]
+            (reset! captured (js->clj opts :keywordize-keys true))
+            (js-obj "unref" (fn [] nil))))
+    (try
+      (daemon/configure-proxy-env! nil)
+      (daemon/spawn-server! {:script "/tmp/db-worker-node.js"
+                             :repo "logseq_db_spawn_helper_test"
+                             :root-dir "/tmp/logseq-root"})
+      (doseq [key [:HTTP_PROXY :HTTPS_PROXY :ALL_PROXY :NO_PROXY
+                   :http_proxy :https_proxy :all_proxy :no_proxy]]
+        (is (nil? (get-in @captured [:env key]))))
+      (finally
+        (daemon/configure-proxy-env! :inherit)
         (set! (.-spawn child-process) original-spawn)))))
 
 (deftest spawn-server-appends-create-empty-db-flag-when-enabled

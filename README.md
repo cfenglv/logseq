@@ -1,3 +1,22 @@
+## Self-hosted RTC fork
+
+This branch extends the Logseq DB version with the client, Cloudflare Worker, and desktop release changes needed to run RTC (real-time sync and collaboration) for a self-hosted team. It is not an official Logseq release. Test it with a non-critical graph first and keep independent backups of important graphs.
+
+Compared with upstream Logseq, this fork adds or fixes:
+
+- A configurable Sync Server base URL used by both HTTP and WebSocket traffic.
+- System proxy support on macOS, Windows, and Linux, including proxied WebSocket connections.
+- Heartbeats and automatic reconnection after sleep, standby, and network changes. Offline edits remain local and resume syncing when connectivity returns.
+- Recovery from individual rejected transactions, plus a fix for missing `created-by-ref` user entities that could make a shared graph uneditable.
+- GitHub Actions builds for macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64.
+- Electron 42.4.1, including upstream Safe Storage initialization fixes that reduce unnecessary macOS Keychain prompts.
+
+To configure a client, open **Settings → Advanced → Sync Server URL**, enter the Worker base URL (for example, `https://selfhost-sync.example.workers.dev`), and save it. Do not append `/health`, `/sync/%s`, or another path. Every collaborator must use the same server URL.
+
+See the [self-hosted Logseq DB Sync / RTC guide](docs/selfhost-sync.md) for the full setup process and the [2.0.1-selfhost.2 release notes](docs/releases/2.0.1-selfhost.2.md) for this release. Installers are available from [this fork's Releases](https://github.com/cfenglv/logseq/releases).
+
+> Data compatibility: this fork intentionally keeps the `Logseq` product name and `com.logseq.logseq` application ID so it can continue using existing Logseq user data, settings, authentication state, and local graphs. Do not run official Logseq and this fork at the same time. Quit Logseq and back up your graphs before installing or switching builds. macOS packages that are not signed and notarized with an Apple Developer ID may still trigger Gatekeeper warnings.
+
 <!-- logo -->
 <p align="center">
     <a href="https://logseq.com" alt="Logseq Logo">

@@ -1,0 +1,9 @@
+extends: ./electron-builder.yml
+afterSign: ./electron-builder-adhoc-after-sign.cjs
+
+mac:
+  hardenedRuntime: false
+  entitlements: ./entitlements.local-signed.plist
+  entitlementsInherit: ./entitlements.local-signed.plist
+  signIgnore:
+    - "\\.pak$"

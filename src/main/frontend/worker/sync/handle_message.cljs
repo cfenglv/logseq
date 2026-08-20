@@ -169,6 +169,7 @@
   (sync-apply/clear-upload-response-timeout! client)
   (let [reason (:reason message)
         remote-tx (:t message)
+        error-detail (:error-detail message)
         success-tx-ids (:success-tx-ids message)
         failed-tx-id (:failed-tx-id message)
         missing-block-uuids (:missing-block-uuids message)]
@@ -177,6 +178,10 @@
                  {:repo repo :type "tx/reject" :field :reason}))
     (when (contains? message :t)
       (require-non-negative remote-tx {:repo repo :type "tx/reject"}))
+    (when (and (contains? message :error-detail)
+               (not (string? error-detail)))
+      (fail-fast :db-sync/invalid-field
+                 {:repo repo :type "tx/reject" :field :error-detail :value error-detail}))
     (when (contains? message :success-tx-ids)
       (require-seq success-tx-ids {:repo repo :type "tx/reject" :field :success-tx-ids})
       (doseq [tx-id success-tx-ids]
@@ -198,6 +203,10 @@
                                    vec)
             failed-tx-id (when (and failed-tx-id (contains? inflight-set failed-tx-id))
                            failed-tx-id)
+            partial-success? (and (seq successful-tx-ids)
+                                  (number? remote-tx))
+            next-local-tx (when partial-success?
+                            (max local-tx remote-tx))
             data (when-let [raw-data (:data message)]
                    (parse-transit raw-data
                                   {:repo repo
@@ -212,6 +221,7 @@
                             (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
                             (some? failed-tx-id) (assoc :failed-tx-id failed-tx-id)
                             (seq missing-block-uuids) (assoc :missing-block-uuids (vec missing-block-uuids))
+                            (some? error-detail) (assoc :error-detail error-detail)
                             (some? data) (assoc :data data))]
         (if (or (contains? message :success-tx-ids)
                 (contains? message :failed-tx-id))
@@ -221,8 +231,18 @@
               (sync-apply/rollback-and-mark-failed-txs! repo [failed-tx-id])))
           ;; Backward compatibility for older servers without per-tx reject metadata.
           (sync-apply/rollback-and-mark-failed-txs! repo inflight))
+        ;; The server commits txs before the rejected tx and reports the resulting
+        ;; cursor in :t. Advance the local cursor so rebased pending txs can resume.
+        (when partial-success?
+          (client-op/update-local-tx repo next-local-tx))
         (reset! (:inflight client) [])
         (broadcast-rtc-state! client)
+        (when partial-success?
+          (let [latest-remote-tx (get @sync-apply/*repo->latest-remote-tx repo)]
+            (if (and (number? latest-remote-tx)
+                     (> latest-remote-tx next-local-tx))
+              (request-pull! client next-local-tx)
+              (sync-apply/enqueue-flush-pending! repo client))))
         (sync-log-state/rtc-log :rtc.log/tx-rejected rejected-data)
         (fail-fast :db-sync/tx-rejected
                    rejected-data)))))

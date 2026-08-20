@@ -1755,9 +1755,11 @@
           raw-message (js/JSON.stringify
                        (clj->js {:type "tx/reject"
                                  :reason "db transact failed"
-                                 :t 3
+                                 :t 5
+                                 :error-detail "server transact exception"
                                  :success-tx-ids [(str success-tx-id)]
                                  :failed-tx-id (str failed-tx-id)}))
+          flush-calls (atom [])
           client {:repo test-repo
                   :graph-id "graph-1"
                   :inflight (atom [success-tx-id failed-tx-id untouched-tx-id])
@@ -1776,28 +1778,35 @@
             {:db-sync/tx-id untouched-tx-id
              :db-sync/created-at 3
              :db-sync/pending? true}])
-          (with-redefs [client-op/get-local-tx (constantly 0)]
-            (let [error (try
+          (client-op/update-local-tx test-repo 4)
+          (let [error (with-redefs [sync-apply/enqueue-flush-pending!
+                                    (fn [repo client]
+                                      (swap! flush-calls conj [repo client]))]
+                        (try
                           (with-silenced-console-error
                             #(sync-handle-message/handle-message! test-repo client raw-message))
                           nil
                           (catch :default e
-                            e))
-                  success-ent (client-op-tx-row client-ops-conn success-tx-id)
-                  failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
-                  untouched-ent (client-op-tx-row client-ops-conn untouched-tx-id)]
-              (is (some? error))
-              (is (= :db-sync/tx-rejected
-                     (:type (ex-data error))))
-              (is (= "db transact failed"
-                     (:reason (ex-data error))))
-              (is (= [] @(:inflight client)))
-              (is (= 0 (aget success-ent "pending")))
-              (is (not= 1 (aget success-ent "failed")))
-              (is (= 0 (aget failed-ent "pending")))
-              (is (= 1 (aget failed-ent "failed")))
-              (is (= 1 (aget untouched-ent "pending")))
-              (is (not= 1 (aget untouched-ent "failed"))))))))))
+                            e)))
+                success-ent (client-op-tx-row client-ops-conn success-tx-id)
+                failed-ent (client-op-tx-row client-ops-conn failed-tx-id)
+                untouched-ent (client-op-tx-row client-ops-conn untouched-tx-id)]
+            (is (some? error))
+            (is (= :db-sync/tx-rejected
+                   (:type (ex-data error))))
+            (is (= "db transact failed"
+                   (:reason (ex-data error))))
+            (is (= "server transact exception"
+                   (:error-detail (ex-data error))))
+            (is (= 5 (client-op/get-local-tx test-repo)))
+            (is (= [[test-repo client]] @flush-calls))
+            (is (= [] @(:inflight client)))
+            (is (= 0 (aget success-ent "pending")))
+            (is (not= 1 (aget success-ent "failed")))
+            (is (= 0 (aget failed-ent "pending")))
+            (is (= 1 (aget failed-ent "failed")))
+            (is (= 1 (aget untouched-ent "pending")))
+            (is (not= 1 (aget untouched-ent "failed")))))))))
 
 (deftest tx-reject-missing-blocks-marks-failed-tx-failed-test
   (testing "tx/reject with missing block ids should fail the rejected tx"
@@ -2376,6 +2385,64 @@
             (db-sync/update-local-sync-checksum! test-repo tx-report)
             (is (= (client-op/get-local-checksum test-repo)
                    (sync-checksum/recompute-checksum (:db-after tx-report))))))))))
+
+(deftest normalized-local-tx-upserts-referenced-current-user-test
+  (testing "an existing local-only current user is recreated on the server before created-by is referenced"
+    (let [{:keys [conn parent]} (setup-parent-child)
+          server-before-repair (d/conn-from-db @conn)
+          server-after-repair (d/conn-from-db @conn)
+          user-uuid #uuid "11111111-1111-4111-8111-111111111111"]
+      (d/transact! conn
+                   [{:block/uuid user-uuid
+                     :block/name "cfenglv"
+                     :block/title "cfenglv"
+                     :block/tags :logseq.class/Page
+                     :block/created-at 1784725856064
+                     :block/updated-at 1784725856064
+                     :logseq.property.user/name "cfenglv"
+                     :logseq.property.user/email "member@example.test"}]
+                   {:persist-op? false})
+      (let [user-id (:db/id (d/entity @conn [:block/uuid user-uuid]))
+            tx-report (d/with @conn
+                              [[:db/add (:db/id parent) :block/title "edited"]
+                               [:db/add (:db/id parent) :logseq.property/created-by-ref user-id]])]
+        (with-redefs [worker-state/get-id-token (constantly "token")
+                      worker-util/parse-jwt (constantly {:sub (str user-uuid)})]
+          (let [normalized (:normalized-tx-data
+                            (sync-apply/normalize-rebased-pending-tx tx-report))
+                user-uuid-op [:db/add (str user-uuid) :block/uuid user-uuid]
+                created-by-index (first (keep-indexed
+                                         (fn [idx [_op _e attr value]]
+                                           (when (and (= :logseq.property/created-by-ref attr)
+                                                      (= [:block/uuid user-uuid] value))
+                                             idx))
+                                         normalized))
+                user-index (first (keep-indexed
+                                   (fn [idx [op e attr value]]
+                                     (when (= user-uuid-op [op e attr value])
+                                       idx))
+                                   normalized))
+                tx-entry {:tx (sqlite-util/write-transit-str normalized)
+                          :outliner-op :save-block}
+                tx-without-user (remove (fn [[_op e]]
+                                          (= (str user-uuid) e))
+                                        normalized)]
+            (is (number? user-index))
+            (is (number? created-by-index))
+            (is (< user-index created-by-index)
+                "the server must receive the user upsert before its lookup ref")
+            (is (thrown? js/Error
+                         (#'sync-handler/apply-tx-entry!
+                          server-before-repair
+                          {:tx (sqlite-util/write-transit-str tx-without-user)
+                           :outliner-op :save-block})))
+            (is (true? (#'sync-handler/apply-tx-entry! server-after-repair tx-entry)))
+            (is (= "edited"
+                   (:block/title
+                    (d/entity @server-after-repair [:block/uuid (:block/uuid parent)]))))
+            (is (= "cfenglv"
+                   (:block/title
+                    (d/entity @server-after-repair [:block/uuid user-uuid]))))))))))
 
 (deftest local-checksum-listener-updates-in-release-mode-test
   (testing "db-worker-node release keeps the stored checksum aligned incrementally"

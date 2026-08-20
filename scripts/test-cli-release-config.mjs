@@ -16,6 +16,14 @@ const readJson = (relativePath) =>
 
 const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
+const desktopPackagingGulpfile = readText("gulpfile.js");
+const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const unsignedDesktopBuilder = readText("resources/electron-builder-unsigned.mjs");
+const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
+const adhocAfterSign = readText("resources/electron-builder-adhoc-after-sign.cjs");
+const verifyDesktopRuntimeRevisionsScript = readText(
+  "scripts/verify-desktop-runtime-revisions.mjs",
+);
 
 const zvecOptionalRuntimeDependencies = [
   "@zvec/bindings-darwin-arm64",
@@ -47,6 +55,50 @@ const assertRootScriptDoesNotBuildShadowCli = (scriptName, command) => {
     `${scriptName} should not build the old Shadow CLI`,
   );
 };
+
+assert.equal(
+  desktopPackage.scripts["electron:make-unsigned"],
+  "node ./electron-builder-unsigned.mjs",
+  "the standalone desktop artifact should run its bundled unsigned builder",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /resourceFilePath = path\.join\(resourcesPath, '\*\*'\)/,
+  "desktop resource sync should include the bundled signing scripts",
+);
+
+assert.match(
+  rootPackage.scripts["desktop:verify-runtime-revisions"],
+  /verify-desktop-runtime-revisions\.mjs/,
+  "package.json should expose desktop runtime revision verification",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop packaging should reject inconsistent runtime revisions",
+);
+assert.match(
+  desktopPackagingWorkflow,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop release CI should reject inconsistent runtime revisions",
+);
+for (const relativePath of [
+  "static/electron.js",
+  "static/db-worker-node.js",
+  "static/logseq-cli.js",
+  "dist/db-worker-node.js",
+  "static/js/db-worker-node.js",
+  "static/js/logseq-cli.js",
+  "static/js/main.js",
+  "static/js/db-worker.js",
+  "static/js/publishing/main.js",
+]) {
+  assert.match(
+    verifyDesktopRuntimeRevisionsScript,
+    new RegExp(relativePath.replaceAll("/", "[\\\\/]")),
+    `runtime revision verification should cover ${relativePath}`,
+  );
+}
 
 const assertCliReleaseCommand = (command, label) => {
   assert.match(command, /pnpm --dir cli bundle/, `${label} should bundle cli/`);
@@ -140,6 +192,76 @@ assertNotContains(
   desktopReleaseWorkflow,
   "clojure -M:cljs release logseq-cli",
   "desktop release workflow",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /name: Signing By Apple Developer ID\s+if: \$\{\{ github\.repository == 'logseq\/logseq' \}\}/,
+  "desktop release workflow Apple signing should not exclude forks",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /APPLE_CERTIFICATES_P12: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 \}\}/,
+  "desktop release workflow should make fork-owned Apple signing secrets available",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /if: \$\{\{ env\.APPLE_CERTIFICATES_P12 != '' \}\}/,
+  "desktop release workflow should import Apple certificates when a fork configures them",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /spctl --assess --type execute/,
+  "desktop release workflow should verify notarized apps with Gatekeeper",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /xcrun stapler validate/,
+  "desktop release workflow should verify stapled notarization tickets",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --x64/,
+  "fork desktop release workflow should build an unsigned macOS x64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Build\/Release Electron App for x64[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace[\s\S]*?pnpm rebuild:all/,
+  "macOS x64 dependencies should be installed outside the root workspace",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --arm64/,
+  "fork desktop release workflow should build an unsigned macOS arm64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Fetch deps[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace --config\.supportedArchitectures\.os=darwin --config\.supportedArchitectures\.cpu=arm64/,
+  "macOS arm64 dependencies should be installed outside the root workspace",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /ELECTRON_RUN_AS_NODE=1/,
+  "fork desktop release workflow should smoke-test the packaged Electron runtime",
+);
+assert.match(
+  unsignedDesktopBuilder,
+  /electron-builder\.unsigned\.yml/,
+  "unsigned desktop builds should use the ad-hoc signing configuration",
+);
+assert.match(
+  unsignedDesktopConfig,
+  /afterSign: \.\/electron-builder-adhoc-after-sign\.cjs/,
+  "unsigned macOS builds should re-sign the completed application bundle",
+);
+assert.match(
+  adhocAfterSign,
+  /"--sign",\s+"-"/,
+  "the fork afterSign hook should use an ad-hoc identity",
+);
+assert.match(
+  adhocAfterSign,
+  /entitlements\.local-signed\.plist/,
+  "the fork afterSign hook should disable library validation",
 );
 
 const shadowCljs = readText("shadow-cljs.edn");

@@ -13,7 +13,7 @@
     ".agents/skills/logseq-cli/SKILL.md"
   ],
   "engines": {
-    "node": ">=22.20.0"
+    "node": ">=22.21.0"
   },
   "devDependencies": {
     "@capacitor/assets": "^3.0.5",
@@ -62,7 +62,9 @@
     "dev-release-app": "run-s gulp:build cljs:dev-release-app webpack-app-build",
     "dev-electron-app": "gulp electron",
     "release-electron": "run-s gulp:build && gulp electronMaker",
+    "release-electron:local-signed": "run-s gulp:build && gulp electronMakerLocalSigned",
     "release-electron:unsigned": "run-s gulp:build && gulp electronMakerUnsigned",
+    "setup-macos-local-signing": "node ./scripts/setup-local-macos-codesign.mjs",
     "debug-electron": "cd static/ && pnpm electron:debug",
     "webpack-watch": "webpack --watch",
     "webpack-app-watch": "pnpm exec webpack --watch --config-name app",
@@ -106,6 +108,7 @@
     "db-worker-node:compile:bundle": "run-s db-worker-node:compile db-worker-node:bundle",
     "cli:release": "pnpm --dir cli bundle && node ./scripts/stage-cli-runtime.mjs",
     "desktop:prepare-runtime-js": "node ./scripts/prepare-desktop-runtime-js.mjs",
+    "desktop:verify-runtime-revisions": "node ./scripts/verify-desktop-runtime-revisions.mjs",
     "cli:e2e": "bb dev:cli-e2e",
     "cli:e2e:skip-build": "bb dev:cli-e2e --skip-build",
     "cljs:dev-release-app": "clojure -M:cljs release app db-worker db-worker-node --config-merge \"{:closure-defines {frontend.config/DEV-RELEASE true}}\"",

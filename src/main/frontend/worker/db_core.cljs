@@ -743,6 +743,14 @@
      (start-db! repo {:close-other-db? false})
      (db-sync/start! repo))))
 
+(def-thread-api :thread-api/db-sync-resume
+  [repo]
+  (if (db-sync-dbs-open? repo)
+    (db-sync/resume! repo)
+    (p/do!
+     (start-db! repo {:close-other-db? false})
+     (db-sync/start! repo))))
+
 (def-thread-api :thread-api/db-sync-stop
   []
   (db-sync/stop!))
@@ -1493,8 +1501,11 @@
   [new-state]
   (when (and (contains? new-state :git/current-repo)
              (nil? (:git/current-repo new-state)))
-    (log/error :thread-api/sync-app-state new-state))
-  (worker-state/set-new-state! new-state)
+    (log/warn :thread-api/sync-app-state-ignored-current-repo
+              {:reason :missing-current-repo}))
+  (worker-state/set-new-state! (cond-> new-state
+                                 (nil? (:git/current-repo new-state))
+                                 (dissoc :git/current-repo)))
   nil)
 
 (def-thread-api :thread-api/markdown-mirror-set-enabled
