@@ -1886,7 +1886,7 @@
  :updater/quit-and-install "Restart and install"
  :updater/up-to-date "Your app is up-to-date 🎉"
  :updater/update-available "Update available"
- :updater/update-error "⚠️ Oops, Something Went Wrong!\nPlease check out the {1}."
+ :updater/update-error "⚠️ Automatic update couldn't finish.\nDownload the latest version from the {1} and install it manually."
  :updater/update-ready-to-install "Update ready to install"
 
  :view/add-new-view "Add new view"

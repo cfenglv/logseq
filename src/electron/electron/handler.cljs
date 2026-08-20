@@ -5,7 +5,6 @@
             ["abort-controller" :as AbortController]
             ["buffer" :as buffer]
             ["electron" :refer [app dialog ipcMain shell]]
-            ["electron-updater" :refer [autoUpdater]]
             ["electron-window-state" :as windowStateKeeper]
             ["fs" :as fs]
             ["fs-extra" :as fs-extra]
@@ -28,6 +27,7 @@
             [electron.server :as server]
             [electron.shell :as shell]
             [electron.state :as state]
+            [electron.updater :as updater]
             [electron.utils :as utils]
             [electron.window :as win]
             [electron.graph-switch-flow :as graph-switch-flow]
@@ -281,11 +281,33 @@
 (defmethod handle :getLogseqDotDirRoot []
   (utils/get-ls-dotdir-root))
 
-(defmethod handle :setProxy [_win [_ options]]
+(defmethod handle :setProxy [_window [_ options]]
   ;; options: {:type "system" | "direct" | "socks5" | "http" | ... }
-  (p/do!
-   (utils/<set-proxy options)
-   (utils/save-proxy-settings options)))
+  (let [saved (cfgs/get-item :settings/agent)
+        previous (cond
+                   (:type saved) saved
+                   (:protocol saved) (assoc saved :type (:protocol saved))
+                   :else {:type "system"})]
+    (-> (p/do!
+         ;; A db-worker's proxy environment is fixed at process birth. Stop
+         ;; every runtime before changing the process-wide proxy contract.
+         (db-worker/stop-all-managed!)
+         (utils/<set-proxy options)
+         (utils/save-proxy-settings options)
+         (doseq [^js window (win/get-all-windows)]
+           (when-not (.isDestroyed window)
+             (.reload window))))
+        (p/catch
+         (fn [error]
+           (-> (utils/<set-proxy previous)
+               (p/catch
+                (fn [rollback-error]
+                  (p/rejected
+                   (ex-info "proxy update and rollback failed"
+                            {:code :proxy-rollback-failed
+                             :update-error error
+                             :rollback-error rollback-error}))))
+               (p/then (fn [] (p/rejected error)))))))))
 
 (defmethod handle :testProxyUrl [_win [_ url options]]
   (let [start-ms (.getTime (js/Date.))]
@@ -496,8 +518,7 @@
 
 (defmethod handle :quitAndInstall []
   (logger/info ::quick-and-install)
-  ;; https://www.electron.build/electron-updater.class.appupdater#quitandinstall
-  (.quitAndInstall autoUpdater false true))
+  (updater/install-downloaded-update!))
 
 ;; The graphHas* events are not used but maybe useful later?
 (defmethod handle :graphHasOtherWindow [^js win [_ graph]]

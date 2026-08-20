@@ -10,6 +10,12 @@
             [promesa.core :as p]
             [io.factorhouse.hsx.core :as hsx]))
 
+(defn- current-password
+  [*password-input password]
+  (or (some-> (hooks/deref *password-input) .-value)
+      password
+      ""))
+
 (hsx/defc e2ee-request-new-password
   [password-promise]
   (let [[password set-password!] (hooks/use-state "")
@@ -59,16 +65,20 @@
 
 (hsx/defc e2ee-request-password
   [password-promise]
-  (let [[password set-password!] (hooks/use-state "")
+  (let [*password-input (hooks/use-ref nil)
+        [password set-password!] (hooks/use-state "")
         on-submit (fn []
-                    (p/resolve! password-promise password)
-                    (shui/dialog-close!))]
+                    (let [entered-password (current-password *password-input password)]
+                      (when-not (string/blank? entered-password)
+                        (p/resolve! password-promise entered-password)
+                        (shui/dialog-close!))))]
     [:div.e2ee-password-modal-overlay
      [:div.e2ee-password-modal-content.flex.flex-col.gap-8.p-4
       [:div.text-2xl.font-medium (t :encryption/enter-password-title)]
       [:div.flex.flex-col.gap-4
        (shui/toggle-password
-        {:value password
+        {:ref *password-input
+         :value password
          :on-key-press (fn [e]
                          (when (= "Enter" (util/ekey e))
                            (on-submit)))
@@ -76,7 +86,6 @@
                       (set-password! (-> e .-target .-value)))})
        (shui/button
         {:on-click on-submit
-         :disabled (string/blank? password)
          :on-key-press (fn [e]
                          (when (= "Enter" (util/ekey e))
                            (on-submit)))}
@@ -84,24 +93,28 @@
 
 (hsx/defc e2ee-password-to-decrypt-private-key
   [encrypted-private-key private-key-promise]
-  (let [[password set-password!] (hooks/use-state "")
+  (let [*password-input (hooks/use-ref nil)
+        [password set-password!] (hooks/use-state "")
         [decrypt-fail? set-decrypt-fail!] (hooks/use-state false)
         on-submit (fn []
-                    (->
-                     (p/let [private-key (crypt/<decrypt-private-key password encrypted-private-key)]
-                       (state/<invoke-db-worker :thread-api/save-e2ee-password password)
-                       (p/resolve! private-key-promise private-key)
-                       (shui/dialog-close!))
-                     (p/catch (fn [e]
-                                (when (= "decrypt-private-key" (ex-message e))
-                                  (set-decrypt-fail! true))))))]
+                    (let [entered-password (current-password *password-input password)]
+                      (when-not (string/blank? entered-password)
+                        (->
+                         (p/let [private-key (crypt/<decrypt-private-key entered-password encrypted-private-key)]
+                           (state/<invoke-db-worker :thread-api/save-e2ee-password entered-password)
+                           (p/resolve! private-key-promise private-key)
+                           (shui/dialog-close!))
+                         (p/catch (fn [e]
+                                    (when (= "decrypt-private-key" (ex-message e))
+                                      (set-decrypt-fail! true))))))))]
     [:div.e2ee-password-modal-overlay
      [:div.e2ee-password-modal-content.flex.flex-col.gap-8.p-4
       [:div.text-2xl.font-medium (t :encryption/enter-password-title)]
       [:div.flex.flex-col.gap-4
        [:div.flex.flex-col.gap-1
         (shui/toggle-password
-         {:value password
+         {:ref *password-input
+          :value password
           :on-key-press (fn [e]
                           (when (= "Enter" (util/ekey e))
                             (on-submit)))
@@ -111,7 +124,6 @@
         (when decrypt-fail? [:p.text-warning.text-sm (t :encryption/wrong-password)])]
        (shui/button
         {:on-click on-submit
-         :disabled (string/blank? password)
          :on-key-press (fn [e]
                          (when (= "Enter" (util/ekey e))
                            (on-submit)))}

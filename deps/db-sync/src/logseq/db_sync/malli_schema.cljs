@@ -5,6 +5,11 @@
 (def tx-entry-schema
   [:map
    [:tx-id {:optional true} :uuid]
+   [:logical-tx-id {:optional true} :uuid]
+   [:upload-session-id {:optional true} :string]
+   [:chunk-index {:optional true} :int]
+   [:chunk-final? {:optional true} :boolean]
+   [:payload-digest {:optional true} :string]
    [:tx :string]
    [:outliner-op {:optional true} [:maybe :keyword]]])
 
@@ -53,12 +58,16 @@
   [:map
    [:type [:= "tx/reject"]]
    [:reason tx-reject-reason-schema]
+   [:capabilities {:optional true} [:sequential :string]]
    [:t {:optional true} :int]
    [:success-tx-ids {:optional true} [:sequential :uuid]]
    [:failed-tx-id {:optional true} :uuid]
    [:missing-block-uuids {:optional true} [:sequential :uuid]]
    [:error-detail {:optional true} :string]
-   [:data {:optional true} :string]])
+   [:data {:optional true} :string]
+   [:checksum {:optional true} :string]
+   [:checksum-version {:optional true} :string]
+   [:server-checksum {:optional true} :string]])
 
 (def user-presence-schema
   [:map
@@ -76,14 +85,20 @@
   [:map
    [:type [:= "pull/ok"]]
    [:t :int]
+   [:capabilities {:optional true} [:sequential :string]]
    [:checksum {:optional true} :string]
+   [:checksum-version {:optional true} :string]
+   [:server-checksum {:optional true} :string]
    [:txs [:sequential tx-log-entry-schema]]])
 
 (def tx-batch-ok-schema
   [:map
    [:type [:= "tx/batch/ok"]]
    [:t :int]
-   [:checksum {:optional true} :string]])
+   [:capabilities {:optional true} [:sequential :string]]
+   [:checksum {:optional true} :string]
+   [:checksum-version {:optional true} :string]
+   [:server-checksum {:optional true} :string]])
 
 (def ws-server-message-schema
   [:multi {:dispatch :type}
@@ -91,7 +106,10 @@
     [:map
      [:type [:= "hello"]]
      [:t :int]
-     [:checksum {:optional true} :string]]]
+     [:capabilities {:optional true} [:sequential :string]]
+     [:checksum {:optional true} :string]
+     [:checksum-version {:optional true} :string]
+     [:server-checksum {:optional true} :string]]]
    ["online-users" online-users-schema]
    ["presence"
     [:map
@@ -131,6 +149,7 @@
    [:schema-version {:optional true} [:maybe :string]]
    [:graph-e2ee? {:optional true} :boolean]
    [:graph-ready-for-use? {:optional true} :boolean]
+   [:owned? {:optional true} :boolean]
    [:role {:optional true} [:maybe graph-member-role-schema]]
    [:invited-by {:optional true} [:maybe :string]]
    [:created-at :int]
@@ -236,12 +255,36 @@
    [:ok :boolean]
    [:key :string]
    [:url :string]
+   [:t {:optional true} :int]
+   [:row-count {:optional true} :int]
+   [:checksum {:optional true} [:maybe :string]]
    [:content-encoding {:optional true} [:maybe :string]]])
 
 (def snapshot-upload-response-schema
   [:map
    [:ok :boolean]
    [:count :int]])
+
+(def large-title-marker-schema
+  [:map
+   [:asset-uuid :string]
+   [:asset-type :string]
+   [:payload-format :string]
+   [:payload-digest-alg :string]
+   [:payload-digest :string]])
+
+(def large-title-marker-state-entry-schema
+  [:map
+   [:block-uuid :string]
+   [:marker large-title-marker-schema]])
+
+(def large-title-marker-state-response-schema
+  [:map
+   [:t :int]
+   [:checksum :string]
+   [:checksum-version [:= "server-db-v2"]]
+   [:server-checksum :string]
+   [:large-title-markers [:sequential large-title-marker-state-entry-schema]]])
 
 (def asset-get-response-schema
   [:or
@@ -270,6 +313,7 @@
    :sync/health http-ok-response-schema
    :sync/pull pull-ok-schema
    :sync/tx-batch [:or tx-batch-ok-schema tx-reject-schema http-error-response-schema]
+   :sync/large-title-markers large-title-marker-state-response-schema
    :sync/snapshot-download snapshot-download-response-schema
    :sync/snapshot-upload snapshot-upload-response-schema
    :sync/admin-reset http-ok-response-schema

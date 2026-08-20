@@ -20,13 +20,16 @@
       (finally
         (reset! worker-state/*state state-prev)))))
 
-(deftest online?-node-runtime-does-not-require-main-thread-online-event
+(deftest online?-node-runtime-uses-main-thread-online-event-when-available
   (let [state-prev @worker-state/*state]
     (try
       (with-redefs [platform/current (fn []
                                        {:env {:runtime :node}})]
+        (reset! worker-state/*state (with-online-event false))
+        (testing "desktop worker follows the renderer's network event"
+          (is (false? (worker-state/online?))))
         (reset! worker-state/*state (with-online-event nil))
-        (testing "node runtime should provide its own online detection"
+        (testing "node runtime stays online when no network signal exists"
           (is (true? (worker-state/online?)))))
       (finally
         (reset! worker-state/*state state-prev)))))

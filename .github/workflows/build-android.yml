@@ -29,6 +29,10 @@ on:
       build-target:
         type: string
         required: true
+      source-sha:
+        description: 'Frozen release source commit from the caller'
+        type: string
+        required: true
       enable-file-sync-production:
         description: 'File sync production mode'
         type: boolean
@@ -52,7 +56,7 @@ jobs:
       - name: Check out Git repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.git-ref }}
+          ref: ${{ inputs.source-sha || github.event.inputs.git-ref }}
 
       - name: Install Node.js
         uses: actions/setup-node@v4

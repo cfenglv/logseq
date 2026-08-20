@@ -1,0 +1,171 @@
+name: Deploy Selfhost DB Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected-sha:
+        description: Exact commit SHA approved for production deployment
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: selfhost-db-sync-production
+  cancel-in-progress: false
+
+env:
+  CLOJURE_VERSION: "1.12.4.1618"
+  JAVA_VERSION: "21"
+  NODE_VERSION: "24"
+  PNPM_VERSION: "10.33.0"
+
+jobs:
+  verify:
+    name: Verify production candidate
+    if: ${{ github.repository == 'cfenglv/logseq' }}
+    runs-on: ubuntu-latest
+    outputs:
+      source-sha: ${{ steps.source.outputs.sha }}
+
+    steps:
+      - name: Require a selfhost release branch
+        env:
+          EXPECTED_SHA: ${{ inputs.expected-sha }}
+          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_REF_NAME: ${{ github.ref_name }}
+          SOURCE_REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ "$SOURCE_REF_TYPE" != "branch" || "$SOURCE_REF_NAME" != "release/2.0.1-selfhost.5" ]]; then
+            echo "::error title=Invalid source::This production deploy must run from release/2.0.1-selfhost.5."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ || "$EXPECTED_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error title=Unapproved source::expected-sha must exactly match the workflow source SHA."
+            exit 1
+          fi
+          echo "Deploy source: $SOURCE_REF at $SOURCE_SHA"
+
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Record immutable source
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: deps/db-sync/pnpm-lock.yaml
+
+      - name: Set up Java
+        uses: actions/setup-java@d7793b545071e98d581d3bf084a51c3213318a07 # v4
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Clojure
+        uses: DeLaGuardo/setup-clojure@f556541eb28a9303896cee0679ba9f60b898300f # 13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Install db-sync dependencies
+        run: pnpm --dir deps/db-sync install --frozen-lockfile
+
+      - name: Run db-sync server tests
+        run: pnpm --dir deps/db-sync test
+
+      - name: Run 128 MB transaction memory gate
+        run: pnpm --dir deps/db-sync test:large-op-128m
+
+      - name: Clean generated Worker bundle
+        run: pnpm --dir deps/db-sync clean
+
+      - name: Build production Worker
+        run: pnpm --dir deps/db-sync release
+
+      - name: Build db-sync API documentation asset
+        run: pnpm --dir deps/db-sync build:api-docs
+
+      - name: Validate production Worker bundle
+        working-directory: deps/db-sync/worker
+        run: pnpm exec wrangler deploy --dry-run --env prod
+
+      - name: Archive verified Worker bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: selfhost-db-sync-${{ github.sha }}
+          path: deps/db-sync/worker/dist
+          if-no-files-found: error
+          retention-days: 3
+
+  deploy:
+    name: Deploy verified Worker
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: selfhost-production
+
+    steps:
+      - name: Checkout verified source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.verify.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: deps/db-sync/pnpm-lock.yaml
+
+      - name: Install db-sync dependencies
+        run: pnpm --dir deps/db-sync install --frozen-lockfile
+
+      - name: Download verified Worker bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: selfhost-db-sync-${{ needs.verify.outputs.source-sha }}
+          path: deps/db-sync/worker/dist
+
+      - name: Require scoped Cloudflare credentials
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [[ -z "$CLOUDFLARE_ACCOUNT_ID" || -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            echo "::error title=Missing Cloudflare credentials::Configure CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in the selfhost-production environment."
+            exit 1
+          fi
+
+      - name: Deploy production Worker
+        working-directory: deps/db-sync/worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: pnpm exec wrangler deploy --env prod
+
+      - name: Verify deployed Worker version is visible
+        working-directory: deps/db-sync/worker
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: pnpm exec wrangler versions list --env prod

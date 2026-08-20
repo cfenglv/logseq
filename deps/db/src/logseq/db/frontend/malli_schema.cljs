@@ -136,8 +136,28 @@
   what the frontend property since they both call validate-property-value"
   [property]
   ;; use explicit call to be nbb compatible
-  (let [closed-values (entity-plus/lookup-kv-then-entity property :property/closed-values)]
-    (cond-> (select-keys property [:db/ident :db/valueType :db/cardinality :logseq.property/type])
+  (let [ident (:db/ident property)
+        stored-property (select-keys property [:db/ident :db/valueType :db/cardinality
+                                               :logseq.property/type])
+        ;; Some legacy remote graphs contain only the ident for built-in
+        ;; properties. Use the shipped definition only when the stored type is
+        ;; absent; explicit stored schema remains authoritative and is validated.
+        built-in-schema (when (nil? (:logseq.property/type stored-property))
+                          (when-let [property-type
+                                     (get-in db-property/built-in-properties [ident :schema :type])]
+                            (cond-> {:db/ident ident
+                                     :db/cardinality
+                                     (if (= :many
+                                            (get-in db-property/built-in-properties
+                                                    [ident :schema :cardinality]))
+                                       :db.cardinality/many
+                                       :db.cardinality/one)
+                                     :logseq.property/type property-type}
+                              (contains? db-property-type/all-ref-property-types property-type)
+                              (assoc :db/valueType :db.type/ref))))
+        validation-property (merge built-in-schema stored-property)
+        closed-values (entity-plus/lookup-kv-then-entity property :property/closed-values)]
+    (cond-> validation-property
       (seq closed-values)
       (assoc :property/closed-values closed-values))))
 

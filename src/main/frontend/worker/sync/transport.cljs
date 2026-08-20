@@ -7,6 +7,8 @@
    [logseq.db.sqlite.util :as sqlite-util]))
 
 (def invalid-coerce ::invalid-coerce)
+(def max-ws-message-bytes (* 16 1024 1024))
+(def ^:private text-encoder (js/TextEncoder.))
 
 (defn format-ws-url
   [base graph-id]
@@ -40,7 +42,10 @@
   (try
     (coercer value)
     (catch :default e
-      (log/error :db-sync/malli-coerce-failed (merge context {:error e :value value}))
+      (log/error :db-sync/malli-coerce-failed
+                 (merge context
+                        {:error-name (or (.-name e) "Error")
+                         :message-type (when (map? value) (:type value))}))
       invalid-coerce)))
 
 (defn coerce-ws-client-message
@@ -95,6 +100,15 @@
     (catch :default _
       nil)))
 
+(defn encoded-message-byte-length
+  [message]
+  (.-byteLength ^js (.encode text-encoder
+                             (js/JSON.stringify (clj->js message)))))
+
+(defn encoded-string-byte-length
+  [raw]
+  (.-byteLength ^js (.encode text-encoder raw)))
+
 (defn send!
   [coerce-ws-client-message-f ws message]
   (when (ws-open? ws)
@@ -103,10 +117,22 @@
                        (update coerced :txs
                                (fn [txs]
                                  (mapv (fn [tx-entry]
-                                         (if-let [tx-id (:tx-id tx-entry)]
-                                           (assoc tx-entry :tx-id (str tx-id))
-                                           tx-entry))
+                                         (cond-> tx-entry
+                                           (:tx-id tx-entry)
+                                           (update :tx-id str)
+
+                                           (:logical-tx-id tx-entry)
+                                           (update :logical-tx-id str)))
                                        txs)))
-                       coerced)]
-        (.send ws (js/JSON.stringify (clj->js message*))))
-      (log/error :db-sync/ws-request-invalid {:message message}))))
+                       coerced)
+            raw (js/JSON.stringify (clj->js message*))
+            encoded-bytes (encoded-string-byte-length raw)]
+        (when (> encoded-bytes max-ws-message-bytes)
+          (throw (ex-info "websocket message exceeds safe byte limit"
+                          {:type :db-sync/ws-message-too-large
+                           :encoded-bytes encoded-bytes
+                           :max-bytes max-ws-message-bytes
+                           :message-type (:type message*)})))
+        (.send ws raw))
+      (log/error :db-sync/ws-request-invalid
+                 {:message-type (when (map? message) (:type message))}))))

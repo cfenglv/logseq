@@ -74,21 +74,26 @@
     (keep #(d/entity db %) ids)))
 
 (defn- page-descendants
-  [page]
+  [db page]
   (loop [pages [page]
+         seen-ids #{}
          result []]
     (if-let [page' (first pages)]
-      (let [children (->> (:block/_parent page')
-                          (filter ldb/page?)
-                          ldb/sort-by-order)]
-        (recur (concat (rest pages) children)
-               (conj result page')))
+      (if (or (nil? (:db/id page'))
+              (contains? seen-ids (:db/id page')))
+        (recur (rest pages) seen-ids result)
+        (let [children (->> (ldb/get-block-direct-full-children db page')
+                            (filter ldb/page?))]
+          (recur (concat (rest pages) children)
+                 (conj seen-ids (:db/id page'))
+                 (conj result page'))))
       result)))
 
 (defn- page-block-subtree-ids
   [db page]
   (let [root-blocks (->> (concat (:block/_page page)
-                                 (remove ldb/page? (:block/_parent page)))
+                                 (remove ldb/page?
+                                         (ldb/get-block-direct-full-children db page)))
                          (common-util/distinct-by :db/id)
                          ldb/sort-by-order)]
     (->> root-blocks
@@ -97,7 +102,7 @@
 
 (defn- page-tree-ids
   [db page]
-  (->> (page-descendants page)
+  (->> (page-descendants db page)
        (mapcat (fn [page']
                  (cons (:db/id page')
                        (page-block-subtree-ids db page'))))

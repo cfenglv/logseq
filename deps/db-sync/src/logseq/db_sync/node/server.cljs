@@ -4,6 +4,7 @@
             ["ws" :as ws]
             [clojure.string :as string]
             [lambdaisland.glogi :as log]
+            [logseq.db-sync.common :as common]
             [logseq.db-sync.index :as index]
             [logseq.db-sync.logging :as logging]
             [logseq.db-sync.node.assets :as assets]
@@ -50,14 +51,15 @@
        :host (.-host url)})
     {:scheme "http"}))
 
-(defn- access-allowed?
+(defn- <access-context
   [env graph-id request]
   (p/let [claims (auth/auth-claims request env)
           user-id (when claims (aget claims "sub"))
           db (aget env "DB")]
-    (if (string? user-id)
-      (index/<user-has-access-to-graph? db graph-id user-id)
-      false)))
+    {:claims claims
+     :allowed? (if (string? user-id)
+                 (index/<user-has-access-to-graph? db graph-id user-id)
+                 false)}))
 
 (defn- attach-ws! [^js ctx ^js socket]
   (let [state (.-state ctx)]
@@ -81,20 +83,28 @@
   (.destroy socket))
 
 (defn- handle-ws-connection
-  [ctx env request ^js socket]
-  (p/let [claims (auth/auth-claims request env)
-          user (presence/claims->user claims)]
+  [^js ctx graph-id claims ^js socket]
+  (let [user (presence/claims->user claims)]
     (when user
-      (presence/add-presence! ctx socket user))
+      (presence/add-presence! ctx socket user graph-id))
     (presence/broadcast-online-users! ctx))
   (.on socket "message"
        (fn [data]
-         (let [text (if (string? data) data (.toString data))]
-           (try
-             (ws-handler/handle-ws-message! ctx socket text)
-             (catch :default e
-               (log/error :db-sync/ws-error e)
-               (.send socket (js/JSON.stringify #js {:type "error" :message "server error"})))))))
+         (if (true? (.-deleting ctx))
+           (when (= 1 (.-readyState socket))
+             (.close socket 1001 "graph deleted"))
+           (let [text (if (string? data) data (.toString data))]
+             (->
+              (try
+                (p/resolved (ws-handler/handle-ws-message! ctx socket text))
+                (catch :default e
+                  (p/rejected e)))
+              (p/catch
+               (fn [e]
+                 (log/error :db-sync/ws-error (common/error-log-data e))
+                 (when (= 1 (.-readyState socket))
+                   (.send socket (js/JSON.stringify #js {:type "error" :message "server error"})))
+                 (.close socket 1011 "server error"))))))))
   (.on socket "close"
        (fn []
          (presence/remove-presence! ctx socket)
@@ -105,7 +115,7 @@
          (presence/remove-presence! ctx socket)
          (presence/broadcast-online-users! ctx)
          (detach-ws! ctx socket)
-         (log/error :db-sync/ws-error error))))
+         (log/error :db-sync/ws-error (common/error-log-data error)))))
 
 (defn start!
   [overrides]
@@ -120,7 +130,11 @@
         env (doto (make-env cfg index-db assets-bucket)
               (aset "DB_SYNC_DELETE_GRAPH"
                     (fn [graph-id]
-                      (graph/delete-graph! registry deps graph-id))))
+                      (graph/delete-graph! registry deps graph-id)))
+              (aset "DB_SYNC_REVOKE_GRAPH_USER"
+                    (fn [graph-id user-id]
+                      (when-let [ctx (get @registry graph-id)]
+                        (presence/revoke-user! ctx user-id)))))
         server (.createServer http
                               (fn [req res]
                                 (-> (p/let [request (platform-node/request-from-node req request-origin)
@@ -131,13 +145,17 @@
                                       (platform-node/send-response! res response))
                                     (p/catch
                                      (fn [e]
-                                       (log/error :db-sync/node-request-failed {:error e})
-                                       (js/console.error ":db-sync/node-request-failed" e)
+                                       (log/error :db-sync/node-request-failed
+                                                  (common/error-log-data e))
                                        (platform-node/send-response! res (worker-http/error-response "server error" 500)))))))
         WSS (or (.-WebSocketServer ws) (.-Server ws))
         ^js wss (new WSS #js {:noServer true})]
-    (.on server "error" (fn [error] (log/error :db-sync/node-server-error {:error error})))
-    (.on wss "error" (fn [error] (log/error :db-sync/node-ws-error {:error error})))
+    (.on server "error" (fn [error]
+                           (log/error :db-sync/node-server-error
+                                      (common/error-log-data error))))
+    (.on wss "error" (fn [error]
+                        (log/error :db-sync/node-ws-error
+                                   (common/error-log-data error))))
     (p/let [_ (index/<index-init! index-db)]
       (.on server "upgrade"
            (fn [req ^js socket head]
@@ -147,22 +165,50 @@
                    parsed (node-routes/parse-sync-path path)
                    graph-id (:graph-id parsed)]
                (if (and graph-id (seq graph-id))
-                 (p/let [allowed? (access-allowed? env graph-id request)]
-                   (if allowed?
-                     (let [ctx (graph/get-or-create-graph registry deps graph-id)]
-                       (p/let [ready-for-sync? (sync-handler/<ready-for-sync? ctx graph-id)]
-                         (if ready-for-sync?
-                           (.handleUpgrade wss req socket head
-                                           (fn [ws-socket]
-                                             (attach-ws! ctx ws-socket)
-                                             (handle-ws-connection ctx env request ws-socket)))
-                           (reject-ws-upgrade! socket 409 "graph not ready"))))
-                     (.destroy socket)))
+                 (->
+                  (p/let [{:keys [allowed? claims]}
+                          (<access-context env graph-id request)]
+                    (if allowed?
+                      (let [ctx (graph/get-or-create-graph registry deps graph-id)]
+                        (aset ctx "graph-id" graph-id)
+                        (p/let [ready-for-sync? (sync-handler/<ready-for-sync? ctx graph-id)]
+                          (if ready-for-sync?
+                            (.handleUpgrade wss req socket head
+                                            (fn [ws-socket]
+                                              (attach-ws! ctx ws-socket)
+                                              (handle-ws-connection
+                                               ctx graph-id claims ws-socket)))
+                            (reject-ws-upgrade! socket 409 "graph not ready"))))
+                      (.destroy socket)))
+                  (p/catch
+                   (fn [error]
+                     (log/error :db-sync/node-upgrade-failed
+                                (common/error-log-data error))
+                     (when-not (.-destroyed socket)
+                       (.destroy socket)))))
                  (.destroy socket)))))
       (p/let [_ (js/Promise.
-                 (fn [resolve]
-                   (.listen server (:port cfg)
-                            (fn [] (resolve nil)))))
+                 (fn [resolve reject]
+                   (letfn [(on-listen-error [error]
+                             (.removeListener server "error"
+                                              on-listen-error)
+                             ;; start! does not return a stop handle when
+                             ;; listen fails, so release storage opened before
+                             ;; binding the port here.
+                             (try
+                               (graph/close-graphs! registry)
+                               (catch :default _ nil))
+                             (try
+                               (when-let [close (.-close index-db)]
+                                 (close))
+                               (catch :default _ nil))
+                             (reject error))]
+                     (.once server "error" on-listen-error)
+                     (.listen server (:port cfg)
+                              (fn []
+                                (.removeListener server "error"
+                                                 on-listen-error)
+                                (resolve nil))))))
               address (.address server)
               port (if (number? address) address (.-port address))
               base-url (or (:base-url cfg) (str "http://localhost:" port))]
@@ -173,9 +219,32 @@
          :port port
          :base-url base-url
          :stop! (fn []
-                  (graph/close-graphs! registry)
-                  (when-let [close (.-close index-db)]
-                    (close))
-                  (js/Promise.
-                   (fn [resolve]
-                     (.close server (fn [] (resolve nil))))))}))))
+                  ;; Stop accepting upgrades and terminate upgraded sockets
+                  ;; before closing graph/index storage used by their handlers.
+                  (.removeAllListeners server "upgrade")
+                  (doseq [^js client (js/Array.from (.-clients wss))]
+                    (try
+                      (.terminate client)
+                      (catch :default _ nil)))
+                  ;; A noServer WebSocketServer can report "not running" from
+                  ;; close() without invoking its callback. It owns no listener,
+                  ;; so terminate its clients and let the HTTP server closure be
+                  ;; the lifecycle barrier.
+                  (try
+                    (.close wss)
+                    (catch :default _ nil))
+                  (when-let [close-all-connections
+                             (.-closeAllConnections server)]
+                    (.call close-all-connections server))
+                  (-> (if (.-listening server)
+                        (p/create
+                         (fn [resolve _reject]
+                           (try
+                             (.close server (fn [& _] (resolve nil)))
+                             (catch :default _ (resolve nil)))))
+                        (p/resolved nil))
+                      (p/finally
+                       (fn []
+                         (graph/close-graphs! registry)
+                         (when-let [close (.-close index-db)]
+                           (close))))))}))))

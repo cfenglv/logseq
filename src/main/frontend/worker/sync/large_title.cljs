@@ -3,11 +3,14 @@
   (:require [datascript.core :as d]
             [logseq.db :as ldb]
             [promesa.core :as p]
-            [frontend.worker.sync.util :refer [get-graph-id]]))
+            [frontend.worker.sync.util :as sync-util :refer [get-graph-id]]))
 
 (def large-title-byte-limit 4096)
 (def large-title-asset-type "txt")
 (def large-title-object-attr :logseq.property.sync/large-title-object)
+(def large-title-payload-digest-alg "sha256-v1")
+(def large-title-plain-payload-format "utf8-plain-v1")
+(def large-title-encrypted-payload-format "aes-gcm-transit-v1")
 (def text-encoder (js/TextEncoder.))
 (def text-decoder (js/TextDecoder.))
 
@@ -33,15 +36,41 @@
     (into [op e a new-value] others)))
 
 (defn large-title-object
-  [asset-uuid asset-type]
-  {:asset-uuid asset-uuid
-   :asset-type asset-type})
+  ([asset-uuid asset-type]
+   {:asset-uuid asset-uuid
+    :asset-type asset-type})
+  ([asset-uuid asset-type payload-format payload-digest]
+   {:asset-uuid asset-uuid
+    :asset-type asset-type
+    :payload-format payload-format
+    :payload-digest-alg large-title-payload-digest-alg
+    :payload-digest payload-digest}))
 
 (defn large-title-object?
   [value]
   (and (map? value)
        (string? (:asset-uuid value))
        (string? (:asset-type value))))
+
+(defn large-title-object-v2?
+  [value]
+  (and (large-title-object? value)
+       (contains? #{large-title-plain-payload-format
+                    large-title-encrypted-payload-format}
+                  (:payload-format value))
+       (= large-title-payload-digest-alg
+          (:payload-digest-alg value))
+       (string? (:payload-digest value))
+       (boolean
+        (re-matches #"[0-9a-f]{64}" (:payload-digest value)))))
+
+(defn <sha256-hex
+  [^js payload-bytes]
+  (p/let [digest (.digest (.-subtle js/crypto) "SHA-256" payload-bytes)]
+    (->> (array-seq (js/Uint8Array. digest))
+         (map (fn [byte-value]
+                (.padStart (.toString byte-value 16) 2 "0")))
+         (apply str))))
 
 (defn- large-title-object-datoms
   [db]
@@ -84,18 +113,26 @@
   (let [asset-uuid (str (random-uuid))
         asset-type large-title-asset-type
         url (asset-url http-base graph-id asset-uuid asset-type)]
-    (p/let [payload (if aes-key
-                      (p/let [payload-str (encrypt-text-value-f aes-key title)]
+    (p/let [payload-format (if aes-key
+                            large-title-encrypted-payload-format
+                            large-title-plain-payload-format)
+            payload (if aes-key
+                      (p/let [payload-str
+                              (encrypt-text-value-f aes-key title)]
                         (.encode text-encoder payload-str))
-                      (p/resolved title))
+                      (p/resolved (.encode text-encoder title)))
+            payload-digest (<sha256-hex payload)
             headers (merge {"content-type" "text/plain; charset=utf-8"
                             "x-amz-meta-type" asset-type}
                            auth-headers)
-            resp (js/fetch url #js {:method "PUT"
-                                    :headers (clj->js headers)
-                                    :body payload})]
+            resp (sync-util/fetch url {:method "PUT"
+                                       :headers headers
+                                       :body payload
+                                       :operation :large-title-upload
+                                       :timeout-ms 120000})]
       (if (.-ok resp)
-        (large-title-object asset-uuid asset-type)
+        (large-title-object
+         asset-uuid asset-type payload-format payload-digest)
         (fail-fast-f :db-sync/large-title-upload-failed
                      {:repo repo :status (.-status resp)})))))
 
@@ -107,23 +144,48 @@
            http-base
            auth-headers
            fail-fast-f
-           decrypt-text-value-f]}]
+           decrypt-text-value-f
+           strict-decrypt-text-value-f]}]
   (when-not (seq http-base)
     (fail-fast-f :db-sync/missing-field {:repo repo :field :http-base}))
   (when-not (seq graph-id)
     (fail-fast-f :db-sync/missing-field {:repo repo :field :graph-id}))
   (let [url (asset-url http-base graph-id (:asset-uuid obj) (:asset-type obj))]
-    (p/let [resp (js/fetch url #js {:method "GET"
-                                    :headers (clj->js auth-headers)})]
+    (p/let [resp (sync-util/fetch url {:method "GET"
+                                       :headers auth-headers
+                                       :operation :large-title-download
+                                       :timeout-ms 120000})]
       (when-not (.-ok resp)
         (fail-fast-f :db-sync/large-title-download-failed
                      {:repo repo :status (.-status resp)}))
-      (p/let [buf (.arrayBuffer resp)
+      (p/let [buf (sync-util/with-timeout
+                    (.arrayBuffer resp)
+                    120000
+                    {:type :db-sync/http-timeout
+                     :code :http-body-timeout
+                     :operation :large-title-download
+                     :stage :response-body})
               payload (js/Uint8Array. buf)
+              actual-digest (<sha256-hex payload)
+              _ (when (and (large-title-object-v2? obj)
+                           (not= (:payload-digest obj) actual-digest))
+                  (fail-fast-f
+                   :db-sync/large-title-integrity-failed
+                   {:type :db-sync/large-title-integrity-failed
+                    :repo repo
+                    :asset-uuid (:asset-uuid obj)
+                    :expected-digest (:payload-digest obj)
+                    :actual-digest actual-digest}))
               payload-str (.decode text-decoder payload)
               data (if aes-key
-                     (-> (decrypt-text-value-f aes-key payload-str)
-                         (p/catch (fn [_] payload-str)))
+                     (if (= large-title-encrypted-payload-format
+                            (:payload-format obj))
+                       (strict-decrypt-text-value-f aes-key payload-str)
+                       ;; Historical payloads did not declare a format. Keep
+                       ;; their compatibility behavior, but never apply it to
+                       ;; a new authenticated marker.
+                       (-> (decrypt-text-value-f aes-key payload-str)
+                           (p/catch (fn [_] payload-str))))
                      (p/resolved payload-str))]
         data))))
 

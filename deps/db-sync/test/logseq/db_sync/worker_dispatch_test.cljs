@@ -3,6 +3,7 @@
             [clojure.string :as string]
             [logseq.db-sync.common :as common]
             [logseq.db-sync.index :as index]
+            [logseq.db-sync.platform.core :as platform]
             [logseq.db-sync.worker.auth :as auth]
             [logseq.db-sync.worker.dispatch :as dispatch]
             [logseq.db-sync.worker.handler.assets :as assets-handler]
@@ -65,6 +66,28 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest public-sync-route-never-forwards-internal-revoke-user-test
+  (async done
+         (let [forwarded (atom [])
+               request
+               (js/Request.
+                "http://localhost/sync/graph-1/internal/revoke-user?user-id=member-1"
+                #js {:method "POST"
+                     :headers
+                     #js {"x-db-sync-admin-token" "test-admin-token"}})
+               env #js {"DB_SYNC_ADMIN_TOKEN" "test-admin-token"
+                        "LOGSEQ_SYNC_DO"
+                        (capturing-do-namespace forwarded)}]
+           (-> (p/let [response
+                       (dispatch/handle-worker-fetch request env)
+                       body (json-body response)]
+                 (is (= 404 (.-status response)))
+                 (is (= "not found" (:error body)))
+                 (is (empty? @forwarded)))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
 (deftest public-sync-route-still-forwards-legacy-snapshot-request-test
   (async done
          (let [forwarded (atom [])
@@ -83,6 +106,129 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))
+
+(deftest destructive-sync-routes-require-graph-owner-test
+  (async done
+         (let [forwarded (atom [])
+               env #js {"DB" #js {}
+                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}
+               request (js/Request. "http://localhost/sync/graph-1/admin/reset"
+                                    #js {:method "DELETE"
+                                         :headers #js {"authorization" "Bearer member-token"}})]
+           (-> (p/with-redefs [auth/auth-claims (fn [_request _env]
+                                                  (p/resolved #js {"sub" "shared-member"}))
+                               index/<user-has-access-to-graph? (fn [_db _graph-id _user-id]
+                                                                  (p/resolved true))
+                               index/<user-owns-graph? (fn [_db _graph-id _user-id]
+                                                        (p/resolved false))]
+                 (p/let [response (dispatch/handle-worker-fetch request env)
+                         body (json-body response)]
+                   (is (= 403 (.-status response)))
+                   (is (= {:error "forbidden"} body))
+                   (is (empty? @forwarded))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest snapshot-upload-requires-graph-owner-test
+  (async done
+         (let [forwarded (atom [])
+               env #js {"DB" #js {}
+                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}
+               request (js/Request. "http://localhost/sync/graph-1/snapshot/upload?reset=true"
+                                    #js {:method "POST"
+                                         :headers #js {"authorization" "Bearer member-token"
+                                                       "content-type" "application/octet-stream"}
+                                         :body "snapshot"})]
+           (-> (p/with-redefs [auth/auth-claims (fn [_request _env]
+                                                  (p/resolved #js {"sub" "shared-member"}))
+                               index/<user-has-access-to-graph? (fn [_db _graph-id _user-id]
+                                                                  (p/resolved true))
+                               index/<user-owns-graph? (fn [_db _graph-id _user-id]
+                                                        (p/resolved false))]
+                 (p/let [response (dispatch/handle-worker-fetch request env)
+                         body (json-body response)]
+                   (is (= 403 (.-status response)))
+                   (is (= {:error "forbidden"} body))
+                   (is (empty? @forwarded))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest snapshot-upload-v2-requires-graph-owner-test
+  (async done
+         (let [forwarded (atom [])
+               env #js {"DB" #js {}
+                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}
+               request (js/Request. "http://localhost/sync/graph-1/snapshot/upload-v2?reset=true"
+                                    #js {:method "POST"
+                                         :headers #js {"authorization" "Bearer member-token"
+                                                       "content-type" "application/octet-stream"}
+                                         :body "snapshot"})]
+           (-> (p/with-redefs [auth/auth-claims (fn [_request _env]
+                                                  (p/resolved #js {"sub" "shared-member"}))
+                               index/<user-has-access-to-graph? (fn [_db _graph-id _user-id]
+                                                                  (p/resolved true))
+                               index/<user-owns-graph? (fn [_db _graph-id _user-id]
+                                                        (p/resolved false))]
+                 (p/let [response (dispatch/handle-worker-fetch request env)
+                         body (json-body response)]
+                   (is (= 403 (.-status response)))
+                   (is (= {:error "forbidden"} body))
+                   (is (empty? @forwarded))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest legacy-v1-snapshot-upload-is-forwarded-unchanged-test
+  (async done
+         (let [forwarded (atom [])
+               request (js/Request.
+                        "http://localhost/sync/graph-1/snapshot/upload?reset=true&finished=true&checksum=legacy-v1"
+                        #js {:method "POST"
+                             :headers #js {"authorization" "Bearer owner-token"
+                                           "content-type" "application/transit+json"}
+                             :body "legacy-v1-snapshot"})
+               env #js {"LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}]
+           (-> (p/with-redefs [index-handler/graph-owner-response
+                               (fn [_request _env _graph-id]
+                                 (p/resolved (ok-json-response)))]
+                 (p/let [response (dispatch/handle-worker-fetch request env)
+                         forwarded-request (first @forwarded)
+                         forwarded-url (js/URL. (.-url forwarded-request))
+                         forwarded-body (.text forwarded-request)]
+                   (is (= 200 (.-status response)))
+                   (is (= 1 (count @forwarded)))
+                   (is (= "/snapshot/upload" (.-pathname forwarded-url)))
+                   (is (= "graph-1" (.get (.-searchParams forwarded-url) "graph-id")))
+                   (is (= "true" (.get (.-searchParams forwarded-url) "reset")))
+                   (is (= "true" (.get (.-searchParams forwarded-url) "finished")))
+                   (is (= "legacy-v1" (.get (.-searchParams forwarded-url) "checksum")))
+                   (is (= "legacy-v1-snapshot" forwarded-body))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest dispatch-errors-do-not-expose-internal-details-test
+  (async done
+         (-> (p/with-redefs [platform/request-url
+                             (fn [_request]
+                               (throw (ex-info "secret dispatch detail"
+                                               {:sql "select private_data"})))]
+               (p/let [response (dispatch/handle-worker-fetch
+                                 (js/Request. "http://localhost/health")
+                                 #js {})
+                       body (json-body response)]
+                 (is (= 500 (.-status response)))
+                 (is (= {:error "server error"} body))))
+             (p/then (fn [] (done)))
+             (p/catch (fn [error]
+                        (is false (str error))
+                        (done))))))
 
 (defn- json-body [response]
   (p/let [text (.text response)]

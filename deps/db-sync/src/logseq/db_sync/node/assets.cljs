@@ -16,11 +16,20 @@
 (defn- write-meta! [path meta]
   (.writeFile (.-promises fs) path (js/JSON.stringify meta) "utf8"))
 
-(defn- normalize-bytes [data]
+(defn- <normalize-bytes [data]
   (cond
-    (instance? js/Uint8Array data) data
-    (instance? js/ArrayBuffer data) (js/Uint8Array. data)
-    :else (js/Uint8Array. data)))
+    (instance? js/Uint8Array data)
+    (p/resolved data)
+
+    (instance? js/ArrayBuffer data)
+    (p/resolved (js/Uint8Array. data))
+
+    (fn? (some-> data .-getReader))
+    (p/let [buf (.arrayBuffer (js/Response. data))]
+      (js/Uint8Array. buf))
+
+    :else
+    (p/resolved (js/Uint8Array. data))))
 
 (defn make-bucket [base-dir]
   (ensure-dir! base-dir)
@@ -40,11 +49,18 @@
               (let [file-path (node-path/join base-dir key)
                     meta-file (meta-path file-path)
                     dir (node-path/dirname file-path)
-                    data (normalize-bytes body)
                     metadata (or (aget opts "httpMetadata") #js {})
-                    custom (or (aget opts "customMetadata") #js {})]
+                    custom (or (aget opts "customMetadata") #js {})
+                    expected-size (aget opts "logseqExpectedSize")]
                 (ensure-dir! dir)
-                (p/let [_ (.writeFile (.-promises fs) file-path data)
+                (p/let [data (<normalize-bytes body)
+                        _ (when (and (number? expected-size)
+                                     (not= expected-size (.-byteLength data)))
+                            (throw (ex-info "asset body length mismatch"
+                                            {:type :db-sync/asset-size-mismatch
+                                             :expected-size expected-size
+                                             :actual-size (.-byteLength data)})))
+                        _ (.writeFile (.-promises fs) file-path data)
                         _ (write-meta! meta-file #js {:contentType (aget metadata "contentType")
                                                       :contentEncoding (aget metadata "contentEncoding")
                                                       :cacheControl (aget metadata "cacheControl")

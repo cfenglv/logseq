@@ -25,6 +25,78 @@
     (assert/assert-is-visible result)
     (w/click result)))
 
+(def ^:private selected-blocks-q
+  ".ls-page-blocks .page-blocks-inner .ls-block.selected")
+
+(defn- assert-selected-blocks-exactly!
+  [expected-contents]
+  (assert/assert-have-count selected-blocks-q (count expected-contents))
+  (let [actual-contents
+        (w/all-text-contents
+         (str selected-blocks-q " .block-title-wrap"))]
+    (is (= (set expected-contents) (set actual-contents))
+        {:expected-selected-blocks expected-contents
+         :actual-selected-blocks actual-contents})))
+
+(defn- select-blocks-exactly!
+  [expected-contents]
+  (b/select-blocks-to-count (count expected-contents))
+  (assert-selected-blocks-exactly! expected-contents))
+
+(defn- assert-page-blocks-exactly!
+  [page-name expected-contents]
+  (p/goto-page-via-api page-name)
+  (assert/assert-have-count
+   ".ls-page-blocks .ls-block:not(.block-add-button)"
+   (count expected-contents))
+  (let [actual-contents (util/get-page-blocks-contents)]
+    (is (= expected-contents actual-contents)
+        {:page page-name
+         :expected-blocks expected-contents
+         :actual-blocks actual-contents})))
+
+(defn- expected-block-subsequence
+  [actual-contents expected-contents]
+  (let [expected? (set expected-contents)]
+    (filterv expected? actual-contents)))
+
+(defn- assert-page-contains-once!
+  [page-name expected-contents]
+  (p/goto-page-via-api page-name)
+  (let [actual-contents (util/get-page-blocks-contents)
+        actual-frequencies (frequencies actual-contents)
+        actual-subsequence
+        (expected-block-subsequence actual-contents expected-contents)]
+    (is (= (zipmap expected-contents (repeat 1))
+           (select-keys actual-frequencies expected-contents))
+        {:page page-name
+         :expected-once expected-contents
+         :actual-frequencies actual-frequencies})
+    (is (= expected-contents actual-subsequence)
+        {:page page-name
+         :expected-relative-order expected-contents
+         :actual-relative-order actual-subsequence
+         :actual-blocks actual-contents})))
+
+(deftest move-block-order-contract-rejects-permutations
+  (testing "exact page order rejects a permutation accepted by set equality"
+    (let [expected ["anchor" "b1" "b2" "b3"]
+          permuted ["anchor" "b2" "b1" "b3"]]
+      (is (= (set expected) (set permuted))
+          "The former set contract accepts the permutation")
+      (is (not= expected permuted)
+          "The vector contract rejects the permutation")))
+  (testing "Library relative order rejects a permutation accepted by counts"
+    (let [expected ["b1" "b2" "b3"]
+          permuted-with-other-blocks ["other 1" "b2" "b1" "other 2" "b3"]
+          actual-frequencies (frequencies permuted-with-other-blocks)]
+      (is (= (zipmap expected (repeat 1))
+             (select-keys actual-frequencies expected))
+          "The former frequency contract accepts the permutation")
+      (is (not= expected
+                (expected-block-subsequence permuted-with-other-blocks expected))
+          "The filtered-subsequence contract rejects the permutation"))))
+
 (defn- drag-and-drop-file!
   [file-name file-type]
   (w/eval-js
@@ -831,53 +903,69 @@
 
 (deftest move-blocks-mod+shift+m
   (testing "move blocks using `mod+shift+m`"
-    (p/new-page "Target page")
-    (p/new-page "Source page")
-    (b/new-blocks ["b1" "b2" "b3"])
-    (b/select-blocks 3)
-    (k/press "ControlOrMeta+Shift+m")
-    (choose-move-target! "Target page")
-    (assert/assert-have-count ".ls-page-blocks .page-blocks-inner .ls-block" 0)))
+    (let [target-page "Shortcut move target"
+          source-page "Shortcut move source"
+          target-anchor "shortcut target anchor"
+          blocks ["shortcut block 1" "shortcut block 2" "shortcut block 3"]]
+      (p/new-page target-page)
+      (b/new-blocks [target-anchor])
+      (p/new-page source-page)
+      (b/new-blocks blocks)
+      (select-blocks-exactly! blocks)
+      (k/press "ControlOrMeta+Shift+m")
+      (choose-move-target! target-page)
+      (assert-page-blocks-exactly! source-page [])
+      (assert-page-blocks-exactly!
+       target-page
+       (into [target-anchor] blocks)))))
 
 (deftest move-blocks-cmdk
   (testing "move blocks using cmdk"
-    (p/new-page "Target page 2")
-    (p/new-page "Source page 2")
-    (b/new-blocks ["b1" "b2" "b3"])
-    (b/select-blocks 3)
-    (util/search-and-click "Move blocks to")
-    (choose-move-target! "Target page 2")
-    (assert/assert-have-count ".ls-page-blocks .page-blocks-inner .ls-block" 0)))
+    (let [target-page "Command palette move target"
+          source-page "Command palette move source"
+          target-anchor "cmdk target anchor"
+          blocks ["cmdk block 1" "cmdk block 2" "cmdk block 3"]]
+      (p/new-page target-page)
+      (b/new-blocks [target-anchor])
+      (p/new-page source-page)
+      (b/new-blocks blocks)
+      (select-blocks-exactly! blocks)
+      (util/search-and-click "Move blocks to")
+      (choose-move-target! target-page)
+      (assert-page-blocks-exactly! source-page [])
+      (assert-page-blocks-exactly!
+       target-page
+       (into [target-anchor] blocks)))))
 
 (deftest move-pages-to-library
   (testing "move pages using `mod+shift+m`"
-    (p/goto-page "Library")
-    (p/new-page "test page")
-    (b/new-blocks ["block1" "block2" "block3"])
-    (b/select-blocks 3)
-    (b/toggle-property "Tags" "Page")
-    (assert/assert-is-visible ".ls-page-blocks .ls-block .ls-icon-file")
-    (k/press "ControlOrMeta+Shift+m")
-    (w/fill "input[placeholder=\"Move blocks to\"]" "Library")
-    (w/wait-for (w/get-by-test-id "Library"))
-    (.focus (w/-query ".cp__cmdk-search-input"))
-    (k/enter)
-    (p/goto-page "Library")
-    (let [contents (set (util/get-page-blocks-contents))]
-      (is (set/subset? (set ["block1" "block2" "block3"]) contents)))
-    (p/goto-page "test page")
-    (b/new-blocks ["block4" "block5"])
-    (b/select-blocks 2)
-    (b/toggle-property "Tags" "Page")
-    (assert/assert-is-visible ".ls-page-blocks .ls-block .ls-icon-file")
-    (k/press "ControlOrMeta+Shift+m")
-    (w/fill "input[placeholder=\"Move blocks to\"]" "Library")
-    (w/wait-for (w/get-by-test-id "Library"))
-    (.focus (w/-query ".cp__cmdk-search-input"))
-    (k/enter)
-    (p/goto-page "Library")
-    (let [contents (set (util/get-page-blocks-contents))]
-      (is (set/subset? (set ["block1" "block2" "block3" "block4" "block5"]) contents)))))
+    (let [source-page "Move pages to Library source"
+          first-blocks ["library block 1" "library block 2" "library block 3"]
+          second-blocks ["library block 4" "library block 5"]
+          all-blocks (into first-blocks second-blocks)]
+      ;; Creating Page blocks materializes Library. The test must not assume
+      ;; another test has already created it.
+      (p/new-page source-page)
+      (b/new-blocks first-blocks)
+      (select-blocks-exactly! first-blocks)
+      (b/toggle-property "Tags" "Page")
+      (assert/assert-is-visible ".ls-page-blocks .ls-block .ls-icon-file")
+      (assert-selected-blocks-exactly! first-blocks)
+      (k/press "ControlOrMeta+Shift+m")
+      (choose-move-target! "Library")
+      (assert-page-blocks-exactly! source-page [])
+      (assert-page-contains-once! "Library" first-blocks)
+
+      (p/goto-page-via-api source-page)
+      (b/new-blocks second-blocks)
+      (select-blocks-exactly! second-blocks)
+      (b/toggle-property "Tags" "Page")
+      (assert/assert-is-visible ".ls-page-blocks .ls-block .ls-icon-file")
+      (assert-selected-blocks-exactly! second-blocks)
+      (k/press "ControlOrMeta+Shift+m")
+      (choose-move-target! "Library")
+      (assert-page-blocks-exactly! source-page [])
+      (assert-page-contains-once! "Library" all-blocks))))
 
 (deftest create-nested-pages-in-library
   (testing "create nested pages in Library"

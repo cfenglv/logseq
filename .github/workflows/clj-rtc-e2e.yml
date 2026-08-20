@@ -1,7 +1,17 @@
 name: Clojure RTC E2E
 
 on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: "Exact source ref tested by a calling release workflow"
+        required: false
+        type: string
+        default: ""
+  workflow_dispatch:
   push:
+    # selfhost/cloudflare-rtc is exercised through Build-Desktop-Release so
+    # one commit cannot start two competing copies of the same RTC suite.
     branches: [master]
     paths:
       - 'clj-e2e/**'
@@ -10,7 +20,7 @@ on:
       - deps/**
       - packages/**
   pull_request:
-    branches: [master]
+    branches: [master, selfhost/cloudflare-rtc]
     paths:
       - 'clj-e2e/**'
       - '.github/workflows/clj-rtc-e2e.yml'
@@ -29,10 +39,11 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-22.04
-    if: "contains(github.event.head_commit.message, 'rtc')"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -71,7 +82,7 @@ jobs:
 
       - name: Fetch Clojure deps
         if: steps.clojure-deps.outputs.cache-hit != 'true'
-        run: clojure -A:cljs -P
+        run: clojure -Srepro -A:cljs -P
 
       - name: Shadow-cljs cache
         uses: actions/cache@v4
@@ -101,17 +112,14 @@ jobs:
           retention-days: 1
 
   test:
-    name: Test ${{ matrix.test-task }}
+    name: Test RTC E2E
     needs: build
     runs-on: ubuntu-22.04
-    if: "contains(github.event.head_commit.message, 'rtc')"
-    strategy:
-      fail-fast: false
-      matrix:
-        test-task: [run-rtc-extra-test, run-rtc-extra-part2-test]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -141,8 +149,8 @@ jobs:
           path: |
             ~/.m2/repository
             ~/.gitlibs
-          key: ${{ runner.os }}-clojure-deps-${{ hashFiles('deps.edn') }}
-          restore-keys: ${{ runner.os }}-clojure-deps-
+          key: ${{ runner.os }}-clojure-e2e-deps-v2-${{ hashFiles('deps.edn', 'clj-e2e/deps.edn') }}
+          restore-keys: ${{ runner.os }}-clojure-e2e-deps-v2-
 
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -155,13 +163,26 @@ jobs:
           rsync -avz --exclude node_modules --exclude android --exclude ios ./static/ ./public/
           ls -lR ./public
 
-      - name: Run e2e tests
-        run: cd clj-e2e && timeout 30m bb ${{ matrix.test-task }}
+      - name: Fetch E2E Clojure deps
+        working-directory: clj-e2e
+        run: clojure -Srepro -P -M:test
+
+      # Both shards use the fixture's default e2etest account. Keep their
+      # execution order aligned with the local rtc:prepush gate so one shard
+      # cannot mutate the account while the other is preparing its RTC graph.
+      - name: Run RTC E2E part 1
+        run: timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-test
+
+      - name: Run RTC E2E part 2
+        # A part 1 failure must not silently skip coverage for part 2. The job
+        # still remains failed because neither step ignores its exit status.
+        if: ${{ !cancelled() }}
+        run: timeout 30m node scripts/run-rtc-e2e.mjs rtc-extra-part2-test
 
       - name: Collect screenshots
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-screenshots-${{ matrix.test-task }}
+          name: e2e-screenshots-rtc
           path: clj-e2e/e2e-dump/*
           retention-days: 1

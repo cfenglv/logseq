@@ -6,6 +6,14 @@
 (def ^:private fnv-offset 2166136261)
 (def ^:private djb-offset 5381)
 (def ^:private field-separator 31)
+(def ^:private large-title-byte-limit 4096)
+(def ^:private large-title-object-attr
+  :logseq.property.sync/large-title-object)
+(def ^:private large-title-payload-digest-alg "sha256-v1")
+(def ^:private large-title-plain-payload-format "utf8-plain-v1")
+(def ^:private large-title-encrypted-payload-format "aes-gcm-transit-v1")
+(def ^:private text-encoder (js/TextEncoder.))
+(def server-checksum-version "server-db-v2")
 
 (defn- fnv-step
   [h code]
@@ -56,7 +64,7 @@
      (or (parse-hex32 (subs checksum 8 16)) 0)]
     [0 0]))
 
-(defn- valid-checksum?
+(defn valid-checksum?
   [checksum]
   (boolean
    (and (string? checksum)
@@ -68,9 +76,10 @@
        (unsigned-hex djb)))
 
 (defn- relevant-attrs
-  [e2ee?]
+  [e2ee? mode]
   (cond-> #{:block/uuid :block/parent :block/page :block/order}
-    (not e2ee?) (into #{:block/title :block/name})))
+    (not e2ee?) (into #{:block/title :block/name})
+    (= :server-db-v2 mode) (conj large-title-object-attr)))
 
 (defn- get-block-uuid
   [db eid]
@@ -105,16 +114,74 @@
       (and uuid-value (lookup-ref db-after [:block/uuid uuid-value]))
       (conj (lookup-ref db-after [:block/uuid uuid-value])))))
 
+(defn- large-title-object?
+  [value]
+  (and (map? value)
+       (string? (:asset-uuid value))
+       (string? (:asset-type value))))
+
+(defn- large-title-object-v2?
+  [value]
+  (and (large-title-object? value)
+       (contains? #{large-title-plain-payload-format
+                    large-title-encrypted-payload-format}
+                  (:payload-format value))
+       (= large-title-payload-digest-alg
+          (:payload-digest-alg value))
+       (string? (:payload-digest value))
+       (boolean
+        (re-matches #"[0-9a-f]{64}" (:payload-digest value)))))
+
+(defn- large-title?
+  [value]
+  (and (string? value)
+       (> (.-length (.encode text-encoder value))
+          large-title-byte-limit)))
+
 (defn- normalize-checksum-value
-  [db attr value]
-  (case attr
-    :block/parent (get-block-uuid db value)
-    :block/page (get-block-uuid db value)
-    value))
+  [db eid attr value mode]
+  (let [large-title-object
+        (get (d/entity db eid) large-title-object-attr)]
+    (case attr
+      :block/parent (get-block-uuid db value)
+      :block/page (get-block-uuid db value)
+      :block/title
+      (cond
+        (= :server-db-v2 mode)
+        (if (and (large-title-object-v2? large-title-object)
+                 (or (large-title? value)
+                     (= "" value)))
+          [:title/large
+           (:payload-digest-alg large-title-object)
+           (:payload-digest large-title-object)]
+          [:title/text value])
+
+        ;; The unversioned checksum remains the rolling-upgrade contract with
+        ;; older servers. Their DB stores an empty transport placeholder while
+        ;; a new client rehydrates the logical title locally. Normalize both
+        ;; forms to the old server representation once an offload marker is
+        ;; present.
+        (and (large-title-object? large-title-object)
+             (or (large-title? value)
+                 (= "" value)))
+        ""
+
+        :else
+        value)
+      :logseq.property.sync/large-title-object
+      (if (= :server-db-v2 mode)
+        [:large-title/object
+         (:asset-uuid value)
+         (:asset-type value)
+         (:payload-format value)
+         (:payload-digest-alg value)
+         (:payload-digest value)]
+        value)
+      value)))
 
 (defn- entity-values
   [db eid e2ee?]
-  (let [attrs (relevant-attrs e2ee?)
+  (let [attrs (relevant-attrs e2ee? :legacy)
         datoms (d/datoms db :eavt eid)]
     (reduce (fn [acc datom]
               (let [attr (:a datom)]
@@ -140,16 +207,58 @@
              (some? (:block/page ent))
              (some? (:block/name ent))))))
 
+(defn- server-db-v2-entity-valid?
+  [db e2ee? eid]
+  (if-not (checksum-eligible-entity? db eid)
+    true
+    (let [ent (d/entity db eid)
+          title (:block/title ent)
+          marker (get ent large-title-object-attr)]
+      (and
+       (or (nil? marker)
+           (large-title-object-v2? marker))
+       (or e2ee?
+           (not (large-title? title))
+           (large-title-object-v2? marker))))))
+
+(defn- server-db-v2-eids-valid?
+  [db eids]
+  (let [e2ee? (ldb/get-graph-rtc-e2ee? db)]
+    (every? (partial server-db-v2-entity-valid? db e2ee?) eids)))
+
+(defn- server-db-v2-valid?
+  [db]
+  (let [e2ee? (ldb/get-graph-rtc-e2ee? db)]
+    (every? (fn [{:keys [e]}]
+              (server-db-v2-entity-valid? db e2ee? e))
+            (d/datoms db :avet :block/uuid))))
+
+(defn server-large-title-markers
+  "Return the complete marker state that contributes to server-db-v2.
+  Nil means the DB cannot advertise the versioned checksum contract."
+  [db]
+  (when (server-db-v2-valid? db)
+    (->> (d/datoms db :avet :block/uuid)
+         (keep
+          (fn [{:keys [e v]}]
+            (when (checksum-eligible-entity? db e)
+              (when-let [marker
+                         (get (d/entity db e) large-title-object-attr)]
+                {:block-uuid v
+                 :marker marker}))))
+         (sort-by (comp str :block-uuid))
+         vec)))
+
 (defn- entity-checksum-tuples
-  [db eid e2ee?]
+  [db eid e2ee? mode]
   (when-let [entity-uuid (get-block-uuid db eid)]
-    (let [attrs (relevant-attrs e2ee?)]
+    (let [attrs (relevant-attrs e2ee? mode)]
       (->> (d/datoms db :eavt eid)
            (keep (fn [{:keys [a v]}]
                    (when (contains? attrs a)
                      [entity-uuid
                       a
-                      (normalize-checksum-value db a v)])))
+                      (normalize-checksum-value db eid a v mode)])))
            set))))
 
 (defn- tuple-digest
@@ -172,11 +281,11 @@
    (add-step sum-djb djb)])
 
 (defn- db-checksum-tuples
-  [db e2ee?]
+  [db e2ee? mode]
   (->> (d/datoms db :avet :block/uuid)
        (mapcat (fn [{:keys [e]}]
                  (when (checksum-eligible-entity? db e)
-                   (entity-checksum-tuples db e e2ee?))))))
+                   (entity-checksum-tuples db e e2ee? mode))))))
 
 (defn- tx-item-eids
   [db-before db-after tx-item]
@@ -274,16 +383,16 @@
         block-uuids))
 
 (defn- tuple-set-for-eids
-  [db eids e2ee?]
+  [db eids e2ee? mode]
   (reduce (fn [tuples eid]
             (if (checksum-eligible-entity? db eid)
-              (into tuples (or (entity-checksum-tuples db eid e2ee?) #{}))
+              (into tuples (or (entity-checksum-tuples db eid e2ee? mode) #{}))
               tuples))
           #{}
           eids))
 
 (defn- tuple-counts-for-eids
-  [db eids e2ee?]
+  [db eids e2ee? mode]
   (reduce
    (fn [counts eid]
      (let [datom-count (block-uuid-datom-count db eid)]
@@ -292,13 +401,13 @@
          (reduce (fn [acc tuple]
                    (update acc tuple (fnil + 0) datom-count))
                  counts
-                 (or (entity-checksum-tuples db eid e2ee?) #{}))
+                 (or (entity-checksum-tuples db eid e2ee? mode) #{}))
          counts)))
    {}
    eids))
 
 (defn- net-tuple-delta
-  [db-before db-after e2ee? tx-data]
+  [db-before db-after e2ee? mode tx-data]
   (let [base-eids (touched-base-eids db-before db-after tx-data)]
     (if (empty? base-eids)
       {:removed {}
@@ -324,8 +433,8 @@
                                              (checksum-eligible-entity? db-after eid))))
                                set)
                 touched-eids (set/union effective-eids peer-eids)
-                before-counts (tuple-counts-for-eids db-before touched-eids e2ee?)
-                after-counts (tuple-counts-for-eids db-after touched-eids e2ee?)
+                before-counts (tuple-counts-for-eids db-before touched-eids e2ee? mode)
+                after-counts (tuple-counts-for-eids db-after touched-eids e2ee? mode)
                 all-tuples (set/union (set (keys before-counts))
                                       (set (keys after-counts)))]
             (reduce
@@ -347,8 +456,8 @@
              {:removed {}
               :added {}}
              all-tuples))
-          (let [before-tuples (tuple-set-for-eids db-before effective-eids e2ee?)
-                after-tuples (tuple-set-for-eids db-after effective-eids e2ee?)
+          (let [before-tuples (tuple-set-for-eids db-before effective-eids e2ee? mode)
+                after-tuples (tuple-set-for-eids db-after effective-eids e2ee? mode)
                 removed (set/difference before-tuples after-tuples)
                 added (set/difference after-tuples before-tuples)]
             {:removed (into {} (map (fn [tuple] [tuple 1]) removed))
@@ -363,20 +472,45 @@
         (recur (dec n) (op state digest))
         state))))
 
-(defn recompute-checksum
-  [db]
+(defn- apply-incremental-delta
+  [checksum db-before db-after e2ee? mode tx-data]
+  (let [{:keys [removed added]}
+        (net-tuple-delta db-before db-after e2ee? mode tx-data)
+        state-after-removals
+        (reduce-kv (fn [checksum-state tuple count]
+                     (apply-digest-n checksum-state tuple count subtract-digest))
+                   (checksum->state checksum)
+                   removed)
+        state-after-additions
+        (reduce-kv (fn [checksum-state tuple count]
+                     (apply-digest-n checksum-state tuple count add-digest))
+                   state-after-removals
+                   added)]
+    (state->checksum state-after-additions)))
+
+(defn- recompute-checksum*
+  [db mode]
   (let [e2ee? (ldb/get-graph-rtc-e2ee? db)
-        tuples (db-checksum-tuples db e2ee?)]
+        tuples (db-checksum-tuples db e2ee? mode)]
     (->> tuples
          (reduce (fn [checksum-state tuple]
                    (add-digest checksum-state (tuple-digest tuple)))
                  [0 0])
          state->checksum)))
 
+(defn recompute-checksum
+  [db]
+  (recompute-checksum* db :legacy))
+
+(defn recompute-server-checksum
+  [db]
+  (when (server-db-v2-valid? db)
+    (recompute-checksum* db (keyword server-checksum-version))))
+
 (defn recompute-checksum-diagnostics
   [db]
   (let [e2ee? (boolean (ldb/get-graph-rtc-e2ee? db))
-        attrs (relevant-attrs e2ee?)
+        attrs (relevant-attrs e2ee? :legacy)
         eids (->> (d/datoms db :eavt)
                   (keep (fn [datom]
                           (when (contains? attrs (:a datom))
@@ -400,30 +534,80 @@
      :attrs (->> attrs (sort-by str) vec)
      :blocks blocks}))
 
-(defn update-checksum
-  [checksum {:keys [db-before db-after tx-data]}]
+(defn- update-checksum*
+  [checksum {:keys [db-before db-after tx-data]} mode]
   (let [before-e2ee? (ldb/get-graph-rtc-e2ee? db-before)
         after-e2ee? (ldb/get-graph-rtc-e2ee? db-after)
+        server-v2? (= :server-db-v2 mode)
         tx-data (or tx-data [])]
     (cond
+      (and server-v2?
+           (not (server-db-v2-valid? db-after)))
+      nil
+
       (not= before-e2ee? after-e2ee?)
       ;; E2EE mode changes the global digest semantics, so incremental deltas are invalid.
-      (recompute-checksum db-after)
+      (recompute-checksum* db-after mode)
+
+      (and server-v2?
+           (or (not (valid-checksum? checksum))
+               (not (server-db-v2-valid? db-before))))
+      (recompute-checksum* db-after mode)
 
       (empty? tx-data)
       checksum
 
       :else
-      (let [initial-state (if (valid-checksum? checksum)
-                            (checksum->state checksum)
-                            (checksum->state (recompute-checksum db-before)))
-            {:keys [removed added]} (net-tuple-delta db-before db-after after-e2ee? tx-data)
-            state-after-removals (reduce-kv (fn [checksum-state tuple count]
-                                              (apply-digest-n checksum-state tuple count subtract-digest))
-                                            initial-state
-                                            removed)
-            state-after-additions (reduce-kv (fn [checksum-state tuple count]
-                                               (apply-digest-n checksum-state tuple count add-digest))
-                                             state-after-removals
-                                             added)]
-        (state->checksum state-after-additions)))))
+      (apply-incremental-delta
+       (if (valid-checksum? checksum)
+         checksum
+         (recompute-checksum* db-before mode))
+       db-before db-after after-e2ee? mode tx-data))))
+
+(defn update-checksum
+  [checksum tx-report]
+  (update-checksum* checksum tx-report :legacy))
+
+(defn update-server-checksum
+  [checksum tx-report]
+  (update-checksum* checksum tx-report (keyword server-checksum-version)))
+
+(defn update-verified-server-checksum
+  "Incrementally update a server-db-v2 checksum after its db-before state was
+  verified against persisted checksum metadata. A nil checksum is a verified
+  unavailable state: the graph contained an incompatible large-title marker.
+  Only tx-touched entities can invalidate either contract, so ordinary edits
+  avoid rescanning the entire graph."
+  [checksum {:keys [db-before db-after tx-data] :as tx-report}]
+  (let [before-e2ee? (ldb/get-graph-rtc-e2ee? db-before)
+        after-e2ee? (ldb/get-graph-rtc-e2ee? db-after)
+        tx-data (or tx-data [])]
+    (cond
+      (and (some? checksum)
+           (not (valid-checksum? checksum)))
+      (update-server-checksum checksum tx-report)
+
+      (not= before-e2ee? after-e2ee?)
+      (recompute-server-checksum db-after)
+
+      (empty? tx-data)
+      checksum
+
+      :else
+      (let [touched-eids (touched-base-eids db-before db-after tx-data)]
+        (if (nil? checksum)
+          ;; A known-invalid untouched entity remains invalid. Recompute only
+          ;; when this transaction repairs/removes an invalid touched entity,
+          ;; because that may make the whole graph eligible for server-db-v2.
+          (when (some (fn [eid]
+                        (and (not (server-db-v2-entity-valid?
+                                   db-before before-e2ee? eid))
+                             (server-db-v2-entity-valid?
+                              db-after after-e2ee? eid)))
+                      touched-eids)
+            (recompute-server-checksum db-after))
+          (when (server-db-v2-eids-valid? db-after touched-eids)
+            (apply-incremental-delta checksum
+                                     db-before db-after after-e2ee?
+                                     (keyword server-checksum-version)
+                                     tx-data)))))))

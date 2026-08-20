@@ -6,6 +6,7 @@
             [logseq.common.config :as common-config]
             [logseq.common.util :as common-util]
             [logseq.common.util.date-time :as date-time-util]
+            [logseq.db.common.entity-plus :as entity-plus]
             [logseq.db.common.order :as db-order]
             [logseq.db.frontend.class :as db-class]
             [logseq.db.frontend.db :as db-db]
@@ -110,6 +111,16 @@
   (let [ids (get-block-children-ids db eid opts)]
     (when (seq ids)
       (map (fn [id] (d/entity db id)) ids))))
+
+(defn get-block-direct-full-children
+  "Returns all direct :block/parent children, including generated property
+  values hidden from the regular :block/_parent view."
+  [db block-eid]
+  (when-let [entity (d/entity db (or (:db/id block-eid) block-eid))]
+    (->> (concat (:block/_parent entity)
+                 (entity-plus/lookup-kv-then-entity entity :block/_raw-parent))
+         (common-util/distinct-by :db/id)
+         (sort-by :block/order))))
 
 (defn get-block-full-children-ids
   "Including nested, collapsed and property value children."

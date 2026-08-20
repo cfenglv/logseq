@@ -1077,16 +1077,16 @@
         title-or-path])]))
 
 (defn- maybe-request-asset-download!
-  [file-exists? requested? block]
-  (let [repo (state/get-current-repo)
-        asset-file-write-finish @(get @state/state :assets/asset-file-write-finish)
-        asset-file-write-finished? (get-in asset-file-write-finish [repo (str (:block/uuid block))])
-        file-ready? (or file-exists? asset-file-write-finished?)]
-    (when (and (true? @requested?) file-ready?)
-      (reset! requested? false))
-    (when (and (not @requested?)
-               (assets-handler/maybe-request-remote-asset-download! repo block file-ready?))
-      (reset! requested? true))))
+  [file-exists? requested? block on-retry]
+  (let [repo (state/get-current-repo)]
+    (when-let [request
+               (assets-handler/request-remote-asset-download-once!
+                repo block (true? file-exists?) requested?)]
+      (p/then request
+              (fn [downloaded?]
+                (when-not downloaded?
+                  (on-retry))
+                downloaded?)))))
 
 (defn- retry-missing-asset-upload!
   [repo block file-exists?*]
@@ -1109,49 +1109,66 @@
       (ui/icon "refresh" {:size 14})
       (t :asset/reload-file))]))
 
+(defn- asset-transfer-progress
+  [direction loaded total]
+  (when (and (number? loaded) (number? total) (pos? total) (not= loaded total))
+    (let [percent (int (* 100 (/ loaded total)))
+          label (case direction
+                  :upload (t :asset/uploading)
+                  :download (t :asset/downloading)
+                  (t :asset/syncing))]
+      {:label label
+       :view [:div.asset-transfer-progress
+              [:div.asset-transfer-progress-label (str label " " percent "%")]
+              [:div.asset-transfer-progress-bar
+               [:span {:style {:width (str percent "%")}}]]]})))
+
+(defn- asset-image-render-data
+  [block image?]
+  (when image?
+    (let [resize-width (get-in block [:logseq.property.asset/resize-metadata :width])
+          asset-width (:logseq.property.asset/width block)
+          asset-height (:logseq.property.asset/height block)
+          width (or resize-width 250 asset-width)
+          aspect-ratio (when (and asset-width asset-height)
+                         (/ asset-width asset-height))
+          metadata (merge
+                    (when width {:width width})
+                    (when (and width aspect-ratio)
+                      {:height (/ width aspect-ratio)}))]
+      {:metadata metadata
+       :placeholder [:div.img-placeholder.asset-container
+                     {:style metadata}]})))
+
 (hsx/defc asset-cp
   [config block]
   (let [asset-type (:logseq.property.asset/type block)
         file (block-asset/asset-file-name block)
         file-exists?* (hooks/use-memo #(atom nil) [(:block/uuid block) asset-type])
         requested?* (hooks/use-memo #(atom false) [(:block/uuid block)])
+        retry-attempt* (hooks/use-memo #(atom 0) [(:block/uuid block)])
+        retry-timer* (hooks/use-memo #(atom nil) [(:block/uuid block)])
+        connectivity* (hooks/use-memo #(atom nil) [(:block/uuid block)])
+        [retry-tick set-retry-tick!] (hooks/use-state 0)
         [file-exists?] (hooks/use-atom file-exists?*)
         repo (state/get-current-repo)
+        online? (state/use-sub :network/online?)
+        rtc-ws-state (state/use-sub :rtc/state
+                                    :path-in-sub-atom [:rtc-state :ws-state])
         asset-file-write-finished? (state/use-sub :assets/asset-file-write-finish
                                                   :path-in-sub-atom [repo (str (:block/uuid block))])
-        file-ready? (or file-exists? asset-file-write-finished?)
+        ;; The write-finish timestamp is an invalidation signal, not proof that
+        ;; the file still exists. It can outlive graph removal and restoration.
+        file-ready? (true? file-exists?)
         progress-entry (state/use-sub :rtc/asset-upload-download-progress
                                       :path-in-sub-atom [repo (str (:block/uuid block))])
         {:keys [direction loaded total]} progress-entry
-        in-progress? (and (number? loaded) (number? total) (pos? total) (not= loaded total))
-        percent (when in-progress?
-                  (int (* 100 (/ loaded total))))
-        label (case direction
-                :upload (t :asset/uploading)
-                :download (t :asset/downloading)
-                (t :asset/syncing))
-        progress-view (when in-progress?
-                        [:div.asset-transfer-progress
-                         [:div.asset-transfer-progress-label (str label " " percent "%")]
-                         [:div.asset-transfer-progress-bar
-                          [:span {:style {:width (str percent "%")}}]]])
+        {progress-label :label progress-view :view}
+        (asset-transfer-progress direction loaded total)
         image? (contains? (common-config/img-formats) (keyword asset-type))
         gallery-image? (and (:gallery-view? config) image?)
-        width (get-in block [:logseq.property.asset/resize-metadata :width])
-        asset-width (:logseq.property.asset/width block)
-        asset-height (:logseq.property.asset/height block)
-        img-metadata (when image?
-                       (let [width (or width 250 asset-width)
-                             aspect-ratio (when (and asset-width asset-height)
-                                            (/ asset-width asset-height))]
-                         (merge
-                          (when width
-                            {:width width})
-                          (when (and width aspect-ratio)
-                            {:height (/ width aspect-ratio)}))))
-        img-placeholder (when image?
-                          [:div.img-placeholder.asset-container
-                           {:style img-metadata}])
+        {img-metadata :metadata img-placeholder :placeholder}
+        (asset-image-render-data block image?)
         ;; When external-url is set, use it as the render path so
         ;; plugin-sandboxed assets (./assets/storages/<plugin-id>/...)
         ;; resolve correctly; <make-asset-url handles both remote URLs
@@ -1167,9 +1184,36 @@
                                 true
                                 (fs/file-exists? (config/get-repo-dir (state/get-current-repo)) path))]
                  (reset! file-exists?* result))))
-           [file])
+           [file asset-file-write-finished?])
         _ (hooks/use-effect!
-           #(maybe-request-asset-download! file-exists? requested?* block))
+           (fn []
+             (let [connectivity [online? rtc-ws-state]
+                   connectivity-changed? (not= connectivity @connectivity*)]
+               (when connectivity-changed?
+                 (reset! connectivity* connectivity)
+                 (reset! retry-attempt* 0)
+                 (assets-handler/cancel-remote-asset-download-retry!
+                  retry-timer*))
+               (if file-ready?
+                 (do
+                   (reset! retry-attempt* 0)
+                   (assets-handler/cancel-remote-asset-download-retry!
+                    retry-timer*))
+                 (when online?
+                   (maybe-request-asset-download!
+                    file-exists?
+                    requested?*
+                    block
+                    #(assets-handler/schedule-remote-asset-download-retry!
+                      retry-timer*
+                      retry-attempt*
+                      (fn [] (set-retry-tick! (inc retry-tick)))))))))
+           [file-exists? online? rtc-ws-state retry-tick])
+        _ (hooks/use-effect!
+           (fn []
+             #(assets-handler/cancel-remote-asset-download-retry!
+               retry-timer*))
+           [])
         content (cond
                   (or file-ready? gallery-image?)
                   (asset-link (cond-> (assoc config :asset-block block)
@@ -1189,7 +1233,7 @@
     (if progress-view
       [:div.asset-transfer-shell
        (or content
-           [:div.asset-transfer-placeholder (t :asset/transfer-placeholder label)])
+           [:div.asset-transfer-placeholder (t :asset/transfer-placeholder progress-label)])
        progress-view]
       content)))
 

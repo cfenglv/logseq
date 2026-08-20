@@ -1,5 +1,8 @@
 (ns logseq.cli.commands-test
-  (:require [babashka.cli :as cli]
+  (:require ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as node-path]
+            [babashka.cli :as cli]
             [cljs.test :refer [async deftest is testing]]
             [clojure.string :as string]
             [logseq.cli.command.add :as add-command]
@@ -4263,6 +4266,117 @@
                    (is (= :sync-download (get-in @captured [0 :type])))))
                (p/catch (fn [e] (is false (str "unexpected error: " e))))
                (p/finally done)))))
+
+(deftest test-execute-real-sync-action-canonicalizes-relative-auth-path
+  (async done
+         (let [root-dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-cli-relative-auth-"))
+               auth-path (node-path/join root-dir "auth.json")
+               relative-auth-path (node-path/relative (.cwd js/process) auth-path)
+               invoke-calls (atom [])]
+           (fs/writeFileSync auth-path
+                             (js/JSON.stringify
+                              (clj->js {:provider "cognito"
+                                       :id-token "id-token-relative-auth"
+                                       :access-token "access-token-relative-auth"
+                                       :refresh-token "refresh-token-relative-auth"
+                                       :expires-at 4102444800000})))
+           (-> (p/with-redefs [transport/invoke
+                               (fn [_ method args]
+                                 (swap! invoke-calls conj [method args])
+                                 (p/resolved (when (= :thread-api/db-sync-ensure-user-rsa-keys method)
+                                               {:ok true})))]
+                 (p/let [result (commands/execute
+                                 {:type :sync-ensure-keys
+                                  :e2ee-password "pw"}
+                                 {:base-url "http://example"
+                                  :root-dir root-dir
+                                  :auth-path relative-auth-path})]
+                   (is (false? (node-path/isAbsolute relative-auth-path)))
+                   (is (= :ok (:status result)))
+                   (is (= :sync-ensure-keys (:command result)))
+                   (is (= [:thread-api/sync-app-state
+                           :thread-api/set-db-sync-config
+                           :thread-api/verify-and-save-e2ee-password
+                           :thread-api/sync-app-state
+                           :thread-api/set-db-sync-config
+                           :thread-api/db-sync-ensure-user-rsa-keys]
+                          (mapv first @invoke-calls)))
+                   (is (= ["refresh-token-relative-auth" "pw"]
+                          (some (fn [[method args]]
+                                  (when (= :thread-api/verify-and-save-e2ee-password method)
+                                    args))
+                                @invoke-calls)))
+                   (let [set-configs (->> @invoke-calls
+                                          (keep (fn [[method [config]]]
+                                                  (when (= :thread-api/set-db-sync-config method)
+                                                    config))))]
+                     (is (= 2 (count set-configs)))
+                     (is (every? #(= auth-path (:auth-path %)) set-configs)))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally (fn []
+                            (fs/rmSync root-dir #js {:recursive true :force true})
+                            (done)))))))
+
+(deftest test-execute-real-sync-action-default-config-omits-auth-path
+  (async done
+         (let [invoke-calls (atom [])]
+           (-> (p/with-redefs [transport/invoke
+                               (fn [_ method args]
+                                 (swap! invoke-calls conj [method args])
+                                 (p/resolved (when (= :thread-api/db-sync-ensure-user-rsa-keys method)
+                                               {:ok true})))]
+                 (p/let [result (commands/execute
+                                 {:type :sync-ensure-keys}
+                                 {:base-url "http://example"
+                                  :root-dir "/tmp"
+                                  :id-token "runtime-id-token"})]
+                   (is (= :ok (:status result)))
+                   (is (= :sync-ensure-keys (:command result)))
+                   (is (= [:thread-api/sync-app-state
+                           :thread-api/set-db-sync-config
+                           :thread-api/db-sync-ensure-user-rsa-keys]
+                          (mapv first @invoke-calls)))
+                   (is (= {:ws-url nil
+                           :http-base nil}
+                          (get-in @invoke-calls [1 1 0])))
+                   (is (not (contains? (get-in @invoke-calls [1 1 0])
+                                       :auth-path)))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally done)))))
+
+(deftest test-execute-real-sync-action-relative-auth-failure-boundaries
+  (async done
+         (let [root-dir (fs/mkdtempSync (node-path/join (os/tmpdir) "logseq-cli-relative-auth-errors-"))
+               auth-path (node-path/join root-dir "custom" "auth.json")
+               relative-auth-path (node-path/relative (.cwd js/process) auth-path)
+               action {:type :sync-ensure-keys
+                       :e2ee-password "pw"}
+               config {:base-url "http://example"
+                       :root-dir root-dir
+                       :auth-path relative-auth-path}
+               invoke-calls (atom [])]
+           (-> (p/with-redefs [transport/invoke
+                               (fn [_ method args]
+                                 (swap! invoke-calls conj [method args])
+                                 (p/resolved nil))]
+                 (p/let [missing-result (commands/execute action config)
+                         _ (fs/mkdirSync (node-path/dirname auth-path) #js {:recursive true})
+                         _ (fs/writeFileSync auth-path "{\"provider\":")
+                         invalid-result (commands/execute action config)]
+                   (is (= :error (:status missing-result)))
+                   (is (= :missing-auth (get-in missing-result [:error :code])))
+                   (is (= :sync-ensure-keys (:command missing-result)))
+                   (is (= :error (:status invalid-result)))
+                   (is (= :invalid-auth-file (get-in invalid-result [:error :code])))
+                   (is (= :sync-ensure-keys (:command invalid-result)))
+                   (is (empty? @invoke-calls))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally (fn []
+                            (fs/rmSync root-dir #js {:recursive true :force true})
+                            (done)))))))
 
 (deftest test-execute-graph-export
   (async done

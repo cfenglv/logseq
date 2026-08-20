@@ -1,5 +1,6 @@
 (ns logseq.db-sync.common-test
   (:require [cljs.test :refer [async deftest is]]
+            [clojure.string :as string]
             [logseq.db-sync.common :as common]
             [promesa.core :as p]))
 
@@ -16,6 +17,29 @@
             (swap! calls update :all-count (fnil inc 0))
             result))
     stmt))
+
+(deftest error-log-data-redacts-nested-error-payload-test
+  (let [summary (common/error-log-data
+                 (ex-info "secret transaction title"
+                          {:type :db-sync/test-failure
+                           :sql "select private_data"
+                           :tx-data [[:db/add 1 :block/title "secret page text"]]}))
+        printed (pr-str summary)]
+    (is (= {:error-name "Error"
+            :error-code :db-sync/test-failure}
+           summary))
+    (is (not (string/includes? printed "secret")))
+    (is (not (string/includes? printed "private_data")))
+    (is (not (string/includes? printed "tx-data")))))
+
+(deftest error-log-data-rejects-nested-error-code-test
+  (let [summary (common/error-log-data
+                 (ex-info "secret"
+                          {:type {:private "secret block title"}}))]
+    (is (= {:error-name "Error"
+            :error-code :exception}
+           summary))
+    (is (not (string/includes? (pr-str summary) "secret")))))
 
 (deftest d1-all-falls-back-when-with-session-missing-test
   (async done

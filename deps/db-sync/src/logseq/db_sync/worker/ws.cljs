@@ -24,7 +24,8 @@
     (if-let [coerced (coerce-ws-server-message msg)]
       (.send ws (protocol/encode-message coerced))
       (do
-        (log/error :db-sync/ws-response-invalid {:message msg})
+        (log/error :db-sync/ws-response-invalid
+                   {:message-type (when (map? msg) (:type msg))})
         (.send ws (protocol/encode-message {:type "error" :message "server error"}))))))
 
 (defn broadcast! [^js self sender msg]
@@ -33,4 +34,17 @@
       (let [clients (.getWebSockets state)]
         (doseq [ws clients]
           (when (and (not= ws sender) (ws-open? ws))
-            (send! ws msg)))))))
+            (try
+              (send! ws msg)
+              (catch :default error
+                ;; A stale peer must never turn an already committed graph
+                ;; transaction into an HTTP/WebSocket failure or prevent
+                ;; healthy peers from receiving the notification.
+                (log/warn :db-sync/ws-broadcast-send-failed
+                          {:message-type (when (map? msg) (:type msg))
+                           :ready-state (.-readyState ws)
+                           :error-name (or (some-> error .-name) "Error")})
+                (try
+                  (when (fn? (.-close ws))
+                    (.close ws 1011 "send failed"))
+                  (catch :default _ nil))))))))))

@@ -1,8 +1,11 @@
 (ns frontend.extensions.pdf.assets-test
-  (:require [clojure.test :as test :refer [are deftest testing]]
+  (:require [cljs.test :refer [are deftest is testing]]
+            [frontend.db :as db]
+            [frontend.db.model :as db-model]
             [frontend.extensions.pdf.assets :as pdf-assets]
-            [frontend.util :as util]
-            [frontend.extensions.pdf.utils :as pdf-utils]))
+            [frontend.extensions.pdf.utils :as pdf-utils]
+            [frontend.handler.editor :as editor-handler]
+            [frontend.util :as util]))
 
 (deftest fix-local-asset-pagename
   (testing "matched filenames"
@@ -21,7 +24,30 @@
 (deftest inflate-asset-normalizes-local-assets-url-on-windows
   (with-redefs [util/electron? (constantly true)
                 util/win32? true]
-    (test/is (= "assets:///C/logseq__colon/Users/charlie/sicp.pdf"
-                (:url (pdf-assets/inflate-asset
-                       "C:/Users/charlie/sicp.pdf"
-                       {:href "assets:///C:/Users/charlie/sicp.pdf"}))))))
+    (is (= "assets:///C/logseq__colon/Users/charlie/sicp.pdf"
+           (:url (pdf-assets/inflate-asset
+                  "C:/Users/charlie/sicp.pdf"
+                  {:href "assets:///C:/Users/charlie/sicp.pdf"}))))))
+
+(deftest creating-pdf-annotation-preserves-explicit-title-test
+  (let [inserted (atom nil)
+        annotation {:id #uuid "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                    :page 4
+                    :content {:text "Quoted sentence"}
+                    :properties {:color "yellow"}}]
+    (with-redefs [db-model/query-block-by-uuid (constantly nil)
+                  db/entity (constantly
+                             {:property/closed-values
+                              [{:db/id 200 :block/title "yellow"}]})
+                  editor-handler/api-insert-new-block!
+                  (fn [title opts]
+                    (reset! inserted [title opts])
+                    {:block/title title})]
+      (pdf-assets/db-based-ensure-ref-block!
+       {:block {:db/id 100
+                :block/uuid #uuid "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}}
+       annotation
+       nil)
+      (is (= "Quoted sentence" (first @inserted)))
+      (is (= annotation
+             (get-in @inserted [1 :properties :logseq.property.pdf/hl-value]))))))

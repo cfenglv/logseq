@@ -1,0 +1,26 @@
+(ns frontend.test.version-stub
+  (:require [clojure.string :as string]))
+
+(defonce version
+  (or (aget js/globalThis "__LOGSEQ_TEST_COMPILED_VERSION__")
+      "2.0.1-selfhost.5"))
+
+(def selfhost-build?
+  (string/includes? version "-selfhost."))
+
+(def releases-url
+  (if selfhost-build?
+    "https://github.com/cfenglv/logseq/releases"
+    "https://github.com/logseq/logseq/releases"))
+
+(def changelog-url
+  (if selfhost-build?
+    releases-url
+    "https://docs.logseq.com/#/page/changelog"))
+
+(defn commit-url
+  [revision]
+  (str (if selfhost-build?
+         "https://github.com/cfenglv/logseq/commit/"
+         "https://github.com/logseq/logseq/commit/")
+       revision))

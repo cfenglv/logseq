@@ -3,6 +3,10 @@
 This package contains the DB sync server code and tests used by Logseq.
 It includes the Cloudflare Worker implementation and a Node.js adapter for self-hosting.
 
+For a reproducible Cloudflare deployment, including D1 migrations, Durable
+Objects, R2, rolling upgrades, and client configuration, see
+[`docs/selfhost-sync.md`](../../docs/selfhost-sync.md).
+
 ## Requirements
 - Node.js (see repo root for required version)
 - Clojure (for shadow-cljs builds)

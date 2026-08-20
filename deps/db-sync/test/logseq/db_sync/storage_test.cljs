@@ -4,6 +4,7 @@
             [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
             [logseq.db :as ldb]
+            [logseq.db-sync.checksum :as sync-checksum]
             [logseq.db-sync.common :as common]
             [logseq.db-sync.storage :as storage]
             [logseq.db.common.normalize :as db-normalize]
@@ -26,7 +27,8 @@
 (defn- with-memory-sql
   [f]
   (let [db (new sqlite ":memory:" nil)
-        sql #js {:exec (fn [sql-str & args]
+        sql #js {:_db db
+                 :exec (fn [sql-str & args]
                          (let [stmt (.prepare db sql-str)]
                            (if (select-sql? sql-str)
                              (all-sql stmt args)
@@ -61,6 +63,178 @@
   (when (seq coll)
     (nth coll (rand-int* rng (count coll)))))
 
+(deftest hundred-thousand-idempotency-markers-use-primary-key-lookup-test
+  (testing "safe retention keeps markers until reset without turning replay into a scan"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (common/sql-exec
+         sql
+         (str "with recursive n(x) as ("
+              "select 1 union all select x + 1 from n where x < 100000"
+              ") insert into applied_client_txs(identity, payload_digest, created_at) "
+              "select 'tx/' || x, printf('%064x', x), x from n"))
+        (is (= {"tx/1" (str (apply str (repeat 63 "0")) "1")
+                "tx/100000" (str (apply str (repeat 59 "0")) "186a0")}
+               (storage/applied-client-tx-records
+                sql ["tx/1" "tx/100000"])))
+        (let [^js db (aget sql "_db")
+              plan (.all (.prepare db
+                                   (str "explain query plan select identity, payload_digest "
+                                        "from applied_client_txs where identity in (?, ?)"))
+                         "tx/1" "tx/100000")
+              details (mapv #(aget % "detail") plan)]
+          (is (some #(string/includes? (string/lower-case %) "index") details)
+              (str "marker lookup must use the PK index: " (pr-str details))))
+        (is (= 100000
+               (-> (common/sql-exec
+                    sql "select count(*) as n from applied_client_txs")
+                   common/get-sql-rows first (aget "n")))
+            "markers are not silently expired without snapshot/reset")))))
+
+(deftest versioned-server-checksum-listener-updates-independently-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            block-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "server-checksum-page"
+           :block/title "Server checksum page"}
+          {:block/uuid block-uuid
+           :block/title "short"
+           :block/parent [:block/uuid page-uuid]
+           :block/page [:block/uuid page-uuid]}])
+        (storage/set-server-checksum!
+         sql
+         (sync-checksum/recompute-server-checksum @conn)
+         (storage/get-t sql))
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid block-uuid]
+           :block/title
+           (apply str (repeat 5000 "x"))]
+          [:db/add [:block/uuid block-uuid]
+           :logseq.property.sync/large-title-object
+           {:asset-uuid "listener-large-title"
+            :asset-type "txt"
+            :payload-format "utf8-plain-v1"
+            :payload-digest-alg "sha256-v1"
+            :payload-digest (apply str (repeat 64 "a"))}]])
+        (is (= (sync-checksum/recompute-server-checksum @conn)
+               (storage/get-server-checksum sql)))
+        (is (= (storage/get-t sql)
+               (storage/get-server-checksum-t sql)))))))
+
+(deftest versioned-server-checksum-recomputes-when-first-upgrade-action-is-write-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "checksum-rollback-page"
+           :block/title "Before rollback"}])
+        (storage/set-server-checksum!
+         sql
+         (sync-checksum/recompute-server-checksum @conn)
+         (storage/get-t sql))
+
+        ;; Model an old server write: DB and cursor advance, while the additive
+        ;; versioned checksum metadata remains at the prior cursor.
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "Written during rollback"]]
+         {:db-sync/skip-checksum-update? true})
+        (is (not= (storage/get-t sql)
+                  (storage/get-server-checksum-t sql)))
+
+        ;; The first action after upgrading is another write, not a hello/pull
+        ;; that would otherwise repair metadata. It must recompute instead of
+        ;; extending and blessing the stale checksum.
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "First write after upgrade"]])
+        (is (= (sync-checksum/recompute-server-checksum @conn)
+               (storage/get-server-checksum sql)))
+        (is (= (storage/get-t sql)
+               (storage/get-server-checksum-t sql)))))))
+
+(deftest checksum-metadata-verification-watermark-tracks-only-verified-history-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "verified-checksum-watermark"
+           :block/title "Verified checksum watermark"}])
+        (let [first-t (storage/get-t sql)]
+          (is (storage/checksum-metadata-verified? sql first-t))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (storage/get-checksum sql)))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql))))
+
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "Verified checksum watermark updated"]])
+        (let [second-t (storage/get-t sql)]
+          (is (storage/checksum-metadata-verified? sql second-t))
+          (is (= (sync-checksum/recompute-checksum @conn)
+                 (storage/get-checksum sql)))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql))))
+
+        ;; Model a rollback to a server that does not know the new watermark.
+        ;; The cursor advances, but the old verification proof must not.
+        (ldb/transact!
+         conn
+         [[:db/add [:block/uuid page-uuid]
+           :block/title
+           "Written by an older server"]]
+         {:db-sync/skip-checksum-update? true})
+        (is (not (storage/checksum-metadata-verified?
+                  sql
+                  (storage/get-t sql))))))))
+
+(deftest checksum-metadata-verification-watermark-binds-verified-values-test
+  (with-memory-sql
+    (fn [sql]
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)]
+        (ldb/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "checksum-watermark-values"
+           :block/title "Checksum watermark values"}])
+        (let [t (storage/get-t sql)
+              checksum (storage/get-checksum sql)
+              server-checksum (storage/get-server-checksum sql)]
+          (is (storage/checksum-metadata-verified? sql t))
+
+          (storage/set-checksum! sql "0000000000000000")
+          (is (not (storage/checksum-metadata-verified? sql t)))
+
+          (storage/set-checksum! sql checksum)
+          (storage/mark-checksum-metadata-verified! sql t)
+          (storage/set-server-checksum! sql nil nil)
+          (is (not (storage/checksum-metadata-verified? sql t)))
+
+          (storage/set-server-checksum! sql server-checksum t)
+          (storage/mark-checksum-metadata-verified! sql t)
+          (is (storage/checksum-metadata-verified? sql t)))))))
+
 (defn- normal-block-uuids
   [db]
   (->> (d/datoms db :avet :block/uuid)
@@ -74,6 +248,41 @@
                             (some? (:block/page ent)))
                    (:block/uuid ent)))))
        vec))
+
+(deftest cloudflare-transaction-sync-rolls-back-all-sql-writes-test
+  (testing "the Durable Object transactionSync adapter is used atomically"
+    (let [db (new sqlite ":memory:" nil)
+          calls (atom 0)
+          sql #js {:exec (fn [sql-str & args]
+                           (let [stmt (.prepare db sql-str)]
+                             (if (select-sql? sql-str)
+                               (all-sql stmt args)
+                               (do
+                                 (run-sql stmt args)
+                                 nil))))}]
+      (try
+        (storage/init-schema! sql)
+        (storage/register-transaction-sync!
+         sql
+         (fn [f]
+           (swap! calls inc)
+           (let [tx-fn (.transaction db f)]
+             (tx-fn))))
+        (let [result (try
+                       (storage/with-sql-transaction!
+                        sql
+                        (fn []
+                          (storage/set-meta! sql :t 12)
+                          (throw (js/Error. "abort transaction"))))
+                       :unexpected-success
+                       (catch :default error
+                         error))]
+          (is (instance? js/Error result))
+          (is (= 1 @calls))
+          (is (= 0 (storage/get-t sql))
+              "a failed callback must not leave partial Durable Object writes"))
+        (finally
+          (.close db))))))
 
 (deftest t-meta-test
   (let [sql (test-sql/make-sql)]
@@ -95,6 +304,29 @@
               {:t 3 :tx "tx-3" :outliner-op nil}]
              result)))))
 
+(deftest tx-log-tx-id-online-migration-keeps-legacy-rows-test
+  (with-memory-sql
+    (fn [sql]
+      ;; Model a Durable Object created before tx-id idempotency existed.
+      (common/sql-exec sql
+                       (str "create table tx_log ("
+                            "t INTEGER primary key,"
+                            "tx TEXT not null,"
+                            "created_at INTEGER"
+                            ")"))
+      (common/sql-exec sql
+                       "insert into tx_log (t, tx, created_at) values (?, ?, ?)"
+                       1 "legacy" 100)
+      (storage/init-schema! sql)
+      (let [tx-id (random-uuid)]
+        (storage/append-tx! sql 2 "idempotent" 200 :save-block tx-id)
+        (storage/append-tx! sql 3 "legacy-v1" 300 :save-block)
+        (is (storage/tx-id-applied? sql tx-id))
+        (is (= [{:t 1 :tx "legacy" :outliner-op nil}
+                {:t 2 :tx "idempotent" :outliner-op :save-block}
+                {:t 3 :tx "legacy-v1" :outliner-op :save-block}]
+               (storage/fetch-tx-since sql 0)))))))
+
 (deftest stale-checksum-no-op-transact-does-not-throw-test
   (testing "a no-op tx should not throw and should keep incremental checksum state"
     (with-memory-sql
@@ -113,6 +345,36 @@
             (is (= :ok result))
             (is (= stale-checksum
                    (storage/get-checksum sql)))))))))
+
+(deftest verified-checksum-metadata-uses-touched-entity-server-update-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            block-uuid (random-uuid)]
+        (d/transact! conn [{:block/uuid page-uuid
+                            :block/name "verified-update"
+                            :block/title "Verified update"}])
+        (is (storage/checksum-metadata-verified?
+             sql (storage/get-t sql)))
+        (let [original-verified-update
+              sync-checksum/update-verified-server-checksum
+              verified-update-count (atom 0)]
+          (with-redefs [sync-checksum/update-server-checksum
+                        (fn [& _]
+                          (throw (js/Error. "unexpected full-graph update")))
+                        sync-checksum/update-verified-server-checksum
+                        (fn [checksum tx-report]
+                          (swap! verified-update-count inc)
+                          (original-verified-update checksum tx-report))]
+            (d/transact! conn [{:block/uuid block-uuid
+                                :block/title "Child"
+                                :block/parent [:block/uuid page-uuid]
+                                :block/page [:block/uuid page-uuid]}]))
+          (is (= 1 @verified-update-count))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql))))))))
 
 (deftest initial-checksum-does-not-overwrite-existing-checksum-test
   (testing "snapshot checksum initialization must not replace an existing incremental checksum"

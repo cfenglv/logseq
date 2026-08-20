@@ -1886,7 +1886,7 @@
  :updater/quit-and-install "重启并安装"
  :updater/up-to-date "应用已是最新版本 🎉"
  :updater/update-available "发现新版本"
- :updater/update-error "⚠️ 哎呀，出了点问题！\n请查看{1}。"
+ :updater/update-error "⚠️ 自动更新未能完成。\n请从{1}下载最新版本并手动安装。"
  :updater/update-ready-to-install "更新已准备就绪"
 
  :view/add-new-view "添加新视图"

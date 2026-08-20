@@ -17,6 +17,21 @@
       (k/esc)
       (util/search-and-click page-name))))
 
+(defn goto-page-via-api
+  "Navigate to an existing page without depending on command-palette indexing."
+  [page-name]
+  (assert (string? page-name) page-name)
+  (w/eval-js
+   (str
+    "(async () => {"
+    "  const page = await window.logseq.api.get_page(" (pr-str page-name) ");"
+    "  if (!page || !page.uuid) throw new Error('Page not found: ' + " (pr-str page-name) ");"
+    "  window.logseq.api.push_state('page', {name: page.uuid}, null);"
+    "  return page.uuid;"
+    "})()"))
+  (w/wait-for (format "div[data-testid='page title']:has-text('%s')" page-name)
+              {:timeout 30000}))
+
 (defn get-page-name
   []
   (util/get-text "div[data-testid='page title'] .block-title-wrap"))

@@ -1,8 +1,10 @@
 (ns logseq.e2e.rtc-extra-part2-test
   (:require [clojure.java.io :as io]
             [clojure.string :as string]
-            [clojure.test :refer [deftest testing is use-fixtures run-test]]
+            [clojure.test :refer [deftest testing is use-fixtures]]
             [jsonista.core :as json]
+            [logseq.e2e.api :refer [ls-api-call!]]
+            [logseq.e2e.assets :as e2e-assets]
             [logseq.e2e.block :as b]
             [logseq.e2e.const :refer [*page1 *page2 *graph-name*]]
             [logseq.e2e.custom-report :as custom-report]
@@ -12,8 +14,7 @@
             [logseq.e2e.page :as page]
             [logseq.e2e.rtc :as rtc]
             [logseq.e2e.util :as util]
-            [wally.main :as w]
-            [wally.repl :as repl]))
+            [wally.main :as w]))
 
 (use-fixtures :once
   fixtures/open-2-pages
@@ -27,10 +28,15 @@
 (def ^:private stress-default-seed-blocks 20)
 (def ^:private stress-default-seed 20260330)
 (def ^:private stress-max-seed-depth 4)
+(def ^:private stress-quiescence-poll-ms 250)
+(def ^:private stress-quiescence-stable-ms 3000)
+(def ^:private stress-quiescence-timeout-ms 30000)
 (def ^:private severe-sync-log-patterns
   ["db-sync/checksum-mismatch"
    "db-sync/tx-rejected"
    "db-sync/apply-remote-txs-failed"])
+(def ^:private block-uuid-pattern
+  #"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 (def ^:private random-edit-actions
   [:new :save :indent-outdent :delete-existing :undo :redo])
 
@@ -64,15 +70,30 @@
 (defn- page-sync-state
   [pw-page]
   (w/with-page pw-page
-    (util/exit-edit)
     {:rtc-tx (rtc/get-rtc-tx)
      :blocks (util/get-page-blocks-contents)}))
 
-(defn- assert-two-pages-synced!
+(defn- two-page-sync-state
   []
-  (let [s1 (page-sync-state @*page1)
-        s2 (page-sync-state @*page2)
-        tx1 (:rtc-tx s1)
+  {:page1 (page-sync-state @*page1)
+   :page2 (page-sync-state @*page2)})
+
+(defn- wait-for-two-pages-quiescent!
+  []
+  (let [state (rtc/wait-for-stable-state!
+               two-page-sync-state
+               rtc/two-client-snapshot-quiescent?
+               {:poll-ms stress-quiescence-poll-ms
+                :stable-ms stress-quiescence-stable-ms
+                :timeout-ms stress-quiescence-timeout-ms})]
+    (prn :two-page-rtc-quiescent
+         {:rtc-tx (mapv (comp :rtc-tx state) [:page1 :page2])
+          :stable-ms stress-quiescence-stable-ms})
+    state))
+
+(defn- assert-two-pages-synced!
+  [{s1 :page1 s2 :page2}]
+  (let [tx1 (:rtc-tx s1)
         tx2 (:rtc-tx s2)]
     (is (= (:blocks s1) (:blocks s2))
         (str "page blocks diverged: "
@@ -83,27 +104,41 @@
     (is (= (:local-tx tx1) (:remote-tx tx1))
         (str "page1 rtc-tx not converged: " (pr-str tx1)))
     (is (= (:local-tx tx2) (:remote-tx tx2))
-        (str "page2 rtc-tx not converged: " (pr-str tx2)))))
+        (str "page2 rtc-tx not converged: " (pr-str tx2)))
+    (is (= tx1 tx2)
+        (str "client rtc-tx watermarks differ: "
+             (pr-str {:page1 tx1 :page2 tx2})))))
+
+(defn- current-editor-layout
+  []
+  ;; A concurrent remote render can detach the editor between get-editor and
+  ;; boundingBox. Playwright reports that as a nil box; it is an expected
+  ;; "operation unavailable" result for these optional stress actions.
+  (when-let [editor (util/get-editor)]
+    (when-let [box (.boundingBox editor)]
+      (when-let [editor-id (.getAttribute editor "id")]
+        {:editor-id editor-id
+         :x (.-x box)}))))
 
 (defn- try-indent!
   []
-  (if-let [editor (util/get-editor)]
-    (let [[x1 _] (util/bounding-xy editor)]
+  (if-let [{editor-id :editor-id x1 :x} (current-editor-layout)]
+    (do
       (k/tab)
-      (if-let [editor' (util/get-editor)]
-        (let [[x2 _] (util/bounding-xy editor')]
-          (> x2 x1))
+      (if-let [{editor-id' :editor-id x2 :x} (current-editor-layout)]
+        (and (= editor-id editor-id')
+             (> x2 x1))
         false))
     false))
 
 (defn- try-outdent!
   []
-  (if-let [editor (util/get-editor)]
-    (let [[x1 _] (util/bounding-xy editor)]
+  (if-let [{editor-id :editor-id x1 :x} (current-editor-layout)]
+    (do
       (k/shift+tab)
-      (if-let [editor' (util/get-editor)]
-        (let [[x2 _] (util/bounding-xy editor')]
-          (> x1 x2))
+      (if-let [{editor-id' :editor-id x2 :x} (current-editor-layout)]
+        (and (= editor-id editor-id')
+             (> x1 x2))
         false))
     false))
 
@@ -119,6 +154,10 @@
                      d)
       :else d)))
 
+(defn- page-has-block-title?
+  [title]
+  (boolean (some #(= title %) (util/get-page-blocks-contents))))
+
 (defn- new-block-safe!
   [title]
   (loop [attempt 4]
@@ -130,22 +169,87 @@
               false))]
       (if created?
         true
-        (if (zero? attempt)
-          (throw (ex-info "new-block-safe failed" {:title title}))
-          (do
-            (util/exit-edit)
-            (util/wait-timeout 80)
-            (try
-              (b/open-last-block)
-              (catch Throwable _
-                nil))
-            (util/wait-timeout 80)
-            (recur (dec attempt))))))))
+        ;; `b/new-block` verifies transient editor DOM after committing the
+        ;; block. A concurrent remote render can replace that DOM even though
+        ;; the uniquely named block was committed; do not create a duplicate
+        ;; in that case.
+        (if (page-has-block-title? title)
+          true
+          (if (zero? attempt)
+            (throw (ex-info "new-block-safe failed" {:title title}))
+            (do
+              (util/exit-edit)
+              (util/wait-timeout 80)
+              (try
+                (b/open-last-block)
+                (catch Throwable _
+                  nil))
+              (util/wait-timeout 80)
+              (recur (dec attempt)))))))))
 
-(defn- sync-by-trigger!
+(defn- save-block-safe!
+  [original-title updated-title]
+  (loop [attempt 4]
+    (let [saved?
+          (try
+            (b/save-block updated-title)
+            true
+            (catch Throwable _
+              (page-has-block-title? updated-title)))]
+      (cond
+        saved?
+        true
+
+        (zero? attempt)
+        (throw (ex-info "save-block-safe failed"
+                        {:original-title original-title
+                         :updated-title updated-title}))
+
+        :else
+        (do
+          (util/exit-edit)
+          (if (page-has-block-title? original-title)
+            (b/jump-to-block original-title)
+            (new-block-safe! original-title))
+          (recur (dec attempt)))))))
+
+(defn- append-barrier-marker!
+  [title]
+  ;; Execute the marker transaction in the active RTC client without relying
+  ;; on transient editor DOM or focus state left by the stress operations.
+  (let [block (ls-api-call! :editor.appendBlockInPage title)
+        block-uuid (or (get block "uuid") (get block :uuid))]
+    (when-not (and (string? block-uuid)
+                   (re-matches block-uuid-pattern block-uuid))
+      (throw (ex-info "barrier marker client write returned no durable block"
+                      {:title title
+                       :result block})))
+    (let [persisted-block (ls-api-call! :editor.getBlock block-uuid)
+          persisted-uuid (or (get persisted-block "uuid")
+                             (get persisted-block :uuid))
+          persisted-title (or (get persisted-block "title")
+                              (get persisted-block :title)
+                              (get persisted-block :block/title))]
+      (when-not (and (string? persisted-uuid)
+                     (re-matches block-uuid-pattern persisted-uuid)
+                     (= (string/lower-case block-uuid)
+                        (string/lower-case persisted-uuid))
+                     (= title persisted-title))
+        (throw
+         (ex-info "barrier marker client write was not durably readable"
+                  {:expected {:title title :uuid block-uuid}
+                   :result persisted-block}))))
+    block))
+
+(defn- sync-by-barrier!
   ([tag]
-   (sync-by-trigger! tag nil))
+   (sync-by-barrier! tag nil))
   ([tag checkpoints]
+   ;; Exiting edit mode can itself enqueue a transaction. Do it on both pages
+   ;; before creating either half of the causal barrier.
+   (doseq [pw-page [@*page1 @*page2]]
+     (w/with-page pw-page
+       (util/exit-edit)))
    (let [target-tx (some->> checkpoints
                             vals
                             (filter integer?)
@@ -157,37 +261,48 @@
          (rtc/wait-tx-update-to target-tx))
        (w/with-page @*page2
          (rtc/wait-tx-update-to target-tx)))
-     (let [{:keys [remote-tx]}
+     (let [{first-marker-tx :remote-tx}
            (w/with-page @*page1
              (rtc/with-wait-tx-updated
-               (new-block-safe! (str "sync-trigger-" tag))))]
+               (append-barrier-marker! (str "sync-trigger-" tag))))]
        (w/with-page @*page1
-         (rtc/wait-tx-update-to remote-tx))
+         (rtc/wait-tx-update-to first-marker-tx))
        (w/with-page @*page2
-         (rtc/wait-tx-update-to remote-tx))))))
+         (rtc/wait-tx-update-to first-marker-tx))
+       ;; The second client's acknowledgement is ordered after it observes the
+       ;; first marker and after any of its own pre-barrier queued transactions.
+       (let [{ack-marker-tx :remote-tx}
+             (w/with-page @*page2
+               (rtc/with-wait-tx-updated
+                 (append-barrier-marker! (str "sync-ack-" tag))))]
+         (w/with-page @*page1
+           (rtc/wait-tx-update-to ack-marker-tx))
+         (w/with-page @*page2
+           (rtc/wait-tx-update-to ack-marker-tx))
+         ack-marker-tx)))))
 
 (defn- seed-long-nested-page!
   [seed]
   (let [seed-blocks (max 20 (env-int "DB_SYNC_E2E_STRESS_SEED_BLOCKS" stress-default-seed-blocks))
-        rng (java.util.Random. (long (+ seed 97)))]
-    (let [titles
-          (w/with-page @*page1
-            (util/exit-edit)
-            (loop [i 0
-                   depth 0
-                   titles #{}]
-              (if (< i seed-blocks)
-                (let [title (format "seed-r%s-%03d" seed i)
-                      target-depth (.nextInt rng (inc stress-max-seed-depth))]
-                  (new-block-safe! title)
-                  (recur (inc i)
-                         (align-depth! depth target-depth)
-                         (conj titles title)))
-                (do
-                  (util/exit-edit)
-                  titles))))]
-      (sync-by-trigger! (str "seed-" seed))
-      titles)))
+        rng (java.util.Random. (long (+ seed 97)))
+        titles
+        (w/with-page @*page1
+          (util/exit-edit)
+          (loop [i 0
+                 depth 0
+                 titles #{}]
+            (if (< i seed-blocks)
+              (let [title (format "seed-r%s-%03d" seed i)
+                    target-depth (.nextInt rng (inc stress-max-seed-depth))]
+                (new-block-safe! title)
+                (recur (inc i)
+                       (align-depth! depth target-depth)
+                       (conj titles title)))
+              (do
+                (util/exit-edit)
+                titles))))]
+    (sync-by-barrier! (str "seed-" seed))
+    titles))
 
 (defn- next-action
   [rng]
@@ -229,7 +344,7 @@
       :save
       (let [save-title (str base "-save-updated")]
         (new-block-safe! (str base "-save"))
-        (b/save-block save-title)
+        (save-block-safe! (str base "-save") save-title)
         (swap! known-titles conj save-title)
         2)
 
@@ -333,13 +448,13 @@
               p2-undo-remote-tx (w/with-page @*page2
                                   (-> (rtc/get-rtc-tx) :local-tx))]
 
-          (sync-by-trigger!
+          (sync-by-barrier!
            round
            {:p1-edit p1-edit-remote-tx
             :p2-edit p2-edit-remote-tx
             :p1-undo p1-undo-remote-tx
             :p2-undo p2-undo-remote-tx})
-          (assert-two-pages-synced!)
+          (assert-two-pages-synced! (wait-for-two-pages-quiescent!))
           (assert-no-severe-sync-errors!))))))
 
 ;;; https://github.com/logseq/db-test/issues/651
@@ -371,11 +486,17 @@ wait for 5-10 seconds, will found that \"aaa/bbb\" became \"aaa/<encrypted-strin
       (w/with-page @*page2
         (rtc/wait-tx-update-to remote-tx)))
 
-;; check 'aaa/bbb' still exists
-    (w/with-page @*page1
-      (page/goto-page "aaa/bbb"))
-    (w/with-page @*page2
-      (page/goto-page "aaa/bbb"))
+    ;; The command palette no longer exposes the computed "aaa/bbb" title as
+    ;; a stable test id. Inspect the synced tag relation through the public API;
+    ;; #651 replaced the parent title with a transit/encryption payload.
+    (doseq [p [@*page1 @*page2]]
+      (w/with-page p
+        (let [child (first (ls-api-call! :editor.getTagsByName "bbb"))
+              parent-ids (get child ":logseq.property.class/extends")
+              parent (ls-api-call! :editor.getTag (first parent-ids))]
+          (is (= "bbb" (get child "title")))
+          (is (= 1 (count parent-ids)))
+          (is (= "aaa" (get parent "title"))))))
 
     (rtc/validate-graphs-in-2-pw-pages)))
 
@@ -433,16 +554,40 @@ wait for 5-10 seconds, will found that \"aaa/bbb\" became \"aaa/<encrypted-strin
 - remove local graph in client2
 - re-download the remote graph in client2
 - compare asset-blocks data in both clients"
-    (let [asset-file "../assets/icon.png"
-          page-title (w/with-page @*page1 (page/get-page-name))]
+    (let [asset-path (.toAbsolutePath
+                      (java.nio.file.Paths/get
+                       "../assets/icon.png"
+                       (into-array String [])))
+          page-title (w/with-page @*page1 (page/get-page-name))
+          expected-asset-sha256 (e2e-assets/file-sha256 asset-path)
+          asset-filename* (atom nil)
+          asset-block-uuid* (atom nil)]
       (w/with-page @*page1
-        (let [p (w/get-page)]
-          (.onFileChooser p (reify java.util.function.Consumer
-                              (accept [_ fc]
-                                (.setFiles fc (into-array java.nio.file.Path [(java.nio.file.Paths/get asset-file (into-array String []))])))))
-          (b/new-block "asset block")
-          (util/input-command "Upload an asset")
-          (w/wait-for ".ls-block img")))
+        (let [p (w/get-page)
+              before (e2e-assets/list-assets *graph-name*)
+              _ (when-not (util/get-editor)
+                  (b/open-last-block))
+              chooser (.waitForFileChooser
+                       p
+                       (reify Runnable
+                         (run [_]
+                           (util/input-command "Upload an asset"))))]
+          (.setFiles chooser (into-array java.nio.file.Path [asset-path]))
+          (let [filename (e2e-assets/wait-for-new-asset!
+                          *graph-name* before 60000)
+                asset-block-uuid (some-> filename
+                                         (string/replace #"\.[^.]+$" ""))]
+            (reset! asset-filename* filename)
+            (reset! asset-block-uuid* asset-block-uuid)
+            (is (string? filename)
+                (pr-str {:graph *graph-name*
+                         :assets-before before
+                         :assets (e2e-assets/list-assets *graph-name*)}))
+            (is (true? (e2e-assets/wait-for-asset!
+                        *graph-name* filename 60000))))
+          ;; A database transaction cursor does not imply that attachment
+          ;; upload has completed. Wait for both queues to drain.
+          (w/wait-for "button.cloud.on.idle" {:timeout 120000})))
 
       (let [{:keys [remote-tx]}
             (w/with-page @*page1
@@ -452,12 +597,39 @@ wait for 5-10 seconds, will found that \"aaa/bbb\" became \"aaa/<encrypted-strin
           (rtc/wait-tx-update-to remote-tx)))
 
       (w/with-page @*page2
-        (graph/remove-local-graph *graph-name*)
-        (graph/wait-for-remote-graph *graph-name*)
-        (graph/switch-graph *graph-name* true false)
-        (page/goto-page page-title)
-        (w/wait-for ".ls-block img")
-        (is (some? (.getAttribute (w/-query ".ls-block img") "src"))))
+        (let [asset-filename @asset-filename*
+              asset-block-uuid @asset-block-uuid*
+              asset-block-locator (format ".ls-block[blockid='%s']"
+                                          asset-block-uuid)]
+          (is (string? asset-filename))
+          (is (string? asset-block-uuid))
+          (page/goto-page-via-api page-title)
+          (w/wait-for asset-block-locator {:timeout 60000})
+
+          (graph/remove-local-graph *graph-name*)
+          (is (true? (e2e-assets/clear-assets-dir! *graph-name*)))
+          (is (not (some #(= asset-filename %)
+                         (e2e-assets/list-assets *graph-name*))))
+
+          (graph/wait-for-remote-graph *graph-name*)
+          (graph/switch-graph *graph-name* true false)
+          (page/goto-page-via-api page-title)
+
+          ;; Browser E2E exercises the lazy download path. Electron and CLI
+          ;; additionally prefetch these files during graph download.
+          (is (true? (e2e-assets/wait-for-asset!
+                      *graph-name* asset-filename 60000))
+              (pr-str {:graph *graph-name*
+                       :asset-filename asset-filename
+                       :assets (e2e-assets/list-assets *graph-name*)}))
+          (w/wait-for ".asset-container img" {:timeout 60000})
+          (is (= expected-asset-sha256
+                 (e2e-assets/asset-sha256 *graph-name* asset-filename))
+              "the restored bytes must match the uploaded file")
+          (is (pos? (w/eval-js
+                     "document.querySelector('.asset-container img')?.naturalWidth || 0"))
+              "the restored image must decode successfully")
+          (w/wait-for asset-block-locator {:timeout 60000})))
 
       (rtc/validate-graphs-in-2-pw-pages))))
 

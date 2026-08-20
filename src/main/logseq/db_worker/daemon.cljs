@@ -13,6 +13,49 @@
 
 (def ^:private embedding-url-env "LOGSEQ_EMBEDDINGS_URL")
 
+(def ^:private inherit-proxy-env ::inherit)
+(def ^:private proxy-env-keys
+  ["HTTP_PROXY" "HTTPS_PROXY" "ALL_PROXY"
+   "NO_PROXY" "http_proxy" "https_proxy" "all_proxy" "no_proxy"])
+(def ^:private local-proxy-bypass ["localhost" "127.0.0.1" "::1"])
+(defonce ^:private *proxy-env (atom inherit-proxy-env))
+
+(defn configure-proxy-env!
+  "Configure the proxy environment inherited by subsequently spawned db-worker-node processes.
+  Use :inherit for CLI callers that should retain the parent process environment, and nil for direct mode."
+  [proxy]
+  (reset! *proxy-env (if (= :inherit proxy) inherit-proxy-env proxy)))
+
+(defn- proxy-bypass
+  [env]
+  (->> [(aget env "NO_PROXY") (aget env "no_proxy")]
+       (mapcat #(string/split (or % "") #","))
+       (map string/trim)
+       (remove #(or (string/blank? %) (= "*" %)))
+       (concat local-proxy-bypass)
+       distinct
+       (string/join ",")))
+
+(defn- apply-proxy-env!
+  [env]
+  (let [proxy @*proxy-env
+        bypass (proxy-bypass env)]
+    (when-not (= inherit-proxy-env proxy)
+      (doseq [key proxy-env-keys]
+        (js-delete env key))
+      (when (and (map? proxy) (:protocol proxy) (:host proxy) (:port proxy))
+        (let [proxy-url (str (:protocol proxy) "://" (:host proxy) ":" (:port proxy))
+              socks-proxy? (contains? #{"socks4" "socks5"} (:protocol proxy))
+              keys (if socks-proxy?
+                     ["ALL_PROXY" "all_proxy"]
+                     ["HTTP_PROXY" "HTTPS_PROXY" "http_proxy" "https_proxy"])]
+          (doseq [key keys]
+            (aset env key proxy-url))
+          (when-not socks-proxy?
+            (aset env "NO_PROXY" bypass)
+            (aset env "no_proxy" bypass)))))
+    env))
+
 (defn normalize-owner-source
   [owner-source]
   (let [owner-source (cond
@@ -231,7 +274,10 @@
                         create-empty-db? (conj "--create-empty-db")
                         (seq embedding-endpoint) (conj "--embedding-endpoint" embedding-endpoint)
                         (seq embedding-model-id) (conj "--embedding-model-id" embedding-model-id)))
-        env (js/Object.assign #js {} (.-env js/process) #js {:ELECTRON_RUN_AS_NODE "1"})]
+        env (apply-proxy-env!
+             (js/Object.assign #js {} (.-env js/process) #js {:ELECTRON_RUN_AS_NODE "1"
+                                                               :NODE_USE_ENV_PROXY "1"
+                                                               :NODE_USE_SYSTEM_CA "1"}))]
     (when (and (= :electron owner-source)
                (not (seq embedding-endpoint)))
       (js-delete env embedding-url-env))
