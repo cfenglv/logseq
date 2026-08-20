@@ -762,6 +762,16 @@
                   {:status :ok
                    :data status}
 
+                  (= :repair-required ws-state)
+                  {:status :error
+                   :error {:code :sync-repair-required
+                           :message "sync stopped after detecting a persistent data inconsistency"
+                           :repo repo
+                           :ws-state ws-state
+                           :status status
+                           :last-error last-error
+                           :hint runtime-error-hint}}
+
                   (and initial? (contains? sync-start-skipped-states ws-state))
                   (p/let [_ (invoke-with-repo config repo :thread-api/db-sync-start [repo])
                           _ (p/delay poll-interval-ms)]

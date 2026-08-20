@@ -16,6 +16,16 @@ const readJson = (relativePath) =>
 
 const rootPackage = readJson("package.json");
 const desktopPackage = readJson("resources/package.json");
+const dbSyncPackage = readJson("deps/db-sync/package.json");
+const dbSyncWorkspace = readText("deps/db-sync/pnpm-workspace.yaml");
+const desktopPackagingGulpfile = readText("gulpfile.js");
+const desktopPackagingWorkflow = readText(".github/workflows/build-desktop-release.yml");
+const unsignedDesktopBuilder = readText("resources/electron-builder-unsigned.mjs");
+const unsignedDesktopConfig = readText("resources/electron-builder.unsigned.yml");
+const adhocAfterSign = readText("resources/electron-builder-adhoc-after-sign.cjs");
+const verifyDesktopRuntimeRevisionsScript = readText(
+  "scripts/verify-desktop-runtime-revisions.mjs",
+);
 
 const zvecOptionalRuntimeDependencies = [
   "@zvec/bindings-darwin-arm64",
@@ -47,6 +57,50 @@ const assertRootScriptDoesNotBuildShadowCli = (scriptName, command) => {
     `${scriptName} should not build the old Shadow CLI`,
   );
 };
+
+assert.equal(
+  desktopPackage.scripts["electron:make-unsigned"],
+  "node ./electron-builder-unsigned.mjs",
+  "the standalone desktop artifact should run its bundled unsigned builder",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /resourceFilePath = path\.join\(resourcesPath, '\*\*'\)/,
+  "desktop resource sync should include the bundled signing scripts",
+);
+
+assert.match(
+  rootPackage.scripts["desktop:verify-runtime-revisions"],
+  /verify-desktop-runtime-revisions\.mjs/,
+  "package.json should expose desktop runtime revision verification",
+);
+assert.match(
+  desktopPackagingGulpfile,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop packaging should reject inconsistent runtime revisions",
+);
+assert.match(
+  desktopPackagingWorkflow,
+  /pnpm desktop:verify-runtime-revisions/,
+  "desktop release CI should reject inconsistent runtime revisions",
+);
+for (const relativePath of [
+  "static/electron.js",
+  "static/db-worker-node.js",
+  "static/logseq-cli.js",
+  "dist/db-worker-node.js",
+  "static/js/db-worker-node.js",
+  "static/js/logseq-cli.js",
+  "static/js/main.js",
+  "static/js/db-worker.js",
+  "static/js/publishing/main.js",
+]) {
+  assert.match(
+    verifyDesktopRuntimeRevisionsScript,
+    new RegExp(relativePath.replaceAll("/", "[\\\\/]")),
+    `runtime revision verification should cover ${relativePath}`,
+  );
+}
 
 const assertCliReleaseCommand = (command, label) => {
   assert.match(command, /pnpm --dir cli bundle/, `${label} should bundle cli/`);
@@ -140,6 +194,163 @@ assertNotContains(
   desktopReleaseWorkflow,
   "clojure -M:cljs release logseq-cli",
   "desktop release workflow",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /name: Signing By Apple Developer ID\s+if: \$\{\{ github\.repository == 'logseq\/logseq' \}\}/,
+  "desktop release workflow Apple signing should not exclude forks",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /HAS_APPLE_SIGNING: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 != '' \}\}/,
+  "desktop release workflow should expose only a non-secret signing availability flag at job scope",
+);
+assert.doesNotMatch(
+  desktopReleaseWorkflow,
+  /^\s{6}APPLE_CERTIFICATES_P12: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 \}\}$/m,
+  "desktop release workflow should not expose the signing certificate at job scope",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /p12-file-base64: \$\{\{ secrets\.APPLE_CERTIFICATES_P12 \}\}/,
+  "desktop release workflow should pass the signing certificate only to the import step",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /if: \$\{\{ env\.HAS_APPLE_SIGNING == 'true' \}\}/,
+  "desktop release workflow should import Apple certificates when a fork configures them",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /permissions:\s+contents: read/,
+  "desktop release workflow should default to read-only repository permissions",
+);
+for (const job of ["nightly-release", "release"]) {
+  assert.match(
+    desktopReleaseWorkflow,
+    new RegExp(`${job}:\\n[\\s\\S]*?permissions:\\n\\s+contents: write`),
+    `${job} should receive write permission explicitly`,
+  );
+}
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?pnpm cljs:test[\s\S]*?pnpm --dir deps\/db-sync test[\s\S]*?pnpm --dir deps\/db-sync test:large-op-128m/,
+  "desktop release workflow should gate packaging on client and server RTC tests",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /clojure -M:test release db-sync-backup-memory-test[\s\S]*?node --expose-gc --max-old-space-size=128[\s\S]*?static\/db-sync-backup-memory-test\.js/,
+  "RTC release gate should exercise durable client backup under a 128 MB heap",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /frontend\\\.handler\\\.db-based\\\.\(rtc-background-tasks\|sync\)-test/,
+  "RTC release gate should include suspend, resume, and background trigger coverage",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /frontend\\\.worker\\\.\(db-core\|db-sync\|db-sync-sim\|db-worker\|pipeline\|platform-node\|state\)-test/,
+  "RTC release gate should execute db-worker import and cleanup coverage",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /logseq\\\.cli\\\.command\\\.sync-test/,
+  "RTC release gate should include CLI repair-required behavior",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?pnpm --dir deps\/db-sync install --frozen-lockfile[\s\S]*?pnpm --dir deps\/db-sync test/,
+  "RTC release gate should install the isolated db-sync dependency tree before testing it",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?pnpm --dir deps\/db-sync release[\s\S]*?pnpm --dir deps\/db-sync build:api-docs[\s\S]*?pnpm exec wrangler deploy --dry-run --env=""/,
+  "RTC release gate should build all Worker assets and dry-run the production bundle",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /name: Update APP Version\s+run: pnpm pkg set version="\$\{\{ steps\.ref\.outputs\.version \}\}"\s+working-directory: \.\/static/,
+  "desktop release workflow should update any previous static package version",
+);
+assert.equal(
+  dbSyncPackage.packageManager,
+  "pnpm@10.33.0",
+  "db-sync should pin the same pnpm version used by CI",
+);
+assert.equal(
+  dbSyncPackage.devDependencies.wrangler,
+  "4.113.0",
+  "db-sync deployments should use a reproducible Wrangler version",
+);
+assert.match(
+  dbSyncWorkspace,
+  /allowBuilds:[\s\S]*"@sentry\/cli": true[\s\S]*better-sqlite3: true[\s\S]*esbuild: true[\s\S]*sharp: true[\s\S]*workerd: true/,
+  "db-sync should explicitly allow only its required native install scripts",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /compile-cljs:[\s\S]*?needs: \[ rtc-release-gate \]/,
+  "desktop compilation should wait for the RTC release gate",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /rtc-release-gate:[\s\S]*?persist-credentials: false/,
+  "RTC test checkout should not retain repository credentials",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /spctl --assess --type execute/,
+  "desktop release workflow should verify notarized apps with Gatekeeper",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /xcrun stapler validate/,
+  "desktop release workflow should verify stapled notarization tickets",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --x64/,
+  "fork desktop release workflow should build an unsigned macOS x64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Build\/Release Electron App for x64[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace[\s\S]*?pnpm rebuild:all/,
+  "macOS x64 dependencies should be installed outside the root workspace",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /electron:make-unsigned --mac dmg zip --arm64/,
+  "fork desktop release workflow should build an unsigned macOS arm64 app",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /Fetch deps[\s\S]*?pnpm install --frozen-lockfile --ignore-workspace --config\.supportedArchitectures\.os=darwin --config\.supportedArchitectures\.cpu=arm64/,
+  "macOS arm64 dependencies should be installed outside the root workspace",
+);
+assert.match(
+  desktopReleaseWorkflow,
+  /ELECTRON_RUN_AS_NODE=1/,
+  "fork desktop release workflow should smoke-test the packaged Electron runtime",
+);
+assert.match(
+  unsignedDesktopBuilder,
+  /electron-builder\.unsigned\.yml/,
+  "unsigned desktop builds should use the ad-hoc signing configuration",
+);
+assert.match(
+  unsignedDesktopConfig,
+  /afterSign: \.\/electron-builder-adhoc-after-sign\.cjs/,
+  "unsigned macOS builds should re-sign the completed application bundle",
+);
+assert.match(
+  adhocAfterSign,
+  /"--sign",\s+"-"/,
+  "the fork afterSign hook should use an ad-hoc identity",
+);
+assert.match(
+  adhocAfterSign,
+  /entitlements\.local-signed\.plist/,
+  "the fork afterSign hook should disable library validation",
 );
 
 const shadowCljs = readText("shadow-cljs.edn");

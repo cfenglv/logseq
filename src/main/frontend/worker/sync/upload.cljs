@@ -12,6 +12,7 @@
    [frontend.worker.sync.large-title :as sync-large-title]
    [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
    [frontend.worker.sync.util :refer [coerce-http-request fail-fast fetch-json] :as sync-util]
+   [lambdaisland.glogi :as log]
    [logseq.common.config :as common-config]
    [logseq.db :as ldb]
    [logseq.db-sync.checksum :as sync-checksum]
@@ -153,28 +154,49 @@
       (p/resolved {:body frame :encoding nil}))))
 
 (defn- snapshot-upload-url
-  [base graph-id reset? finished? checksum]
-  (str base "/sync/" graph-id "/snapshot/upload?reset="
+  [base graph-id reset? finished? checksum row-count upload-id v2?]
+  (str base
+       "/sync/"
+       graph-id
+       (if v2? "/snapshot/upload-v2?reset=" "/snapshot/upload?reset=")
        (if reset? "true" "false")
        "&finished="
        (if finished? "true" "false")
        (when finished?
-         (str "&checksum=" (js/encodeURIComponent checksum)))))
+         (str "&checksum=" (js/encodeURIComponent checksum)))
+       (when v2?
+         (str "&row-count=" row-count))
+       (when (seq upload-id)
+         (str "&upload-id=" (js/encodeURIComponent upload-id)))))
 
 (defn- <upload-snapshot-rows-batches!
-  [rows-batches {:keys [base graph-id first-batch? finished? checksum auth-fetch-f]}]
-  (p/loop [remaining rows-batches
+  [rows-batches {:keys [base graph-id first-batch? finished? checksum
+                        row-count upload-id auth-fetch-f v2?]
+                 :or {v2? true}}]
+  (let [rows-batches (if (and (empty? rows-batches)
+                              first-batch?
+                              finished?)
+                       [[]]
+                       rows-batches)]
+    (p/loop [remaining rows-batches
            first-request? first-batch?]
-    (if-let [rows-batch (first remaining)]
-      (let [last-request? (nil? (next remaining))
-            finished-request? (and finished? last-request?)
-            upload-url (snapshot-upload-url base graph-id first-request? finished-request? checksum)]
-        (p/let [{:keys [body encoding]} (<snapshot-upload-body rows-batch)
-                headers (cond-> {"content-type" snapshot-content-type}
-                          (string? encoding) (assoc "content-encoding" encoding))
-                _ (auth-fetch-f upload-url headers body)]
-          (p/recur (next remaining) false)))
-      nil)))
+      (if-let [rows-batch (first remaining)]
+        (let [last-request? (nil? (next remaining))
+              finished-request? (and finished? last-request?)
+              upload-url (snapshot-upload-url base
+                                              graph-id
+                                              first-request?
+                                              finished-request?
+                                              checksum
+                                              row-count
+                                              upload-id
+                                              v2?)]
+          (p/let [{:keys [body encoding]} (<snapshot-upload-body rows-batch)
+                  headers (cond-> {"content-type" snapshot-content-type}
+                            (string? encoding) (assoc "content-encoding" encoding))
+                  _ (auth-fetch-f upload-url headers body)]
+            (p/recur (next remaining) false)))
+        nil))))
 (defn <prepare-upload-temp-sqlite!
   [repo graph-id source-conn aes-key update-progress]
   (p/let [temp (sync-temp-sqlite/<create-temp-sqlite-conn (d/schema @source-conn) [])
@@ -321,6 +343,21 @@
   [target-graph-name {:keys [graph-name]}]
   (= target-graph-name graph-name))
 
+(defn- resumable-remote-graph?
+  [repo requested-graph-e2ee?
+   {:keys [graph-id graph-e2ee? graph-ready-for-use? owned?]}]
+  (let [local-graph-id (sync-util/get-graph-id repo)]
+    (and (or (and (seq local-graph-id)
+                  (= local-graph-id graph-id))
+             ;; If graph creation committed but its response was lost, the
+             ;; server-owned incomplete graph is the only safe name match to
+             ;; resume. Shared graphs never satisfy this branch.
+             (and (not (seq local-graph-id))
+                  (true? owned?)))
+         (false? graph-ready-for-use?)
+         (= (normalize-graph-e2ee? requested-graph-e2ee?)
+            (normalize-graph-e2ee? graph-e2ee?)))))
+
 (defn create-remote-graph!
   [repo {:keys [graph-e2ee? graph-ready-for-use?]}]
   (let [target-graph-name (some-> repo common-config/strip-leading-db-version-prefix)]
@@ -340,12 +377,99 @@
                                                      :match-count (count matching-graphs)})
 
           (= 1 (count matching-graphs))
-          (fail-upload-graph-already-exists! repo {:graph-name target-graph-name})
+          (let [graph (first matching-graphs)
+                graph-id (:graph-id graph)
+                remote-graph-e2ee? (:graph-e2ee? graph)]
+            (if (resumable-remote-graph? repo graph-e2ee? graph)
+              (persist-upload-graph-identity! repo graph-id remote-graph-e2ee?)
+              (fail-upload-graph-already-exists! repo graph)))
 
           :else
           (p/let [_ (sync-crypt/<preflight-upload-e2ee! repo graph-e2ee?)]
             (<create-remote-graph-aux! repo {:graph-e2ee? graph-e2ee?
                                              :graph-ready-for-use? graph-ready-for-use?})))))))
+
+(defn- <upload-temp-snapshot!
+  [db {:keys [base graph-id snapshot-checksum upload-id
+              total-rows update-progress v2?]}]
+  (p/loop [last-addr -1
+           first-batch? true
+           loaded 0]
+    (let [rows (fetch-kvs-rows db last-addr upload-kvs-batch-size)]
+      (if (empty? rows)
+        (<upload-snapshot-rows-batches!
+         []
+         {:base base
+          :graph-id graph-id
+          :first-batch? first-batch?
+          :finished? true
+          :checksum snapshot-checksum
+          :row-count total-rows
+          :upload-id upload-id
+          :v2? v2?
+          :auth-fetch-f
+          (fn [upload-url headers body]
+            (fetch-json
+             upload-url
+             {:method "POST"
+              :headers headers
+              :body body}
+             {:response-schema :sync/snapshot-upload}))})
+        (let [max-addr (apply max (map first rows))
+              rows* (normalize-snapshot-rows rows)
+              loaded' (+ loaded (count rows*))
+              finished? (= loaded' total-rows)
+              row-batches (split-snapshot-rows-by-max-bytes
+                           rows* snapshot-upload-max-bytes)
+              batch-payloads
+              (mapv (fn [rows-batch]
+                      {:rows (count rows-batch)
+                       :payload-bytes (snapshot-rows-byte-length rows-batch)})
+                    row-batches)]
+          (prn :db-sync/upload-kvs-batch
+               {:protocol (if v2? :snapshot-v2 :snapshot-v1)
+                :total-kvs-rows total-rows
+                :fetched-kvs-rows (count rows*)
+                :upload-kvs-batch-size upload-kvs-batch-size
+                :split-batch-count (count row-batches)
+                :split-batches batch-payloads
+                :max-request-bytes snapshot-upload-max-bytes})
+          (p/let [_ (<upload-snapshot-rows-batches!
+                     row-batches
+                     {:base base
+                      :graph-id graph-id
+                      :first-batch? first-batch?
+                      :finished? finished?
+                      :checksum snapshot-checksum
+                      :row-count total-rows
+                      :upload-id upload-id
+                      :v2? v2?
+                      :auth-fetch-f
+                      (fn [upload-url headers body]
+                        (fetch-json
+                         upload-url
+                         {:method "POST"
+                          :headers headers
+                          :body body}
+                         {:response-schema :sync/snapshot-upload}))})]
+            (update-progress {:sub-type :upload-progress
+                              :message (str "Uploading " loaded' "/" total-rows)})
+            (p/recur max-addr false loaded')))))))
+
+(defn- <upload-temp-snapshot-with-fallback!
+  [db opts]
+  (-> (<upload-temp-snapshot! db (assoc opts :v2? true))
+      (p/catch
+       (fn [error]
+         (if (= 404 (:status (ex-data error)))
+           (do
+             (log/warn :db-sync/snapshot-v2-unavailable
+                       {:graph-id (:graph-id opts)
+                        :fallback :snapshot-v1})
+             ;; <upload-temp-snapshot! always starts at addr -1, so the v1
+             ;; reset request cannot continue a partially accepted v2 upload.
+             (<upload-temp-snapshot! db (assoc opts :v2? false)))
+           (p/rejected error))))))
 
 (defn upload-graph!
   [repo]
@@ -360,7 +484,8 @@
       (if-let [source-conn (worker-state/get-datascript-conn repo)]
         (p/let [graph-e2ee? (normalize-graph-e2ee? (sync-crypt/graph-e2ee? repo))
                 {:keys [graph-id]} (create-remote-graph! repo {:graph-e2ee? graph-e2ee?
-                                                               :graph-ready-for-use? false})]
+                                                               :graph-ready-for-use? false})
+                upload-id (str (random-uuid))]
           (p/let [aes-key (when graph-e2ee?
                             (sync-crypt/<ensure-graph-aes-key repo graph-id))
                   _ (when (and graph-e2ee? (nil? aes-key))
@@ -372,53 +497,22 @@
                       {:keys [db] :as temp} (<prepare-upload-temp-sqlite!
                                              repo graph-id source-conn aes-key update-progress)
                       total-rows (count-kvs-rows db)]
-                (-> (p/loop [last-addr -1
-                             first-batch? true
-                             loaded 0]
-                      (let [rows (fetch-kvs-rows db last-addr upload-kvs-batch-size)]
-                        (if (empty? rows)
-                          (do
-                            (sync-apply/clear-pending-txs! repo)
-                            (client-op/reset-local-tx repo)
-                            (client-op/add-all-exists-asset-as-ops repo)
-                            (update-progress {:sub-type :upload-completed
-                                              :message "Graph upload finished!"})
-                            {:graph-id graph-id})
-                          (let [max-addr (apply max (map first rows))
-                                rows* (normalize-snapshot-rows rows)
-                                loaded' (+ loaded (count rows*))
-                                finished? (= loaded' total-rows)
-                                row-batches (split-snapshot-rows-by-max-bytes rows* snapshot-upload-max-bytes)
-                                batch-payloads
-                                (mapv (fn [rows-batch]
-                                        {:rows (count rows-batch)
-                                         :payload-bytes (snapshot-rows-byte-length rows-batch)})
-                                      row-batches)]
-                            (prn :db-sync/upload-kvs-batch
-                                 {:total-kvs-rows total-rows
-                                  :fetched-kvs-rows (count rows*)
-                                  :upload-kvs-batch-size upload-kvs-batch-size
-                                  :split-batch-count (count row-batches)
-                                  :split-batches batch-payloads
-                                  :max-request-bytes snapshot-upload-max-bytes})
-                            (p/let [_ (<upload-snapshot-rows-batches!
-                                       row-batches
-                                       {:base base
-                                        :graph-id graph-id
-                                        :first-batch? first-batch?
-                                        :finished? finished?
-                                        :checksum snapshot-checksum
-                                        :auth-fetch-f
-                                        (fn [upload-url headers body]
-                                          (fetch-json
-                                           upload-url
-                                           {:method "POST"
-                                            :headers headers
-                                            :body body}
-                                           {:response-schema :sync/snapshot-upload}))})]
-                              (update-progress {:sub-type :upload-progress
-                                                :message (str "Uploading " loaded' "/" total-rows)})
-                              (p/recur max-addr false loaded'))))))
+                (-> (<upload-temp-snapshot-with-fallback!
+                     db
+                     {:base base
+                      :graph-id graph-id
+                      :snapshot-checksum snapshot-checksum
+                      :upload-id upload-id
+                      :total-rows total-rows
+                      :update-progress update-progress})
+                    (p/then
+                     (fn [_]
+                       (sync-apply/clear-pending-txs! repo)
+                       (client-op/reset-local-tx repo)
+                       (client-op/add-all-exists-asset-as-ops repo)
+                       (update-progress {:sub-type :upload-completed
+                                         :message "Graph upload finished!"})
+                       {:graph-id graph-id}))
                     (p/finally
                       (fn []
                         (sync-temp-sqlite/cleanup-temp-sqlite! temp))))))))

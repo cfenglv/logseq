@@ -26,6 +26,35 @@
     (task)
     (p/resolved nil)))
 
+(deftest asset-string-payload-size-uses-utf8-bytes-test
+  (is (= 4 (#'sync-assets/payload-size "a中"))))
+
+(deftest asset-upload-retries-without-size-header-for-legacy-server-test
+  (async done
+         (let [original-fetch js/fetch
+               calls* (atom [])]
+           (set! js/fetch
+                 (fn [_url opts]
+                   (swap! calls* conj (.-headers opts))
+                   (if (= 1 (count @calls*))
+                     (p/rejected (js/TypeError. "CORS preflight rejected"))
+                     (p/resolved #js {:ok true :status 200}))))
+           (-> (#'sync-assets/<put-remote-asset!
+                "https://sync.example.test/assets/graph/asset.png"
+                {"authorization" "Bearer token"
+                 "x-logseq-asset-size" "3"}
+                (js/Uint8Array. #js [1 2 3]))
+               (p/then (fn [response]
+                         (is (.-ok response))
+                         (is (= 2 (count @calls*)))
+                         (is (= "3" (aget (first @calls*) "x-logseq-asset-size")))
+                         (is (nil? (aget (second @calls*) "x-logseq-asset-size")))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally (fn []
+                            (set! js/fetch original-fetch)
+                            (done)))))))
+
 (deftest request-asset-download-skips-existing-local-asset-test
   (async done
          (let [repo "asset-download-repo"
@@ -151,7 +180,8 @@
                  (fn [url opts]
                    (reset! fetch-call*
                            {:url url
-                            :body (.-body opts)})
+                            :body (.-body opts)
+                            :headers (js->clj (.-headers opts) :keywordize-keys true)})
                    (p/resolved #js {:ok true
                                      :status 200})))
            (-> (p/with-redefs [sync-assets/graph-aes-key
@@ -173,7 +203,9 @@
                (p/then
                 (fn [_]
                   (is (instance? js/Uint8Array @encrypt-input*))
-                  (is (= expected-body (:body @fetch-call*)))))
+                  (is (= expected-body (:body @fetch-call*)))
+                  (is (= (str (count expected-body))
+                         (get-in @fetch-call* [:headers :x-logseq-asset-size])))))
                (p/catch
                 (fn [error]
                   (is false (str "unexpected error: " error))))
@@ -330,7 +362,7 @@
                                  :skipped-existing 0}
                                 result))
                          (is (= 12 (count @download-calls)))
-                         (is (= 10 @max-active-downloads))))
+                         (is (= 2 @max-active-downloads))))
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
                (p/finally done)))))

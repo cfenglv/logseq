@@ -131,6 +131,7 @@
    [:schema-version {:optional true} [:maybe :string]]
    [:graph-e2ee? {:optional true} :boolean]
    [:graph-ready-for-use? {:optional true} :boolean]
+   [:owned? {:optional true} :boolean]
    [:role {:optional true} [:maybe graph-member-role-schema]]
    [:invited-by {:optional true} [:maybe :string]]
    [:created-at :int]
@@ -236,6 +237,9 @@
    [:ok :boolean]
    [:key :string]
    [:url :string]
+   [:t {:optional true} :int]
+   [:row-count {:optional true} :int]
+   [:checksum {:optional true} [:maybe :string]]
    [:content-encoding {:optional true} [:maybe :string]]])
 
 (def snapshot-upload-response-schema

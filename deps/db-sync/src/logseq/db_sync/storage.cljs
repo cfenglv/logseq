@@ -33,6 +33,29 @@
 (defn init-schema! [sql]
   (common/sql-exec sql "create table if not exists kvs (addr INTEGER primary key, content TEXT, addresses JSON)")
   (common/sql-exec sql
+                   "create table if not exists snapshot_kvs_staging (addr INTEGER primary key, content TEXT, addresses JSON)")
+  (common/sql-exec
+   sql
+   (str "create table if not exists snapshot_downloads ("
+        "download_id TEXT primary key,"
+        "t INTEGER not null,"
+        "checksum TEXT,"
+        "row_count INTEGER not null,"
+        "created_at INTEGER not null"
+        ");"))
+  (common/sql-exec
+   sql
+   (str "create table if not exists snapshot_kvs_exports ("
+        "download_id TEXT not null,"
+        "addr INTEGER not null,"
+        "content TEXT,"
+        "addresses JSON,"
+        "primary key(download_id, addr)"
+        ");"))
+  ;; The composite primary key already provides the lookup/order index.
+  (common/sql-exec sql
+                   "drop index if exists snapshot_kvs_exports_download_id")
+  (common/sql-exec sql
                    (str "create table if not exists tx_log ("
                         "t INTEGER primary key,"
                         "tx TEXT not null,"
@@ -75,6 +98,13 @@
   (set-meta! sql :t t))
 
 (def ^:dynamic *in-sql-transaction?* false)
+(defonce ^:private sql->transaction-sync (js/WeakMap.))
+
+(defn register-transaction-sync!
+  [sql transaction-sync-f]
+  (when (and sql (fn? transaction-sync-f))
+    (.set sql->transaction-sync sql transaction-sync-f))
+  sql)
 
 (defn with-sql-transaction!
   [sql f]
@@ -83,13 +113,15 @@
     (let [f' (fn []
                (binding [*in-sql-transaction?* true]
                  (f)))]
-      (if-let [db (aget sql "_db")]
-        (let [transaction (.-transaction db)]
-          (if (fn? transaction)
-            (let [tx-fn (.call transaction db f')]
-              (tx-fn))
-            (f')))
-        (f')))))
+      (if-let [transaction-sync (.get sql->transaction-sync sql)]
+        (transaction-sync f')
+        (if-let [db (aget sql "_db")]
+          (let [transaction (.-transaction db)]
+            (if (fn? transaction)
+              (let [tx-fn (.call transaction db f')]
+                (tx-fn))
+              (f')))
+          (f'))))))
 
 (defn set-initial-checksum! [sql checksum]
   (with-sql-transaction!

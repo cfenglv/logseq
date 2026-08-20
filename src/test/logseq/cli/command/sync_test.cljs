@@ -862,6 +862,45 @@
                           (is false (str "unexpected error: " e))))
                (p/finally done)))))
 
+(deftest test-execute-sync-start-stops-on-repair-required
+  (async done
+         (let [start-calls (atom 0)
+               last-error {:type :db-sync/checksum-mismatch
+                           :message "checksum mismatch"}]
+           (-> (p/with-redefs [cli-server/ensure-server! (fn [config _repo]
+                                                           (p/resolved (assoc config :base-url "http://example")))
+                               transport/invoke (fn [_ method _args]
+                                                  (case method
+                                                    :thread-api/db-sync-start
+                                                    (do
+                                                      (swap! start-calls inc)
+                                                      (p/resolved nil))
+
+                                                    :thread-api/db-sync-status
+                                                    (p/resolved {:repo "logseq_db_demo"
+                                                                 :ws-state :repair-required
+                                                                 :pending-local 3
+                                                                 :pending-asset 0
+                                                                 :pending-server 1
+                                                                 :last-error last-error})
+
+                                                    (p/resolved {:ok true})))]
+                 (p/let [result (execute-with-runtime-auth
+                                 {:type :sync-start
+                                  :repo "logseq_db_demo"
+                                  :wait-timeout-ms 200
+                                  :wait-poll-interval-ms 0}
+                                 {:root-dir "/tmp"})]
+                   (is (= :error (:status result)))
+                   (is (= :sync-repair-required (get-in result [:error :code])))
+                   (is (= last-error (get-in result [:error :last-error])))
+                   ;; execute-sync-start issues one explicit start request before
+                   ;; polling; repair-required must prevent any retry request.
+                   (is (= 1 @start-calls))))
+               (p/catch (fn [e]
+                          (is false (str "unexpected error: " e))))
+               (p/finally done)))))
+
 (deftest test-execute-sync-stop-syncs-non-auth-config-only
   (async done
          (let [ensure-calls (atom [])

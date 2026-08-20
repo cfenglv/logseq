@@ -1,9 +1,30 @@
 (ns logseq.db-sync.node-server-test
   (:require [cljs.test :refer [async deftest is]]
+            [logseq.db-sync.node.graph :as graph]
             [logseq.db-sync.node.server :as node-server]
+            [logseq.db-sync.node.storage :as node-storage]
             [logseq.db-sync.platform.node :as platform-node]
             [logseq.db-sync.worker.auth :as auth]
             [promesa.core :as p]))
+
+(deftest node-graph-delete-terminates-websockets-before-closing-storage-test
+  (let [events* (atom [])
+        socket #js {:terminate (fn []
+                                (swap! events* conj :socket-terminated))}
+        sql #js {:close (fn []
+                         (swap! events* conj :sql-closed))}
+        ctx #js {:state #js {:getWebSockets (fn [] #js [socket])}
+                 :sql sql}
+        registry (atom {"graph-1" ctx})]
+    (with-redefs [node-storage/delete-graph-db!
+                  (fn [_data-dir _graph-id]
+                    (swap! events* conj :storage-deleted))]
+      (graph/delete-graph! registry {:config {:data-dir "/tmp/test"}}
+                           "graph-1"))
+    (is (= [:socket-terminated :sql-closed :storage-deleted]
+           @events*))
+    (is (true? (.-deleting ctx)))
+    (is (empty? @registry))))
 
 (defn- fetch-with-timeout [url timeout-ms]
   (let [timeout-sentinel ::timeout]
@@ -112,52 +133,48 @@
                       (is false (str error))
                       (done)))))))))
 
-(deftest node-server-logs-request-failed-marker-when-auth-claims-rejects-test
+(deftest node-server-start-rejects-when-port-is-already-in-use-test
   (async done
-         (let [stop-server! (atom nil)
-               original-console-error (.-error js/console)
-               logged-errors (atom [])]
-           (aset js/console
-                 "error"
-                 (fn [& args]
-                   (swap! logged-errors conj args)))
-           (-> (p/with-redefs [auth/auth-claims
-                               (fn [_request _env]
-                                 (p/rejected (ex-info "jwks" {})))]
-                 (p/let [{:keys [base-url stop!]} (node-server/start! {:port 0
-                                                                       :data-dir (str "tmp/db-sync-node-server-log-test/" (random-uuid))})
-                         _ (reset! stop-server! stop!)
-                         _ (reset! logged-errors [])
-                         {:keys [promise sentinel]} (fetch-with-timeout (str base-url "/graphs") 1200)
-                         response promise]
-                   (if (identical? response sentinel)
-                     (is false "request timed out")
-                     (do
-                       (is (= 500 (.-status response)))
-                       (is (some #(= ":db-sync/node-request-failed" (first %))
-                                 @logged-errors))))))
+         (let [first-server* (atom nil)
+               cleanup! (fn []
+                          (if-let [stop! (:stop! @first-server*)]
+                            (stop!)
+                            (p/resolved nil)))
+               finish! (fn [assertions]
+                         (try
+                           (assertions)
+                           (catch :default error
+                             (is false (str error))))
+                         (-> (cleanup!)
+                             (p/then (fn [] (done)))
+                             (p/catch (fn [error]
+                                        (is false (str error))
+                                        (done)))))]
+           (-> (node-server/start!
+                {:port 0
+                 :data-dir
+                 (str "tmp/db-sync-node-server-port-owner/" (random-uuid))})
                (p/then
-                (fn []
-                  (aset js/console "error" original-console-error)
-                  (if-let [stop! @stop-server!]
-                    (-> (stop!)
-                        (p/then (fn [] (done)))
-                        (p/catch (fn [error]
-                                   (is false (str error))
-                                   (done))))
-                    (done))))
+                (fn [first-server]
+                  (reset! first-server* first-server)
+                  (let [second-start
+                        (try
+                          (node-server/start!
+                           {:port (:port first-server)
+                            :data-dir
+                            (str "tmp/db-sync-node-server-port-conflict/"
+                                 (random-uuid))})
+                          (catch :default error
+                            (p/rejected error)))]
+                    (.then (js/Promise.resolve second-start)
+                           (fn [second-server]
+                             (when-let [stop! (:stop! second-server)]
+                               (stop!))
+                             (finish!
+                              #(is false "expected EADDRINUSE rejection")))
+                           (fn [error]
+                             (finish!
+                              #(is (= "EADDRINUSE" (.-code error)))))))))
                (p/catch
                 (fn [error]
-                  (aset js/console "error" original-console-error)
-                  (if-let [stop! @stop-server!]
-                    (-> (stop!)
-                        (p/then (fn []
-                                  (is false (str error))
-                                  (done)))
-                        (p/catch (fn [stop-error]
-                                   (is false (str error))
-                                   (is false (str stop-error))
-                                   (done))))
-                    (do
-                      (is false (str error))
-                      (done)))))))))
+                  (finish! #(is false (str error)))))))))

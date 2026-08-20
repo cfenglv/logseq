@@ -46,6 +46,8 @@
 (declare coerce-http-response)
 (declare <sync-auth-state-to-db-worker!)
 
+(def ^:private db-worker-ready-timeout-ms 15000)
+
 (defn fetch-json
   [url opts {:keys [response-schema error-schema] :or {error-schema :error}}]
   (p/let [resp (js/fetch url (clj->js (with-auth-headers opts)))
@@ -164,22 +166,33 @@
         (p/resolved nil)))))
 
 (defn- <wait-for-db-worker-ready!
-  []
-  (if @state/*db-worker
-    (p/resolved true)
-    (let [ready (p/deferred)
-          watch-key (keyword "frontend.handler.db-based.sync"
-                             (str "wait-db-worker-ready-" (random-uuid)))]
-      (add-watch state/*db-worker watch-key
-                 (fn [_ _ _ worker]
-                   (when worker
-                     (remove-watch state/*db-worker watch-key)
-                     (p/resolve! ready true))))
-      ;; If worker becomes ready between the initial check and add-watch.
-      (when @state/*db-worker
-        (remove-watch state/*db-worker watch-key)
-        (p/resolve! ready true))
-      ready)))
+  ([] (<wait-for-db-worker-ready! db-worker-ready-timeout-ms))
+  ([timeout-ms]
+   (if @state/*db-worker
+     (p/resolved true)
+     (let [ready (p/deferred)
+           watch-key (keyword "frontend.handler.db-based.sync"
+                              (str "wait-db-worker-ready-" (random-uuid)))
+           timeout-id (js/setTimeout
+                       (fn []
+                         (remove-watch state/*db-worker watch-key)
+                         (p/reject! ready
+                                    (ex-info "db-worker readiness timeout"
+                                             {:code :db-worker-ready-timeout
+                                              :timeout-ms timeout-ms})))
+                       timeout-ms)]
+       (add-watch state/*db-worker watch-key
+                  (fn [_ _ _ worker]
+                    (when worker
+                      (remove-watch state/*db-worker watch-key)
+                      (js/clearTimeout timeout-id)
+                      (p/resolve! ready true))))
+       ;; If worker becomes ready between the initial check and add-watch.
+       (when @state/*db-worker
+         (remove-watch state/*db-worker watch-key)
+         (js/clearTimeout timeout-id)
+         (p/resolve! ready true))
+       ready))))
 
 (defn <rtc-stop!
   []
@@ -188,21 +201,21 @@
 
 (defn- sync-app-state-payload
   []
-  (cond-> (select-keys @state/state [:git/current-repo :config
-                                     :auth/id-token :auth/access-token :auth/refresh-token
-                                     :auth/oauth-token-url :auth/oauth-domain :auth/oauth-client-id
-                                     :user/info])
+  (cond-> (select-keys @state/state [:auth/id-token :auth/access-token :auth/refresh-token
+                                     :auth/oauth-token-url :auth/oauth-domain :auth/oauth-client-id])
     (seq config/OAUTH-DOMAIN)
     (assoc :auth/oauth-domain config/OAUTH-DOMAIN)
 
     (seq config/COGNITO-CLIENT-ID)
     (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID)))
 
-(defn- <sync-auth-state-to-db-worker!
+(defn <sync-auth-state-to-db-worker!
   []
-  (p/let [_ (js/Promise. user-handler/task--ensure-id&access-token)
-          payload (sync-app-state-payload)]
-    (state/<invoke-db-worker :thread-api/sync-app-state payload)))
+  (p/let [_ (<wait-for-db-worker-ready!)
+          _ (js/Promise. user-handler/task--ensure-id&access-token)
+          payload (sync-app-state-payload)
+          _ (state/<invoke-db-worker :thread-api/sync-app-state payload)]
+    payload))
 
 (defn <rtc-start!
   [repo & {:keys [_stop-before-start?] :as _opts}]
@@ -217,6 +230,25 @@
                                        :remote-graphs-loading? (:rtc/loading-graphs? @state/state)
                                        :has-local-rtc-id? (graph-has-local-rtc-id? repo)})
         (<rtc-stop!)))))
+
+(defn <rtc-resume!
+  [repo]
+  (p/let [_ (<wait-for-db-worker-ready!)]
+    (if (should-start-rtc? repo)
+      (do
+        (log/info :db-sync/system-resume {:repo repo})
+        (p/let [_ (<sync-auth-state-to-db-worker!)]
+          (state/<invoke-db-worker :thread-api/db-sync-resume repo)))
+      (p/resolved nil))))
+
+(defn <rtc-start-from-trigger!
+  [start-reason repo]
+  (if (contains? #{:document-visible&rtc-not-running
+                   :network-online&rtc-not-running
+                   :mobile-app-active&rtc-not-running}
+                 start-reason)
+    (<rtc-resume! repo)
+    (<rtc-start! repo)))
 
 (defonce ^:private debounced-update-presence
   (util/debounce
@@ -380,7 +412,8 @@
                _ (<rtc-get-users-info true)]
          (notification/show! (t :sync/invitation-sent) :success))
        (p/catch (fn [e]
-                  (if (= "user not found" (get-in (ex-data e) [:body :error]))
+                  (if (= :user-not-found
+                         (:response-error-code (ex-data e)))
                     (notification/show! (t :sync/user-doesnt-exist-yet) :warning)
                     (do
                       (notification/show! (t :sync/something-wrong) :error)

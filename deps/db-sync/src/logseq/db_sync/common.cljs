@@ -6,7 +6,7 @@
 
 (defn cors-headers []
   #js {"Access-Control-Allow-Origin" "*"
-       "Access-Control-Allow-Headers" "content-type,content-encoding,authorization,x-amz-meta-checksum,x-amz-meta-type"
+       "Access-Control-Allow-Headers" "content-type,content-encoding,authorization,x-amz-meta-checksum,x-amz-meta-type,x-logseq-asset-size"
        "Access-Control-Allow-Methods" "GET,POST,PUT,DELETE,OPTIONS,HEAD"
        "Access-Control-Expose-Headers" "content-type,content-encoding,content-length,cache-control,x-asset-type,x-asset-size,x-snapshot-row-count"})
 
@@ -86,6 +86,21 @@
 
 (defn now-ms []
   (.now js/Date))
+
+(defn error-log-data
+  "Return a bounded diagnostic that cannot contain request bodies, tx data, SQL,
+  tokens, or nested exception payloads."
+  [error]
+  (let [data (or (ex-data error) {})
+        raw-code (or (:type data) (:code data) (:error data))
+        error-code (if (or (keyword? raw-code)
+                           (string? raw-code)
+                           (number? raw-code))
+                     raw-code
+                     :exception)]
+    (cond-> {:error-name (or (some-> error .-name) "Error")
+             :error-code error-code}
+      (number? (:status data)) (assoc :status (:status data)))))
 
 (defn upgrade-request? [request]
   (= "websocket"

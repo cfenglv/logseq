@@ -217,6 +217,27 @@
                      (is false (str "unexpected error: " e))))
           (p/finally (fn [] (done)))))))
 
+(deftest stop-all-rejects-and-retains-failed-runtimes
+  (async done
+    (let [manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo] (p/resolved (runtime repo)))
+                    :stop-daemon! (fn [rt]
+                                    (p/resolved (not= "graph-b" (:repo rt))))})]
+      (-> (p/let [_ (db-worker/ensure-started! manager "graph-a" :window-1)
+                  _ (db-worker/ensure-started! manager "graph-b" :window-2)]
+            (db-worker/stop-all! manager))
+          (p/then (fn [_]
+                    (is false "expected stop-all! to reject")))
+          (p/catch (fn [error]
+                     (is (= :db-worker-stop-failed (:code (ex-data error))))
+                     (is (= #{"graph-b"}
+                            (set (:repos (ex-data error)))))
+                     (is (nil? (get-in @(:state manager) [:repos "graph-a"])))
+                     (is (some? (get-in @(:state manager) [:repos "graph-b"])))
+                     (is (= {:window-2 "graph-b"}
+                            (get @(:state manager) :window->repo)))))
+          (p/finally (fn [] (done)))))))
+
 (deftest ensure-started-restarts-unhealthy-cached-runtime
   (async done
     (let [start-count (atom 0)

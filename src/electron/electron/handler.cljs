@@ -281,11 +281,33 @@
 (defmethod handle :getLogseqDotDirRoot []
   (utils/get-ls-dotdir-root))
 
-(defmethod handle :setProxy [_win [_ options]]
+(defmethod handle :setProxy [_window [_ options]]
   ;; options: {:type "system" | "direct" | "socks5" | "http" | ... }
-  (p/do!
-   (utils/<set-proxy options)
-   (utils/save-proxy-settings options)))
+  (let [saved (cfgs/get-item :settings/agent)
+        previous (cond
+                   (:type saved) saved
+                   (:protocol saved) (assoc saved :type (:protocol saved))
+                   :else {:type "system"})]
+    (-> (p/do!
+         ;; A db-worker's proxy environment is fixed at process birth. Stop
+         ;; every runtime before changing the process-wide proxy contract.
+         (db-worker/stop-all-managed!)
+         (utils/<set-proxy options)
+         (utils/save-proxy-settings options)
+         (doseq [^js window (win/get-all-windows)]
+           (when-not (.isDestroyed window)
+             (.reload window))))
+        (p/catch
+         (fn [error]
+           (-> (utils/<set-proxy previous)
+               (p/catch
+                (fn [rollback-error]
+                  (p/rejected
+                   (ex-info "proxy update and rollback failed"
+                            {:code :proxy-rollback-failed
+                             :update-error error
+                             :rollback-error rollback-error}))))
+               (p/then (fn [] (p/rejected error)))))))))
 
 (defmethod handle :testProxyUrl [_win [_ url options]]
   (let [start-ms (.getTime (js/Date.))]

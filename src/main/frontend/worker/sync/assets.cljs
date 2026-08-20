@@ -21,7 +21,8 @@
 (defonce *repo->missing-asset-upload-files
   (atom {}))
 
-(def ^:private remote-asset-download-parallelism 10)
+(def ^:private remote-asset-download-parallelism 2)
+(def ^:private text-encoder (js/TextEncoder.))
 
 (defn graph-aes-key
   [repo graph-id fail-fast-f]
@@ -67,7 +68,7 @@
 (defn- payload-size
   [payload]
   (cond
-    (string? payload) (count payload)
+    (string? payload) (.-byteLength (.encode text-encoder payload))
     (some? (.-byteLength payload)) (.-byteLength payload)
     (some? (.-length payload)) (.-length payload)
     :else 0))
@@ -142,6 +143,21 @@
     (mark-asset-write-finish! repo asset-id)
     nil))
 
+(defn- <put-remote-asset!
+  [put-url headers payload]
+  (let [request (fn [request-headers]
+                  (js/fetch put-url
+                            (clj->js {:method "PUT"
+                                      :headers request-headers
+                                      :body payload})))]
+    (-> (request headers)
+        (p/catch
+         (fn [_]
+           ;; Servers deployed before x-logseq-asset-size was added do not
+           ;; allow that header in their CORS preflight. PUT is idempotent for
+           ;; this content-addressed path, so retry the legacy request once.
+           (request (dissoc headers "x-logseq-asset-size")))))))
+
 (defn upload-remote-asset!
   [repo graph-id asset-uuid asset-type checksum]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
@@ -170,11 +186,11 @@
                   _ (notify-asset-progress! repo asset-id :upload 0 total)
                   headers (merge (sync-auth/auth-headers (worker-state/get-id-token))
                                  {"x-amz-meta-checksum" checksum
-                                  "x-amz-meta-type" asset-type})
-                  ^js resp (js/fetch put-url
-                                     (clj->js {:method "PUT"
-                                               :headers headers
-                                               :body payload}))
+                                  "x-amz-meta-type" asset-type
+                                  ;; Additive hint used by newer self-hosted servers
+                                  ;; for fixed-length streaming. Older servers ignore it.
+                                  "x-logseq-asset-size" (str total)})
+                  ^js resp (<put-remote-asset! put-url headers payload)
                   status (.-status resp)
                   _ (notify-asset-progress! repo asset-id :upload total total)]
             (when-not (.-ok resp)
@@ -301,7 +317,10 @@
   [repo client {:keys [current-client-f broadcast-rtc-state!-f fail-fast-f]}]
   (let [graph-id (:graph-id client)
         asset-ops (not-empty (client-op/get-all-asset-ops repo))
-        parallelism 10]
+        ;; Asset encryption and desktop file reads are currently whole-buffer
+        ;; operations. Serialize them to avoid multiplying the 100 MiB per-asset
+        ;; ceiling into a multi-gigabyte memory spike.
+        parallelism 1]
     (if (and (seq graph-id) asset-ops)
       (let [queue (atom (vec asset-ops))
             pop-queue! (fn []
@@ -399,7 +418,10 @@
   (log/error :db-sync/request-asset-download-failed
              {:repo repo
               :asset-uuid asset-uuid
-              :error error}))
+              :error-name (or (some-> error .-name) "Error")
+              :error-code (or (:type (ex-data error))
+                              (:code (ex-data error))
+                              :download-failed)}))
 
 (defn request-asset-download!
   [repo asset-uuid {:keys [current-client-f enqueue-asset-task-f broadcast-rtc-state!-f]}]

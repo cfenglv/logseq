@@ -246,11 +246,13 @@
   (if (string? user-id)
     (p/let [result (common/<d1-all db
                                    (str "select g.graph_id, g.graph_name, g.schema_version, g.graph_e2ee, g.graph_ready_for_use, g.created_at, g.updated_at, "
+                                        "case when g.user_id = ? then 1 else 0 end as owned, "
                                         "m.role, m.invited_by "
                                         "from graphs g "
                                         "left join graph_members m on g.graph_id = m.graph_id and m.user_id = ? "
                                         "where g.user_id = ? or m.user_id = ? "
                                         "order by g.updated_at desc")
+                                   user-id
                                    user-id
                                    user-id
                                    user-id)
@@ -261,6 +263,7 @@
                :schema-version (aget row "schema_version")
                :graph-e2ee? (graph-e2ee-sql->bool (aget row "graph_e2ee"))
                :graph-ready-for-use? (graph-ready-for-use-sql->bool (aget row "graph_ready_for_use"))
+               :owned? (= 1 (aget row "owned"))
                :role (aget row "role")
                :invited-by (aget row "invited_by")
                :created-at (aget row "created_at")
@@ -287,7 +290,7 @@
   [db user-id {:keys [name limit cursor]}]
   (let [cursor-key (when cursor (decode-semantic-graph-cursor cursor))
         [cursor-updated-at cursor-graph-id] cursor-key
-        conditions (cond-> [(str "(g.user_id = ? or m.user_id = ?) ")
+        conditions (cond-> ["(g.user_id = ? or m.user_id = ?) "
                             "g.graph_e2ee = 0"
                             "g.graph_ready_for_use = 1"]
                      (string? name) (conj "lower(g.graph_name) = lower(?)")
@@ -575,6 +578,15 @@
                                         "union select graph_id from graph_members where graph_id = ? and user_id = ?")
                                    graph-id
                                    user-id
+                                   graph-id
+                                   user-id)
+            rows (common/get-sql-rows result)]
+      (boolean (seq rows)))))
+
+(defn <user-owns-graph? [db graph-id user-id]
+  (when (and (string? graph-id) (string? user-id))
+    (p/let [result (common/<d1-all db
+                                   "select graph_id from graphs where graph_id = ? and user_id = ?"
                                    graph-id
                                    user-id)
             rows (common/get-sql-rows result)]
