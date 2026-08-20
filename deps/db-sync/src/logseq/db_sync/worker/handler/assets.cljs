@@ -103,17 +103,20 @@
     (> size max-asset-size)
     (p/resolved (http/error-response "asset too large" 413))
 
-    (nil? body)
+    (and (nil? body) (pos? size))
     (p/resolved (http/error-response "missing asset body" 400))
 
     :else
     (let [{decoded-body :body decode-promise :pipe-promise}
           (when (= "base64" encoding) (base64-decoded-body body))
-          source-body (or decoded-body body)
+          source-body (or decoded-body body (js/Uint8Array. 0))
           {stream-body :body fixed-length-promise :pipe-promise} (fixed-length-body source-body size)
           put-promise (.put bucket key (or stream-body source-body)
                             #js {:httpMetadata #js {:contentType (or content-type "application/octet-stream")}
-                                 :customMetadata #js {:checksum checksum :type asset-type}})]
+                                 :customMetadata #js {:checksum checksum :type asset-type}
+                                 ;; Ignored by R2, consumed by the Node adapter
+                                 ;; to reject truncated or oversized streams.
+                                 :logseqExpectedSize size})]
       (-> (p/all (cond-> [put-promise]
                    decode-promise (conj decode-promise)
                    fixed-length-promise (conj fixed-length-promise)))
@@ -222,19 +225,34 @@
               (handle-get-asset bucket key asset-type)
 
               "PUT"
-              (.then (.arrayBuffer request)
-                     (fn [buf]
-                       (if (> (.-byteLength buf) max-asset-size)
-                         (http/error-response "asset too large" 413)
-                         (.then (.put bucket
-                                      key
-                                      buf
-                                      #js {:httpMetadata #js {:contentType (or (.get (.-headers request) "content-type")
-                                                                               "application/octet-stream")}
-                                           :customMetadata #js {:checksum (.get (.-headers request) "x-amz-meta-checksum")
-                                                                :type asset-type}})
-                                (fn [_]
-                                  (http/json-response :assets/put {:ok true} 200))))))
+              (let [headers (.-headers request)
+                    declared-size-header (.get headers "x-logseq-asset-size")
+                    content-type (or (.get headers "content-type")
+                                     "application/octet-stream")
+                    checksum (.get headers "x-amz-meta-checksum")]
+                (if (some? declared-size-header)
+                  (<put-stream! bucket
+                                key
+                                (.-body request)
+                                {:size (parse-size declared-size-header)
+                                 :content-type content-type
+                                 :checksum checksum
+                                 :asset-type asset-type})
+                  ;; Legacy clients do not send x-logseq-asset-size. Keep their
+                  ;; request contract unchanged and validate the actual buffered
+                  ;; length before writing.
+                  (.then (.arrayBuffer request)
+                         (fn [buf]
+                           (if (> (.-byteLength buf) max-asset-size)
+                             (http/error-response "asset too large" 413)
+                             (.then (.put bucket
+                                          key
+                                          buf
+                                          #js {:httpMetadata #js {:contentType content-type}
+                                               :customMetadata #js {:checksum checksum
+                                                                    :type asset-type}})
+                                    (fn [_]
+                                      (http/json-response :assets/put {:ok true} 200))))))))
 
               "DELETE"
               (.then (.delete bucket key)

@@ -30,6 +30,13 @@
 - For CLJS tests, avoid recompiling when source files have not changed since the last successful `cljs:test`; run against the existing compiled test artifact instead.
 - Run lint/tests before submitting PRs; keep changes green.
 
+## Push safety gate
+- Never push a commit before the exact local gate for every affected GitHub workflow has passed against that same commit in a clean worktree.
+- For RTC, DB sync, or desktop release changes, run `pnpm rtc:prepush` in addition to `pnpm desktop:release-preflight`. A failed, skipped, interrupted, or stale result blocks the push.
+- GitHub Actions is confirmation, not the first test environment. Do not push speculative CI fixes or use repeated pushes to discover local build and test failures.
+- If a source, lockfile, workflow, or test changes after a gate passes, the affected gate is stale and must be rerun before pushing.
+- Record the tested commit SHA and commands in the handoff. Never claim push readiness when a required platform-equivalent check could not be run.
+
 ## *IMPORTANT*: Always respect directory-specific AGENTS.md based on file path
 - when editing code in a specific directory, you must recursively read `AGENTS.md` files up the directory tree, and `AGENTS.md` in subdirectories takes precedence over the root-level one
 

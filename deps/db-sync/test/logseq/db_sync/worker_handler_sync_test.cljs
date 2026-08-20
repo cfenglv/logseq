@@ -74,6 +74,61 @@
   (p/let [text (.text response)]
     (js->clj (js/JSON.parse text) :keywordize-keys true)))
 
+(deftest current-server-checksum-recomputes-after-old-server-cursor-advance-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            page-uuid (random-uuid)]
+        (d/transact! conn
+                     [{:block/uuid page-uuid
+                       :block/name "before-downgrade"
+                       :block/title "Before downgrade"}])
+        (let [checksum-before (sync-handler/current-server-checksum self)
+              checksum-t-before (storage/get-server-checksum-t sql)]
+          ;; Model an old server: DB and cursor advance while the new metadata
+          ;; keys are left untouched.
+          (d/transact! conn
+                       [[:db/add [:block/uuid page-uuid]
+                         :block/title
+                         "Changed by old server"]]
+                       {:db-sync/skip-checksum-update? true})
+          (is (> (storage/get-t sql) checksum-t-before))
+          (is (= checksum-before (storage/get-server-checksum sql)))
+          (let [checksum-after (sync-handler/current-server-checksum self)]
+            (is (not= checksum-before checksum-after))
+            (is (= (sync-checksum/recompute-server-checksum @conn)
+                   checksum-after))
+            (is (= (storage/get-t sql)
+                   (storage/get-server-checksum-t sql)))))))))
+
+(deftest legacy-large-title-marker-omits-v2-but-keeps-old-client-checksum-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            page-uuid (random-uuid)
+            block-uuid (random-uuid)
+            self #js {:sql sql :conn conn :schema-ready true}]
+        (d/transact!
+         conn
+         [{:block/uuid page-uuid
+           :block/name "legacy-large-title-page"
+           :block/title "Legacy large title page"}
+          {:block/uuid block-uuid
+           :block/title ""
+           :block/page [:block/uuid page-uuid]
+           :block/parent [:block/uuid page-uuid]
+           :logseq.property.sync/large-title-object
+           {:asset-uuid "legacy-title"
+            :asset-type "txt"}}])
+        (let [fields (sync-handler/checksum-response-fields self)]
+          (is (string? (:checksum fields))
+              "the historical field remains available to old clients")
+          (is (nil? (:checksum-version fields)))
+          (is (nil? (:server-checksum fields))))))))
+
 (deftest semantic-create-page-delegates-to-outliner-and-broadcasts-test
   (async done
          (with-memory-sql-async
@@ -398,12 +453,12 @@
                         :logseq.property/status :logseq.property/status.todo
                         :block/created-at 3000 :block/updated-at 3000}])
                    self #js {:sql sql :conn conn :schema-ready true}
-                   paths [(str "/semantic/pages?graph-id=graph-1&created-after=2000")
-                          (str "/semantic/tasks?graph-id=graph-1&updated-after=2000")
-                          (str "/semantic/tags?graph-id=graph-1&created-after=2000")
+                   paths ["/semantic/pages?graph-id=graph-1&created-after=2000"
+                          "/semantic/tasks?graph-id=graph-1&updated-after=2000"
+                          "/semantic/tags?graph-id=graph-1&created-after=2000"
                           (str "/semantic/tags/" target-tag-id "/objects?graph-id=graph-1&updated-after=2000")
-                          (str "/semantic/properties?graph-id=graph-1&created-after=2000")
-                          (str "/semantic/search?graph-id=graph-1&q=timed&types=blocks&updated-after=2000")]
+                          "/semantic/properties?graph-id=graph-1&created-after=2000"
+                          "/semantic/search?graph-id=graph-1&q=timed&types=blocks&updated-after=2000"]
                    keys [:blocks :tasks :tags :objects :properties :results]]
                (-> (p/let [responses (p/all (map #(sync-handler/handle-http
                                                    self (semantic-json-request % "GET" nil)) paths))
@@ -1184,11 +1239,18 @@
   [sql conn prev-t prev-checksum response label]
   (let [stored-checksum (storage/get-checksum sql)
         recomputed-checksum (sync-checksum/recompute-checksum @conn)
+        stored-server-checksum (storage/get-server-checksum sql)
+        recomputed-server-checksum
+        (sync-checksum/recompute-server-checksum @conn)
         new-t (storage/get-t sql)
         accepted? (= "tx/batch/ok" (:type response))
         advanced? (> new-t prev-t)]
     (is (= new-t (:t response))
         (str label " response.t should match storage t"))
+    (is (= recomputed-server-checksum stored-server-checksum)
+        (str label " versioned checksum should equal full recompute"))
+    (is (= new-t (storage/get-server-checksum-t sql))
+        (str label " versioned checksum watermark should match t"))
     (if accepted?
       (if advanced?
         (do
@@ -1382,7 +1444,7 @@
 
 (defn- request-url
   ([]
-   (request-url "/sync/graph-1/snapshot/download?graph-id=graph-1"))
+   (request-url "/sync/graph-1/snapshot/download-v2?graph-id=graph-1"))
   ([path]
    (let [request (js/Request. (str "http://localhost" path)
                               #js {:method "GET"})]
@@ -1401,7 +1463,6 @@
                          :schema-ready true
                          :sql sql}
                {:keys [request url]} (request-url)
-               expected-url "http://localhost/sync/graph-1/snapshot/stream"
                original-compression-stream (.-CompressionStream js/globalThis)
                restore! #(aset js/globalThis "CompressionStream" original-compression-stream)]
            (aset js/globalThis
@@ -1410,13 +1471,16 @@
            (-> (p/let [resp (sync-handler/handle {:self self
                                                   :request request
                                                   :url url
-                                                  :route {:handler :sync/snapshot-download}})
+                                                  :route {:handler :sync/snapshot-download-v2}})
                        text (.text resp)
                        body (js->clj (js/JSON.parse text) :keywordize-keys true)]
                  (is (= 200 (.-status resp)))
                  (is (= true (:ok body)))
                  (is (= "stream/graph-1.snapshot" (:key body)))
-                 (is (= expected-url (:url body)))
+                 (is (string/starts-with?
+                      (:url body)
+                      "http://localhost/sync/graph-1/snapshot/stream-v2?download-id="))
+                 (is (= 0 (:t body)))
                  (is (= "gzip" (:content-encoding body))))
                (p/then (fn []
                          (restore!)
@@ -1438,7 +1502,7 @@
            (-> (p/let [resp (sync-handler/handle {:self self
                                                   :request request
                                                   :url url
-                                                  :route {:handler :sync/snapshot-download}})
+                                                  :route {:handler :sync/snapshot-download-v2}})
                        text (.text resp)
                        body (js->clj (js/JSON.parse text) :keywordize-keys true)]
                  (is (= 200 (.-status resp)))
@@ -1450,6 +1514,319 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))
+
+(deftest legacy-snapshot-download-keeps-v1-live-stream-shape-test
+  (async done
+         (let [sql (empty-sql)
+               self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                         :conn nil
+                         :schema-ready true
+                         :sql sql}
+               {:keys [request url]}
+               (request-url
+                "/sync/graph-1/snapshot/download?graph-id=graph-1")]
+           (-> (p/with-redefs
+                 [sync-handler/<ready-for-sync?
+                  (fn [_self _graph-id] (p/resolved true))]
+                 (p/let [resp
+                         (sync-handler/handle
+                          {:self self
+                           :request request
+                           :url url
+                           :route {:handler :sync/snapshot-download}})
+                         body (json-body resp)]
+                   (is (= 200 (.-status resp)))
+                   (is (= {:ok true
+                           :key "stream/graph-1.snapshot"
+                           :url "http://localhost/sync/graph-1/snapshot/stream"}
+                          body))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest snapshot-v2-stream-requires-valid-frozen-download-id-test
+  (async done
+         (let [sql (empty-sql)
+               self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                         :conn nil
+                         :schema-ready true
+                         :sql sql}
+               {:keys [request url]}
+               (request-url
+                "/sync/graph-1/snapshot/stream-v2?graph-id=graph-1")]
+           (-> (p/let [resp (sync-handler/handle
+                             {:self self
+                              :request request
+                              :url url
+                              :route {:handler :sync/snapshot-stream-v2}})
+                       body (json-body resp)]
+                 (is (= 410 (.-status resp)))
+                 (is (= {:error "snapshot download expired"} body)))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest snapshot-v2-stream-expiry-deletes-frozen-export-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [download-id "expired-download"
+                   _ (common/sql-exec
+                      sql
+                      (str "insert into snapshot_downloads "
+                           "(download_id, t, checksum, row_count, created_at) "
+                           "values (?, ?, ?, ?, ?)")
+                      download-id 7 "0000000000000000" 1 0)
+                   _ (common/sql-exec
+                      sql
+                      (str "insert into snapshot_kvs_exports "
+                           "(download_id, addr, content, addresses) "
+                           "values (?, ?, ?, ?)")
+                      download-id 1 "snapshot-row" nil)
+                   self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                             :conn nil
+                             :schema-ready true
+                             :sql sql}
+                   {:keys [request url]}
+                   (request-url
+                    (str "/sync/graph-1/snapshot/stream-v2"
+                         "?graph-id=graph-1&download-id=" download-id))]
+               (-> (p/let [response
+                           (sync-handler/handle
+                            {:self self
+                             :request request
+                             :url url
+                             :route {:handler :sync/snapshot-stream-v2}})
+                           body (json-body response)
+                           downloads
+                           (common/get-sql-rows
+                            (common/sql-exec
+                             sql
+                             "select download_id from snapshot_downloads"))
+                           exports
+                           (common/get-sql-rows
+                            (common/sql-exec
+                             sql
+                             "select download_id from snapshot_kvs_exports"))]
+                     (is (= 410 (.-status response)))
+                     (is (= {:error "snapshot download expired"} body))
+                     (is (empty? downloads))
+                     (is (empty? exports)))
+                   (p/catch (fn [error]
+                              (is false (str error))))
+                   (p/finally done)))))))
+
+(deftest snapshot-download-stream-is-frozen-at-metadata-watermark-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (common/sql-exec sql
+                              "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                              1 "snapshot-row" nil)
+             (storage/set-t! sql 7)
+             (storage/set-checksum! sql "snapshot-checksum")
+             (let [self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                             :conn nil
+                             :schema-ready true
+                             :sql sql}
+                   {:keys [request url]} (request-url)]
+               (-> (p/with-redefs [sync-handler/<ready-for-sync?
+                                    (fn [_self _graph-id] (p/resolved true))]
+                     (p/let [metadata-response
+                             (sync-handler/handle
+                              {:self self
+                               :request request
+                               :url url
+                               :route {:handler :sync/snapshot-download-v2}})
+                             metadata (json-body metadata-response)
+                             _ (common/sql-exec
+                                sql
+                                "update kvs set content = ? where addr = ?"
+                                "live-row-after-metadata" 1)
+                             _ (common/sql-exec
+                                sql
+                                "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                                2 "new-live-row" nil)
+                             stream-response
+                             (sync-handler/handle-http
+                              self
+                              (js/Request. (:url metadata) #js {:method "GET"}))
+                             buffer (.arrayBuffer stream-response)
+                             payload (js/Uint8Array. buffer)
+                             rows (snapshot/finalize-framed-buffer payload)
+                             active-downloads
+                             (common/get-sql-rows
+                              (common/sql-exec
+                               sql
+                               "select download_id from snapshot_downloads"))]
+                       (is (= 200 (.-status metadata-response)))
+                       (is (= 7 (:t metadata)))
+                       (is (= "snapshot-checksum" (:checksum metadata)))
+                       (is (= 1 (:row-count metadata)))
+                       (is (= [[1 "snapshot-row" nil]] rows)
+                           "the stream must not include writes committed after metadata")
+                       (is (empty? active-downloads)
+                           "a fully consumed stream must release its frozen export")))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest snapshot-download-capacity-is-bounded-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                             :conn nil
+                             :schema-ready true
+                             :sql sql}
+                   {:keys [request url]} (request-url)
+                   download! #(sync-handler/handle
+                               {:self self
+                                :request request
+                                :url url
+                                :route {:handler :sync/snapshot-download-v2}})]
+               (-> (p/with-redefs [sync-handler/<ready-for-sync?
+                                    (fn [_self _graph-id] (p/resolved true))]
+                     (p/let [first-response (download!)
+                             second-response (download!)
+                             third-response (download!)
+                             third-body (json-body third-response)]
+                       (is (= 200 (.-status first-response)))
+                       (is (= 200 (.-status second-response)))
+                       (is (= 429 (.-status third-response)))
+                       (is (= {:error "snapshot download busy; retry later"}
+                              third-body))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest snapshot-download-metadata-cleans-expired-capacity-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (doseq [download-id ["expired-1" "expired-2"]]
+               (common/sql-exec
+                sql
+                (str "insert into snapshot_downloads "
+                     "(download_id, t, checksum, row_count, created_at) "
+                     "values (?, ?, ?, ?, ?)")
+                download-id 7 "0000000000000000" 1 0)
+               (common/sql-exec
+                sql
+                (str "insert into snapshot_kvs_exports "
+                     "(download_id, addr, content, addresses) "
+                     "values (?, ?, ?, ?)")
+                download-id 1 "stale" nil))
+             (let [self #js {:env
+                             #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                             :conn nil
+                             :schema-ready true
+                             :sql sql}
+                   {:keys [request url]} (request-url)]
+               (-> (p/with-redefs
+                     [sync-handler/<ready-for-sync?
+                      (fn [_self _graph-id] (p/resolved true))]
+                     (p/let [response
+                             (sync-handler/handle
+                              {:self self
+                               :request request
+                               :url url
+                               :route
+                               {:handler :sync/snapshot-download-v2}})
+                             downloads
+                             (common/get-sql-rows
+                              (common/sql-exec
+                               sql
+                               "select download_id from snapshot_downloads"))
+                             exports
+                             (common/get-sql-rows
+                              (common/sql-exec
+                               sql
+                               "select download_id from snapshot_kvs_exports"))]
+                       (is (= 200 (.-status response)))
+                       (is (= 1 (count downloads)))
+                       (is (empty? exports))))
+                   (p/catch (fn [error]
+                              (is false (str error))))
+                   (p/finally done)))))))
+
+(deftest snapshot-download-cancel-releases-frozen-export-idempotently-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (common/sql-exec sql
+                              "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                              1 "snapshot-row" nil)
+             (let [self #js {:env #js {"DB_SYNC_SNAPSHOT_STREAM_GZIP" "false"}
+                             :conn nil
+                             :schema-ready true
+                             :sql sql}
+                   {:keys [request url]} (request-url)]
+               (-> (p/with-redefs [sync-handler/<ready-for-sync?
+                                    (fn [_self _graph-id] (p/resolved true))]
+                     (p/let [metadata-response
+                             (sync-handler/handle
+                              {:self self
+                               :request request
+                               :url url
+                               :route {:handler :sync/snapshot-download-v2}})
+                             metadata (json-body metadata-response)
+                             stream-url (js/URL. (:url metadata))
+                             download-id (.get (.-searchParams stream-url)
+                                               "download-id")
+                             cancel-url
+                             (str "http://localhost/sync/graph-1/snapshot/download-v2"
+                                  "?graph-id=graph-1&download-id="
+                                  (js/encodeURIComponent download-id))
+                             cancel-request
+                             (js/Request. cancel-url #js {:method "DELETE"})
+                             cancel-response
+                             (sync-handler/handle
+                              {:self self
+                               :request cancel-request
+                               :url (js/URL. cancel-url)
+                               :route
+                               {:handler :sync/snapshot-download-v2-cancel}})
+                             cancel-again-response
+                             (sync-handler/handle
+                              {:self self
+                               :request cancel-request
+                               :url (js/URL. cancel-url)
+                               :route
+                               {:handler :sync/snapshot-download-v2-cancel}})
+                             expired-response
+                             (sync-handler/handle
+                              {:self self
+                               :request (js/Request. (:url metadata))
+                               :url stream-url
+                               :route {:handler :sync/snapshot-stream-v2}})
+                             download-rows
+                             (common/get-sql-rows
+                              (common/sql-exec
+                               sql
+                               "select download_id from snapshot_downloads"))
+                             export-rows
+                             (common/get-sql-rows
+                              (common/sql-exec
+                               sql
+                               "select download_id from snapshot_kvs_exports"))]
+                       (is (= 200 (.-status metadata-response)))
+                       (is (= 200 (.-status cancel-response)))
+                       (is (= 200 (.-status cancel-again-response)))
+                       (is (= 410 (.-status expired-response)))
+                       (is (empty? download-rows))
+                       (is (empty? export-rows))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
 
 (deftest snapshot-download-stream-route-returns-framed-kvs-rows-test
   (async done
@@ -1532,6 +1909,48 @@
                           (is false (str error))
                           (done)))))))
 
+(defn- drain-snapshot-frame-payloads
+  [rows]
+  (loop [pending [(vec rows)]
+         payloads []]
+    (if-let [{:keys [payload pending]} (#'sync-handler/next-snapshot-frame pending)]
+      (recur pending (conj payloads payload))
+      payloads)))
+
+(deftest snapshot-download-frame-payloads-bound-multi-row-frames-test
+  (let [large-content (apply str (repeat 600000 "x"))
+        rows [[1 large-content nil]
+              [2 large-content nil]]
+        payloads (drain-snapshot-frame-payloads rows)]
+    (is (= 2 (count payloads)))
+    (is (every? #(<= (.-byteLength %) (* 1024 1024)) payloads))
+    (is (= rows (vec (mapcat snapshot/decode-rows payloads)))))
+
+  (testing "a single legacy oversized row remains atomic and readable"
+    (let [oversized-content (apply str (repeat 1100000 "x"))
+          row [1 oversized-content nil]
+          payloads (drain-snapshot-frame-payloads [row])]
+      (is (= 1 (count payloads)))
+      (is (= [row] (snapshot/decode-rows (first payloads)))))))
+
+(deftest next-snapshot-frame-does-not-eagerly-encode-pending-splits-test
+  (let [large-content (apply str (repeat 600000 "x"))
+        rows [[1 large-content nil]
+              [2 large-content nil]]
+        encode-rows snapshot/encode-rows
+        encode-count (atom 0)]
+    (with-redefs [snapshot/encode-rows
+                  (fn [batch]
+                    (swap! encode-count inc)
+                    (encode-rows batch))]
+      (let [{:keys [payload pending]}
+            (#'sync-handler/next-snapshot-frame [rows])]
+        ;; One attempt for the oversized two-row batch and one for the first
+        ;; split. The second split remains unencoded until the next pull.
+        (is (= 2 @encode-count))
+        (is (= [(second rows)] (first pending)))
+        (is (= [(first rows)] (snapshot/decode-rows payload)))))))
+
 (deftest ensure-schema-fallback-probes-existing-tables-test
   (async done
          (let [self #js {:sql (empty-sql)}
@@ -1544,7 +1963,9 @@
                                                  #js [])
                                storage/fetch-tx-since (fn [_ _] [])
                                storage/get-t (fn [_] 7)
-                               sync-handler/current-checksum (fn [_] "checksum-ok")]
+                               sync-handler/current-checksum (fn [_] "checksum-ok")
+                               sync-handler/current-server-checksum
+                               (fn [_] "server-checksum-ok")]
                  (p/let [resp (sync-handler/handle {:self self
                                                     :request request
                                                     :url url
@@ -1555,7 +1976,13 @@
                    (is (= 200 (.-status resp)))
                    (is (= 7 (:t body)))
                    (is (= "checksum-ok" (:checksum body)))
+                   (is (= sync-checksum/server-checksum-version
+                          (:checksum-version body)))
+                   (is (= "server-checksum-ok" (:server-checksum body)))
                    (is (contains? probe-set "select 1 from kvs limit 1"))
+                   (is (contains? probe-set "select 1 from snapshot_kvs_staging limit 1"))
+                   (is (contains? probe-set "select 1 from snapshot_downloads limit 1"))
+                   (is (contains? probe-set "select 1 from snapshot_kvs_exports limit 1"))
                    (is (contains? probe-set "select 1 from tx_log limit 1"))
                    (is (contains? probe-set "select 1 from sync_meta limit 1"))))
                (p/then (fn []
@@ -2183,6 +2610,532 @@
           (is (= (sync-checksum/recompute-checksum @conn)
                  (storage/get-checksum sql))))))))
 
+(deftest large-entry-recomputes-versioned-checksum-after-rollback-write-test
+  (testing "a mutation-first upgrade cannot bless stale versioned metadata"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              page-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid page-uuid
+                                    :block/name "large-rollback-page"
+                                    :block/title "Before rollback"}])
+              _ (storage/set-server-checksum!
+                 sql
+                 (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-t sql))
+              _ (d/transact!
+                 conn
+                 [[:db/add [:block/uuid page-uuid]
+                   :block/title
+                   "Changed by old server"]]
+                 {:db-sync/skip-checksum-update? true})
+              t-before (storage/get-t sql)
+              tx-entry {:tx (protocol/tx->transit
+                             (large-block-insert-tx page-uuid 1200))
+                        :tx-id (random-uuid)
+                        :outliner-op :insert-blocks}
+              self #js {:sql sql
+                        :conn conn
+                        :schema-ready true}
+              response
+              (with-redefs [ws/broadcast! (fn [& _] nil)]
+                (sync-handler/handle-tx-batch!
+                 self nil [tx-entry] t-before))]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= (sync-checksum/recompute-server-checksum @conn)
+                 (storage/get-server-checksum sql)))
+          (is (= (storage/get-t sql)
+                 (storage/get-server-checksum-t sql))))))))
+
+(defn- concat-bytes
+  [^js a ^js b]
+  (let [result (js/Uint8Array. (+ (.-byteLength a) (.-byteLength b)))]
+    (.set result a 0)
+    (.set result b (.-byteLength a))
+    result))
+
+(defn- snapshot-upload-request
+  ([query body]
+   (snapshot-upload-request false query body))
+  ([v2? query body]
+   (js/Request.
+    (str "http://localhost/sync/graph-1/snapshot/upload"
+         (when v2? "-v2")
+         "?graph-id=graph-1&"
+         query)
+    #js {:method "POST"
+         :body body})))
+
+(defn- kvs-rows
+  [sql]
+  (mapv (fn [row]
+          [(aget row "addr")
+           (aget row "content")
+           (aget row "addresses")])
+        (common/get-sql-rows
+         (common/sql-exec sql "select addr, content, addresses from kvs order by addr"))))
+
+(deftest snapshot-upload-v2-requires-session-and-integrity-fields-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (common/sql-exec sql
+                       "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                       99 "live-row" nil)
+      (let [frame (#'sync-handler/frame-bytes
+                   (snapshot/encode-rows [[1 "staged-row" nil]]))
+            self #js {:sql sql
+                      :conn nil
+                      :schema-ready true
+                      :env #js {"DB" nil}}
+            status-for
+            (fn [query]
+              (let [request (snapshot-upload-request true query frame)]
+                (.-status
+                 (sync-handler/handle
+                  {:self self
+                   :request request
+                   :url (js/URL. (.-url request))
+                   :route {:handler :sync/snapshot-upload-v2}}))))]
+        (is (= 400
+               (status-for
+                "reset=true&finished=true&checksum=0000000000000000&row-count=1")))
+        (is (= 400
+               (status-for
+                "reset=true&finished=true&upload-id=upload-1&row-count=1")))
+        (is (= 400
+               (status-for
+                (str "reset=true&finished=true&upload-id=upload-1"
+                     "&checksum=0000000000000000"))))
+        (is (= [[99 "live-row" nil]]
+               (kvs-rows sql)))))))
+
+(deftest interrupted-snapshot-upload-does-not-replace-live-kvs-test
+  (async done
+         (->
+          (with-memory-sql-async
+            (fn [sql]
+              (storage/init-schema! sql)
+              (common/sql-exec sql
+                               "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                               99 "live-row" nil)
+              (let [valid-frame (#'sync-handler/frame-bytes
+                                 (snapshot/encode-rows [[1 "staged-row" nil]]))
+                    incomplete-frame (js/Uint8Array. #js [0 0 0 5 1])
+                    request (snapshot-upload-request
+                             true
+                             (str "reset=true&finished=true"
+                                  "&checksum=0000000000000000"
+                                  "&row-count=1&upload-id=upload-1")
+                             (concat-bytes valid-frame incomplete-frame))]
+                (-> (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                    (fn [_self _graph-id _ready?]
+                                      (p/resolved true))]
+                      (sync-handler/handle
+                       {:self #js {:sql sql
+                                   :conn nil
+                                   :schema-ready true
+                                   :env #js {"DB" nil}}
+                        :request request
+                        :url (js/URL. (.-url request))
+                        :route {:handler :sync/snapshot-upload-v2}}))
+                    (p/then (fn [_]
+                              (is false "expected malformed snapshot upload to fail")))
+                    (p/catch (fn [_error]
+                               (is (= [[99 "live-row" nil]]
+                                      (kvs-rows sql)))))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done))))))
+
+(deftest snapshot-upload-commits-staged-kvs-only-after-finished-test
+  (async done
+         (->
+          (with-memory-sql-async
+            (fn [sql]
+              (storage/init-schema! sql)
+              (common/sql-exec sql
+                               "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                               99 "live-row" nil)
+              (let [self #js {:sql sql
+                              :conn nil
+                              :schema-ready true
+                              :env #js {"DB" nil}}
+                    first-frame (#'sync-handler/frame-bytes
+                                 (snapshot/encode-rows [[1 "staged-row-1" nil]]))
+                    final-frame (#'sync-handler/frame-bytes
+                                 (snapshot/encode-rows [[2 "staged-row-2" nil]]))
+                    first-request (snapshot-upload-request
+                                   true
+                                   "reset=true&finished=false&upload-id=upload-1"
+                                   first-frame)
+                    final-request (snapshot-upload-request
+                                   true
+                                   (str "reset=false&finished=true"
+                                        "&checksum=0000000000000000"
+                                        "&row-count=2&upload-id=upload-1")
+                                   final-frame)]
+                (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                (fn [_self _graph-id _ready?]
+                                  (p/resolved true))]
+                  (p/let [first-response (sync-handler/handle
+                                          {:self self
+                                           :request first-request
+                                           :url (js/URL. (.-url first-request))
+                                           :route {:handler :sync/snapshot-upload-v2}})
+                          _ (is (= 200 (.-status first-response)))
+                          _ (is (= [[99 "live-row" nil]]
+                                   (kvs-rows sql)))
+                          final-response (sync-handler/handle
+                                          {:self self
+                                           :request final-request
+                                           :url (js/URL. (.-url final-request))
+                                           :route {:handler :sync/snapshot-upload-v2}})]
+                    (is (= 200 (.-status final-response)))
+                    (is (= [[1 "staged-row-1" nil]
+                            [2 "staged-row-2" nil]]
+                           (kvs-rows sql)))
+                    (is (= "0000000000000000"
+                           (storage/get-checksum sql))))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done))))))
+
+(deftest snapshot-upload-row-count-mismatch-preserves-live-kvs-test
+  (async done
+         (->
+          (with-memory-sql-async
+            (fn [sql]
+              (storage/init-schema! sql)
+              (common/sql-exec sql
+                               "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                               99 "live-row" nil)
+              (let [frame (#'sync-handler/frame-bytes
+                           (snapshot/encode-rows [[1 "staged-row" nil]]))
+                    request
+                    (snapshot-upload-request
+                     true
+                     (str "reset=true&finished=true&upload-id=upload-1"
+                          "&checksum=0000000000000000&row-count=2")
+                     frame)]
+                (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                (fn [_self _graph-id _ready?]
+                                  (p/resolved true))]
+                  (p/let [response
+                          (sync-handler/handle
+                           {:self #js {:sql sql
+                                       :conn nil
+                                       :schema-ready true
+                                       :env #js {"DB" nil}}
+                            :request request
+                            :url (js/URL. (.-url request))
+                            :route {:handler :sync/snapshot-upload-v2}})
+                          body (json-body response)]
+                    (is (= 409 (.-status response)))
+                    (is (= {:error "snapshot row count mismatch"} body))
+                    (is (= [[99 "live-row" nil]]
+                           (kvs-rows sql))))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done))))))
+
+(deftest newer-v2-snapshot-upload-replaces-abandoned-session-test
+  (async done
+         (->
+          (with-memory-sql-async
+            (fn [sql]
+              (storage/init-schema! sql)
+              (common/sql-exec sql
+                               "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                               99 "live-row" nil)
+              (let [self #js {:sql sql
+                              :conn nil
+                              :schema-ready true
+                              :env #js {"DB" nil}}
+                    make-frame (fn [rows]
+                                 (#'sync-handler/frame-bytes
+                                  (snapshot/encode-rows rows)))
+                    request-1 (snapshot-upload-request
+                               true
+                               "reset=true&finished=false&upload-id=upload-1"
+                               (make-frame [[1 "stale-row" nil]]))
+                    request-2 (snapshot-upload-request
+                               true
+                               "reset=true&finished=false&upload-id=upload-2"
+                               (make-frame [[2 "fresh-row" nil]]))
+                    stale-final-request (snapshot-upload-request
+                                         true
+                                         (str "reset=false&finished=true"
+                                              "&checksum=0000000000000000"
+                                              "&row-count=2&upload-id=upload-1")
+                                         (make-frame [[3 "stale-final-row" nil]]))
+                    fresh-final-request (snapshot-upload-request
+                                         true
+                                         (str "reset=false&finished=true"
+                                              "&checksum=0000000000000000"
+                                              "&row-count=2&upload-id=upload-2")
+                                         (make-frame [[4 "fresh-final-row" nil]]))
+                    handle-request (fn [request]
+                                     (sync-handler/handle
+                                      {:self self
+                                       :request request
+                                       :url (js/URL. (.-url request))
+                                       :route {:handler :sync/snapshot-upload-v2}}))]
+                (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                (fn [_self _graph-id _ready?]
+                                  (p/resolved true))]
+                  (p/let [_ (handle-request request-1)
+                          second-response (handle-request request-2)
+                          _ (is (= 200 (.-status second-response)))
+                          _ (is (= [[99 "live-row" nil]]
+                                   (kvs-rows sql)))
+                          stale-final-response
+                          (handle-request stale-final-request)
+                          stale-final-body (json-body stale-final-response)
+                          _ (is (= 409 (.-status stale-final-response)))
+                          _ (is (= {:error "snapshot upload session replaced"}
+                                   stale-final-body))
+                          fresh-final-response
+                          (handle-request fresh-final-request)]
+                    (is (= 200 (.-status fresh-final-response)))
+                    (is (= [[2 "fresh-row" nil]
+                            [4 "fresh-final-row" nil]]
+                           (kvs-rows sql))))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done))))))
+
+(deftest legacy-fallback-aborts-v2-staging-without-mixing-rows-test
+  (async done
+         (->
+          (with-memory-sql-async
+            (fn [sql]
+              (storage/init-schema! sql)
+              (common/sql-exec sql
+                               "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                               99 "live-row" nil)
+              (let [self #js {:sql sql
+                              :conn nil
+                              :schema-ready true
+                              :env #js {"DB" nil}}
+                    make-frame (fn [rows]
+                                 (#'sync-handler/frame-bytes
+                                  (snapshot/encode-rows rows)))
+                    v2-partial-request
+                    (snapshot-upload-request
+                     true
+                     "reset=true&finished=false&upload-id=upload-1"
+                     (make-frame [[1 "staged-v2-row" nil]]))
+                    legacy-request
+                    (snapshot-upload-request
+                     "reset=true&finished=true&checksum=legacy-checksum"
+                     (make-frame [[2 "legacy-row" nil]]))
+                    stale-v2-final-request
+                    (snapshot-upload-request
+                     true
+                     (str "reset=false&finished=true"
+                          "&checksum=0000000000000000"
+                          "&row-count=2&upload-id=upload-1")
+                     (make-frame [[3 "stale-v2-row" nil]]))
+                    handle-request
+                    (fn [request handler]
+                      (sync-handler/handle
+                       {:self self
+                        :request request
+                        :url (js/URL. (.-url request))
+                        :route {:handler handler}}))]
+                (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                (fn [_self _graph-id _ready?]
+                                  (p/resolved true))]
+                  (p/let [v2-response
+                          (handle-request v2-partial-request
+                                          :sync/snapshot-upload-v2)
+                          _ (is (= 200 (.-status v2-response)))
+                          legacy-response
+                          (handle-request legacy-request
+                                          :sync/snapshot-upload)
+                          _ (is (= 200 (.-status legacy-response)))
+                          _ (is (= [[2 "legacy-row" nil]]
+                                   (kvs-rows sql)))
+                          stale-response
+                          (handle-request stale-v2-final-request
+                                          :sync/snapshot-upload-v2)
+                          stale-body (json-body stale-response)]
+                    (is (= 409 (.-status stale-response)))
+                    (is (= {:error "snapshot upload session replaced"}
+                           stale-body))
+                    (is (= [[2 "legacy-row" nil]]
+                           (kvs-rows sql))))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done))))))
+
+(deftest legacy-v1-snapshot-upload-without-upload-id-still-commits-test
+  (async done
+         (->
+          (with-memory-sql-async
+            (fn [sql]
+              (storage/init-schema! sql)
+              (let [frame (#'sync-handler/frame-bytes
+                           (snapshot/encode-rows [[7 "legacy-row" nil]]))
+                    request (snapshot-upload-request
+                             "reset=true&finished=true&checksum=legacy-checksum"
+                             frame)]
+                (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                (fn [_self _graph-id _ready?]
+                                  (p/resolved true))]
+                  (p/let [response (sync-handler/handle
+                                    {:self #js {:sql sql
+                                                :conn nil
+                                                :schema-ready true
+                                                :env #js {"DB" nil}}
+                                     :request request
+                                     :url (js/URL. (.-url request))
+                                     :route {:handler :sync/snapshot-upload}})]
+                    (is (= 200 (.-status response)))
+                    (is (= [[7 "legacy-row" nil]]
+                           (kvs-rows sql)))
+                    (is (= "legacy-checksum"
+                           (storage/get-checksum sql))))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done))))))
+
+(deftest legacy-v1-multi-chunk-snapshot-upload-without-upload-id-still-commits-test
+  (async done
+         (->
+          (with-memory-sql-async
+            (fn [sql]
+              (storage/init-schema! sql)
+              (common/sql-exec sql
+                               "insert into kvs (addr, content, addresses) values (?, ?, ?)"
+                               99 "live-row" nil)
+              (let [self #js {:sql sql
+                              :conn nil
+                              :schema-ready true
+                              :env #js {"DB" nil}}
+                    first-frame (#'sync-handler/frame-bytes
+                                 (snapshot/encode-rows [[7 "legacy-row-1" nil]]))
+                    final-frame (#'sync-handler/frame-bytes
+                                 (snapshot/encode-rows [[8 "legacy-row-2" nil]]))
+                    first-request (snapshot-upload-request
+                                   "reset=true&finished=false"
+                                   first-frame)
+                    final-request (snapshot-upload-request
+                                   "reset=false&finished=true&checksum=legacy-checksum"
+                                   final-frame)]
+                (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                (fn [_self _graph-id _ready?]
+                                  (p/resolved true))]
+                  (p/let [first-response
+                          (sync-handler/handle
+                           {:self self
+                            :request first-request
+                            :url (js/URL. (.-url first-request))
+                            :route {:handler :sync/snapshot-upload}})
+                          _ (is (= 200 (.-status first-response)))
+                          _ (is (= [[7 "legacy-row-1" nil]]
+                                   (kvs-rows sql)))
+                          final-response
+                          (sync-handler/handle
+                           {:self self
+                            :request final-request
+                            :url (js/URL. (.-url final-request))
+                            :route {:handler :sync/snapshot-upload}})]
+                    (is (= 200 (.-status final-response)))
+                    (is (= [[7 "legacy-row-1" nil]
+                            [8 "legacy-row-2" nil]]
+                           (kvs-rows sql)))
+                    (is (= "legacy-checksum"
+                           (storage/get-checksum sql))))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done))))))
+
+(deftest concurrent-legacy-snapshot-upload-cannot-replace-active-session-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [self #js {:sql sql
+                             :conn nil
+                             :schema-ready true
+                             :env #js {"DB" nil}}
+                   first-request
+                   (snapshot-upload-request
+                    "reset=true&finished=false"
+                    (#'sync-handler/frame-bytes
+                     (snapshot/encode-rows [[7 "first-client-row" nil]])))
+                   second-request
+                   (snapshot-upload-request
+                    "reset=true&finished=false"
+                    (#'sync-handler/frame-bytes
+                     (snapshot/encode-rows [[8 "second-client-row" nil]])))
+                   handle-request
+                   (fn [request]
+                     (sync-handler/handle
+                      {:self self
+                       :request request
+                       :url (js/URL. (.-url request))
+                       :route {:handler :sync/snapshot-upload}}))]
+               (-> (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                    (fn [_self _graph-id _ready?]
+                                      (p/resolved true))]
+                     (p/let [first-response (handle-request first-request)
+                             second-response (handle-request second-request)
+                             second-body (json-body second-response)]
+                       (is (= 200 (.-status first-response)))
+                       (is (= 409 (.-status second-response)))
+                       (is (= {:error "legacy snapshot upload already in progress"}
+                              second-body))
+                       (is (= [[7 "first-client-row" nil]]
+                              (kvs-rows sql)))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest legacy-v1-upload-cannot-resume-without-active-session-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [self #js {:sql sql
+                             :conn nil
+                             :schema-ready true
+                             :env #js {"DB" nil}}
+                   delayed-request
+                   (snapshot-upload-request
+                    "reset=false&finished=true"
+                    (#'sync-handler/frame-bytes
+                     (snapshot/encode-rows [[8 "delayed-row" nil]])))]
+               (-> (p/with-redefs [sync-handler/<set-graph-ready-for-use!
+                                    (fn [_self _graph-id _ready?]
+                                      (p/resolved true))]
+                     (p/let [response
+                             (sync-handler/handle
+                              {:self self
+                               :request delayed-request
+                               :url (js/URL. (.-url delayed-request))
+                               :route {:handler :sync/snapshot-upload}})
+                             body (json-body response)]
+                       (is (= 409 (.-status response)))
+                       (is (= {:error "legacy snapshot upload session missing"}
+                              body))
+                       (is (empty? (kvs-rows sql)))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
 (deftest finished-snapshot-upload-persists-provided-checksum-test
   (async done
          (let [sql (test-sql/make-sql)
@@ -2198,8 +3151,11 @@
            (d/transact! conn [{:block/uuid (random-uuid)
                                :block/title "uploaded"}])
            (is (nil? (storage/get-checksum sql)))
-           (-> (p/with-redefs [sync-handler/import-snapshot-stream! (fn [_self _stream _reset?]
-                                                                      (p/resolved 0))
+           (-> (p/with-redefs [sync-handler/import-snapshot-stream! (fn
+                                                                      ([_self _stream _reset?]
+                                                                       (p/resolved 0))
+                                                                      ([_self _stream _reset? _import-f]
+                                                                       (p/resolved 0)))
                                sync-handler/<set-graph-ready-for-use! (fn [_self _graph-id _graph-ready-for-use?]
                                                                         (p/resolved true))]
                  (p/let [resp (sync-handler/handle {:self self
@@ -2228,8 +3184,11 @@
                request (js/Request. "http://localhost/sync/graph-1/snapshot/upload?graph-id=graph-1&finished=true"
                                     #js {:method "POST"
                                          :body (js/Uint8Array. 0)})]
-           (-> (p/with-redefs [sync-handler/import-snapshot-stream! (fn [_self _stream _reset?]
-                                                                      (p/rejected (js/Error. "string or blob too big: SQLITE_TOOBIG")))
+           (-> (p/with-redefs [sync-handler/import-snapshot-stream! (fn
+                                                                      ([_self _stream _reset?]
+                                                                       (p/rejected (js/Error. "string or blob too big: SQLITE_TOOBIG")))
+                                                                      ([_self _stream _reset? _import-f]
+                                                                       (p/rejected (js/Error. "string or blob too big: SQLITE_TOOBIG"))))
                                sync-handler/<set-graph-ready-for-use! (fn [_self _graph-id _graph-ready-for-use?]
                                                                         (p/resolved true))]
                  (p/let [resp (sync-handler/handle {:self self
@@ -2302,6 +3261,41 @@
       (is (= 0 (:t response)))
       (is (nil? (:data response)))
       (is (= 2 @apply-calls)))))
+
+(deftest committed-tx-response-survives-stale-peer-broadcast-failure-test
+  (let [sql (test-sql/make-sql)
+        conn (storage/open-conn sql)
+        sender #js {:readyState 1}
+        bad-closed* (atom nil)
+        bad-peer #js {:readyState 1
+                      :send (fn [_raw]
+                              (throw (js/Error. "stale peer")))
+                      :close (fn [code reason]
+                               (reset! bad-closed* [code reason]))}
+        healthy-messages* (atom [])
+        healthy-peer #js {:readyState 1
+                          :send (fn [raw]
+                                  (swap! healthy-messages* conj
+                                         (-> raw
+                                             js/JSON.parse
+                                             (js->clj
+                                              :keywordize-keys true))))}
+        self #js {:sql sql
+                  :conn conn
+                  :schema-ready true
+                  :state #js {:getWebSockets
+                              (fn []
+                                #js [sender bad-peer healthy-peer])}}
+        tx-entry {:tx (protocol/tx->transit
+                       [[:db/add -1 :block/title "committed"]])
+                  :outliner-op :save-block}
+        response (sync-handler/handle-tx-batch!
+                  self sender [tx-entry] 0)]
+    (is (= "tx/batch/ok" (:type response)))
+    (is (= 1 (:t response)))
+    (is (= [1011 "send failed"] @bad-closed*))
+    (is (= [{:type "changed" :t 1}]
+           @healthy-messages*))))
 
 (deftest tx-batch-reject-includes-success-and-failed-tx-ids-test
   (testing "partial failure returns success and failed tx ids and broadcasts changed once"
@@ -2610,6 +3604,7 @@
                                   :block/parent [:block/uuid page-uuid]
                                   :block/page [:block/uuid page-uuid]}])
             rng (seeded-rng seed)]
+        (sync-handler/current-server-checksum self)
         (loop [step 0
                prev-t (storage/get-t sql)
                prev-checksum (storage/get-checksum sql)]
@@ -2619,11 +3614,20 @@
                              (sync-handler/handle-tx-batch! self nil [entry] prev-t))
                   new-t (:t response)
                   stored-checksum (storage/get-checksum sql)
-                  recomputed-checksum (sync-checksum/recompute-checksum @conn)]
+                  recomputed-checksum (sync-checksum/recompute-checksum @conn)
+                  stored-server-checksum (storage/get-server-checksum sql)
+                  recomputed-server-checksum
+                  (sync-checksum/recompute-server-checksum @conn)]
               (is (= "tx/batch/ok" (:type response))
                   (str "expected tx/batch/ok at seed " seed " step " step))
               (is (= new-t (storage/get-t sql))
                   (str "t mismatch at seed " seed " step " step))
+              (is (= recomputed-server-checksum stored-server-checksum)
+                  (str "versioned checksum mismatch at seed " seed
+                       " step " step))
+              (is (= new-t (storage/get-server-checksum-t sql))
+                  (str "versioned checksum watermark mismatch at seed "
+                       seed " step " step))
               (if (> new-t prev-t)
                 (do
                   (is (string? stored-checksum)
@@ -2961,13 +3965,32 @@
                  (p/let [resp (sync-handler/handle {:self self
                                                     :request request
                                                     :url url
-                                                    :route {:handler :sync/snapshot-download}})
+                                                    :route {:handler :sync/snapshot-download-v2}})
                          text (.text resp)
                          body (js->clj (js/JSON.parse text) :keywordize-keys true)]
                    (is (= 409 (.-status resp)))
                    (is (= "graph not ready" (:error body)))))
                (p/then (fn []
                          (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest sync-http-errors-do-not-expose-internal-details-test
+  (async done
+         (let [self #js {}
+               request (js/Request. "http://localhost/health")]
+           (-> (p/with-redefs [sync-handler/handle
+                               (fn [_request-context]
+                                 (js/Promise.reject
+                                  (ex-info "secret sync detail"
+                                           {:sql "select private_data"})))]
+                 (p/let [response (sync-handler/handle-http self request)
+                         text (.text response)
+                         body (js->clj (js/JSON.parse text) :keywordize-keys true)]
+                   (is (= 500 (.-status response)))
+                   (is (= {:error "server error"} body))))
+               (p/then (fn [] (done)))
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))

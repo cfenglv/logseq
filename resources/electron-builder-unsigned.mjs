@@ -27,10 +27,9 @@ const unsignedElectronBuilderBaseArgs = [
   "exec",
   "electron-builder",
   "--config",
-  "electron-builder.yml",
+  "electron-builder.unsigned.yml",
   "--publish",
   "never",
-  "-c.mac.hardenedRuntime=false",
 ];
 
 export const unsignedElectronBuilderArgs = (extraArgs = []) => [

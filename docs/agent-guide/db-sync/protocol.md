@@ -6,6 +6,15 @@
 - Encoding: JSON objects; `tx` payloads are Transit strings.
 - Note: keep this document in sync with the current implementation.
 
+## Backward compatibility
+- The unversioned WebSocket and HTTP shapes documented here are the v1 compatibility contract.
+- Existing v1 clients must continue to authenticate, list/open graphs, exchange RTC messages, upload/download snapshots, and access assets after a server upgrade.
+- Protocol evolution must be additive. New request fields are optional, and old requests that omit them retain their existing behavior.
+- New response fields are optional. Clients must ignore fields they do not understand, while servers must continue emitting every v1-required field.
+- A new feature that needs incompatible semantics must use an explicitly negotiated capability or a separate versioned route. It must not silently change the v1 route.
+- Releases must pass the legacy v1 wire-schema and snapshot-forwarding tests for both the Cloudflare Worker and Node adapters.
+- New clients try the v2 snapshot routes first and restart the complete operation on v1 only when the v2 route returns 404. Old clients continue using the unchanged v1 routes.
+
 ## Client -> Server
 - `{"type":"hello","client":"<repo-id>"}`
   - Initial handshake from client.
@@ -17,17 +26,32 @@
   - Upload a batch of txs based on `t-before` (required).
   - `tx-id` is optional but recommended for per-entry ack/reject mapping.
 - `{"type":"ping"}`
-  - Optional keepalive; server replies `pong`.
+  - Client keepalive, sent every 30 seconds while the connection is otherwise healthy.
+  - Cloudflare Durable Objects reply through `setWebSocketAutoResponse` without waking a hibernating object.
 
 ## Server -> Client
-- `{"type":"hello","t":<t>,"checksum":"<hex>"}`
+- `{"type":"hello","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}`
   - Server hello with current t and entity checksum.
+  - `checksum` retains the historical v1 value and meaning for old clients.
+    Current servers additionally emit the optional, paired
+    `checksum-version` and `server-checksum` fields. A client may compare the
+    latter only when it implements the exact advertised version; unknown or
+    missing versions fall back to the strict v1 comparison.
+  - `server-db-v2` uses a typed large-title token containing the exact uploaded
+    payload's SHA-256 digest. The logical title and the server placeholder
+    therefore compare equal only when they reference the same authenticated
+    payload; ordinary user text cannot collide with the token representation.
+    New markers contain `payload-format`, `payload-digest-alg`, and
+    `payload-digest`. Graphs that still contain a legacy marker without these
+    fields omit the v2 pair and retain strict v1 comparison until migrated.
+  - The server stores and updates v2 independently without changing the
+    historical `checksum`, so older clients continue to work.
 - `{"type":"online-users","online-users":[{"user-id":"...","email":"...","username":"...","name":"..."}...]}`
   - Presence update
   - Optional `editing-block-uuid` indicates the block the user is editing.
-- `{"type":"pull/ok","t":<t>,"checksum":"<hex>","txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`
+- `{"type":"pull/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?,"txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`
   - Pull response with txs and post-apply entity checksum.
-- `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>"}`
+- `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}`
   - Batch accepted; `t` and `checksum` describe the resulting server state.
     `t` remains unchanged when every entry is an idempotent no-op.
 - `{"type":"changed","t":<t>}`
@@ -42,7 +66,7 @@
 - `{"type":"tx/reject","reason":"empty tx data"|"invalid tx"|"invalid t-before"|"snapshot upload in progress"}`
   - Invalid batch.
 - `{"type":"pong"}`
-  - Keepalive response.
+  - Keepalive response. The client replaces the connection after 90 seconds without any server message.
 - `{"type":"error","message":"..."}`
   - Invalid/unknown message. Current messages: `"unknown type"`, `"invalid request"`, `"server error"`, `"invalid since"`.
 
@@ -90,24 +114,44 @@
 - `GET /sync/:graph-id/health`
   - Health check. Response: `{"ok":true}`.
 - `GET /sync/:graph-id/pull?since=<t>`
-  - Same as WS pull. Response: `{"type":"pull/ok","t":<t>,"checksum":"<hex>","txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`.
+  - Same as WS pull. Response: `{"type":"pull/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?,"txs":[{"t":<t>,"tx":"<tx-transit>","outliner-op":"<keyword?>"}...]}`.
   - Error response (400): `{"error":"invalid since"}`.
   - Error response (409): `{"error":"graph not ready"}` when bootstrap upload/import has not finished.
 - `POST /sync/:graph-id/tx/batch`
   - Same as WS tx/batch. Body: `{"t-before":<t>,"txs":[{"tx":"<tx-transit>","tx-id":"<uuid?>","outliner-op":"<keyword?>"}, ...]}`.
-  - Response: `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>"}` or `{"type":"tx/reject","reason":...}`.
+  - Response: `{"type":"tx/batch/ok","t":<t>,"checksum":"<hex>","checksum-version":"server-db-v2"?,"server-checksum":"<hex>"?}` or `{"type":"tx/reject","reason":...}`.
   - Error response (400): `{"error":"missing body"|"invalid tx"}`.
   - Error response (409): `{"error":"graph not ready"}` when bootstrap upload/import has not finished.
 - `GET /sync/:graph-id/snapshot/download`
-  - Build a snapshot file in R2 and return a download URL.
-  - Response: `{"ok":true,"key":"<graph-id>/<uuid>.snapshot","url":"<origin>/assets/:graph-id/<uuid>.snapshot","content-encoding":"gzip"}`.
+  - v1 compatibility route. Return the current live framed snapshot stream URL.
+  - Response: `{"ok":true,"key":"stream/<graph-id>.snapshot","url":"<origin>/sync/:graph-id/snapshot/stream","content-encoding":"gzip"?}`.
   - Error response (409): `{"error":"graph not ready"}` when bootstrap upload/import has not finished.
-  - The snapshot file stored in R2 is a framed Transit stream of sqlite `kvs` rows (`[addr, content, addresses]`), optionally gzip-compressed.
-- `POST /sync/:graph-id/snapshot/upload?reset=true|false`
-  - Upload a snapshot stream for bootstrap import. Current upload format remains framed Transit JSON kvs rows, optionally gzip-compressed.
+- `GET /sync/:graph-id/snapshot/download-v2`
+  - Create a frozen snapshot and return its watermark and stream URL.
+  - Response: `{"ok":true,"key":"stream/<graph-id>.snapshot","url":"<origin>/sync/:graph-id/snapshot/stream-v2?download-id=<uuid>","t":<t>,"row-count":<n>,"checksum":"<hex>"?,"content-encoding":"gzip"?}`.
+  - Error response (429): `{"error":"snapshot download busy; retry later"}` when the bounded frozen-snapshot capacity is in use.
+- `GET /sync/:graph-id/snapshot/stream`
+  - v1 live stream. It remains available without a download id.
+- `GET /sync/:graph-id/snapshot/stream-v2?download-id=<uuid>`
+  - Stream the frozen v2 snapshot. Missing, expired, or unknown ids return `410 {"error":"snapshot download expired"}`.
+- `DELETE /sync/:graph-id/snapshot/download-v2?download-id=<uuid>`
+  - Idempotently release a frozen snapshot that will not be consumed, including before a rolling-deployment fallback to v1.
+  - Response: `{"ok":true}`.
+- All snapshot stream bodies are framed Transit sqlite `kvs` rows (`[addr, content, addresses]`), optionally gzip-compressed. Servers may emit more, smaller frames without changing the row format.
+- `POST /sync/:graph-id/snapshot/upload?reset=true|false&finished=true|false&checksum=<hex>?`
+  - v1 compatibility route. It retains the legacy direct-import behavior and exact response shape for old clients.
+  - `reset=true` clears the live snapshot before importing the request body. Because v1 has no upload identity, an unfinished multipart session never expires into an automatic takeover: a second reset is rejected until the first upload finishes or an administrator explicitly resets the graph. Non-reset chunks are rejected when no v1 session is active.
+  - A successful final request with `finished=true` marks the graph ready.
+- `POST /sync/:graph-id/snapshot/upload-v2?reset=true|false&finished=true|false&upload-id=<session-id>&checksum=<16-hex>&row-count=<n>`
+  - Atomic v2 bootstrap upload. A non-empty, bounded, stable `upload-id` identifies every request in one upload.
+  - `reset=true` creates or replaces an isolated staging session. The matching `finished=true` request requires the logical checksum and exact snapshot row count before atomically replacing the live snapshot.
+  - Framed Transit decoding protects each uploaded chunk, and the Worker verifies the staged sqlite row count before activation. The checksum is over the logical graph, so the client verifies it only after decrypting rows and rehydrating offloaded large titles; the Worker stores it for subsequent RTC validation rather than pretending it can recompute plaintext from encrypted/offloaded rows.
+  - Chunks from a replaced upload id are rejected and can never mix with the replacement session. A v1 rolling-deployment fallback aborts v2 staging before restarting the complete upload through v1.
   - Request body: binary stream; headers should include `content-type: application/transit+json` and `content-encoding: gzip` when compressed.
-  - Response: `{"ok":true,"count":<n>,"key":"<graph-id>/<uuid>.snapshot"}`.
-  - Error response (400): `{"error":"missing body"|"missing graph id"}`.
+  - Response: `{"ok":true,"count":<n>}`.
+  - Error response (400): `{"error":"missing body"|"missing graph id"|"invalid upload id"|"invalid checksum"|"invalid row count"}`.
+  - Error response (409): `{"error":"snapshot upload session replaced"|"snapshot upload already committed"|"snapshot row count mismatch"}`.
+  - Both v1 and v2 upload routes require graph-owner authorization.
 - `DELETE /sync/:graph-id/admin/reset`
   - Drop/recreate per-graph tables. Response: `{"ok":true}`.
 
@@ -116,6 +160,7 @@
   - Download asset (binary response, `content-type` set, `x-asset-type` header included).
 - `PUT /assets/:graph-id/:asset-uuid.:ext`
   - Upload asset (binary body). Size limit ~100MB. Response: `{"ok":true}`.
+  - New clients may send `x-logseq-asset-size: <exact UTF-8/binary byte length>` so new servers can stream directly to object storage. The header is optional: new servers retain the v1 buffered path when it is absent, and old servers ignore it.
 - `DELETE /assets/:graph-id/:asset-uuid.:ext`
   - Delete asset. Response: `{"ok":true}`.
 - Asset error responses: `{"error":"invalid asset path"}` (400), `{"error":"not found"}` (404), `{"error":"asset too large"}` (413), `{"error":"method not allowed"}` (405), `{"error":"missing assets bucket"}` (500).

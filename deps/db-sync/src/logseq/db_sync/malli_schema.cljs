@@ -58,7 +58,10 @@
    [:failed-tx-id {:optional true} :uuid]
    [:missing-block-uuids {:optional true} [:sequential :uuid]]
    [:error-detail {:optional true} :string]
-   [:data {:optional true} :string]])
+   [:data {:optional true} :string]
+   [:checksum {:optional true} :string]
+   [:checksum-version {:optional true} :string]
+   [:server-checksum {:optional true} :string]])
 
 (def user-presence-schema
   [:map
@@ -77,13 +80,17 @@
    [:type [:= "pull/ok"]]
    [:t :int]
    [:checksum {:optional true} :string]
+   [:checksum-version {:optional true} :string]
+   [:server-checksum {:optional true} :string]
    [:txs [:sequential tx-log-entry-schema]]])
 
 (def tx-batch-ok-schema
   [:map
    [:type [:= "tx/batch/ok"]]
    [:t :int]
-   [:checksum {:optional true} :string]])
+   [:checksum {:optional true} :string]
+   [:checksum-version {:optional true} :string]
+   [:server-checksum {:optional true} :string]])
 
 (def ws-server-message-schema
   [:multi {:dispatch :type}
@@ -91,7 +98,9 @@
     [:map
      [:type [:= "hello"]]
      [:t :int]
-     [:checksum {:optional true} :string]]]
+     [:checksum {:optional true} :string]
+     [:checksum-version {:optional true} :string]
+     [:server-checksum {:optional true} :string]]]
    ["online-users" online-users-schema]
    ["presence"
     [:map
@@ -131,6 +140,7 @@
    [:schema-version {:optional true} [:maybe :string]]
    [:graph-e2ee? {:optional true} :boolean]
    [:graph-ready-for-use? {:optional true} :boolean]
+   [:owned? {:optional true} :boolean]
    [:role {:optional true} [:maybe graph-member-role-schema]]
    [:invited-by {:optional true} [:maybe :string]]
    [:created-at :int]
@@ -236,6 +246,9 @@
    [:ok :boolean]
    [:key :string]
    [:url :string]
+   [:t {:optional true} :int]
+   [:row-count {:optional true} :int]
+   [:checksum {:optional true} [:maybe :string]]
    [:content-encoding {:optional true} [:maybe :string]]])
 
 (def snapshot-upload-response-schema

@@ -1,3 +1,39 @@
+## Self-hosted RTC fork
+
+This branch extends the Logseq DB version with the client, Cloudflare Worker, and desktop release changes needed to run RTC (real-time sync and collaboration) for a self-hosted team. It is not an official Logseq release. Test it with a non-critical graph first and keep independent backups of important graphs.
+
+Compared with upstream Logseq, this fork adds or fixes:
+
+- A configurable Sync Server base URL used by both HTTP and WebSocket traffic.
+- System proxy support on macOS, Windows, and Linux, including proxied WebSocket connections.
+- Heartbeats and automatic reconnection after sleep, standby, and network changes. Offline edits remain local and resume syncing when connectivity returns.
+- Recovery from individual rejected transactions, plus a fix for missing `created-by-ref` user entities that could make a shared graph uneditable.
+- Backward-compatible, atomic snapshot upload/download with v2 negotiation and automatic fallback to unchanged v1 endpoints during rolling upgrades.
+- Byte-for-byte attachment restoration in browser-backed graphs, including protection against zero-byte LightningFS writes.
+- Strict checksum and transaction-cursor validation, bounded-memory retry during continuous editing, and local database restoration if snapshot activation fails.
+- Hardened graph access, member revocation, WebSocket error handling, payload limits, and Node server lifecycle cleanup.
+- GitHub Actions builds for macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64.
+- In-application update discovery for production selfhost releases starting with `2.0.1-selfhost.4`, with architecture-specific metadata and a six-target provider rehearsal.
+- Electron 42.4.1, including upstream Safe Storage initialization fixes that reduce unnecessary macOS Keychain prompts.
+
+To configure a client, open **Settings → Advanced → Sync Server URL**, enter the Worker base URL (for example, `https://selfhost-sync.example.workers.dev`), and save it. Do not append `/health`, `/sync/%s`, or another path. Every collaborator must use the same server URL.
+
+See the [self-hosted Logseq DB Sync / RTC guide](docs/selfhost-sync.md) for the full setup process and the [2.0.1-selfhost.4 release notes](docs/releases/2.0.1-selfhost.4.md) for this release. Installers are available from [this fork's Releases](https://github.com/cfenglv/logseq/releases).
+
+> Data compatibility: this fork intentionally keeps the `Logseq` product name and `com.logseq.logseq` application ID so it can continue using existing Logseq user data, settings, authentication state, and local graphs. Do not run official Logseq and this fork at the same time. Quit Logseq and back up your graphs before installing or switching builds. macOS packages that are not signed and notarized with an Apple Developer ID may still trigger Gatekeeper warnings.
+
+### Release verification
+
+Desktop releases use a staged verification process so deterministic source, dependency, packaging, and asset errors are caught before a GitHub Release is created:
+
+1. Run `pnpm desktop:release-preflight:quick` for fast source, version, environment, workflow, and release-configuration checks. CI runs its strict mode and rejects a dirty tracked worktree.
+2. Run `pnpm desktop:release-preflight` before pushing to install from frozen lockfiles, execute the RTC and Electron test gates, build the production client, package the current host platform in an isolated `static/` dependency root, and verify the packaged executable and native modules. This full check expects the repository-local `cli/` opam switch to use OCaml 5.4.0, matching CI.
+3. Push the exact release commit to `selfhost/cloudflare-rtc`. GitHub Actions automatically rehearses all six desktop targets: macOS Intel and Apple Silicon, Windows x64 and ARM64, and Linux x64 and ARM64. Each job inspects the packaged application, its Electron version, and the architecture of its main executable and native `keytar` module.
+4. Start a manual beta or stable build only after that exact commit has a successful push rehearsal. The workflow enforces this by commit SHA.
+5. Before a draft is created, the workflow validates the exact installer/update-file set, updater metadata, sizes and SHA-512 digests, and writes a complete `SHA256SUMS.txt`.
+
+This process catches deterministic release failures before publication. External runner, package-registry, or CDN outages can still cause transient CI failures and should be retried only after the logs confirm that the failure is external.
+
 <!-- logo -->
 <p align="center">
     <a href="https://logseq.com" alt="Logseq Logo">

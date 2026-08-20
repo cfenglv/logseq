@@ -681,6 +681,28 @@
           value
           value')))))
 
+(defn <decrypt-text-value-strict
+  [aes-key value]
+  (assert (string? value)
+          (str "encrypted value should be a string, value: " value))
+  (let [decoded (read-transit-safe value)]
+    (if (= decoded invalid-transit)
+      (p/rejected
+       (ex-info "invalid encrypted transit payload"
+                {:type :db-sync/large-title-decrypt-failed}))
+      (if-let [decrypted (crypt/<decrypt-text-if-encrypted aes-key decoded)]
+        (p/let [plain-transit decrypted
+                plain-value (read-transit-safe plain-transit)]
+          (if (and (not= plain-value invalid-transit)
+                   (string? plain-value))
+            plain-value
+            (p/rejected
+             (ex-info "invalid decrypted title payload"
+                      {:type :db-sync/large-title-decrypt-failed}))))
+        (p/rejected
+         (ex-info "payload is not encrypted"
+                  {:type :db-sync/large-title-decrypt-failed}))))))
+
 (defn- encrypt-tx-item
   [aes-key item]
   (cond

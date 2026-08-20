@@ -33,6 +33,29 @@
 (defn init-schema! [sql]
   (common/sql-exec sql "create table if not exists kvs (addr INTEGER primary key, content TEXT, addresses JSON)")
   (common/sql-exec sql
+                   "create table if not exists snapshot_kvs_staging (addr INTEGER primary key, content TEXT, addresses JSON)")
+  (common/sql-exec
+   sql
+   (str "create table if not exists snapshot_downloads ("
+        "download_id TEXT primary key,"
+        "t INTEGER not null,"
+        "checksum TEXT,"
+        "row_count INTEGER not null,"
+        "created_at INTEGER not null"
+        ");"))
+  (common/sql-exec
+   sql
+   (str "create table if not exists snapshot_kvs_exports ("
+        "download_id TEXT not null,"
+        "addr INTEGER not null,"
+        "content TEXT,"
+        "addresses JSON,"
+        "primary key(download_id, addr)"
+        ");"))
+  ;; The composite primary key already provides the lookup/order index.
+  (common/sql-exec sql
+                   "drop index if exists snapshot_kvs_exports_download_id")
+  (common/sql-exec sql
                    (str "create table if not exists tx_log ("
                         "t INTEGER primary key,"
                         "tx TEXT not null,"
@@ -59,11 +82,32 @@
                    (name k)
                    (str v)))
 
+(defn delete-meta! [sql k]
+  (common/sql-exec sql
+                   "delete from sync_meta where key = ?"
+                   (name k)))
+
 (defn get-checksum [sql]
   (get-meta sql :checksum))
 
 (defn set-checksum! [sql checksum]
   (set-meta! sql :checksum checksum))
+
+(defn get-server-checksum [sql]
+  (get-meta sql :server-checksum-v2))
+
+(defn get-server-checksum-t [sql]
+  (when-let [value (get-meta sql :server-checksum-v2-t)]
+    (js/parseInt value 10)))
+
+(defn set-server-checksum! [sql checksum t]
+  (if (string? checksum)
+    (do
+      (set-meta! sql :server-checksum-v2 checksum)
+      (set-meta! sql :server-checksum-v2-t t))
+    (do
+      (delete-meta! sql :server-checksum-v2)
+      (delete-meta! sql :server-checksum-v2-t))))
 
 (defn get-t [sql]
   (let [value (get-meta sql :t)]
@@ -75,6 +119,13 @@
   (set-meta! sql :t t))
 
 (def ^:dynamic *in-sql-transaction?* false)
+(defonce ^:private sql->transaction-sync (js/WeakMap.))
+
+(defn register-transaction-sync!
+  [sql transaction-sync-f]
+  (when (and sql (fn? transaction-sync-f))
+    (.set sql->transaction-sync sql transaction-sync-f))
+  sql)
 
 (defn with-sql-transaction!
   [sql f]
@@ -83,13 +134,15 @@
     (let [f' (fn []
                (binding [*in-sql-transaction?* true]
                  (f)))]
-      (if-let [db (aget sql "_db")]
-        (let [transaction (.-transaction db)]
-          (if (fn? transaction)
-            (let [tx-fn (.call transaction db f')]
-              (tx-fn))
-            (f')))
-        (f')))))
+      (if-let [transaction-sync (.get sql->transaction-sync sql)]
+        (transaction-sync f')
+        (if-let [db (aget sql "_db")]
+          (let [transaction (.-transaction db)]
+            (if (fn? transaction)
+              (let [tx-fn (.call transaction db f')]
+                (tx-fn))
+              (f')))
+          (f'))))))
 
 (defn set-initial-checksum! [sql checksum]
   (with-sql-transaction!
@@ -192,15 +245,31 @@
       (with-sql-transaction!
         sql
         (fn []
-          (let [new-t (inc (get-t sql))]
+          (let [prev-t (get-t sql)
+                new-t (inc prev-t)]
             (append-tx! sql new-t tx-str created-at (:outliner-op tx-meta))
             (set-t! sql new-t)
             (when-not (:db-sync/skip-checksum-update? tx-meta)
               (let [prev-checksum (get-checksum sql)
                     checksum (sync-checksum/update-checksum
                               prev-checksum
-                              (assoc tx-report :tx-data normalized-data))]
-                (set-checksum! sql checksum)))))))))
+                              (assoc tx-report :tx-data normalized-data))
+                    prev-server-checksum (get-server-checksum sql)
+                    prev-server-checksum-t (get-server-checksum-t sql)]
+                ;; Keep the historical checksum untouched for older clients.
+                ;; A rollback through an older server can advance `t` without
+                ;; maintaining the additive versioned metadata. Never extend a
+                ;; stale checksum and then stamp it with the new cursor.
+                (set-checksum! sql checksum)
+                (when (string? prev-server-checksum)
+                  (set-server-checksum!
+                   sql
+                   (if (= prev-t prev-server-checksum-t)
+                     (sync-checksum/update-server-checksum
+                      prev-server-checksum
+                      (assoc tx-report :tx-data normalized-data))
+                     (sync-checksum/recompute-server-checksum db-after))
+                   new-t))))))))))
 
 (defn- listen-db-updates!
   [sql conn]

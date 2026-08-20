@@ -1,6 +1,8 @@
 (ns electron.utils
   (:require ["electron" :refer [app BrowserWindow session]]
             ["fs-extra" :as fs]
+            ["http" :as node-http]
+            ["https" :as node-https]
             ["node-fetch" :default node-fetch]
             ["open" :as open-module]
             ["path" :as node-path]
@@ -9,9 +11,11 @@
             [electron.configs :as cfgs]
             [electron.interop :as interop]
             [electron.logger :as logger]
+            [electron.proxy :as electron-proxy]
             [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
             [logseq.common.graph-dir :as graph-dir]
+            [logseq.db-worker.daemon :as db-worker-daemon]
             [promesa.core :as p]))
 
 (defonce *win (atom nil)) ;; The main window
@@ -27,10 +31,147 @@
 (defonce extract-zip (js/require "extract-zip"))
 (defonce https-proxy-agent (js/require "https-proxy-agent"))
 (defonce socks-proxy-agent (js/require "socks-proxy-agent"))
+(defonce socks-client (.-SocksClient (js/require "socks")))
+(defonce ^:private *db-worker-proxy-bridge (atom nil))
+(defonce ^:private *proxy-transition (atom (p/resolved nil)))
 (defonce open-external
   (interop/default-function-or-module open-module))
 
-(declare <resolve-fetch-proxy)
+(declare <resolve-fetch-proxy <set-electron-proxy)
+
+(defn- current-session
+  []
+  (or (some-> ^js @*win .-webContents .-session)
+      (.-defaultSession session)))
+
+(defn- <close-proxy-bridge!
+  [{:keys [^js server sockets closed?]}]
+  (if server
+    (do
+      (reset! closed? true)
+      (doseq [^js socket @sockets]
+        (.destroy socket))
+      (p/create
+       (fn [resolve _reject]
+         (if (.-listening server)
+           (.close server #(resolve nil))
+           (resolve nil)))))
+    (p/resolved nil)))
+
+(defn- track-socket!
+  [sockets ^js socket]
+  (swap! sockets conj socket)
+  (.once socket "close" #(swap! sockets disj socket))
+  socket)
+
+(defn- send-proxy-error!
+  [^js res status message]
+  (when-not (.-headersSent res)
+    (.writeHead res status #js {"Content-Type" "text/plain"}))
+  (.end res message))
+
+(defn- create-socks-agent
+  [{:keys [protocol host port]}]
+  (new (.-SocksProxyAgent ^js socks-proxy-agent)
+       (str protocol "://" host ":" port)))
+
+(defn- url-hostname
+  [^js url]
+  (let [host (.-hostname url)]
+    (if (and (string/starts-with? host "[")
+             (string/ends-with? host "]"))
+      (subs host 1 (dec (count host)))
+      host)))
+
+(defn- proxy-http-request!
+  [socks-proxy sockets ^js req ^js res]
+  (try
+    (let [target-url (js/URL. (.-url req))
+          transport (if (= "https:" (.-protocol target-url)) node-https node-http)
+          headers (js/Object.assign #js {} (.-headers req))
+          _ (js-delete headers "proxy-connection")
+          proxy-req (.request transport
+                              target-url
+                              #js {:method (.-method req)
+                                   :headers headers
+                                   :agent (create-socks-agent socks-proxy)}
+                              (fn [^js proxy-res]
+                                (.writeHead res (.-statusCode proxy-res) (.-headers proxy-res))
+                                (.pipe proxy-res res)))]
+      (.on proxy-req "error" #(send-proxy-error! res 502 (str "SOCKS proxy request failed: " (.-message %))))
+      (.on proxy-req "socket" #(track-socket! sockets %))
+      (.pipe req proxy-req))
+    (catch :default e
+      (send-proxy-error! res 400 (str "Invalid proxy request: " (.-message e))))))
+
+(defn- parse-connect-target
+  [target]
+  (let [url (js/URL. (str "http://" target))]
+    {:host (url-hostname url)
+     :port (js/parseInt (or (.-port url) "443") 10)}))
+
+(defn- proxy-connect!
+  [socks-proxy sockets closed? ^js req ^js client-socket head]
+  (try
+    (let [{:keys [host port]} (parse-connect-target (.-url req))]
+      (-> (.createConnection socks-client
+                             #js {:proxy #js {:host (:host socks-proxy)
+                                              :port (js/parseInt (str (:port socks-proxy)) 10)
+                                              :type (if (= "socks4" (:protocol socks-proxy)) 4 5)}
+                                  :command "connect"
+                                  :destination #js {:host host :port port}})
+          (p/then (fn [^js result]
+                    (let [^js upstream-socket (.-socket result)]
+                      (if (or @closed? (.-destroyed client-socket))
+                        (.destroy upstream-socket)
+                        (do
+                          (track-socket! sockets upstream-socket)
+                          (.write client-socket "HTTP/1.1 200 Connection Established\r\n\r\n")
+                          (when (pos? (.-length head))
+                            (.write upstream-socket head))
+                          (.on upstream-socket "error" #(.destroy client-socket))
+                          (.on client-socket "error" #(.destroy upstream-socket))
+                          (.on upstream-socket "close" #(.destroy client-socket))
+                          (.on client-socket "close" #(.destroy upstream-socket))
+                          (.pipe upstream-socket client-socket)
+                          (.pipe client-socket upstream-socket))))))
+          (p/catch (fn [e]
+                     (when-not (.-destroyed client-socket)
+                       (.end client-socket
+                             (str "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\n"
+                                  "SOCKS proxy connection failed: " (.-message e))))))))
+    (catch :default e
+      (.end client-socket
+            (str "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\n"
+                 "Invalid CONNECT target: " (.-message e))))))
+
+(defn- <start-socks-proxy-bridge!
+  [socks-proxy]
+  (p/create
+   (fn [resolve reject]
+     (let [sockets (atom #{})
+           closed? (atom false)
+           server (.createServer node-http #(proxy-http-request! socks-proxy sockets %1 %2))
+           startup-error (fn [e] (reject e))]
+       (.once server "error" startup-error)
+       (.on server "connect" #(proxy-connect! socks-proxy sockets closed? %1 %2 %3))
+       (.on server "connection"
+            #(track-socket! sockets %))
+       (.listen server 0 "127.0.0.1"
+                (fn []
+                  (.removeListener server "error" startup-error)
+                  (.on server "error"
+                       (fn [e]
+                         (logger/error :db-worker-proxy-bridge-failed e)))
+                  (.unref server)
+                  (let [port (.-port (.address server))
+                        bridge {:server server
+                                :sockets sockets
+                                :closed? closed?
+                                :proxy {:protocol "http"
+                                        :host "127.0.0.1"
+                                        :port port}}]
+                    (resolve bridge))))))))
 
 (defn open
   ([target] (open target nil))
@@ -41,11 +182,11 @@
 
 (defn- <build-fetch-agent
   [{:keys [protocol host port]}]
-  (when (and protocol host port (contains? #{"http" "socks5"} protocol))
+  (when (and protocol host port (contains? #{"http" "https" "socks4" "socks5"} protocol))
     (let [proxy-url (str protocol "://" host ":" port)]
       (if-let [ctor (case protocol
-                     "http" (.-HttpsProxyAgent ^js https-proxy-agent)
-                     "socks5" (.-SocksProxyAgent ^js socks-proxy-agent)
+                     ("http" "https") (.-HttpsProxyAgent ^js https-proxy-agent)
+                     ("socks4" "socks5") (.-SocksProxyAgent ^js socks-proxy-agent)
                      nil)]
         (new ctor proxy-url)
         (do
@@ -138,71 +279,78 @@
                   (map #(node-path/join plugins-root (.-name %))))]
     dirs))
 
-(defn- set-fetch-agent-proxy
-  "Set proxy for fetch agent(plugin system)
-  protocol: http | socks5"
+(defn- <prepare-fetch-proxy
   [proxy]
-  (if proxy
-    (p/let [agent (<build-fetch-agent proxy)]
-      (reset! *fetchAgent agent))
-    (reset! *fetchAgent nil)))
+  (p/let [agent (<build-fetch-agent proxy)
+          bridge (when (contains? #{"socks4" "socks5"} (:protocol proxy))
+                   (<start-socks-proxy-bridge! proxy))]
+    {:agent agent
+     :bridge bridge
+     :db-worker-proxy (or (:proxy bridge) proxy)}))
+
+(defn- <commit-fetch-proxy!
+  [{:keys [agent bridge db-worker-proxy]}]
+  (let [old-bridge @*db-worker-proxy-bridge]
+    (reset! *db-worker-proxy-bridge bridge)
+    (db-worker-daemon/configure-proxy-env! db-worker-proxy)
+    (reset! *fetchAgent agent)
+    (<close-proxy-bridge! old-bridge)))
+
+(defn- <apply-proxy-transition!
+  [electron-opts proxy]
+  (p/let [prepared (<prepare-fetch-proxy proxy)]
+    (-> (p/do!
+         (<set-electron-proxy electron-opts)
+         (<commit-fetch-proxy! prepared))
+        (p/catch (fn [e]
+                   (-> (<close-proxy-bridge! (:bridge prepared))
+                       (p/then (fn [] (p/rejected e)))))))))
+
+(defn- <serialize-proxy-transition!
+  [transition-fn]
+  (let [result (p/then @*proxy-transition transition-fn)]
+    (reset! *proxy-transition (p/catch result (fn [_] nil)))
+    result))
 
 (defn <set-electron-proxy
   "Set proxy for electron
   type: system | direct | socks5 | http"
   ([{:keys [type host port] :or {type "system"}}]
    (let [config (->proxy-config {:type type :host host :port port})
-         sess (.. ^js @*win -webContents -session)]
+         ^js sess (current-session)]
      (if sess
-       (p/do!
-        (.setProxy sess config)
-        (.forceReloadProxyConfig sess))
+       (-> (p/do!
+            (.setProxy sess config)
+            (.forceReloadProxyConfig sess))
+           (p/timeout 10000))
        (p/resolved nil)))))
-
-(defn- parse-pac-rule
-  "Parse Proxy Auto Config(PAC) line"
-  [line]
-  (let [parts (string/split line #"[ :]")
-        type (first parts)]
-    (cond
-      (= type "DIRECT")
-      nil
-
-      (and (contains? #{"PROXY" "HTTP" "SOCKS"} type)
-           (>= (count parts) 3))
-      {:protocol (if (= type "SOCKS") "socks5" "http")
-       :host (nth parts 1)
-       :port (nth parts 2)}
-
-      :else
-      (do
-        (logger/warn "Unknown PAC rule:" line)
-        nil))))
 
 (defn- <resolve-session-proxy
   [^js sess for-url]
-  (p/let [proxy (.resolveProxy sess for-url)
-          pac-opts (->> (string/split proxy #";")
-                        (map parse-pac-rule)
-                        (remove nil?))]
-    (when (seq pac-opts)
-      (first pac-opts))))
+  (p/let [result (.resolveProxy sess for-url)]
+    (try
+      (electron-proxy/select-pac-route result)
+      (catch :default error
+        (p/rejected (ex-info (ex-message error)
+                             (assoc (ex-data error) :url for-url)
+                             error))))))
 
 (defn <get-system-proxy
   "Get system proxy for url, requires proxy to be set to system"
   ([] (<get-system-proxy "https://www.google.com"))
   ([for-url]
-   (when-let [sess (.. ^js @*win -webContents -session)]
+   (when-let [sess (current-session)]
      (<resolve-session-proxy sess for-url))))
 
 (defn- <resolve-temporary-system-proxy
   [for-url]
   (let [session-partition (str "logseq-system-proxy-" (random-uuid))
         ^js sess (.fromPartition session session-partition)]
-    (p/do!
-     (.setProxy sess #js {:mode "system"})
-     (.forceReloadProxyConfig sess)
-     (<resolve-session-proxy sess for-url))))
+    (-> (p/do!
+         (.setProxy sess #js {:mode "system"})
+         (.forceReloadProxyConfig sess)
+         (<resolve-session-proxy sess for-url))
+        (p/timeout 10000))))
 
 (defn- <resolve-fetch-proxy
   [url {:keys [type protocol host port] :as proxy}]
@@ -227,24 +375,28 @@
 
 (defn <set-proxy
   "Set proxy for electron, fetch"
-  ([{:keys [type host port] :or {type "system"} :as opts}]
+  ([{test-url :test :keys [type host port] :or {type "system"} :as opts}]
    (logger/info "set proxy to" opts)
-   (cond
-     (= type "system")
-     (p/let [_ (<set-electron-proxy {:type "system"})
-             proxy (<get-system-proxy)]
-       (set-fetch-agent-proxy proxy))
+   (<serialize-proxy-transition!
+    (fn []
+      (cond
+        (= type "system")
+        (p/let [proxy (<resolve-temporary-system-proxy
+                       (if (string/blank? test-url)
+                         "https://www.google.com"
+                         test-url))
+                effective-proxy (when-not (= "direct" (:protocol proxy)) proxy)]
+          (<apply-proxy-transition! {:type "system"} effective-proxy))
 
-     (= type "direct")
-     (p/let [_ (<set-electron-proxy {:type "direct"})]
-       (set-fetch-agent-proxy nil))
+        (= type "direct")
+        (<apply-proxy-transition! {:type "direct"} nil)
 
-     (or (= type "socks5") (= type "http"))
-     (p/let [_ (<set-electron-proxy {:type type :host host :port port})]
-       (set-fetch-agent-proxy {:protocol type :host host :port port}))
+        (or (= type "socks5") (= type "http"))
+        (<apply-proxy-transition! {:type type :host host :port port}
+                                  {:protocol type :host host :port port})
 
-     :else
-     (logger/error "Unknown proxy type:" type))))
+        :else
+        (p/rejected (ex-info "Unknown proxy type" {:type type})))))))
 
 (defn <restore-proxy-settings
   "Restore proxy settings from configs.edn"

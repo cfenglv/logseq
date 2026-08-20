@@ -22,6 +22,11 @@
 (use-fixtures :each
   fixtures/new-logseq-page-in-rtc)
 
+(defn- focus-exact-block!
+  [text]
+  (w/click (util/get-by-text text true))
+  (b/wait-editor-text text))
+
 (defn- with-stop-restart-rtc
   [pw-page f]
   (w/with-page pw-page
@@ -153,8 +158,8 @@
 (deftest rtc-outliner-test
   (doseq [test-fn [outliner-basic-test/create-test-page-and-insert-blocks
                    outliner-basic-test/indent-and-outdent
-                   outliner-basic-test/move-up-down
-                   outliner-basic-test/delete
+                   #(outliner-basic-test/move-up-down rtc/wait-current-tx-synced)
+                   #(outliner-basic-test/delete rtc/wait-current-tx-synced)
                    outliner-basic-test/delete-test-with-children]]
     (let [test-fn-in-page2 (fn [*latest-remote-tx]
                              (w/with-page @*page2
@@ -194,10 +199,10 @@
                    (assert/assert-in-normal-mode?)
                    (b/new-block "page2-done-1"))]
         (w/with-page @*page1
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 1)))
+          (focus-exact-block! (str title-prefix "-" 1))
           (b/indent))
         (w/with-page @*page2
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 0)))
+          (focus-exact-block! (str title-prefix "-" 0))
           (b/delete-blocks)))
       (validate-graphs-in-2-pw-pages))
     (testing "
@@ -218,18 +223,23 @@ page2:
         [@*page1 (rtc/with-wait-tx-updated (b/new-block "page1-done-2"))
          @*page2 (rtc/with-wait-tx-updated (b/new-block "page2-done-2"))]
         (w/with-page @*page1
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 3)))
+          (focus-exact-block! (str title-prefix "-" 3))
           (b/indent)
           (k/arrow-down)
+          (b/wait-editor-text (str title-prefix "-" 4))
           (b/indent)
           (b/indent))
         (w/with-page @*page2
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 2)))
+          (focus-exact-block! (str title-prefix "-" 2))
           (b/delete-blocks)
-          (w/click (format ".ls-block :text('%s')" (str title-prefix "-" 3)))
+          (focus-exact-block! (str title-prefix "-" 3))
           (k/shift+arrow-down)
           (k/meta+shift+arrow-down)
           (k/enter)
+          ;; The move shortcut can leave the selection in normal mode on a
+          ;; slow runner. Re-establish the exact editor target before Tab so a
+          ;; swallowed Enter is detected without replaying the move.
+          (focus-exact-block! (str title-prefix "-" 3))
           (b/indent)))
       (validate-graphs-in-2-pw-pages))))
 

@@ -1,14 +1,18 @@
 (ns frontend.worker.db-core-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require ["fs" :as fs]
+            ["path" :as node-path]
+            [cljs.test :refer [async deftest is]]
             [datascript.core :as d]
             [datascript.storage :as storage]
             [frontend.common.thread-api :as thread-api]
             [frontend.common.graph-view :as graph-view]
+            [frontend.test.node-helper :as node-helper]
             [frontend.worker.db-core :as db-core]
             [frontend.worker.db.validate :as worker-db-validate]
             [frontend.worker.export :as worker-export]
             [frontend.worker.pipeline :as worker-pipeline]
             [frontend.worker.platform :as platform]
+            [frontend.worker.platform.node :as platform-node]
             [frontend.worker.search :as search]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
@@ -109,6 +113,7 @@
               :resolve-db-path (fn [_repo _pool path] path)
               :export-file (fn [_pool _path] (p/resolved (js/Uint8Array. 0)))
               :import-db (or import-db (fn [_pool _path _data] (p/resolved nil)))
+              :unlink-db-file! (fn [_pool _path] (p/resolved true))
               :remove-vfs! remove-vfs!
               :read-text! (fn [_path] (p/resolved ""))
               :write-text! (fn [_path _text] (p/resolved nil))
@@ -140,6 +145,7 @@
         opfs-prev @worker-state/*opfs-pools
         main-thread-prev @worker-state/*main-thread
         platform-prev @@#'platform/*platform
+        node-pools-prev @(deref #'db-core/*node-pools)
         search-build-prev @(deref #'db-core/*search-index-build-ids)
         vector-build-prev @(deref #'db-core/*vector-index-rebuild-ids)
         cleanup (fn []
@@ -152,6 +158,7 @@
                   (reset! worker-state/*client-ops-conns client-ops-prev)
                   (reset! worker-state/*opfs-pools opfs-prev)
                   (reset! worker-state/*main-thread main-thread-prev)
+                  (reset! (deref #'db-core/*node-pools) node-pools-prev)
                   (reset! (deref #'db-core/*search-index-build-ids) search-build-prev)
                   (reset! (deref #'db-core/*vector-index-rebuild-ids) vector-build-prev)
                   (reset! @#'platform/*platform platform-prev))]
@@ -163,6 +170,7 @@
     (reset! worker-state/*client-ops-conns {})
     (reset! worker-state/*opfs-pools {})
     (reset! worker-state/*main-thread nil)
+    (reset! (deref #'db-core/*node-pools) {})
     (reset! (deref #'db-core/*search-index-build-ids) {})
     (reset! (deref #'db-core/*vector-index-rebuild-ids) {})
     (let [result (f)]
@@ -991,6 +999,231 @@
          (finally
            (reset! *import-state import-state-prev)))))))
 
+(deftest db-sync-close-db-can-preserve-active-import-state-test
+  (restoring-worker-state
+   (fn []
+     (let [*import-state @#'sync-download/*import-state
+           import-state-prev @*import-state
+           closed (atom [])
+           removed-pools (atom [])]
+       (try
+         (platform/set-platform!
+          (build-test-platform
+           {:remove-vfs! (fn [pool]
+                           (swap! removed-pools conj pool)
+                           (p/resolved nil))}))
+         (reset! worker-state/*sqlite-conns
+                 {test-repo
+                  {:db (fake-db {:close-calls closed :close-label :db})
+                   :search
+                   (fake-db {:close-calls closed :close-label :search})
+                   :client-ops
+                   (fake-db {:close-calls closed
+                             :close-label :client-ops})}})
+         (reset! worker-state/*opfs-pools
+                 {test-repo #js {:pauseVfs (fn [] nil)}})
+         (reset! *import-state
+                 {:repo test-repo
+                  :graph-id "graph-1"
+                  :import-id "import-1"
+                  :rows-db
+                  #js {:close (fn []
+                                (swap! closed conj :rows-db))}
+                  :rows-pool :rows-pool})
+
+         (db-core/close-db!
+          test-repo {:preserve-sync-import? true})
+
+         (is (= "import-1" (:import-id @*import-state)))
+         (is (= #{:db :search :client-ops} (set @closed)))
+         (is (empty? @removed-pools))
+         (finally
+           (when-let [state @*import-state]
+             (when-let [rows-db (:rows-db state)]
+               (.close rows-db)))
+           (reset! *import-state import-state-prev)))))))
+
+(deftest interrupted-snapshot-activation-restores-durable-sidecar-test
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [root-dir
+                   (node-helper/create-tmp-dir
+                    "db-core-durable-sync-backup")
+                   backup!
+                   (get @thread-api/*thread-apis
+                        :thread-api/db-sync-export-local-backup)
+                   reset-target!
+                   (get @thread-api/*thread-apis
+                        :thread-api/db-sync-reset-target-preserving-backup)]
+               (p/let [node-platform
+                       (platform-node/node-platform {:root-dir root-dir})
+                       _ (platform/set-platform! node-platform)
+                       _ (reset! worker-state/*sqlite #js {})
+                       storage (:storage node-platform)
+                       sqlite (:sqlite node-platform)
+                       pool (#'db-core/<get-opfs-pool test-repo)
+                       resolve-path
+                       (fn [path]
+                         ((:resolve-db-path storage)
+                          test-repo pool path))
+                       db-path (resolve-path db-core/repo-path)
+                       search-path
+                       (resolve-path (str "search" db-core/repo-path))
+                       client-ops-path
+                       (resolve-path
+                        (str "client-ops-" db-core/repo-path))
+                       db ((:open-db sqlite) {:path db-path})
+                       search-db
+                       ((:open-db sqlite) {:path search-path})
+                       client-ops-db
+                       ((:open-db sqlite) {:path client-ops-path})
+                       _ (.exec db
+                                "create table kvs (addr integer primary key, content text, addresses text)")
+                       _ (.exec db
+                                "insert into kvs (addr, content) values (1, 'original')")
+                       _ (.exec search-db
+                                "create table search_state (id integer)")
+                       _ (.exec client-ops-db
+                                "create table kvs (addr integer primary key, content text, addresses text)")
+                       _ (.exec client-ops-db
+                                "insert into kvs (addr, content) values (1, 'original-op')")
+                       _ (reset! worker-state/*sqlite-conns
+                                 {test-repo
+                                  {:db db
+                                   :search search-db
+                                   :client-ops client-ops-db}})
+                       backup (backup! test-repo)
+                       _ (is (true? (:durable? backup)))
+                       _ (reset-target! test-repo)
+                       ^js pool-after-reset
+                       (#'db-core/<get-opfs-pool test-repo)
+                       replacement-path
+                       ((:resolve-db-path storage)
+                        test-repo pool-after-reset db-core/repo-path)
+                       replacement-db
+                       ((:open-db sqlite) {:path replacement-path})
+                       _ (.exec replacement-db
+                                "create table kvs (addr integer primary key, content text, addresses text)")
+                       _ (.exec replacement-db
+                                "insert into kvs (addr, content) values (1, 'partial-replacement')")
+                       _ ((:close-db sqlite) replacement-db)
+                       ;; Simulate process restart before activation commits.
+                       _ (#'db-core/<recover-pending-sync-backup! test-repo)
+                       restored-db
+                       ((:open-db sqlite) {:path replacement-path})
+                       rows
+                       (.exec restored-db
+                              #js {:sql
+                                   "select content from kvs where addr = 1"
+                                   :rowMode "array"})
+                       _ ((:close-db sqlite) restored-db)
+                       restored-client-ops-db
+                       ((:open-db sqlite) {:path client-ops-path})
+                       client-ops-rows
+                       (.exec restored-client-ops-db
+                              #js {:sql
+                                   "select content from kvs where addr = 1"
+                                   :rowMode "array"})
+                       _ ((:close-db sqlite) restored-client-ops-db)
+                       repo-dir (.-repoDir pool-after-reset)]
+                 (is (= [["original"]]
+                        (mapv vec (js->clj rows))))
+                 (is (= [["original-op"]]
+                        (mapv vec (js->clj client-ops-rows))))
+                 (is (not
+                      (fs/existsSync
+                       (node-path/join
+                        repo-dir "db-sync-backup.sqlite"))))
+                 (is (not
+                      (fs/existsSync
+                       (node-path/join
+                        repo-dir
+                        "db-sync-client-ops-backup.sqlite"))))
+                 (is (not
+                      (fs/existsSync
+                       (node-path/join
+                        repo-dir "db-sync-recovery.sqlite"))))))))
+          (p/catch (fn [error]
+                     (is false (str error))))
+          (p/finally done))))
+
+(deftest committed-snapshot-recovery-keeps-live-graph-and-cleans-sidecars-test
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [root-dir
+                   (node-helper/create-tmp-dir
+                    "db-core-committed-sync-backup")]
+               (p/let [node-platform
+                       (platform-node/node-platform {:root-dir root-dir})
+                       _ (platform/set-platform! node-platform)
+                       _ (reset! worker-state/*sqlite #js {})
+                       storage (:storage node-platform)
+                       sqlite (:sqlite node-platform)
+                       pool (#'db-core/<get-opfs-pool test-repo)
+                       resolve-path
+                       (fn [path]
+                         ((:resolve-db-path storage)
+                          test-repo pool path))
+                       live-path (resolve-path db-core/repo-path)
+                       backup-path
+                       (resolve-path "/db-sync-backup.sqlite")
+                       live-db ((:open-db sqlite) {:path live-path})
+                       _ (.exec
+                          live-db
+                          (str "create table kvs "
+                               "(addr integer primary key, "
+                               "content text, addresses text)"))
+                       _ (.exec
+                          live-db
+                          (str "insert into kvs (addr, content) "
+                               "values (1, 'new-live-graph')"))
+                       _ ((:close-db sqlite) live-db)
+                       backup-db
+                       ((:open-db sqlite) {:path backup-path})
+                       _ (.exec
+                          backup-db
+                          (str "create table kvs "
+                               "(addr integer primary key, "
+                               "content text, addresses text)"))
+                       _ (.exec
+                          backup-db
+                          (str "insert into kvs (addr, content) "
+                               "values (1, 'old-backup')"))
+                       _ ((:close-db sqlite) backup-db)
+                       _ (#'db-core/<write-sync-backup-marker!
+                          test-repo "committed" false)
+                       result
+                       (#'db-core/<recover-pending-sync-backup!
+                        test-repo)
+                       verified-db
+                       ((:open-db sqlite) {:path live-path})
+                       rows
+                       (.exec verified-db
+                              #js {:sql
+                                   (str "select content from kvs "
+                                        "where addr = 1")
+                                   :rowMode "array"})
+                       _ ((:close-db sqlite) verified-db)
+                       repo-dir (.-repoDir ^js pool)]
+                 (is (= :committed result))
+                 (is (= [["new-live-graph"]]
+                        (mapv vec (js->clj rows))))
+                 (is (not
+                      (fs/existsSync
+                       (node-path/join
+                        repo-dir "db-sync-backup.sqlite"))))
+                 (is (not
+                      (fs/existsSync
+                       (node-path/join
+                        repo-dir "db-sync-recovery.sqlite"))))))))
+          (p/catch (fn [error]
+                     (is false (str error))))
+          (p/finally done))))
+
 ;; ---- ->uint8array tests ----
 
 (deftest ->uint8array-returns-uint8array-unchanged
@@ -1793,6 +2026,28 @@
        (sync-app-state! new-state)
        (is (= new-state (select-keys @worker-state/*state [:git/current-repo :theme])))))))
 
+(deftest sync-app-state-auth-only-preserves-repo-and-config
+  (restoring-worker-state
+   (fn []
+     (let [sync-app-state! (get @thread-api/*thread-apis :thread-api/sync-app-state)]
+       (swap! worker-state/*state assoc
+              :git/current-repo test-repo
+              :config {:existing true})
+       (sync-app-state! {:auth/id-token "fresh-token"})
+       (is (= test-repo (:git/current-repo @worker-state/*state)))
+       (is (= {:existing true} (:config @worker-state/*state)))
+       (is (= "fresh-token" (:auth/id-token @worker-state/*state)))))))
+
+(deftest sync-app-state-nil-repo-does-not-clear-bound-repo
+  (restoring-worker-state
+   (fn []
+     (let [sync-app-state! (get @thread-api/*thread-apis :thread-api/sync-app-state)]
+       (swap! worker-state/*state assoc :git/current-repo test-repo)
+       (sync-app-state! {:git/current-repo nil
+                         :auth/id-token "fresh-token"})
+       (is (= test-repo (:git/current-repo @worker-state/*state)))
+       (is (= "fresh-token" (:auth/id-token @worker-state/*state)))))))
+
 ;; ---- get-block-parents thread-api test ----
 
 (deftest get-block-parents-returns-parents
@@ -2071,6 +2326,12 @@
                      client-op/update-local-checksum (fn [input-repo checksum]
                                                        (swap! calls conj [:update-local-checksum input-repo checksum])
                                                        nil)
+                     client-op/update-local-server-checksum
+                     (fn [input-repo checksum]
+                       (swap! calls conj
+                              [:update-local-server-checksum
+                               input-repo checksum])
+                       nil)
                      db-view/get-view-data (fn [db view-id option]
                                              (swap! calls conj [:get-view-data db view-id option])
                                              {:view-id view-id})
@@ -2092,7 +2353,11 @@
          (is (= [:value-1] ((get-thread-api :thread-api/get-property-values) repo property-option)))
          (is (= [:p-link] ((get-thread-api :thread-api/get-bidirectional-properties) repo {:target-id "b1"})))
          (is (= {:nodes 1} ((get-thread-api :thread-api/build-graph) repo {:depth 1})))
-         (is (some #(= [:update-local-checksum repo "new-checksum"] %) @calls)))))))
+         (is (some #(= [:update-local-checksum repo "new-checksum"] %) @calls))
+         (is (some #(and (= :update-local-server-checksum (first %))
+                         (= repo (second %))
+                         (string? (nth % 2)))
+                   @calls)))))))
 
 ;; When source and dest built-in eids differ, a :graph (datom) import would trip
 ;; the pipeline's revert-disallowed-changes, which sees the moved :db/ident as a

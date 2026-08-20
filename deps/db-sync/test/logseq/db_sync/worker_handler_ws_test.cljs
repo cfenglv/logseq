@@ -2,14 +2,92 @@
   (:require [cljs-bean.core :as bean]
             [cljs.test :refer [async deftest is]]
             [datascript.core :as d]
+            [logseq.db-sync.index :as index]
             [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.storage :as storage]
             [logseq.db-sync.test-sql :as test-sql]
-            [logseq.db-sync.worker.handler.sync :as sync-handler]
             [logseq.db-sync.worker.handler.ws :as ws-handler]
             [logseq.db-sync.worker.presence :as presence]
             [logseq.db-sync.worker.ws :as ws]
             [promesa.core :as p]))
+
+(defn- fake-d1
+  ([rows]
+   (fake-d1 rows nil))
+  ([rows bind-args*]
+   (let [stmt (js-obj)]
+     (aset stmt "bind"
+           (fn [& args]
+             (when bind-args*
+               (reset! bind-args* args))
+             stmt))
+     (aset stmt "all"
+           (fn []
+             (p/resolved #js {:results (clj->js rows)})))
+     #js {:prepare (fn [_sql] stmt)})))
+
+(deftest revoked-member-is-closed-before-next-websocket-message-test
+  (async done
+         (let [closed* (atom nil)
+               sent* (atom [])
+               socket (js-obj)
+               self #js {:env #js {"DB" (fake-d1 [])}
+                         :graph-id "graph-1"
+                         :state #js {:getWebSockets (fn [] #js [socket])}}
+               raw (protocol/encode-message {:type "hello" :client "test"})]
+           (aset socket "readyState" 1)
+           (aset socket "serializeAttachment" (fn [_attachment] nil))
+           (aset socket "deserializeAttachment" (fn [] nil))
+           (aset socket "send" (fn [message]
+                                 (swap! sent* conj message)))
+           (aset socket "close"
+                 (fn [code reason]
+                   (aset socket "readyState" 2)
+                   (reset! closed* [code reason])))
+           (presence/add-presence!
+            self socket {:user-id "revoked-user"} "graph-1")
+           (-> (ws-handler/handle-ws-message! self socket raw)
+               (p/then (fn [_]
+                         (is (= [1008 "graph access revoked"] @closed*))
+                         (is (empty? @sent*))
+                         (is (nil? (presence/get-user self socket)))
+                         (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest websocket-access-check-is-cached-for-active-connection-test
+  (async done
+         (let [query-count* (atom 0)
+               sent* (atom [])
+               socket (js-obj)
+               self #js {:env #js {"DB" #js {}}
+                         :graph-id "graph-cache"
+                         :state #js {:getWebSockets (fn [] #js [socket])}}
+               raw (protocol/encode-message {:type "ping"})]
+           (aset socket "readyState" 1)
+           (aset socket "serializeAttachment" (fn [_attachment] nil))
+           (aset socket "deserializeAttachment" (fn [] nil))
+           (presence/add-presence!
+            self socket {:user-id "cached-user"} "graph-cache")
+           (-> (p/with-redefs
+                 [index/<user-has-access-to-graph?
+                  (fn [_db _graph-id _user-id]
+                    (swap! query-count* inc)
+                    (p/resolved true))
+                  ws/send!
+                  (fn [_socket message]
+                    (swap! sent* conj message))]
+                 (p/let [_ (ws-handler/handle-ws-message!
+                            self socket raw)
+                         _ (ws-handler/handle-ws-message!
+                            self socket raw)]
+                   (is (= 1 @query-count*))
+                   (is (= [{:type "pong"} {:type "pong"}]
+                          @sent*))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
 
 (deftest presence-message-broadcast-excludes-source-client-test
   (let [source-ws #js {:readyState 1}
@@ -31,6 +109,26 @@
              :editing-block-uuid "block-1"
              :user-id "user-1"}]
            (mapv :msg @send-events)))))
+
+(deftest broadcast-send-failure-isolated-from-healthy-peers-test
+  (let [bad-close* (atom nil)
+        healthy-raw* (atom [])
+        bad-ws #js {:readyState 1
+                    :send (fn [_raw]
+                            (throw (js/Error. "stale socket")))
+                    :close (fn [code reason]
+                             (reset! bad-close* [code reason]))}
+        healthy-ws #js {:readyState 1
+                        :send (fn [raw]
+                                (swap! healthy-raw* conj raw))}
+        self #js {:state
+                  #js {:getWebSockets (fn [] #js [bad-ws healthy-ws])}}]
+    (is (nil? (ws/broadcast! self nil {:type "changed" :t 7})))
+    (is (= [1011 "send failed"] @bad-close*))
+    (is (= [{:type "changed" :t 7}]
+           (mapv #(-> % js/JSON.parse
+                      (js->clj :keywordize-keys true))
+                 @healthy-raw*)))))
 
 (deftest hello-message-includes-checksum-test
   (let [sql (test-sql/make-sql)
@@ -148,20 +246,60 @@
             :online-users [user]}
            @sent))))
 
+(deftest restored-attachment-preserves-graph-context-for-tx-batch-test
+  (let [sql (test-sql/make-sql)
+        conn (storage/open-conn sql)
+        attachment* (atom nil)
+        ws #js {:readyState 1
+                :serializeAttachment (fn [attachment]
+                                       (reset! attachment* attachment))
+                :deserializeAttachment (fn []
+                                         @attachment*)}
+        initial-self #js {:graph-id "graph-before-hibernation"}
+        restored-self #js {:conn conn
+                           :schema-ready true
+                           :sql sql}
+        user {:user-id "user-1"
+              :username "alice"}
+        tx-metas* (atom [])
+        raw (protocol/encode-message
+             {:type "tx/batch"
+              :t-before 0
+              :txs [{:tx (protocol/tx->transit
+                          [[:db/add -1 :block/title "after hibernation"]])
+                     :outliner-op :save-block}]})]
+    (presence/add-presence! initial-self ws user "graph-before-hibernation")
+    (is (= "graph-before-hibernation"
+           (presence/attachment->graph-id (.deserializeAttachment ws))))
+    (swap! (presence/presence* restored-self)
+           assoc
+           ws
+           (presence/attachment->user (.deserializeAttachment ws)))
+    (with-redefs [ws/broadcast! (fn [& _] nil)
+                  ws/send! (fn [& _] nil)]
+      (d/listen! conn ::capture-restored-graph-context
+                 (fn [tx-report]
+                   (swap! tx-metas* conj (:tx-meta tx-report))))
+      (try
+        (ws-handler/handle-ws-message! restored-self ws raw)
+        (finally
+          (d/unlisten! conn ::capture-restored-graph-context))))
+    (is (some #(= "graph-before-hibernation" (:graph-id %))
+              @tx-metas*))))
+
 (deftest websocket-connection-is-rejected-while-snapshot-upload-is-in-progress-test
   (async done
          (let [accepted (atom [])
                presence-events (atom [])
-               self #js {:state #js {:acceptWebSocket (fn [socket]
-                                                        (swap! accepted conj socket))}}
+               sql (test-sql/make-sql)
+               self #js {:sql sql
+                         :schema-ready true
+                         :state #js {:acceptWebSocket (fn [socket]
+                                                       (swap! accepted conj socket))}}
                request (js/Request. "http://localhost/sync/graph-1/ws?graph-id=graph-1"
                                     #js {:method "GET"})]
-           (-> (p/with-redefs [sync-handler/<ready-for-sync? (fn [_ _] (p/resolved false))
-                               presence/add-presence! (fn [& _]
-                                                        (swap! presence-events conj :add))
-                               presence/broadcast-online-users! (fn [& _]
-                                                                  (swap! presence-events conj :broadcast))]
-                 (ws-handler/handle-ws self request))
+           (storage/set-meta! sql :snapshot-uploading? true)
+           (-> (ws-handler/handle-ws self request)
                (p/then (fn [response]
                          (is (= 409 (.-status response)))
                          (is (empty? @accepted))
@@ -174,14 +312,18 @@
 (deftest websocket-connection-uses-graph-id-from-sync-path-test
   (async done
          (let [seen-graph-id (atom ::unset)
-               self #js {}
+               bind-args* (atom nil)
+               sql (test-sql/make-sql)
+               self #js {:sql sql
+                         :schema-ready true
+                         :env #js {"DB" (fake-d1
+                                         [#js {"graph_ready_for_use" 0}]
+                                         bind-args*)}}
                request (js/Request. "http://localhost/sync/graph-from-path"
                                     #js {:method "GET"})]
-           (-> (p/with-redefs [sync-handler/<ready-for-sync? (fn [_self graph-id]
-                                                               (reset! seen-graph-id graph-id)
-                                                               (p/resolved false))]
-                 (ws-handler/handle-ws self request))
+           (-> (ws-handler/handle-ws self request)
                (p/then (fn [response]
+                         (reset! seen-graph-id (first @bind-args*))
                          (is (= "graph-from-path" @seen-graph-id))
                          (is (= 409 (.-status response)))
                          (done)))

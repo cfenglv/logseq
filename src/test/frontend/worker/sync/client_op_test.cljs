@@ -40,14 +40,65 @@
         (client-op/update-graph-uuid repo "graph-1")
         (client-op/update-local-tx repo 9)
         (client-op/update-local-checksum repo "checksum-1")
+        (client-op/update-local-server-checksum repo "server-checksum-1")
 
         (client-op/update-graph-uuid repo "graph-2")
         (client-op/update-local-tx repo 12)
         (client-op/update-local-checksum repo "checksum-2")
+        (client-op/update-local-server-checksum repo "server-checksum-2")
 
         (is (= "graph-2" (client-op/get-graph-uuid repo)))
         (is (= 12 (client-op/get-local-tx repo)))
-        (is (= "checksum-2" (client-op/get-local-checksum repo)))))))
+        (is (= "checksum-2" (client-op/get-local-checksum repo)))
+        (is (= "server-checksum-2"
+               (client-op/get-local-server-checksum repo)))))))
+
+(deftest stale-versioned-checksum-watermark-is-not-trusted-test
+  (let [repo "repo-stale-server-checksum"]
+    (with-client-ops-db
+      repo
+      (fn [db]
+        (client-op/update-local-tx repo 9)
+        (client-op/update-local-checksum repo "legacy-checksum-at-9")
+        (client-op/update-local-server-checksum repo "server-checksum-at-9")
+        (is (= "server-checksum-at-9"
+               (client-op/get-local-server-checksum repo)))
+
+        ;; Simulate an old client that advances only the historical metadata.
+        (let [^js stmt
+              (.prepare ^js db
+                        (str "insert into sync_meta (key, value) values ('local-tx', '10') "
+                             "on conflict(key) do update set value = excluded.value"))]
+          (.run stmt))
+        (is (nil? (client-op/get-local-server-checksum repo))
+            "a new client must recompute after an old-client downgrade")
+
+        (client-op/update-local-checksum repo "legacy-checksum-at-10")
+        (client-op/update-local-server-checksum repo "server-checksum-at-10")
+        (is (= "server-checksum-at-10"
+               (client-op/get-local-server-checksum repo)))))))
+
+(deftest versioned-checksum-is-invalidated-by-old-client-pending-edit-test
+  (let [repo "repo-stale-server-checksum-pending-edit"]
+    (with-client-ops-db
+      repo
+      (fn [_db]
+        (client-op/update-local-tx repo 4)
+        (client-op/update-local-checksum repo "legacy-before-edit")
+        (client-op/update-local-server-checksum repo "server-before-edit")
+        (is (= "server-before-edit"
+               (client-op/get-local-server-checksum repo)))
+
+        ;; Old clients maintain the legacy checksum for local edits but do not
+        ;; know the additive versioned metadata. local-t remains unchanged
+        ;; until the pending edit is acknowledged.
+        (client-op/update-local-checksum repo "legacy-after-local-edit")
+        (is (nil? (client-op/get-local-server-checksum repo)))
+
+        ;; Advancing the cursor must not bless that stale value. The message
+        ;; verifier will recompute and stamp a fresh checksum at the new t.
+        (client-op/update-local-tx repo 5)
+        (is (nil? (client-op/get-local-server-checksum repo)))))))
 
 (deftest sqlite-asset-ops-coalescing-test
   (let [repo "repo-asset"

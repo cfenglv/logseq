@@ -18,6 +18,15 @@
          (seq expected)
          (= expected actual))))
 
+(defn- destructive-sync-request?
+  [method tail]
+  (or (and (= method "DELETE")
+           (= tail "/admin/reset"))
+      (and (= method "POST")
+           (contains? #{"/snapshot/upload"
+                        "/snapshot/upload-v2"}
+                      tail))))
+
 (defn handle-node-fetch
   [{:keys [request env registry deps]}]
   (let [url (platform/request-url request)
@@ -53,22 +62,31 @@
       (string/starts-with? path "/sync/")
       (if-let [{:keys [graph-id tail]} (node-routes/parse-sync-path path)]
         (if (seq graph-id)
-          (if (= method "OPTIONS")
+          (cond
+            (= tail "/internal/revoke-user")
+            (http/not-found)
+
+            (= method "OPTIONS")
             (common/options-response)
-            (if (admin-token-valid? request env)
-              (let [ctx (graph/get-or-create-graph registry deps graph-id)
-                    new-url (js/URL. (str (.-origin url) tail (.-search url)))]
-                (.set (.-searchParams new-url) "graph-id" graph-id)
-                (let [rewritten (platform/request (.toString new-url) request)]
-                  (sync-handler/handle-http ctx rewritten)))
-              (p/let [access-resp (index-handler/graph-access-response request env graph-id)]
-                (if (.-ok access-resp)
-                  (let [ctx (graph/get-or-create-graph registry deps graph-id)
-                        new-url (js/URL. (str (.-origin url) tail (.-search url)))]
-                    (.set (.-searchParams new-url) "graph-id" graph-id)
-                    (let [rewritten (platform/request (.toString new-url) request)]
-                      (sync-handler/handle-http ctx rewritten)))
-                  access-resp))))
+
+            (admin-token-valid? request env)
+            (let [ctx (graph/get-or-create-graph registry deps graph-id)
+                  new-url (js/URL. (str (.-origin url) tail (.-search url)))]
+              (.set (.-searchParams new-url) "graph-id" graph-id)
+              (let [rewritten (platform/request (.toString new-url) request)]
+                (sync-handler/handle-http ctx rewritten)))
+
+            :else
+            (p/let [access-resp (if (destructive-sync-request? method tail)
+                                  (index-handler/graph-owner-response request env graph-id)
+                                  (index-handler/graph-access-response request env graph-id))]
+              (if (.-ok access-resp)
+                (let [ctx (graph/get-or-create-graph registry deps graph-id)
+                      new-url (js/URL. (str (.-origin url) tail (.-search url)))]
+                  (.set (.-searchParams new-url) "graph-id" graph-id)
+                  (let [rewritten (platform/request (.toString new-url) request)]
+                    (sync-handler/handle-http ctx rewritten)))
+                access-resp)))
           (http/bad-request "missing graph id"))
         (http/bad-request "missing graph id"))
 

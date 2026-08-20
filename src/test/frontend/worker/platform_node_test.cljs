@@ -76,6 +76,37 @@
     (is (string/includes? source "\"node:sqlite\""))
     (is (not (string/includes? source "\"better-sqlite3\"")))))
 
+(deftest node-platform-websocket-proxy-env-resolution
+  (let [resolve-proxy #'platform-node/websocket-proxy-url]
+    (testing "wss prefers HTTPS_PROXY and supports lowercase fallback"
+      (is (= "http://127.0.0.1:7897"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                 "HTTP_PROXY" "http://127.0.0.1:7898"})))
+      (is (= "http://127.0.0.1:7899"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"https_proxy" "http://127.0.0.1:7899"}))))
+
+    (testing "ws prefers HTTP_PROXY and supports SOCKS through ALL_PROXY"
+      (is (= "http://127.0.0.1:7898"
+             (resolve-proxy "ws://team.example/sync/graph"
+                            #js {"HTTP_PROXY" "http://127.0.0.1:7898"})))
+      (is (= "socks5://127.0.0.1:1080"
+             (resolve-proxy "wss://team.example/sync/graph"
+                            #js {"ALL_PROXY" "socks5://127.0.0.1:1080"}))))
+
+    (testing "NO_PROXY bypasses exact hosts, subdomains, ports, and wildcard"
+      (is (nil? (resolve-proxy "wss://team.example:8443/sync/graph"
+                               #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                    "NO_PROXY" "localhost,.example:8443"})))
+      (is (= "http://127.0.0.1:7897"
+             (resolve-proxy "wss://team.example:443/sync/graph"
+                            #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                 "NO_PROXY" ".example:8443"})))
+      (is (nil? (resolve-proxy "wss://anything.example/sync/graph"
+                               #js {"HTTPS_PROXY" "http://127.0.0.1:7897"
+                                    "NO_PROXY" "*"}))))))
+
 (deftest node-platform-loads-zvec-lazily
   (let [source (node-platform-source)]
     (is (not (string/includes? source "[\"@zvec/zvec\" :as zvec]")))
@@ -476,6 +507,52 @@
             (is (not (fs/existsSync lock-path)))
             (is (not (fs/existsSync db-path)))
             (is (not (fs/existsSync nested-path))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest unlink-db-file-removes-only-selected-file
+  (async done
+    (let [root-dir
+          (node-helper/create-tmp-dir "platform-node-unlink-db-file")]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage) nil "logseq_db_demo")
+                  repo-dir (gobj/get pool "repoDir")
+                  db-path (node-path/join repo-dir "db.sqlite")
+                  backup-path
+                  (node-path/join repo-dir "db-sync-backup.sqlite")
+                  _ (fs/writeFileSync db-path "db" "utf8")
+                  _ (fs/writeFileSync backup-path "backup" "utf8")
+                  removed? ((:unlink-db-file! storage) pool "/db.sqlite")
+                  missing? ((:unlink-db-file! storage) pool "/db.sqlite")]
+            (is (true? removed?))
+            (is (false? missing?))
+            (is (not (fs/existsSync db-path)))
+            (is (fs/existsSync backup-path)))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest copy-db-file-copies-into-pool-without-using-os-root
+  (async done
+    (let [root-dir
+          (node-helper/create-tmp-dir "platform-node-copy-db-file")]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage)
+                        nil "logseq_db_demo")
+                  repo-dir (gobj/get pool "repoDir")
+                  source-path (node-path/join repo-dir "db.sqlite")
+                  target-path
+                  (node-path/join repo-dir "db-sync-backup.sqlite")
+                  _ (fs/writeFileSync source-path "database-bytes" "utf8")
+                  _ ((:copy-db-file! storage)
+                     pool source-path "/db-sync-backup.sqlite")]
+            (is (= "database-bytes"
+                   (fs/readFileSync target-path "utf8"))))
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))

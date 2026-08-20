@@ -179,10 +179,11 @@
                     (and (:db-sync/suppress-stale-rebase-transact-failed-log? tx-meta)
                          (= :entity-id/missing (:error (ex-data e)))))
         (prn :debug :transact-failed
-             :tx-meta tx-meta
-             :tx-data tx-data
-             :error (str e))
-        (js/console.error e))
+             :tx-meta (select-keys tx-meta [:op :outliner-op])
+             :tx-count (count tx-data)
+             :error-code (or (:error (ex-data e))
+                             (:type (ex-data e))
+                             :transact-failed)))
       (throw e))))
 
 (defn transact!

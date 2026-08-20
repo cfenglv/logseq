@@ -194,6 +194,13 @@
                    :compiler-options {:static-fns false}
                    :main frontend.test.frontend-node-test-runner/main}
 
+  :db-sync-backup-memory-test
+  {:target :node-script
+   :output-to "static/db-sync-backup-memory-test.js"
+   :main frontend.worker.db-sync-backup-memory-test-runner/main
+   :closure-defines {frontend.worker-common.util/NODETEST true}
+   :devtools {:enabled false}}
+
   :gen-malli-kondo-config {:target :node-script
                            :build-hooks [(shadow.hooks/build-metadata-hook "--long --always --dirty")]
                            :closure-defines {frontend.util/NODETEST true}

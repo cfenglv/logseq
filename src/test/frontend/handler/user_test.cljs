@@ -140,7 +140,11 @@
         (with-mocked-local-storage
           (fn []
             (with-redefs [state/<invoke-db-worker (fn [op & _]
-                                                    (swap! ops* conj op)
+                                                    ;; Logout also wakes the global RTC stop
+                                                    ;; background flow. This test owns only
+                                                    ;; the password-clear contract.
+                                                    (when (= :thread-api/clear-e2ee-password op)
+                                                      (swap! ops* conj op))
                                                     (p/resolved nil))
                           state/clear-user-info! (fn [] nil)
                           state/pub-event! (fn [& _] nil)
@@ -158,8 +162,9 @@
       (try
         (with-mocked-local-storage
           (fn []
-            (with-redefs [state/<invoke-db-worker (fn [& _]
-                                                    (swap! invoke-calls* inc)
+            (with-redefs [state/<invoke-db-worker (fn [op & _]
+                                                    (when (= :thread-api/clear-e2ee-password op)
+                                                      (swap! invoke-calls* inc))
                                                     (p/resolved nil))
                           state/clear-user-info! (fn [] nil)
                           state/pub-event! (fn [& _] nil)

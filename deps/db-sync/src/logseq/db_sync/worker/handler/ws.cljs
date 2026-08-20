@@ -1,5 +1,6 @@
 (ns logseq.db-sync.worker.handler.ws
-  (:require [logseq.db-sync.protocol :as protocol]
+  (:require [logseq.db-sync.index :as index]
+            [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.worker.auth :as auth]
             [logseq.db-sync.worker.handler.sync :as sync-handler]
             [logseq.db-sync.worker.http :as http]
@@ -7,16 +8,57 @@
             [logseq.db-sync.worker.ws :as ws]
             [promesa.core :as p]))
 
+(def ^:private connection-access-cache-ttl-ms 5000)
+
+(defn- access-cache*
+  [^js self]
+  (or (.-connectionAccessCache self)
+      (set! (.-connectionAccessCache self) (atom {}))))
+
+(defn- <connection-authorized?
+  [^js self ^js ws]
+  (let [env (.-env self)
+        user (presence/get-user self ws)
+        user-id (:user-id user)
+        graph-id (presence/get-graph-id self ws)
+        db (some-> env (aget "DB"))
+        cache-key [graph-id user-id]
+        now (.now js/Date)
+        cached (get @(access-cache* self) cache-key)]
+    (cond
+      ;; Unit-level protocol handlers historically use a bare in-memory self.
+      ;; Every production Worker and Node graph context carries :env.
+      (nil? env)
+      true
+
+      (and (number? (:checked-at cached))
+           (< (- now (:checked-at cached))
+              connection-access-cache-ttl-ms))
+      (:allowed? cached)
+
+      (and db (string? user-id) (string? graph-id))
+      (p/let [allowed?
+              (index/<user-has-access-to-graph? db graph-id user-id)]
+        (swap! (access-cache* self)
+               assoc
+               cache-key
+               {:allowed? (true? allowed?)
+                :checked-at now})
+        (true? allowed?))
+
+      :else
+      false)))
+
 (defn handle-ws-message! [^js self ^js ws raw]
-  (let [message (-> raw protocol/parse-message ws/coerce-ws-client-message)]
-    (if-not (map? message)
-      (ws/send! ws {:type "error" :message "invalid request"})
-      (case (:type message)
+  (letfn [(handle-authorized-message! []
+            (let [message (-> raw protocol/parse-message ws/coerce-ws-client-message)]
+              (if-not (map? message)
+                (ws/send! ws {:type "error" :message "invalid request"})
+                (case (:type message)
         "hello"
-        (let [checksum (sync-handler/current-checksum self)]
-          (ws/send! ws (cond-> {:type "hello"
-                                :t (sync-handler/t-now self)}
-                         (string? checksum) (assoc :checksum checksum))))
+        (ws/send! ws (merge {:type "hello"
+                             :t (sync-handler/t-now self)}
+                            (sync-handler/checksum-response-fields self)))
 
         "ping"
         (ws/send! ws {:type "pong"})
@@ -49,14 +91,26 @@
                           ws
                           txs
                           t-before
-                          (cond-> {:graph-id (aget self "graph-id")}
+                          (cond-> {:graph-id (presence/get-graph-id self ws)}
                             (:client-revision message)
                             (assoc :client-revision (:client-revision message))
                             (:username user)
                             (assoc :username (:username user)))))
             (ws/send! ws {:type "tx/reject" :reason "invalid tx"})))
 
-        (ws/send! ws {:type "error" :message "unknown type"})))))
+                  (ws/send! ws {:type "error" :message "unknown type"})))))]
+    (let [authorized? (<connection-authorized? self ws)
+          continue! (fn [allowed?]
+                      (if allowed?
+                        (handle-authorized-message!)
+                        (do
+                          (presence/remove-presence! self ws)
+                          (.close ws 1008 "graph access revoked")
+                          (presence/broadcast-online-users! self))))]
+      (if (p/promise? authorized?)
+        (p/let [allowed? authorized?]
+          (continue! allowed?))
+        (continue! authorized?)))))
 
 (defn handle-ws [^js self request]
   (let [graph-id (sync-handler/graph-id-from-request request)]
@@ -72,7 +126,8 @@
           (let [token (auth/token-from-request request)
                 claims (auth/unsafe-jwt-claims token)
                 user (presence/claims->user claims)]
-            (when user
-              (presence/add-presence! self server user))
+            (if user
+              (presence/add-presence! self server user graph-id)
+              (presence/set-connection-context! server nil graph-id))
             (presence/broadcast-online-users! self)
             (js/Response. nil #js {:status 101 :webSocket client})))))))

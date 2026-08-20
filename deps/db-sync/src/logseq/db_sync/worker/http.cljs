@@ -1,5 +1,6 @@
 (ns logseq.db-sync.worker.http
-  (:require [logseq.db-sync.common :as common]
+  (:require [lambdaisland.glogi :as log]
+            [logseq.db-sync.common :as common]
             [logseq.db-sync.malli-schema :as db-sync-schema]
             [logseq.db-sync.worker.coerce :as coerce]))
 
@@ -17,12 +18,9 @@
      (let [coerced (coerce/coerce coercer data {:schema schema-key :dir :response})]
        (if (= coerced coerce/invalid-coerce)
          (do
-           (js/console.error "DEBUG json-response coercion FAILED for" (pr-str schema-key) "data:" (pr-str data))
-           (common/json-response
-            {:error "server error"
-             :debug-coercion-failed (pr-str schema-key)
-             :debug-data (pr-str data)}
-            500))
+           (log/error :db-sync/http-response-coercion-failed
+                      {:schema schema-key})
+           (common/json-response {:error "server error"} 500))
          (common/json-response coerced status)))
      (common/json-response data status))))
 
