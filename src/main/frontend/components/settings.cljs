@@ -130,7 +130,7 @@
            (ui/button
             (t :updater/quit-and-install)
             :class "text-sm"
-            :on-click #(ipc/ipc :quitAndInstall))]
+            :on-click #(ipc/invoke "install-updates"))]
 
           "error"
           (let [release-channel-link

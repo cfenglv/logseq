@@ -34,6 +34,8 @@ function getClipboardData (format) {
 }
 
 contextBridge.exposeInMainWorld('apis', {
+  qualificationHome: Boolean(process.env.LOGSEQ_TEST_HOME_DIR),
+
   getFilePath: (file) => webUtils.getPathForFile(file),
 
   doAction: async (arg) => {

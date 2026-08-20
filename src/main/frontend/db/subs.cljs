@@ -27,15 +27,16 @@
         (require-revision! :block/tx-id (:block/tx-id new-block))))
 
 (defn- empty-store
-  [graph-id generation]
+  [graph-id generation projection-epoch]
   {:graph-id graph-id
    :generation generation
+   :projection-epoch projection-epoch
    :rev -1
    :slots {}
    :resource-slot-keys #{}
    :warm (cache/lru-cache-factory {} :threshold warm-cache-size)})
 
-(defonce ^:private *store (atom (empty-store (state/get-current-repo) 0)))
+(defonce ^:private *store (atom (empty-store (state/get-current-repo) 0 0)))
 (defonce ^:private *listeners (atom {}))
 (defonce ^:private *in-flight (atom {}))
 (defonce ^:private *query-reloads (atom {:timer-id nil :slot-keys #{}}))
@@ -147,6 +148,7 @@
 (defn- loaded-slot
   [slot-key current next-slot]
   (let [selected (cond
+                   (:stale? current) next-slot
                    (> (slot-revision current) (slot-revision next-slot)) current
                    (and (= :block (first slot-key))
                         (:tx-id current)
@@ -158,8 +160,11 @@
       selected)))
 
 (defn- apply-patch!
-  [generation requested-slot-key response]
-  (let [{:keys [basis-rev slots] :as patch} response
+  [generation projection-epoch requested-slot-key response]
+  (let [{response-epoch :projection-epoch
+         :keys [basis-rev slots]
+         :as patch} response
+        _ (require-revision! :projection-epoch response-epoch)
         _ (require-revision! :basis-rev basis-rev)
         stale-resource? (and (= :resource (first requested-slot-key))
                              (resource-response-stale? requested-slot-key patch))
@@ -172,7 +177,9 @@
     (when-not stale-resource?
       (swap! *store
              (fn [store]
-               (if (not= generation (:generation store))
+               (if (or (not= generation (:generation store))
+                       (not= projection-epoch (:projection-epoch store))
+                       (not= response-epoch projection-epoch))
                  store
                  (reduce-kv
                   (fn [store slot-key wire]
@@ -199,10 +206,11 @@
 (declare start-load! schedule-resource-reload!)
 
 (defn- current-request?
-  [slot-key token graph-id generation]
+  [slot-key token graph-id generation projection-epoch]
   (let [store @*store]
     (and (= graph-id (:graph-id store))
          (= generation (:generation store))
+         (= projection-epoch (:projection-epoch store))
          (identical? token (get-in @*in-flight [slot-key :token])))))
 
 (defn- finish-request!
@@ -241,7 +249,7 @@
 (defn- start-load!
   [slot-key]
   (when (and (:graph-id @*store) (not (contains? @*in-flight slot-key)))
-    (let [{:keys [graph-id generation]} @*store
+    (let [{:keys [graph-id generation projection-epoch]} @*store
           token (js-obj)
           request (try (load-slot graph-id slot-key)
                        (catch :default error (p/rejected error)))]
@@ -249,11 +257,17 @@
              {:token token :dirty-keys #{} :dirty-slots #{} :reload? false})
       (-> request
           (p/then (fn [response]
-                    (when (current-request? slot-key token graph-id generation)
-                      (when (apply-patch! generation slot-key response)
-                        (swap! *in-flight assoc-in [slot-key :reload?] true)))))
+                    (when (current-request? slot-key token graph-id generation projection-epoch)
+                      (let [response-epoch (:projection-epoch response)]
+                        (if (and (nat-int? response-epoch)
+                                 (> response-epoch projection-epoch))
+                          (state/pub-event!
+                           [:db/projection-committed
+                            {:repo graph-id :projection-epoch response-epoch}])
+                          (when (apply-patch! generation projection-epoch slot-key response)
+                            (swap! *in-flight assoc-in [slot-key :reload?] true)))))))
           (p/catch (fn [error]
-                     (when (current-request? slot-key token graph-id generation)
+                     (when (current-request? slot-key token graph-id generation projection-epoch)
                        (load-error! slot-key error))))
           (p/finally #(finish-request! slot-key token))))))
 
@@ -287,19 +301,70 @@
     (request-reload! slot-key)))
 
 (defn reset-graph!
-  [graph-id]
-  (let [generation (inc (:generation @*store))
-        resource-slot-keys (into #{} (filter #(= :resource (first %)))
-                                 (keys @*listeners))
-        listeners (mapcat vals (vals @*listeners))
-        error (ex-info "Graph changed during renderer load" {:graph-id graph-id})]
-    (clear-query-reloads!)
-    (reset! *store (assoc (empty-store graph-id generation)
-                          :resource-slot-keys resource-slot-keys))
-    (reset! *in-flight {})
-    (loader/reject-pending! error)
-    (run! (fn [listener] (listener)) listeners))
-  nil)
+  ([graph-id]
+   (reset-graph! graph-id 0))
+  ([graph-id projection-epoch]
+   (require-revision! :projection-epoch projection-epoch)
+   (let [generation (inc (:generation @*store))
+         resource-slot-keys (into #{} (filter #(= :resource (first %)))
+                                  (keys @*listeners))
+         listeners (mapcat vals (vals @*listeners))
+         error (ex-info "Graph changed during renderer load"
+                        {:graph-id graph-id :projection-epoch projection-epoch})]
+     (clear-query-reloads!)
+     (reset! *store (assoc (empty-store graph-id generation projection-epoch)
+                           :resource-slot-keys resource-slot-keys))
+     (reset! *in-flight {})
+     (loader/reject-pending! error)
+     (run! (fn [listener] (listener)) listeners))
+   nil))
+
+(defn projection-context
+  []
+  (select-keys @*store [:graph-id :projection-epoch]))
+
+(defn future-projection?
+  [{:keys [graph-id projection-epoch]}]
+  (let [store @*store]
+    (and (= graph-id (:graph-id store))
+         (nat-int? projection-epoch)
+         (> projection-epoch (:projection-epoch store)))))
+
+(defn advance-projection!
+  [graph-id projection-epoch]
+  (require-revision! :projection-epoch projection-epoch)
+  (if (future-projection? {:graph-id graph-id
+                           :projection-epoch projection-epoch})
+    (let [previous @*store
+          generation (inc (:generation previous))
+          mounted-slot-keys (vec (keys @*listeners))
+          retained-slots
+          (into {}
+                (keep (fn [slot-key]
+                        (when-let [slot (store-slot previous slot-key)]
+                          [slot-key (assoc slot :stale? true)])))
+                mounted-slot-keys)
+          resource-slot-keys
+          (into #{} (filter #(= :resource (first %))) mounted-slot-keys)
+          error (ex-info "Projection changed during renderer load"
+                         {:graph-id graph-id
+                          :projection-epoch projection-epoch})]
+      (clear-query-reloads!)
+      (reset! *store
+              (assoc (empty-store graph-id generation projection-epoch)
+                     :slots retained-slots
+                     :resource-slot-keys resource-slot-keys))
+      (reset! *in-flight {})
+      (loader/reject-pending! error)
+      ;; Same-graph cutovers keep mounted snapshots visible until the new
+      ;; projection replaces them. Graph switches still use reset-graph!.
+      (schedule-load-batch!
+       (fn []
+         (doseq [slot-key mounted-slot-keys
+                 :when (mounted? slot-key)]
+           (start-load! slot-key))))
+      true)
+    false))
 
 (defn- retry-mounted-errors!
   [_key _ref _old-value ready?]
@@ -362,8 +427,10 @@
 (defn- put-delta-slot
   [store slot-key next-slot]
   (let [current (store-slot store slot-key)]
-    (if (or (> (slot-revision current) (:rev store))
+    (if (or (and (not (:stale? current))
+                 (> (slot-revision current) (:rev store)))
             (and (= :block (first slot-key))
+                 (not (:stale? current))
                  (:tx-id current)
                  (= (:tx-id current) (:tx-id next-slot))))
       [store false]
@@ -479,16 +546,25 @@
                store (:resource-slot-keys store))]
     [store {:changed @changed :reload @reload}]))
 
+(defn current-projection?
+  [{:keys [graph-id projection-epoch]}]
+  (let [store @*store]
+    (and (= graph-id (:graph-id store))
+         (= projection-epoch (:projection-epoch store)))))
+
 (defn apply-delta!
-  [{:keys [graph-id rev blocks deleted children affected-keys] :as delta}]
+  [{:keys [graph-id projection-epoch rev blocks deleted children affected-keys] :as delta}]
   (when-not (and (map? delta) (map? blocks) (map? deleted)
                  (map? children) (set? affected-keys))
     (throw (ex-info "Invalid renderer delta" {:delta delta})))
+  (require-revision! :projection-epoch projection-epoch)
   (require-revision! :rev rev)
   (let [effects (volatile! nil)]
     (swap! *store
            (fn [store]
-             (if (or (not= graph-id (:graph-id store)) (<= rev (:rev store)))
+             (if (or (not= graph-id (:graph-id store))
+                     (not= projection-epoch (:projection-epoch store))
+                     (<= rev (:rev store)))
                store
                (let [[store result] (apply-delta-store store delta)]
                  (vreset! effects result)

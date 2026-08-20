@@ -1,11 +1,12 @@
 (ns logseq.db-sync.checksum-test
   (:require ["fs" :as fs]
             [cljs.reader :as reader]
-            [cljs.test :refer [deftest is testing]]
+            [cljs.test :refer [async deftest is testing]]
             [datascript.core :as d]
             [logseq.db :as ldb]
             [logseq.db-sync.checksum :as checksum]
-            [logseq.db.frontend.schema :as db-schema]))
+            [logseq.db.frontend.schema :as db-schema]
+            [promesa.core :as p]))
 
 (defn- sample-db
   []
@@ -70,6 +71,31 @@
              (checksum/recompute-checksum (:db-after tx-report))))
       (is (= checksum-before
              (checksum/update-checksum checksum-before tx-report))))))
+
+(deftest large-title-rehydration-keeps-wire-checksum-test
+  (testing "a local rehydrated title has the checksum of its canonical large-title marker"
+    (let [db-before (sample-db)
+          checksum-before (checksum/recompute-checksum db-before)
+          large-title (apply str (repeat 5000 "a"))
+          large-title-object {:asset-uuid (str (random-uuid))
+                              :asset-type "txt"}
+          wire-report (d/with db-before
+                              [[:db/add 4 :block/title ""]
+                               [:db/add 4 :logseq.property.sync/large-title-object
+                                large-title-object]])
+          wire-db (:db-after wire-report)
+          wire-checksum (checksum/recompute-checksum wire-db)
+          wire-incremental (checksum/update-checksum checksum-before wire-report)
+          rehydrate-report (d/with wire-db [[:db/add 4 :block/title large-title]])
+          rehydrated-db (:db-after rehydrate-report)
+          rehydrated-checksum (checksum/recompute-checksum rehydrated-db)
+          rehydrated-incremental (checksum/update-checksum wire-checksum rehydrate-report)]
+      (is (= large-title (:block/title (d/entity rehydrated-db 4))))
+      (is (= large-title-object
+             (:logseq.property.sync/large-title-object (d/entity rehydrated-db 4))))
+      (is (= wire-checksum wire-incremental))
+      (is (= wire-checksum rehydrated-checksum))
+      (is (= wire-checksum rehydrated-incremental)))))
 
 (deftest incremental-checksum-matches-recompute-on-rebased-retract-entity-log-repro-test
   (testing "incremental checksum should equal full recompute on rebased retract-entity replay payload"
@@ -340,6 +366,25 @@
       (is (= child-parent-uuid (:block/parent child)))
       (is (= child-page-uuid (:block/page child)))
       (is (string? (:block/title child))))))
+
+(deftest yielded-recompute-matches-official-checksum-test
+  (async done
+         (let [timer-fired? (atom false)
+               _ (js/setTimeout #(reset! timer-fired? true) 0)
+               db (-> (d/empty-db db-schema/schema)
+                      (d/db-with
+                       (mapv (fn [idx]
+                               {:block/uuid (random-uuid)
+                                :block/name (str "page-" idx)
+                                :block/title (str "Page " idx)})
+                             (range 300))))]
+           (-> (checksum/<recompute-checksum db)
+               (p/then (fn [yielded]
+                         (is @timer-fired?)
+                         (is (= (checksum/recompute-checksum db) yielded))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
 
 (deftest recompute-checksum-diagnostics-omits-title-and-name-in-e2ee-test
   (testing "diagnostics for E2EE graphs omits title/name from checksum attrs and export blocks"

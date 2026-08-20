@@ -6,6 +6,7 @@
             [logseq.db-sync.common :as common]
             [logseq.db-sync.logging :as logging]
             [logseq.db-sync.sentry.worker :as sentry]
+            [logseq.db-sync.storage :as storage]
             [logseq.db-sync.worker.dispatch :as dispatch]
             [logseq.db-sync.worker.handler.sync :as sync-handler]
             [logseq.db-sync.worker.handler.ws :as ws-handler]
@@ -28,7 +29,15 @@
                (super state env)
                (set! (.-state this) state)
                (set! (.-env this) env)
-               (set! (.-sql this) (.-sql ^js (.-storage state)))
+               (let [durable-storage (.-storage state)
+                     sql (.-sql ^js durable-storage)
+                     transaction-sync (.-transactionSync durable-storage)]
+                 (storage/register-transaction-sync!
+                  sql
+                  (when (fn? transaction-sync)
+                    (fn [f]
+                      (.call transaction-sync durable-storage f))))
+                 (set! (.-sql this) sql))
                (set! (.-conn this) nil)
                (set! (.-schema-ready this) false)
                (let [presence (presence/presence* this)

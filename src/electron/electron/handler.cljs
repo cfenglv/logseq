@@ -5,11 +5,9 @@
             ["abort-controller" :as AbortController]
             ["buffer" :as buffer]
             ["electron" :refer [app dialog ipcMain shell]]
-            ["electron-updater" :refer [autoUpdater]]
             ["electron-window-state" :as windowStateKeeper]
             ["fs" :as fs]
             ["fs-extra" :as fs-extra]
-            ["os" :as os]
             ["path" :as node-path]
             [cljs-bean.core :as bean]
             [clojure.string :as string]
@@ -494,11 +492,6 @@
   (when-let [^js controller (get @*request-abort-signals req-id)]
     (.abort controller)))
 
-(defmethod handle :quitAndInstall []
-  (logger/info ::quick-and-install)
-  ;; https://www.electron.build/electron-updater.class.appupdater#quitandinstall
-  (.quitAndInstall autoUpdater false true))
-
 ;; The graphHas* events are not used but maybe useful later?
 (defmethod handle :graphHasOtherWindow [^js win [_ graph]]
   (let [dir (utils/get-graph-dir graph)]
@@ -571,7 +564,7 @@
   (server/set-config! config))
 
 (defmethod handle :system/info [^js _win _]
-  {:home-dir (.homedir os)})
+  {:home-dir cfgs/home-root})
 
 (defmethod handle :window/open-blank-callback [^js win [_ _type]]
   (win/setup-window-listeners! win) nil)
@@ -590,23 +583,27 @@
       (string? command) command
       :else nil)))
 
-(defn set-ipc-handler! [window]
-  (let [main-channel "main"]
-    (.handle ipcMain main-channel
-             (fn [^js event args-js]
-               (let [message* (volatile! nil)]
-                 (->
-                  (p/let [message (decode-main-ipc-message args-js)
-                          _ (vreset! message* message)
-                          result (handle (or (utils/get-win-from-sender event) window) message)]
-                    (if (= (some-> message last keyword) :js-obj)
-                      (bean/->js result)
-                      (sqlite-util/write-transit-str result)))
-                  (p/catch (fn [e]
-                             (let [command (command-name @message*)]
-                               (when-not (contains? #{"mkdir" "stat"} command)
-                                 (logger/error "IPC error: " {:event event
-                                                              :args args-js}
-                                               e)
-                                 (throw e)))))))))
-    #(.removeHandler ipcMain main-channel)))
+(defn set-ipc-handler!
+  ([window]
+   (set-ipc-handler! window (p/resolved nil)))
+  ([window startup-ready]
+   (let [main-channel "main"]
+     (.handle ipcMain main-channel
+              (fn [^js event args-js]
+                (let [message* (volatile! nil)]
+                  (->
+                   (p/let [_ startup-ready
+                           message (decode-main-ipc-message args-js)
+                           _ (vreset! message* message)
+                           result (handle (or (utils/get-win-from-sender event) window) message)]
+                     (if (= (some-> message last keyword) :js-obj)
+                       (bean/->js result)
+                       (sqlite-util/write-transit-str result)))
+                   (p/catch (fn [e]
+                              (let [command (command-name @message*)]
+                                (when-not (contains? #{"mkdir" "stat"} command)
+                                  (logger/error "IPC error: " {:event event
+                                                               :args args-js}
+                                                e)
+                                  (throw e)))))))))
+     #(.removeHandler ipcMain main-channel))))

@@ -47,7 +47,8 @@
   },
   "devDependencies": {
     "@redocly/cli": "^2.38.0",
-    "@sentry/cli": "^3.3.3"
+    "@sentry/cli": "^3.3.3",
+    "wrangler": "4.113.0"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

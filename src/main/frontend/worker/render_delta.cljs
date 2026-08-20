@@ -48,7 +48,9 @@
       (fail! "Invalid deleted block UUID" {:block-uuid block-uuid}))))
 
 (defn- validate-input!
-  [{:keys [rev blocks deleted-block-uuids affected-keys tx-report]}]
+  [{:keys [projection-epoch rev blocks deleted-block-uuids affected-keys tx-report]}]
+  (when-not (valid-tx-id? projection-epoch)
+    (fail! "Invalid projection epoch" {:projection-epoch projection-epoch}))
   (when-not (valid-tx-id? rev)
     (fail! "Invalid renderer revision" {:rev rev}))
   (validate-blocks! blocks)
@@ -144,10 +146,11 @@
 
 (defn build
   "Build one renderer delta from complete block replacements and a transaction report."
-  [{:keys [graph-id rev op-id blocks deleted-block-uuids affected-keys tx-report]
+  [{:keys [graph-id projection-epoch rev op-id blocks deleted-block-uuids affected-keys tx-report]
     :as input}]
   (validate-input! input)
   {:graph-id graph-id
+   :projection-epoch projection-epoch
    :rev rev
    :op-id op-id
    :blocks blocks

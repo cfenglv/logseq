@@ -83,6 +83,29 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest worker-version-override-is-not-forwarded-to-durable-object-test
+  (async done
+         (let [forwarded (atom [])
+               request (js/Request. "http://localhost/sync/graph-1"
+                                    #js {:method "GET"
+                                         :headers #js {"upgrade" "websocket"
+                                                       "x-db-sync-admin-token" "test-admin-token"
+                                                       "cloudflare-workers-version-overrides"
+                                                       "sync-worker=\"candidate-version\""}})
+               env #js {"DB_SYNC_ADMIN_TOKEN" "test-admin-token"
+                        "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}]
+           (-> (p/let [response (dispatch/handle-worker-fetch request env)
+                       forwarded-request (first @forwarded)]
+                 (is (= 200 (.-status response)))
+                 (is (= 1 (count @forwarded)))
+                 (is (= "websocket" (.get (.-headers forwarded-request) "upgrade")))
+                 (is (nil? (.get (.-headers forwarded-request)
+                                 "cloudflare-workers-version-overrides"))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
 (defn- json-body [response]
   (p/let [text (.text response)]
     (js->clj (js/JSON.parse text) :keywordize-keys true)))

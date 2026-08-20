@@ -1,5 +1,8 @@
 (ns electron.db-worker
-  (:require [logseq.cli.server :as cli-server]
+  (:require ["os" :as os]
+            ["path" :as node-path]
+            [electron.home :as home]
+            [logseq.cli.server :as cli-server]
             [logseq.common.graph-dir :as graph-dir]
             [logseq.db-worker.daemon :as daemon]
             [promesa.core :as p]))
@@ -109,7 +112,41 @@
    :start-daemon! start-daemon!
    :stop-daemon! stop-daemon!
    :runtime-ready? (or runtime-ready? (fn [_runtime] (p/resolved true)))
+   :claim-state (atom {:open? true :inflight 0 :waiters []})
+   :install-attempt (atom nil)
    :state (atom (initial-state))})
+
+(defn- begin-runtime-claim!
+  [{:keys [claim-state]}]
+  (let [accepted? (atom false)]
+    (swap! claim-state
+           (fn [state]
+             (if (:open? state)
+               (do
+                 (reset! accepted? true)
+                 (update state :inflight inc))
+               state)))
+    (when-not @accepted?
+      (throw (ex-info "db-worker runtime claims are quiescing for update"
+                      {:code :updater-quiescing})))
+    true))
+
+(defn- end-runtime-claim!
+  [{:keys [claim-state]}]
+  (let [ready-waiters (atom [])]
+    (swap! claim-state
+           (fn [state]
+             (let [next-inflight (dec (:inflight state))]
+               (when (neg? next-inflight)
+                 (throw (ex-info "db-worker runtime claim count underflow"
+                                 {:code :runtime-claim-underflow})))
+               (if (zero? next-inflight)
+                 (do
+                   (reset! ready-waiters (:waiters state))
+                   (assoc state :inflight 0 :waiters []))
+                 (assoc state :inflight next-inflight)))))
+    (doseq [resolve @ready-waiters]
+      (resolve true))))
 
 (defn- owned-runtime?
   [runtime]
@@ -130,7 +167,7 @@
         (p/resolved true))
       (p/resolved false))))
 
-(defn ensure-started!
+(defn- ensure-started-without-claim!
   [{:keys [state start-daemon! stop-daemon! runtime-ready?] :as manager} repo window-id]
   (let [key (repo-key repo)]
     (p/let [current-repo (get-in (ensure-state @state) [:window->repo window-id])
@@ -166,6 +203,15 @@
                                                      :windows #{window-id}})
                              (assoc-in [:window->repo window-id] key))))
           runtime)))))
+
+(defn ensure-started!
+  [manager repo window-id]
+  (try
+    (begin-runtime-claim! manager)
+    (-> (ensure-started-without-claim! manager repo window-id)
+        (p/finally (fn [] (end-runtime-claim! manager))))
+    (catch :default error
+      (p/rejected error))))
 
 (defn- parse-runtime-lock
   [{:keys [base-url]}]
@@ -207,15 +253,126 @@
 
 (defn stop-all!
   [{:keys [state stop-daemon!]}]
-  (let [entries (vals (:repos (ensure-state @state)))]
-    (-> (p/all (map (fn [{:keys [runtime]}]
-                      (if (owned-runtime? runtime)
-                        (stop-daemon! runtime)
-                        (p/resolved true)))
+  (let [entries (:repos (ensure-state @state))]
+    (-> (p/all (map (fn [[repo {:keys [runtime]}]]
+                      (-> (if (owned-runtime? runtime)
+                            (stop-daemon! runtime)
+                            (p/resolved true))
+                          (p/then (fn [ok?] [repo (true? ok?) nil]))
+                          (p/catch (fn [error] [repo false error]))))
                     entries))
-        (p/then (fn [_]
-                  (reset! state (initial-state))
-                  true)))))
+        (p/then
+         (fn [results]
+           (let [failed (->> results (remove second) (map first) set)
+                 stopped (->> results (filter second) (map first) set)]
+             (swap! state
+                    (fn [current]
+                      (-> (ensure-state current)
+                          (update :repos #(apply dissoc % stopped))
+                          (update :window->repo
+                                  (fn [window->repo]
+                                    (into {}
+                                          (filter (fn [[_ repo]] (contains? failed repo)))
+                                          window->repo))))))
+             (if (seq failed)
+               (p/rejected
+                (ex-info "failed to stop all db-worker runtimes"
+                         {:code :db-worker-stop-failed
+                          :repos (vec failed)}))
+               true)))))))
+
+(defn update-quiescing?
+  [{:keys [claim-state]}]
+  (not (:open? @claim-state)))
+
+(defn- close-runtime-claim-gate!
+  [{:keys [claim-state]}]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [accepted? (atom false)
+           ready? (atom false)]
+       (swap! claim-state
+              (fn [state]
+                (if (:open? state)
+                  (do
+                    (reset! accepted? true)
+                    (if (zero? (:inflight state))
+                      (do
+                        (reset! ready? true)
+                        (assoc state :open? false))
+                      (-> state
+                          (assoc :open? false)
+                          (update :waiters conj resolve))))
+                  state)))
+       (cond
+         (not @accepted?)
+         (reject (ex-info "db-worker runtime claim gate is already closed"
+                          {:code :updater-quiescing}))
+
+         @ready?
+         (resolve true))))))
+
+(defn- active-owner-token
+  [state]
+  (let [state (ensure-state state)]
+    {:attempt-id (str (random-uuid))
+     :active-repo-identities (-> state :repos keys sort vec)
+     :window-to-repo-ownership (:window->repo state)}))
+
+(defn begin-update-quiesce!
+  [{:keys [state install-attempt] :as manager}]
+  (when @install-attempt
+    (throw (ex-info "an updater quiesce attempt is already active"
+                    {:code :updater-quiescing})))
+  (-> (close-runtime-claim-gate! manager)
+      (p/then
+       (fn [_]
+         (let [token (active-owner-token @state)]
+           (reset! install-attempt {:token token :phase :captured})
+           token)))))
+
+(defn- require-active-attempt!
+  [{:keys [install-attempt]} token]
+  (let [attempt @install-attempt]
+    (when-not (= (:attempt-id token) (get-in attempt [:token :attempt-id]))
+      (throw (ex-info "updater quiesce token is missing, stale, or consumed"
+                      {:code :invalid-updater-quiesce-token})))
+    attempt))
+
+(defn stop-active-for-update!
+  [{:keys [install-attempt] :as manager} token]
+  (require-active-attempt! manager token)
+  (swap! install-attempt assoc :phase :stopping)
+  (-> (stop-all! manager)
+      (p/then (fn [result]
+                (swap! install-attempt assoc :phase :stopped)
+                result))
+      (p/catch (fn [error]
+                 (swap! install-attempt assoc :phase :stopped)
+                 (p/rejected error)))))
+
+(defn resume-update-quiesce!
+  [{:keys [claim-state install-attempt] :as manager} token]
+  (let [{:keys [phase]} (require-active-attempt! manager token)
+        restore! (fn []
+                   (p/all
+                    (map (fn [[window-id repo]]
+                           (ensure-started-without-claim! manager repo window-id))
+                         (:window-to-repo-ownership token))))]
+    (-> (if (= phase :captured)
+          (p/resolved true)
+          (restore!))
+        (p/then
+         (fn [_]
+           (reset! install-attempt nil)
+           (swap! claim-state assoc :open? true :waiters [])
+           true)))))
+
+(defn commit-update-quiesce!
+  [{:keys [install-attempt] :as manager} token]
+  (require-active-attempt! manager token)
+  (reset! install-attempt nil)
+  true)
 
 (defn ensure-repo-stopped!
   [{:keys [state stop-daemon!]} repo]
@@ -235,23 +392,34 @@
 
 (defonce ^:private *runtime-opts (atom {}))
 
+(defn- managed-root-dir
+  []
+  (node-path/join
+   (home/resolve-root (.-LOGSEQ_TEST_HOME_DIR js/process.env)
+                      (.homedir os))
+   "logseq"))
+
 (defn- start-managed-daemon!
   [repo]
-  (let [config (merge {:owner-source :electron}
-                      @*runtime-opts)]
-    (p/let [_ (when (seq (:embedding-endpoint config))
-                (-> (cli-server/stop-server! config repo)
+  (let [runtime-config (merge {:owner-source :electron
+                               :root-dir (managed-root-dir)}
+                              @*runtime-opts)]
+    (p/let [_ (when (seq (:embedding-endpoint runtime-config))
+                (-> (cli-server/stop-server! runtime-config repo)
                     (p/catch (fn [_] nil))))
-            config (cli-server/ensure-server! config
-                                            repo)]
+            config (cli-server/ensure-server! runtime-config repo)]
       {:repo repo
        :base-url (:base-url config)
+       :root-dir (:root-dir runtime-config)
        :auth-token nil
        :owned? (:owned? config)})))
 
 (defn- stop-managed-daemon!
-  [{:keys [repo]}]
-  (p/let [result (cli-server/stop-server! {:owner-source :electron} repo)]
+  [{:keys [repo root-dir]}]
+  (p/let [result (cli-server/stop-server! {:owner-source :electron
+                                           :root-dir (or root-dir
+                                                         (managed-root-dir))}
+                                          repo)]
     (:ok? result)))
 
 (defonce manager

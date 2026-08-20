@@ -32,6 +32,37 @@
       (js/Object.defineProperty js/process "platform" platform-descriptor)
       (js/Object.defineProperty js/process "arch" arch-descriptor))))
 
+(def ^:private websocket-proxy-env-keys
+  ["HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy"
+   "ALL_PROXY" "all_proxy" "NO_PROXY" "no_proxy"])
+
+(defn- set-websocket-proxy-env!
+  [values]
+  (let [env (.-env js/process)
+        original (into {} (map (fn [key] [key (gobj/get env key)]))
+                       websocket-proxy-env-keys)]
+    (doseq [key websocket-proxy-env-keys]
+      (gobj/remove env key))
+    (doseq [[key value] values]
+      (gobj/set env key value))
+    (fn []
+      (doseq [key websocket-proxy-env-keys]
+        (gobj/remove env key))
+      (doseq [[key value] original]
+        (when (some? value)
+          (gobj/set env key value))))))
+
+(defn- close-test-websocket!
+  [ws]
+  (when ws
+    (.on ^js ws "error" (fn [_] nil))
+    (.terminate ^js ws)))
+
+(defn- websocket-agent
+  [ws]
+  (some-> (gobj/get ws "_req")
+          (gobj/get "agent")))
+
 (defn- <open-test-db
   []
   (let [root-dir (node-helper/create-tmp-dir "platform-node")
@@ -141,6 +172,46 @@
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
 
+(deftest node-platform-websocket-uses-https-proxy-agent
+  (async done
+    (let [restore-env! (set-websocket-proxy-env!
+                        {"HTTPS_PROXY" "http://127.0.0.1:9"})
+          ws* (atom nil)]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir (node-helper/create-tmp-dir "platform-node-ws-proxy")})
+                  ws ((get-in platform [:websocket :connect])
+                      "wss://sync.example.invalid/sync/graph")]
+            (reset! ws* ws)
+            (is (= "HttpsProxyAgent"
+                   (some-> (websocket-agent ws)
+                           (gobj/get "constructor")
+                           (gobj/get "name")))))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (close-test-websocket! @ws*)
+                       (restore-env!)
+                       (done)))))))
+
+(deftest node-platform-websocket-honors-no-proxy
+  (async done
+    (let [restore-env! (set-websocket-proxy-env!
+                        {"HTTPS_PROXY" "http://127.0.0.1:9"
+                         "NO_PROXY" "sync.example.invalid"})
+          ws* (atom nil)]
+      (-> (p/let [platform (platform-node/node-platform
+                            {:root-dir (node-helper/create-tmp-dir "platform-node-ws-no-proxy")})
+                  ws ((get-in platform [:websocket :connect])
+                      "wss://sync.example.invalid/sync/graph")]
+            (reset! ws* ws)
+            (is (nil? (websocket-agent ws))))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (close-test-websocket! @ws*)
+                       (restore-env!)
+                       (done)))))))
+
 (deftest node-platform-writes-text-atomically-and-deletes-files
   (async done
     (let [root-dir (node-helper/create-tmp-dir "platform-node-text-files")]
@@ -160,6 +231,91 @@
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))
+
+(deftest node-prepared-artifact-inspection-streams-canonical-allows-shm-and-checks-wal-test
+  (async done
+         (let [root-dir (node-helper/create-tmp-dir "platform-node-prepared-inspection")
+               paths {:canonical-path "/db.sqlite"
+                      :wal-path "/db.sqlite-wal"
+                      :shm-path "/db.sqlite-shm"}
+               capture-error (fn [f]
+                               (try
+                                 (.catch (.then (js/Promise.resolve (f))
+                                                (constantly nil))
+                                         identity)
+                                 (catch :default error
+                                   (p/resolved error))))
+               payload (js/Uint8Array. #js [1 2 3])]
+           (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir})
+                       storage (:storage platform)
+                       pool ((:install-opfs-pool storage) nil "prepared-graph")
+                       _ ((:import-db storage) pool "/db.sqlite" payload)
+                       result ((:inspect-db-artifact-set storage) pool paths)
+                       _ ((:import-db storage) pool "/db.sqlite-shm"
+                          (js/Uint8Array. #js [8]))
+                       result-with-shm ((:inspect-db-artifact-set storage) pool paths)
+                       _ ((:import-db storage) pool "/db.sqlite-wal"
+                          (js/Uint8Array. #js [9]))
+                       wal-error (capture-error
+                                  #((:inspect-db-artifact-set storage) pool paths))]
+                 (is (= {:canonical-sha256
+                         "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81"
+                         :canonical-byte-size 3
+                         :bounded-memory? true}
+                        result))
+                 (is (= result result-with-shm))
+                 (is (= :selfhost6/uncheckpointed-prepared-canonical
+                        (:type (ex-data wal-error)))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally done)))))
+
+(deftest node-platform-prepares-previous-and-commits-one-canonical-rename-test
+  (async done
+         (let [root-dir (node-helper/create-tmp-dir "platform-node-artifact-swap")
+               source (js/Uint8Array. #js [1 2 3])
+               target (js/Uint8Array. #js [4 5 6])
+               paths {:canonical-path "/db.sqlite"
+                      :canonical-wal-path "/db.sqlite-wal"
+                      :canonical-shm-path "/db.sqlite-shm"
+                      :previous-path "/db.previous.sqlite"
+                      :target-path "/repair-target.sqlite"
+                      :target-wal-path "/repair-target.sqlite-wal"
+                      :target-shm-path "/repair-target.sqlite-shm"}]
+           (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir})
+                       storage (:storage platform)
+                       ^js canonical-pool ((:install-opfs-pool storage) nil "swap-canonical")
+                       ^js target-pool ((:install-opfs-pool storage) nil "swap-target")
+                       _ ((:import-db storage) canonical-pool "/db.sqlite" source)
+                       _ ((:import-db storage) canonical-pool "/db.sqlite-shm"
+                          (js/Uint8Array. #js [8]))
+                       _ ((:import-db storage) target-pool "/repair-target.sqlite" target)
+                       _ ((:import-db storage) target-pool "/repair-target.sqlite-shm"
+                          (js/Uint8Array. #js [9]))
+                       prepared ((:prepare-db-artifact-swap! storage)
+                                 canonical-pool target-pool paths)
+                       previous ((:export-file storage)
+                                 canonical-pool "/db.previous.sqlite")
+                       before ((:export-file storage) canonical-pool "/db.sqlite")
+                       committed ((:commit-db-artifact-swap! storage)
+                                  canonical-pool target-pool paths)
+                       after ((:export-file storage) canonical-pool "/db.sqlite")]
+                 (is (= "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81"
+                        (:source-sha256 prepared)))
+                 (is (= "787c798e39a5bc1910355bae6d0cd87a36b2e10fd0202a83e3bb6b005da83472"
+                        (:target-sha256 prepared)))
+                 (is (string/includes? (:target-artifact-identity prepared)
+                                       "swap-target/repair-target.sqlite"))
+                 (is (not (fs/existsSync
+                           (node-path/join (.-repoDir canonical-pool) "db.sqlite-shm"))))
+                 (is (= (vec source) (vec previous)))
+                 (is (= (vec source) (vec before)))
+                 (is (= {:canonical-path "/db.sqlite" :rename-count 1}
+                        committed))
+                 (is (= (vec target) (vec after))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally done)))))
 
 (deftest node-platform-cli-owner-bypasses-keychain-in-cli-e2e-test
   (async done
@@ -204,17 +360,62 @@
                          (gobj/remove process-env "CLI_E2E_TEST"))
                        (done)))))))
 
-(deftest node-platform-cli-owner-uses-keychain-when-keychain-present
+(deftest node-platform-electron-owner-bypasses-keychain-in-isolated-test-home
   (async done
-    (let [root-dir (node-helper/create-tmp-dir "platform-node-cli-secrets-keychain")
+    (let [root-dir (node-helper/create-tmp-dir "platform-node-electron-isolated-secrets")
+          process-env (.-env js/process)
+          original-test-home (gobj/get process-env "LOGSEQ_TEST_HOME_DIR")
+          calls (atom {:save 0 :read 0 :delete 0})
+          original-save (gobj/get keytar "setPassword")
+          original-read (gobj/get keytar "getPassword")
+          original-delete (gobj/get keytar "deletePassword")]
+      (gobj/set process-env "LOGSEQ_TEST_HOME_DIR" root-dir)
+      (gobj/set keytar "setPassword" (fn [& _]
+                                        (swap! calls update :save inc)
+                                        (js/Promise.resolve true)))
+      (gobj/set keytar "getPassword" (fn [& _]
+                                       (swap! calls update :read inc)
+                                       (js/Promise.resolve "keychain-value")))
+      (gobj/set keytar "deletePassword" (fn [& _]
+                                           (swap! calls update :delete inc)
+                                           (js/Promise.resolve true)))
+      (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir
+                                                         :owner-source :electron})
+                  crypto (:crypto platform)
+                  kv (:kv platform)
+                  _ ((:save-secret-text! crypto) "secret-key" "secret-value")
+                  kv-value ((:get kv) "secret-key")
+                  secret-value ((:read-secret-text crypto) "secret-key")
+                  _ ((:delete-secret-text! crypto) "secret-key")
+                  kv-cleared ((:get kv) "secret-key")]
+            (is (= "secret-value" kv-value))
+            (is (= "secret-value" secret-value))
+            (is (nil? kv-cleared))
+            (is (= {:save 0 :read 0 :delete 0} @calls)))
+          (p/catch (fn [error]
+                     (is false (str "unexpected error: " error))))
+          (p/finally (fn []
+                       (gobj/set keytar "setPassword" original-save)
+                       (gobj/set keytar "getPassword" original-read)
+                       (gobj/set keytar "deletePassword" original-delete)
+                       (if (some? original-test-home)
+                         (gobj/set process-env "LOGSEQ_TEST_HOME_DIR" original-test-home)
+                         (gobj/remove process-env "LOGSEQ_TEST_HOME_DIR"))
+                       (done)))))))
+
+(deftest node-platform-electron-owner-uses-keychain-without-isolated-test-home
+  (async done
+    (let [root-dir (node-helper/create-tmp-dir "platform-node-electron-secrets-keychain")
           process-env (.-env js/process)
           original-cli-e2e-test (gobj/get process-env "CLI_E2E_TEST")
+          original-test-home (gobj/get process-env "LOGSEQ_TEST_HOME_DIR")
           calls (atom {:save 0 :read 0 :delete 0})
           secrets (atom {})
           original-save (gobj/get keytar "setPassword")
           original-read (gobj/get keytar "getPassword")
           original-delete (gobj/get keytar "deletePassword")]
       (gobj/remove process-env "CLI_E2E_TEST")
+      (gobj/remove process-env "LOGSEQ_TEST_HOME_DIR")
       (gobj/set keytar "setPassword" (fn [_service key value]
                                         (swap! calls update :save inc)
                                         (swap! secrets assoc key value)
@@ -227,7 +428,7 @@
                                            (swap! secrets dissoc key)
                                            (js/Promise.resolve true)))
       (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir
-                                                         :owner-source :cli})
+                                                         :owner-source :electron})
                   crypto (:crypto platform)
                   kv (:kv platform)
                   _ ((:save-secret-text! crypto) "secret-key" "secret-value")
@@ -248,6 +449,9 @@
                        (if (some? original-cli-e2e-test)
                          (gobj/set process-env "CLI_E2E_TEST" original-cli-e2e-test)
                          (gobj/remove process-env "CLI_E2E_TEST"))
+                       (if (some? original-test-home)
+                         (gobj/set process-env "LOGSEQ_TEST_HOME_DIR" original-test-home)
+                         (gobj/remove process-env "LOGSEQ_TEST_HOME_DIR"))
                        (done)))))))
 
 (deftest kv-store-preserves-uint8array-values-across-reloads-test
@@ -450,6 +654,27 @@
             (is (not (fs/existsSync lock-path)))
             (is (not (fs/existsSync db-path)))
             (is (not (fs/existsSync nested-path))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally done)))))
+
+(deftest previous-artifact-cleanup-is-idempotent
+  (async done
+    (let [root-dir (node-helper/create-tmp-dir "platform-node-previous-cleanup")
+          paths {:previous-path "/db.previous.sqlite"
+                 :previous-wal-path "/db.previous.sqlite-wal"
+                 :previous-shm-path "/db.previous.sqlite-shm"}]
+      (-> (p/let [platform (platform-node/node-platform {:root-dir root-dir})
+                  storage (:storage platform)
+                  pool ((:install-opfs-pool storage) nil "cleanup-previous")
+                  repo-dir (gobj/get pool "repoDir")
+                  previous-path (node-path/join repo-dir "db.previous.sqlite")
+                  _ (fs/writeFileSync previous-path "previous" "utf8")
+                  first-result ((:cleanup-db-previous! storage) pool paths)
+                  second-result ((:cleanup-db-previous! storage) pool paths)]
+            (is (= {:removed? true} first-result))
+            (is (= {:removed? true} second-result))
+            (is (not (fs/existsSync previous-path))))
           (p/catch (fn [e]
                      (is false (str "unexpected error: " e))))
           (p/finally done)))))

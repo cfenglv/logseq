@@ -7,13 +7,14 @@
             [frontend.worker.sync.auth :as sync-auth]
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.crypt :as sync-crypt]
+            [frontend.worker.sync.download :as sync-download]
             [frontend.worker.sync.log-and-state :as sync-log-state]
             [frontend.worker.sync.presence :as sync-presence]
             [frontend.worker.sync.transport :as sync-transport]
             [frontend.worker.sync.util :as sync-util]
             [lambdaisland.glogi :as log]
-            [promesa.core :as p]
-            [frontend.worker-common.util :as worker-util]))
+            [logseq.common.util :as common-util]
+            [promesa.core :as p]))
 
 (defn- fail-fast
   [tag data]
@@ -112,7 +113,10 @@
   [value context]
   (sync-transport/parse-transit fail-fast value context))
 
-(defn- request-pull!
+(defn request-pull!
+  "Enqueue one bounded pull request. The same `since` is deduplicated within
+  `catch-up-pull-interval-ms`; after the freeze it may be sent again so one
+  lost `changed`/pull cannot stall sync forever. Newer `since` always sends."
   [client since]
   (when (and (:ws client) (ws-open? (:ws client)))
     (enqueue-send-task!
@@ -120,9 +124,18 @@
      (fn []
        (when (and (:ws client) (ws-open? (:ws client)))
          (if-let [*pending (:pending-pull-since client)]
-           (let [pending @*pending]
-             (when (or (nil? pending) (< since pending))
-               (reset! *pending since)
+           (let [pending @*pending
+                 pending-since (if (map? pending) (:since pending) pending)
+                 sent-at (when (map? pending) (:sent-at pending))
+                 now (common-util/time-ms)
+                 resend-same-since? (and (= since pending-since)
+                                         (some? sent-at)
+                                         (>= (- now sent-at)
+                                             sync-util/catch-up-pull-interval-ms))]
+             (when (or (nil? pending)
+                       (not= since pending-since)
+                       resend-same-since?)
+               (reset! *pending {:since since :sent-at now})
                (send! (:ws client) {:type "pull" :since since})))
            (send! (:ws client) {:type "pull" :since since})))))))
 
@@ -141,33 +154,52 @@
        (not (pending-local-tx? repo))
        (empty? @(:inflight client))))
 
-(defn- checksum-compare-ready?
+(defn- ready-sync-metadata
   [repo client local-t remote-t]
-  (and (synced-checksum-ready? repo client local-t remote-t)
-       (string? (client-op/get-local-checksum repo))))
+  (when (synced-checksum-ready? repo client local-t remote-t)
+    (let [metadata
+          (client-op/read-local-checksum-and-sync-meta-value
+           repo "selfhost.activation-record.v1")]
+      (when (string? (:local-checksum metadata))
+        metadata))))
 
 (defn- verify-sync-checksum!
   [repo client local-tx remote-tx remote-checksum context]
-  (when worker-util/dev-or-test?
-    (when (and (string? remote-checksum)
-               (checksum-compare-ready? repo client local-tx remote-tx))
-      (let [local-checksum (client-op/get-local-checksum repo)]
-        (when-not (= local-checksum remote-checksum)
-          (let [mismatch-data (merge context
-                                     {:type :db-sync/checksum-mismatch
-                                      :repo repo
-                                      :message-type (:type context)
-                                      :local-tx local-tx
-                                      :remote-tx remote-tx
-                                      :local-checksum local-checksum
-                                      :remote-checksum remote-checksum})]
-            (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
-            (log/warn :db-sync/checksum-mismatch mismatch-data)))))))
+  (when (string? remote-checksum)
+    (when-let [{:keys [local-checksum reserved-value]}
+               (ready-sync-metadata repo client local-tx remote-tx)]
+      (if (= local-checksum remote-checksum)
+        (p/catch
+         (sync-download/<complete-repair-if-converged!
+          repo client remote-tx remote-checksum reserved-value)
+         (fn [error]
+           (log/error :db-sync/repair-completion-failed
+                      {:repo repo
+                       :remote-tx remote-tx
+                       :error error})))
+        (let [mismatch-data (merge context
+                                   {:type :db-sync/checksum-mismatch
+                                    :repo repo
+                                    :message-type (:type context)
+                                    :local-tx local-tx
+                                    :remote-tx remote-tx
+                                    :local-checksum local-checksum
+                                    :remote-checksum remote-checksum})]
+          (sync-log-state/rtc-log :rtc.log/checksum-mismatch mismatch-data)
+          (log/warn :db-sync/checksum-mismatch mismatch-data)
+          (p/catch
+           (sync-download/<claim-repair-after-checksum-mismatch!
+            repo client remote-tx remote-checksum)
+           (fn [error]
+             (log/error :db-sync/repair-claim-failed
+                        {:repo repo
+                         :remote-tx remote-tx
+                         :error error}))))))))
 
 (defn- handle-tx-reject!
   [repo client message local-tx]
-  (sync-apply/clear-upload-response-timeout! client)
-  (let [reason (:reason message)
+  (let [request (sync-apply/clear-upload-response-timeout! client)
+        reason (:reason message)
         remote-tx (:t message)
         success-tx-ids (:success-tx-ids message)
         failed-tx-id (:failed-tx-id message)
@@ -189,15 +221,30 @@
         (require-uuid block-uuid {:repo repo :type "tx/reject" :field :missing-block-uuids})))
     (case reason
       "stale"
-      (request-pull! client local-tx)
+      (do
+        (request-pull! client local-tx)
+        ;; A stale batch was not accepted; release the in-memory inflight gate
+        ;; so the pending rows can be retried with the same logical tx ids once
+        ;; the pull has caught the local tx up. The server deduplicates by tx id.
+        (when-let [*inflight (:inflight client)]
+          (reset! *inflight []))
+        (broadcast-rtc-state! client))
 
       (let [inflight @(:inflight client)
             inflight-set (set inflight)
+            wire-id->logical-id (:wire-id->logical-id request)
+            semantic-ack-set (set (or (:semantic-ack-tx-ids request) inflight))
+            logical-id (fn [tx-id]
+                         (get wire-id->logical-id tx-id tx-id))
             successful-tx-ids (->> (or success-tx-ids [])
+                                   (map logical-id)
                                    (filter inflight-set)
+                                   (filter semantic-ack-set)
                                    vec)
-            failed-tx-id (when (and failed-tx-id (contains? inflight-set failed-tx-id))
-                           failed-tx-id)
+            failed-logical-tx-id (some-> failed-tx-id logical-id)
+            failed-tx-id (when (and failed-logical-tx-id
+                                    (contains? inflight-set failed-logical-tx-id))
+                           failed-logical-tx-id)
             data (when-let [raw-data (:data message)]
                    (parse-transit raw-data
                                   {:repo repo
@@ -209,6 +256,8 @@
                                    :message-type "tx/reject"
                                    :reason reason}
                             (contains? message :t) (assoc :t remote-tx)
+                            (string? (:error-detail message))
+                            (assoc :error-detail (:error-detail message))
                             (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
                             (some? failed-tx-id) (assoc :failed-tx-id failed-tx-id)
                             (seq missing-block-uuids) (assoc :missing-block-uuids (vec missing-block-uuids))
@@ -228,7 +277,9 @@
                    rejected-data)))))
 
 (defn- handle-hello!
-  [repo client local-tx remote-tx remote-checksum]
+  [repo client local-tx remote-tx remote-checksum capabilities]
+  (when-let [server-capabilities (:server-capabilities client)]
+    (reset! server-capabilities (set capabilities)))
   (require-non-negative remote-tx {:repo repo :type "hello"})
   (verify-sync-checksum! repo client local-tx remote-tx remote-checksum {:type "hello"})
   (broadcast-rtc-state! client)
@@ -265,12 +316,14 @@
 (defn- handle-tx-batch-ok!
   [repo client remote-tx remote-checksum]
   (require-non-negative remote-tx {:repo repo :type "tx/batch/ok"})
-  (sync-apply/ack-upload-response! repo client)
-  (let [current-local-tx (client-op/get-local-tx repo)
+  (let [request (sync-apply/ack-upload-response! repo client)
+        semantic-ack-tx-ids (or (:semantic-ack-tx-ids request)
+                                @(:inflight client))
+        current-local-tx (client-op/get-local-tx repo)
         next-local-tx (max current-local-tx remote-tx)]
     (client-op/update-local-tx repo next-local-tx)
     (sync-util/clear-last-sync-error! client)
-    (sync-apply/mark-pending-txs-false! repo @(:inflight client))
+    (sync-apply/mark-pending-txs-false! repo semantic-ack-tx-ids)
     (reset! (:inflight client) [])
     (broadcast-rtc-state! client)
     (verify-sync-checksum! repo client next-local-tx remote-tx remote-checksum {:type "tx/batch/ok"})
@@ -327,7 +380,8 @@
       (validate-local-tx! repo message local-tx)
       (update-latest-remote-state! repo message)
       (case (:type message)
-        "hello" (handle-hello! repo client local-tx remote-tx remote-checksum)
+        "hello" (handle-hello! repo client local-tx remote-tx remote-checksum
+                               (:capabilities message))
         "online-users" (handle-online-users! repo client message)
         "presence" (handle-presence! client message)
         "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx remote-checksum)

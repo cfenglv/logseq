@@ -5,6 +5,7 @@
             [cljs-time.coerce :as tc]
             [cljs-time.core :as t]
             [cljs.core.async :as async :refer [<! go timeout]]
+            [clojure.core.async.interop :refer [p->c]]
             [clojure.set :as set]
             [clojure.string :as string]
             [electron.ipc :as ipc]
@@ -420,12 +421,25 @@
   (-> resp (:body) (get-json-body)))
 
 (defn- <request-once [api-name body token]
-  (go
-    (let [resp (http/post (str "https://" config/API-DOMAIN "/file-sync/" api-name)
-                          {:oauth-token token
-                           :body (js/JSON.stringify (clj->js body))
-                           :with-credentials? false})]
-      {:resp (<! resp)
+  (let [url (str "https://" config/API-DOMAIN "/file-sync/" api-name)
+        request-body (js/JSON.stringify (clj->js body))
+        response (if (and (util/electron?) (= "user_info" api-name))
+                   (p->c
+                    (ipc/ipc :httpRequest
+                             (str (random-uuid))
+                             {:url url
+                              :method "POST"
+                              :headers {"authorization" (str "Bearer " token)
+                                        "content-type" "application/json"}
+                              :body request-body
+                              :returnType "text"
+                              :includeResponse true}))
+                   (http/post url
+                              {:oauth-token token
+                               :body request-body
+                               :with-credentials? false}))]
+    (go
+      {:resp (<! response)
        :api-name api-name
        :body body})))
 

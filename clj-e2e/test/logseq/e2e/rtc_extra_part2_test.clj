@@ -64,6 +64,8 @@
   [pw-page]
   (w/with-page pw-page
     (util/exit-edit)
+    ;; Let transient editor rows settle before snapshotting the rendered page.
+    (util/wait-timeout 300)
     {:rtc-tx (rtc/get-rtc-tx)
      :blocks (util/get-page-blocks-contents)}))
 
@@ -137,6 +139,13 @@
             (util/wait-timeout 80)
             (try
               (b/open-last-block)
+              ;; A failed attempt can leave a non-persisted empty DOM row (or a
+              ;; partial title that never committed). Discard it before retrying
+              ;; so it cannot skew later page snapshots.
+              (let [content (util/get-edit-content)]
+                (when (or (string/blank? content)
+                          (= content title))
+                  (b/delete-blocks)))
               (catch Throwable _
                 nil))
             (util/wait-timeout 80)

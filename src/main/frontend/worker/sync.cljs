@@ -2,12 +2,14 @@
   "Sync client"
   (:require
    [frontend.worker.platform :as platform]
+   [frontend.worker.repair-commit-fence :as repair-commit-fence]
    [frontend.worker.shared-service :as shared-service]
    [frontend.worker.state :as worker-state]
    [frontend.worker.sync.apply-txs :as sync-apply]
    [frontend.worker.sync.assets :as sync-assets]
    [frontend.worker.sync.auth :as sync-auth]
    [frontend.worker.sync.client-op :as client-op]
+   [frontend.worker.sync.download :as sync-download]
    [frontend.worker.sync.handle-message :as sync-handle-message]
    [frontend.worker.sync.presence :as sync-presence]
    [frontend.worker.sync.transport :as sync-transport]
@@ -24,11 +26,13 @@
 (def ^:private reconnect-jitter-ms 250)
 (def ^:private ws-stale-kill-interval-ms 60000)
 (def ^:private ws-stale-timeout-ms 600000)
+(def ^:private catch-up-pull-check-interval-ms 2000)
 (def fail-fast sync-util/fail-fast)
 
 (defonce *repo->latest-remote-tx sync-apply/*repo->latest-remote-tx)
 (defonce *repo->latest-remote-checksum sync-apply/*repo->latest-remote-checksum)
 (defonce *start-inflight-target (atom nil))
+(defonce ^:private *catch-up-pull-timer (atom nil))
 
 (defn- current-client
   [repo]
@@ -168,13 +172,15 @@
              (-> (or prev (p/resolved nil))
                  ;; Keep queue alive even if one message handler fails.
                  (p/catch (fn [_] nil))
-                 (p/then (fn [_] (task)))
+                 (p/then (fn [_]
+                           (repair-commit-fence/<with-repo-call!
+                            (:repo client) task)))
                  (p/catch (fn [error]
                             (sync-util/set-last-sync-error! client error)
                             (log/error :db-sync/ws-handle-message-failed
                                        {:repo (:repo client)
                                         :error error}))))))
-    (task)))
+    (repair-commit-fence/<with-repo-call! (:repo client) task)))
 
 (defn update-presence!
   [editing-block-uuid]
@@ -204,6 +210,7 @@
    :stale-kill-timer (atom nil)
    :last-ws-message-ts (atom (common-util/time-ms))
    :online-users (atom [])
+   :server-capabilities (atom #{})
    :ws-state (atom :closed)})
 
 (declare connect!)
@@ -335,11 +342,14 @@
                 :fail-fast-f fail-fast})))
       (close-stale-ws-loop updated ws url))))
 
+(declare clear-catch-up-pull-timer!)
+
 (defn stop!
   []
   (when-let [client @worker-state/*db-sync-client]
     (stop-client! client)
     (reset! worker-state/*db-sync-client nil))
+  (clear-catch-up-pull-timer!)
   (p/resolved nil))
 
 (declare list-remote-graphs!)
@@ -359,6 +369,55 @@
           (when (seq remote-graph-id)
             (ensure-client-graph-uuid! repo remote-graph-id)
             remote-graph-id))))))
+
+(defn- defer-repair-resume!
+  [repo]
+  ;; db-sync-start itself is a fenced thread-api call. Resume on the next turn
+  ;; so that call can release before a repair commit enters the same fence.
+  (-> (p/delay 0)
+      (p/then #(sync-download/<resume-repair-operation! repo))
+      (p/catch
+       (fn [error]
+         (log/error :db-sync/repair-resume-failed
+                    {:repo repo :error error}))))
+  nil)
+
+(defn- catch-up-pull-due?
+  [repo client]
+  (let [remote-tx (get @*repo->latest-remote-tx repo)
+        *pending (:pending-pull-since client)]
+    (and (some? *pending)
+         (integer? remote-tx)
+         (not (sync-download/repair-staging-in-progress?
+               repo (:graph-id client)))
+         (let [pending @*pending
+               sent-at (when (map? pending) (:sent-at pending))
+               now (common-util/time-ms)]
+           (or (nil? sent-at)
+               (>= (- now sent-at) sync-util/catch-up-pull-interval-ms)))
+         (let [local-tx (client-op/get-local-tx repo)]
+           (and (integer? local-tx) (< local-tx remote-tx))))))
+
+(defn- catch-up-pull-check!
+  []
+  (when-let [client @worker-state/*db-sync-client]
+    (when-let [repo (:repo client)]
+      (when (catch-up-pull-due? repo client)
+        (sync-handle-message/request-pull!
+         client (client-op/get-local-tx repo))))))
+
+(defn- clear-catch-up-pull-timer!
+  []
+  (when-let [timer @*catch-up-pull-timer]
+    (js/clearInterval timer)
+    (reset! *catch-up-pull-timer nil)))
+
+(defn- ensure-catch-up-pull-timer!
+  []
+  (when (nil? @*catch-up-pull-timer)
+    (reset! *catch-up-pull-timer
+            (js/setInterval catch-up-pull-check!
+                            catch-up-pull-check-interval-ms))))
 
 (defn start!
   [repo]
@@ -390,6 +449,9 @@
           (do
             (broadcast-rtc-state! current)
             (sync-apply/enqueue-flush-pending! repo current)
+            (when (catch-up-pull-due? repo current)
+              (sync-handle-message/request-pull!
+               current (client-op/get-local-tx repo)))
             (p/resolved nil))
 
           :else
@@ -405,6 +467,8 @@
                       token (<resolve-ws-token)
                       connected (connect! repo connected url token)]
                 (reset! worker-state/*db-sync-client connected)
+                (ensure-catch-up-pull-timer!)
+                (defer-repair-resume! repo)
                 nil))
              (p/finally
                (fn []

@@ -14,6 +14,8 @@
   (log/error tag data)
   (throw (ex-info (name tag) data)))
 
+(def catch-up-pull-interval-ms 5000)
+
 (defn cli-node-owner?
   []
   (try

@@ -38,6 +38,10 @@
   (swap! *search-index-build-ids dissoc repo)
   (swap! *vector-index-rebuild-ids dissoc repo))
 
+(defn search-index-build-active?
+  [repo]
+  (contains? @*search-index-build-ids repo))
+
 (defn- get-search-db
   [repo]
   (worker-state/get-sqlite-conn repo :search))
@@ -284,7 +288,12 @@
 
 (def-thread-api :thread-api/search-blocks
   [repo q option]
-  (<search-blocks repo q option))
+  ;; A repair cutover starts the official rebuild before releasing its short
+  ;; fence. Suppress queries while that existing owner is rebuilding so an
+  ;; old index can never publish results for the newly committed projection.
+  (if (search-index-build-active? repo)
+    (p/resolved nil)
+    (<search-blocks repo q option)))
 
 (def-thread-api :thread-api/search-upsert-blocks
   [repo blocks]
@@ -415,8 +424,8 @@
                                                             :total total}))]
              nil)))))))
 
-(def-thread-api :thread-api/search-build-blocks-indice-in-worker
-  [repo & [force?]]
+(defn <rebuild-blocks-indice!
+  [repo force?]
   (p/let [search-db (get-search-db repo)]
     (when search-db
       (let [version (search-index-version search-db)]
@@ -445,6 +454,10 @@
                                                                       :status :idle}))
                                (clear-search-index-build! repo build-id))))
               :started)))))))
+
+(def-thread-api :thread-api/search-build-blocks-indice-in-worker
+  [repo & [force?]]
+  (<rebuild-blocks-indice! repo force?))
 
 (def-thread-api :thread-api/search-build-pages-indice
   [_repo]

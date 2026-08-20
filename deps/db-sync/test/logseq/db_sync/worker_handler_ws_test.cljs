@@ -49,6 +49,7 @@
       (ws-handler/handle-ws-message! self ws raw))
     (is (= "hello" (:type @sent)))
     (is (number? (:t @sent)))
+    (is (= ["tx-upload-staged-v1"] (:capabilities @sent)))
     (is (string? (:checksum @sent)))))
 
 (deftest hello-message-omits-nil-checksum-test

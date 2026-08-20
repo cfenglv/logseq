@@ -18,6 +18,49 @@
        :headers #js {:get (constantly nil)}
        :arrayBuffer (fn [] (p/resolved #js {:byteLength size}))})
 
+(deftest asset-put-get-round-trip-reuses-existing-r2-owner-test
+  (async done
+    (let [stored (atom nil)
+          payload (js/Uint8Array. #js [11 22 33 44])
+          bucket #js {:put (fn [key body ^js opts]
+                             (reset! stored
+                                     {:key key
+                                      :body body
+                                      :http-metadata (.-httpMetadata opts)})
+                             (p/resolved nil))
+                      :get (fn [key]
+                             (let [{stored-key :key body :body
+                                    http-metadata :http-metadata} @stored]
+                               (p/resolved
+                                (when (= key stored-key)
+                                  #js {:body body
+                                       :size (.-byteLength body)
+                                       :httpMetadata http-metadata}))))}
+          env #js {:DB #js {}
+                   :LOGSEQ_SYNC_ASSETS bucket}
+          put-request (js/Request.
+                       "http://localhost/assets/graph-1/round-trip.bin"
+                       #js {:method "PUT"
+                            :headers #js {"content-type" "application/octet-stream"}
+                            :body payload})
+          get-request (js/Request.
+                       "http://localhost/assets/graph-1/round-trip.bin"
+                       #js {:method "GET"})]
+      (-> (p/with-redefs [index/<graph-e2ee? (fn [_ _]
+                                               (p/resolved true))]
+            (p/let [put-response (assets/handle put-request env)
+                    get-response (assets/handle get-request env)
+                    received (.arrayBuffer get-response)]
+              (is (= 200 (.-status put-response)))
+              (is (= 200 (.-status get-response)))
+              (is (= "graph-1/round-trip.bin" (:key @stored)))
+              (is (= (vec payload)
+                     (vec (js/Uint8Array. received))))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done)))))))
+
 (deftest encrypted-assets-allow-upload-at-larger-limit-test
   (async done
          (let [request (put-request-with-size (* 200 1024 1024))

@@ -51,6 +51,49 @@
     (f repo pool path)
     path))
 
+(defn inspect-db-artifact-set
+  [platform pool paths]
+  (if-let [f (get-in platform [:storage :inspect-db-artifact-set])]
+    (f pool paths)
+    (throw (ex-info "platform storage/inspect-db-artifact-set missing"
+                    {:paths paths}))))
+
+(defn db-artifact-swap-supported?
+  [platform]
+  (let [storage-adapter (:storage platform)]
+    (and (fn? (:prepare-db-artifact-swap! storage-adapter))
+         (fn? (:commit-db-artifact-swap! storage-adapter)))))
+
+(defn require-db-artifact-swap!
+  [platform]
+  (when-not (db-artifact-swap-supported? platform)
+    (throw (ex-info "Platform does not support an atomic graph artifact swap"
+                    {:type :selfhost6/artifact-swap-unsupported
+                     :runtime (env-flag platform :runtime)})))
+  nil)
+
+(defn prepare-db-artifact-swap!
+  [platform canonical-pool target-pool paths]
+  (require-db-artifact-swap! platform)
+  ((get-in platform [:storage :prepare-db-artifact-swap!])
+   canonical-pool target-pool paths))
+
+(defn commit-db-artifact-swap!
+  [platform canonical-pool target-pool paths]
+  (require-db-artifact-swap! platform)
+  ((get-in platform [:storage :commit-db-artifact-swap!])
+   canonical-pool target-pool paths))
+
+(defn <cleanup-db-previous!
+  "Remove the one non-authoritative previous graph artifact set. The storage
+  owner makes this idempotent; callers retain durable metadata until success."
+  [platform canonical-pool paths]
+  (if-let [f (get-in platform [:storage :cleanup-db-previous!])]
+    (f canonical-pool paths)
+    (throw (ex-info "Platform does not support previous artifact cleanup"
+                    {:type :selfhost6/previous-cleanup-unsupported
+                     :runtime (env-flag platform :runtime)}))))
+
 (defn remove-storage-pool!
   [platform pool]
   (if-let [f (get-in platform [:storage :remove-vfs!])]

@@ -15,7 +15,8 @@
         "hello"
         (let [checksum (sync-handler/current-checksum self)]
           (ws/send! ws (cond-> {:type "hello"
-                                :t (sync-handler/t-now self)}
+                                :t (sync-handler/t-now self)
+                                :capabilities sync-handler/server-capabilities}
                          (string? checksum) (assoc :checksum checksum))))
 
         "ping"

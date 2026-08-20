@@ -1,5 +1,8 @@
 (ns frontend.worker.sync.client-op-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require ["fs" :as node-fs]
+            ["path" :as node-path]
+            [cljs.test :refer [deftest is testing]]
+            [frontend.test.node-helper :as node-helper]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync.client-op :as client-op]
             [logseq.db.common.sqlite :as common-sqlite]
@@ -21,6 +24,24 @@
         (.close db)
         (reset! worker-state/*client-ops-conns prev-client-ops-conns)))))
 
+(defn- with-fixture-client-ops-db
+  [repo fixture-relative-path f]
+  (let [root-dir (node-helper/create-tmp-dir "client-op-fixture")
+        source (node-path/join (js/process.cwd)
+                               "src/test/fixtures/selfhost6"
+                               fixture-relative-path)
+        target (node-path/join root-dir "client-ops.sqlite")
+        Database (js/require "better-sqlite3")
+        prev-client-ops-conns @worker-state/*client-ops-conns]
+    (node-fs/copyFileSync source target)
+    (let [db (new Database target)]
+      (reset! worker-state/*client-ops-conns {repo db})
+      (try
+        (f db)
+        (finally
+          (.close db)
+          (reset! worker-state/*client-ops-conns prev-client-ops-conns))))))
+
 (defn- sqlite-count
   [^js db sql & args]
   (let [^js stmt (.prepare db sql)
@@ -31,6 +52,88 @@
       (or (aget row "c")
           (aget row "count"))
       0)))
+
+(deftest reserved-sync-meta-whole-value-atomicity-test
+  (let [key "selfhost.activation-record.v1"
+        initial "activation-v1-initial"
+        replacement "activation-v1-replacement"]
+    (with-client-ops-db
+      "repo-activation-atomicity"
+      (fn [db]
+        (testing "missing values are inserted once without overwriting the existing row"
+          (is (= {:found? false}
+                 (client-op/read-sync-meta-value db key)))
+          (is (= {:inserted? true :value initial}
+                 (client-op/insert-sync-meta-value-if-absent! db key initial)))
+          (is (= {:inserted? false :value initial}
+                 (client-op/insert-sync-meta-value-if-absent! db key replacement)))
+          (is (= {:found? true :value initial}
+                 (client-op/read-sync-meta-value db key))))
+
+        (testing "the whole encoded value is compared before replacement"
+          (is (false? (client-op/compare-and-set-sync-meta-value!
+                       db key "stale-value" replacement)))
+          (is (= {:found? true :value initial}
+                 (client-op/read-sync-meta-value db key)))
+          (is (true? (client-op/compare-and-set-sync-meta-value!
+                      db key initial replacement)))
+          (is (= {:found? true :value replacement}
+                 (client-op/read-sync-meta-value db key))))
+
+        (testing "repair cutover advances activation and official sync_meta together"
+          (is (true?
+               (client-op/commit-repair-activation-and-sync-meta!
+                db key replacement "activation-v1-target" 7 "checksum-7")))
+          (is (= {:found? true :value "activation-v1-target"}
+                 (client-op/read-sync-meta-value db key)))
+          (is (= 7 (client-op/get-local-tx "repo-activation-atomicity")))
+          (is (= "checksum-7"
+                 (client-op/get-local-checksum "repo-activation-atomicity"))))
+
+        (testing "an aborted replacement leaves the previous value readable"
+          (.exec db (str "create trigger abort_activation_update before update on sync_meta "
+                         "when old.key = 'selfhost.activation-record.v1' "
+                         "begin select raise(abort, 'activation update aborted'); end"))
+          (is (thrown-with-msg?
+               js/Error
+               #"activation update aborted"
+               (client-op/commit-repair-activation-and-sync-meta!
+                db key "activation-v1-target" "activation-v1-cleared"
+                8 "checksum-8")))
+          (is (= {:found? true :value "activation-v1-target"}
+                 (client-op/read-sync-meta-value db key)))
+          (is (= 7 (client-op/get-local-tx "repo-activation-atomicity")))
+          (is (= "checksum-7"
+                 (client-op/get-local-checksum "repo-activation-atomicity"))))))))
+
+(deftest frozen-upload-state-orphan-and-malformed-reader-boundaries-test
+  (let [orphan-id #uuid "20000000-0000-4000-8000-000000000002"
+        unrelated-id #uuid "20000000-0000-4000-8000-000000000004"
+        malformed-id #uuid "20000000-0000-4000-8000-000000000003"]
+    (with-fixture-client-ops-db
+      "repo-orphan-upload-fixture" "upload-state/orphan.sqlite"
+      (fn [db]
+        (is (= :staged-large-upload-v1
+               (:kind (client-op/get-client-tx-upload-state
+                       "repo-orphan-upload-fixture" orphan-id))))
+        (is (= {} (client-op/get-client-tx-upload-states
+                   "repo-orphan-upload-fixture" [unrelated-id])))
+        (is (= 1 (sqlite-count db
+                               "select count(*) as c from client_tx_upload_state where logical_tx_id = ?"
+                               (str orphan-id))))))
+    (with-fixture-client-ops-db
+      "repo-malformed-upload-fixture" "upload-state/malformed.sqlite"
+      (fn [db]
+        (let [error (try
+                      (client-op/get-client-tx-upload-state
+                       "repo-malformed-upload-fixture" malformed-id)
+                      nil
+                      (catch :default error
+                        error))]
+          (is (some? error))
+          (is (= 1 (sqlite-count db
+                                 "select count(*) as c from client_tx_upload_state where logical_tx_id = ?"
+                                 (str malformed-id)))))))))
 
 (deftest sqlite-sync-meta-roundtrip-test
   (let [repo "repo-1"]
@@ -48,6 +151,127 @@
         (is (= "graph-2" (client-op/get-graph-uuid repo)))
         (is (= 12 (client-op/get-local-tx repo)))
         (is (= "checksum-2" (client-op/get-local-checksum repo)))))))
+
+(deftest legacy-client-tx-upload-state-table-is-migrated-test
+  (testing "legacy .5 client_tx_upload_state (session_data) must migrate to the current upload-state schema"
+    (let [repo "legacy-upload-state-repo"]
+      (with-client-ops-db
+       repo
+       (fn [db]
+         (.exec db (str "create table client_tx_upload_state ("
+                        "logical_tx_id text primary key,"
+                        "session_data text not null,"
+                        "updated_at integer not null)"))
+         (let [tx-id (random-uuid)]
+           (client-op/put-client-tx-upload-state!
+            repo
+            tx-id
+            {:format-version 1
+             :kind :single-wire-v1
+             :source-digest "legacy-migration-digest"
+             :outliner-op :save-block
+             :wire-entry {:tx-id (str tx-id)}})
+           (is (= "legacy-migration-digest"
+                  (get-in (client-op/get-client-tx-upload-state
+                           repo tx-id)
+                          [:source-digest])))
+           (let [columns (->> (.all (.prepare db
+                                              "pragma table_info(client_tx_upload_state)"))
+                              (mapv #(aget % "name")))]
+             (is (contains? (set columns) "format_version"))
+             (is (contains? (set columns) "kind"))
+             (is (contains? (set columns) "source_digest"))
+             (is (contains? (set columns) "state")))))))))
+
+(deftest repair-local-observation-is-one-journal-read-transaction-test
+  (let [repo "repo-repair-observation"
+        tx-id (random-uuid)]
+    (with-client-ops-db
+      repo
+      (fn [_db]
+        (client-op/update-local-tx repo 7)
+        (client-op/update-local-checksum repo "legacy-7")
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id tx-id
+               :created-at 10
+               :pending? true
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (is (= {:remote-t 7
+                :journal-high-water 1
+                :pending-count 1
+                :legacy-anchor "legacy-7"}
+               (client-op/read-repair-local-observation repo)))))))
+
+(deftest repair-completion-observation-bounds-pending-membership-test
+  (let [repo "repo-repair-completion"
+        target-tx-id (random-uuid)
+        later-tx-id (random-uuid)]
+    (with-client-ops-db
+      repo
+      (fn [db]
+        (client-op/update-local-tx repo 12)
+        (client-op/update-local-checksum repo "legacy-12")
+        (client-op/insert-sync-meta-value-if-absent!
+         db "selfhost.activation-record.v1" "activation-raw")
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id target-tx-id
+               :created-at 10
+               :pending? false
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id later-tx-id
+               :created-at 20
+               :pending? true
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (is (= {:remote-t 12
+                :journal-high-water 2
+                :pending-count 1
+                :legacy-anchor "legacy-12"
+                :pending-through-target 0}
+               (client-op/read-repair-completion-observation repo 1)))
+        (is (= 1
+               (:pending-through-target
+                (client-op/read-repair-completion-observation repo 2))))
+        (is (= {:local-checksum "legacy-12"
+               :reserved-value "activation-raw"}
+               (client-op/read-local-checksum-and-sync-meta-value
+                repo "selfhost.activation-record.v1")))))))
+
+(deftest repair-local-batch-binds-watermark-and-official-order-test
+  (let [repo "repo-repair-batch"
+        first-tx-id (random-uuid)
+        second-tx-id (random-uuid)]
+    (with-client-ops-db
+      repo
+      (fn [db]
+        (client-op/update-local-tx repo 11)
+        (doseq [tx-id [first-tx-id second-tx-id]]
+          (client-op/upsert-local-tx-entry!
+           repo {:tx-id tx-id
+                 :created-at 10
+                 :normalized-tx-data []
+                 :reversed-tx-data []}))
+        (client-op/upsert-local-tx-entry!
+         repo {:tx-id (random-uuid)
+               :created-at 20
+               :pending? false
+               :normalized-tx-data []
+               :reversed-tx-data []})
+        (.exec db "delete from client_ops where id = 3")
+        (let [{:keys [observation pending-ids]}
+              (client-op/read-repair-local-batch repo)]
+          (is (= {:remote-t 11
+                  :journal-high-water 3
+                  :pending-count 2
+                  :legacy-anchor nil}
+                 observation))
+          (is (= [1 2] pending-ids))
+          (is (= [first-tx-id second-tx-id]
+                 (mapv :tx-id
+                       (client-op/read-repair-local-page repo pending-ids)))))))))
 
 (deftest sqlite-asset-ops-coalescing-test
   (let [repo "repo-asset"

@@ -227,6 +227,65 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest e2ee-graph-aes-key-post-get-round-trip-reuses-existing-d1-owner-test
+  (async done
+    (let [stored (atom {})
+          graph-id "graph-e2ee-round-trip"
+          user-id "user-e2ee-round-trip"
+          encrypted-key "encrypted-aes-key-payload"
+          post-request (js/Request.
+                        (str "http://localhost/e2ee/graphs/" graph-id "/aes-key")
+                        #js {:method "POST"
+                             :headers #js {"content-type" "application/json"}
+                             :body (js/JSON.stringify
+                                    #js {"encrypted-aes-key" encrypted-key})})
+          get-request (js/Request.
+                       (str "http://localhost/e2ee/graphs/" graph-id "/aes-key")
+                       #js {:method "GET"})
+          context (fn [request handler]
+                    {:db :db
+                     :env #js {}
+                     :request request
+                     :url (js/URL. (.-url request))
+                     :claims #js {"sub" user-id}
+                     :route {:handler handler
+                             :path-params {:graph-id graph-id}}})]
+      (-> (p/with-redefs [index/<user-has-access-to-graph?
+                          (fn [_db requested-graph-id requested-user-id]
+                            (p/resolved
+                             (and (= graph-id requested-graph-id)
+                                  (= user-id requested-user-id))))
+                          index/<graph-encrypted-aes-key-upsert!
+                          (fn [_db requested-graph-id requested-user-id value]
+                            (swap! stored assoc
+                                   [requested-graph-id requested-user-id] value)
+                            (p/resolved true))
+                          index/<graph-encrypted-aes-key
+                          (fn [_db requested-graph-id requested-user-id]
+                            (p/resolved
+                             (get @stored
+                                  [requested-graph-id requested-user-id])))]
+            (p/let [post-response
+                    (index-handler/handle
+                     (context post-request :e2ee/graph-aes-key-post))
+                    post-text (.text post-response)
+                    get-response
+                    (index-handler/handle
+                     (context get-request :e2ee/graph-aes-key-get))
+                    get-text (.text get-response)
+                    post-body (js->clj (js/JSON.parse post-text)
+                                       :keywordize-keys true)
+                    get-body (js->clj (js/JSON.parse get-text)
+                                      :keywordize-keys true)]
+              (is (= 200 (.-status post-response) (.-status get-response)))
+              (is (= {:encrypted-aes-key encrypted-key}
+                     post-body get-body))
+              (is (= encrypted-key (get @stored [graph-id user-id])))))
+          (p/then (fn [] (done)))
+          (p/catch (fn [error]
+                     (is false (str error))
+                     (done)))))))
+
 (deftest graphs-delete-supports-node-delete-hook-without-do-namespace-test
   (async done
          (let [request (js/Request. "http://localhost/graphs/graph-1" #js {:method "DELETE"})

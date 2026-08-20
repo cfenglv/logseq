@@ -3,12 +3,21 @@
             ["fs-extra" :as ^js fs]
             ["path" :as ^js node-path]
             [cljs.reader :as reader]
+            [electron.home :as home]
             [electron.logger :as logger]
             [logseq.common.graph-registry :as graph-registry]))
 
 ;; FIXME: move configs.edn to where it should be
-(defonce dot-root (.join node-path (.getPath app "home") ".logseq"))
-(defonce cfg-root (.getPath app "userData"))
+;; Qualification launches may isolate every desktop home-owned path explicitly.
+(defonce home-root
+  (home/resolve-root (.-LOGSEQ_TEST_HOME_DIR js/process.env)
+                     (.getPath app "home")))
+(defonce dot-root (.join node-path home-root ".logseq"))
+(defonce cfg-root
+  (let [qualification-user-data (.-LOGSEQ_TEST_USER_DATA_DIR js/process.env)]
+    (when (seq qualification-user-data)
+      (.setPath app "userData" qualification-user-data))
+    (.getPath app "userData")))
 (defonce cfg-path (.join node-path cfg-root "configs.edn"))
 
 (defn graph-registry-path

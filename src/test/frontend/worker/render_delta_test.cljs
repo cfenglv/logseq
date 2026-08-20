@@ -31,6 +31,7 @@
   [report overrides]
   (render-delta/build
    (merge {:graph-id "graph"
+           :projection-epoch 0
            :rev 101
            :op-id "operation"
            :blocks {}
@@ -54,6 +55,7 @@
                            {:blocks {block-uuid replacement}
                             :affected-keys #{[:graph] [:query :tasks]}})]
     (is (= {:graph-id "graph"
+            :projection-epoch 0
             :rev 101
             :op-id "operation"
             :blocks {block-uuid replacement}
@@ -298,6 +300,10 @@
       (is (thrown-with-msg? js/Error
                             #"Invalid renderer revision"
                             (build-delta report {:rev nil}))))
+    (testing "projection epoch"
+      (is (thrown-with-msg? js/Error
+                            #"Invalid projection epoch"
+                            (build-delta report {:projection-epoch nil}))))
     (testing "block map key"
       (is (thrown-with-msg? js/Error
                             #"Invalid block UUID"

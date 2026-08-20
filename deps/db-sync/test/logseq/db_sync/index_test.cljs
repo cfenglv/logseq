@@ -113,6 +113,22 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest user-upsert-does-not-bind-undefined-optional-claims-test
+  (async done
+         (let [called (atom nil)]
+           (-> (p/with-redefs [common/now-ms (fn [] 1234)
+                               common/<d1-run (fn [_db sql & args]
+                                                (reset! called {:sql sql :args args})
+                                                (p/resolved {:ok true}))]
+                 (index/<user-upsert! :db #js {"sub" "minimal-claims-user"}))
+               (p/then (fn [_]
+                         (is (string/includes? (:sql @called) "insert into users"))
+                         (is (every? #(not (identical? js/undefined %)) (:args @called)))
+                         (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
 (deftest index-init-runs-graph-e2ee-migration-test
   (async done
          (let [sql-calls (atom [])]

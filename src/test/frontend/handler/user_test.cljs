@@ -1,5 +1,6 @@
 (ns frontend.handler.user-test
-  (:require [cljs.core.async :as a]
+  (:require [cljs-http.client :as http]
+            [cljs.core.async :as a]
             [cljs.test :refer [async deftest is testing]]
             [electron.ipc :as ipc]
             [frontend.handler.user :as user-handler]
@@ -41,6 +42,46 @@
   (str "header."
        (js/btoa (js/JSON.stringify (clj->js (merge {:cognito:username ""} payload))))
        ".sig"))
+
+(deftest file-sync-request-uses-existing-electron-http-owner-test
+  (async done
+         (let [called* (atom nil)
+               result-ch (with-redefs [util/electron? (constantly true)
+                                       ipc/ipc (fn [& args]
+                                                 (reset! called* args)
+                                                 (p/resolved {:status 200 :ok true :body "{}"}))]
+                           (#'user-handler/<request-once "user_info" {} "qualification-token"))
+               [method request-id options] @called*]
+           (is (= :httpRequest method))
+           (is (some? (and (string? request-id)
+                           (re-matches #"[0-9a-f-]{36}" request-id))))
+           (is (= {:url "https://api.logseq.com/file-sync/user_info"
+                   :method "POST"
+                   :headers {"authorization" "Bearer qualification-token"
+                             "content-type" "application/json"}
+                   :body "{}"
+                   :returnType "text"
+                   :includeResponse true}
+                  options))
+           (a/take! result-ch
+                    (fn [result]
+                      (is (= {:status 200 :ok true :body "{}"}
+                             (:resp result)))
+                      (done))))))
+
+(deftest file-sync-request-keeps-browser-http-path-test
+  (let [called* (atom nil)]
+    (with-redefs [util/electron? (constantly false)
+                  http/post
+                  (fn [& args]
+                    (reset! called* args)
+                    (a/go {:status 200 :body "{}"}))]
+      (#'user-handler/<request-once "user_info" {} "qualification-token"))
+    (is (= ["https://api.logseq.com/file-sync/user_info"
+            {:oauth-token "qualification-token"
+             :body "{}"
+             :with-credentials? false}]
+           @called*))))
 
 (deftest set-tokens-persists-auth-json-with-latest-token-values-test
   (let [writes* (atom [])
@@ -130,6 +171,26 @@
           (is false (str "unexpected error: " e))
           (restore!)
           (done))))))
+
+(deftest restore-fresh-tokens-publishes-login-continuation-synchronously-test
+  (let [old-state (state/get-state)
+        events* (atom [])
+        future-exp (+ (quot (.now js/Date) 1000) 7200)]
+    (state/replace-state! (assoc old-state
+                                :auth/id-token nil
+                                :auth/access-token nil
+                                :auth/refresh-token nil))
+    (try
+      (with-mocked-local-storage
+        {"id-token" (jwt {:exp future-exp})
+         "access-token" "access-token-from-local-storage"
+         "refresh-token" "refresh-token-from-local-storage"}
+        (fn []
+          (with-redefs [state/pub-event! #(swap! events* conj %)]
+            (user-handler/restore-tokens-from-localstorage)
+            (is (= [[:user/fetch-info-and-graphs]] @events*)))))
+      (finally
+        (state/replace-state! old-state)))))
 
 (deftest logout-clears-e2ee-password-when-db-worker-ready-test
   (testing "logout should request db-worker to clear persisted e2ee password"

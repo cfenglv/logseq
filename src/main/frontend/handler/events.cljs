@@ -13,6 +13,7 @@
             [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
             [frontend.db.async :as db-async]
+            [frontend.db.projection-cutover :as projection-cutover]
             [frontend.extensions.fsrs :as fsrs]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.code :as code-handler]
@@ -338,6 +339,9 @@
 (defevent! :editor/save-current-block [_]
   (editor-handler/save-current-block!))
 
+(defevent! :editor/recover-deleted-dirty-draft [[_ editing-block draft]]
+  (editor-handler/recover-deleted-dirty-draft! editing-block draft))
+
 (defevent! :editor/add-comment [_]
   (comments-handler/add-comment-to-current-context!))
 
@@ -479,6 +483,10 @@
 ;; db-worker -> UI
 (defevent! :db/sync-changes [[_ data]]
   (pipeline/invoke-hooks data)
+  nil)
+
+(defevent! :db/projection-committed [[_ payload]]
+  (projection-cutover/apply-committed! payload)
   nil)
 
 (defevent! :db/export-sqlite [_]

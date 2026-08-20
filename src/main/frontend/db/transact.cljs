@@ -146,11 +146,14 @@
 
 (defn- publish-worker-response!
   [tx-meta delta editor-rows row-uuids run-editor-callback?]
-  (let [started-at (now-ms)]
+  (let [started-at (now-ms)
+        current-projection? (or (nil? delta)
+                                (db-subs/current-projection? delta))]
     (when delta
       (react-dom/flushSync #(db-subs/apply-delta! delta)))
     (let [delta-flushed-at (now-ms)]
-      (p/let [editor-callback-perf (when run-editor-callback?
+      (p/let [editor-callback-perf (when (and run-editor-callback?
+                                                current-projection?)
                                      (run-response-editor-callback!
                                       tx-meta editor-rows row-uuids))]
         (let [completed-at (now-ms)]
