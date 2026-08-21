@@ -1530,7 +1530,7 @@
   (let [root-dir (node-helper/create-tmp-dir (str "phase5-fixture-" id))
         repo (str "phase5-fixture-" id)
         fixture-root (node-path/join (js/process.cwd)
-                                     "docs/selfhost6-phase0/fixtures/v1")
+                                     "src/test/fixtures/selfhost6")
         canonical-fixture (node-path/join fixture-root "clean/db.sqlite")]
     (p/let [platform' (platform-node/node-platform {:root-dir root-dir})
             _ (platform/set-platform! platform')
