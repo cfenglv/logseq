@@ -42,8 +42,12 @@
     "frontend.handler.editor-lifecycle-test"
     "frontend.handler.editor-test"
     "frontend.handler.route-test"
+    "frontend.persist-db-test"
     "frontend.rfx-test"
-    "frontend.worker.db-core-test"})
+    "frontend.worker.db-core-test"
+    "frontend.worker.db-worker-node-test"
+    "frontend.worker.sync.download-test"
+    "frontend.worker.sync.restart-test"})
 
 (def serial-test-namespaces
   #{"frontend.db.query-dsl-test"
