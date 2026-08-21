@@ -91,7 +91,7 @@
                                          :headers #js {"upgrade" "websocket"
                                                        "x-db-sync-admin-token" "test-admin-token"
                                                        "cloudflare-workers-version-overrides"
-                                                       "team-logseq-sync=\"candidate-version\""}})
+                                                       "sync-worker=\"candidate-version\""}})
                env #js {"DB_SYNC_ADMIN_TOKEN" "test-admin-token"
                         "LOGSEQ_SYNC_DO" (capturing-do-namespace forwarded)}]
            (-> (p/let [response (dispatch/handle-worker-fetch request env)
