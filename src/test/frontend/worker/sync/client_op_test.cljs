@@ -28,7 +28,7 @@
   [repo fixture-relative-path f]
   (let [root-dir (node-helper/create-tmp-dir "client-op-fixture")
         source (node-path/join (js/process.cwd)
-                               "docs/selfhost6-phase0/fixtures/v1"
+                               "src/test/fixtures/selfhost6"
                                fixture-relative-path)
         target (node-path/join root-dir "client-ops.sqlite")
         Database (js/require "better-sqlite3")

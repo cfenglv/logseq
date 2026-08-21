@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "kind": "selfhost6.phase0.fixture-manifest.v1",
+  "status": "ready",
+  "officialBaseFullSha": "abdc94bfb47cd7db924cd8a45ff3d114e8278604",
+  "groups": [
+    {
+      "id": "clean-db-graph",
+      "files": [
+        {
+          "role": "official-base-clean-graph",
+          "path": "clean/db.sqlite",
+          "sha256": "21d0cb6b74a66f84bc6ab56057c0f8f36cd3360894f0511d0d387524a02ad09e",
+          "byteSize": 462848
+        }
+      ],
+      "oracle": {
+        "sqliteIntegrityCheck": "ok"
+      }
+    },
+    {
+      "id": "pending-history-asset",
+      "files": [
+        {
+          "role": "official-base-clean-graph",
+          "path": "clean/db.sqlite",
+          "sha256": "21d0cb6b74a66f84bc6ab56057c0f8f36cd3360894f0511d0d387524a02ad09e",
+          "byteSize": 462848
+        },
+        {
+          "role": "client-ops",
+          "path": "pending-history-asset/client-ops.sqlite",
+          "sha256": "931fc83512362d39dfe9ed219778c903bafe87ed1560544bb5fb115bb1a443aa",
+          "byteSize": 57344
+        },
+        {
+          "role": "asset",
+          "path": "pending-history-asset/assets/phase0-fixture.txt",
+          "sha256": "89d3f2e6f0137dae45c47d1af0117fb05084ae01d1597f3f63843cc7ed30cf3f",
+          "byteSize": 31
+        }
+      ],
+      "oracle": {
+        "pendingTxId": "10000000-0000-4000-8000-000000000001",
+        "historyProtectedTxIds": [
+          "10000000-0000-4000-8000-000000000002"
+        ],
+        "assetUuid": "10000000-0000-4000-8000-000000000003"
+      }
+    },
+    {
+      "id": "upload-state",
+      "files": [
+        {
+          "role": "valid",
+          "path": "upload-state/valid.sqlite",
+          "sha256": "2731c55846afe051417d4025aad54c2c350d638f67ef27eef5a3005932cad821",
+          "byteSize": 548864
+        },
+        {
+          "role": "orphan",
+          "path": "upload-state/orphan.sqlite",
+          "sha256": "7ac5b82995ab920037540ac9697e6c9b26e6071f7730faef720182f5b1e7dabd",
+          "byteSize": 57344
+        },
+        {
+          "role": "malformed",
+          "path": "upload-state/malformed.sqlite",
+          "sha256": "1f1a325d97a5d935c614563c435a68c0c53cd82e0e50d443be257c7c9db221b6",
+          "byteSize": 57344
+        }
+      ],
+      "oracle": {
+        "validLogicalTxId": "20000000-0000-4000-8000-000000000001",
+        "orphanLogicalTxId": "20000000-0000-4000-8000-000000000002",
+        "malformedLogicalTxId": "20000000-0000-4000-8000-000000000003",
+        "orphanPolicy": "retain-and-report-without-rebinding",
+        "malformedPolicy": "fail-closed"
+      }
+    },
+    {
+      "id": "sync-conflict-repair-corruption",
+      "files": [
+        {
+          "role": "official-base-clean-graph",
+          "path": "clean/db.sqlite",
+          "sha256": "21d0cb6b74a66f84bc6ab56057c0f8f36cd3360894f0511d0d387524a02ad09e",
+          "byteSize": 462848
+        },
+        {
+          "role": "sync-conflict",
+          "path": "repair-corruption/client-ops.sqlite",
+          "sha256": "4c7aa5000b22f190f0fab94e19b32800752aba2341f05ab47c18b958d31a2ea6",
+          "byteSize": 57344
+        },
+        {
+          "role": "deterministically-corrupt-local-graph",
+          "path": "repair-corruption/corrupt-db.sqlite",
+          "sha256": "208333718ffcda73f68e79a27c1d99b556efec9e18372b3a9e915233edca054e",
+          "byteSize": 458752
+        },
+        {
+          "role": "repair-receipt",
+          "path": "repair-corruption/TEST6_REPAIR_RECEIPT.json",
+          "sha256": "e6068d06e868a8501b481008e44ec66fa5a29a5db2cebf0b58c6f86f9e791475",
+          "byteSize": 1524
+        }
+      ],
+      "oracle": {
+        "conflictBlockUuid": "40000000-0000-4000-8000-000000000001",
+        "repairReceiptPath": "repair-corruption/TEST6_REPAIR_RECEIPT.json"
+      }
+    }
+  ],
+  "derivedActivationCorruptions": [
+    {
+      "id": "unknown-version",
+      "sourceGroup": "clean-db-graph",
+      "file": {
+        "role": "activation-unknown-version",
+        "path": "activation-transforms/unknown-version.sqlite",
+        "sha256": "f720e7495c09e96513347478d0a18a074e96feace6b46d8f8982b0e4bf57a51d",
+        "byteSize": 57344
+      },
+      "oracle": "fail-closed"
+    },
+    {
+      "id": "unknown-kind",
+      "sourceGroup": "clean-db-graph",
+      "file": {
+        "role": "activation-unknown-kind",
+        "path": "activation-transforms/unknown-kind.sqlite",
+        "sha256": "ee7e6cde4b29127aae95d19f0709dd917ff2d87e0fbbe5d13f63b41a6a36a5e9",
+        "byteSize": 57344
+      },
+      "oracle": "fail-closed"
+    }
+  ],
+  "e2ee": {
+    "included": false,
+    "reason": "product release contract does not enable E2EE"
+  }
+}
