@@ -1,6 +1,17 @@
 name: Clojure RTC E2E
 
 on:
+  workflow_call:
+    inputs:
+      source-ref:
+        description: "Exact source ref tested by a calling release workflow"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SELFHOST_SYNC_SERVER_URL:
+        description: "RTC HTTP base URL required by release callers"
+        required: true
   push:
     branches: [master]
     paths:
@@ -29,10 +40,12 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-22.04
-    if: "contains(github.event.head_commit.message, 'rtc')"
+    if: ${{ inputs.source-ref != '' || contains(github.event.head_commit.message, 'rtc') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -104,7 +117,7 @@ jobs:
     name: Test ${{ matrix.test-task }}
     needs: build
     runs-on: ubuntu-22.04
-    if: "contains(github.event.head_commit.message, 'rtc')"
+    if: ${{ inputs.source-ref != '' || contains(github.event.head_commit.message, 'rtc') }}
     strategy:
       fail-fast: false
       matrix:
@@ -112,6 +125,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -155,8 +170,16 @@ jobs:
           rsync -avz --exclude node_modules --exclude android --exclude ios ./static/ ./public/
           ls -lR ./public
 
+      - name: Require the selected RTC target for release qualification
+        if: ${{ inputs.source-ref != '' }}
+        run: test -n "$LOGSEQ_E2E_SYNC_SERVER_URL"
+        env:
+          LOGSEQ_E2E_SYNC_SERVER_URL: ${{ secrets.SELFHOST_SYNC_SERVER_URL }}
+
       - name: Run e2e tests
         run: cd clj-e2e && timeout 40m bb ${{ matrix.test-task }}
+        env:
+          LOGSEQ_E2E_SYNC_SERVER_URL: ${{ secrets.SELFHOST_SYNC_SERVER_URL }}
 
       - name: Collect screenshots
         if: ${{ failure() }}
