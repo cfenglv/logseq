@@ -131,6 +131,65 @@
                               (is false (str error))
                               (done)))))))))
 
+(deftest checksum-diagnostics-reconciles-stale-stored-anchor-to-recomputed-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   self #js {:sql sql :conn conn :schema-ready true}
+                   graph-id "graph-stale-anchor"
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                         :block/title "stale anchor block"}])
+                   recomputed (sync-checksum/recompute-checksum @conn)
+                   _ (storage/set-checksum! sql "0000000000000000")]
+               (-> (p/let [first-response (#'sync-handler/<checksum-diagnostics-response
+                                             self graph-id false)
+                           _ (is (= recomputed
+                                    (:legacy-anchor first-response)
+                                    (:server-recomputed-checksum first-response)))
+                           _ (is (= recomputed (storage/get-checksum sql))
+                                 "stale stored anchor must be reconciled")
+                           second-response (#'sync-handler/<checksum-diagnostics-response
+                                             self graph-id false)]
+                     (is (= recomputed
+                            (:legacy-anchor second-response)
+                            (:server-recomputed-checksum second-response)
+                            (storage/get-checksum sql))))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
+(deftest checksum-diagnostics-does-not-overwrite-a-newer-anchor-test
+  (with-memory-sql
+    (fn [sql]
+      (storage/init-schema! sql)
+      (let [conn (storage/open-conn sql)
+            self #js {:sql sql :conn conn :schema-ready true}
+            graph-id "graph-diagnostics-race"
+            _ (d/transact! conn [{:block/uuid (random-uuid)
+                                  :block/title "captured block"}])
+            captured-t (storage/get-t sql)
+            captured-anchor "0000000000000000"
+            _ (storage/set-checksum! sql captured-anchor)
+            _ (d/transact! conn [{:block/uuid (random-uuid)
+                                  :block/title "concurrent block"}])
+            current-t (storage/get-t sql)
+            current-anchor (storage/get-checksum sql)
+            error (try
+                    (#'sync-handler/reconcile-checksum-if-current!
+                     self graph-id captured-t captured-anchor "1111111111111111")
+                    nil
+                    (catch :default error
+                      error))]
+        (is (= :db-sync/checksum-diagnostics-observation-changed
+               (:type (ex-data error))))
+        (is (> current-t captured-t))
+        (is (= current-t (storage/get-t sql)))
+        (is (= current-anchor (storage/get-checksum sql))
+            "a stale diagnostics continuation must not overwrite the newer anchor")))))
+
 (deftest semantic-create-page-delegates-to-outliner-and-broadcasts-test
   (async done
          (with-memory-sql-async

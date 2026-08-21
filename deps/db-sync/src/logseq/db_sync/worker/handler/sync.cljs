@@ -990,6 +990,21 @@
     page (assoc :block/page (str page))
     order (assoc :block/order order)))
 
+(defn- reconcile-checksum-if-current!
+  [^js self graph-id captured-t captured-anchor recomputed]
+  (let [current-t (t-now self)
+        current-anchor (current-checksum self)]
+    (when-not (and (= captured-t current-t)
+                   (= captured-anchor current-anchor))
+      (throw
+       (ex-info
+        "Checksum diagnostics observation changed during recomputation"
+        {:type :db-sync/checksum-diagnostics-observation-changed
+         :graph-id graph-id
+         :captured-t captured-t
+         :current-t current-t})))
+    (storage/set-checksum! (.-sql self) recomputed)))
+
 (defn- <checksum-diagnostics-response
   [^js self graph-id include-blocks?]
   (ensure-conn! self)
@@ -1001,7 +1016,20 @@
     (p/let [recomputed (if diagnostics
                          (:checksum diagnostics)
                          (sync-checksum/<recompute-checksum db))]
-      (let [legacy-anchor (or stored-legacy-anchor recomputed)
+      (let [stale-anchor? (and stored-legacy-anchor
+                               (not= stored-legacy-anchor recomputed))
+            ;; The stored legacy anchor is derived metadata over the immutable
+            ;; tx log. When it disagrees with a fresh recomputation, the stored
+            ;; value is stale (e.g. written under an earlier checksum rule).
+            ;; Reconcile it only while the captured t/checksum pair is still
+            ;; current. The recompute yields, so a newer transaction may have
+            ;; already installed a newer anchor.
+            _ (when stale-anchor?
+                (reconcile-checksum-if-current!
+                 self graph-id remote-t stored-legacy-anchor recomputed))
+            legacy-anchor (if stale-anchor?
+                            recomputed
+                            (or stored-legacy-anchor recomputed))
             checkpoint-identity
             (str "sync-do-checkpoint-v1:" graph-id ":" remote-t ":" legacy-anchor)
             metadata-proof
