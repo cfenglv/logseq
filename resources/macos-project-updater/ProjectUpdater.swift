@@ -237,7 +237,7 @@ private func validateMetadata(_ value: SignedMetadata, archive: URL) throws {
           value.algorithm == algorithm,
           value.keyId == keyId,
           value.releaseLineId == releaseLine,
-          value.targetVersion == "2.0.1-selfhost.7",
+          value.targetVersion == "2.0.1-selfhost.8",
           value.platform == "darwin",
           value.arch == helperArch(),
           value.bundleIdentity == bundleIdentity,

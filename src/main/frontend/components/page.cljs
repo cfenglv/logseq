@@ -679,7 +679,7 @@
                      (p/let [_ (p/all (map (fn [page]
                                              (page-handler/<delete! (:block/uuid page) nil
                                                                     {:error-handler
-                                                                     (fn []
+                                                                     (fn [& _]
                                                                        (swap! failed-pages conj (:block/name page)))}))
                                            pages))]
                        (if (seq @failed-pages)

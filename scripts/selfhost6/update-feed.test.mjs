@@ -90,7 +90,7 @@ test("a content-addressed synthetic target becomes isolated channel metadata", (
     releasePolicy,
     signingPolicy,
   });
-  assert.match(item.descriptor.assetName, /darwin-arm64-2\.0\.1-selfhost\.7\.zip$/);
+  assert.match(item.descriptor.assetName, /darwin-arm64-2\.0\.1-selfhost\.8\.zip$/);
   assert.ok(item.descriptor.immutableObjectKey.includes(verified["archive-sha256"]));
   assert.equal(item.descriptor.provider.baseUrl, releasePolicy.provider.baseUrl);
 
@@ -124,7 +124,7 @@ test("win32 arm64 uses the same shared Windows update channel as win32 x64", () 
   );
 });
 
-test("promotion rejects source .6 and post-signing artifact replacement", () => {
+test("promotion rejects source .7 and post-signing artifact replacement", () => {
   const source = fixture(releasePolicy.sourceVersion);
   assert.throws(
     () => buildPromotion({

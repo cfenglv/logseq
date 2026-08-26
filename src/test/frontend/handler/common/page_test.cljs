@@ -186,6 +186,72 @@
                 [:ok]]
                @calls))))))
 
+(deftest-async delete-page-worker-rejection-reaches-error-handler-test
+  (let [page-uuid #uuid "11111111-1111-1111-1111-111111111111"
+        worker-error (js/Error. "delete failed")
+        errors (atom [])]
+    (p/with-redefs [state/*db-worker (atom true)
+                    state/get-current-repo (constantly "test")
+                    state/get-default-home (constantly {})
+                    state/<invoke-db-worker
+                    (fn [method & _args]
+                      (case method
+                        :thread-api/pull
+                        (p/resolved {:block/uuid page-uuid
+                                     :block/title "Deleted Page"})
+
+                        :thread-api/apply-outliner-ops
+                        (p/rejected worker-error)
+
+                        (p/rejected (js/Error. (str "Unexpected worker API " method)))))
+                    user-handler/user-uuid (constantly nil)]
+      (p/let [_ (page-common-handler/<delete!
+                 page-uuid
+                 nil
+                 :error-handler #(swap! errors conj %))]
+        (is (= [worker-error] @errors))))))
+
+(deftest-async delete-page-false-result-reaches-error-handler-test
+  (let [page-uuid #uuid "11111111-1111-1111-1111-111111111111"
+        errors (atom [])]
+    (p/with-redefs [state/*db-worker (atom true)
+                    state/get-current-repo (constantly "test")
+                    state/get-default-home (constantly {})
+                    state/<invoke-db-worker
+                    (fn [method & _args]
+                      (case method
+                        :thread-api/pull
+                        (p/resolved {:block/uuid page-uuid
+                                     :block/title "Deleted Page"})
+
+                        :thread-api/apply-outliner-ops
+                        (p/resolved false)
+
+                        (p/rejected (js/Error. (str "Unexpected worker API " method)))))
+                    user-handler/user-uuid (constantly nil)]
+      (p/let [_ (page-common-handler/<delete!
+                 page-uuid
+                 nil
+                 :error-handler #(swap! errors conj %))]
+        (is (= [nil] @errors))))))
+
+(deftest-async delete-page-missing-after-initial-pull-reaches-error-handler-test
+  (let [page-uuid #uuid "11111111-1111-1111-1111-111111111111"
+        errors (atom [])]
+    (p/with-redefs [state/*db-worker (atom true)
+                    state/get-current-repo (constantly "test")
+                    state/<invoke-db-worker
+                    (fn [method & _args]
+                      (case method
+                        :thread-api/pull (p/resolved nil)
+                        (p/rejected (js/Error. (str "Unexpected worker API " method)))))]
+      (p/let [_ (page-common-handler/<delete!
+                 page-uuid
+                 nil
+                 :error-handler #(swap! errors conj %))]
+        (is (= [nil] @errors)
+            "A concurrently removed page must settle the page-owner promise instead of leaving its dialog busy.")))))
+
 (deftest-async after-page-renamed-uses-worker-page-lookup-test
   (let [page-uuid #uuid "11111111-1111-1111-1111-111111111111"
         calls (atom [])]

@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "releaseLineId": "selfhost-official-architecture-v1",
-  "sourceVersion": "2.0.1-selfhost.6",
-  "syntheticForwardTargetVersion": "2.0.1-selfhost.7",
+  "sourceVersion": "2.0.1-selfhost.7",
+  "syntheticForwardTargetVersion": "2.0.1-selfhost.8",
   "bundleIdentity": "com.logseq.logseq",
   "forwardUpdateChannel": "selfhost-official-architecture-v1",
   "provider": {

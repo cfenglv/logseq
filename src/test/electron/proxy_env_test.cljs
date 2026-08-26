@@ -47,14 +47,38 @@
 
 (deftest set-worker-proxy-env-never-clobbers-existing-env-test
   (testing "an explicitly configured proxy env must win over the resolved system proxy"
-    (let [saved (aget js/process.env "https_proxy")]
+    (let [saved (into {}
+                      (map (fn [k]
+                             [k (aget js/process.env k)]))
+                      ["https_proxy" "HTTPS_PROXY"])
+          proxy {:protocol "http" :host "127.0.0.1" :port 7897}]
       (try
+        (doseq [k ["https_proxy" "HTTPS_PROXY"]]
+          (js-delete js/process.env k))
+        (proxy-env/set-worker-proxy-env! nil)
+
+        (aset js/process.env "HTTPS_PROXY" "http://uppercase-proxy:3128")
+        (proxy-env/set-worker-proxy-env! proxy)
+        (is (nil? (aget js/process.env "https_proxy")))
+        (is (= "http://uppercase-proxy:3128"
+               (aget js/process.env "HTTPS_PROXY")))
+
+        (js-delete js/process.env "HTTPS_PROXY")
+        (proxy-env/set-worker-proxy-env! proxy)
+        (aset js/process.env "HTTPS_PROXY" "http://later-uppercase-proxy:3128")
+        (proxy-env/set-worker-proxy-env! proxy)
+        (is (nil? (aget js/process.env "https_proxy")))
+        (is (= "http://later-uppercase-proxy:3128"
+               (aget js/process.env "HTTPS_PROXY")))
+
+        (js-delete js/process.env "HTTPS_PROXY")
         (aset js/process.env "https_proxy" "http://user-proxy:3128")
-        (proxy-env/set-worker-proxy-env!
-         {:protocol "http" :host "127.0.0.1" :port 7897})
+        (proxy-env/set-worker-proxy-env! proxy)
         (is (= "http://user-proxy:3128"
                (aget js/process.env "https_proxy")))
         (finally
-          (if (nil? saved)
-            (js-delete js/process.env "https_proxy")
-            (aset js/process.env "https_proxy" saved)))))))
+          (proxy-env/set-worker-proxy-env! nil)
+          (doseq [[k v] saved]
+            (if (nil? v)
+              (js-delete js/process.env k)
+              (aset js/process.env k v))))))))

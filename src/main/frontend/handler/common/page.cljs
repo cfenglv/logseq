@@ -189,8 +189,8 @@
 
 (defn <delete!
   "Deletes a page. If delete is successful calls ok-handler. Otherwise calls error-handler
-   if given. Note that error-handler is being called in addition to error messages that worker
-   already provides"
+   with the error or nil if given. Note that error-handler is being called in addition to error
+   messages that worker already provides"
   [page-uuid-or-name ok-handler & {:keys [error-handler]}]
   (when page-uuid-or-name
     (assert (or (uuid? page-uuid-or-name) (string? page-uuid-or-name)))
@@ -201,7 +201,7 @@
                       repo
                       [:block/uuid :block/title]
                       (page-lookup-ref page-uuid-or-name))]
-          (when-let [page-uuid (:block/uuid page)]
+          (if-let [page-uuid (:block/uuid page)]
             (let [default-home (state/get-default-home)
                   home-page? (= (:block/title page) (:page default-home))]
               (p/do!
@@ -216,9 +216,13 @@
                                  nil)]
                      (if res
                        (when ok-handler (ok-handler))
-                       (when error-handler (error-handler))))
+                       (when error-handler (error-handler nil))))
                    (p/catch (fn [error]
-                              (js/console.error error))))))))))))
+                              (js/console.error error)
+                              (when error-handler
+                                (error-handler error)))))))
+            (when error-handler
+              (error-handler nil))))))))
 
 ;; other fns
 ;; =========

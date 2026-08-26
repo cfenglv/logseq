@@ -35,11 +35,11 @@ else process.exitCode = 2;
 }
 
 test("packaging writes the exact platform target manifest and rejects a version split", () => {
-  const valid = fixture("2.0.1-selfhost.7");
+  const valid = fixture("2.0.1-selfhost.8");
   const environment = {
     ...process.env,
     SELFHOST6_SOURCE_FULL_SHA: "a".repeat(40),
-    SELFHOST6_TARGET_VERSION: "2.0.1-selfhost.7",
+    SELFHOST6_TARGET_VERSION: "2.0.1-selfhost.8",
     SELFHOST6_TARGET_PLATFORM: "linux",
     SELFHOST6_TARGET_ARCH: "arm64",
   };
@@ -49,18 +49,18 @@ test("packaging writes the exact platform target manifest and rejects a version 
     fs.readFileSync(path.join(valid.root, "updater/TARGET_BUILD_MANIFEST.json"), "utf8"),
   );
   assert.equal(manifest["target-source-full-sha"], "a".repeat(40));
-  assert.equal(manifest["target-version"], "2.0.1-selfhost.7");
+  assert.equal(manifest["target-version"], "2.0.1-selfhost.8");
   assert.equal(manifest.platform, "linux");
   assert.equal(manifest.arch, "arm64");
 
-  const invalid = fixture("2.0.1-selfhost.6");
+  const invalid = fixture("2.0.1-selfhost.7");
   const rejected = spawnSync(process.execPath, [invalid.script], { encoding: "utf8", env: environment });
   assert.notEqual(rejected.status, 0);
   assert.match(rejected.stderr, /static package version must equal/);
 });
 
 test("packaging infers immutable build identity when callers omit repeated parameters", () => {
-  const valid = fixture("2.0.1-selfhost.6");
+  const valid = fixture("2.0.1-selfhost.7");
   const bin = fakeGit(valid.root);
   const environment = {
     ...process.env,
@@ -76,9 +76,9 @@ test("packaging infers immutable build identity when callers omit repeated param
     fs.readFileSync(path.join(valid.root, "updater/TARGET_BUILD_MANIFEST.json"), "utf8"),
   );
   assert.equal(manifest["target-source-full-sha"], "b".repeat(40));
-  assert.equal(manifest["target-version"], "2.0.1-selfhost.6");
+  assert.equal(manifest["target-version"], "2.0.1-selfhost.7");
 
-  const dirty = fixture("2.0.1-selfhost.6");
+  const dirty = fixture("2.0.1-selfhost.7");
   const dirtyBin = fakeGit(dirty.root, { dirty: true });
   const dirtyResult = spawnSync(process.execPath, [dirty.script], {
     encoding: "utf8",
@@ -89,11 +89,11 @@ test("packaging infers immutable build identity when callers omit repeated param
 });
 
 test("win32 arm64 is an admitted packaging target", () => {
-  const valid = fixture("2.0.1-selfhost.6");
+  const valid = fixture("2.0.1-selfhost.7");
   const environment = {
     ...process.env,
     SELFHOST6_SOURCE_FULL_SHA: "a".repeat(40),
-    SELFHOST6_TARGET_VERSION: "2.0.1-selfhost.6",
+    SELFHOST6_TARGET_VERSION: "2.0.1-selfhost.7",
     SELFHOST6_TARGET_PLATFORM: "win32",
     SELFHOST6_TARGET_ARCH: "arm64",
   };

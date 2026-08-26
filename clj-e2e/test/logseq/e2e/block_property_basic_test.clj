@@ -9,7 +9,10 @@
    [logseq.e2e.locator :as loc]
    [logseq.e2e.page :as page]
    [logseq.e2e.util :as util]
-   [wally.main :as w]))
+   [wally.main :as w])
+  (:import
+   (com.microsoft.playwright Locator$ClickOptions)
+   (com.microsoft.playwright.options KeyboardModifier)))
 
 (use-fixtures :once fixtures/open-page)
 (use-fixtures :each fixtures/new-logseq-page fixtures/validate-graph)
@@ -90,6 +93,108 @@
         (page/goto-page target-page)
         (assert/assert-is-visible
          (loc/filter ".references" :has-text source-page))))))
+
+(defn- create-node-embed-fixture!
+  [suffix]
+  (let [target-page (str "node embed target " suffix)
+        source-page (str "node embed source " suffix)]
+    (page/new-page target-page)
+    (let [target (ls-api-call! :editor.appendBlockInPage
+                               target-page
+                               "node embed target parent")
+          target-uuid (get target "uuid")]
+      (let [child (ls-api-call! :editor.insertBlock
+                                target-uuid
+                                "node embed target child"
+                                {:sibling false})]
+        (page/new-page source-page)
+        (b/new-block "")
+        (util/input-command "Node embed")
+        (util/press-seq target-page)
+        (assert/assert-is-visible
+         (loc/filter ".ui__popover-content a.menu-link.chosen"
+                     :has-text target-page))
+        (k/enter)
+        (let [embed-row (.first
+                         (w/-query
+                          ".ls-page-blocks .ls-block.embed-block[originalblockid]"))]
+          (assert/assert-is-visible embed-row)
+          {:child-uuid (get child "uuid")
+           :embed-row embed-row
+           :target-uuid target-uuid})))))
+
+(defn- assert-node-embed-target-intact!
+  [{:keys [child-uuid target-uuid]}]
+  (let [target (ls-api-call! :editor.getBlock target-uuid)
+        child (ls-api-call! :editor.getBlock child-uuid)]
+    (is (= "node embed target parent" (get target "content")))
+    (is (= "node embed target child" (get child "content")))))
+
+(deftest node-embed-selection-delete-keeps-the-canonical-target-test
+  (testing "selection Delete removes only the rendered placeholder"
+    (let [{:keys [embed-row target-uuid] :as fixture}
+          (create-node-embed-fixture! "selection delete")]
+      (w/click (.first (.locator embed-row
+                                 (format "#block-content-%s" target-uuid)))
+               (doto (Locator$ClickOptions.)
+                 (.setModifiers [(if util/mac?
+                                   KeyboardModifier/META
+                                   KeyboardModifier/CONTROL)])))
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (b/delete-blocks)
+      (assert-node-embed-target-intact! fixture)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (b/undo)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       1)
+      (assert-node-embed-target-intact! fixture)
+      (b/redo)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (assert-node-embed-target-intact! fixture)
+      (util/refresh-until-graph-loaded)
+      (assert-node-embed-target-intact! fixture))))
+
+(deftest node-embed-keyboard-cut-keeps-the-canonical-target-test
+  (testing "keyboard Cut removes only the rendered placeholder"
+    (let [{:keys [embed-row target-uuid] :as fixture}
+          (create-node-embed-fixture! "keyboard cut")]
+      (w/click (.first (.locator embed-row
+                                 (format "#block-content-%s" target-uuid)))
+               (doto (Locator$ClickOptions.)
+                 (.setModifiers [(if util/mac?
+                                   KeyboardModifier/META
+                                   KeyboardModifier/CONTROL)])))
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (k/press "ControlOrMeta+x")
+      (assert-node-embed-target-intact! fixture)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (util/refresh-until-graph-loaded)
+      (assert-node-embed-target-intact! fixture))))
+
+(deftest node-embed-context-menu-cut-keeps-the-canonical-target-test
+  (testing "context-menu Cut removes only the rendered placeholder"
+    (let [{:keys [embed-row target-uuid] :as fixture}
+          (create-node-embed-fixture! "context menu cut")]
+      (util/double-esc)
+      (util/right-click
+       (.first (.locator embed-row
+                         (format ".bullet-container[blockid='%s']"
+                                 target-uuid))))
+      (assert/assert-is-visible ".ls-context-menu-content")
+      (w/click (loc/filter "[role='menuitem']" :has-text "Cut"))
+      (assert-node-embed-target-intact! fixture)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (util/refresh-until-graph-loaded)
+      (assert-node-embed-target-intact! fixture))))
 
 (deftest unlinked-reference-filter-and-breadcrumb-test
   (testing "unlinked-reference search updates results and breadcrumbs track renames"
