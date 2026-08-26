@@ -5,7 +5,7 @@ import { validateTargetBuildManifest } from "../../resources/updater/target-buil
 const manifest = {
   "schema-version": 1,
   "target-source-full-sha": "a".repeat(40),
-  "target-version": "2.0.1-selfhost.7",
+  "target-version": "2.0.1-selfhost.8",
   "release-line-id": "selfhost-official-architecture-v1",
   platform: "darwin",
   arch: "arm64",
@@ -22,7 +22,7 @@ const validInput = {
   archiveDigestVerified: true,
   expected: {
     targetSourceFullSha: "a".repeat(40),
-    targetVersion: "2.0.1-selfhost.7",
+    targetVersion: "2.0.1-selfhost.8",
     releaseLineId: "selfhost-official-architecture-v1",
     platform: "darwin",
     arch: "arm64",

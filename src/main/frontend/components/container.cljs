@@ -337,7 +337,11 @@
            (fn [^js e]
              (let [target (gobj/get e "target")
                    block-el (.closest target ".bullet-container[blockid]")
-                   block-id (some-> block-el (.getAttribute "blockid"))
+                   ;; Context-menu actions inside an embed must use the linking
+                   ;; placeholder rather than a rendered canonical descendant.
+                   original-block-el (some-> target (.closest ".ls-block[originalblockid]"))
+                   block-id (or (some-> original-block-el (.getAttribute "originalblockid"))
+                                (some-> block-el (.getAttribute "blockid")))
                    {:keys [block block-ref]} (state/get-state :block-ref/context)
                    {:keys [page page-entity]} (state/get-state :page-title/context)
                    show!

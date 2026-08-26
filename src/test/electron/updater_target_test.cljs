@@ -67,7 +67,7 @@
                                  :archive-size (.-size (fs/statSync archive))
                                  :target-build-manifest-sha256 (.-sha256 extracted)
                                  :target-source-full-sha (.repeat "b" 40)
-                                 :target-version "2.0.1-selfhost.7"
+                                 :target-version "2.0.1-selfhost.8"
                                  :release-line-id "selfhost-official-architecture-v1"
                                  :platform "darwin"
                                  :arch "arm64"

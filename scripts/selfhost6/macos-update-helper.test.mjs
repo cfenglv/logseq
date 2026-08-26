@@ -89,7 +89,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
     const manifestObject = {
       "schema-version": 1,
       "target-source-full-sha": sourceSha,
-      "target-version": "2.0.1-selfhost.7",
+      "target-version": "2.0.1-selfhost.8",
       "release-line-id": releaseLineId,
       platform: "darwin",
       arch: process.arch,
@@ -104,7 +104,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
     const candidateRoot = path.join(root, "candidate");
     const candidate = path.join(candidateRoot, "Logseq.app");
     fs.mkdirSync(candidateRoot);
-    makeApp(candidate, "2.0.1-selfhost.7", manifest);
+    makeApp(candidate, "2.0.1-selfhost.8", manifest);
     const archive = path.join(root, "Logseq.zip");
     run("/usr/bin/ditto", ["-c", "-k", "--keepParent", candidate, archive]);
     const archiveBytes = fs.readFileSync(archive);
@@ -116,7 +116,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
       "key-id": keyId,
       "release-line-id": releaseLineId,
       "target-source-full-sha": sourceSha,
-      "target-version": "2.0.1-selfhost.7",
+      "target-version": "2.0.1-selfhost.8",
       platform: "darwin",
       arch: process.arch,
       "bundle-identity": bundleIdentity,
@@ -133,7 +133,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
     const signed = signUpdateMetadata({ metadata: unsigned, policy, privateKeyPem });
     const target = path.join(root, "installed/Logseq.app");
     fs.mkdirSync(path.dirname(target));
-    makeApp(target, "2.0.1-selfhost.6");
+    makeApp(target, "2.0.1-selfhost.7");
 
     const attempt = path.join(root, "attempt-success");
     fs.mkdirSync(attempt);
@@ -151,9 +151,9 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
     assert.match(productionFaultAttempt.stderr, /invalid argument near --test-fail-after-swap/);
     run(helper, [...baseArgs, "--verify-only"]);
     run(helper, baseArgs);
-    assert.equal(installedVersion(target), "2.0.1-selfhost.7");
+    assert.equal(installedVersion(target), "2.0.1-selfhost.8");
 
-    makeApp(target, "2.0.1-selfhost.6");
+    makeApp(target, "2.0.1-selfhost.7");
     const parentExitFailureAttempt = path.join(root, "attempt-parent-exit-failure");
     fs.mkdirSync(parentExitFailureAttempt);
     const parentExitFailureMetadata = path.join(parentExitFailureAttempt, "metadata.json");
@@ -166,7 +166,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
       "--target", target,
       "--test-fail-after-parent-exit",
     ], { expectFailure: true });
-    assert.equal(installedVersion(target), "2.0.1-selfhost.6");
+    assert.equal(installedVersion(target), "2.0.1-selfhost.7");
 
     const failureAttempt = path.join(root, "attempt-failure");
     fs.mkdirSync(failureAttempt);
@@ -180,7 +180,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
       "--target", target,
       "--test-fail-after-swap",
     ], { expectFailure: true });
-    assert.equal(installedVersion(target), "2.0.1-selfhost.6");
+    assert.equal(installedVersion(target), "2.0.1-selfhost.7");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

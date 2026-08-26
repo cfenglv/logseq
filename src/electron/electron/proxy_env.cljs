@@ -18,12 +18,21 @@
                              (some? (:port proxy)))
                     (str (:protocol proxy) "://" (:host proxy) ":" (:port proxy)))
         prev @*worker-proxy-env]
-    (doseq [k ["https_proxy" "http_proxy" "all_proxy"]]
-      (let [current (aget js/process.env k)]
-        (when (or (nil? current) (= prev current))
+    (doseq [[lower-case upper-case] [["https_proxy" "HTTPS_PROXY"]
+                                     ["http_proxy" "HTTP_PROXY"]
+                                     ["all_proxy" "ALL_PROXY"]]]
+      (let [current (aget js/process.env lower-case)
+            upper-case-value (aget js/process.env upper-case)
+            owned? (= prev current)]
+        (cond
+          (some? upper-case-value)
+          (when owned?
+            (js-delete js/process.env lower-case))
+
+          (or (nil? current) owned?)
           (if proxy-url
-            (aset js/process.env k proxy-url)
-            (js-delete js/process.env k)))))
+            (aset js/process.env lower-case proxy-url)
+            (js-delete js/process.env lower-case)))))
     (reset! *worker-proxy-env proxy-url)
     (when (and proxy-url
                (nil? (or (aget js/process.env "NO_PROXY")

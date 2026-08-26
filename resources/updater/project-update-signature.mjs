@@ -11,7 +11,13 @@ const rawEd25519SpkiPrefix = Buffer.from("302a300506032b6570032100", "hex");
 const fullShaPattern = /^[0-9a-f]{40}$/;
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const sha512Pattern = /^[0-9a-f]{128}$/;
-const allowedVersions = new Set(["2.0.1-selfhost.6", "2.0.1-selfhost.7"]);
+// Keep the published .6 descriptor format verifiable while the live release
+// policy advances independently through .7 and its synthetic .8 target.
+const allowedVersions = new Set([
+  "2.0.1-selfhost.6",
+  "2.0.1-selfhost.7",
+  "2.0.1-selfhost.8",
+]);
 const allowedTargets = new Set([
   "darwin/arm64",
   "darwin/x64",

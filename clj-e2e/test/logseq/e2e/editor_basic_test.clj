@@ -41,6 +41,122 @@
     (w/click "#left-menu")
     (w/wait-for "#left-sidebar.is-open")))
 
+(deftest page-delete-left-click-does-not-expose-stale-page-frame-test
+  (let [page-name (str "page-delete-settlement-" (random-uuid))
+        confirm "div[role='alertdialog'] button:text('Confirm')"]
+    (open-left-sidebar!)
+    (p/new-page page-name)
+    (util/exit-edit)
+    (w/click ".toolbar-dots-btn")
+    (let [delete-menu "[role='menuitem'] div:text('Delete page')"
+          page-url (w/eval-js "location.href")]
+      (util/right-click delete-menu)
+      (assert/assert-is-hidden "div[role='alertdialog']")
+      (is (= page-url (w/eval-js "location.href")))
+      (k/esc)
+      (w/click ".toolbar-dots-btn")
+      (w/click delete-menu))
+    (let [initial-url (w/eval-js "location.href")]
+      (util/right-click confirm)
+      (assert/assert-is-visible "div[role='alertdialog']")
+      (is (= initial-url (w/eval-js "location.href")))
+      (w/eval-js
+       "(target) => {
+          const trace = {
+            target,
+            initialHref: location.href,
+            startedAt: performance.now(),
+            clickedAt: null,
+            staleFrames: [],
+            stableFrames: 0,
+            stopped: false,
+            stopReason: null,
+          };
+          window.__logseqPageDeleteSettlement = trace;
+          const confirm = Array.from(
+            document.querySelectorAll(\"div[role='alertdialog'] button\")
+          ).find((element) => element.textContent.trim() === 'Confirm');
+          confirm.addEventListener('click', () => {
+            trace.clickedAt = performance.now();
+          }, {capture: true, once: true});
+          const sample = () => {
+            const currentTitle = document.querySelector(
+              \"[data-testid='page title'] .block-title-wrap\"
+            )?.textContent?.trim() || '';
+            const recentCount = Array.from(
+              document.querySelectorAll('.recent .recent-item .page-title')
+            ).filter((element) => element.textContent.trim() === target).length;
+            const dialogVisible = Boolean(
+              document.querySelector(\"div[role='alertdialog']\")
+            );
+            if (trace.clickedAt !== null
+                && !dialogVisible
+                && location.href === trace.initialHref
+                && currentTitle === target) {
+              trace.staleFrames.push({
+                elapsedMs: performance.now() - trace.clickedAt,
+                href: location.href,
+                currentTitle,
+                recentCount,
+              });
+            }
+            const settled = trace.clickedAt !== null
+              && !dialogVisible
+              && location.href !== trace.initialHref
+              && currentTitle.length > 0
+              && currentTitle !== target
+              && recentCount === 0;
+            trace.stableFrames = settled ? trace.stableFrames + 1 : 0;
+            if (trace.stableFrames >= 2) {
+              trace.stopped = true;
+              trace.stopReason = 'settled';
+            } else if (performance.now() - trace.startedAt >= 8000) {
+              trace.stopped = true;
+              trace.stopReason = 'timeout';
+            } else {
+              requestAnimationFrame(sample);
+            }
+          };
+          requestAnimationFrame(sample);
+        }"
+       page-name)
+      (w/click confirm)
+      (let [trace (w/eval-js
+                   "() => new Promise((resolve) => {
+                      const poll = () => {
+                        const trace = window.__logseqPageDeleteSettlement;
+                        if (trace?.stopped) {
+                          resolve({
+                            staleFrames: trace.staleFrames,
+                            stopReason: trace.stopReason,
+                          });
+                        } else {
+                          setTimeout(poll, 10);
+                        }
+                      };
+                      poll();
+                    })")]
+        (is (= "settled" (get trace "stopReason")) trace)
+        (is (empty? (get trace "staleFrames"))
+            (str "deleted page became visible after confirmation: "
+                 (json/write-value-as-string trace)))
+        (util/refresh-until-graph-loaded)
+        (let [reloaded (w/eval-js
+                        "(target) => ({
+                           href: location.href,
+                           currentTitle: document.querySelector(
+                             \"[data-testid='page title'] .block-title-wrap\"
+                           )?.textContent?.trim() || '',
+                           recentCount: Array.from(
+                             document.querySelectorAll('.recent .recent-item .page-title')
+                           ).filter((element) => element.textContent.trim() === target).length,
+                         })"
+                        page-name)]
+          (is (not= initial-url (get reloaded "href")) reloaded)
+          (is (and (not= page-name (get reloaded "currentTitle"))
+                   (zero? (get reloaded "recentCount")))
+              reloaded))))))
+
 (deftest recycle-restore-removes-row-immediately-test
   (let [page-name (str "recycle-restore-" (random-uuid))]
     (p/new-page page-name)
@@ -1548,8 +1664,8 @@
     (is (= ["alpha" "middle-omega"]
            (take-last 2 (util/get-page-blocks-contents))))))
 
-(deftest node-reference-autocomplete-and-label-test
-  (testing "node reference autocomplete keeps its label and opens the updated target"
+(deftest node-reference-autocomplete-test
+  (testing "node reference search inserts a reference and rerenders target updates"
     (let [source-page (p/get-page-name)]
       (b/new-block "reference autocomplete unique target")
       (let [target-uuid (.getAttribute (util/get-edit-block-container) "blockid")]
@@ -1569,14 +1685,11 @@
         (util/press-seq "reference autocomplete updated target")
         (util/exit-edit)
         (assert/assert-is-visible
-         (loc/filter ".block-title-wrap"
-                     :has-text "reference autocomplete updated target"))
-        (assert/assert-is-visible
          (loc/filter ".page-reference"
-                     :has-text "reference autocomplete unique target"))
+                     :has-text "reference autocomplete updated target"))
         (is (= source-page (p/get-page-name)))
         (w/click (.first (loc/filter ".page-reference .page-ref"
-                                     :has-text "reference autocomplete unique target")))
+                                     :has-text "reference autocomplete updated target")))
         (is (string/includes? (.url (w/get-page)) target-uuid))
         (assert/assert-is-visible
          (loc/filter ".ls-page-blocks .block-title-wrap"

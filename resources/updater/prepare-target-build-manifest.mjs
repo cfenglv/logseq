@@ -38,7 +38,7 @@ const arch = process.env.SELFHOST6_TARGET_ARCH ?? process.arch;
 assert.match(sourceFullSha ?? "", /^[0-9a-f]{40}$/, "SELFHOST6_SOURCE_FULL_SHA must be a full lowercase Git SHA");
 assert.ok(
   [releasePolicy.sourceVersion, releasePolicy.syntheticForwardTargetVersion].includes(targetVersion),
-  "SELFHOST6_TARGET_VERSION must be the reissued .6 or synthetic .7",
+  "SELFHOST6_TARGET_VERSION must be the formal .7 or synthetic .8",
 );
 assert.equal(packageJson.version, targetVersion, "static package version must equal SELFHOST6_TARGET_VERSION");
 assert.ok(

@@ -17,8 +17,8 @@ export function readReleasePolicy(policyPath) {
   const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
   assert.equal(policy.schemaVersion, 1);
   assert.equal(policy.releaseLineId, "selfhost-official-architecture-v1");
-  assert.equal(policy.sourceVersion, "2.0.1-selfhost.6");
-  assert.equal(policy.syntheticForwardTargetVersion, "2.0.1-selfhost.7");
+  assert.equal(policy.sourceVersion, "2.0.1-selfhost.7");
+  assert.equal(policy.syntheticForwardTargetVersion, "2.0.1-selfhost.8");
   assert.equal(policy.bundleIdentity, "com.logseq.logseq");
   assert.equal(policy.forwardUpdateChannel, policy.releaseLineId);
   assert.deepEqual(policy.provider, {
@@ -39,6 +39,35 @@ export function readReleasePolicy(policyPath) {
   return policy;
 }
 
+export function releasePolicyFromHistoricalIdentity(releaseIdentity) {
+  const providerPrefix = "generic:";
+  assert.equal(releaseIdentity.status, "policy-frozen");
+  assert.equal(releaseIdentity.productVersion, "2.0.1-selfhost.6");
+  assert.ok(releaseIdentity.newIdentity.provider.startsWith(providerPrefix));
+  return Object.freeze({
+    schemaVersion: 1,
+    releaseLineId: releaseIdentity.releaseLineId,
+    sourceVersion: releaseIdentity.productVersion,
+    syntheticForwardTargetVersion: "2.0.1-selfhost.7",
+    bundleIdentity: "com.logseq.logseq",
+    forwardUpdateChannel: releaseIdentity.newIdentity.forwardUpdateChannel,
+    provider: Object.freeze({
+      kind: "generic",
+      baseUrl: releaseIdentity.newIdentity.provider.slice(providerPrefix.length),
+      remoteMutation: "promotion-only",
+    }),
+    firstInstall: releaseIdentity.newIdentity.firstInstallMode,
+    allowDowngrade: false,
+    sameVersionUpdate: releaseIdentity.newIdentity.sameVersionAutomaticTransitionFromWithdrawnBuild,
+    legacySharedLatestMutation: releaseIdentity.newIdentity.legacySharedLatestMutationAllowed,
+    legacyChannelsAccepted: [],
+    readableActivationFormats: ["selfhost-activation-v1"],
+    readableClientOpsFormats: ["official-client-ops-sqlite-v2+selfhost-upload-v1"],
+    activationWriteFormat: "selfhost-activation-v1",
+    clientOpsWriteFormat: "official-client-ops-sqlite-v2+selfhost-upload-v1",
+  });
+}
+
 export function buildTargetManifest({
   policy,
   sourceFullSha,
@@ -50,7 +79,7 @@ export function buildTargetManifest({
   assert.match(sourceFullSha, shaPattern, "source full SHA must be 40 lowercase hex characters");
   assert.ok(
     [policy.sourceVersion, policy.syntheticForwardTargetVersion].includes(targetVersion),
-    "target version must be the reissued .6 or its synthetic .7 fixture",
+    "target version must be the formal .7 or its synthetic .8 fixture",
   );
   assert.ok(supportedTargets.has(`${platform}/${arch}`), "unsupported platform/arch");
   assert.equal(typeof signingKeyIdentity, "string");

@@ -61,35 +61,95 @@
          (t :publish/publishing)
          (t :publish/action)))]]))
 
-(defn- delete-page!
+(defn- <two-animation-frames
+  []
+  (p/create
+   (fn [resolve _reject]
+     (js/requestAnimationFrame
+      (fn []
+        (js/requestAnimationFrame resolve))))))
+
+(defn- <delete-page!
   [page]
-  (page-handler/<delete! (:block/uuid page)
-                         (fn []
-                           (notification/show!
-	                            (if (today-journal-page? page)
-                              (t :page.delete/today-journal-truncate-success)
-                              (t :page.delete/success (:block/title page)))
-                            :success))
-                         {:error-handler (fn [{:keys [msg]}]
-                                           (when msg
-                                             (notification/show! msg :warning)))}))
+  (p/create
+   (fn [resolve reject]
+     (let [result
+           (page-handler/<delete!
+            (:block/uuid page)
+            (fn []
+              (notification/show!
+	              (if (today-journal-page? page)
+                  (t :page.delete/today-journal-truncate-success)
+                  (t :page.delete/success (:block/title page)))
+                :success)
+              (resolve true))
+            {:error-handler
+             (fn [& [error]]
+               (notification/show!
+                (or (when (map? error) (:msg error))
+                    (t :page.delete/warning (pr-str (:block/title page))))
+                :warning)
+               (reject (or error (ex-info "Page deletion failed" {}))))})]
+       (when (nil? result)
+         (notification/show!
+          (t :page.delete/warning (pr-str (:block/title page)))
+          :warning)
+         (reject (ex-info "Page deletion unavailable" {})))))))
+
+(hsx/defc ^:private delete-page-dialog
+  [page close! *deleting?]
+  (let [[deleting? set-deleting!] (hooks/use-state false)
+        submit! (fn []
+                  (when-not @*deleting?
+                    (reset! *deleting? true)
+                    (set-deleting! true)
+                    (-> (<delete-page! page)
+                        (p/then (fn [] (<two-animation-frames)))
+                        (p/then (fn [] (close!)))
+                        (p/catch (fn [_error]
+                                   (reset! *deleting? false)
+                                   (set-deleting! false))))))]
+    [:form.flex.flex-col.gap-4
+     {:aria-busy deleting?
+      :on-submit (fn [event]
+                   (.preventDefault event)
+                   (submit!))}
+     [:p.opacity-60 (str "- " (:block/title page))]
+     [:div.flex.justify-end.gap-2
+      (shui/button
+       {:variant "outline"
+        :type "button"
+        :disabled deleting?
+        :on-click #(when-not @*deleting? (close!))}
+       (t :ui/cancel))
+      (shui/button
+       {:type "submit"
+        :auto-focus true
+        :disabled deleting?}
+       (t :ui/confirm))]]))
 
 (defn delete-page-confirm!
   [page]
   (when page
-    (-> (shui/dialog-confirm!
-         {:title [:span.flex.gap-2.items-center
-                  [:span.relative
-                   (shui/tabler-icon "alert-triangle")]
-	                  (if (or (entity/class? page) (entity/property? page) (today-journal-page? page))
-                    (t :page.delete/permanent-confirm-title)
-                    (t :page.delete/confirm-title))]
-          :content [:p.opacity-60 (str "- " (:block/title page))]
-          :outside-cancel? true
-          :cancel-label (t :ui/cancel)
-          :ok-label (t :ui/confirm)})
-        (p/then #(delete-page! page))
-        (p/catch #()))))
+    (let [*deleting? (atom false)
+          prevent-close-while-deleting!
+          (fn [event]
+            (when @*deleting?
+              (.preventDefault event)))]
+      (shui/dialog-open!
+       (fn [{:keys [close]}]
+         (delete-page-dialog page close *deleting?))
+       {:title [:span.flex.gap-2.items-center
+                [:span.relative
+                 (shui/tabler-icon "alert-triangle")]
+	                (if (or (entity/class? page) (entity/property? page) (today-journal-page? page))
+                  (t :page.delete/permanent-confirm-title)
+                  (t :page.delete/confirm-title))]
+        :close-btn? false
+        :content-props {:role "alertdialog"
+                        :data-mode :confirm
+                        :onEscapeKeyDown prevent-close-while-deleting!
+                        :onPointerDownOutside prevent-close-while-deleting!}}))))
 
 (defn- latest-page
   [page]

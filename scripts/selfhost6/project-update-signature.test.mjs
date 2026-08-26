@@ -37,7 +37,7 @@ const metadata = {
   "key-id": policy.keyId,
   "release-line-id": releaseLineId,
   "target-source-full-sha": source,
-  "target-version": "2.0.1-selfhost.7",
+  "target-version": "2.0.1-selfhost.8",
   platform: "darwin",
   arch: "arm64",
   "bundle-identity": bundleIdentity,
