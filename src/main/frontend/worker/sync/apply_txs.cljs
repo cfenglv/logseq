@@ -1090,12 +1090,16 @@
             ops' (if (seq ops)
                    ops
                    [[:transact [tx-data nil]]])
+            history-outliner-op (if (and (seq ops)
+                                         (every? #(= :delete-blocks (first %)) ops))
+                                  :delete-blocks
+                                  (:outliner-op action))
             history-tx-id (let [provided-history-tx-id (:db-sync/tx-id tx-meta)]
                             (if (and (uuid? provided-history-tx-id)
                                      (not= provided-history-tx-id tx-id))
                               provided-history-tx-id
                               (random-uuid)))
-            tx-meta' (cond-> {:outliner-op (:outliner-op action)
+            tx-meta' (cond-> {:outliner-op history-outliner-op
                               :local-tx? true
                               :gen-undo-ops? false
                               :persist-op? true
