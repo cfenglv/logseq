@@ -223,7 +223,7 @@ test("candidate workflow builds only the frozen desktop matrix and never publish
   assert.doesNotMatch(legacyWorkflow, /Use Build-Selfhost6-Candidate/);
 });
 
-test("the mature desktop action builds and promotes one exact .7 release set", () => {
+test("the mature desktop action builds one exact .7 draft release set", () => {
   const selfhostReleaseJobs = legacyWorkflow.match(
     /  compile-cljs:[\s\S]*?\n  nightly-release:/,
   )[0];
@@ -273,19 +273,21 @@ test("the mature desktop action builds and promotes one exact .7 release set", (
   assert.match(selfhostReleaseJobs, /environment: selfhost-production/);
   assert.match(
     selfhostReleaseJobs,
-    /concurrency:\n\s+group: selfhost-release-selfhost-official-architecture-v1\n\s+cancel-in-progress: false/,
+    /concurrency:\n\s+group: selfhost-release-2\.0\.1-selfhost\.7-draft\n\s+cancel-in-progress: false/,
   );
-  assert.match(selfhostReleaseJobs, /Stage four source-version channel pointers/);
-  assert.match(selfhostReleaseJobs, /promote-update-feed\.mjs[\s\S]*--expected-target-version "\$\{SELFHOST6_TARGET_VERSION\}"/);
-  assert.match(selfhostReleaseJobs, /Promote immutable assets before compare-and-write pointers/);
-  assert.match(selfhostReleaseJobs, /promote-existing-release\.mjs[\s\S]*--expected-source-full-sha "\$\{\{ needs\.selfhost-release-verifier\.outputs\.product-source-sha \}\}"/);
-  for (const name of [
-    "SELFHOST_EXISTING_RELEASE_ID",
-    "SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA",
-    "SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA",
-    "SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA",
-  ]) assert.match(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
-  assert.doesNotMatch(selfhostReleaseJobs, /softprops\/action-gh-release|target_commitish:|make_latest:/);
+  assert.match(selfhostReleaseJobs, /github\.event\.inputs\.is-draft == 'true'/);
+  assert.match(selfhostReleaseJobs, /Create the reviewed release as a draft/);
+  assert.match(selfhostReleaseJobs, /softprops\/action-gh-release@v2/);
+  assert.match(selfhostReleaseJobs, /files: release-assets\/Logseq-\*/);
+  assert.match(selfhostReleaseJobs, /tag_name: \$\{\{ env\.SELFHOST6_TARGET_VERSION \}\}/);
+  assert.match(selfhostReleaseJobs, /target_commitish: \$\{\{ needs\.selfhost-release-verifier\.outputs\.product-source-sha \}\}/);
+  assert.match(selfhostReleaseJobs, /draft: true/);
+  assert.match(selfhostReleaseJobs, /prerelease: false/);
+  assert.match(selfhostReleaseJobs, /make_latest: false/);
+  assert.match(selfhostReleaseJobs, /fail_on_unmatched_files: true/);
+  assert.doesNotMatch(selfhostReleaseJobs, /Stage four source-version channel pointers|promote-update-feed\.mjs/);
+  assert.doesNotMatch(selfhostReleaseJobs, /Promote immutable assets|promote-existing-release\.mjs/);
+  assert.doesNotMatch(selfhostReleaseJobs, /SELFHOST_EXISTING_RELEASE_/);
   assert.doesNotMatch(legacyWorkflow, /selfhost-release-terminal-audit:/);
   assert.doesNotMatch(legacyWorkflow, /gh release (create|edit|upload)/);
   assert.doesNotMatch(selfhostReleaseJobs, /Build-Selfhost6-Candidate|32051789643|verify-release-promotion\.mjs/);
