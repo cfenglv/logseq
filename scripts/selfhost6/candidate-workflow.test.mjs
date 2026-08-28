@@ -259,6 +259,10 @@ test("the mature desktop action builds and promotes one exact .7 release set", (
     2,
   );
   assert.doesNotMatch(rtcWorkflow, /github\.event_name == 'workflow_call'/);
+  assert.match(
+    rtcWorkflow,
+    /Collect screenshots\n\s+if: \$\{\{ failure\(\) && inputs\.source-ref == '' \}\}/,
+  );
   assert.match(legacyWorkflow, /upstream-compile-cljs:\n\s+name: compile-cljs \(upstream desktop\)/);
   assert.match(selfhostReleaseJobs, /compile-cljs:[\s\S]*Compile the release desktop owners/);
   assert.match(selfhostReleaseJobs, /selfhost-build-platform:/);

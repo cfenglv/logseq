@@ -15,6 +15,28 @@
 
 (def ^:dynamic *preserve-graph* nil)
 
+(def ^:private redacted-sync-server "[REDACTED_SYNC_SERVER]")
+
+(defn sanitize-console-message
+  ([message]
+   (sanitize-console-message message (System/getenv "LOGSEQ_E2E_SYNC_SERVER_URL")))
+  ([message sync-server-url]
+   (let [message (str (or message ""))]
+     (if (string/blank? sync-server-url)
+       message
+       (let [uri (try
+                   (java.net.URI. sync-server-url)
+                   (catch Throwable _e nil))
+             sensitive-values (->> [sync-server-url
+                                    (some-> uri .getRawAuthority)
+                                    (some-> uri .getHost)]
+                                   (remove string/blank?)
+                                   distinct
+                                   (sort-by count >))]
+         (reduce #(string/replace %1 %2 redacted-sync-server)
+                 message
+                 sensitive-values))))))
+
 (defn screenshot
   [page test-name]
   (println :screenshot test-name)
