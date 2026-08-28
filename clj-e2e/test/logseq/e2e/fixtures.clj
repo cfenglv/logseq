@@ -30,7 +30,8 @@
       (let [p (w/get-page)]
         (.onConsoleMessage p (fn [msg]
                                (when custom-report/*pw-page->console-logs*
-                                 (swap! custom-report/*pw-page->console-logs* update p conj (.text msg))))))
+                                 (swap! custom-report/*pw-page->console-logs* update p conj
+                                        (custom-report/sanitize-console-message (.text msg)))))))
       (f))))
 
 (defn open-2-pages
@@ -59,7 +60,8 @@
              p
              (fn [msg]
                (when custom-report/*pw-page->console-logs*
-                 (swap! custom-report/*pw-page->console-logs* update p conj (.text msg)))))))
+                 (swap! custom-report/*pw-page->console-logs* update p conj
+                        (custom-report/sanitize-console-message (.text msg))))))))
        [p1 p2])
       (f))
 

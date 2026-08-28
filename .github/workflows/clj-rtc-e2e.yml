@@ -182,7 +182,7 @@ jobs:
           LOGSEQ_E2E_SYNC_SERVER_URL: ${{ secrets.SELFHOST_SYNC_SERVER_URL }}
 
       - name: Collect screenshots
-        if: ${{ failure() }}
+        if: ${{ failure() && inputs.source-ref == '' }}
         uses: actions/upload-artifact@v4
         with:
           name: e2e-screenshots-${{ matrix.test-task }}
