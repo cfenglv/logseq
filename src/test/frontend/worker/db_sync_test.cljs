@@ -5052,8 +5052,12 @@
                    (get-in pending [:forward-outliner-ops 0 1 0 0 :block/uuid])))
             (is (= inserted-uuid
                    (get-in pending [:inverse-outliner-ops 0 1 0 0])))
-            (is (= true
-                   (:applied? (#'sync-apply/apply-history-action! test-repo tx-id true {}))))
+            (let [{:keys [applied? history-tx-id]}
+                  (#'sync-apply/apply-history-action! test-repo tx-id true {})]
+              (is (= true applied?))
+              (is (= :delete-blocks
+                     (:outliner-op (#'sync-apply/pending-tx-by-id test-repo
+                                                                   history-tx-id)))))
             (is (nil? (d/entity @conn [:block/uuid inserted-uuid])))
             (is (= true
                    (:applied? (#'sync-apply/apply-history-action! test-repo tx-id false {}))))
