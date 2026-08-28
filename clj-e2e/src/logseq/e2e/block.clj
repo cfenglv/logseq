@@ -57,19 +57,21 @@
     (util/move-cursor-to-end)
     (k/enter)
     (let [new-editor (focus-new-block! last-id)]
-      (.focus new-editor))
-    (when (seq title)
-      (util/press-seq title))
-    (assert/assert-editor-mode)
-    (loop [i 20]
-      (if (= title (util/get-edit-content))
-        true
-        (if (zero? i)
-          (is (= title (util/get-edit-content))
-              "new block editor should settle on the expected content")
-          (do
-            (util/wait-timeout 50)
-            (recur (dec i))))))))
+      (.focus new-editor)
+      (when (seq title)
+        (w/fill new-editor title))
+      (assert/assert-editor-mode)
+      (loop [i 20]
+        (let [content (util/get-text new-editor)]
+          (if (= title content)
+            true
+            (if (zero? i)
+              (throw (ex-info "new block editor did not settle on the expected content"
+                              {:expected title
+                               :actual content}))
+              (do
+                (util/wait-timeout 50)
+                (recur (dec i))))))))))
 
 ;; TODO: support tree
 (defn new-blocks
