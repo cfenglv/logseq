@@ -79,6 +79,33 @@
       (is (= [original]
              (block-handler/get-top-level-blocks [block]))))))
 
+(deftest selected-node-embed-resolves-the-placeholder-from-rendered-identity-test
+  (let [target-uuid #uuid "11111111-1111-1111-1111-111111111111"
+        placeholder-uuid #uuid "22222222-2222-2222-2222-222222222222"
+        target {:db/id 1
+                :block/uuid target-uuid
+                :block/title "canonical target"}
+        embed-wrapper #js {:getAttribute
+                           (fn [attribute]
+                             (when (= attribute "originalblockid")
+                               (str placeholder-uuid)))}
+        selected-node #js {:getAttribute
+                           (fn [attribute]
+                             (when (= attribute "blockid")
+                               (str target-uuid)))
+                           :closest
+                           (fn [selector]
+                             (when (= selector ".ls-block[originalblockid]")
+                               embed-wrapper))}]
+    (with-redefs [outliner-core/blocks-with-level
+                  (fn [_] [(assoc target :block/level 1)])
+                  state/get-edit-block (constantly nil)
+                  state/get-input (constantly nil)
+                  state/get-selection-blocks (constantly [selected-node])]
+      (is (= [{:block/uuid placeholder-uuid}]
+             (vec (block-handler/get-top-level-blocks [target])))
+          "A selected linked-render row must resolve to its placeholder, not its canonical target."))))
+
 (deftest edit-block-loads-target-through-worker-test
   (async done
     (let [block-id #uuid "11111111-1111-1111-1111-111111111111"

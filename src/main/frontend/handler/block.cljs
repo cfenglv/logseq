@@ -133,6 +133,13 @@
                         uuid)]
     {:block/uuid id}))
 
+(defn- selected-node-original-block
+  "Resolve the linking placeholder for a selected row inside an embed."
+  [node]
+  (some-> node
+          (.closest ".ls-block[originalblockid]")
+          node-original-block))
+
 (defn- get-original-block-by-dom
   [node]
   (some-> node
@@ -155,7 +162,7 @@
          (remove nil?)
          (keep #(when-let [id (dom/attr % "blockid")]
                   (when (= (uuid id) (:block/uuid linked-block))
-                    (node-original-block %))))
+                    (selected-node-original-block %))))
          ;; FIXME: what if there're multiple same blocks in the selection
          first)))
 
