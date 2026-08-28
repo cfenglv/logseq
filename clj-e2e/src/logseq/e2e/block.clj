@@ -56,13 +56,14 @@
     (is (some? last-id))
     (util/move-cursor-to-end)
     (k/enter)
-    (let [new-editor (focus-new-block! last-id)]
-      (.focus new-editor)
+    (let [new-editor (focus-new-block! last-id)
+          new-input (.first (.locator new-editor "textarea"))]
+      (.focus new-input)
       (when (seq title)
-        (w/fill new-editor title))
+        (.pressSequentially new-input title))
       (assert/assert-editor-mode)
       (loop [i 20]
-        (let [content (util/get-text new-editor)]
+        (let [content (.inputValue new-input)]
           (if (= title content)
             true
             (if (zero? i)
