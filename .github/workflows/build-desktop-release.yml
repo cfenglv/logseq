@@ -1192,6 +1192,7 @@ jobs:
         run: |
           if ! gh api --method PATCH \
             "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            -f tag_name="${SELFHOST6_TARGET_VERSION}" \
             -f target_commitish="${EXPECTED_SOURCE_FULL_SHA}" \
             -f name="Logseq ${SELFHOST6_TARGET_VERSION}" \
             -f body="Source commit ${EXPECTED_SOURCE_FULL_SHA}." \
