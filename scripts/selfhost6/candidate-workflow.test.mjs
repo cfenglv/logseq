@@ -312,6 +312,11 @@ test("the mature desktop action stages one exact .7 draft before promotion", () 
   );
   assert.match(
     selfhostReleaseJobs,
+    /--descriptors release-assets\/\*\.zip\.selfhost6\.json \\\n\s+release-assets\/\*\.exe\.selfhost6\.json \\\n\s+release-assets\/\*\.AppImage\.selfhost6\.json/,
+  );
+  assert.doesNotMatch(selfhostReleaseJobs, /--descriptors release-assets\/\*\.selfhost6\.json/);
+  assert.match(
+    selfhostReleaseJobs,
     /promote-existing-release\.mjs[\s\S]*--expected-source-full-sha "\$\{\{ needs\.selfhost-release-verifier\.outputs\.product-source-sha \}\}"/,
   );
   for (const name of [
