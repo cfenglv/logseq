@@ -1237,7 +1237,9 @@ jobs:
             --artifact-directory release-assets \
             --output-directory release-channel \
             --expected-target-version "${SELFHOST6_TARGET_VERSION}" \
-            --descriptors release-assets/*.selfhost6.json
+            --descriptors release-assets/*.zip.selfhost6.json \
+              release-assets/*.exe.selfhost6.json \
+              release-assets/*.AppImage.selfhost6.json
 
       - name: Promote immutable assets after the draft is staged
         env:
