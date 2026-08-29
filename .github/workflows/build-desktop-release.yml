@@ -1100,7 +1100,7 @@ jobs:
     timeout-minutes: 30
     environment: selfhost-production
     concurrency:
-      group: selfhost-release-2.0.1-selfhost.7-draft
+      group: selfhost-release-selfhost-official-architecture-v1
       cancel-in-progress: false
     permissions:
       actions: read
@@ -1132,6 +1132,44 @@ jobs:
             --target-version "${SELFHOST6_TARGET_VERSION}" \
             --output release-final-verification/receipt.json
 
+      - name: Verify the frozen Draft before replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+          SELFHOST_DRAFT_TARGET_FULL_SHA: ${{ secrets.SELFHOST_DRAFT_TARGET_FULL_SHA }}
+          SELFHOST_DRAFT_ASSET_INVENTORY_SHA256: ${{ secrets.SELFHOST_DRAFT_ASSET_INVENTORY_SHA256 }}
+          SELFHOST_DRAFT_ASSET_INVENTORY_JSON: ${{ secrets.SELFHOST_DRAFT_ASSET_INVENTORY_JSON }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-draft-tag-refs-before.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-releases-before.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Release inventory could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            > "${RUNNER_TEMP}/selfhost-draft-before.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Frozen Draft could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-draft-assets-before.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Frozen Draft assets could not be read"
+            exit 1
+          fi
+          node release-source/scripts/selfhost6/verify-draft-release.mjs \
+            --phase before \
+            --release-json "${RUNNER_TEMP}/selfhost-draft-before.json" \
+            --assets-json "${RUNNER_TEMP}/selfhost-draft-assets-before.json" \
+            --tag-refs-json "${RUNNER_TEMP}/selfhost-draft-tag-refs-before.json" \
+            --release-list-json "${RUNNER_TEMP}/selfhost-releases-before.json" \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${SELFHOST_DRAFT_TARGET_FULL_SHA}" \
+            --replacement-source-full-sha "${{ needs.selfhost-release-verifier.outputs.product-source-sha }}" \
+            --artifact-directory release-assets \
+            --target-version "${SELFHOST6_TARGET_VERSION}" \
+            --expected-inventory-sha256 "${SELFHOST_DRAFT_ASSET_INVENTORY_SHA256}"
+
       - name: Create the reviewed release as a draft
         uses: softprops/action-gh-release@v2
         with:
@@ -1139,11 +1177,82 @@ jobs:
           tag_name: ${{ env.SELFHOST6_TARGET_VERSION }}
           target_commitish: ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}
           name: Logseq ${{ env.SELFHOST6_TARGET_VERSION }}
-          body: Source commit `${{ needs.selfhost-release-verifier.outputs.product-source-sha }}`.
+          body: Source commit ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}.
           draft: true
           prerelease: false
           make_latest: false
           fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Bind and verify the exact reviewed Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+          EXPECTED_SOURCE_FULL_SHA: ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}
+        run: |
+          if ! gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            -f target_commitish="${EXPECTED_SOURCE_FULL_SHA}" \
+            -f name="Logseq ${SELFHOST6_TARGET_VERSION}" \
+            -f body="Source commit ${EXPECTED_SOURCE_FULL_SHA}." \
+            -F draft=true \
+            -F prerelease=false \
+            -f make_latest=false >/dev/null 2>&1; then
+            echo "::error title=DraftBindFailed::Frozen Draft could not be bound"
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-draft-tag-refs-after.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-releases-after.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Release inventory could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            > "${RUNNER_TEMP}/selfhost-draft-after.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Bound Draft could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-draft-assets-after.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Bound Draft assets could not be read"
+            exit 1
+          fi
+          node release-source/scripts/selfhost6/verify-draft-release.mjs \
+            --phase after \
+            --release-json "${RUNNER_TEMP}/selfhost-draft-after.json" \
+            --assets-json "${RUNNER_TEMP}/selfhost-draft-assets-after.json" \
+            --tag-refs-json "${RUNNER_TEMP}/selfhost-draft-tag-refs-after.json" \
+            --release-list-json "${RUNNER_TEMP}/selfhost-releases-after.json" \
+            --artifact-directory release-assets \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${EXPECTED_SOURCE_FULL_SHA}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}"
+
+      - name: Stage four source-version channel pointers
+        run: |
+          mkdir -p release-channel
+          node release-source/scripts/selfhost6/promote-update-feed.mjs \
+            --artifact-directory release-assets \
+            --output-directory release-channel \
+            --expected-target-version "${SELFHOST6_TARGET_VERSION}" \
+            --descriptors release-assets/*.selfhost6.json
+
+      - name: Promote immutable assets after the draft is staged
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SELFHOST_EXISTING_RELEASE_ID: ${{ secrets.SELFHOST_EXISTING_RELEASE_ID }}
+          SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA }}
+          SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA }}
+          SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA }}
+        run: |
+          node release-source/scripts/selfhost6/promote-existing-release.mjs \
+            --artifact-directory release-assets \
+            --pointer-directory release-channel \
+            --release-line-id "${{ needs.selfhost-release-verifier.outputs.release-line-id }}" \
+            --expected-source-full-sha "${{ needs.selfhost-release-verifier.outputs.product-source-sha }}" \
+            --expected-version "${SELFHOST6_TARGET_VERSION}" \
+            --receipt "${RUNNER_TEMP}/selfhost-release-promotion.json"
 
   nightly-release:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' }}

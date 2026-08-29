@@ -131,6 +131,7 @@ function validateInputs({
   expectedReleaseIdentity,
   immutableFiles,
   pointerFiles,
+  initialPointerBaseline,
 }) {
   assert.equal(typeof releaseLineId, "string");
   assert.ok(releaseLineId.length > 0, "release line id is required");
@@ -171,6 +172,8 @@ function validateInputs({
   assert.ok(pointerFiles instanceof Map, "pointer files must be a Map");
   assert.deepEqual(new Set(pointerFiles.keys()), expectedPointerNames,
     "promotion must update exactly the four release-line pointers");
+  assert.ok(["absent", "compatible-prior"].includes(initialPointerBaseline),
+    "initial pointer baseline is invalid");
   for (const [name, bytes] of pointerFiles) {
     const identity = pointerMetadata(bytes, name);
     assert.equal(identity.version, expectedVersion, `${name} target version differs`);
@@ -234,10 +237,12 @@ async function assertPointerOwnership(api, release, snapshots, promoted) {
   }
 }
 
-function validateExistingPointers(snapshots, targets, expectedVersion) {
+function validateExistingPointers(snapshots, targets, expectedVersion, initialPointerBaseline) {
   const expectedOrdinal = versionOrdinal(expectedVersion);
   for (const [name, snapshot] of snapshots) {
     if (!snapshot.present || sameRecord(snapshot, targets.get(name))) continue;
+    assert.equal(initialPointerBaseline, "compatible-prior",
+      `channel pointer ${name} violates the frozen absent baseline`);
     const identity = pointerMetadata(snapshot.bytes, name);
     assert.ok(versionOrdinal(identity.version) < expectedOrdinal,
       `channel pointer ${name} already targets a conflicting release`);
@@ -263,6 +268,7 @@ export async function promoteExistingRelease({
   immutableFiles,
   pointerFiles,
   api,
+  initialPointerBaseline = "compatible-prior",
 }) {
   validateInputs({
     releaseLineId,
@@ -271,6 +277,7 @@ export async function promoteExistingRelease({
     expectedReleaseIdentity,
     immutableFiles,
     pointerFiles,
+    initialPointerBaseline,
   });
   assert.ok(api, "release API is required");
 
@@ -309,7 +316,7 @@ export async function promoteExistingRelease({
     for (const name of pointerFiles.keys()) {
       snapshots.set(name, await remoteRecord(api, release, name));
     }
-    validateExistingPointers(snapshots, targets, expectedVersion);
+    validateExistingPointers(snapshots, targets, expectedVersion, initialPointerBaseline);
 
     for (const name of pointerFiles.keys()) {
       const snapshot = snapshots.get(name);

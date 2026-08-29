@@ -8,7 +8,10 @@ import {
   PromotionError,
   promoteExistingRelease,
 } from "../lib/selfhost6-existing-release-promotion.mjs";
-import { GitHubReleaseApi } from "./promote-existing-release.mjs";
+import {
+  GitHubReleaseApi,
+  parseExpectedReleaseId,
+} from "./promote-existing-release.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const workflow = fs.readFileSync(
@@ -223,7 +226,7 @@ test("candidate workflow builds only the frozen desktop matrix and never publish
   assert.doesNotMatch(legacyWorkflow, /Use Build-Selfhost6-Candidate/);
 });
 
-test("the mature desktop action builds one exact .7 draft release set", () => {
+test("the mature desktop action stages one exact .7 draft before promotion", () => {
   const selfhostReleaseJobs = legacyWorkflow.match(
     /  compile-cljs:[\s\S]*?\n  nightly-release:/,
   )[0];
@@ -273,9 +276,14 @@ test("the mature desktop action builds one exact .7 draft release set", () => {
   assert.match(selfhostReleaseJobs, /environment: selfhost-production/);
   assert.match(
     selfhostReleaseJobs,
-    /concurrency:\n\s+group: selfhost-release-2\.0\.1-selfhost\.7-draft\n\s+cancel-in-progress: false/,
+    /concurrency:\n\s+group: selfhost-release-selfhost-official-architecture-v1\n\s+cancel-in-progress: false/,
   );
   assert.match(selfhostReleaseJobs, /github\.event\.inputs\.is-draft == 'true'/);
+  assert.match(selfhostReleaseJobs, /Verify the frozen Draft before replacement/);
+  assert.equal((selfhostReleaseJobs.match(/git\/matching-refs\/tags\/\$\{SELFHOST6_TARGET_VERSION\}/g) ?? []).length, 2);
+  assert.equal((selfhostReleaseJobs.match(/releases\?per_page=100/g) ?? []).length, 2);
+  assert.equal((selfhostReleaseJobs.match(/--release-list-json/g) ?? []).length, 2);
+  assert.match(selfhostReleaseJobs, /verify-draft-release\.mjs[\s\S]*--phase before/);
   assert.match(selfhostReleaseJobs, /Create the reviewed release as a draft/);
   assert.match(selfhostReleaseJobs, /softprops\/action-gh-release@v2/);
   assert.match(selfhostReleaseJobs, /files: release-assets\/Logseq-\*/);
@@ -285,9 +293,32 @@ test("the mature desktop action builds one exact .7 draft release set", () => {
   assert.match(selfhostReleaseJobs, /prerelease: false/);
   assert.match(selfhostReleaseJobs, /make_latest: false/);
   assert.match(selfhostReleaseJobs, /fail_on_unmatched_files: true/);
-  assert.doesNotMatch(selfhostReleaseJobs, /Stage four source-version channel pointers|promote-update-feed\.mjs/);
-  assert.doesNotMatch(selfhostReleaseJobs, /Promote immutable assets|promote-existing-release\.mjs/);
-  assert.doesNotMatch(selfhostReleaseJobs, /SELFHOST_EXISTING_RELEASE_/);
+  assert.match(selfhostReleaseJobs, /overwrite_files: true/);
+  assert.match(selfhostReleaseJobs, /Bind and verify the exact reviewed Draft/);
+  assert.doesNotMatch(selfhostReleaseJobs, /steps\.draft\.outputs\.id|ACTION_DRAFT_RELEASE_ID/);
+  assert.match(selfhostReleaseJobs, /verify-draft-release\.mjs[\s\S]*--phase after/);
+  assert.match(selfhostReleaseJobs, /-f name="Logseq \$\{SELFHOST6_TARGET_VERSION\}"/);
+  assert.match(selfhostReleaseJobs, /-f body="Source commit \$\{EXPECTED_SOURCE_FULL_SHA\}\."/);
+  for (const name of [
+    "SELFHOST_DRAFT_RELEASE_ID",
+    "SELFHOST_DRAFT_TARGET_FULL_SHA",
+    "SELFHOST_DRAFT_ASSET_INVENTORY_SHA256",
+    "SELFHOST_DRAFT_ASSET_INVENTORY_JSON",
+  ]) assert.match(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
+  assert.match(
+    selfhostReleaseJobs,
+    /Verify the frozen Draft before replacement[\s\S]*Create the reviewed release as a draft[\s\S]*Bind and verify the exact reviewed Draft[\s\S]*Stage four source-version channel pointers[\s\S]*promote-update-feed\.mjs[\s\S]*Promote immutable assets after the draft is staged[\s\S]*promote-existing-release\.mjs/,
+  );
+  assert.match(
+    selfhostReleaseJobs,
+    /promote-existing-release\.mjs[\s\S]*--expected-source-full-sha "\$\{\{ needs\.selfhost-release-verifier\.outputs\.product-source-sha \}\}"/,
+  );
+  for (const name of [
+    "SELFHOST_EXISTING_RELEASE_ID",
+    "SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA",
+    "SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA",
+    "SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA",
+  ]) assert.match(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
   assert.doesNotMatch(legacyWorkflow, /selfhost-release-terminal-audit:/);
   assert.doesNotMatch(legacyWorkflow, /gh release (create|edit|upload)/);
   assert.doesNotMatch(selfhostReleaseJobs, /Build-Selfhost6-Candidate|32051789643|verify-release-promotion\.mjs/);
@@ -307,10 +338,17 @@ test("existing release promotion keeps one bounded transaction owner", () => {
   assert.match(existingReleasePromotion, /for \(const name of pointerFiles\.keys\(\)\)/);
   assert.match(existingReleasePromotion, /assertPointerOwnership/);
   assert.match(existingReleasePromotion, /restorePointer/);
+  assert.match(existingReleasePromotionCli, /initialPointerBaseline: "absent"/);
   assert.match(existingReleasePromotion, /promotion-incomplete\/recovery-required/);
   assert.doesNotMatch(existingReleasePromotion, /setTimeout|setInterval|retry/);
   assert.match(existingReleasePromotionCli, /GITHUB_TOKEN \?\? process\.env\.GH_TOKEN/);
   assert.doesNotMatch(existingReleasePromotionCli, /console\.log\(.*token|upload-artifact/);
+});
+
+test("existing release promotion rejects a missing release id before API access", () => {
+  assert.throws(() => parseExpectedReleaseId(""), /positive decimal integer/);
+  assert.throws(() => parseExpectedReleaseId(undefined), /positive decimal integer/);
+  assert.equal(parseExpectedReleaseId("424243"), 424243);
 });
 
 test("existing-release promotion resumes a partial run and is idempotent", async () => {
@@ -352,6 +390,41 @@ test("second and third pointer write failures restore all four snapshots", async
       assert.deepEqual(api.assets.get(name)?.bytes, bytes, name);
     }
   }
+});
+
+test("first .7 promotion restores newly created pointers to absence", async () => {
+  for (const failedName of pointerNames) {
+    const input = promotionFixture();
+    const api = new FakeReleaseApi();
+    let failed = false;
+    api.hook = ({ phase, name }) => {
+      if (!failed && phase === "before-upload" && name === failedName) {
+        failed = true;
+        throw new Error("injected first-promotion pointer failure");
+      }
+    };
+    const receipt = await rejectedReceipt(() => promoteExistingRelease({
+      ...input,
+      initialPointerBaseline: "absent",
+      api,
+    }));
+    assert.equal(receipt.status, "promotion-failed-recovered", failedName);
+    for (const name of pointerNames) assert.equal(api.assets.has(name), false, name);
+    assertRemoteBytes(api, input.immutableFiles);
+  }
+});
+
+test("first .7 promotion rejects an unexpected prior channel baseline", async () => {
+  const input = promotionFixture();
+  const seed = oldPointerSeed();
+  const api = new FakeReleaseApi(seed);
+  const receipt = await rejectedReceipt(() => promoteExistingRelease({
+    ...input,
+    initialPointerBaseline: "absent",
+    api,
+  }));
+  assert.equal(receipt.status, "promotion-failed-no-pointer-mutation");
+  assertRemoteBytes(api, seed);
 });
 
 test("failed compensation records exact recovery targets without overwriting them", async () => {
