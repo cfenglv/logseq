@@ -297,6 +297,7 @@ test("the mature desktop action stages one exact .7 draft before promotion", () 
   assert.match(selfhostReleaseJobs, /Bind and verify the exact reviewed Draft/);
   assert.doesNotMatch(selfhostReleaseJobs, /steps\.draft\.outputs\.id|ACTION_DRAFT_RELEASE_ID/);
   assert.match(selfhostReleaseJobs, /verify-draft-release\.mjs[\s\S]*--phase after/);
+  assert.match(selfhostReleaseJobs, /-f tag_name="\$\{SELFHOST6_TARGET_VERSION\}"/);
   assert.match(selfhostReleaseJobs, /-f name="Logseq \$\{SELFHOST6_TARGET_VERSION\}"/);
   assert.match(selfhostReleaseJobs, /-f body="Source commit \$\{EXPECTED_SOURCE_FULL_SHA\}\."/);
   for (const name of [
