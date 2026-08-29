@@ -55,6 +55,14 @@ function immutableFiles(directory) {
   return readFiles(directory, names);
 }
 
+export function parseExpectedReleaseId(value) {
+  assert.match(value ?? "", /^[1-9][0-9]*$/,
+    "SELFHOST_EXISTING_RELEASE_ID must be a positive decimal integer");
+  const releaseId = Number(value);
+  assert.ok(Number.isSafeInteger(releaseId), "SELFHOST_EXISTING_RELEASE_ID is invalid");
+  return releaseId;
+}
+
 export class GitHubReleaseApi {
   constructor({ repository, token, apiBaseUrl, fetchImpl = fetch }) {
     assert.match(repository ?? "", /^[^/]+\/[^/]+$/, "GITHUB_REPOSITORY is invalid");
@@ -175,8 +183,7 @@ async function main() {
     token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
     apiBaseUrl: process.env.GITHUB_API_URL ?? "https://api.github.com",
   });
-  const expectedReleaseId = Number(process.env.SELFHOST_EXISTING_RELEASE_ID);
-  assert.ok(Number.isSafeInteger(expectedReleaseId), "SELFHOST_EXISTING_RELEASE_ID is required");
+  const expectedReleaseId = parseExpectedReleaseId(process.env.SELFHOST_EXISTING_RELEASE_ID);
   const expectedReleaseIdentity = {
     releaseId: expectedReleaseId,
     releaseTargetFullSha: process.env.SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA,
@@ -191,6 +198,7 @@ async function main() {
       expectedReleaseIdentity,
       immutableFiles: immutableFiles(options.artifactDirectory),
       pointerFiles: readFiles(options.pointerDirectory, pointerNames),
+      initialPointerBaseline: "absent",
       api,
     });
     writeReceipt(options.receiptPath, receipt);
