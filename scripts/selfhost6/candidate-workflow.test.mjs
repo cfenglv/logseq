@@ -226,7 +226,7 @@ test("candidate workflow builds only the frozen desktop matrix and never publish
   assert.doesNotMatch(legacyWorkflow, /Use Build-Selfhost6-Candidate/);
 });
 
-test("the mature desktop action stages one exact .7 draft before promotion", () => {
+test("the mature desktop action stops after staging one exact .7 draft", () => {
   const selfhostReleaseJobs = legacyWorkflow.match(
     /  compile-cljs:[\s\S]*?\n  nightly-release:/,
   )[0];
@@ -308,23 +308,16 @@ test("the mature desktop action stages one exact .7 draft before promotion", () 
   ]) assert.match(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
   assert.match(
     selfhostReleaseJobs,
-    /Verify the frozen Draft before replacement[\s\S]*Create the reviewed release as a draft[\s\S]*Bind and verify the exact reviewed Draft[\s\S]*Stage four source-version channel pointers[\s\S]*promote-update-feed\.mjs[\s\S]*Promote immutable assets after the draft is staged[\s\S]*promote-existing-release\.mjs/,
+    /Verify the frozen Draft before replacement[\s\S]*Create the reviewed release as a draft[\s\S]*Bind and verify the exact reviewed Draft/,
   );
-  assert.match(
-    selfhostReleaseJobs,
-    /--descriptors release-assets\/\*\.zip\.selfhost6\.json \\\n\s+release-assets\/\*\.exe\.selfhost6\.json \\\n\s+release-assets\/\*\.AppImage\.selfhost6\.json/,
-  );
-  assert.doesNotMatch(selfhostReleaseJobs, /--descriptors release-assets\/\*\.selfhost6\.json/);
-  assert.match(
-    selfhostReleaseJobs,
-    /promote-existing-release\.mjs[\s\S]*--expected-source-full-sha "\$\{\{ needs\.selfhost-release-verifier\.outputs\.product-source-sha \}\}"/,
-  );
+  assert.doesNotMatch(selfhostReleaseJobs, /Stage four source-version channel pointers|promote-update-feed\.mjs/);
+  assert.doesNotMatch(selfhostReleaseJobs, /Promote immutable assets after the draft is staged|promote-existing-release\.mjs/);
   for (const name of [
     "SELFHOST_EXISTING_RELEASE_ID",
     "SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA",
     "SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA",
     "SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA",
-  ]) assert.match(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
+  ]) assert.doesNotMatch(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
   assert.doesNotMatch(legacyWorkflow, /selfhost-release-terminal-audit:/);
   assert.doesNotMatch(legacyWorkflow, /gh release (create|edit|upload)/);
   assert.doesNotMatch(selfhostReleaseJobs, /Build-Selfhost6-Candidate|32051789643|verify-release-promotion\.mjs/);
