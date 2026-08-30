@@ -22,9 +22,10 @@ export function readReleasePolicy(policyPath) {
   assert.equal(policy.bundleIdentity, "com.logseq.logseq");
   assert.equal(policy.forwardUpdateChannel, policy.releaseLineId);
   assert.deepEqual(policy.provider, {
-    kind: "generic",
-    baseUrl: "https://github.com/cfenglv/logseq/releases/download/selfhost-official-architecture-v1",
-    remoteMutation: "promotion-only",
+    kind: "github",
+    owner: "cfenglv",
+    repo: "logseq",
+    remoteMutation: "version-release-only",
   });
   assert.equal(policy.firstInstall, "controlled-manual-artifact");
   assert.equal(policy.allowDowngrade, false);

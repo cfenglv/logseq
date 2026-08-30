@@ -61,7 +61,7 @@
   []
   (let [platform (.-platform js/process)
         arch (.-arch js/process)
-        {:keys [provider feed-url channel allow-prerelease? allow-downgrade?] :as options}
+        {:keys [feed-url channel allow-prerelease? allow-downgrade?] :as options}
         (updater-config/updater-options electron-version platform arch)]
     (when-not options
       (throw (ex-info "this build has no qualified update provider"
@@ -69,10 +69,11 @@
                        :version electron-version
                        :platform platform
                        :arch arch})))
-    (.setFeedURL autoUpdater
-                 (bean/->js {:provider provider
-                             :url feed-url
-                             :channel channel}))
+    (when feed-url
+      (.setFeedURL autoUpdater
+                   (bean/->js {:provider "generic"
+                               :url feed-url
+                               :channel channel})))
     (when channel
       (set! (.-channel autoUpdater) channel)
       (set! (.-allowPrerelease autoUpdater) allow-prerelease?)
