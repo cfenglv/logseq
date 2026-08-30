@@ -22,13 +22,8 @@ function digestFile(filePath, algorithm) {
   return createHash(algorithm).update(fs.readFileSync(filePath)).digest("hex");
 }
 
-function extensionFor(filePath) {
-  const lower = filePath.toLowerCase();
-  if (lower.endsWith(".appimage")) return ".AppImage";
-  if (lower.endsWith(".dmg")) return ".dmg";
-  if (lower.endsWith(".zip")) return ".zip";
-  if (lower.endsWith(".exe")) return ".exe";
-  throw new Error("unsupported update archive extension");
+function sha512Base64(filePath) {
+  return createHash("sha512").update(fs.readFileSync(filePath)).digest("base64");
 }
 
 function assertManifestIdentity(manifest, input, releasePolicy, signingPolicy) {
@@ -56,6 +51,135 @@ export function channelFileName(releasePolicy, platform, arch) {
   return `${releasePolicy.forwardUpdateChannel}${suffix}.yml`;
 }
 
+export function traditionalChannelFileName(releasePolicy, platform, arch) {
+  assert.ok(["x64", "arm64"].includes(arch), "unsupported release metadata architecture");
+  if (platform === "win32") return `${releasePolicy.forwardUpdateChannel}-${arch}.yml`;
+  if (platform === "darwin") return `${releasePolicy.forwardUpdateChannel}-${arch}-mac.yml`;
+  if (platform === "linux") {
+    return `${releasePolicy.forwardUpdateChannel}-linux${arch === "x64" ? "" : `-${arch}`}.yml`;
+  }
+  throw new Error("unsupported release metadata platform");
+}
+
+export function traditionalReleaseAssetNames(releasePolicy, version) {
+  const packages = [];
+  for (const arch of ["arm64", "x64"]) {
+    const mac = `Logseq-darwin-${arch}-${version}`;
+    packages.push(`${mac}.dmg`, `${mac}.dmg.blockmap`, `${mac}.zip`, `${mac}.zip.blockmap`);
+    const win = `Logseq-win-${arch}-${version}`;
+    packages.push(`${win}-nsis.exe`, `${win}-nsis.exe.blockmap`, `${win}.zip`);
+  }
+  for (const label of ["arm64", "x86_64"]) {
+    const linux = `Logseq-linux-${label}-${version}`;
+    packages.push(`${linux}.AppImage`, `${linux}.zip`);
+  }
+  const descriptorArchives = packages.filter((name) =>
+    name.endsWith(".dmg") || (name.endsWith(".zip") && name.includes("darwin-")) ||
+    name.endsWith("-nsis.exe") || name.endsWith(".AppImage"));
+  const metadata = [
+    ["darwin", "arm64"],
+    ["darwin", "x64"],
+    ["win32", "arm64"],
+    ["win32", "x64"],
+    ["linux", "arm64"],
+    ["linux", "x64"],
+  ].map(([platform, arch]) => traditionalChannelFileName(releasePolicy, platform, arch));
+  const names = [
+    ...packages,
+    ...descriptorArchives.map((name) => `${name}.selfhost6.json`),
+    ...metadata,
+    "VERSION",
+    "SOURCE_REVISION",
+    "SHA256SUMS.txt",
+  ];
+  assert.equal(names.length, 35, "traditional release inventory must contain thirty-five assets");
+  assert.equal(new Set(names).size, names.length, "traditional release inventory contains duplicates");
+  return names.sort();
+}
+
+function unquoteYamlScalar(value) {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+      (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function parseNativeMetadata(metadataText) {
+  assert.doesNotMatch(metadataText, /^selfhostUpdateSignatures:/m,
+    "native metadata already contains project signatures");
+  const version = unquoteYamlScalar(metadataText.match(/^version:\s*(.+)$/m)?.[1] ?? "");
+  const primary = unquoteYamlScalar(metadataText.match(/^path:\s*(.+)$/m)?.[1] ?? "");
+  assert.ok(version, "native metadata version is missing");
+  assert.ok(primary, "native metadata primary path is missing");
+  const files = [...metadataText.matchAll(
+    /^\s*-\s+url:\s*(.+)\n\s+sha512:\s*(.+)\n\s+size:\s*(\d+)$/gm,
+  )].map((match) => ({
+    name: decodeURIComponent(unquoteYamlScalar(match[1])),
+    sha512: unquoteYamlScalar(match[2]),
+    size: Number(match[3]),
+  }));
+  assert.ok(files.length > 0, "native metadata contains no update files");
+  assert.ok(files.some(({ name }) => name === primary),
+    "native metadata primary path is not present in files");
+  return { version, primary, files };
+}
+
+export function finalizeTraditionalMetadata({
+  metadataText,
+  artifactDirectory,
+  descriptors,
+  expectedTargetVersion,
+  platform,
+  arch,
+  releasePolicy,
+  signingPolicy,
+}) {
+  const native = parseNativeMetadata(metadataText);
+  assert.equal(native.version, expectedTargetVersion,
+    "native metadata version differs from the release target");
+  const descriptorsByAsset = new Map(descriptors.map((descriptor) => [descriptor.assetName, descriptor]));
+  assert.equal(descriptorsByAsset.size, descriptors.length, "duplicate metadata descriptor asset");
+  for (const file of native.files) {
+    const artifactPath = path.join(artifactDirectory, file.name);
+    assert.ok(fs.statSync(artifactPath).isFile(), `native metadata references missing ${file.name}`);
+    assert.equal(fs.statSync(artifactPath).size, file.size,
+      `native metadata size differs for ${file.name}`);
+    assert.equal(sha512Base64(artifactPath), file.sha512,
+      `native metadata SHA-512 differs for ${file.name}`);
+    const descriptor = descriptorsByAsset.get(file.name);
+    assert.ok(descriptor, `native metadata update file has no signed descriptor: ${file.name}`);
+    assert.equal(descriptor.targetVersion, expectedTargetVersion);
+    assert.equal(descriptor.platform, platform);
+    assert.equal(descriptor.arch, arch);
+    verifyArtifactDescriptor({ descriptor, artifactPath, releasePolicy, signingPolicy });
+  }
+  const primaryDescriptor = descriptorsByAsset.get(native.primary);
+  assert.ok(primaryDescriptor, "native metadata primary update has no signed descriptor");
+  const signatures = { [arch]: primaryDescriptor.signedMetadata };
+  return `${metadataText.trimEnd()}\nselfhostUpdateSignatures: ${JSON.stringify(signatures)}\n`;
+}
+
+export function verifyTraditionalMetadata(options) {
+  const signatureLine = /\nselfhostUpdateSignatures:\s*(\{.+\})\n?$/;
+  assert.match(options.metadataText, signatureLine,
+    "traditional metadata is missing the final project-signature field");
+  const unsignedMetadata = options.metadataText.replace(signatureLine, "\n");
+  const expected = finalizeTraditionalMetadata({
+    ...options,
+    metadataText: unsignedMetadata,
+  });
+  assert.equal(options.metadataText, expected,
+    "traditional metadata signature differs from the signed primary update");
+  return parseNativeMetadata(unsignedMetadata);
+}
+
+export function writeTraditionalMetadata({ metadata, outputPath }) {
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, metadata, { flag: "wx", mode: 0o600 });
+}
+
 export function prepareSignedArtifact({
   archivePath,
   targetManifestPath,
@@ -79,12 +203,10 @@ export function prepareSignedArtifact({
 
   const archiveSha256 = digestFile(archivePath, "sha256");
   const archiveSha512 = digestFile(archivePath, "sha512");
-  const assetName = [
-    "Logseq",
-    platform,
-    arch,
-    targetVersion,
-  ].join("-") + extensionFor(archivePath);
+  const assetName = path.basename(archivePath);
+  assert.ok(assetName.startsWith("Logseq-"), "update archive must use its final Logseq asset name");
+  assert.ok(assetName.includes(`-${targetVersion}.`) || assetName.includes(`-${targetVersion}-`),
+    "update archive name must bind the target version");
   const immutableObjectKey = [
     releasePolicy.releaseLineId,
     sourceFullSha,
@@ -121,7 +243,9 @@ export function prepareSignedArtifact({
     kind: descriptorKind,
     provider: releasePolicy.provider,
     channel: releasePolicy.forwardUpdateChannel,
-    channelFile: channelFileName(releasePolicy, platform, arch),
+    channelFile: releasePolicy.provider.kind === "github"
+      ? traditionalChannelFileName(releasePolicy, platform, arch)
+      : channelFileName(releasePolicy, platform, arch),
     sourceFullSha,
     targetVersion,
     platform,
@@ -140,7 +264,9 @@ export function verifyArtifactDescriptor({ descriptor, artifactPath, releasePoli
   assert.equal(descriptor.channel, releasePolicy.forwardUpdateChannel);
   assert.equal(
     descriptor.channelFile,
-    channelFileName(releasePolicy, descriptor.platform, descriptor.arch),
+    releasePolicy.provider.kind === "github"
+      ? traditionalChannelFileName(releasePolicy, descriptor.platform, descriptor.arch)
+      : channelFileName(releasePolicy, descriptor.platform, descriptor.arch),
   );
   assert.equal(path.basename(artifactPath), descriptor.assetName);
   const verified = verifySignedUpdateMetadata({
@@ -176,11 +302,8 @@ export function buildPromotion({
   signingPolicy,
 }) {
   assert.ok(descriptors.length > 0, "at least one signed artifact descriptor is required");
-  assert.ok(
-    [releasePolicy.sourceVersion, releasePolicy.syntheticForwardTargetVersion]
-      .includes(expectedTargetVersion),
-    "promotion requires an explicit release-line target version",
-  );
+  assert.equal(expectedTargetVersion, releasePolicy.sourceVersion,
+    "the fixed release line is only the one-time .6 to .7 bridge");
   const groups = new Map();
   for (const descriptor of descriptors) {
     assert.equal(
@@ -190,9 +313,14 @@ export function buildPromotion({
     );
     const artifactPath = path.join(artifactDirectory, descriptor.assetName);
     const verified = verifyArtifactDescriptor({ descriptor, artifactPath, releasePolicy, signingPolicy });
-    const entries = groups.get(descriptor.channelFile) ?? [];
+    const bridgeChannelFile = channelFileName(
+      releasePolicy,
+      descriptor.platform,
+      descriptor.arch,
+    );
+    const entries = groups.get(bridgeChannelFile) ?? [];
     entries.push({ descriptor, verified });
-    groups.set(descriptor.channelFile, entries);
+    groups.set(bridgeChannelFile, entries);
   }
 
   const output = new Map();

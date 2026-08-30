@@ -30,6 +30,12 @@ const policyPath = path.join(repoRoot, "resources/updater/selfhost-release-polic
 
 test("formal .7 and synthetic .8 bind only the final public source identity", () => {
   const policy = readReleasePolicy(policyPath);
+  assert.deepEqual(policy.provider, {
+    kind: "github",
+    owner: "cfenglv",
+    repo: "logseq",
+    remoteMutation: "version-release-only",
+  });
   const privateDevelopmentParentSha = "a".repeat(40);
   const finalPublicSourceSha = "b".repeat(40);
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
@@ -69,10 +75,13 @@ test("formal .7 and synthetic .8 bind only the final public source identity", ()
   );
 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "selfhost6-version-identity-"));
-  const archivePath = path.join(directory, "candidate.exe");
   const manifestPath = path.join(directory, "manifest.json");
-  fs.writeFileSync(archivePath, "candidate bytes");
   const descriptorFor = (manifest) => {
+    const archivePath = path.join(
+      directory,
+      `Logseq-win-arm64-${manifest["target-version"]}-nsis.exe`,
+    );
+    fs.writeFileSync(archivePath, `candidate bytes:${manifest["target-version"]}`);
     writeTargetManifest(manifestPath, manifest);
     return prepareSignedArtifact({
       archivePath,
@@ -88,15 +97,20 @@ test("formal .7 and synthetic .8 bind only the final public source identity", ()
   };
   const formalDescriptor = descriptorFor(source);
   const syntheticDescriptor = descriptorFor(target);
-  stageSignedArtifact({ descriptor: syntheticDescriptor, archivePath, outputDirectory: directory });
-  const channel = buildPromotion({
+  const stagedDirectory = path.join(directory, "staged");
+  stageSignedArtifact({
+    descriptor: syntheticDescriptor,
+    archivePath: path.join(directory, syntheticDescriptor.assetName),
+    outputDirectory: stagedDirectory,
+  });
+  assert.throws(() => buildPromotion({
     descriptors: [syntheticDescriptor],
-    artifactDirectory: directory,
+    artifactDirectory: stagedDirectory,
     expectedTargetVersion: policy.syntheticForwardTargetVersion,
     releasePolicy: policy,
     signingPolicy,
-  }).values().next().value;
-  for (const identity of [source, target, formalDescriptor, syntheticDescriptor, channel]) {
+  }), /only the one-time \.6 to \.7 bridge/);
+  for (const identity of [source, target, formalDescriptor, syntheticDescriptor]) {
     assert.ok(JSON.stringify(identity).includes(finalPublicSourceSha));
     assert.ok(!JSON.stringify(identity).includes(privateDevelopmentParentSha));
   }
@@ -118,8 +132,10 @@ test("formal .7 and synthetic .8 bind only the final public source identity", ()
   assert.equal(historicalPolicy.syntheticForwardTargetVersion, "2.0.1-selfhost.7");
   const historicalManifest = { ...source, "target-version": historicalPolicy.sourceVersion };
   writeTargetManifest(manifestPath, historicalManifest);
+  const historicalArchivePath = path.join(directory, "Logseq-win-arm64-2.0.1-selfhost.6-nsis.exe");
+  fs.writeFileSync(historicalArchivePath, "historical candidate bytes");
   const historicalDescriptor = prepareSignedArtifact({
-    archivePath,
+    archivePath: historicalArchivePath,
     targetManifestPath: manifestPath,
     sourceFullSha: finalPublicSourceSha,
     targetVersion: historicalPolicy.sourceVersion,
@@ -131,8 +147,8 @@ test("formal .7 and synthetic .8 bind only the final public source identity", ()
   });
   const historicalStaged = stageSignedArtifact({
     descriptor: historicalDescriptor,
-    archivePath,
-    outputDirectory: directory,
+    archivePath: historicalArchivePath,
+    outputDirectory: path.join(directory, "historical-staged"),
   });
   assert.equal(
     verifyArtifactDescriptor({

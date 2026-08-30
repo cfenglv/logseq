@@ -7,7 +7,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { readReleasePolicy } from "../lib/selfhost6-release-identity.mjs";
-import { verifyArtifactDescriptor } from "../lib/selfhost6-update-feed.mjs";
+import {
+  traditionalChannelFileName,
+  traditionalReleaseAssetNames,
+  verifyArtifactDescriptor,
+  verifyTraditionalMetadata,
+} from "../lib/selfhost6-update-feed.mjs";
 import { loadProjectSigningPolicy } from "../../resources/updater/project-update-signature.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -62,9 +67,15 @@ const topLevelDirectories = topLevel
   .map(({ name }) => name)
   .sort();
 assert.deepEqual(topLevelDirectories, ["qualification-receipts"]);
-assert.equal(topLevelFiles.length, 16,
-  "formal release set must contain eight platform archives and eight descriptors");
-assert.equal(topLevelFiles.some((name) => name.endsWith(".yml")), false);
+const expectedAssetNames = new Set(traditionalReleaseAssetNames(releasePolicy, options.targetVersion));
+assert.equal(expectedAssetNames.size, 35,
+  "formal release set must contain exactly thirty-five assets");
+assert.deepEqual(new Set(topLevelFiles), expectedAssetNames,
+  "formal release asset inventory differs from the traditional contract");
+assert.equal(fs.readFileSync(path.join(options.artifactDirectory, "VERSION"), "utf8"),
+  `${options.targetVersion}\n`);
+assert.equal(fs.readFileSync(path.join(options.artifactDirectory, "SOURCE_REVISION"), "utf8"),
+  `${options.sourceFullSha}\n`);
 
 const descriptorNames = topLevelFiles.filter((name) => name.endsWith(".selfhost6.json"));
 assert.equal(descriptorNames.length, 8);
@@ -73,10 +84,12 @@ const names = new Set();
 const archiveShas = new Set();
 const immutableObjectKeys = new Set();
 const assets = [];
+const descriptors = [];
 
 for (const descriptorName of descriptorNames) {
   const descriptorPath = path.join(options.artifactDirectory, descriptorName);
   const descriptor = readJson(descriptorPath);
+  descriptors.push(descriptor);
   const artifactPath = path.join(options.artifactDirectory, descriptor.assetName);
   assert.ok(fs.statSync(artifactPath).isFile(), `missing release archive ${descriptor.assetName}`);
   assert.equal(descriptorName, `${descriptor.assetName}.selfhost6.json`);
@@ -142,10 +155,44 @@ for (const descriptorName of descriptorNames) {
 }
 
 assert.deepEqual(targets, expectedTargets);
-assert.deepEqual(
-  new Set(topLevelFiles),
-  new Set(assets.flatMap(({ name, descriptorName }) => [name, descriptorName])),
-);
+for (const [platform, arch] of [
+  ["darwin", "arm64"],
+  ["darwin", "x64"],
+  ["win32", "arm64"],
+  ["win32", "x64"],
+  ["linux", "arm64"],
+  ["linux", "x64"],
+]) {
+  const metadataName = traditionalChannelFileName(releasePolicy, platform, arch);
+  verifyTraditionalMetadata({
+    metadataText: fs.readFileSync(path.join(options.artifactDirectory, metadataName), "utf8"),
+    artifactDirectory: options.artifactDirectory,
+    descriptors: descriptors.filter((descriptor) =>
+      descriptor.platform === platform && descriptor.arch === arch),
+    expectedTargetVersion: options.targetVersion,
+    platform,
+    arch,
+    releasePolicy,
+    signingPolicy,
+  });
+}
+
+const checksumLines = fs.readFileSync(
+  path.join(options.artifactDirectory, "SHA256SUMS.txt"),
+  "utf8",
+).trim().split("\n");
+const checksums = new Map(checksumLines.map((line) => {
+  const match = line.match(/^([0-9a-f]{64})  (.+)$/);
+  assert.ok(match, "SHA256SUMS.txt contains an invalid line");
+  return [match[2], match[1]];
+}));
+const checksummedNames = topLevelFiles.filter((name) => name !== "SHA256SUMS.txt").sort();
+assert.deepEqual(new Set(checksums.keys()), new Set(checksummedNames),
+  "SHA256SUMS.txt inventory differs from the release assets");
+for (const name of checksummedNames) {
+  assert.equal(checksums.get(name), sha256(path.join(options.artifactDirectory, name)),
+    `SHA256SUMS.txt digest differs for ${name}`);
+}
 const qualificationFiles = fs
   .readdirSync(path.join(options.artifactDirectory, "qualification-receipts"))
   .sort();
