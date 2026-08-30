@@ -124,6 +124,16 @@ function pointerMetadata(bytes, name) {
   return { version: metadata.version, sourceFullSha };
 }
 
+export function bridgeImmutableAssetNames(version) {
+  return [
+    `Logseq-darwin-arm64-${version}.zip`,
+    `Logseq-darwin-x64-${version}.zip`,
+    `Logseq-linux-arm64-${version}.AppImage`,
+    `Logseq-linux-x86_64-${version}.AppImage`,
+    `Logseq-win-x64-${version}-nsis.exe`,
+  ];
+}
+
 function validateInputs({
   releaseLineId,
   expectedSourceFullSha,
@@ -146,22 +156,11 @@ function validateInputs({
   ]) assert.match(expectedReleaseIdentity[field] ?? "", fullShaPattern,
     `frozen existing ${field} is required`);
   assert.ok(immutableFiles instanceof Map, "immutable files must be a Map");
-  assert.equal(immutableFiles.size, 16,
-    "formal release promotion requires eight archives and eight descriptors");
-  const descriptorNames = [...immutableFiles.keys()].filter((name) => name.endsWith(".selfhost6.json"));
-  assert.equal(descriptorNames.length, 8, "formal release promotion requires eight descriptors");
-  for (const descriptorName of descriptorNames) {
-    const archiveName = descriptorName.slice(0, -".selfhost6.json".length);
-    assert.ok(immutableFiles.has(archiveName), `descriptor has no archive ${descriptorName}`);
-    assert.ok(archiveName.startsWith("Logseq-"), `unexpected archive name ${archiveName}`);
-    assert.ok(archiveName.includes(`-${expectedVersion}.`),
-      `archive name does not bind ${expectedVersion}`);
-    const descriptor = JSON.parse(immutableFiles.get(descriptorName).toString("utf8"));
-    assert.equal(descriptor.sourceFullSha, expectedSourceFullSha);
-    assert.equal(descriptor.targetVersion, expectedVersion);
-    assert.equal(descriptor.signedMetadata["target-source-full-sha"], expectedSourceFullSha);
-    assert.equal(descriptor.signedMetadata["target-version"], expectedVersion);
-  }
+  assert.deepEqual(
+    [...immutableFiles.keys()].sort(),
+    bridgeImmutableAssetNames(expectedVersion).sort(),
+    "bridge promotion requires exactly five admitted updater assets",
+  );
 
   const expectedPointerNames = new Set([
     `${releaseLineId}.yml`,

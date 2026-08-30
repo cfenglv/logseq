@@ -9,10 +9,18 @@ import { fileURLToPath } from "node:url";
 
 import {
   draftInventorySha256,
+  obsoleteDraftAssetIds,
   verifyDraftAfterStaging,
   verifyDraftBeforeReplacement,
+  verifyPublishedRelease,
 } from "./verify-draft-release.mjs";
+import { readReleasePolicy } from "../lib/selfhost6-release-identity.mjs";
+import { traditionalReleaseAssetNames } from "../lib/selfhost6-update-feed.mjs";
 
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const releasePolicy = readReleasePolicy(
+  path.join(repoRoot, "resources/updater/selfhost-release-policy.json"),
+);
 const releaseId = 424242;
 const sourceFullSha = "a".repeat(40);
 const replacementSourceFullSha = "b".repeat(40);
@@ -24,17 +32,25 @@ function digest(bytes) {
 
 function fixture() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "selfhost-draft-verifier-"));
-  const names = [];
-  for (let index = 0; index < 8; index += 1) {
-    const archiveName = `Logseq-fixture-${index}-${targetVersion}.zip`;
-    names.push(archiveName, `${archiveName}.selfhost6.json`);
-  }
-  const assets = [];
-  const replacementAssets = names.sort().map((name, index) => {
+  const legacyArchives = [
+    `Logseq-darwin-arm64-${targetVersion}.dmg`,
+    `Logseq-darwin-arm64-${targetVersion}.zip`,
+    `Logseq-darwin-x64-${targetVersion}.dmg`,
+    `Logseq-darwin-x64-${targetVersion}.zip`,
+    `Logseq-linux-arm64-${targetVersion}.AppImage`,
+    `Logseq-linux-x64-${targetVersion}.AppImage`,
+    `Logseq-win32-arm64-${targetVersion}.exe`,
+    `Logseq-win32-x64-${targetVersion}.exe`,
+  ];
+  const legacyNames = legacyArchives.flatMap((name) => [name, `${name}.selfhost6.json`]).sort();
+  const replacementNames = traditionalReleaseAssetNames(releasePolicy, targetVersion);
+  const assets = legacyNames.map((name, index) => {
     const oldBytes = Buffer.from(`old:${name}`);
+    return { id: 1000 + index, name, size: oldBytes.length, digest: digest(oldBytes) };
+  });
+  const replacementAssets = replacementNames.map((name, index) => {
     const replacementBytes = Buffer.from(`replacement:${name}`);
     fs.writeFileSync(path.join(directory, name), replacementBytes);
-    assets.push({ id: 1000 + index, name, size: oldBytes.length, digest: digest(oldBytes) });
     return {
       id: 2000 + index,
       name,
@@ -68,6 +84,17 @@ test("frozen Draft identity and inventory pass before replacement", (context) =>
     expectedAssets: input.assets,
     expectedInventorySha256: draftInventorySha256(input.assets),
   }), { status: "draft-prewrite-verified" });
+  assert.deepEqual(
+    obsoleteDraftAssetIds({
+      assets: input.assets,
+      artifactDirectory: input.directory,
+      targetVersion,
+    }),
+    input.assets
+      .filter(({ name }) => !new Set(traditionalReleaseAssetNames(releasePolicy, targetVersion)).has(name))
+      .map(({ id }) => id)
+      .sort((left, right) => left - right),
+  );
 });
 
 test("Draft replacement rejects identity or inventory drift", (context) => {
@@ -145,15 +172,16 @@ test("Draft replacement rejects identity or inventory drift", (context) => {
     artifactDirectory: input.directory,
     expectedAssets: renamedFrozenAssets,
     expectedInventorySha256: draftInventorySha256(renamedFrozenAssets),
-  }), /asset names differ/);
+  }), /outside the frozen\/replacement boundary/);
 });
 
 test("a partial official Draft replacement remains safely resumable", (context) => {
   const input = fixture();
   context.after(() => fs.rmSync(input.directory, { recursive: true, force: true }));
-  const mixedAssets = input.assets.map((asset, index) => index % 2 === 0
-    ? input.replacementAssets[index]
-    : asset).slice(0, -1);
+  const mixedAssets = [...new Map([
+    ...input.assets.slice(0, 8),
+    ...input.replacementAssets.slice(8, 17),
+  ].map((asset) => [asset.name, asset])).values()].slice(0, -1);
   assert.deepEqual(verifyDraftBeforeReplacement({
     ...input,
     release: {
@@ -241,6 +269,50 @@ test("staged Draft rejects every published-envelope drift", (context) => {
   }
 });
 
+test("published release must be latest, exact, and byte-identical before bridging", (context) => {
+  const input = fixture();
+  context.after(() => fs.rmSync(input.directory, { recursive: true, force: true }));
+  const published = {
+    ...input.release,
+    target_commitish: replacementSourceFullSha,
+    body: `Source commit ${replacementSourceFullSha}.`,
+    draft: false,
+    published_at: "2026-08-31T00:00:00Z",
+  };
+  const options = {
+    ...input,
+    release: published,
+    releases: [published],
+    latestRelease: published,
+    tagRefs: [{
+      ref: `refs/tags/${targetVersion}`,
+      object: { sha: replacementSourceFullSha },
+    }],
+    assets: input.replacementAssets,
+    releaseId: String(releaseId),
+    sourceFullSha: replacementSourceFullSha,
+    targetVersion,
+    artifactDirectory: input.directory,
+  };
+  assert.deepEqual(verifyPublishedRelease(options), { status: "published-release-verified" });
+  assert.throws(() => verifyPublishedRelease({
+    ...options,
+    latestRelease: { ...published, id: releaseId + 1 },
+  }), /not the GitHub latest stable/);
+  assert.throws(() => verifyPublishedRelease({
+    ...options,
+    release: { ...published, draft: true, published_at: null },
+  }), /still a Draft/);
+  assert.throws(() => verifyPublishedRelease({
+    ...options,
+    tagRefs: [{ ref: `refs/tags/${targetVersion}`, object: { sha: sourceFullSha } }],
+  }), /does not target the qualified source/);
+  assert.throws(() => verifyPublishedRelease({
+    ...options,
+    assets: input.replacementAssets.slice(1),
+  }), /traditional release inventory/);
+});
+
 test("Draft verifier CLI emits only a constant failure status", (context) => {
   const input = fixture();
   context.after(() => fs.rmSync(input.directory, { recursive: true, force: true }));
@@ -248,6 +320,7 @@ test("Draft verifier CLI emits only a constant failure status", (context) => {
   const assetsJson = path.join(input.directory, "assets.json");
   const tagRefsJson = path.join(input.directory, "tag-refs.json");
   const releaseListJson = path.join(input.directory, "release-list.json");
+  const deleteListOutput = path.join(input.directory, "delete-list.txt");
   fs.writeFileSync(releaseJson, JSON.stringify({ ...input.release, id: releaseId + 1 }));
   fs.writeFileSync(assetsJson, JSON.stringify(input.assets));
   fs.writeFileSync(tagRefsJson, JSON.stringify(input.tagRefs));
@@ -265,6 +338,7 @@ test("Draft verifier CLI emits only a constant failure status", (context) => {
     "--replacement-source-full-sha", replacementSourceFullSha,
     "--target-version", targetVersion,
     "--expected-inventory-sha256", draftInventorySha256(input.assets),
+    "--delete-list-output", deleteListOutput,
   ], {
     encoding: "utf8",
     env: {

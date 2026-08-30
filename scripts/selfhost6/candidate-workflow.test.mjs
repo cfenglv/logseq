@@ -5,9 +5,12 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  bridgeImmutableAssetNames,
   PromotionError,
   promoteExistingRelease,
 } from "../lib/selfhost6-existing-release-promotion.mjs";
+import { readReleasePolicy } from "../lib/selfhost6-release-identity.mjs";
+import { traditionalReleaseAssetNames } from "../lib/selfhost6-update-feed.mjs";
 import {
   GitHubReleaseApi,
   parseExpectedReleaseId,
@@ -46,6 +49,9 @@ const existingReleasePromotionCli = fs.readFileSync(
   path.join(repoRoot, "scripts/selfhost6/promote-existing-release.mjs"),
   "utf8",
 );
+const releasePolicy = readReleasePolicy(
+  path.join(repoRoot, "resources/updater/selfhost-release-policy.json"),
+);
 
 const releaseLineId = "selfhost-official-architecture-v1";
 const pointerNames = [
@@ -74,28 +80,10 @@ function pointerBytes(version, sourceFullSha, name) {
 
 function promotionFixture(sourceFullSha = "b".repeat(40)) {
   const version = "2.0.1-selfhost.7";
-  const archiveNames = [
-    `Logseq-darwin-x64-${version}.zip`,
-    `Logseq-darwin-arm64-${version}.zip`,
-    `Logseq-darwin-x64-${version}.dmg`,
-    `Logseq-darwin-arm64-${version}.dmg`,
-    `Logseq-win32-x64-${version}.exe`,
-    `Logseq-win32-arm64-${version}.exe`,
-    `Logseq-linux-x64-${version}.AppImage`,
-    `Logseq-linux-arm64-${version}.AppImage`,
-  ];
-  const immutableFiles = new Map();
-  for (const name of archiveNames) {
-    immutableFiles.set(name, Buffer.from(`archive:${name}`));
-    immutableFiles.set(`${name}.selfhost6.json`, Buffer.from(`${JSON.stringify({
-      sourceFullSha,
-      targetVersion: version,
-      signedMetadata: {
-        "target-source-full-sha": sourceFullSha,
-        "target-version": version,
-      },
-    })}\n`));
-  }
+  const immutableFiles = new Map(bridgeImmutableAssetNames(version).map((name) => [
+    name,
+    Buffer.from(`archive:${name}`),
+  ]));
   return {
     releaseLineId,
     expectedSourceFullSha: sourceFullSha,
@@ -216,27 +204,24 @@ test("candidate workflow builds only the frozen desktop matrix and never publish
   assert.match(workflow, /environment: selfhost-release-signing/);
   assert.equal((workflow.match(/LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/g) ?? []).length, 2);
   assert.doesNotMatch(workflow, /gh release|--publish always|action-gh-release|contents: write/);
-  assert.match(workflow, /promote-update-feed\.mjs[\s\S]*--expected-target-version/);
-  assert.match(
-    workflow,
-    /Stage isolated synthetic forward-update channel\n\s+if: inputs\.target-version == '2\.0\.1-selfhost\.8'/,
-  );
-  assert.equal((workflow.match(/promote-update-feed\.mjs/g) ?? []).length, 1);
+  assert.doesNotMatch(workflow, /promote-update-feed\.mjs|Stage isolated synthetic forward-update channel/);
   assert.doesNotMatch(legacyWorkflow, /Refuse the isolated Selfhost6 release line/);
   assert.doesNotMatch(legacyWorkflow, /Use Build-Selfhost6-Candidate/);
 });
 
-test("the mature desktop action stops after staging one exact .7 draft", () => {
+test("the mature desktop action stages one complete traditional .7 draft and stops", () => {
   const selfhostReleaseJobs = legacyWorkflow.match(
-    /  compile-cljs:[\s\S]*?\n  nightly-release:/,
+    /  compile-cljs:[\s\S]*?\n  selfhost-release-bridge:/,
   )[0];
   assert.match(legacyWorkflow, /name: Build-Desktop-Release/);
   assert.equal((legacyWorkflow.match(/^name: Build-Desktop-Release$/gm) ?? []).length, 1);
   assert.match(legacyWorkflow, /SELFHOST6_TARGET_VERSION: '2\.0\.1-selfhost\.7'/);
+  assert.match(legacyWorkflow, /selfhost-operation:[\s\S]*stage-draft[\s\S]*bridge-published-\.7/);
+  assert.match(selfhostReleaseJobs, /selfhost-operation == 'stage-draft'/);
   assert.match(legacyWorkflow, /github\.ref_name == 'release\/2\.0\.1-selfhost\.7'/);
   assert.match(
     legacyWorkflow,
-    /run-name: Desktop release · \$\{\{ github\.event\.inputs\.build-target \}\} · \$\{\{ github\.event\.inputs\.git-ref \}\}/,
+    /run-name: Desktop release · \$\{\{ github\.event\.inputs\.build-target \}\} · \$\{\{ github\.event\.inputs\.selfhost-operation \}\} · \$\{\{ github\.event\.inputs\.git-ref \}\}/,
   );
   assert.doesNotMatch(legacyWorkflow.match(/on:[\s\S]*?\nenv:/)[0], /\n\s+push:/);
   assert.match(legacyWorkflow, /resolve-release-source:/);
@@ -284,9 +269,29 @@ test("the mature desktop action stops after staging one exact .7 draft", () => {
   assert.equal((selfhostReleaseJobs.match(/releases\?per_page=100/g) ?? []).length, 2);
   assert.equal((selfhostReleaseJobs.match(/--release-list-json/g) ?? []).length, 2);
   assert.match(selfhostReleaseJobs, /verify-draft-release\.mjs[\s\S]*--phase before/);
+  assert.match(selfhostReleaseJobs, /--delete-list-output/);
+  assert.match(selfhostReleaseJobs, /Remove only obsolete assets from the verified Draft/);
   assert.match(selfhostReleaseJobs, /Create the reviewed release as a draft/);
   assert.match(selfhostReleaseJobs, /softprops\/action-gh-release@v2/);
-  assert.match(selfhostReleaseJobs, /files: release-assets\/Logseq-\*/);
+  assert.match(selfhostReleaseJobs, /files:\s*\|/);
+  const releaseUpload = selfhostReleaseJobs.match(
+    /Create the reviewed release as a draft[\s\S]*?files:\s*\|\n([\s\S]*?)\n\s+tag_name:/,
+  )[1];
+  const releaseUploadFiles = releaseUpload.trim().split("\n").map((line) => line.trim());
+  assert.equal(releaseUploadFiles.length, 35);
+  assert.equal(new Set(releaseUploadFiles).size, 35);
+  assert.ok(releaseUploadFiles.every((name) => name.startsWith("release-assets/")));
+  assert.ok(releaseUploadFiles.every((name) => !name.includes("*")));
+  assert.deepEqual(
+    releaseUploadFiles.map((name) => name
+      .slice("release-assets/".length)
+      .replace("${{ env.SELFHOST6_TARGET_VERSION }}", releasePolicy.sourceVersion))
+      .sort(),
+    traditionalReleaseAssetNames(releasePolicy, releasePolicy.sourceVersion),
+  );
+  for (const name of ["VERSION", "SOURCE_REVISION", "SHA256SUMS.txt"]) {
+    assert.ok(releaseUploadFiles.includes(`release-assets/${name}`));
+  }
   assert.match(selfhostReleaseJobs, /tag_name: \$\{\{ env\.SELFHOST6_TARGET_VERSION \}\}/);
   assert.match(selfhostReleaseJobs, /target_commitish: \$\{\{ needs\.selfhost-release-verifier\.outputs\.product-source-sha \}\}/);
   assert.match(selfhostReleaseJobs, /draft: true/);
@@ -308,7 +313,7 @@ test("the mature desktop action stops after staging one exact .7 draft", () => {
   ]) assert.match(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
   assert.match(
     selfhostReleaseJobs,
-    /Verify the frozen Draft before replacement[\s\S]*Create the reviewed release as a draft[\s\S]*Bind and verify the exact reviewed Draft/,
+    /Verify the frozen Draft before replacement[\s\S]*Remove only obsolete assets from the verified Draft[\s\S]*Create the reviewed release as a draft[\s\S]*Bind and verify the exact reviewed Draft/,
   );
   assert.doesNotMatch(selfhostReleaseJobs, /Stage four source-version channel pointers|promote-update-feed\.mjs/);
   assert.doesNotMatch(selfhostReleaseJobs, /Promote immutable assets after the draft is staged|promote-existing-release\.mjs/);
@@ -321,18 +326,61 @@ test("the mature desktop action stops after staging one exact .7 draft", () => {
   assert.doesNotMatch(legacyWorkflow, /selfhost-release-terminal-audit:/);
   assert.doesNotMatch(legacyWorkflow, /gh release (create|edit|upload)/);
   assert.doesNotMatch(selfhostReleaseJobs, /Build-Selfhost6-Candidate|32051789643|verify-release-promotion\.mjs/);
-  assert.doesNotMatch(
-    selfhostReleaseJobs,
-    /wrangler (deploy|versions deploy)|latest-x64|latest-arm64|2\.0\.1-selfhost\.8/,
-  );
-  assert.match(builtReleaseVerifier, /formal release set must contain eight platform archives and eight descriptors/);
+  assert.doesNotMatch(selfhostReleaseJobs, /wrangler (deploy|versions deploy)|2\.0\.1-selfhost\.8/);
+  assert.match(builtReleaseVerifier, /formal release set must contain exactly thirty-five assets/);
+  assert.match(builtReleaseVerifier, /traditionalReleaseAssetNames/);
+  for (const channelFile of [
+    "selfhost-official-architecture-v1-x64.yml",
+    "selfhost-official-architecture-v1-arm64.yml",
+    "selfhost-official-architecture-v1-x64-mac.yml",
+    "selfhost-official-architecture-v1-arm64-mac.yml",
+    "selfhost-official-architecture-v1-linux.yml",
+    "selfhost-official-architecture-v1-linux-arm64.yml",
+  ]) assert.match(selfhostReleaseJobs, new RegExp(channelFile.replaceAll(".", "\\.")));
+  assert.doesNotMatch(builtReleaseVerifier, /endsWith\("\.yml"\)\), false/);
   assert.match(builtReleaseVerifier, /built-assets-verified-awaiting-product-qualification/);
   assert.match(builtReleaseVerifier, /withdrawnArchiveSha256Denylist/);
   assert.match(builtReleaseVerifier, /release archive must not reuse withdrawn \.6 bytes/);
   assert.doesNotMatch(builtReleaseVerifier, /docs\/selfhost6-phase/);
 });
 
+test("the same desktop action bridges published .7 with only five assets and four pointers", () => {
+  const bridgeJob = legacyWorkflow.match(
+    /  selfhost-release-bridge:[\s\S]*?\n  nightly-release:/,
+  )[0];
+  assert.match(bridgeJob, /selfhost-operation == 'bridge-published-\.7'/);
+  assert.match(bridgeJob, /environment: selfhost-production/);
+  assert.match(bridgeJob, /group: selfhost-release-selfhost-official-architecture-v1/);
+  assert.match(
+    bridgeJob,
+    /Download and verify the published latest release[\s\S]*--phase published[\s\S]*Stage the one-time \.6 bridge pointers[\s\S]*Promote exactly five updater assets and four pointers/,
+  );
+  assert.match(bridgeJob, /repos\/\$\{GITHUB_REPOSITORY\}\/releases\/latest/);
+  assert.match(bridgeJob, /gh release download "\$\{SELFHOST6_TARGET_VERSION\}"/);
+  assert.equal((bridgeJob.match(/\.selfhost6\.json/g) ?? []).length, 5);
+  assert.equal((bridgeJob.match(/promote-update-feed\.mjs/g) ?? []).length, 1);
+  assert.equal((bridgeJob.match(/promote-existing-release\.mjs/g) ?? []).length, 1);
+  for (const name of [
+    "SELFHOST_EXISTING_RELEASE_ID",
+    "SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA",
+    "SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA",
+    "SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA",
+  ]) assert.match(bridgeJob, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
+  assert.doesNotMatch(bridgeJob, /softprops\/action-gh-release|draft: false|setTimeout|setInterval|retry/);
+  assert.doesNotMatch(
+    legacyWorkflow.match(/on:[\s\S]*?\nenv:/)[0],
+    /release:\s*\n\s+types:\s*\[published\]/,
+  );
+});
+
 test("existing release promotion keeps one bounded transaction owner", () => {
+  assert.deepEqual(bridgeImmutableAssetNames("2.0.1-selfhost.7"), [
+    "Logseq-darwin-arm64-2.0.1-selfhost.7.zip",
+    "Logseq-darwin-x64-2.0.1-selfhost.7.zip",
+    "Logseq-linux-arm64-2.0.1-selfhost.7.AppImage",
+    "Logseq-linux-x86_64-2.0.1-selfhost.7.AppImage",
+    "Logseq-win-x64-2.0.1-selfhost.7-nsis.exe",
+  ]);
   assert.match(existingReleasePromotion, /for \(const \[name, bytes\] of immutableFiles\)/);
   assert.match(existingReleasePromotion, /for \(const name of pointerFiles\.keys\(\)\)/);
   assert.match(existingReleasePromotion, /assertPointerOwnership/);
@@ -546,6 +594,7 @@ test("version override and every signed descriptor bind the requested full SHA",
   assert.match(workflow, /test "\$\(git rev-parse HEAD\)" = "\$\{\{ inputs\.source-full-sha \}\}"/);
   assert.match(workflow, /set-candidate-version\.mjs --version "\$\{\{ inputs\.target-version \}\}"/);
   assert.equal((workflow.match(/prepare-update-artifact\.mjs --archive/g) ?? []).length, 8);
+  assert.doesNotMatch(workflow, /candidate\.(zip|dmg|exe|AppImage)/);
   assert.equal((workflow.match(/--source-full-sha "\$\{\{ inputs\.source-full-sha \}\}"/g) ?? []).length, 9);
 });
 

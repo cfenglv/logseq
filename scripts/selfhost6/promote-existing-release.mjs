@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { readReleasePolicy } from "../lib/selfhost6-release-identity.mjs";
 import {
+  bridgeImmutableAssetNames,
   PromotionError,
   promoteExistingRelease,
 } from "../lib/selfhost6-existing-release-promotion.mjs";
@@ -44,15 +45,6 @@ function readFiles(directory, names) {
     assert.ok(fs.statSync(filePath).isFile(), `missing promotion input ${name}`);
     return [name, fs.readFileSync(filePath)];
   }));
-}
-
-function immutableFiles(directory) {
-  const names = fs.readdirSync(directory, { withFileTypes: true })
-    .filter((entry) => entry.isFile() && entry.name.startsWith("Logseq-"))
-    .map(({ name }) => name)
-    .sort();
-  assert.equal(names.length, 16, "promotion input must contain sixteen formal release files");
-  return readFiles(directory, names);
 }
 
 export function parseExpectedReleaseId(value) {
@@ -196,7 +188,10 @@ async function main() {
       expectedSourceFullSha: options.expectedSourceFullSha,
       expectedVersion: options.expectedVersion,
       expectedReleaseIdentity,
-      immutableFiles: immutableFiles(options.artifactDirectory),
+      immutableFiles: readFiles(
+        options.artifactDirectory,
+        bridgeImmutableAssetNames(options.expectedVersion),
+      ),
       pointerFiles: readFiles(options.pointerDirectory, pointerNames),
       initialPointerBaseline: "absent",
       api,

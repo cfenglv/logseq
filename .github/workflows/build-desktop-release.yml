@@ -1,7 +1,7 @@
 # This is the main desktop application release workflow for both nightly and beta/stable releases.
 
 name: Build-Desktop-Release
-run-name: Desktop release · ${{ github.event.inputs.build-target }} · ${{ github.event.inputs.git-ref }}
+run-name: Desktop release · ${{ github.event.inputs.build-target }} · ${{ github.event.inputs.selfhost-operation }} · ${{ github.event.inputs.git-ref }}
 
 on:
   workflow_dispatch:
@@ -20,6 +20,14 @@ on:
         description: "Release Git Ref (Which branch or tag to build?)"
         required: true
         default: "master"
+      selfhost-operation:
+        description: 'Selfhost .7 operation'
+        type: choice
+        required: true
+        options:
+          - stage-draft
+          - bridge-published-.7
+        default: stage-draft
       is-draft:
         description: 'Draft Release?'
         type: boolean
@@ -678,7 +686,7 @@ jobs:
       SENTRY_AUTH_TOKEN: "${{ secrets.SENTRY_AUTH_TOKEN }}"
 
   resolve-release-source:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -955,10 +963,19 @@ jobs:
           mkdir -p release-input
           cp static/updater/TARGET_BUILD_MANIFEST.json release-input/TARGET_BUILD_MANIFEST.json
           if [ "${{ matrix.platform }}" = darwin ]; then
-            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip' -print -quit)" release-input/package.zip
-            cp "$(find static/dist -maxdepth 1 -type f -name '*.dmg' -print -quit)" release-input/package.dmg
+            base="Logseq-darwin-${{ matrix.arch }}-${SELFHOST6_TARGET_VERSION}"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip' -print -quit)" "release-input/${base}.zip"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.dmg' -print -quit)" "release-input/${base}.dmg"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip.blockmap' -print -quit)" "release-input/${base}.zip.blockmap"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.dmg.blockmap' -print -quit)" "release-input/${base}.dmg.blockmap"
+            cp static/dist/latest-mac.yml release-input/native-update.yml
           else
-            cp "$(find static/dist -maxdepth 1 -type f -name '*.AppImage' -print -quit)" release-input/package.AppImage
+            linux_arch="${{ matrix.arch }}"
+            if [ "$linux_arch" = x64 ]; then linux_arch=x86_64; fi
+            base="Logseq-linux-${linux_arch}-${SELFHOST6_TARGET_VERSION}"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.AppImage' -print -quit)" "release-input/${base}.AppImage"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip' -print -quit)" "release-input/${base}.zip"
+            cp "$(find static/dist -maxdepth 1 -type f -name 'latest-linux*.yml' -print -quit)" release-input/native-update.yml
           fi
 
       - name: Normalize Windows release input
@@ -967,7 +984,11 @@ jobs:
         run: |
           New-Item -ItemType Directory release-input
           Copy-Item static/updater/TARGET_BUILD_MANIFEST.json release-input/TARGET_BUILD_MANIFEST.json
-          Copy-Item (Get-ChildItem static/dist/*-nsis.exe | Select-Object -First 1) release-input/package.exe
+          $base = "Logseq-win-${{ matrix.arch }}-${env:SELFHOST6_TARGET_VERSION}"
+          Copy-Item (Get-ChildItem static/dist/*-nsis.exe | Select-Object -First 1) "release-input/${base}-nsis.exe"
+          Copy-Item (Get-ChildItem static/dist/*-nsis.exe.blockmap | Select-Object -First 1) "release-input/${base}-nsis.exe.blockmap"
+          Copy-Item (Get-ChildItem static/dist/*.zip | Select-Object -First 1) "release-input/${base}.zip"
+          Copy-Item static/dist/latest.yml release-input/native-update.yml
 
       - name: Qualify native SQLite WAL swap boundary
         shell: bash
@@ -1000,7 +1021,7 @@ jobs:
           ref: ${{ needs.release-source-gate.outputs.source-sha }}
           persist-credentials: false
 
-      - name: Download all five platform release inputs
+      - name: Download all six platform release inputs
         uses: actions/download-artifact@v4
         with:
           pattern: selfhost6-unsigned-*-${{ env.SELFHOST6_TARGET_VERSION }}-${{ needs.release-source-gate.outputs.source-sha }}
@@ -1017,14 +1038,35 @@ jobs:
           LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64: ${{ secrets.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 }}
         run: |
           mkdir -p signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.zip --target-manifest unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --output-directory signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.zip --target-manifest unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --output-directory signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.dmg --target-manifest unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --output-directory signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.dmg --target-manifest unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --output-directory signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.exe --target-manifest unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch x64 --output-directory signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.exe --target-manifest unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch arm64 --output-directory signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch x64 --output-directory signed
-          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/package.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.zip --target-manifest unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.zip --target-manifest unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.dmg --target-manifest unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.dmg --target-manifest unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}-nsis.exe --target-manifest unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-arm64-${SELFHOST6_TARGET_VERSION}-nsis.exe --target-manifest unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch arm64 --output-directory signed
+
+      - name: Retain native packages, blockmaps, and release-local metadata
+        shell: bash
+        run: |
+          cp unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          cp unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-arm64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          cp unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          cp unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-x64-mac.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --descriptors signed/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json signed/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.dmg.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-arm64-mac.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --descriptors signed/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json signed/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.dmg.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-x64.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch x64 --descriptors signed/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}-nsis.exe.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-arm64.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch arm64 --descriptors signed/Logseq-win-arm64-${SELFHOST6_TARGET_VERSION}-nsis.exe.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-linux.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch x64 --descriptors signed/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-linux-arm64.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch arm64 --descriptors signed/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json
+          printf '%s\n' "${SELFHOST6_TARGET_VERSION}" > signed/VERSION
+          printf '%s\n' "${{ needs.release-source-gate.outputs.source-sha }}" > signed/SOURCE_REVISION
+          (cd signed && sha256sum $(find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' | sort) > SHA256SUMS.txt)
 
       - name: Bind native platform qualification receipts
         shell: bash
@@ -1094,7 +1136,7 @@ jobs:
           if-no-files-found: error
 
   selfhost-release:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'stable' && github.event.inputs.is-draft == 'true' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.event.inputs.is-draft == 'true' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
     needs: [ release-source-gate, selfhost-release-verifier ]
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -1167,13 +1209,59 @@ jobs:
             --source-full-sha "${SELFHOST_DRAFT_TARGET_FULL_SHA}" \
             --replacement-source-full-sha "${{ needs.selfhost-release-verifier.outputs.product-source-sha }}" \
             --artifact-directory release-assets \
+            --delete-list-output "${RUNNER_TEMP}/selfhost-draft-obsolete-asset-ids.txt" \
             --target-version "${SELFHOST6_TARGET_VERSION}" \
             --expected-inventory-sha256 "${SELFHOST_DRAFT_ASSET_INVENTORY_SHA256}"
+
+      - name: Remove only obsolete assets from the verified Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while IFS= read -r asset_id; do
+            if [ -n "$asset_id" ]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" >/dev/null
+            fi
+          done < "${RUNNER_TEMP}/selfhost-draft-obsolete-asset-ids.txt"
 
       - name: Create the reviewed release as a draft
         uses: softprops/action-gh-release@v2
         with:
-          files: release-assets/Logseq-*
+          files: |
+            release-assets/VERSION
+            release-assets/SOURCE_REVISION
+            release-assets/SHA256SUMS.txt
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.blockmap
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.selfhost6.json
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.blockmap
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.blockmap
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.selfhost6.json
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.blockmap
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
+            release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
+            release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
+            release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
+            release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
+            release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.blockmap
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.selfhost6.json
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.blockmap
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.selfhost6.json
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/selfhost-official-architecture-v1-arm64-mac.yml
+            release-assets/selfhost-official-architecture-v1-arm64.yml
+            release-assets/selfhost-official-architecture-v1-linux-arm64.yml
+            release-assets/selfhost-official-architecture-v1-linux.yml
+            release-assets/selfhost-official-architecture-v1-x64-mac.yml
+            release-assets/selfhost-official-architecture-v1-x64.yml
           tag_name: ${{ env.SELFHOST6_TARGET_VERSION }}
           target_commitish: ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}
           name: Logseq ${{ env.SELFHOST6_TARGET_VERSION }}
@@ -1229,6 +1317,89 @@ jobs:
             --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
             --source-full-sha "${EXPECTED_SOURCE_FULL_SHA}" \
             --target-version "${SELFHOST6_TARGET_VERSION}"
+
+  selfhost-release-bridge:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'bridge-published-.7' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: selfhost-production
+    concurrency:
+      group: selfhost-release-selfhost-official-architecture-v1
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Check out exact published release tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download and verify the published latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-published-release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
+            > "${RUNNER_TEMP}/selfhost-latest-release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-published-tag-refs.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-published-releases.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-published-assets.json"
+          mkdir published-release-assets
+          gh release download "${SELFHOST6_TARGET_VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir published-release-assets
+          node scripts/selfhost6/verify-draft-release.mjs \
+            --phase published \
+            --release-json "${RUNNER_TEMP}/selfhost-published-release.json" \
+            --latest-release-json "${RUNNER_TEMP}/selfhost-latest-release.json" \
+            --assets-json "${RUNNER_TEMP}/selfhost-published-assets.json" \
+            --tag-refs-json "${RUNNER_TEMP}/selfhost-published-tag-refs.json" \
+            --release-list-json "${RUNNER_TEMP}/selfhost-published-releases.json" \
+            --artifact-directory published-release-assets \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${GITHUB_SHA}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}"
+
+      - name: Stage the one-time .6 bridge pointers
+        run: |
+          node scripts/selfhost6/promote-update-feed.mjs \
+            --artifact-directory published-release-assets \
+            --output-directory bridge-pointers \
+            --expected-target-version "${SELFHOST6_TARGET_VERSION}" \
+            --descriptors \
+            published-release-assets/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json \
+            published-release-assets/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json \
+            published-release-assets/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json \
+            published-release-assets/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json \
+            published-release-assets/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}-nsis.exe.selfhost6.json
+
+      - name: Promote exactly five updater assets and four pointers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_EXISTING_RELEASE_ID: ${{ secrets.SELFHOST_EXISTING_RELEASE_ID }}
+          SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA }}
+          SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA }}
+          SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA }}
+        run: |
+          node scripts/selfhost6/promote-existing-release.mjs \
+            --artifact-directory published-release-assets \
+            --pointer-directory bridge-pointers \
+            --release-line-id selfhost-official-architecture-v1 \
+            --expected-source-full-sha "${GITHUB_SHA}" \
+            --expected-version "${SELFHOST6_TARGET_VERSION}" \
+            --receipt "${RUNNER_TEMP}/selfhost6-bridge-receipt.json"
 
   nightly-release:
     if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' }}
