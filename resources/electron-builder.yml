@@ -42,8 +42,9 @@ protocols:
       - logseq
 
 publish:
-  - provider: generic
-    url: https://github.com/cfenglv/logseq/releases/download/selfhost-official-architecture-v1
+  - provider: github
+    owner: cfenglv
+    repo: logseq
 
 extraResources:
   - from: updater/TARGET_BUILD_MANIFEST.json
