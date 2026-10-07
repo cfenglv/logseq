@@ -71,6 +71,16 @@
             :else
             false))))))
 
+(defn- current-page-uuid-string
+  []
+  (when-let [page (state/get-current-page)]
+    (if (util/uuid-string? page)
+      page
+      (let [{:keys [status value]}
+            (db-subs/resource-snapshot [:page-identity (util/page-name-sanity-lc page)])]
+        (when (= :ready status)
+          (some-> value str))))))
+
 (defn- current-page-deleted?
   [current-page deleted]
   (and current-page
@@ -106,12 +116,13 @@
       {:repo repo :projection-epoch (:projection-epoch delta)}])
     (let [current-projection? (or (nil? delta)
                                   (db-subs/current-projection? delta))
+          ;; Named routes use the mounted identity before deletion invalidates it.
+          current-page (when current-projection? (current-page-uuid-string))
           editing-block-before (when delta (editing-block-before-delta))
           delta-applied? (when delta
                            (db-subs/apply-delta! delta))]
       (when current-projection?
       (let [{:keys [initial-pages? end?]} tx-meta
-            current-page (state/get-current-page)
             blocks (:blocks delta)
             deleted (:deleted delta)]
         (when (= repo (state/get-current-repo))
@@ -125,9 +136,10 @@
               (state/sidebar-remove-deleted-block! deleted-ids))
             (when-let [removed-page-ids (not-empty (concat deleted-ids recycled-ids))]
               (state/remove-pages-from-recent! removed-page-ids)))
-          (when (and (current-page-deleted? current-page deleted)
-                     (not (util/mobile?)))
-            (route-handler/redirect-to-home!))
+          (when (or (current-page-deleted? current-page deleted)
+                    (and (not initial-pages?)
+                         (current-page-recycled? current-page blocks)))
+            (route-handler/<redirect-after-page-deletion!))
 
           (cond
             initial-pages?
@@ -137,9 +149,6 @@
 
             :else
             (do
-              (when (current-page-recycled? current-page blocks)
-                (route-handler/redirect! {:to :home :push false}))
-
               (let [external-edit? (not= (:client-id tx-meta)
                                          (:client-id (state/get-state)))
                     refresh-edit? (or external-edit?

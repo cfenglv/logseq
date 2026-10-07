@@ -63,13 +63,6 @@
   [ws]
   (sync-transport/ws-open? ws))
 
-(defn- enqueue-asset-task!
-  [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue
-           (fn [prev]
-             (p/then prev (fn [_] (task)))))))
-
 (defn- enqueue-send-task!
   [client task]
   (if-let [queue (:send-queue client)]
@@ -265,6 +258,7 @@
         (if (or (contains? message :success-tx-ids)
                 (contains? message :failed-tx-id))
           (do
+            (sync-apply/commit-large-title-markers! repo request (or success-tx-ids []))
             (sync-apply/mark-pending-txs-false! repo successful-tx-ids)
             (when failed-tx-id
               (sync-apply/rollback-and-mark-failed-txs! repo [failed-tx-id])))
@@ -287,7 +281,7 @@
     (request-pull! client local-tx))
   (sync-assets/enqueue-asset-sync!
    repo client
-   {:enqueue-asset-task-f enqueue-asset-task!
+   {:enqueue-asset-task-f sync-assets/enqueue-asset-task!
     :current-client-f current-client
     :broadcast-rtc-state!-f broadcast-rtc-state!
     :fail-fast-f fail-fast})

@@ -4,9 +4,43 @@
             [frontend.common.thread-api :as thread-api]
             [frontend.worker.db-listener :as db-listener]
             [frontend.worker.handler.block :as block-handler]
-            [frontend.worker.handler.transaction]
+            [frontend.worker.handler.transaction :as transaction]
             [frontend.worker.state :as worker-state]
-            [logseq.outliner.op :as outliner-op]))
+            [logseq.common.util :as common-util]
+            [logseq.db :as ldb]
+            [logseq.db.test.helper :as db-test]
+            [logseq.outliner.op :as outliner-op]
+            [logseq.outliner.recycle :as recycle]))
+
+(deftest automatic-recycle-gc-respects-remote-graph-boundary-test
+  (doseq [remote? [true false]]
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "retained-page"}
+                  :blocks [{:block/title "retained-text"
+                            :build/properties {:default "retained-property"}
+                            :build/children [{:block/title "retained-child"}]}]}])
+          page (ldb/get-page @conn "retained-page")
+          page-id (:db/id page)
+          reports (atom [])]
+      (d/transact! conn [{:db/ident :logseq.kv/graph-remote? :kv/value remote?}])
+      (ldb/transact! conn (recycle/recycle-page-tx-data @conn page {:now-ms 0})
+                     {:outliner-op :delete-page})
+      (let [before @conn]
+        (d/listen! conn ::gc #(swap! reports conj %))
+        (with-redefs [common-util/time-ms (constantly (* 31 24 3600 1000))]
+          (transaction/maybe-run-recycle-gc! conn))
+        (if remote?
+          (do
+            (is (true? (identical? before @conn))
+                "Automatic GC must not mutate even an offline remote graph.")
+            (is (zero? (count @reports)))
+            (is (some? (d/entity @conn page-id)))
+            (is (nil? (d/entity @conn :logseq.kv/recycle-last-gc-at))))
+          (do
+            (is (nil? (d/entity @conn page-id)))
+            (is (= (* 31 24 3600 1000)
+                   (:kv/value (d/entity @conn :logseq.kv/recycle-last-gc-at)))))))
+      (d/unlisten! conn ::gc))))
 
 (deftest apply-outliner-ops-returns-stored-delta-and-canonical-editor-rows-test
   (let [repo "transaction-handler-test"

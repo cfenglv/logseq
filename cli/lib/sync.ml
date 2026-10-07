@@ -925,14 +925,35 @@ let execute_upload mode config repo e2ee_password =
           ensure_upload_e2ee_password () >>= function
           | Error err -> error err
           | Ok () -> (
-              Transport.thread_api_db_sync_upload_graph upload_invoke_config
-                ~repo
-              >>= fun result ->
-              match tagged_error_value result with
-              | Some value -> error (sync_upload_worker_error value)
-              | None ->
-                  Cli_effect.pure
-                    (Cli_result.ok ~command mode (Raw (result_value result))))))
+              Cli_effect.catch
+                ( Transport.thread_api_db_sync_upload_graph upload_invoke_config
+                    ~repo
+                >>= fun result ->
+                  match tagged_error_value result with
+                  | Some value -> error (sync_upload_worker_error value)
+                  | None ->
+                      Cli_effect.pure
+                        (Cli_result.ok ~command mode (Raw (result_value result))) )
+                (function
+                  | Transport.Http_error
+                      { code = "graph-already-exists"; message; _ } ->
+                      let value =
+                        Edn_util.map_vec
+                          (Vec.of_array
+                             [|
+                               (kw "code", Edn_util.string "graph-already-exists");
+                               (kw "message", Edn_util.string message);
+                               ( kw "data",
+                                 Edn_util.map_vec
+                                   (Vec.singleton
+                                      ( kw "graph-name",
+                                        Edn_util.string
+                                          (graph_string
+                                             (Cli_config.repo_to_graph repo)) )) );
+                             |])
+                      in
+                      error (sync_upload_worker_error value)
+                  | exn -> Cli_effect.error exn))))
 
 let execute_start mode config repo e2ee_password =
   let command = Command_id.Sync_start in
@@ -1146,7 +1167,13 @@ let execute_download mode config repo graph progress progress_explicit
       Cli_effect.pure
         (Cli_result.error ~command:Command_id.Sync_download mode err)
   | Ok config -> (
-      invoke_global_config config ~create_empty_db:true >>= function
+      ( Server_runtime.create_graph config repo >>= function
+        | Error err -> Cli_effect.pure (Error err)
+        | Ok generation ->
+            invoke_global_config
+              { config with graph_generation = Some generation }
+              ~create_empty_db:true )
+      >>= function
       | Error err ->
           Cli_effect.pure
             (Cli_result.error ~command:Command_id.Sync_download mode err)

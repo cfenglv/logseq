@@ -725,6 +725,45 @@
                 :bidirectional
                 (affected-keys db [[:db/add 5 property-ident 7]]))))))))
 
+(deftest bidirectional-invalidation-does-not-require-intersecting-property-scope-test
+  (doseq [property-ident [:user.property/target
+                          :plugin.property.example/target]]
+    (testing (str property-ident)
+      (let [{:keys [db target-before-uuid target-after-uuid]}
+            (bidirectional-db property-ident)
+            disabled-db (d/db-with db [[:db/retract 5 :block/tags 2]
+                                      [:db/add 5 :block/tags 3]])
+            enabled-db (d/db-with disabled-db
+                                  [[:db/add 3 :logseq.property.class/enable-bidirectional? true]])
+            empty-scope-db (d/db-with enabled-db [[:db/retract 4 :logseq.property/classes 2]])
+            target-key #{[:bidirectional target-before-uuid]}]
+        (doseq [[label db-before tx-data expected]
+                [["retarget" enabled-db [[:db/add 5 property-ident 7]]
+                  (conj target-key [:bidirectional target-after-uuid])]
+                 ["enable" disabled-db
+                  [[:db/add 3 :logseq.property.class/enable-bidirectional? true]] target-key]
+                 ["disable" enabled-db
+                  [[:db/add 3 :logseq.property.class/enable-bidirectional? false]] target-key]
+                 ["clear scope" enabled-db [[:db/retract 4 :logseq.property/classes 2]] target-key]
+                 ["empty scope" empty-scope-db [[:db/add 5 property-ident 7]] #{}]
+                 ["disabled source class" disabled-db [[:db/add 5 property-ident 7]] #{}]]]
+          (testing label
+            (is (= expected (keys-with-tag :bidirectional (affected-keys db-before tx-data))))))
+        (testing "existing exclusions still apply"
+          (doseq [tx-data [[[:db/add 3 :logseq.property.class/enable-bidirectional? false]]
+                           [[:db/add 3 :logseq.property/built-in? true]]
+                           [[:db/add 3 :logseq.property/deleted-at 1000]]
+                           [[:db/add 4 :logseq.property/deleted-at 1000]]
+                           [[:db/add 5 :logseq.property/deleted-at 1000]]
+                           [[:db/add 5 :block/tags 1]]
+                           [{:db/id 8 :db/ident :logseq.class/Property :block/uuid (random-uuid)}
+                            [:db/add 5 :block/tags 8]]
+                           [[:db/add 5 property-ident 5]]
+                           [[:db/add 6 :logseq.property/created-from-property 4]]]]
+            (is (= #{} (keys-with-tag :bidirectional
+                                      (affected-keys (d/db-with enabled-db tx-data)
+                                                     [[:db/add 5 :block/title "Edited source"]]))))))))))
+
 (deftest bidirectional-invalidation-covers-source-membership-and-visibility-test
   (let [{:keys [db target-before-uuid]} (bidirectional-db :user.property/target)
         expected #{[:bidirectional target-before-uuid]}]

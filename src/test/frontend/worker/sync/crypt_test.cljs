@@ -677,10 +677,13 @@
                                                           (p/resolved :exported-public-key))
                                ldb/write-transit-str pr-str]
                  (let [task-1 (sync-crypt/ensure-user-rsa-keys!)
-                       task-2 (sync-crypt/ensure-user-rsa-keys!)]
-                   (p/all [task-1 task-2])))
+                       task-2 (sync-crypt/ensure-user-rsa-keys!)
+                       task-3 (sync-crypt/ensure-user-rsa-keys! {:ensure-server? true})
+                       task-4 (sync-crypt/ensure-user-rsa-keys! {:ensure-server? true
+                                                             :server-rsa-keys-exists? false})]
+                   (p/all [task-1 task-2 task-3 task-4])))
                (p/then (fn [results]
-                         (is (= 2 (count results)))
+                         (is (= 4 (count results)))
                          (is (= 1 @ui-calls))
                          (is (= 1 (count @upload-calls)))
                          (is (= ["new-password"] @save-calls))))

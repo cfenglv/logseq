@@ -6,6 +6,7 @@
             [frontend.worker.pipeline :as worker-pipeline]
             [frontend.worker.platform :as platform]
             [frontend.worker.render-delta :as render-delta]
+            [frontend.worker.search :as search]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync :as db-sync]
@@ -79,10 +80,26 @@
     (is (= [["repo" nil tx-report {:defer? true}]]
            @calls))))
 
-(deftest db-listener-persists-local-tx-before-broadcasting-ui-refresh-test
+(deftest db-listener-skips-search-sync-for-imported-data-test
+  (doseq [tx-meta [{:logseq.graph-parser.exporter/imported-data? true}
+                   {:logseq.db.sqlite.export/imported-data? true}
+                   {:from-disk? true}]]
+    (let [calls (atom 0)]
+      (with-redefs [search/sync-search-indice
+                    (fn [& _]
+                      (swap! calls inc)
+                      {})]
+        ((get-method db-listener/listen-db-changes :search)
+         :search
+         {:repo "repo"}
+         {:tx-meta tx-meta :tx-data [:tx]}))
+      (is (zero? @calls) (str tx-meta)))))
+
+(deftest db-listener-persists-local-tx-before-checksum-and-ui-refresh-test
   (let [conn (db-test/create-conn)
         calls (atom [])]
-    (with-redefs [db-sync/update-local-sync-checksum! (fn [& _] nil)
+    (with-redefs [db-sync/update-local-sync-checksum! (fn [& _]
+                                                    (swap! calls conj :checksum))
                   db-sync/handle-local-tx! (fn [& _]
                                              (swap! calls conj :persist-local-tx))
                   worker-pipeline/invoke-hooks (fn [_conn tx-report _context]
@@ -95,8 +112,8 @@
                                                            (swap! calls conj :broadcast-ui-refresh)))]
       (db-listener/listen-db-changes! "repo" conn :handler-keys [:sync-db-to-main-thread :db-sync])
       (d/transact! conn [{:db/id -1 :block/title "b1"}] {:local-tx? true}))
-    (is (= [:persist-local-tx :build-ui-refresh :broadcast-ui-refresh] @calls)
-        "UI refresh work must wait until the local tx has been persisted.")))
+    (is (= [:persist-local-tx :checksum :build-ui-refresh :broadcast-ui-refresh] @calls)
+        "The sync journal must precede the derived checksum and UI refresh.")))
 
 (deftest db-listener-builds-one-render-delta-for-origin-and-broadcast-test
   (let [repo "repo"
@@ -250,7 +267,8 @@
 (deftest db-listener-does-not-publish-incomplete-graph-render-deltas-test
   (doseq [tx-meta [{:rtc-download-graph? true}
                    {:sync-download-graph? true}
-                   {:logseq.graph-parser.exporter/new-graph? true}]]
+                   {:logseq.graph-parser.exporter/new-graph? true}
+                   {:logseq.graph-parser.exporter/imported-data? true}]]
     (let [conn (db-test/create-conn)
           build-inputs (atom [])
           broadcast-payloads (atom [])]
@@ -377,7 +395,7 @@
                           :where [?e :block/title "hello"]]
                         @conn)))
           (is (= 1 (count @captured-errors)))
-          (is (= [:checksum :persist :build-ui-refresh :broadcast-ui-refresh]
+          (is (= [:persist :checksum :build-ui-refresh :broadcast-ui-refresh]
                  @calls)))))))
 
 (deftest deferred-listener-failures-do-not-block-ui-sync-test

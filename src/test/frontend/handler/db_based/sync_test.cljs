@@ -3,7 +3,9 @@
             [clojure.string :as string]
             [electron.ipc :as ipc]
             [frontend.config :as config]
+            [frontend.context.i18n :as i18n]
             [frontend.handler.db-based.sync :as db-sync]
+            [frontend.handler.notification :as notification]
             [frontend.persist-db :as persist-db]
             [frontend.handler.repo :as repo-handler]
             [frontend.handler.user :as user-handler]
@@ -757,6 +759,32 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (finish-async-test! done)))))))
+
+(deftest rtc-download-graph-reports-partial-assets-test
+  (async done
+    (let [warnings (atom [])]
+      (-> (p/with-redefs [db-sync/http-base (constantly "https://sync.example.invalid")
+                         user-handler/<ensure-id&access-token! (fn [] (p/resolved true))
+                         util/electron? (constantly true)
+                         persist-db/<open-and-fetch-schema (fn [& _] (p/resolved {:schema {}}))
+                         state/<invoke-db-worker
+                         (fn [method & _]
+                           (p/resolved (if (= :thread-api/db-sync-download-missing-assets method)
+                                         {:total 2 :downloaded 1 :failed 1 :skipped-existing 0}
+                                         :ok)))
+                         notification/show! (fn [& args] (swap! warnings conj args))
+                         i18n/t (fn [& args]
+                                  (is (= [:sync/assets-download-partial 1 1] args))
+                                  "partial assets")
+                         state/pub-event! (fn [& _] nil)
+                         state/set-state! (fn [& _] nil)]
+            (db-sync/<rtc-download-graph! "assets-graph" "graph-1" false))
+          (p/then (fn [result]
+                    (is (true? result) "The downloaded graph remains available")
+                    (is (= 1 (count @warnings)))
+                    (is (= [:warning false] (vec (rest (first @warnings)))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally #(finish-async-test! done))))))
 
 (deftest rtc-download-graph-skips-runtime-rebind-outside-electron-test
   (async done

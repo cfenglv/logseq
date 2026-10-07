@@ -56,8 +56,7 @@
   [repo]
   (true? (get @*repo->upload-stopped? repo)))
 
-(declare enqueue-asset-task!
-         apply-remote-txs!
+(declare apply-remote-txs!
          attach-frozen-wire-cache
          cap-upload-request-tx-entries
          ref-attr?
@@ -225,9 +224,32 @@
                    upload-response-timeout-ms)]
         (reset! *upload-request (assoc request' :timer timer))))))
 
+(defn commit-large-title-markers!
+  "Write sender metadata only for accepted wire entries whose local title is unchanged."
+  [repo request accepted-tx-ids]
+  (let [accepted (when (some? accepted-tx-ids) (set accepted-tx-ids))
+        entries (cond->> (:large-title-marker-tx-entries request)
+                  accepted (filter #(contains? accepted (:tx-id %))))]
+    (when (seq entries)
+      (let [conn (worker-state/get-datascript-conn repo)]
+        (when-not conn
+          (fail-fast :db-sync/missing-db {:repo repo :op :large-title-marker-ack}))
+        (let [marker-txs (into []
+                              (keep (fn [{:keys [marker-tx target-eid logical-title]}]
+                                      (let [entity (d/entity @conn (nth marker-tx 1))]
+                                        (when (and (some? target-eid)
+                                                   (= target-eid (:db/id entity))
+                                                   (= logical-title (:block/title entity)))
+                                          marker-tx))))
+                              (mapcat :marker-commits entries))]
+          (when (seq marker-txs)
+            (ldb/transact! conn marker-txs
+                           {:rtc-tx? true :persist-op? false :op :large-title-marker-ack})))))))
+
 (defn ack-upload-response!
   [repo client]
   (when-let [request (clear-upload-response-timeout! client)]
+    (commit-large-title-markers! repo request nil)
     (doseq [{:keys [logical-tx-id source-next-index chunk-seq chunk-final?]}
             (:staged-upload-acks request)
             :when (not chunk-final?)]
@@ -284,20 +306,17 @@
   (sync-assets/request-asset-download!
    repo asset-uuid
    {:current-client-f current-client
-    :enqueue-asset-task-f enqueue-asset-task!
+    :enqueue-asset-task-f sync-assets/enqueue-asset-task!
     :broadcast-rtc-state!-f broadcast-rtc-state!}))
-
-(defn- enqueue-asset-task! [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue (fn [prev] (p/then prev (fn [_] (task)))))))
 
 (defn- derive-history-outliner-ops
   [db-before db-after tx-data tx-meta]
   (op-construct/derive-history-outliner-ops db-before db-after tx-data tx-meta))
 
 (defn- rebase-history-ops
-  [local-tx]
-  {:forward-ops (seq (:forward-outliner-ops local-tx))
+  [local-tx db-before]
+  {:forward-ops (seq (op-construct/canonicalize-insert-ops
+                     db-before (:tx local-tx) (:forward-outliner-ops local-tx)))
    :inverse-ops (seq (:inverse-outliner-ops local-tx))})
 
 (defn- normalize-tx-data-for-rebase
@@ -581,8 +600,34 @@
   (or (and (integer? value) (neg? value))
       (string? value)))
 
-(defn- upload-tx-item-tempids
-  [db item]
+(defn- cardinality-many-attr?
+  [db attr]
+  (= :db.cardinality/many
+     (or (get-in (d/schema db) [attr :db/cardinality])
+         (:db/cardinality (d/entity db attr)))))
+
+(defn- upload-replaced-values
+  "The [entity attr] pairs whose cardinality-one value the tx retracts on an
+  existing entity. The server validates each request as a whole
+  transaction, so such a retract sent ahead of the add of the new value
+  can leave the entity without a required attribute and be rejected."
+  [db tx-data]
+  (into #{}
+        (keep (fn [item]
+                (when (and (vector? item)
+                           (= :db/retract (first item))
+                           (<= 4 (count item)))
+                  (let [[_op entity attr] item]
+                    (when (and (not (upload-tempid? entity))
+                               (not (and db (cardinality-many-attr? db attr))))
+                      [entity attr])))))
+        tx-data))
+
+(defn- upload-tx-item-group-keys
+  "Keys of the groups an upload tx item belongs to. Items sharing a key are
+  sent in one request: those of a tempid, which the server resolves within a
+  request, and the retract and adds of a value in `replaced`."
+  [db replaced item]
   (cond
     (and (map? item) (upload-tempid? (:db/id item)))
     #{(:db/id item)}
@@ -590,14 +635,17 @@
     (and (vector? item)
          (contains? #{:db/add :db/retract :db/cas :db.fn/cas} (first item))
          (<= 4 (count item)))
-    (let [[_op entity attr value] item]
+    (let [[op entity attr value] item]
       (cond-> #{}
         (upload-tempid? entity)
         (conj entity)
         (and db
              (ref-attr? db attr)
              (upload-tempid? value))
-        (conj value)))
+        (conj value)
+        (and (contains? #{:db/add :db/retract} op)
+             (contains? replaced [entity attr]))
+        (conj [::value-replacement entity attr])))
 
     (and (vector? item)
          (contains? #{:db/retractEntity :db.fn/retractEntity} (first item))
@@ -622,22 +670,23 @@
         (recur (next remaining) [[start end]]))
       merged)))
 
-(defn- upload-tempid-range-by-start
+(defn- upload-group-range-by-start
   [db tx-data]
-  (let [ranges-by-tempid
+  (let [replaced (upload-replaced-values db tx-data)
+        ranges-by-key
         (reduce-kv
          (fn [acc idx item]
-           (reduce (fn [acc* tempid]
-                     (update acc* tempid
+           (reduce (fn [acc* group-key]
+                     (update acc* group-key
                              (fn [[start end]]
                                [(if (some? start) (min start idx) idx)
                                 (if (some? end) (max end idx) idx)])))
                    acc
-                   (upload-tx-item-tempids db item)))
+                   (upload-tx-item-group-keys db replaced item)))
          {}
          tx-data)]
-         (into {} (map (fn [[start end]] [start end])
-                  (merge-upload-tx-ranges (vals ranges-by-tempid))))))
+    (into {} (map (fn [[start end]] [start end])
+                  (merge-upload-tx-ranges (vals ranges-by-key))))))
 
 (defn- outbound-item-shape
   [item]
@@ -692,13 +741,13 @@
           tx-data)))
 
 (defn- canonicalize-outbound-tx-data
-  "Wire data must never carry numeric db/ids or refs to entities that no longer
-  exist. Re-resolve any numeric entity or ref value for both op-prefixed and raw
+  "Wire data must never carry numeric db/ids. Re-resolve any numeric entity or ref value for both op-prefixed and raw
   datom forms; drop ops whose ref target is absent from both the payload's own
   :block/uuid adds and the current db (for example a parent retracted in the
   same rebased op). Numeric ids are resolved first from the payload's own
   :block/uuid datoms, then from the current db; ordinary payloads without
-  numeric ids pass through unchanged."
+  numeric ids pass through unchanged: their UUID refs belong to the historical
+  transaction and may have been deleted by a later pending transaction."
   [db tx-data]
   (if db
     (let [tx-uuid-refs (into {}
@@ -753,7 +802,7 @@
                                                (ref-attr? db a))
                                       a))))
                           tx-data)
-          tx-data (into []
+          filtered-tx-data (into []
                         (keep (fn [item]
                                 (if-let [{:keys [e a v]} (outbound-item-shape item)]
                                   (when (and (entity-valid? e)
@@ -774,7 +823,7 @@
                 tx-data)]
       (if needs-canonicalization?
         (rewrite-canonicalized-outbound-tx-data
-         tx-data outbound-item-shape created-uuids ref-attrs entity-uuid-ref)
+         filtered-tx-data outbound-item-shape created-uuids ref-attrs entity-uuid-ref)
         tx-data))
     tx-data))
 
@@ -785,9 +834,8 @@
     [(inc idx) [(nth tx-data idx)]]))
 
 (defn- next-large-upload-request-chunk
-  [db tx-data start]
-  (let [range-by-start (upload-tempid-range-by-start db tx-data)
-        total (count tx-data)]
+  [tx-data range-by-start start]
+  (let [total (count tx-data)]
     (loop [idx start
            chunk []]
       (if (< idx total)
@@ -836,17 +884,18 @@
 
 (defn- upload-chunk-boundaries
   [db tx-data]
-  (loop [start 0
-         boundaries []]
-    (if (< start (count tx-data))
-      (let [{:keys [next-index]} (next-large-upload-request-chunk db tx-data start)]
-        (when-not (> next-index start)
-          (throw (ex-info "Large upload chunking did not advance"
-                          {:type :db-sync/large-upload-no-progress
-                           :start start
-                           :total (count tx-data)})))
-        (recur next-index (conj boundaries next-index)))
-      boundaries)))
+  (let [range-by-start (upload-group-range-by-start db tx-data)]
+    (loop [start 0
+           boundaries []]
+      (if (< start (count tx-data))
+        (let [{:keys [next-index]} (next-large-upload-request-chunk tx-data range-by-start start)]
+          (when-not (> next-index start)
+            (throw (ex-info "Large upload chunking did not advance"
+                            {:type :db-sync/large-upload-no-progress
+                             :start start
+                             :total (count tx-data)})))
+          (recur next-index (conj boundaries next-index)))
+        boundaries))))
 
 (defn- attach-frozen-wire-cache
   [{:keys [tx-id tx-data outliner-op] :as entry} state]
@@ -870,8 +919,9 @@
   (let [total (count tx-data)
         source-digest (or (:source-digest entry)
                           (sync-protocol/tx-payload-digest outliner-op tx-data))
-        session-id (sync-protocol/tx-upload-session-id tx-id outliner-op tx-data)
         existing-state (:upload-state entry)
+        session-id (or (:session-id existing-state)
+                       (sync-protocol/tx-upload-session-id tx-id outliner-op tx-data))
         _ (when (and existing-state
                      (or (not= source-digest (:source-digest existing-state))
                          (not= session-id (:session-id existing-state))
@@ -898,13 +948,14 @@
                          (integer? chunk-seq)
                          (integer? next-index)
                          (<= 0 start)
-                         (< start next-index)
+                         (or (< start next-index)
+                             (and (pos? chunk-seq) (= start next-index total)))
                          (<= next-index total))
             (throw (ex-info "Invalid staged upload cursor"
                             {:type :db-sync/invalid-staged-upload-cursor
                              :logical-tx-id tx-id})))
         chunk (subvec tx-data start next-index)
-        final? (>= next-index total)
+        final? (= chunk-seq (dec (count (:boundaries state))))
         wire-tx-id (sync-protocol/tx-chunk-id tx-id session-id chunk-seq final?)]
     (log/info :db-sync/large-upload-request-chunk
               {:repo repo
@@ -937,9 +988,17 @@
       (let [entry-datom-count (count tx-data)
             next-datom-count (+ datom-count entry-datom-count)
             boundaries (when (and staged-upload?
+                                  (not (:upload-state entry))
+                                  (not (:wire-cache entry))
+                                  (empty? result)
                                   (> entry-datom-count max-upload-request-datoms))
                          (upload-chunk-boundaries db tx-data))]
         (cond
+          (:upload-state entry)
+          (if (empty? result)
+            [(large-upload-request-entry repo entry nil)]
+            result)
+
           (and (empty? result) (> entry-datom-count max-upload-request-datoms))
           [(cond
              (:wire-cache entry)
@@ -1113,7 +1172,11 @@
                                                               (:forward-outliner-ops action))
                               :db-sync/inverse-outliner-ops (if undo?
                                                               (:forward-outliner-ops action)
-                                                              (:inverse-outliner-ops action))})]
+                                                              (:inverse-outliner-ops action))}
+                       ;; Replayed recorded tx-data already contains the transact
+                       ;; pipeline's effects for the original tx.
+                       (not (seq ops))
+                       (assoc :db-sync/replayed-tx-data? true))]
           ;; (prn :debug :undo? undo? :ops)
           ;; (cljs.pprint/pprint ops')
           ;; (cljs.pprint/pprint (select-keys action [:tx-id :outliner-op :forward-outliner-ops :inverse-outliner-ops]))
@@ -1185,7 +1248,16 @@
                        :wire-entry wire-payload}))
         wire-payload)))
 
-(defn- prepare-wire-tx-entry!
+(defn- <upload-aes-key
+  [repo graph-id tx-entries]
+  (if (and (seq tx-entries) (sync-crypt/graph-e2ee? repo))
+    (p/let [aes-key (sync-crypt/<ensure-graph-aes-key repo graph-id)]
+      (when (nil? aes-key)
+        (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
+      aes-key)
+    (p/resolved nil)))
+
+(defn- <encrypt-tx-entry
   [repo graph-id aes-key {:keys [tx-data wire-cache] :as tx-entry}]
   (if wire-cache
     tx-entry
@@ -1204,6 +1276,117 @@
              :source-digest (when freeze-wire?
                               (sync-protocol/tx-payload-digest
                                (:outliner-op tx-entry) tx-data))))))
+
+(defn- large-title-marker-commits
+  [db logical-tx-data wire-payload]
+  (let [temp-id->uuid (tx-temp-id->uuid logical-tx-data)
+        entity-ref (fn [e]
+                     (if-let [block-uuid (get temp-id->uuid e)]
+                       [:block/uuid block-uuid]
+                       e))
+        logical-titles (into {}
+                             (keep (fn [item]
+                                     (when (and (vector? item)
+                                                (= :db/add (nth item 0))
+                                                (= :block/title (nth item 2 nil))
+                                                (sync-large-title/large-title? (nth item 3 nil)))
+                                       [(entity-ref (nth item 1)) (nth item 3)])))
+                             logical-tx-data)]
+    (when (seq logical-titles)
+      (into []
+            (keep (fn [item]
+                    (when (and (vector? item)
+                               (= :db/add (nth item 0))
+                               (= sync-large-title/large-title-object-attr (nth item 2 nil))
+                               (sync-large-title/large-title-object? (nth item 3 nil)))
+                      (let [e (entity-ref (nth item 1))]
+                        (when-let [logical-title (get logical-titles e)]
+                          {:marker-tx (assoc item 1 e)
+                           :target-eid (:db/id (d/entity db e))
+                           :logical-title logical-title})))))
+            (sqlite-util/read-transit-str (:tx wire-payload))))))
+
+(defn- <send-tx-batch!
+  [repo client db ws local-tx tx-entries tx-entries*]
+  (let [payload (mapv #(tx-entry->wire-payload! repo %) tx-entries*)
+        marker-tx-entries (into []
+                                (keep identity)
+                                (map (fn [{:keys [tx-id tx-data]} wire-payload]
+                                       (when-let [commits (seq (large-title-marker-commits db tx-data wire-payload))]
+                                         {:tx-id tx-id :marker-commits commits}))
+                                     tx-entries payload))
+        tx-ids (mapv #(or (:logical-tx-id %) (:tx-id %)) tx-entries*)
+        semantic-ack-tx-ids (->> tx-entries*
+                                 (keep (fn [{:keys [tx-id logical-tx-id chunk-final?]}]
+                                         (if logical-tx-id
+                                           (when chunk-final? logical-tx-id)
+                                           tx-id)))
+                                 vec)
+        wire-id->logical-id (->> tx-entries*
+                                 (keep (fn [{:keys [tx-id logical-tx-id]}]
+                                         (when logical-tx-id
+                                           [tx-id logical-tx-id])))
+                                 (into {}))
+        staged-upload-acks (->> tx-entries*
+                                (keep (fn [{:keys [logical-tx-id source-next-index
+                                                  chunk-index chunk-final?]}]
+                                        (when logical-tx-id
+                                          {:logical-tx-id logical-tx-id
+                                           :source-next-index source-next-index
+                                           :chunk-seq chunk-index
+                                           :chunk-final? chunk-final?})))
+                                vec)]
+    (reset! (:inflight client) tx-ids)
+    (p/do!
+     (send! ws {:type "tx/batch"
+                :client-revision (build-version/revision)
+                :t-before local-tx
+                :txs payload})
+     (start-upload-response-timeout!
+      client
+      {:tx-ids tx-ids
+       :semantic-ack-tx-ids semantic-ack-tx-ids
+       :wire-id->logical-id wire-id->logical-id
+       :outliner-ops (->> tx-entries (keep :outliner-op) distinct vec)
+       :large-title-marker-tx-entries marker-tx-entries
+       :staged-upload-acks staged-upload-acks
+       :t-before local-tx}))))
+
+(defn- <upload-pending-batch!
+  [repo client conn ws local-tx]
+  (let [batch (pending-txs repo {:limit 50})
+        graph-id (:graph-id client)
+        ops-conn (client-ops-conn repo)
+        db @conn]
+    (when (seq batch)
+      (let [{:keys [tx-entries drop-tx-ids drop-txs]}
+            (prepare-upload-tx-entries
+             repo conn batch {:staged-upload? (client-supports-staged-upload? client)})]
+        (when (seq drop-tx-ids)
+          (log/info :db-sync/drop-tx-ids {:tx-ids drop-tx-ids :drops drop-txs})
+          (mark-pending-txs-false! repo drop-tx-ids))
+        (-> (p/let [aes-key (<upload-aes-key repo graph-id tx-entries)
+                    tx-entries* (p/all
+                                 (mapv (partial <encrypt-tx-entry repo graph-id aes-key)
+                                       tx-entries))]
+              (let [current @worker-state/*db-sync-client]
+                ;; Freeze and send only for the owner that prepared the batch.
+                ;; Direct controlled callers need not register a socket client.
+                (when (and (seq tx-entries)
+                           (identical? conn (worker-state/get-datascript-conn repo))
+                           (identical? ops-conn (client-ops-conn repo))
+                           (or (nil? current)
+                               (and (= repo (:repo current))
+                                    (= graph-id (:graph-id current))
+                                    (identical? ws (:ws current))))
+                           (ws-open? ws)
+                           (worker-state/online?)
+                           (not (upload-stopped? repo)))
+                  (<send-tx-batch! repo client db ws local-tx tx-entries tx-entries*))))
+            (p/catch (fn [error]
+                       (sync-util/set-last-sync-error! client error)
+                       (log/error :db-sync/flush-pending-failed
+                                  {:repo repo :error error}))))))))
 
 (defn- log-flush-pending-skipped!
   [repo pending-count conn local-tx remote-tx inflight ws ws-open-state?
@@ -1252,68 +1435,7 @@
      repo pending-count conn local-tx remote-tx inflight ws ws-open-state?
      online? upload-stopped-state? ready?)
     (when ready?
-      (let [batch (pending-txs repo {:limit 50})]
-        (when (seq batch)
-          (let [{:keys [tx-entries drop-tx-ids drop-txs]}
-                (prepare-upload-tx-entries
-                 repo conn batch {:staged-upload? (client-supports-staged-upload? client)})]
-            (when (seq drop-tx-ids)
-              (log/info :db-sync/drop-tx-ids {:tx-ids drop-tx-ids
-                                              :drops drop-txs})
-              (mark-pending-txs-false! repo drop-tx-ids))
-            (-> (p/let [aes-key (when (and (seq tx-entries) (sync-crypt/graph-e2ee? repo))
-                                  (sync-crypt/<ensure-graph-aes-key repo (:graph-id client)))
-                        _ (when (and (seq tx-entries) (sync-crypt/graph-e2ee? repo) (nil? aes-key))
-                            (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))
-                        tx-entries* (p/all
-                                     (mapv (partial prepare-wire-tx-entry!
-                                                    repo (:graph-id client) aes-key)
-                                           tx-entries))
-                        payload (mapv #(tx-entry->wire-payload! repo %) tx-entries*)
-                        tx-ids (mapv #(or (:logical-tx-id %) (:tx-id %)) tx-entries*)
-                        semantic-ack-tx-ids (->> tx-entries*
-                                                 (keep (fn [{:keys [tx-id logical-tx-id chunk-final?]}]
-                                                         (if logical-tx-id
-                                                           (when chunk-final? logical-tx-id)
-                                                           tx-id)))
-                                                 vec)
-                        wire-id->logical-id (->> tx-entries*
-                                                 (keep (fn [{:keys [tx-id logical-tx-id]}]
-                                                         (when logical-tx-id
-                                                           [tx-id logical-tx-id])))
-                                                 (into {}))
-                        staged-upload-acks (->> tx-entries*
-                                                (keep (fn [{:keys [logical-tx-id source-next-index
-                                                                  chunk-index chunk-final?]}]
-                                                        (when logical-tx-id
-                                                          {:logical-tx-id logical-tx-id
-                                                           :source-next-index source-next-index
-                                                           :chunk-seq chunk-index
-                                                           :chunk-final? chunk-final?})))
-                                                vec)]
-                  (when (seq tx-entries)
-                    (reset! (:inflight client) tx-ids)
-                    (p/do!
-                     (send! ws {:type "tx/batch"
-                                :client-revision (build-version/revision)
-                                :t-before local-tx
-                                :txs payload})
-                     (start-upload-response-timeout!
-                      client
-                      {:tx-ids tx-ids
-                       :semantic-ack-tx-ids semantic-ack-tx-ids
-                       :wire-id->logical-id wire-id->logical-id
-                       :outliner-ops (->> tx-entries
-                                          (keep :outliner-op)
-                                          distinct
-                                          vec)
-                       :staged-upload-acks staged-upload-acks
-                       :t-before local-tx}))))
-                (p/catch (fn [error]
-                           (sync-util/set-last-sync-error! client error)
-                           (log/error :db-sync/flush-pending-failed
-                                      {:repo repo
-                                       :error error})))))))))))
+      (<upload-pending-batch! repo client conn ws local-tx)))))
 
 (defn enqueue-flush-pending!
   [repo client]
@@ -1822,10 +1944,21 @@
 
     :create-page
     (let [[title opts] args
+          ;; Undo recycles ordinary namespace pages. Restore only nodes created
+          ;; by this history entry; a reused parent is not ours to restore.
+          _ (doseq [id (keep identity (:namespace-page-uuids opts))
+                    :let [node (d/entity @conn [:block/uuid id])]
+                    :when (and node (ldb/recycled? node))]
+              (outliner-recycle/restore! conn id))
           page-uuid (:uuid opts)
           existing-page (or (when (uuid? page-uuid)
                               (d/entity @conn [:block/uuid page-uuid]))
-                            (ldb/get-page @conn title))]
+                            ;; Page, tag and property titles can match; replay
+                            ;; must reuse only the kind being created.
+                            (let [page (ldb/get-page @conn title)]
+                              (when (and (not (ldb/property? page))
+                                         (= (boolean (:class? opts)) (boolean (ldb/class? page))))
+                                page)))]
       (if (and existing-page
                (not (ldb/recycled? existing-page)))
         [(:block/title existing-page) (:block/uuid existing-page)]
@@ -1890,15 +2023,19 @@
   (if (= :fix (:outliner-op local-tx))
     {:tx-id (:tx-id local-tx)
      :status :kept}
-    (let [{:keys [forward-ops inverse-ops]} (rebase-history-ops local-tx)
-          tx-meta {:outliner-op :rebase
-                   :original-outliner-op (:outliner-op local-tx)
-                   :db-sync/rebased-local? true
-                   ;; Keep stable tx-id across rebases so one logical pending op
-                   ;; doesn't fan out into duplicated pending rows.
-                   :db-sync/tx-id (:tx-id local-tx)
-                   :db-sync/forward-outliner-ops forward-ops
-                   :db-sync/inverse-outliner-ops inverse-ops}
+    (let [{:keys [forward-ops inverse-ops]} (rebase-history-ops local-tx rebase-db-before)
+          tx-meta (cond-> {:outliner-op :rebase
+                           :original-outliner-op (:outliner-op local-tx)
+                           :db-sync/rebased-local? true
+                           ;; Keep stable tx-id across rebases so one logical pending op
+                           ;; doesn't fan out into duplicated pending rows.
+                           :db-sync/tx-id (:tx-id local-tx)
+                           :db-sync/forward-outliner-ops forward-ops
+                           :db-sync/inverse-outliner-ops inverse-ops}
+                    ;; Replayed recorded tx-data already contains the transact
+                    ;; pipeline's effects for the original tx.
+                    (not (seq forward-ops))
+                    (assoc :db-sync/replayed-tx-data? true))
           forward-ops' (if (seq forward-ops)
                          forward-ops
                          (let [tx-data (-> (:tx local-tx) normalize-tx-data-for-rebase)]
@@ -2114,11 +2251,11 @@
      (cond-> {:error (js/Error. "Sync apply remote txs failed")
               :payload {:source "db-sync"
                         :operation "apply-remote-txs"
-                        :has-local-changes? has-local-changes?
+                        :has-local-changes has-local-changes?
                         :remote-tx-count (count remote-txs)
                         :local-tx-count (count local-txs)}}
        (ex-data error)
-       (assoc :extra {:error-data (ex-data error)})))
+       (assoc :extra {:error-data (str (ex-data error))})))
     (catch :default report-error
       (log/error :db-sync/report-apply-remote-txs-error-failed
                  {:error report-error}))))
@@ -2286,7 +2423,7 @@
                  (:kv/value (d/entity db-after :logseq.kv/graph-remote?)))
         (sync-assets/enqueue-asset-sync!
          repo client
-         {:enqueue-asset-task-f enqueue-asset-task!
+         {:enqueue-asset-task-f sync-assets/enqueue-asset-task!
           :current-client-f current-client
           :broadcast-rtc-state!-f broadcast-rtc-state!
           :fail-fast-f fail-fast})))))

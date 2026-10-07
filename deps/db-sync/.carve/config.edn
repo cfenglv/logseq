@@ -2,4 +2,6 @@
  :api-namespaces [;; CLI entry points
                   logseq.db-sync.node.find-checksum-drift
                   logseq.db-sync.node.recompute-log-checksum]
+ :ignore-vars [;; Used outside this package by frontend.worker.sync.apply-txs.
+               logseq.db-sync.protocol/tx-upload-session-id]
  :report {:format :ignore}}

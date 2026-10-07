@@ -477,23 +477,28 @@
          (let [block-uuid (random-uuid)
                first-request (p/deferred)
                replacement-request (p/deferred)
+               delta-request (p/deferred)
+               watch-key [:property-config]
+               patch (fn [rev title epoch]
+                       (assoc (block-patch rev {block-uuid
+                                               (block block-uuid rev title
+                                                      {:block.temp/positioned-properties {}})})
+                              :projection-epoch epoch))
                calls (atom 0)
                unsubscribe (atom nil)]
            (finish-async!
             done
             (p/with-redefs [subs/<load-block
                             (fn [_graph-id _block-uuid]
-                              (if (= 1 (swap! calls inc))
-                                first-request
-                                replacement-request))]
+                              (case (swap! calls inc)
+                                1 first-request
+                                2 replacement-request
+                                delta-request))]
               (-> (p/let [_ (subs/reset-graph! test-graph-id 2)
                           _ (reset! unsubscribe
                                     (subs/subscribe-block! block-uuid (fn [])))
                           _ (p/resolve! first-request
-                                        (assoc (block-patch
-                                                10 {block-uuid
-                                                    (block block-uuid 10 "before")})
-                                               :projection-epoch 2))
+                                        (patch 10 "before" 2))
                           _ (p/delay 0)
                           before (subs/block-snapshot block-uuid)
                           _ (is (= "before" (get-in before [:value :block/title])))
@@ -503,13 +508,21 @@
                           _ (p/delay 0)
                           _ (is (= 2 @calls))
                           _ (p/resolve! replacement-request
-                                        (assoc (block-patch
-                                                11 {block-uuid
-                                                    (block block-uuid 11 "after")})
-                                               :projection-epoch 3))
+                                        (patch 11 "after" 3))
+                          _ (p/delay 0)
+                          _ (is (= "after" (get-in (subs/block-snapshot block-uuid)
+                                                  [:value :block/title])))
+                          _ (subs/apply-delta!
+                             (delta 12 {:projection-epoch 3
+                                        :affected-keys #{watch-key}}))
+                          _ (p/delay 0)
+                          _ (is (= 3 @calls)
+                                "Retained watch keys must still reload after same-key projection replacement.")
+                          _ (p/resolve! delta-request (patch 13 "after delta" 3))
                           _ (p/delay 0)]
                     (is (= {:status :ready
-                            :value (block block-uuid 11 "after")}
+                            :value (block block-uuid 13 "after delta"
+                                          {:block.temp/positioned-properties {}})}
                            (subs/block-snapshot block-uuid))))
                   (p/finally
                    (fn []
@@ -2015,6 +2028,73 @@
                         [unsubscribe-children unsubscribe-child
                          unsubscribe-journal unsubscribe-resource]))))))))
 
+(deftest page-identity-readies-a-queued-page-block-before-its-own-response-test
+  (async done
+         (let [conn (db-test/create-conn)
+               page-uuid (random-uuid)
+               resource-key [:page-identity "queued page"]
+               worker-before-test @state/*db-worker
+               scheduled-flush (atom nil)
+               held-block (atom nil)
+               requests (atom [])
+               unsubscribers (atom [])
+               _ (d/transact! conn [{:block/uuid page-uuid
+                                    :block/tx-id 1
+                                    :block/title "Queued page"
+                                    :block/name "queued page"
+                                    :block/tags :logseq.class/Page}])
+               worker (fn [api & args]
+                        (case api
+                          :thread-api/update-thread-atom (p/resolved nil)
+                          :thread-api/get-render-snapshots
+                          (let [[graph-id request] args
+                                response (-> (render-engine/render-snapshots
+                                              @conn request {:repo graph-id})
+                                             (assoc :projection-epoch 0)
+                                             ldb/write-transit-str
+                                             ldb/read-transit-str)]
+                            (is (= test-graph-id graph-id))
+                            (swap! requests conj request)
+                            (if (seq (:blocks request))
+                              (let [result (p/deferred)]
+                                (reset! held-block {:result result :response response})
+                                result)
+                              (p/resolved response)))
+                          (p/rejected
+                           (ex-info "Unexpected worker API" {:api api :args args}))))]
+           (finish-async!
+            done
+            (p/with-redefs [subs/schedule-load-batch! #(reset! scheduled-flush %)]
+              (->
+               (p/let [_ (reset! state/*db-worker worker)
+                       _ (swap! unsubscribers conj
+                                (subs/subscribe-block! page-uuid (fn [])))
+                       _ (swap! unsubscribers conj
+                                (subs/subscribe-resource! resource-key (fn [])))
+                       _ (@scheduled-flush)
+                       _ (p/delay 0)
+                       ready-page (subs/block-snapshot page-uuid)
+                       _ (is (= [{:blocks [] :children [] :resources [resource-key]}
+                                 {:blocks [page-uuid] :children [] :resources []}]
+                                @requests))
+                       _ (is (= {:status :ready :value page-uuid}
+                                (subs/resource-snapshot resource-key)))
+                       _ (is (= :ready (:status ready-page))
+                             "Identity hydrates the page while its standalone reply is held.")
+                       _ (is (= "Queued page" (get-in ready-page [:value :block/title])))
+                       _ (p/resolve! (:result @held-block) (:response @held-block))
+                       _ (p/delay 0)]
+                 (is (identical? ready-page (subs/block-snapshot page-uuid)))
+                 (is (= 2 (count @requests)) "The duplicate reply does not trigger a reload."))
+               (p/handle
+                (fn [value error]
+                  (run! (fn [unsubscribe] (unsubscribe)) @unsubscribers)
+                  (when-let [{:keys [result response]} @held-block]
+                    (p/resolve! result response))
+                  (p/let [_ (p/delay 0)]
+                    (reset! state/*db-worker worker-before-test)
+                    (if error (throw error) value))))))))))
+
 (deftest stale-resource-hydration-cannot-seed-slots-after-a-newer-delta-test
   (async done
          (let [resource-key [:test-resource (random-uuid)]
@@ -2172,3 +2252,128 @@
                               "An unrelated newer graph revision does not stale the result.")]
                   (is (= 1 @calls))
                   (unsubscribe))))))))
+
+(deftest positioned-property-metadata-refreshes-mounted-and-warm-blocks-test
+  (async done
+         (let [mounted-uuid (random-uuid)
+               warm-uuid (random-uuid)
+               property-uuid (random-uuid)
+               calls (atom [])
+               revision (atom 1)
+               position (atom :block-left)
+               title (atom "Status")
+               row (fn [id]
+                     (block id 1 "Task"
+                            {:block.temp/positioned-properties
+                             {@position [{:block/uuid property-uuid :block/title @title}]}}))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-block
+                                          (fn [_ id]
+                                            (swap! calls conj id)
+                                            (p/resolved (block-patch @revision {id (row id)})))]
+                            (let [unsub-mounted (subs/subscribe-block! mounted-uuid (fn []))
+                                  unsub-warm (subs/subscribe-block! warm-uuid (fn []))]
+                              (p/let [_ (p/delay 0)
+                                      _ (unsub-warm)
+                                      _ (p/delay 0)
+                                      _ (reset! revision 2)
+                                      _ (reset! position :block-right)
+                                      _ (subs/apply-delta! (delta 2 {:affected-keys #{[:property-config]}}))
+                                      _ (p/delay 0)]
+                                (is (= 2 (count (filter #{mounted-uuid} @calls))))
+                                (is (= 1 (count (filter #{warm-uuid} @calls))) "Unmounted rows are invalidated without fetching.")
+                                (is (seq (get-in (subs/block-snapshot mounted-uuid)
+                                                 [:value :block.temp/positioned-properties :block-right])))
+                                (let [unsub-warm-again (subs/subscribe-block! warm-uuid (fn []))]
+                                  (p/let [_ (p/delay 0)
+                                          _ (is (= 2 (count (filter #{warm-uuid} @calls))))
+                                          _ (reset! revision 3)
+                                          _ (reset! title "Renamed")
+                                          _ (subs/apply-delta! (delta 3 {:affected-keys #{[:entity property-uuid]}}))
+                                          _ (p/delay 0)]
+                                    (is (= "Renamed" (get-in (subs/block-snapshot mounted-uuid)
+                                                             [:value :block.temp/positioned-properties :block-right 0 :block/title])))
+                                    (unsub-mounted)
+                                    (unsub-warm-again))))))))))
+
+(deftest property-change-during-block-load-rejects-old-projection-test
+  (async done
+         (let [id (random-uuid)
+               property-uuid (random-uuid)
+               pending (p/deferred)
+               calls (atom 0)
+               row (fn [title] (block id 1 "Task"
+                                      {:block.temp/positioned-properties
+                                       {:block-left [{:block/uuid property-uuid :block/title title}]}}))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-block
+                                          (fn [_ _]
+                                            (if (= 1 (swap! calls inc)) pending
+                                                (p/resolved (block-patch 2 {id (row "New")}))))]
+                            (let [unsubscribe (subs/subscribe-block! id (fn []))]
+                              (p/let [_ (subs/apply-delta! (delta 2 {:affected-keys #{[:entity property-uuid]}}))
+                                      _ (p/resolve! pending (block-patch 1 {id (row "Old")}))
+                                      _ (p/delay 0)
+                                      _ (p/delay 0)]
+                                (is (= 2 @calls))
+                                (is (= "New" (get-in (subs/block-snapshot id)
+                                                     [:value :block.temp/positioned-properties :block-left 0 :block/title])))
+                                (unsubscribe))))))))
+
+(deftest property-change-during-children-load-rejects-old-hydrated-projection-test
+  (async done
+         (let [parent-id (random-uuid)
+               id (random-uuid)
+               property-uuid (random-uuid)
+               pending (p/deferred)
+               calls (atom 0)
+               patch (fn [rev title]
+                       (subtree-patch
+                        rev {id (block id 1 "Task"
+                                       {:block.temp/positioned-properties
+                                        {:block-left [{:block/uuid property-uuid :block/title title}]}})}
+                        {parent-id {:parent-tx-id 1 :items [[id "a"]]}}))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-children
+                                          (fn [_ _]
+                                            (if (= 1 (swap! calls inc)) pending
+                                                (p/resolved (patch 2 "New"))))]
+                            (let [unsubscribe (subs/subscribe-children! parent-id (fn []))]
+                              (p/let [_ (subs/apply-delta! (delta 2 {:affected-keys #{[:property-config]}}))
+                                      _ (p/resolve! pending (patch 1 "Old"))
+                                      _ (p/delay 0)
+                                      _ (p/delay 0)]
+                                (is (= 2 @calls))
+                                (is (= "New" (get-in (subs/block-snapshot id)
+                                                     [:value :block.temp/positioned-properties :block-left 0 :block/title])))
+                                (unsubscribe))))))))
+
+(deftest property-change-during-resource-load-rejects-old-hydrated-projection-test
+  (async done
+         (let [resource-key [:test-hydrated-properties]
+               id (random-uuid)
+               property-uuid (random-uuid)
+               pending (p/deferred)
+               calls (atom 0)
+               patch (fn [rev title]
+                       (update (exact-resource-patch rev resource-key #{} [id])
+                               :slots merge
+                               (:slots (block-patch
+                                        rev {id (block id 1 "Task"
+                                                       {:block.temp/positioned-properties
+                                                        {:block-left [{:block/uuid property-uuid
+                                                                       :block/title title}]}})}))))]
+           (finish-async! done
+                          (p/with-redefs [subs/<load-resource
+                                          (fn [_ _]
+                                            (if (= 1 (swap! calls inc)) pending
+                                                (p/resolved (patch 2 "New"))))]
+                            (let [unsubscribe (subs/subscribe-resource! resource-key (fn []))]
+                              (p/let [_ (subs/apply-delta! (delta 2 {:affected-keys #{[:property-config]}}))
+                                      _ (p/resolve! pending (patch 1 "Old"))
+                                      _ (p/delay 0)
+                                      _ (p/delay 0)]
+                                (is (= 2 @calls))
+                                (is (= "New" (get-in (subs/block-snapshot id)
+                                                     [:value :block.temp/positioned-properties :block-left 0 :block/title])))
+                                (unsubscribe))))))))

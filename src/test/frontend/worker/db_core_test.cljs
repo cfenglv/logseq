@@ -3,15 +3,18 @@
             ["node:crypto" :as node-crypto]
             ["path" :as node-path]
             [cljs.test :refer [async deftest is]]
+            [clojure.set :as set]
             [clojure.string :as string]
             [datascript.core :as d]
             [datascript.impl.entity :as de]
             [datascript.storage :as storage]
+            [frontend.common.crypt :as crypt]
             [frontend.common.thread-api :as thread-api]
             [frontend.db.query-dsl :as query-dsl]
             [frontend.test.node-helper :as node-helper]
             [frontend.worker-common.util :as worker-util]
             [frontend.worker.db-core :as db-core]
+            [frontend.worker.db.migrate :as db-migrate]
             [frontend.worker.db-listener :as db-listener]
             [frontend.worker.export :as worker-export]
             [frontend.worker.handler.block :as block-handler]
@@ -30,11 +33,19 @@
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.apply-txs :as sync-apply-txs]
+            [frontend.worker.sync.crypt :as sync-crypt]
             [frontend.worker.sync.download :as sync-download]
+            [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
+            [frontend.worker.sync.upload :as sync-upload]
+            [frontend.worker.ui-request :as ui-request]
             [frontend.worker.undo-redo :as worker-undo-redo]
             [goog.object :as gobj]
             [logseq.common.config :as common-config]
+            [logseq.common.log :as log]
             [logseq.db :as ldb]
+            [logseq.db-sync.checksum :as sync-checksum]
+            [logseq.db-sync.snapshot :as sync-snapshot]
             [logseq.db.common.initial-data :as common-initial-data]
             [logseq.db.common.order :as db-order]
             [logseq.db.common.view :as db-view]
@@ -212,6 +223,72 @@
         (.close client-ops-db)
         (reset! worker-state/*client-ops-conns previous-conns)))))
 
+(deftest committed-repair-can-reclaim-only-fresh-unowned-basis-test
+  (let [repo "repair-reclaim-repo"
+        graph-id "repair-reclaim-graph"
+        client-ops-db (new-memory-sqlite-db)
+        previous-conns @worker-state/*client-ops-conns
+        activation (-> (repair-test-activation activation-operation-id graph-id
+                                              (activation-basis 10 20 graph-id)
+                                              (activation-basis 12 34 graph-id))
+                       (assoc :committed {:projection-epoch 5}
+                              :previous {:projection-epoch 4}))
+        basis (activation-basis 13 35 graph-id)]
+    (try
+      (reset! worker-state/*client-ops-conns {repo client-ops-db})
+      (client-op/insert-sync-meta-value-if-absent!
+       client-ops-db "selfhost.activation-record.v1" (ldb/write-transit-str activation))
+      (doseq [stale [(activation-basis 11 35 graph-id)
+                     (activation-basis 13 33 graph-id)]]
+        (is (false? (:claimed? (#'db-core/claim-repair-operation! repo graph-id stale)))))
+      (with-redefs [sync-download/repair-staging-in-progress? (constantly true)]
+        (is (false? (:claimed? (#'db-core/claim-repair-operation! repo graph-id basis)))))
+      (let [claim (#'db-core/claim-repair-operation! repo graph-id basis)
+            duplicate (#'db-core/claim-repair-operation! repo graph-id basis)
+            stored (#'db-core/repair-operation-status repo)]
+        (is (true? (:claimed? claim)))
+        (is (false? (:claimed? duplicate)))
+        (is (= activation-operation-id (get-in claim [:operation :operation-id])))
+        (is (= 6 (get-in claim [:operation :target-projection-epoch])))
+        (is (= 2 (get-in claim [:operation :attempt-count])))
+        (is (= basis (get-in claim [:operation :start-basis])))
+        (is (nil? (get-in claim [:operation :target-basis])))
+        (is (= {:projection-epoch 4} (:previous stored)))
+        (is (= (:operation claim) (:operation stored))))
+      (finally
+        (.close client-ops-db)
+        (reset! worker-state/*client-ops-conns previous-conns)))))
+
+(deftest committed-repair-exhaustion-preserves-explicit-retry-test
+  (let [repo "repair-reclaim-exhausted-repo"
+        graph-id "repair-reclaim-exhausted-graph"
+        client-ops-db (new-memory-sqlite-db)
+        previous-conns @worker-state/*client-ops-conns
+        activation (-> (repair-test-activation activation-operation-id graph-id
+                                              (activation-basis 10 20 graph-id)
+                                              (activation-basis 12 34 graph-id))
+                       (assoc :committed {:projection-epoch 5}
+                              :previous {:projection-epoch 4})
+                       (assoc-in [:operation :attempt-count] 3))]
+    (try
+      (reset! worker-state/*client-ops-conns {repo client-ops-db})
+      (client-op/insert-sync-meta-value-if-absent!
+       client-ops-db "selfhost.activation-record.v1" (ldb/write-transit-str activation))
+      (let [claim (#'db-core/claim-repair-operation!
+                   repo graph-id (activation-basis 13 35 graph-id))]
+        (is (true? (:claimed? claim)))
+        (is (= :local-only (get-in claim [:operation :disposition])))
+        (is (= 3 (get-in claim [:operation :attempt-count])))
+        (is (= 6 (get-in claim [:operation :target-projection-epoch])))
+        (when (= :local-only (get-in claim [:operation :disposition]))
+          (let [retried (#'db-core/claim-repair-retry! repo activation-operation-id true 5000)]
+            (is (= activation-operation-id (:operation-id retried)))
+            (is (= 4 (:attempt-count retried)))
+            (is (= :repairing (:disposition retried))))))
+      (finally
+        (.close client-ops-db)
+        (reset! worker-state/*client-ops-conns previous-conns)))))
+
 (deftest repair-failure-retry-preserves-one-operation-identity-test
   (let [repo "repair-retry-transition"
         graph-id "repair-retry-graph"
@@ -288,6 +365,7 @@
                                   :last-error nil}
                       :prepared-swap nil}
           verification {:graph-id graph-id
+                        :target-projection-epoch 5
                         :remote-t 12
                         :journal-high-water 34
                         :pending-through-target 0
@@ -315,6 +393,11 @@
                               (catch :default error error))]
                (is (= :selfhost6/repair-completion-rejected
                       (:type (ex-data rejected)))))
+             (is (thrown-with-msg? cljs.core.ExceptionInfo
+                                   #"Repair completion basis is not converged"
+                                   (#'db-core/complete-repair-operation!
+                                    repo operation-id
+                                    (assoc verification :target-projection-epoch 4))))
              (#'db-core/complete-repair-operation!
               repo operation-id verification)
              (p/let [first-cleanup (#'db-core/<cleanup-previous-artifact! repo)
@@ -540,7 +623,7 @@
                 (fn []
                   (reset! worker-state/*client-ops-conns {repo client-ops-db})
                   (client-op/update-local-tx repo 11)
-                  (client-op/update-local-checksum repo "source-checksum")
+                  (client-op/update-local-checksum repo "source-checksum" 41)
                   (reset! worker-state/*sqlite-conns
                           {repo {:db #js {} :search #js {}
                                  :client-ops client-ops-db}})
@@ -633,7 +716,7 @@
                 (fn []
                   (reset! worker-state/*client-ops-conns {repo client-ops-db})
                   (client-op/update-local-tx repo 11)
-                  (client-op/update-local-checksum repo "source-checksum")
+                  (client-op/update-local-checksum repo "source-checksum" 41)
                   (reset! worker-state/*sqlite-conns
                           {repo {:db #js {} :search #js {}
                                  :client-ops client-ops-db}})
@@ -719,7 +802,7 @@
           :thread-api/build-publishing-html :thread-api/reset-db
           :thread-api/get-file-content :thread-api/get-all-properties :thread-api/get-date-scheduled-or-deadlines
           :thread-api/unsafe-unlink-db :thread-api/close-db
-          :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db :thread-api/db-sync-recreate-lock
+          :thread-api/db-sync-close-db :thread-api/db-sync-invalidate-search-db
           :thread-api/db-sync-rehydrate-large-titles :thread-api/db-sync-claim-repair
           :thread-api/db-sync-build-repair-staging :thread-api/db-sync-commit-repair
           :thread-api/db-sync-repair-status :thread-api/db-sync-record-repair-failure
@@ -1145,23 +1228,23 @@
                          (keep (fn [entity]
                                  (when-not (nat-int? (:block/tx-id entity))
                                    (:block/uuid entity))))
-                         entities)})))]
+                         entities)
+                   :blocks (mapv #(block-handler/canonical-block @conn %) entities)})))]
       (p/let [open-result ((get-thread-api :thread-api/create-or-open-db) repo opts)
-              conn (worker-state/get-datascript-conn repo)
-              {:keys [entities missing-revisions]} (first @listener-snapshots)]
+              {:keys [entities missing-revisions blocks]} (first @listener-snapshots)]
         (is (= 0 (:projection-epoch open-result))
             "Graph open returns the activation-record projection epoch.")
         (is (string/includes? (first @opened-paths) "client-ops")
             "Client-ops and its activation row must open before the canonical graph.")
+        (is (empty? missing-revisions)
+            "Bootstrap entities must have canonical revisions before listeners run.")
         (is (= 1 (count @listener-snapshots)))
         (is (= repo (:repo (first @listener-snapshots))))
         (is (seq entities))
-        (is (empty? missing-revisions)
-            "Every UUID entity must have a local revision before the renderer listener is installed.")
-        (when (empty? missing-revisions)
-          (doseq [entity entities]
-            (is (= (:block/uuid entity)
-                   (:block/uuid (block-handler/canonical-block @conn entity))))))
+        (doseq [[entity block] (map vector entities blocks)]
+          (is (= (:block/uuid entity) (:block/uuid block)))
+          (is (= (get entity :block/tx-id 0) (:block/tx-id block)))
+          (is (nat-int? (:block/tx-id block))))
         (is (empty? @broadcasts)
             "Bootstrap transactions must not publish incremental renderer deltas.")
         (db-core/close-db! repo)))))
@@ -1612,6 +1695,412 @@
                         (is false (str error))))
              (p/finally done))))
 
+(defn- <assert-repair-file-swap-cycle!
+  [{:keys [repo graph-id platform' pool target-pool canonical-path target-path previous-path paths opened ops* basis-for]} epoch]
+  (let [current-db (d/restore-conn
+                    (sync-temp-sqlite/new-temp-sqlite-storage (first @opened)))
+        current-checksum (sync-checksum/recompute-checksum @current-db)
+        original-tuples (set (map #(vector (:e %) (:a %) (:v %))
+                                 (d/datoms @current-db :eavt)))
+        page-uuid (if (= 6 epoch)
+                    #uuid "90900000-0000-4000-8000-000000000006"
+                    #uuid "90900000-0000-4000-8000-000000000007")]
+    (doseq [db @opened] (.close db))
+    (reset! opened [])
+    (node-fs/copyFileSync canonical-path target-path)
+    (p/let [target-db (platform/sqlite-open platform' {:path target-path})
+          target-conn (d/restore-conn (sync-temp-sqlite/new-temp-sqlite-storage target-db))]
+      (d/transact! target-conn [{:block/uuid page-uuid
+                               :block/title (str "Recovered page " epoch)
+                               :block/name (str "recovered page " epoch)
+                               :block/tags #{:logseq.class/Page}
+                               :block/created-at 1 :block/updated-at 1}])
+      (let [checksum (sync-checksum/recompute-checksum @target-conn)
+            target-basis (basis-for epoch checksum)
+            start-basis (assoc-in target-basis [:checksum-basis :legacy-checksum]
+                                  current-checksum)]
+        (.exec target-db "PRAGMA wal_checkpoint(TRUNCATE)")
+        (.close target-db)
+        (p/let [reopened (#'db-core/get-dbs repo)
+                _ (reset! opened (take 3 reopened))
+                _ (reset! ops* (nth reopened 2))
+                _ (swap! worker-state/*client-ops-conns assoc repo @ops*)
+                claim (#'db-core/claim-repair-operation! repo graph-id start-basis)
+                _ (is (true? (:claimed? claim)))
+                _ (is (= epoch (get-in claim [:operation :target-projection-epoch])))
+                _ (#'db-core/persist-repair-target-basis! @ops* activation-operation-id target-basis)
+                _ (doseq [db (take 2 @opened)] (.close db))
+                _ (reset! opened [@ops*])
+                proof (platform/prepare-db-artifact-swap! platform' pool target-pool paths)
+                _ (#'db-core/persist-prepared-swap! @ops* activation-operation-id target-basis proof)
+                _ (.close @ops*)
+                _ (reset! opened [])
+                ;; Crash before rename: the normal open path keeps the source authoritative.
+                source-open (#'db-core/get-dbs repo)
+                _ (reset! opened (take 3 source-open))
+                _ (reset! ops* (nth source-open 2))
+                _ (swap! worker-state/*client-ops-conns assoc repo @ops*)
+                source-status (#'db-core/repair-operation-status repo)
+                _ (is (= (dec epoch) (get-in source-status [:committed :projection-epoch])))
+                _ (is (= (- epoch 4) (get-in source-status [:operation :attempt-count])))
+                _ (is (false? (:prepared-swap? source-status)))
+                cleanup-before (#'db-core/<cleanup-previous-artifact! repo)
+                _ (is (= {:cleaned? false} cleanup-before))
+                _ (doseq [db (take 2 @opened)] (.close db))
+                _ (reset! opened [@ops*])
+                proof (platform/prepare-db-artifact-swap! platform' pool target-pool paths)
+                _ (#'db-core/persist-prepared-swap! @ops* activation-operation-id target-basis proof)
+                _ (platform/commit-db-artifact-swap! platform' pool target-pool paths)
+                _ (.close @ops*)
+                _ (reset! opened [])
+                ;; Crash after rename: startup rolls forward metadata from the durable proof.
+                target-open (#'db-core/get-dbs repo)
+                _ (reset! opened (take 3 target-open))
+                _ (reset! ops* (nth target-open 2))
+                _ (swap! worker-state/*client-ops-conns assoc repo @ops*)
+                target-status (#'db-core/repair-operation-status repo)
+                actual-conn (d/restore-conn
+                             (sync-temp-sqlite/new-temp-sqlite-storage (first target-open)))
+                actual-tuples (set (map #(vector (:e %) (:a %) (:v %))
+                                       (d/datoms @actual-conn :eavt)))
+                verification {:graph-id graph-id :target-projection-epoch epoch
+                              :remote-t epoch :journal-high-water epoch :pending-through-target 0
+                              :local-checksum checksum :remote-checksum checksum
+                              :canonical-checksum (sync-checksum/recompute-checksum @actual-conn)}]
+          (is (= epoch (get-in target-status [:committed :projection-epoch])))
+          (is (= (dec epoch) (get-in target-status [:previous :projection-epoch])))
+          (is (every? actual-tuples original-tuples) "All prior text and property datoms survive.")
+          (is (= (str "Recovered page " epoch)
+                 (:block/title (d/entity @actual-conn [:block/uuid page-uuid]))))
+          (is (= (str epoch) (:value (client-op/read-sync-meta-value @ops* "local-tx"))))
+          (is (= checksum (client-op/get-local-checksum repo)))
+          (is (node-fs/existsSync previous-path))
+          (let [stale-error (try
+                              (#'db-core/complete-repair-operation!
+                               repo activation-operation-id
+                               (assoc verification :target-projection-epoch (dec epoch)))
+                              nil
+                              (catch :default error error))]
+            (is (= :selfhost6/repair-completion-rejected (:type (ex-data stale-error)))))
+          (when (= 7 epoch)
+            (#'db-core/complete-repair-operation! repo activation-operation-id verification)))))))
+
+(deftest committed-repair-file-backed-repeated-swap-reconciles-and-completes-test
+  (async done
+    (let [repo "repeated-repair-artifacts"
+          graph-id "repeated-repair-graph"
+          root-dir (node-helper/create-tmp-dir repo)
+          opened (atom [])
+          ops* (atom nil)
+          basis-for (fn [t checksum]
+                      (-> (activation-basis t t graph-id)
+                          (assoc :server-checkpoint-identity
+                                 (str "sync-do-checkpoint-v1:" graph-id ":" t ":" checksum))
+                          (assoc :checksum-basis
+                                 {:version 1 :legacy-checksum checksum
+                                  :server-recomputed-checksum checksum :legacy-anchor checksum
+                                  :server-t t
+                                  :metadata-proof (str "authenticated-diagnostics-v1:"
+                                                       graph-id ":" t ":" checksum ":" checksum)})))
+          paths {:canonical-path "/db.sqlite" :canonical-wal-path "/db.sqlite-wal"
+                 :canonical-shm-path "/db.sqlite-shm" :previous-path "/db.previous.sqlite"
+                 :target-path "/repair-target.sqlite" :target-wal-path "/repair-target.sqlite-wal"
+                 :target-shm-path "/repair-target.sqlite-shm"}]
+      (-> (restoring-worker-state
+           (fn []
+             (p/let [platform' (platform-node/node-platform {:root-dir root-dir})
+                     _ (platform/set-platform! platform')
+                     pool (#'db-core/<get-opfs-pool repo)
+                     storage (:storage platform')
+                     target-pool ((:install-opfs-pool storage) nil "repeated-repair-target")
+                     canonical-path ((:resolve-db-path storage) repo pool "/db.sqlite")
+                     target-path ((:resolve-db-path storage) repo target-pool "/repair-target.sqlite")
+                     previous-path ((:resolve-db-path storage) repo pool "/db.previous.sqlite")
+                     _ (node-fs/copyFileSync "src/test/fixtures/selfhost6/clean/db.sqlite" canonical-path)
+                     _ (node-fs/copyFileSync canonical-path previous-path)
+                     initial-open (#'db-core/get-dbs repo)
+                     _ (reset! opened (take 3 initial-open))
+                     _ (reset! ops* (nth initial-open 2))
+                     initial-db (d/restore-conn (sync-temp-sqlite/new-temp-sqlite-storage (first initial-open)))
+                     initial-checksum (sync-checksum/recompute-checksum @initial-db)
+                     initial (-> (repair-test-activation activation-operation-id graph-id
+                                                        (basis-for 4 initial-checksum)
+                                                        (basis-for 5 initial-checksum))
+                                 (assoc :committed {:projection-epoch 5}
+                                        :previous {:projection-epoch 4}))
+                     raw (:value (client-op/read-sync-meta-value @ops* "selfhost.activation-record.v1"))
+                     _ (client-op/compare-and-set-sync-meta-value!
+                        @ops* "selfhost.activation-record.v1" raw (ldb/write-transit-str initial))]
+               (p/let [_ (p/doseq [epoch [6 7]]
+                           (<assert-repair-file-swap-cycle!
+                            {:repo repo :graph-id graph-id :platform' platform'
+                             :pool pool :target-pool target-pool :paths paths
+                             :canonical-path canonical-path :target-path target-path
+                             :previous-path previous-path :opened opened :ops* ops*
+                             :basis-for basis-for}
+                            epoch))
+                       cleaned (#'db-core/<cleanup-previous-artifact! repo)
+                       cleaned-again (#'db-core/<cleanup-previous-artifact! repo)]
+                 (is (= {:cleaned? true} cleaned))
+                 (is (= {:cleaned? false} cleaned-again))
+                 (is (not (node-fs/existsSync previous-path)))
+                 (is (nil? (:operation (#'db-core/repair-operation-status repo))))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn []
+                       (doseq [db @opened] (.close db))
+                       (done)))))))
+
+(defn- <assert-previous-cleanup-drained-before-next-commit!
+  [entry]
+  (let [repo (str "previous-cleanup-" (name entry))
+        graph-id "previous-cleanup-graph"
+        root-dir (node-helper/create-tmp-dir repo)
+        handles (atom [])
+        owner* (atom nil)
+        cleanup-started (p/deferred)
+        cleanup-resume (p/deferred)
+        entered? (atom false)
+        wrapper* @#'thread-api/*invoke-wrapper-fn
+        previous-wrapper @wrapper*
+        paths {:canonical-path "/db.sqlite" :canonical-wal-path "/db.sqlite-wal"
+               :canonical-shm-path "/db.sqlite-shm" :previous-path "/db.previous.sqlite"
+               :target-path "/repair-target.sqlite" :target-wal-path "/repair-target.sqlite-wal"
+               :target-shm-path "/repair-target.sqlite-shm"}]
+    (repair-commit-fence/reset-for-test!)
+    (-> (restoring-worker-state
+         (fn []
+           (p/let [platform' (platform-node/node-platform {:root-dir root-dir})
+                   storage (:storage platform')
+                   cleanup-f (:cleanup-db-previous! storage)
+                   _ (platform/set-platform!
+                      (assoc-in platform' [:storage :cleanup-db-previous!]
+                                (fn [pool paths]
+                                  (p/resolve! cleanup-started true)
+                                  (p/let [_ cleanup-resume] (cleanup-f pool paths)))))
+                   _ ((@thread-api/*thread-apis :thread-api/init))
+                   pool (#'db-core/<get-opfs-pool repo)
+                   target-pool ((:install-opfs-pool storage) nil "cleanup-next-target")
+                   canonical-path ((:resolve-db-path storage) repo pool "/db.sqlite")
+                   previous-path ((:resolve-db-path storage) repo pool "/db.previous.sqlite")
+                   target-path ((:resolve-db-path storage) repo target-pool "/repair-target.sqlite")
+                   _ (doseq [path [canonical-path previous-path target-path]]
+                       (node-fs/copyFileSync "src/test/fixtures/selfhost6/clean/db.sqlite" path))
+                   target-db (platform/sqlite-open platform' {:pool target-pool :path target-path :mode "c"})
+                   _ (try (.exec target-db "PRAGMA user_version=1") (finally (.close target-db)))
+                   opened (#'db-core/get-dbs repo)
+                   _ (reset! handles (take 3 opened))
+                   ops (nth opened 2)
+                   _ (swap! worker-state/*client-ops-conns assoc repo ops)
+                   basis (activation-basis 5 5 graph-id)
+                   receipt (assoc (repair-test-activation activation-operation-id graph-id basis basis)
+                                  :committed {:projection-epoch 5} :previous {:projection-epoch 4})
+                   raw (:value (client-op/read-sync-meta-value ops "selfhost.activation-record.v1"))
+                   _ (is (client-op/compare-and-set-sync-meta-value!
+                          ops "selfhost.activation-record.v1" raw (ldb/write-transit-str receipt)))]
+             (let [verification {:graph-id graph-id :target-projection-epoch 5
+                                 :remote-t 6 :journal-high-water 5 :pending-through-target 0
+                                 :local-checksum "legacy" :remote-checksum "legacy" :canonical-checksum "legacy"}
+                   completion (case entry
+                                :rpc (thread-api/remote-function
+                                      "thread-api/db-sync-complete-repair"
+                                      (ldb/write-transit-str [repo activation-operation-id verification]))
+                                :receive (#'db-sync/enqueue-receive-message!
+                                          {:repo repo :receive-queue (atom (p/resolved nil))}
+                                          #((@thread-api/*thread-apis :thread-api/db-sync-complete-repair)
+                                            repo activation-operation-id verification)))]
+               (p/let [_ cleanup-started]
+                 (let [next-fence (p/then (repair-commit-fence/<enter! repo (random-uuid))
+                                          (fn [owner] (reset! entered? true) (reset! owner* owner) owner))]
+                   (p/let [_ (p/resolved nil)
+                           _ (is (false? @entered?) "The next rename must wait for the old unlink.")
+                           _ (is (node-fs/existsSync previous-path))
+                           _ (p/resolve! cleanup-resume true)
+                           result completion
+                           _ next-fence
+                           _ (is (:completed? (if (= entry :rpc) (ldb/read-transit-str result) result)))
+                           _ (is (not (node-fs/existsSync previous-path)))
+                           _ (is (nil? (:previous (#'db-core/repair-operation-status repo))))
+                           _ (doseq [db (take 2 @handles)] (.close db))
+                           _ (reset! handles [ops])
+                           _ (platform/prepare-db-artifact-swap! platform' pool target-pool paths)]
+                     (is (node-fs/existsSync previous-path) "The next commit's previous artifact survives.")
+                     (is (= (test-sha256-hex (node-fs/readFileSync canonical-path))
+                            (test-sha256-hex (node-fs/readFileSync previous-path)))))))))))
+        (p/finally
+         (fn []
+           (p/resolve! cleanup-resume true)
+           (when (and @owner* (repair-commit-fence/owner? repo @owner*))
+             (repair-commit-fence/release! repo @owner*))
+           (repair-commit-fence/reset-for-test!)
+           (reset! wrapper* previous-wrapper)
+           (doseq [db @handles] (when (.-open db) (.close db))))))))
+
+(deftest previous-cleanup-from-rpc-and-rtc-drains-before-next-commit-test
+  (async done
+    (-> (p/doseq [entry [:rpc :receive]]
+          (<assert-previous-cleanup-drained-before-next-commit! entry))
+        (p/catch (fn [error] (is false (str error))))
+        (p/finally done))))
+
+(defn- repair-diagnostics
+  [graph-id t checksum]
+  {:t t :legacy-anchor checksum :server-recomputed-checksum checksum
+   :server-checkpoint-identity (str "sync-do-checkpoint-v1:" graph-id ":" t ":" checksum)
+   :metadata-proof (str "authenticated-diagnostics-v1:" graph-id ":" t ":" checksum ":" checksum)})
+
+(defn- snapshot-response
+  [rows]
+  (let [payload (sync-snapshot/encode-rows rows)
+        frame (js/Uint8Array. (+ 4 (.-byteLength payload)))]
+    (.setUint32 (js/DataView. (.-buffer frame)) 0 (.-byteLength payload) false)
+    (.set frame payload 4)
+    (js/Response. frame #js {:status 200})))
+
+(defn- <encrypted-repair-fixture!
+  [repo graph-id active-conn]
+  (let [page-uuid #uuid "71000000-0000-4000-8000-000000000001"
+        child-uuid #uuid "71000000-0000-4000-8000-000000000002"
+        remote-conn (d/conn-from-db @active-conn)
+        tail [[:db/add [:block/uuid child-uuid] :block/title "Remote tail text"]]]
+    (d/transact! remote-conn
+                 [{:db/id -1 :block/uuid page-uuid :block/title "Snapshot page"
+                   :block/name "snapshot page" :block/tags #{:logseq.class/Page}
+                   :block/created-at 1 :block/updated-at 1}
+                  {:block/uuid child-uuid :block/title "Snapshot text"
+                   :block/parent -1 :block/page -1 :block/order (db-order/gen-key)
+                   :block/created-at 1 :block/updated-at 1
+                   :logseq.property.code/lang "clojure"}])
+    (p/let [aes-key (crypt/<generate-aes-key)
+            temp (sync-upload/<prepare-upload-temp-sqlite!
+                  repo graph-id remote-conn aes-key (fn [_] nil))]
+      (-> (p/let [rows (sync-upload/normalize-snapshot-rows
+                    (sync-upload/fetch-kvs-rows (:db temp) -1 10000))
+                  snapshot-checksum (sync-checksum/recompute-checksum @remote-conn)]
+          (is (seq rows))
+          (is (not (string/includes? (pr-str rows) "Snapshot text")))
+          (d/transact! remote-conn tail)
+          (p/let [wire-tail (sync-crypt/<encrypt-tx-data aes-key tail)]
+            {:aes-key aes-key :rows rows :child-uuid child-uuid
+             :snapshot-proof (repair-diagnostics graph-id 5 snapshot-checksum)
+             :tail-proof (repair-diagnostics graph-id 6 (sync-checksum/recompute-checksum @remote-conn))
+             :wire-tail (ldb/write-transit-str wire-tail)}))
+          (p/finally #(sync-temp-sqlite/cleanup-temp-sqlite! temp))))))
+
+(defn- <assert-encrypted-repair-commit-and-reopen!
+  [{:keys [repo graph-id pool canonical-path fixture cleanup-failed?]}]
+  (let [{:keys [aes-key rows child-uuid snapshot-proof tail-proof wire-tail]} fixture
+        diagnostics-count (atom 0)
+        original-fetch js/fetch
+        original-platform (platform/current)
+        remove-vfs (get-in original-platform [:storage :remove-vfs!])
+        cleanup-error (js/Error. "Synthetic repair target unlink failure")
+        expected-checksum (:legacy-anchor tail-proof)]
+    (platform/set-platform!
+     (assoc-in original-platform [:storage :remove-vfs!]
+               (fn [^js target-pool]
+                 (if (and (not @cleanup-failed?)
+                          (string/includes? (.-repoDir target-pool) "repair-"))
+                   (do (reset! cleanup-failed? true) (p/rejected cleanup-error))
+                   (remove-vfs target-pool)))))
+    (-> (p/with-redefs
+          [sync-crypt/<fetch-graph-aes-key-for-download (fn [_] (p/resolved aes-key))
+           sync-download/fetch-json
+           (fn [_url _opts schema]
+             (p/resolved
+              (case schema
+                :sync/checksum-diagnostics
+                (if (= 1 (swap! diagnostics-count inc)) snapshot-proof tail-proof)
+                :sync/snapshot-download {:url "https://snapshot.example.test/synthetic"}
+                :sync/pull {:type "pull/ok" :t 6 :checksum expected-checksum
+                            :txs [{:t 6 :outliner-op :save-block :tx wire-tail}]})))
+           search-handler/<rebuild-blocks-indice! (fn [& _] (p/resolved nil))
+           shared-service/broadcast-to-clients! (fn [& _] nil)]
+          (set! js/fetch (fn [_url _opts] (p/resolved (snapshot-response rows))))
+          (p/let [conn (worker-state/get-datascript-conn repo)
+                  original-tuples (set (map #(vector (:e %) (:a %) (:v %)) (d/datoms @conn :eavt)))
+                  start-basis (-> (activation-basis 6 0 graph-id)
+                                  (assoc :server-checkpoint-identity (:server-checkpoint-identity tail-proof)
+                                         :checksum-basis {:version 1 :legacy-checksum (sync-checksum/recompute-checksum @conn)
+                                                          :server-recomputed-checksum expected-checksum :server-t 6
+                                                          :legacy-anchor expected-checksum :metadata-proof (:metadata-proof tail-proof)}))
+                  claim (#'db-core/claim-repair-operation! repo graph-id start-basis)
+                  failure (-> (sync-download/<run-repair-operation! repo (:operation claim))
+                              (p/then (constantly {:error nil}))
+                              (p/catch (fn [error] {:error error})))
+                  status (#'db-core/repair-operation-status repo)
+                  actual-db @(worker-state/get-datascript-conn repo)]
+            (is (identical? cleanup-error (:error failure)))
+            (is @cleanup-failed?)
+            (is (nil? @worker-state/*db-sync-client) "The actual stop handler clears the client.")
+            (is (= 1 (get-in status [:committed :projection-epoch])))
+            (is (= :repairing (get-in status [:operation :disposition])))
+            (is (false? (:prepared-swap? status)))
+            (is (>= @diagnostics-count 3))
+            (is (= expected-checksum (sync-checksum/recompute-checksum actual-db)))
+            (is (= expected-checksum (client-op/get-local-checksum repo)))
+            (is (= (:max-tx actual-db) (client-op/get-local-checksum-covered-tx repo)))
+            (is (not= 6 (client-op/get-local-checksum-covered-tx repo)))
+            (is (= #{} (set/difference
+                        (set (remove #(= :block/tx-id (second %)) original-tuples))
+                        (set (map #(vector (:e %) (:a %) (:v %)) (d/datoms actual-db :eavt))))))
+            (is (= "Remote tail text" (:block/title (d/entity actual-db [:block/uuid child-uuid]))))
+            (is (= "clojure" (:logseq.property.code/lang (d/entity actual-db [:block/uuid child-uuid]))))
+            (is (node-fs/existsSync canonical-path))
+            (is (node-fs/existsSync (platform/resolve-db-path original-platform repo pool "/db.previous.sqlite")))
+            (db-core/close-db! repo)
+            (p/let [_ (#'db-core/<create-or-open-db! repo {})
+                    reopened @(worker-state/get-datascript-conn repo)
+                    verification (assoc (client-op/read-repair-completion-observation repo 0)
+                                        :graph-id graph-id :target-projection-epoch 1 :remote-t 6
+                                        :local-checksum expected-checksum :remote-checksum expected-checksum
+                                        :canonical-checksum (sync-checksum/recompute-checksum reopened))
+                    completed ((@thread-api/*thread-apis :thread-api/db-sync-complete-repair)
+                               repo (get-in status [:operation :operation-id]) verification)]
+              (is (= expected-checksum (sync-checksum/recompute-checksum reopened)))
+              (is (= expected-checksum (client-op/get-local-checksum repo)))
+              (is (= (:max-tx reopened) (client-op/get-local-checksum-covered-tx repo)))
+              (is (= "Remote tail text" (:block/title (d/entity reopened [:block/uuid child-uuid]))))
+              (is (= "clojure" (:logseq.property.code/lang (d/entity reopened [:block/uuid child-uuid]))))
+              (is (:completed? completed))
+              (is (nil? (:operation (#'db-core/repair-operation-status repo))))
+              (is (not (node-fs/existsSync (platform/resolve-db-path (platform/current) repo
+                                                                  (#'db-core/get-storage-pool repo) "/db.previous.sqlite")))))))
+        (p/finally (fn [] (set! js/fetch original-fetch) (platform/set-platform! original-platform))))))
+
+(deftest encrypted-repair-snapshot-tail-cleanup-failure-and-reopen-test
+  (async done
+    (let [repo "encrypted-repair-lifecycle"
+          graph-id "71000000-0000-4000-8000-000000000003"
+          root-dir (node-helper/create-tmp-dir repo)]
+      (repair-commit-fence/reset-for-test!)
+      (-> (restoring-worker-state
+           (fn []
+             (p/with-redefs [worker-state/*db-sync-client (atom (#'db-sync/ensure-client-state! repo))
+                            sync-download/*repair-staging-builds (atom {})]
+               (p/let [platform' (platform-node/node-platform {:root-dir root-dir})
+                       _ (platform/set-platform! platform')
+                       pool (#'db-core/<get-opfs-pool repo)
+                       canonical-path (platform/resolve-db-path (platform/current) repo pool "/db.sqlite")
+                       _ (node-fs/copyFileSync "src/test/fixtures/selfhost6/clean/db.sqlite" canonical-path)
+                       _ (#'db-core/<create-or-open-db! repo {})
+                       conn (worker-state/get-datascript-conn repo)
+                       _ (d/transact! conn [(ldb/kv :logseq.kv/graph-uuid (uuid graph-id))
+                                            (ldb/kv :logseq.kv/graph-remote? true)
+                                            (ldb/kv :logseq.kv/graph-rtc-e2ee? true)
+                                            {:db/ident :block/closed-value-property
+                                             :db/cardinality :db.cardinality/many}]
+                                      {:persist-op? false})
+                       _ (client-op/update-local-tx repo 6)
+                       _ (swap! worker-state/*state assoc :auth/id-token "synthetic-token")
+                       _ (reset! worker-state/*db-sync-config {:http-base "https://sync.example.test"})
+                       fixture (<encrypted-repair-fixture! repo graph-id conn)]
+                 (-> (<assert-encrypted-repair-commit-and-reopen!
+                      {:repo repo :graph-id graph-id :pool pool :canonical-path canonical-path
+                       :fixture fixture :cleanup-failed? (atom false)})
+                     (p/finally #(db-core/close-db! repo)))))))
+          (p/catch (fn [error] (is false (str error "\n" (.-stack ^js error)))))
+          (p/finally (fn [] (repair-commit-fence/reset-for-test!) (done)))))))
+
 (deftest db-core-registers-db-sync-thread-apis
   (let [api-map @thread-api/*thread-apis]
     (is (contains? api-map :thread-api/set-db-sync-config))
@@ -1757,6 +2246,32 @@
       (is (= [{:repo test-repo
                :tx-report migration-tx-report}]
              @handled-reports)))))
+
+(deftest migration-metadata-reaches-pending-and-remote-apply-test
+  (restoring-worker-state
+   (fn []
+     (let [conn (d/create-conn db-schema/schema)
+           client-db (new-memory-sqlite-db)
+           pending-count-prev @client-op/*repo->pending-local-tx-count]
+       (try
+         (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+         (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                            :kv/value {:major 65 :minor 33}}])
+         (reset! worker-state/*datascript-conns {test-repo conn})
+         (reset! worker-state/*client-ops-conns {test-repo client-db})
+         (with-redefs [worker-state/*db-sync-client (atom nil)]
+           (let [result (db-migrate/migrate conn)
+                 report (first (:upgrade-result-coll result))]
+             (is (true? (get-in report [:tx-meta :db-migrate?])))
+             (#'db-core/handle-migrate-result-local-txs! test-repo result)
+             (let [pending (first (client-op/get-pending-local-txs test-repo))
+                   remote-meta (#'sync-apply-txs/apply-tx-meta pending)]
+               (is (= :db-migrate (:outliner-op pending)))
+               (is (true? (:db-migrate? remote-meta)))
+               (is (true? (:skip-validate-db? remote-meta))))))
+         (finally
+           (.close client-db)
+           (reset! client-op/*repo->pending-local-tx-count pending-count-prev)))))))
 
 (deftest built-in-sync-repair-tx-data-covers-65-26-through-65-28-test
   (let [tx-data (#'db-core/built-in-sync-repair-tx-data)
@@ -2340,6 +2855,180 @@
                 (is false (str "unexpected error: " error))))
      (p/finally done))))
 
+(deftest search-build-blocks-indice-in-worker-starts-rebuild-for-version-two-index-test
+  (async done
+    (->
+     (restoring-worker-state
+      (fn []
+        (let [build-index! (get @thread-api/*thread-apis :thread-api/search-build-blocks-indice-in-worker)
+              conn (d/create-conn db-schema/schema)
+              search-db (fake-db {:user-version 2})]
+          (d/transact! conn [{:block/uuid (random-uuid)}])
+          (platform/set-platform! (build-test-platform {:runtime :node}))
+          (reset! worker-state/*sqlite-conns {test-repo {:search search-db}})
+          (reset! worker-state/*datascript-conns {test-repo conn})
+          (p/let [result (build-index! test-repo false)]
+            (is (= :started result))))))
+     (p/catch (fn [error]
+                (is false (str "unexpected error: " error))))
+     (p/finally done))))
+
+(deftest search-build-blocks-indice-in-worker-moves-version-four-index-to-rowid-keys-test
+  (async done
+    (->
+     (restoring-worker-state
+      (fn []
+        (let [build-index! (get @thread-api/*thread-apis :thread-api/search-build-blocks-indice-in-worker)
+              build-ids @#'search-handler/*search-index-build-ids
+              page (str (random-uuid))
+              blocks (mapv (fn [i] {:id (str (random-uuid)) :title (str "block " i) :page page}) (range 450))
+              rows (fn [db sql] (js->clj (.exec db #js {:sql sql :rowMode "array"})))
+              path (node-path/join (node-helper/create-tmp-dir "search-db") "search.sqlite")]
+          (platform/set-platform! (build-test-platform {:runtime :node}))
+          (p/let [db (#'platform-node/open-sqlite-db nil {:path path})]
+            ;; a version 4 index: FTS rows found by id, rowids drifted by updates
+            (.exec db "CREATE TABLE blocks (id TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL, page TEXT)")
+            (.exec db "CREATE VIRTUAL TABLE blocks_fts USING fts5(id, title, page, tokenize=\"trigram\")")
+            (.exec db "CREATE TRIGGER blocks_ai AFTER INSERT ON blocks BEGIN
+                         INSERT INTO blocks_fts (id, title, page) VALUES (new.id, new.title, new.page);
+                       END;")
+            (.exec db "CREATE TRIGGER blocks_au AFTER UPDATE ON blocks BEGIN
+                         DELETE from blocks_fts where id = old.id;
+                         INSERT INTO blocks_fts (id, title, page) VALUES (new.id, new.title, new.page);
+                       END;")
+            (search/upsert-blocks! db (clj->js blocks))
+            (search/upsert-blocks! db (clj->js (map #(assoc % :title "edited") (take 10 blocks))))
+            (.exec db "PRAGMA user_version = 4")
+            (reset! worker-state/*sqlite-conns {test-repo {:search db}})
+            ;; no datascript conn: the move reads the search db only
+            (p/let [result (build-index! test-repo false)
+                    _ (<wait-for-progress! build-ids #(nil? (get % test-repo)) 1000)]
+              (is (= 4 result) "the old index serves search while it moves, so the graph is ready at once")
+              (is (= [[5]] (rows db "PRAGMA user_version"))
+                  "A cache-only rowid move cannot qualify graph-derived v6 titles")
+              (is (= [[450]] (rows db "SELECT count(*) FROM blocks_fts")))
+              (is (= [] (rows db "SELECT b.id FROM blocks b LEFT JOIN blocks_fts f ON f.rowid = b.rowid
+                                  WHERE f.id IS NOT b.id OR f.title IS NOT b.title")))
+              (is (= [[10]] (rows db "SELECT count(*) FROM blocks_fts WHERE title MATCH 'edited'")))
+              (.close db))))))
+     (p/catch (fn [error]
+                (is false (str "unexpected error: " error))))
+     (p/finally done))))
+
+(deftest search-version-four-rebuild-resolves-uuid-titles-before-completion-test
+  (async done
+    (-> (restoring-worker-state
+         (fn []
+           (let [conn (d/create-conn db-schema/schema)
+                 page-uuid (random-uuid)
+                 target-uuid (random-uuid)
+                 ref-uuid (random-uuid)
+                 raw-title (str "see [[" target-uuid "]]")
+                 progress (atom [])
+                 path (node-path/join (node-helper/create-tmp-dir "search-v4") "search.sqlite")
+                 build-index! (get-thread-api :thread-api/search-build-blocks-indice-in-worker)
+                 rows (fn [db sql] (js->clj (.exec db #js {:sql sql :rowMode "array"})))]
+             (d/transact! conn [{:db/id -1 :block/uuid page-uuid :block/name "page" :block/title "Page"}
+                               {:db/id -2 :block/uuid target-uuid :block/title "Resolved target"
+                                :block/page -1 :block/parent -1 :block/order "a0"}
+                               {:block/uuid ref-uuid :block/title raw-title
+                                :block/page -1 :block/parent -1 :block/order "a1"}])
+             (platform/set-platform! (build-test-platform
+                                      {:runtime :node
+                                       :post-message! (fn [type payload]
+                                                        (when (= :thread-api/search-index-build-progress type)
+                                                          (swap! progress conj (second payload))))}))
+             (p/let [db (#'platform-node/open-sqlite-db nil {:path path})]
+               (.exec db "CREATE TABLE blocks (id TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL, page TEXT);
+                          CREATE VIRTUAL TABLE blocks_fts USING fts5(id, title, page, tokenize=\"trigram\");
+                          CREATE TRIGGER blocks_ai AFTER INSERT ON blocks BEGIN
+                            INSERT INTO blocks_fts (id, title, page) VALUES (new.id, new.title, new.page);
+                          END;")
+               (search/upsert-blocks! db #js [#js {:id (str ref-uuid) :page (str page-uuid) :title raw-title}])
+               (.exec db "PRAGMA user_version = 4")
+               (reset! worker-state/*sqlite-conns {test-repo {:search db}})
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (-> (p/let [result (build-index! test-repo false)
+                           _ (<wait-for-progress! progress #(some (fn [p] (= :completed (:status p))) %) 1000)]
+                     (is (= 4 result) "Starting the background move is not completion")
+                     (is (some #(= :completed (:status %)) @progress))
+                     (is (= [[6]] (rows db "PRAGMA user_version")))
+                     (is (= [["see [[Resolved target]]"]]
+                            (rows db (str "SELECT title FROM blocks WHERE id = '" ref-uuid "'"))))
+                     (is (some #(= ref-uuid (:block/uuid %))
+                               (search-handler/search-blocks test-repo "Resolved target" {:limit 10}))))
+                   (p/finally #(.close db)))))))
+        (p/catch (fn [error] (is false (str "unexpected error: " error))))
+        (p/finally done))))
+
+(deftest search-rowid-migration-truncated-before-start-test
+  (async done
+    (->
+     (restoring-worker-state
+      (fn []
+        (let [build-index! (get @thread-api/*thread-apis :thread-api/search-build-blocks-indice-in-worker)
+              truncate! (get @thread-api/*thread-apis :thread-api/search-truncate-tables)
+              build-ids @#'search-handler/*search-index-build-ids
+              block-id (str (random-uuid))
+              page-id (str (random-uuid))
+              rows (fn [db sql] (js->clj (.exec db #js {:sql sql :rowMode "array"})))
+              path (node-path/join (node-helper/create-tmp-dir "search-db") "search.sqlite")]
+          (platform/set-platform! (build-test-platform {:runtime :node}))
+          (p/let [db (#'platform-node/open-sqlite-db nil {:path path})]
+            (search/create-tables-and-triggers! db)
+            (.exec db "PRAGMA user_version = 4")
+            (reset! worker-state/*sqlite-conns {test-repo {:search db}})
+            (-> (p/let [result (build-index! test-repo false)
+                        _ (truncate! test-repo)
+                        _ (<wait-for-progress! build-ids #(nil? (get % test-repo)) 1000)]
+                  (is (= 4 result))
+                  (is (nil? (get @build-ids test-repo)))
+                  (is (= [[0]] (rows db "PRAGMA user_version")))
+                  (is (= [] (rows db "SELECT name FROM sqlite_master WHERE name GLOB 'blocks_fts_next*'")))
+                  (is (= [["blocks_ad"] ["blocks_ai"] ["blocks_au"]]
+                         (rows db "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")))
+                  (search/upsert-blocks! db #js [#js {:id block-id :title "after truncate" :page page-id}])
+                  (is (= [[block-id]] (rows db "SELECT id FROM blocks_fts WHERE title MATCH 'truncate'"))))
+                (p/finally (fn [] (.close db))))))))
+     (p/catch (fn [error]
+                (is false (str "unexpected error: " error))))
+     (p/finally done))))
+
+(deftest search-rowid-migration-superseded-before-start-test
+  (async done
+    (->
+     (restoring-worker-state
+      (fn []
+        (let [build-ids @#'search-handler/*search-index-build-ids
+              block-id (str (random-uuid))
+              page-id (str (random-uuid))
+              rows (fn [db sql] (js->clj (.exec db #js {:sql sql :rowMode "array"})))
+              path (node-path/join (node-helper/create-tmp-dir "search-db") "search.sqlite")]
+          (platform/set-platform! (build-test-platform {:runtime :node}))
+          (p/let [db (#'platform-node/open-sqlite-db nil {:path path})]
+            (search/create-tables-and-triggers! db)
+            (.exec db "PRAGMA user_version = 4")
+            (reset! worker-state/*sqlite-conns {test-repo {:search db}})
+            (swap! build-ids assoc test-repo "old-build")
+            (let [migration (#'search-handler/<migrate-fts-to-rowid! test-repo db "old-build")]
+              (swap! build-ids assoc test-repo "new-build")
+              (search/start-fts-rowid-migration! db)
+              (search/upsert-blocks! db #js [#js {:id block-id :title "new build" :page page-id}])
+              (-> migration
+                  (p/then (fn [_] (is false "the superseded migration must stop")))
+                  (p/catch (fn [error]
+                             (is (= :search/stale-index-build (:type (ex-data error))))))
+                  (p/then (fn [_]
+                            (is (= "new-build" (get @build-ids test-repo)))
+                            (is (= [[block-id]] (rows db "SELECT id FROM blocks_fts_next")))
+                            (is (= [[4]] (rows db "PRAGMA user_version")))))
+                  (p/finally (fn []
+                               (swap! build-ids dissoc test-repo)
+                               (.close db)))))))))
+     (p/catch (fn [error]
+                (is false (str "unexpected error: " error))))
+     (p/finally done))))
+
 (deftest vector-embedding-title-truncates-long-text-test
   (let [vector-embedding-title #'search-handler/vector-embedding-title
         long-title (apply str (repeat 6000 "x"))]
@@ -2708,7 +3397,13 @@
    (fn []
      (let [conn (d/create-conn db-schema/schema)
            block-uuid #uuid "11111111-2222-3333-4444-555555555555"]
-       (d/transact! conn [{:db/ident :logseq.class/Page
+       (d/transact! conn [{:db/ident :logseq.property/hide?
+                           :db/index true}
+                          {:db/ident :logseq.property/deleted-at
+                           :db/index true}
+                          {:db/ident :logseq.property/built-in?
+                           :db/index true}
+                          {:db/ident :logseq.class/Page
                            :block/title "Page"}
                           {:block/uuid block-uuid
                            :block/title "Tagged page"
@@ -2721,6 +3416,7 @@
                  :block/uuid block-uuid
                  :block/title "Tagged page"
                  :block/raw-title "Tagged page"
+                 :block.temp/property-keys [:block/tags]
                  :block/tags [{:db/id class-id
                                :db/ident :logseq.class/Page
                                :block/title "Page"
@@ -3021,6 +3717,33 @@
          (is (= ["Jan 2nd, 2024"] (mapv :block/title result)))
          (is (= ["Jan 2nd, 2024"] (mapv :block/raw-title result))))))))
 
+(deftest get-latest-journals-bounded-scan
+  (restoring-worker-state
+   (fn []
+     (let [conn (d/create-conn task-spent-time-schema)
+           journal-count 50]
+       (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+       (d/transact! conn (mapv (fn [i]
+                                 {:block/uuid (random-uuid)
+                                  :block/title (str "journal " i)
+                                  :block/name (str "journal " i)
+                                  :block/journal-day (+ 20240101 i)
+                                  :block/tags :logseq.class/Journal})
+                               (range journal-count)))
+       (let [scanned (volatile! 0)
+             wrap-scan (fn [f]
+                         (fn [db index c & cs]
+                           (let [s (apply f db index c cs)]
+                             (if (= :block/journal-day c)
+                               (map (fn [d] (vswap! scanned inc) d) s)
+                               s))))
+             realized (with-redefs [d/datoms (wrap-scan d/datoms)
+                                    d/rseek-datoms (wrap-scan d/rseek-datoms)]
+                        (doall (take 1 (ldb/get-latest-journals @conn))))]
+         (is (= 1 (count realized)))
+         ;; bounded request: realizes O(requested) datoms, not O(total journals)
+         (is (< @scanned journal-count)))))))
+
 ;; ---- q / datoms / pull thread-api tests ----
 
 (deftest q-executes-datascript-query
@@ -3114,7 +3837,23 @@
        (is (= ["current worker page"]
               (resolve-inputs! test-repo [":current-page"]
                                {:current-page page-uuid
-                                :today-title "Today"})))))))
+                                :today-title "Today"})))
+       (let [broken-refs-matcher "\\([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\)"]
+         (is (= [broken-refs-matcher]
+                (resolve-inputs! test-repo [broken-refs-matcher] {}))
+             "Regex query inputs that start with an escaped paren stay strings.")
+         (doseq [input ["target-page" "two words" "foo.*"]]
+           (is (= [input] (resolve-inputs! test-repo [input] {}))
+               "Raw string query inputs retain their complete text."))
+         (is (= [tag-uuid]
+                (resolve-inputs! test-repo [(str "#uuid \"" tag-uuid "\"")] {}))
+             "Plugin EDN UUID inputs stay UUIDs.")
+         (is (= ["target-page"]
+                (resolve-inputs! test-repo ["\"target-page\""] {}))
+             "Quoted EDN string inputs are unquoted.")
+         (is (= [["a" "b" "c"]]
+                (resolve-inputs! test-repo ["[\"a\" \"b\" \"c\"]"] {}))
+             "EDN collection inputs stay collections."))))))
 
 (deftest query-dsl-worker-apis-run-against-worker-db
   (restoring-worker-state
@@ -3394,6 +4133,8 @@
              plain-results (remove #(= "Block 2" (:block/title %)) children)
              unrelated-result (some #(when (= "Block 3" (:block/title %)) %) children)]
          (is (= 165 (count children)))
+         (is (every? #(not (contains? % :block.temp/breadcrumb)) (cons block children))
+             "Ordinary tree metadata does not preload breadcrumbs.")
          (is (contains? block :block.temp/display-properties)
              "The journal root should carry full render data in its initial tree response.")
          (is (contains? block :block.temp/positioned-properties))
@@ -3680,60 +4421,413 @@
          (is (= [:user.property/a :user.property/b :logseq.property/icon :logseq.property/private]
                 (map :db/ident with-built-ins))))))))
 
+(defn- assert-terminal-import-result
+  [result]
+  (is (string? (:run-id result)))
+  (is (contains? #{:completed :completed-with-errors} (:status result)))
+  (is (true? (:persisted? result)))
+  (is (map? (:validation result)))
+  (is (nat-int? (:issue-count result)))
+  (is (nat-int? (:org-file-count result)))
+  (is (not (contains? result :files)))
+  (is (not (contains? result :import-state)))
+  (is (not (contains? result :staged-assets)))
+  (is (not (contains? result :ignored-properties))))
+
 (deftest import-file-graph-imports-documents-into-worker-conn
   (async done
-         (restoring-worker-state
-          (fn []
-            (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
-                  conn (d/create-conn db-schema/schema)
-                  pipeline-before @ldb/*transact-pipeline-fn
-                  renderer-payloads (atom [])
-                  config-file {:path "logseq/config.edn"
-                               :file/content "{}"}
-                  files [config-file
-                         {:path "pages/Home.md"
-                          :file/content "- imported block"}]]
-              (is (fn? import-file-graph!))
-              (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
-              (reset! worker-state/*datascript-conns {test-repo conn})
-              (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
-              (p/with-redefs
-                [db-sync/update-local-sync-checksum! (fn [& _] nil)
-                 db-sync/handle-local-tx! (fn [& _] nil)
-                 shared-service/broadcast-to-clients!
-                 (fn [event payload]
-                   (when (= :sync-db-changes event)
-                     (swap! renderer-payloads conj payload)))]
-                (db-listener/listen-db-changes! test-repo conn
-                                                :handler-keys [:sync-db-to-main-thread])
-                (->
-                 (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
-                         page (some->> (d/q '[:find [?e ...]
-                                               :where [?e :block/name "home"]]
-                                             @conn)
-                                             first
-                                        (d/entity @conn))
-                         block (db-test/find-block-by-content @conn "imported block")
-                         published-block-uuids
-                         (into #{}
-                               (mapcat #(keys (get-in % [:delta :blocks])))
-                               @renderer-payloads)]
-                   (is (= #{"pages/Home.md" "logseq/config.edn"}
-                          (set (map :path (:files result)))))
-                   (is (= "Home" (:block/title page)))
-                   (is (= "imported block" (:block/title block)))
-                   (doseq [entity [page block]]
-                     (is (nat-int? (:block/tx-id entity)))
-                     (is (= (:block/uuid entity)
-                            (:block/uuid (block-handler/canonical-block @conn entity))))
-                     (is (contains? published-block-uuids (:block/uuid entity))
-                         "Live file imports must publish complete canonical replacements.")))
-                 (p/catch
-                  (fn [error]
-                    (is false (str error))))
-                 (p/finally (fn []
-                              (reset! ldb/*transact-pipeline-fn pipeline-before)
-                              (done))))))))))
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   renderer-payloads (atom [])
+                   ui-state (atom [])
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Home.md"
+                           :file/content "- imported block"}]]
+               (is (fn? import-file-graph!))
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread
+                       (fn [qkw & args]
+                         (when (= qkw :thread-api/set-ui-state)
+                           (swap! ui-state conj (vec args)))
+                         (p/resolved nil)))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients!
+                  (fn [event payload]
+                    (when (= :sync-db-changes event)
+                      (swap! renderer-payloads conj payload)))]
+                 (db-listener/listen-db-changes! test-repo conn
+                                                 :handler-keys [:sync-db-to-main-thread])
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          page (some->> (d/q '[:find [?e ...]
+                                                :where [?e :block/name "home"]]
+                                              @conn)
+                                              first
+                                         (d/entity @conn))
+                          block (db-test/find-block-by-content @conn "imported block")]
+                    (assert-terminal-import-result result)
+                    (is (= :completed (:status result)))
+                    (is (= 0 (:org-file-count result)))
+                    (is (= 0 (:ignored-properties-count result)))
+                    (is (= {:status :passed :error-count 0} (:validation result)))
+                    (is (= "Home" (:block/title page)))
+                    (is (= "imported block" (:block/title block)))
+                    (doseq [entity [page block]]
+                      (is (nat-int? (:block/tx-id entity)))
+                      (is (= (:block/uuid entity)
+                             (:block/uuid (block-handler/canonical-block @conn entity)))))
+                    (is (empty? @renderer-payloads)
+                        "File-graph import must not broadcast renderer deltas to clients."))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-reads-file-stat-from-path-string
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   stat-paths (atom [])
+                   created-at (js/Date. "2020-01-02T03:04:05.000Z")
+                   modified-at (js/Date. "2021-06-07T08:09:10.000Z")
+                   fake-fsp #js {:stat (fn [path]
+                                         (swap! stat-paths conj path)
+                                         (p/resolved #js {:birthtime created-at
+                                                          :mtime modified-at}))}
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Home.md"
+                           :fs-path "/tmp/graph/pages/Home.md"
+                           :file/content "- timestamped"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread (fn [& _] (p/resolved nil)))
+               (platform/set-platform! (build-test-platform {:runtime :node}))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-core/node-fs-promises (fn [] fake-fsp)
+                  db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (->
+                  (p/let [_result (import-file-graph! test-repo config-file files {:user-options {}})
+                          page (ldb/get-page @conn "home")
+                          block (db-test/find-block-by-content @conn "timestamped")]
+                    (is (= ["/tmp/graph/pages/Home.md"] @stat-paths)
+                        "Exporter passes a filesystem path string to <get-file-stat.")
+                    (is (= (.getTime created-at) (:block/created-at page) (:block/created-at block)))
+                    (is (= (.getTime modified-at) (:block/updated-at page) (:block/updated-at block))))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-lazy-read-failure-is-ignored-not-empty-page
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   fake-fsp #js {:readFile (fn [_path _encoding]
+                                             (p/rejected (js/Error. "ENOENT")))
+                                 :stat (fn [_path]
+                                         (p/rejected (js/Error. "ENOENT")))}
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Missing.md"
+                           :fs-path "/tmp/graph/pages/Missing.md"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread (fn [& _] (p/resolved nil)))
+               (platform/set-platform! (build-test-platform {:runtime :node}))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-core/node-fs-promises (fn [] fake-fsp)
+                  db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})]
+                    (is (nil? (ldb/get-page @conn "missing"))
+                        "A missing lazy file is not imported as an empty page.")
+                    (is (pos? (:ignored-files-count result))
+                        "Read failure is recorded as an ignored file.")
+                    (is (= :completed-with-errors (:status result))))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(defn- imported-ref-uuids
+  [entity]
+  (set (map :block/uuid (:block/refs entity))))
+
+(deftest import-file-graph-stores-page-refs-and-progress
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   get-block-refs! (get @thread-api/*thread-apis :thread-api/get-block-refs)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   renderer-payloads (atom [])
+                   ui-state (atom [])
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/source.md"
+                           :file/content "- see [[Target]]"}
+                          {:path "pages/Target.md"
+                           :file/content "- target"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread
+                       (fn [qkw & args]
+                         (when (= qkw :thread-api/set-ui-state)
+                           (swap! ui-state conj (vec args)))
+                         (p/resolved nil)))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients!
+                  (fn [event payload]
+                    (when (= :sync-db-changes event)
+                      (swap! renderer-payloads conj payload)))]
+                 (db-listener/listen-db-changes! test-repo conn
+                                                 :handler-keys [:sync-db-to-main-thread])
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          current-pages (->> @ui-state
+                                             (filter #(= [:graph/importing-state :current-page] (first %)))
+                                             (map second)
+                                             set)
+                          last-label (->> @ui-state
+                                          (filter #(= [:graph/importing-state :label] (first %)))
+                                          last
+                                          second)
+                          target (db-test/find-page-by-title @conn "Target")
+                          block (or (db-test/find-block-by-content @conn #"see ")
+                                    (db-test/find-block-by-content @conn (re-pattern (str (:block/uuid target)))))
+                          canonical-block (when block (block-handler/canonical-block @conn block))
+                          canonical-target (when target (block-handler/canonical-block @conn target))
+                          linked (when target (get-block-refs! test-repo (:db/id target)))]
+                    (is (some? target) "Target page is imported.")
+                    (is (some? block) "Referring block is imported.")
+                    (is (contains? (imported-ref-uuids block) (:block/uuid target))
+                        "Imported block refs are stored on the worker conn.")
+                    (is (contains? (imported-ref-uuids canonical-block) (:block/uuid target))
+                        "UI canonical blocks include the same page refs.")
+                    (is (pos? (:block.temp/refs-count canonical-target))
+                        "UI linked-reference counts are present on the referenced page.")
+                    (is (contains? (set (map :block/uuid linked))
+                                   (:block/uuid block))
+                        "Linked-references API returns the referring block.")
+                    (is (empty? @renderer-payloads)
+                        "File-graph import must not broadcast renderer deltas to clients.")
+                    (assert-terminal-import-result result)
+                    (is (contains? current-pages "logseq/config.edn")
+                        "Import progress shows the config file being read.")
+                    (is (contains? current-pages "pages/source.md")
+                        "Import progress shows the current markdown file.")
+                    (is (contains? current-pages "pages/Target.md")
+                        "Import progress shows each imported markdown file.")
+                    (is (some #{:import/finishing}
+                              (->> @ui-state
+                                   (filter #(= [:graph/importing-state :label] (first %)))
+                                   (map second)))
+                        "After files are written, progress shows finishing work.")
+                    (is (= :import/validating-graph last-label)
+                        "After files are written, progress shows graph validation.")
+                    (is (= 2 (->> @ui-state
+                                  (filter #(= [:graph/importing-state :total] (first %)))
+                                  last
+                                  second))
+                        "Progress total is the number of markdown files.")
+                    (is (seq (filter #(= [:graph/importing-state :current-idx] (first %))
+                                     @ui-state))
+                        "Progress current-idx updates during import."))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-reports-progress-via-node-post-message
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   posted (atom [])
+                   main-thread-calls (atom [])
+                   config-file {:path "logseq/config.edn"
+                                :file/content "{}"}
+                   files [config-file
+                          {:path "pages/Home.md"
+                           :file/content "- imported on node"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (platform/set-platform!
+                (build-test-platform
+                 {:runtime :node
+                  :post-message! (fn [type payload]
+                                   (swap! posted conj [type payload]))}))
+               (reset! worker-state/*main-thread
+                       (fn [qkw & _args]
+                         (swap! main-thread-calls conj qkw)
+                         (p/rejected (ex-info "main-thread is not available in db-worker-node"
+                                              {:method qkw}))))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)]
+                 (db-listener/listen-db-changes! test-repo conn
+                                                 :handler-keys [:sync-db-to-main-thread])
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          ui-state (keep (fn [[type payload]]
+                                           (when (= type :thread-api/set-ui-state)
+                                             payload))
+                                         @posted)
+                          current-pages (->> ui-state
+                                             (filter #(= [:graph/importing-state :current-page] (first %)))
+                                             (map second)
+                                             set)
+                          last-label (->> ui-state
+                                          (filter #(= [:graph/importing-state :label] (first %)))
+                                          last
+                                          second)]
+                    (is (map? result)
+                        "Desktop import returns the terminal worker reply.")
+                    (assert-terminal-import-result result)
+                    (is (empty? @main-thread-calls)
+                        "Desktop db-worker-node must not use the main-thread stub for import progress.")
+                    (is (contains? current-pages "pages/Home.md")
+                        "Desktop import progress is posted over the node event channel.")
+                    (is (= :import/validating-graph last-label)
+                        "Desktop import progress reaches graph validation."))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest import-file-graph-streams-files-via-ui-request
+  (async done
+         (->
+          (restoring-worker-state
+           (fn []
+             (let [import-file-graph! (get @thread-api/*thread-apis :thread-api/import-file-graph)
+                   conn (d/create-conn db-schema/schema)
+                   pipeline-before @ldb/*transact-pipeline-fn
+                   in-flight (atom 0)
+                   max-in-flight (atom 0)
+                   requested (atom [])
+                   contents {"logseq/config.edn" "{}"
+                             "pages/Home.md" "- imported home"
+                             "pages/Projects.md" "- imported projects"}
+                   config-file {:path "logseq/config.edn"
+                                :fs-path "/tmp/graph/logseq/config.edn"}
+                   files [{:path "logseq/config.edn"
+                           :fs-path "/tmp/graph/logseq/config.edn"}
+                          {:path "pages/Home.md"
+                           :fs-path "/tmp/graph/pages/Home.md"}
+                          {:path "pages/Projects.md"
+                           :fs-path "/tmp/graph/pages/Projects.md"}]]
+               (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
+               (reset! worker-state/*datascript-conns {test-repo conn})
+               (reset! worker-state/*main-thread (fn [& _] (p/resolved nil)))
+               (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+               (p/with-redefs
+                 [db-sync/update-local-sync-checksum! (fn [& _] nil)
+                  db-sync/handle-local-tx! (fn [& _] nil)
+                  shared-service/broadcast-to-clients! (fn [& _] nil)
+                  ui-request/<request
+                  (fn [action payload _opts]
+                    (is (= :read-import-file action))
+                    (swap! requested conj (:path payload))
+                    (swap! in-flight inc)
+                    (swap! max-in-flight max @in-flight)
+                    (p/let [_ (p/delay 0)]
+                      (swap! in-flight dec)
+                      {:path (:path payload)
+                       :file/content (get contents (:path payload))}))]
+                 (->
+                  (p/let [result (import-file-graph! test-repo config-file files {:user-options {}})
+                          home (ldb/get-page @conn "home")
+                          projects (ldb/get-page @conn "projects")
+                          home-block (db-test/find-block-by-content @conn "imported home")
+                          project-block (db-test/find-block-by-content @conn "imported projects")]
+                    (assert-terminal-import-result result)
+                    (is (= "Home" (:block/title home)))
+                    (is (= "Projects" (:block/title projects)))
+                    (is (= "imported home" (:block/title home-block)))
+                    (is (= "imported projects" (:block/title project-block)))
+                    (is (= 1 @max-in-flight)
+                        "Browser db-worker streams one file at a time via UI request and must not read Node fs.")
+                    (is (= #{"logseq/config.edn" "pages/Home.md" "pages/Projects.md"}
+                           (set @requested))))
+                  (p/finally (fn []
+                               (reset! ldb/*transact-pipeline-fn pipeline-before))))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done))))
+
+(deftest transact-failed-logs-tx-count-not-tx-data-test
+  (let [conn (db-test/create-conn)
+        tx-data [{:db/id -1
+                  :block/uuid (random-uuid)
+                  :block/title "block-1"}]
+        logs (atom [])
+        original-error (js/Error. "store failed")]
+    (with-redefs [log/error (fn [& args]
+                              (swap! logs conj args))
+                  d/transact! (fn [& _] (throw original-error))]
+      (try
+        (ldb/transact! conn tx-data {:skip-validate-db? true})
+        (is false "expected transact! to throw")
+        (catch :default e
+          (is (identical? original-error e)
+              "Original transaction error is rethrown, not a printer overflow."))))
+    (let [payload (some (fn [args]
+                          (some #(when (and (map? %) (:tx-count %)) %) args))
+                        @logs)]
+      (is (some? payload))
+      (is (pos? (:tx-count payload)))
+      (is (not (contains? payload :tx-data)))
+      (is (string/includes? (:error payload) "store failed")))))
 
 (deftest get-date-scheduled-or-deadlines-filters-sorts-and-groups-worker-results
   (restoring-worker-state
@@ -3982,6 +5076,7 @@
        (d/transact! conn (sqlite-create-graph/build-db-initial-data "{}"))
        (d/transact! conn [{:db/id first-block-tempid
                            :block/title "Object"
+                           :block/name "object"
                            :block/uuid first-block-id
                            :block/tags :logseq.class/Page}
                           {:db/id second-block-tempid
@@ -4634,3 +5729,16 @@
          (is (string? (:error result)))
          (is (= page-class-id (:db/id (d/entity @dest-conn :logseq.class/Page)))
              "Invalid datom import should not replace the existing graph"))))))
+
+(deftest close-db-attempts-remaining-handles-on-failure
+  (restoring-worker-state
+   (fn []
+     (let [closed (atom [])
+           failing (fake-db {})
+           search-db (fake-db {:close-calls closed :close-label :search})
+           client-db (fake-db {:close-calls closed :close-label :client-ops})]
+       (set! (.-close failing) (fn [] (throw (js/Error. "close failed"))))
+       (reset! worker-state/*sqlite-conns
+               {test-repo {:db failing :search search-db :client-ops client-db}})
+       (is (thrown? js/Error (db-core/close-db! test-repo)))
+       (is (= [:search :client-ops] @closed))))))

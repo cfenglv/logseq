@@ -9,6 +9,7 @@
    [frontend.worker.plain-value :as worker-plain]
    [frontend.worker.shared-service :as shared-service]
    [frontend.worker.state :as worker-state]
+   [frontend.worker.undo-redo :as worker-undo-redo]
    [lambdaisland.glogi :as log]
    [logseq.common.util :as common-util]
    [logseq.db :as ldb]
@@ -29,8 +30,11 @@
   [conn]
   (let [now (common-util/time-ms)
         last-gc-at (:kv/value (d/entity @conn recycle-gc-kv))]
-    (when (or (not (number? last-gc-at))
-              (> (- now last-gc-at) outliner-recycle/gc-interval-ms))
+    ;; Another client may still have an offline restore or edit. Automatic
+    ;; permanent deletion is local-only; remote graphs use explicit deletion.
+    (when (and (not (:kv/value (d/entity @conn :logseq.kv/graph-remote?)))
+               (or (not (number? last-gc-at))
+                   (> (- now last-gc-at) outliner-recycle/gc-interval-ms)))
       (outliner-recycle/gc! conn {:now-ms now})
       (ldb/transact! conn [{:db/ident recycle-gc-kv
                             :kv/value now}]
@@ -66,8 +70,9 @@
         (maybe-run-recycle-gc! conn)
         nil)
       (catch :default error
-        (prn :debug :worker-transact-failed :tx-meta tx-meta :tx-data tx-data)
-        (log/error ::worker-transact-failed error)
+        (log/error ::worker-transact-failed {:tx-meta tx-meta
+                                             :tx-count (count tx-data)
+                                             :error error})
         (throw error)))))
 
 (defn- perf-time-ms []
@@ -97,12 +102,17 @@
                                  {:type :db/missing-connection
                                   :repo repo})))]
     (try
+      ;; Folded into this call so the client pays one worker roundtrip
+      ;; per outliner op instead of two; must run before apply-ops! so undo
+      ;; records pre-op editor state.
+      (worker-undo-redo/set-pending-editor-info! repo (:pending-editor-info opts))
       (let [started-at (perf-time-ms)
             perf-id (:ui/perf-id opts)
             editor-row-uuids (:editor-row-uuids opts)
             operation-opts (dissoc opts
                                    :affected-block-uuids
                                    :editor-row-uuids
+                                   :pending-editor-info
                                    :return-updated-blocks?)
             apply-started-at (perf-time-ms)
             operation-result (worker-util/profile

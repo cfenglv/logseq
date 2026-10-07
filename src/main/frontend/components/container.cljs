@@ -18,6 +18,8 @@
             [frontend.db.async :as db-async]
             [frontend.handler.common :as common-handler]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.editor.assets :as editor-assets]
+            [frontend.handler.editor.format :as editor-format]
             [frontend.handler.route :as route-handler]
             [frontend.handler.user :as user-handler]
             [frontend.mobile.footer :as footer]
@@ -71,7 +73,7 @@
             {:drop (fn [_e files]
                      (when-let [id (state/get-edit-input-id)]
                        (let [format (get (state/get-edit-block) :block/format :markdown)]
-                         (editor-handler/upload-asset! id files format editor-handler/*asset-uploading? true))))})
+                         (editor-assets/upload-asset! id files format editor-handler/*asset-uploading? true))))})
            (common-handler/listen-to-scroll! element)
            (when margin-less-pages? ;; makes sure full screen pages displaying without scrollbar
              (set! (.. element -scrollTop) 0)))
@@ -122,23 +124,34 @@
 
 (defonce sidebar-inited? (atom false))
 
+(defn home-redirect-target
+  "Home-route start page. Prefer :default-home; publishing with no journals
+  falls back to all-pages."
+  [{:keys [default-home current-route route-has-p? publishing? latest-journals]}]
+  (cond
+    (and default-home
+         (= :home current-route)
+         (not route-has-p?)
+         (:page default-home))
+    [:page (:page default-home)]
+
+    (and publishing?
+         (not default-home)
+         (some? latest-journals)
+         (empty? latest-journals))
+    [:route :all-pages]))
+
 (hsx/defc main-content
   []
   (let [default-home (app-left-sidebar/use-default-home-if-valid)
         current-repo (rfx/use-sub [:git/current-repo])
         [latest-journals set-latest-journals!] (hooks/use-state nil)
-        redirect-target (cond
-                          (and default-home
-                               (= :home (state/get-current-route))
-                               (not (state/route-has-p?))
-                               (:page default-home))
-                          [:page (:page default-home)]
-
-                          (and config/publishing?
-                               (not default-home)
-                               (some? latest-journals)
-                               (empty? latest-journals))
-                          [:route :all-pages])]
+        redirect-target (home-redirect-target
+                         {:default-home default-home
+                          :current-route (state/get-current-route)
+                          :route-has-p? (state/route-has-p?)
+                          :publishing? config/publishing?
+                          :latest-journals latest-journals})]
        (hooks/use-effect!
         (fn []
           (if (and config/publishing? current-repo (not default-home))
@@ -337,10 +350,12 @@
            (fn [^js e]
              (let [target (gobj/get e "target")
                    block-el (.closest target ".bullet-container[blockid]")
-                   ;; Context-menu actions inside an embed must use the linking
-                   ;; placeholder rather than a rendered canonical descendant.
-                   original-block-el (some-> target (.closest ".ls-block[originalblockid]"))
-                   block-id (or (some-> original-block-el (.getAttribute "originalblockid"))
+                   ;; A row rendered through :block/link carries the linked block's
+                   ;; uuid as `blockid` and the linking block's own uuid as
+                   ;; `originalblockid`. Block-level context menu actions must act on
+                   ;; the linking block, otherwise they operate on the embed target.
+                   ls-block-el (some-> target (.closest ".ls-block[originalblockid]"))
+                   block-id (or (some-> ls-block-el (.getAttribute "originalblockid"))
                                 (some-> block-el (.getAttribute "blockid")))
                    {:keys [block block-ref]} (state/get-state :block-ref/context)
                    {:keys [page page-entity]} (state/get-state :page-title/context)
@@ -519,7 +534,7 @@
       :system-theme? system-theme?
       :preferred-language preferred-language
       :on-click (fn [e]
-                  (editor-handler/unhighlight-blocks!)
+                  (editor-format/unhighlight-blocks!)
                   (util/fix-open-external-with-shift! e))}
 
      [:main.theme-container-inner#app-container-wrapper

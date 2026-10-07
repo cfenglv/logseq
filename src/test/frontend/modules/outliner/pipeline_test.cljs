@@ -1,8 +1,46 @@
 (ns frontend.modules.outliner.pipeline-test
   (:require [cljs.test :refer [deftest is]]
             [frontend.db.subs :as db-subs]
+            [frontend.handler.route :as route-handler]
             [frontend.modules.outliner.pipeline :as pipeline]
-            [frontend.state :as state]))
+            [frontend.state :as state]
+            [frontend.util :as util]))
+
+(deftest deletion-resolves-named-route-identity-before-applying-delta-test
+  (let [repo "named-route-deletion-test"
+        page-uuid (random-uuid)]
+    (doseq [[route ready? permanent? same-repo? expected]
+            [["Named Page" true false true 1]
+             ["Named Page" true true true 1]
+             [(str page-uuid) false true true 1]
+             ["Named Page" false true true 0]
+             ["Named Page" true true false 0]]]
+      (let [applied? (atom false)
+            redirects (atom 0)
+            delta {:blocks (if permanent? {} {page-uuid {:logseq.property/deleted-at 1}})
+                   :deleted (if permanent? {page-uuid {:db/id 42}} {})}]
+        (with-redefs [db-subs/future-projection? (constantly false)
+                      db-subs/current-projection? (constantly true)
+                      db-subs/resource-snapshot
+                      (fn [key]
+                        (is (= [:page-identity "named page"] key))
+                        (if (and ready? (not @applied?))
+                          {:status :ready :value page-uuid}
+                          {:status :loading}))
+                      db-subs/apply-delta! (fn [_] (reset! applied? true))
+                      state/get-current-repo (constantly (if same-repo? repo "other-graph"))
+                      state/get-current-page (constantly route)
+                      state/get-edit-block (constantly nil)
+                      state/editing? (constantly false)
+                      state/sidebar-remove-deleted-block! (constantly nil)
+                      state/remove-pages-from-recent! (constantly nil)
+                      state/set-state! (constantly nil)
+                      state/pub-event! (constantly nil)
+                      util/mobile? (constantly false)
+                      route-handler/<redirect-after-page-deletion! #(swap! redirects inc)]
+          (pipeline/invoke-hooks {:repo repo :tx-meta {} :delta delta}))
+        (is @applied?)
+        (is (= expected @redirects))))))
 
 (deftest compact-worker-broadcast-applies-the-exact-delta-once-and-keeps-page-events-test
   (let [original-state (state/get-state)
@@ -375,3 +413,151 @@
              editing-block
              "local dirty draft"]]
            @events))))
+
+(defn- recycled-page-delta
+  [page-uuid]
+  {:graph-id "delete-nav-test"
+   :rev 12
+   :blocks {page-uuid {:db/id 42
+                       :block/uuid page-uuid
+                       :block/tags [{:db/ident :logseq.class/Page}]
+                       :logseq.property/deleted-at 1}}
+   :deleted {}
+   :children {}
+   :affected-keys #{[:entity page-uuid]}})
+
+(defn- hard-deleted-page-delta
+  [page-uuid]
+  {:graph-id "delete-nav-test"
+   :rev 13
+   :blocks {}
+   :deleted {page-uuid {:rev 13 :db/id 42}}
+   :children {}
+   :affected-keys #{[:entity page-uuid]}})
+
+(defn- invoke-delete-hooks
+  [{:keys [current-page delta tx-meta]}]
+  (let [repo "delete-nav-test"
+        nav-calls (atom [])]
+    (with-redefs [db-subs/future-projection? (constantly false)
+                  db-subs/current-projection? (constantly true)
+                  db-subs/apply-delta! (constantly true)
+                  state/get-current-repo (constantly repo)
+                  state/get-current-page (constantly current-page)
+                  state/sidebar-remove-deleted-block! (constantly nil)
+                  state/pub-event! (constantly nil)
+                  route-handler/<redirect-after-page-deletion! (fn []
+                                                        (swap! nav-calls conj :previous))
+                  route-handler/redirect-to-home! (fn [& _]
+                                                    (swap! nav-calls conj :home))]
+      (pipeline/invoke-hooks {:repo repo
+                              :tx-meta (merge {:client-id "client"
+                                               :outliner-op :delete-page
+                                               :deleted-page "Page B"}
+                                              tx-meta)
+                              :delta delta})
+      @nav-calls)))
+
+(deftest recycling-current-page-goes-to-previous-route-test
+  (let [original-state (state/get-state)
+        page-uuid (random-uuid)]
+    (try
+      (state/replace-state! {:client-id "client"})
+      (is (= [:previous]
+             (invoke-delete-hooks
+              {:current-page (str page-uuid)
+               :delta (recycled-page-delta page-uuid)}))
+          "Deleting the current page goes back to the previous page/block, not home.")
+      (finally
+        (state/replace-state! original-state)))))
+
+(deftest recycling-other-page-does-not-navigate-test
+  (let [original-state (state/get-state)
+        page-uuid (random-uuid)]
+    (try
+      (state/replace-state! {:client-id "client"})
+      (is (= []
+             (invoke-delete-hooks
+              {:current-page (str (random-uuid))
+               :delta (recycled-page-delta page-uuid)}))
+          "Deleting a page that is not the current route must not steal navigation.")
+      (finally
+        (state/replace-state! original-state)))))
+
+(deftest hard-deleting-current-page-goes-to-previous-route-test
+  (let [original-state (state/get-state)
+        page-uuid (random-uuid)]
+    (try
+      (state/replace-state! {:client-id "client"})
+      (is (= [:previous]
+             (invoke-delete-hooks
+              {:current-page (str page-uuid)
+               :delta (hard-deleted-page-delta page-uuid)}))
+          "Permanently deleting the current page goes back to the previous page/block.")
+      (finally
+        (state/replace-state! original-state)))))
+
+(deftest hard-deleting-other-page-does-not-navigate-test
+  (let [original-state (state/get-state)
+        page-uuid (random-uuid)]
+    (try
+      (state/replace-state! {:client-id "client"})
+      (is (= []
+             (invoke-delete-hooks
+              {:current-page (str (random-uuid))
+               :delta (hard-deleted-page-delta page-uuid)}))
+          "Permanently deleting a non-current page must not steal navigation.")
+      (finally
+        (state/replace-state! original-state)))))
+
+(deftest deleting-current-page-on-mobile-goes-to-previous-route-once-test
+  (let [original-state (state/get-state)
+        page-uuid (random-uuid)]
+    (try
+      (state/replace-state! {:client-id "client"})
+      (with-redefs [util/mobile? (constantly true)]
+        (doseq [delta [(recycled-page-delta page-uuid)
+                       (hard-deleted-page-delta page-uuid)
+                       (assoc (recycled-page-delta page-uuid)
+                              :deleted (:deleted (hard-deleted-page-delta page-uuid)))]]
+          (is (= [:previous]
+                 (invoke-delete-hooks
+                  {:current-page (str page-uuid)
+                   :delta delta}))
+              "Recycling or permanently deleting the current mobile page navigates exactly once.")))
+      (finally
+        (state/replace-state! original-state)))))
+
+(deftest recycling-current-block-goes-to-previous-route-test
+  (let [original-state (state/get-state)
+        block-uuid (random-uuid)]
+    (try
+      (state/replace-state! {:client-id "client"})
+      (is (= [:previous]
+             (invoke-delete-hooks
+              {:current-page (str block-uuid)
+               :delta {:graph-id "delete-nav-test"
+                       :rev 14
+                       :blocks {block-uuid {:db/id 99
+                                            :block/uuid block-uuid
+                                            :logseq.property/deleted-at 1}}
+                       :deleted {}
+                       :children {}
+                       :affected-keys #{[:entity block-uuid]}}}))
+          "Deleting the focused block also returns to the previous page/block.")
+      (finally
+        (state/replace-state! original-state)))))
+
+(deftest recycling-current-page-during-initial-pages-does-not-navigate-test
+  (let [original-state (state/get-state)
+        page-uuid (random-uuid)]
+    (try
+      (state/replace-state! {:client-id "client"})
+      (is (= []
+             (invoke-delete-hooks
+              {:current-page (str page-uuid)
+               :delta (recycled-page-delta page-uuid)
+               :tx-meta {:initial-pages? true}}))
+          "Graph load must not treat recycled pages as a user delete navigation.")
+      (finally
+        (state/replace-state! original-state)))))

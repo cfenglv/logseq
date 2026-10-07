@@ -56,6 +56,8 @@
                    {:http-base "https://sync.example.test"})
            (-> (p/with-redefs
                  [worker-state/get-datascript-conn (fn [_] conn)
+                  worker-state/*db-sync-client (atom client)
+                  sync-apply/*repo->latest-remote-tx (atom {repo 9})
                   client-op/read-repair-local-observation
                   (fn [_] observation)
                   sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))
@@ -105,11 +107,102 @@
                             (reset! worker-state/*db-sync-config config-prev)
                             (done)))))))
 
+(deftest stale-server-proof-does-not-claim-or-write-checksum-test
+  (async done
+    (-> (p/doseq [server-t [8 10]]
+          (let [repo "stale-proof-repo"
+                conn (atom :db)
+                client {:graph-id "graph-1" :inflight (atom [])}
+                writes (atom 0)]
+            (p/with-redefs
+              [worker-state/get-datascript-conn (constantly conn)
+               worker-state/*db-sync-client (atom client)
+               worker-state/*db-sync-config (atom {:http-base "https://sync.example.test"})
+               sync-apply/*repo->latest-remote-tx (atom {repo 9})
+               client-op/read-repair-local-observation
+               (constantly {:remote-t 9 :journal-high-water 14 :pending-count 0 :legacy-anchor "cached"})
+               client-op/update-local-checksum (fn [& _] (swap! writes inc))
+               sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))
+               sync-download/fetch-json (fn [& _] (p/resolved {:t server-t}))
+               thread-api/*thread-apis
+               (atom {:thread-api/db-sync-claim-repair (fn [& _] (swap! writes inc))
+                      :thread-api/db-sync-commit-repair (fn [& _] (swap! writes inc))})]
+              (p/let [result (sync-download/<claim-repair-after-checksum-mismatch!
+                             repo client 9 "remote-full")]
+                (is (= {:claimed? false :reason :server-t-changed} result))
+                (is (zero? @writes))))))
+        (p/catch (fn [error] (is false (str error))))
+        (p/finally done))))
+
+(deftest local-only-repair-run-stops-without-automatic-commit-test
+  (async done
+    (let [calls (atom [])
+          operation {:operation-id #uuid "90700000-0000-4000-8000-000000000001"
+                     :disposition :local-only :attempt-count 3}]
+      (-> (p/with-redefs
+            [thread-api/*thread-apis
+             (atom {:thread-api/db-sync-stop (fn [] (swap! calls conj :stop))
+                    :thread-api/db-sync-commit-repair (fn [& _] (swap! calls conj :commit))
+                    :thread-api/db-sync-claim-repair-retry (fn [& _] (swap! calls conj :retry))})
+             shared-service/broadcast-to-clients! (fn [& _] (swap! calls conj :warning))]
+            (sync-download/<run-repair-operation! "exhausted-repair" operation))
+          (p/then (fn [result]
+                    (is (= :local-only (:disposition result)))
+                    (is (= [:stop :warning] @calls))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
+(deftest postcommit-cleanup-failure-stops-without-precommit-transition-test
+  (async done
+    (let [operation {:operation-id #uuid "90700000-0000-4000-8000-000000000002"
+                     :target-projection-epoch 5 :disposition :repairing :attempt-count 1}
+          error (ex-info "Synthetic postcommit cleanup failure" {:type :selfhost6/repair-commit-cleanup-failed})
+          calls (atom [])]
+      (-> (p/with-redefs
+            [thread-api/*thread-apis
+             (atom {:thread-api/db-sync-commit-repair (fn [& _] (p/rejected error))
+                    :thread-api/db-sync-repair-status
+                    (fn [_]
+                      (js/queueMicrotask #(swap! calls conj :next-operation))
+                      {:committed {:projection-epoch 5} :operation operation :prepared-swap? false})
+                    :thread-api/db-sync-record-repair-failure
+                    (fn [& _] (swap! calls conj :record) (throw (js/Error. "Wrong precommit transition")))
+                    :thread-api/db-sync-stop (fn [] (swap! calls conj :stop))})]
+            (-> (sync-download/<run-repair-operation! "postcommit-cleanup-failure" operation)
+                (p/then (fn [_] (is false "The original cleanup error must remain visible.")))
+                (p/catch (fn [caught] (is (true? (identical? error caught)))))))
+          (p/then (fn [_] (is (= [:stop :next-operation] @calls))))
+          (p/catch (fn [caught] (is false (str caught))))
+          (p/finally done)))))
+
+(deftest superseded-repair-failure-does-not-change-current-operation-test
+  (async done
+    (let [operation {:operation-id #uuid "90700000-0000-4000-8000-000000000003"
+                     :target-projection-epoch 5 :disposition :repairing :attempt-count 1}
+          error (ex-info "Late failure from the prior attempt" {:type :selfhost6/repair-commit-cleanup-failed})]
+      (-> (p/doseq [current [nil (assoc operation :target-projection-epoch 6 :attempt-count 2)
+                            (assoc operation :attempt-count 2)]]
+            (let [calls (atom [])]
+              (p/with-redefs
+                [thread-api/*thread-apis
+                 (atom {:thread-api/db-sync-commit-repair (fn [& _] (p/rejected error))
+                        :thread-api/db-sync-repair-status
+                        (fn [_] {:committed {:projection-epoch 5} :operation current :prepared-swap? false})
+                        :thread-api/db-sync-record-repair-failure (fn [& _] (swap! calls conj :record))
+                        :thread-api/db-sync-stop (fn [] (swap! calls conj :stop))})]
+                (-> (sync-download/<run-repair-operation! "superseded-repair" operation)
+                    (p/then (fn [_] (is false "The original error must propagate.")))
+                    (p/catch (fn [caught] (is (true? (identical? error caught)))))
+                    (p/then (fn [_] (is (empty? @calls))))))))
+          (p/catch (fn [caught] (is false (str caught))))
+          (p/finally done)))))
+
 (deftest repair-transient-retry-is-one-bounded-chain-test
   (async done
     (let [repo "repair-transient-retry"
           operation-id #uuid "90300000-0000-4000-8000-000000000001"
           operation* (atom {:operation-id operation-id
+                            :target-projection-epoch 1
                             :attempt-count 1
                             :disposition :repairing
                             :next-retry-at-ms nil})
@@ -121,7 +214,9 @@
                (swap! delays conj delay-ms)
                (p/resolved nil))
              thread-api/*thread-apis
-             (atom {:thread-api/db-sync-commit-repair
+             (atom {:thread-api/db-sync-repair-status
+                    (fn [_] {:committed {:projection-epoch 0} :operation @operation*})
+                    :thread-api/db-sync-commit-repair
                     (fn [_repo id]
                       (swap! commits conj id)
                       (if (= 1 (count @commits))
@@ -157,6 +252,7 @@
     (let [repo "repair-retry-budget"
           operation-id #uuid "90300000-0000-4000-8000-000000000002"
           operation {:operation-id operation-id
+                     :target-projection-epoch 1
                      :attempt-count 3
                      :disposition :repairing
                      :next-retry-at-ms nil}
@@ -169,7 +265,9 @@
                (p/resolved nil))
              shared-service/broadcast-to-clients! (fn [& _] nil)
              thread-api/*thread-apis
-             (atom {:thread-api/db-sync-commit-repair
+             (atom {:thread-api/db-sync-repair-status
+                    (fn [_] {:committed {:projection-epoch 0} :operation operation})
+                    :thread-api/db-sync-commit-repair
                     (fn [& _]
                       (p/rejected
                        (ex-info "remote moved"
@@ -196,6 +294,7 @@
           operation-id #uuid "90400000-0000-4000-8000-000000000001"
           fault? (atom true)
           operation* (atom {:operation-id operation-id
+                            :target-projection-epoch 5
                             :attempt-count 1
                             :disposition :repairing
                             :next-retry-at-ms nil})
@@ -279,7 +378,9 @@
           conns-prev @worker-state/*datascript-conns]
       (reset! worker-state/*datascript-conns {repo conn})
       (-> (p/with-redefs
-            [client-op/read-repair-completion-observation
+            [worker-state/*db-sync-client (atom client)
+             sync-apply/*repo->latest-remote-tx (atom {repo 12})
+             client-op/read-repair-completion-observation
              (fn [_repo high-water]
                (is (= 34 high-water))
                {:remote-t 12
@@ -323,6 +424,103 @@
                        (reset! worker-state/*datascript-conns conns-prev)
                        (done)))))))
 
+(deftest committed-repair-checks-canonical-data-and-async-freshness-test
+  (async done
+    (-> (p/doseq [change [:none :canonical-mismatch :db :journal :remote :client :inflight]]
+          (let [repo "committed-repair-freshness"
+                client {:graph-id "graph-1" :inflight (atom [])}
+                conn (atom :canonical-db)
+                observation (atom {:remote-t 12 :journal-high-water 35
+                                   :pending-count 0 :pending-through-target 0
+                                   :legacy-anchor "remote-full"})
+                active-client (atom client)
+                remote-ts (atom {repo 12})
+                canonical (if (= :canonical-mismatch change) "local-full" "remote-full")
+                completions (atom 0)
+                claims (atom 0)]
+            (p/with-redefs
+              [worker-state/get-datascript-conn (constantly conn)
+               worker-state/*db-sync-client active-client
+               worker-state/*db-sync-config (atom {:http-base "https://sync.example.test"})
+               sync-apply/*repo->latest-remote-tx remote-ts
+               client-op/read-repair-completion-observation (fn [& _] @observation)
+               client-op/read-repair-local-observation (fn [_] (dissoc @observation :pending-through-target))
+               sync-checksum/<recompute-checksum
+               (fn [_]
+                 (case change
+                   :db (reset! conn :edited-db)
+                   :journal (swap! observation update :journal-high-water inc)
+                   :remote (swap! remote-ts update repo inc)
+                   :client (reset! active-client (assoc client :replacement true))
+                   :inflight (reset! (:inflight client) ["pending"])
+                   nil)
+                 (p/resolved canonical))
+               sync-download/fetch-json
+               (fn [& _]
+                 (p/resolved {:t 12 :legacy-anchor "remote-full"
+                              :server-recomputed-checksum "remote-full"
+                              :server-checkpoint-identity "checkpoint-12"
+                              :metadata-proof "proof-12"}))
+               thread-api/*thread-apis
+               (atom {:thread-api/db-sync-repair-status-from-value
+                      (fn [_]
+                        {:committed {:projection-epoch 5}
+                         :prepared-swap? false
+                         :operation {:operation-id #uuid "90600000-0000-4000-8000-000000000001"
+                                     :graph-id "graph-1" :disposition :repairing
+                                     :target-projection-epoch 5
+                                     :target-basis {:remote-t 12 :journal-high-water 34}}})
+                      :thread-api/db-sync-complete-repair
+                      (fn [& _] (swap! completions inc) {:completed? true})
+                      :thread-api/db-sync-claim-repair
+                      (fn [& _] (swap! claims inc) {:claimed? false})})]
+              (p/let [_ (sync-download/<complete-repair-if-converged!
+                        repo client 12 "remote-full" "receipt")]
+                (is (= (if (= :none change) 1 0) @completions) (str change))
+                (is (= (if (= :canonical-mismatch change) 1 0) @claims) (str change))))))
+        (p/catch (fn [error] (is false (str error))))
+        (p/finally done))))
+
+(deftest final-repair-observation-and-mutation-share-a-synchronous-boundary-test
+  (async done
+    (-> (p/doseq [mode [:claim :complete]]
+          (let [repo "repair-final-boundary"
+                conn (atom :db)
+                client {:graph-id "graph-1" :inflight (atom [])}
+                reads (atom 0)
+                events (atom [])
+                observation (fn [& _]
+                              (when (= 2 (swap! reads inc))
+                                (js/queueMicrotask #(swap! events conj :later-mutation)))
+                              {:remote-t 12 :journal-high-water 35 :pending-count 0
+                               :pending-through-target 0 :legacy-anchor "remote-full"})]
+            (p/with-redefs
+              [worker-state/get-datascript-conn (constantly conn)
+               worker-state/*db-sync-client (atom client)
+               worker-state/*db-sync-config (atom {:http-base "https://sync.example.test"})
+               sync-apply/*repo->latest-remote-tx (atom {repo 12})
+               client-op/read-repair-local-observation observation
+               client-op/read-repair-completion-observation observation
+               sync-checksum/<recompute-checksum (fn [_] (p/resolved (if (= :claim mode) "local-full" "remote-full")))
+               sync-download/fetch-json
+               (fn [& _] (p/resolved {:t 12 :legacy-anchor "remote-full" :server-recomputed-checksum "remote-full"}))
+               thread-api/*thread-apis
+               (atom {:thread-api/db-sync-claim-repair
+                      (fn [& _] (swap! events conj :claim) {:claimed? false})
+                      :thread-api/db-sync-repair-status-from-value
+                      (fn [_] {:committed {:projection-epoch 5} :prepared-swap? false
+                               :operation {:operation-id #uuid "90600000-0000-4000-8000-000000000001"
+                                           :graph-id "graph-1" :disposition :repairing
+                                           :target-projection-epoch 5 :target-basis {:remote-t 12 :journal-high-water 34}}})
+                      :thread-api/db-sync-complete-repair
+                      (fn [& _] (swap! events conj :complete) {:completed? true})})]
+              (p/let [_ (if (= :claim mode)
+                          (sync-download/<claim-repair-after-checksum-mismatch! repo client 12 "remote-full")
+                          (sync-download/<complete-repair-if-converged! repo client 12 "remote-full" "receipt"))]
+                (is (= [mode :later-mutation] @events))))))
+        (p/catch (fn [error] (is false (str error))))
+        (p/finally done))))
+
 (deftest changed-suspect-does-not-claim-test
   (async done
          (let [repo "repair-suspect-changed-repo"
@@ -338,6 +536,8 @@
                    {:http-base "https://sync.example.test"})
            (-> (p/with-redefs
                  [worker-state/get-datascript-conn (fn [_] conn)
+                  worker-state/*db-sync-client (atom client)
+                  sync-apply/*repo->latest-remote-tx (atom {repo 9})
                   client-op/read-repair-local-observation
                   (fn [_]
                     (let [result (first @observations)]
@@ -387,6 +587,8 @@
                    {:http-base "https://sync.example.test"})
            (-> (p/with-redefs
                  [worker-state/get-datascript-conn (fn [_] @current-conn)
+                  worker-state/*db-sync-client (atom client)
+                  sync-apply/*repo->latest-remote-tx (atom {repo 9})
                   client-op/read-repair-local-observation (fn [_] observation)
                   client-op/update-local-checksum (fn [& _] (swap! writes inc))
                   sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))
@@ -433,6 +635,8 @@
                    {:http-base "https://sync.example.test"})
            (-> (p/with-redefs
                  [worker-state/get-datascript-conn (fn [_] conn)
+                  worker-state/*db-sync-client (atom client)
+                  sync-apply/*repo->latest-remote-tx (atom {repo 9})
                   client-op/read-repair-local-observation (fn [_] observation)
                   client-op/update-local-checksum (fn [& _] (swap! writes inc))
                   sync-checksum/<recompute-checksum (fn [_] (p/resolved "local-full"))

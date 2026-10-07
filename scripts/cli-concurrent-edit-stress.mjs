@@ -2249,10 +2249,7 @@ async function runOperation(opts, state, workerId, seq, forcedOp = null) {
 
     case "create-tree": {
       const page = randomPage(state);
-      const blocks = `[
-        {:block/title ${ednString(`tree root ${stamp}`)}
-         :block/children [{:block/title ${ednString(`tree child ${stamp}`)}}]}
-        {:block/title ${ednString(`tree sibling ${stamp}`)}}]`;
+      const blocks = `- tree root ${stamp}\n  - tree child ${stamp}\n- tree sibling ${stamp}`;
       const response = await runCli(
         opts,
         ["upsert", "block", "--graph", opts.graph, "--target-page", page, "--blocks", blocks],
@@ -2915,9 +2912,21 @@ async function main() {
   }
 
   for (const client of clients) {
-    await waitForSyncSettled(client.opts, { op: "final-sync-settle", client: client.opts.clientName }, true);
-    await validateClientChecksum(client);
-    await validateClientGraph(client, "final");
+    let settleError = null;
+    try {
+      await waitForSyncSettled(client.opts, { op: "final-sync-settle", client: client.opts.clientName }, true);
+    } catch (error) {
+      settleError = error;
+    }
+    await validateClientChecksum(client).catch((error) => {
+      settleError = settleError || error;
+    });
+    await validateClientGraph(client, "final").catch((error) => {
+      settleError = settleError || error;
+    });
+    if (settleError) {
+      throw settleError;
+    }
   }
 
   logEvent(opts, {

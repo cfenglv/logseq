@@ -43,6 +43,28 @@
                           (is false (str error))
                           (done)))))))
 
+(deftest auth-claims-recovers-sync-and-consecutive-verification-errors-test
+  (async done
+         (let [request (js/Request. "http://localhost/graphs"
+                                   #js {:headers #js {"authorization" "Bearer invalid-token"}})
+               calls (atom 0)]
+           (-> (p/with-redefs [authorization/verify-jwt
+                               (fn [_token _env]
+                                 (case (swap! calls inc)
+                                   1 (throw (ex-info "invalid" {}))
+                                   2 (js/Promise.reject (ex-info "aud not found" {}))
+                                   (js/Promise.resolve #js {"sub" "verified-user"})))]
+                 (p/let [malformed (auth/auth-claims request #js {})
+                         wrong-audience (auth/auth-claims request #js {})
+                         verified (auth/auth-claims request #js {})]
+                   (is (nil? malformed))
+                   (is (nil? wrong-audience))
+                   (is (= "verified-user" (aget verified "sub")))))
+               (p/then (fn [] (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
 (deftest auth-claims-expired-token-returns-nil-test
   (async done
          (let [request (js/Request. "http://localhost/graphs"

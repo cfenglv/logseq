@@ -31,8 +31,15 @@
 
 (defn <get-graph-registry
   []
-  (p/let [registry (idb/get-item graph-registry-key)]
+  (p/let [registry (if (util/electron?)
+                    (ipc/ipc "getGraphRegistry")
+                    (idb/get-item graph-registry-key))]
     (storage-registry->clj registry)))
+
+(defn <get-graph-directory-renames
+  []
+  (p/let [renames (ipc/ipc "getGraphDirectoryRenames")]
+    (bean/->clj renames)))
 
 (defn <upsert-graph-registry-entry!
   [entry]
@@ -85,6 +92,41 @@
         tab-target-repo
         current-repo
         (:url (first repos)))))
+
+(defn prepare-startup-repo!
+  "Restore a registered URL or legacy tab identity before the first Desktop open."
+  [registry url-target renames]
+  (when (util/electron?)
+    (let [{tab-repo :repo tab-graph-id :graph-id} (get-tab-graph)
+          renamed-tab (graph-registry/directory-renamed-repo renames tab-repo)
+          renamed-current (when (seq renames)
+                            (graph-registry/directory-renamed-repo renames (state/get-current-repo)))
+          renamed-url (when (string/blank? (:graph-id url-target))
+                        (graph-registry/directory-renamed-identifier renames (:graph-identifier url-target)))
+          url-target' (cond-> url-target renamed-url (assoc :graph-identifier renamed-url))
+          tab-name (when (and (string? tab-repo)
+                              (string/starts-with? tab-repo common-config/db-version-prefix))
+                     (subs tab-repo (count common-config/db-version-prefix)))
+          legacy-tab? (or (string/blank? tab-repo)
+                          (and tab-name (not= tab-name (string/trim tab-name))))
+          entry (or (resolve-registry-target registry url-target')
+                    (when renamed-url {:repo renamed-url})
+                    (when (and (string/blank? (:graph-id url-target))
+                               renamed-tab)
+                      {:repo renamed-tab :graph-id tab-graph-id})
+                    (when (and (string/blank? (:graph-id url-target))
+                               renamed-current legacy-tab?)
+                      (or (some #(when (= renamed-current (:repo %)) %) registry)
+                          {:repo renamed-current}))
+                    (when (and (string/blank? (:graph-id url-target))
+                               legacy-tab?)
+                      (resolve-registry-target registry {:graph-id tab-graph-id})))]
+      (when-let [repo (or (:repo entry) renamed-current)]
+        (state/set-current-repo! repo))
+      (if entry
+        (set-tab-graph! (:repo entry) (:graph-id entry))
+        (when renamed-tab (set-tab-graph! renamed-tab tab-graph-id)))
+      url-target')))
 
 (defn current-graph-id
   []

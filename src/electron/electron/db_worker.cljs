@@ -1,16 +1,16 @@
 (ns electron.db-worker
-  (:require ["os" :as os]
-            ["path" :as node-path]
-            [electron.home :as home]
+  (:require ["@logseq/graph-lifecycle" :as lifecycle]
             [logseq.cli.server :as cli-server]
             [logseq.common.graph-dir :as graph-dir]
+            [logseq.common.version :as version]
             [logseq.db-worker.daemon :as daemon]
             [promesa.core :as p]))
 
 (defn- initial-state
   []
   {:repos {}
-   :window->repo {}})
+   :window->repo {}
+   :epochs {}})
 
 (defn- repo-key
   [repo]
@@ -21,7 +21,8 @@
   (if existing
     (-> existing
         (update :windows (fnil into #{}) (:windows entry))
-        (update :runtime #(or % (:runtime entry))))
+        (update :runtime #(or % (:runtime entry)))
+        (update :opts #(or % (:opts entry))))
     entry))
 
 (defn- normalize-state
@@ -68,24 +69,6 @@
                          (empty? remaining)
                          (update :repos dissoc repo))]
             [state' (when (empty? remaining) (:runtime entry))]))))))
-
-(defn- detach-window-from-repo
-  [state repo window-id]
-  (let [state (ensure-state state)
-        entry (get-in state [:repos repo])]
-    (if-not entry
-      [state nil]
-      (let [remaining (disj (:windows entry) window-id)
-            state' (cond-> state
-                     (= repo (get-in state [:window->repo window-id]))
-                     (update :window->repo dissoc window-id)
-
-                     (seq remaining)
-                     (assoc-in [:repos repo :windows] remaining)
-
-                     (empty? remaining)
-                     (update :repos dissoc repo))]
-        [state' (when (empty? remaining) (:runtime entry))]))))
 
 (defn- detach-repo
   [state repo]
@@ -154,64 +137,115 @@
 
 (defn ensure-window-stopped!
   [{:keys [state stop-daemon!]} window-id]
-  (let [runtime* (atom nil)]
-    (swap! state
-           (fn [current]
-             (let [[next-state runtime] (detach-window current window-id)]
-               (reset! runtime* runtime)
-               next-state)))
-    (if-let [runtime @runtime*]
-      (if (owned-runtime? runtime)
-        (p/let [_ (stop-daemon! runtime)]
-          true)
-        (p/resolved true))
-      (p/resolved false))))
+  (let [key (get-in @state [:window->repo window-id])
+        opts (get-in (ensure-state @state) [:repos key :opts])
+        [next-state runtime] (detach-window @state window-id)
+        stopping (when runtime (p/deferred))]
+    ;; Assign the last-window stop before yielding to another close or open.
+    (reset! state (cond-> next-state
+                    runtime (assoc-in [:repos key] {:runtime runtime
+                                                    :windows #{}
+                                                    :stopping stopping
+                                                    :opts opts})))
+    (if-not runtime
+      (p/resolved false)
+      (let [finish! (fn [success?]
+                      (swap! state
+                             (fn [current]
+                               (if (identical? stopping (get-in current [:repos key :stopping]))
+                                 (if success?
+                                   (update current :repos dissoc key)
+                                   (update-in current [:repos key] dissoc :stopping))
+                                 current))))]
+        (-> (p/let [stopped? (if (owned-runtime? runtime)
+                              (stop-daemon! runtime)
+                              (p/resolved true))]
+              (when-not (true? stopped?)
+                (throw (ex-info "Worker stop did not complete" {:code :server-stop-failed})))
+              (when-let [close! (:close-observer! runtime)] (close!))
+              (finish! true)
+              (p/resolve! stopping true)
+              true)
+            (p/catch (fn [error]
+                       (finish! false)
+                       (p/resolve! stopping false)
+                       (throw error))))))))
 
 (defn- ensure-started-without-claim!
-  [{:keys [state start-daemon! stop-daemon! runtime-ready?] :as manager} repo window-id]
-  (let [key (repo-key repo)]
-    (p/let [current-repo (get-in (ensure-state @state) [:window->repo window-id])
-            _ (when (and current-repo (not= current-repo key))
-                (ensure-window-stopped! manager window-id))]
-      (if-let [entry (get-in (ensure-state @state) [:repos key])]
-        (p/let [runtime (:runtime entry)
-                ready? (runtime-ready? runtime)]
-          (if ready?
-            (do
-              (swap! state (fn [current]
-                             (-> (ensure-state current)
-                                 (update-in [:repos key :windows] (fnil conj #{}) window-id)
-                                 (assoc-in [:window->repo window-id] key))))
-              runtime)
-            (p/let [_ (when (owned-runtime? runtime)
-                        (-> (stop-daemon! runtime)
-                            (p/catch (fn [_] nil))))
-                    runtime' (start-daemon! repo)]
-              (swap! state
-                     (fn [current]
-                       (let [current' (ensure-state current)
-                             windows (get-in current' [:repos key :windows] #{})]
-                         (-> current'
-                             (assoc-in [:repos key] {:runtime runtime'
-                                                     :windows (conj windows window-id)})
-                             (assoc-in [:window->repo window-id] key)))))
-              runtime')))
-        (p/let [runtime (start-daemon! repo)]
-          (swap! state (fn [current]
-                         (-> (ensure-state current)
-                             (assoc-in [:repos key] {:runtime runtime
-                                                     :windows #{window-id}})
-                             (assoc-in [:window->repo window-id] key))))
-          runtime)))))
+  ([manager repo window-id] (ensure-started-without-claim! manager repo window-id nil))
+  ([{:keys [state start-daemon! stop-daemon! runtime-ready?] :as manager} repo window-id
+    {:keys [generation] :as opts}]
+   (let [key (repo-key repo)
+         epoch (get-in @state [:epochs key] 0)
+         assert-current! (fn []
+                           (when-not (= epoch (get-in @state [:epochs key] 0))
+                             (throw (ex-info "Graph lifecycle changed" {:code :graph-not-exists :repo repo}))))
+         install! (fn [runtime]
+                    (try
+                      (assert-current!)
+                      (let [previous (get-in @state [:repos key :runtime])
+                            saved-opts (cond-> opts
+                                         (:generation runtime) (assoc :generation (:generation runtime))
+                                         (:root-dir runtime) (assoc :root-dir (:root-dir runtime))
+                                         (:storage runtime) (assoc :storage (:storage runtime)))]
+                        (when-not (identical? previous runtime)
+                          (when-let [close! (:close-observer! previous)] (close!)))
+                        (swap! state
+                               (fn [current]
+                                 (let [current' (ensure-state current)
+                                       windows (get-in current' [:repos key :windows] #{})]
+                                   (-> current'
+                                       (assoc-in [:repos key] {:runtime runtime
+                                                              :windows (conj windows window-id)
+                                                              :opts saved-opts})
+                                       (assoc-in [:window->repo window-id] key))))))
+                      runtime
+                      (catch :default error
+                        (when-let [close! (:close-observer! runtime)] (close!))
+                        (throw error))))]
+     (p/let [current-repo (get-in (ensure-state @state) [:window->repo window-id])
+             _ (when (and current-repo (not= current-repo key))
+                 (ensure-window-stopped! manager window-id))]
+       (if-let [entry (get-in (ensure-state @state) [:repos key])]
+         (if-let [stopping (:stopping entry)]
+           (p/let [stopped? stopping]
+             (when-not stopped?
+               (throw (ex-info "Worker stop did not complete" {:code :server-stop-failed})))
+             (assert-current!)
+             (ensure-started-without-claim! manager repo window-id opts))
+           (p/let [runtime (:runtime entry)
+                   _ (when (and generation (not= generation (:generation runtime)))
+                       (throw (ex-info "Graph generation changed" {:code :graph-not-exists :repo repo})))
+                   ready? (runtime-ready? runtime)
+                   _ (assert-current!)]
+             (if ready?
+               (do
+                 (swap! state (fn [current]
+                                (-> (ensure-state current)
+                                    (update-in [:repos key :windows] (fnil conj #{}) window-id)
+                                    (assoc-in [:window->repo window-id] key))))
+                 runtime)
+               (do
+                 (when-let [close! (:close-observer! runtime)] (close!))
+                 (p/let [_ (when (owned-runtime? runtime)
+                             (-> (stop-daemon! runtime)
+                                 (p/catch (fn [_] nil))))
+                         _ (assert-current!)
+                         runtime' (start-daemon! repo opts)]
+                   (install! runtime'))))))
+         (p/let [_ (assert-current!)
+                 runtime (start-daemon! repo opts)]
+           (install! runtime)))))))
 
 (defn ensure-started!
-  [manager repo window-id]
-  (try
-    (begin-runtime-claim! manager)
-    (-> (ensure-started-without-claim! manager repo window-id)
-        (p/finally (fn [] (end-runtime-claim! manager))))
-    (catch :default error
-      (p/rejected error))))
+  ([manager repo window-id] (ensure-started! manager repo window-id nil))
+  ([manager repo window-id opts]
+   (try
+     (begin-runtime-claim! manager)
+     (-> (ensure-started-without-claim! manager repo window-id opts)
+         (p/finally (fn [] (end-runtime-claim! manager))))
+     (catch :default error
+       (p/rejected error)))))
 
 (defn- parse-runtime-lock
   [{:keys [base-url]}]
@@ -228,58 +262,22 @@
         nil))))
 
 (defn- runtime-ready-default?
-  [runtime]
-  (if-let [lock (parse-runtime-lock runtime)]
-    (daemon/ready? lock)
-    (p/resolved false)))
+  [{:keys [storage repo generation] :as runtime}]
+  (let [current (lifecycle/snapshot storage repo)]
+    (if (and (= generation (.-generation current))
+             (= "available" (.-phase current)))
+      (if-let [lock (parse-runtime-lock runtime)]
+        (daemon/ready? lock)
+        (p/resolved false))
+      (p/resolved false))))
 
 (defn ensure-stopped!
-  [{:keys [state stop-daemon!]} repo window-id]
-  (let [key (repo-key repo)]
-    (if (= key (get-in (ensure-state @state) [:window->repo window-id]))
-      (ensure-window-stopped! {:state state :stop-daemon! stop-daemon!} window-id)
-      (let [runtime* (atom nil)]
-        (swap! state
-               (fn [current]
-                 (let [[next-state runtime] (detach-window-from-repo current key window-id)]
-                   (reset! runtime* runtime)
-                   next-state)))
-        (if-let [runtime @runtime*]
-          (if (owned-runtime? runtime)
-            (p/let [_ (stop-daemon! runtime)]
-              true)
-            (p/resolved true))
-          (p/resolved false))))))
+  [manager repo window-id]
+  (if (= (repo-key repo) (get-in (ensure-state @(:state manager)) [:window->repo window-id]))
+    (ensure-window-stopped! manager window-id)
+    (p/resolved false)))
 
-(defn stop-all!
-  [{:keys [state stop-daemon!]}]
-  (let [entries (:repos (ensure-state @state))]
-    (-> (p/all (map (fn [[repo {:keys [runtime]}]]
-                      (-> (if (owned-runtime? runtime)
-                            (stop-daemon! runtime)
-                            (p/resolved true))
-                          (p/then (fn [ok?] [repo (true? ok?) nil]))
-                          (p/catch (fn [error] [repo false error]))))
-                    entries))
-        (p/then
-         (fn [results]
-           (let [failed (->> results (remove second) (map first) set)
-                 stopped (->> results (filter second) (map first) set)]
-             (swap! state
-                    (fn [current]
-                      (-> (ensure-state current)
-                          (update :repos #(apply dissoc % stopped))
-                          (update :window->repo
-                                  (fn [window->repo]
-                                    (into {}
-                                          (filter (fn [[_ repo]] (contains? failed repo)))
-                                          window->repo))))))
-             (if (seq failed)
-               (p/rejected
-                (ex-info "failed to stop all db-worker runtimes"
-                         {:code :db-worker-stop-failed
-                          :repos (vec failed)}))
-               true)))))))
+(declare stop-all!)
 
 (defn update-quiescing?
   [{:keys [claim-state]}]
@@ -327,8 +325,14 @@
   (-> (close-runtime-claim-gate! manager)
       (p/then
        (fn [_]
-         (let [token (active-owner-token @state)]
-           (reset! install-attempt {:token token :phase :captured})
+         (let [state' (ensure-state @state)
+               token (active-owner-token state')
+               repo-options (into {}
+                                  (map (fn [[repo entry]] [repo (:opts entry)]))
+                                  (:repos state'))]
+           (reset! install-attempt {:token token
+                                    :repo-options repo-options
+                                    :phase :captured})
            token)))))
 
 (defn- require-active-attempt!
@@ -353,11 +357,12 @@
 
 (defn resume-update-quiesce!
   [{:keys [claim-state install-attempt] :as manager} token]
-  (let [{:keys [phase]} (require-active-attempt! manager token)
+  (let [{:keys [phase repo-options]} (require-active-attempt! manager token)
         restore! (fn []
                    (p/all
                     (map (fn [[window-id repo]]
-                           (ensure-started-without-claim! manager repo window-id))
+                           (ensure-started-without-claim!
+                            manager repo window-id (get repo-options repo)))
                          (:window-to-repo-ownership token))))]
     (-> (if (= phase :captured)
           (p/resolved true)
@@ -377,49 +382,74 @@
 (defn ensure-repo-stopped!
   [{:keys [state stop-daemon!]} repo]
   (let [key (repo-key repo)
-        runtime* (atom nil)]
-    (swap! state
-           (fn [current]
-             (let [[next-state runtime] (detach-repo current key)]
-               (reset! runtime* runtime)
-               next-state)))
-    (if-let [runtime @runtime*]
-      (if (owned-runtime? runtime)
-        (p/let [_ (stop-daemon! runtime)]
-          true)
-        (p/resolved true))
-      (p/resolved false))))
+        runtime (get-in (ensure-state @state) [:repos key :runtime])]
+    (if-not runtime
+      (p/resolved false)
+      (p/let [stopped? (if (owned-runtime? runtime)
+                         (stop-daemon! runtime)
+                         (p/resolved true))]
+        (when-not (true? stopped?)
+          (throw (ex-info "Worker stop did not complete" {:code :server-stop-failed :repo repo})))
+        (when-let [close! (:close-observer! runtime)] (close!))
+        (swap! state (fn [current]
+                       (if (identical? runtime (get-in current [:repos key :runtime]))
+                         (first (detach-repo current key))
+                         current)))
+        true))))
 
-(defonce ^:private *runtime-opts (atom {}))
+(defn stop-all!
+  [{:keys [state] :as manager}]
+  (-> (p/all (map (fn [repo]
+                    (-> (ensure-repo-stopped! manager repo)
+                        (p/then (fn [_] {:error nil}))
+                        (p/catch (fn [error] {:error error}))))
+                  (keys (:repos (ensure-state @state)))))
+      (p/then (fn [results]
+                (if-let [error (some :error results)]
+                  (throw error)
+                  true)))))
 
-(defn- managed-root-dir
+(defn invalidate-repo!
+  [{:keys [state]} repo & {:keys [keep-observer?]}]
+  (let [key (repo-key repo)
+        runtime (get-in @state [:repos key :runtime])]
+    (when-not keep-observer?
+      (when-let [close! (:close-observer! runtime)] (close!)))
+    (swap! state (fn [current]
+                   (-> (first (detach-repo current key))
+                       (update-in [:epochs key] (fnil inc 0)))))))
+
+(declare manager)
+
+(defn <prepare-startup!
   []
-  (node-path/join
-   (home/resolve-root (.-LOGSEQ_TEST_HOME_DIR js/process.env)
-                      (.homedir os))
-   "logseq"))
+  (let [storage (cli-server/resolve-storage {})]
+    (p/let [_ (lifecycle/normalizeGraphDirectories storage)]
+      (lifecycle/stopOutdatedWorkers storage (version/revision)))))
 
 (defn- start-managed-daemon!
-  [repo]
-  (let [runtime-config (merge {:owner-source :electron
-                               :root-dir (managed-root-dir)}
-                              @*runtime-opts)]
-    (p/let [_ (when (seq (:embedding-endpoint runtime-config))
-                (-> (cli-server/stop-server! runtime-config repo)
-                    (p/catch (fn [_] nil))))
-            config (cli-server/ensure-server! runtime-config repo)]
-      {:repo repo
-       :base-url (:base-url config)
-       :root-dir (:root-dir runtime-config)
-       :auth-token nil
-       :owned? (:owned? config)})))
+  [repo opts]
+  (let [config (assoc opts :owner-source :electron)
+        storage (cli-server/resolve-storage config)
+        root (.-root ^js storage)
+        config (assoc config :root-dir root :storage storage)]
+    (p/let [config' (cli-server/ensure-server! config repo)
+            generation (:generation config')
+            close-observer! (lifecycle/observe
+                             storage repo generation
+                             (fn [current]
+                               (when (= generation (get-in @(:state manager) [:repos (repo-key repo) :runtime :generation]))
+                                 (invalidate-repo! manager repo :keep-observer? true))
+                               (when-let [notify! (:on-graph-lifecycle! config)]
+                                 (notify! repo (assoc (js->clj current :keywordize-keys true) :generation generation)))))]
+      {:repo repo :root-dir root :storage storage :generation generation
+       :base-url (:base-url config') :auth-token nil
+       :close-observer! close-observer!
+       :owned? (:owned? config')})))
 
 (defn- stop-managed-daemon!
-  [{:keys [repo root-dir]}]
-  (p/let [result (cli-server/stop-server! {:owner-source :electron
-                                           :root-dir (or root-dir
-                                                         (managed-root-dir))}
-                                          repo)]
+  [{:keys [repo root-dir storage]}]
+  (p/let [result (cli-server/stop-server! {:owner-source :electron :root-dir root-dir :storage storage} repo)]
     (:ok? result)))
 
 (defonce manager
@@ -432,8 +462,7 @@
   ([repo window-id]
    (ensure-started! manager repo window-id))
   ([repo window-id opts]
-   (reset! *runtime-opts opts)
-   (ensure-started! manager repo window-id)))
+   (ensure-started! manager repo window-id opts)))
 
 (defn release-window!
   [window-id]
@@ -444,10 +473,6 @@
    (release-runtime! manager repo window-id))
   ([mgr repo window-id]
    (ensure-stopped! mgr repo window-id)))
-
-(defn release-repo!
-  [repo]
-  (ensure-repo-stopped! manager repo))
 
 (defn stop-all-managed!
   []

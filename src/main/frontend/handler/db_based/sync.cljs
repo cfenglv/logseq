@@ -343,9 +343,13 @@
                        _ (<ensure-download-runtime-bound! graph)
                        _ (state/<invoke-db-worker :thread-api/db-sync-download-graph-by-id
                                                  graph graph-uuid graph-e2ee?)
-                       _ (when (util/electron?)
-                           (state/<invoke-db-worker :thread-api/db-sync-download-missing-assets
-                                                   graph graph-uuid))]
+                       assets-result (when (util/electron?)
+                                       (state/<invoke-db-worker :thread-api/db-sync-download-missing-assets
+                                                               graph graph-uuid))
+                       _ (when (pos? (:failed assets-result))
+                           (notification/show!
+                            (t :sync/assets-download-partial (:downloaded assets-result) (:failed assets-result))
+                            :warning false))]
                  true)
                (p/rejected (ex-info "db-sync missing graph info"
                                     {:type :db-sync/invalid-graph

@@ -8,6 +8,8 @@ type event_type = Cli_primitive.keyword
 type event_payload = Melange_edn_melange.any
 type event_subscription = { close : unit -> unit Cli_effect.t }
 
+exception Http_error of { status : int; code : string; message : string }
+
 val connect_events :
   invoke_config ->
   (event_type -> event_payload -> unit Cli_effect.t) ->

@@ -375,7 +375,7 @@
                                            :field :encrypted-private-key}))
       (<verify-and-save-e2ee-password! password encrypted-private-key))))
 
-(defn- <generate-and-upload-user-rsa-key-pair!
+(defn- <generate-and-upload-user-rsa-key-pair-raw!
   [base {:keys [password]}]
   (p/let [{:keys [publicKey privateKey]} (crypt/<generate-rsa-key-pair)
           password (cond
@@ -397,6 +397,21 @@
       {:public-key public-key-str
        :encrypted-private-key encrypted-private-key-str
        :password password})))
+
+(defn- <generate-and-upload-user-rsa-key-pair!
+  [base {:keys [password] :as opts}]
+  (if (seq password)
+    (<generate-and-upload-user-rsa-key-pair-raw! base opts)
+    (p/let [user-id (<resolve-user-uuid)]
+      ;; Share creation across ensure options, within the existing task owner.
+      (let [k [base user-id]]
+        (if-let [inflight (get @*ensure-user-rsa-key-pair-inflight k)]
+          inflight
+          (let [task (-> (<generate-and-upload-user-rsa-key-pair-raw! base opts)
+                         (p/finally (fn []
+                                      (swap! *ensure-user-rsa-key-pair-inflight dissoc k))))]
+            (swap! *ensure-user-rsa-key-pair-inflight assoc k task)
+            task))))))
 
 (defn- <ensure-user-rsa-key-pair-raw
   [base {:keys [ensure-server? server-rsa-keys-exists?] :as opts}]

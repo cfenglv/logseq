@@ -69,8 +69,9 @@
     (if (string? token)
       (if (expired-token? token)
         (p/resolved nil)
-        (-> (authorization/verify-jwt token env)
-            (p/catch (fn [error]
+        (-> (js/Promise.resolve)
+            (.then (fn [] (authorization/verify-jwt token env)))
+            (.catch (fn [error]
                        (cond
                          (recoverable-auth-error? error)
                          nil
@@ -79,5 +80,5 @@
                          (unsafe-jwt-claims token)
 
                          :else
-                         (p/rejected error))))))
+                         (throw error))))))
       (p/resolved nil))))

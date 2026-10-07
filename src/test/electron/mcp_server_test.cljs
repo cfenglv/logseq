@@ -46,10 +46,10 @@
                         (fake-mcp-server id connected)))]
         (mcp-server/handle-post-request
          shared-api-fn {:host "127.0.0.1" :port 12315}
-         (initialize-request 1) #js {:raw #js {}})
+         (initialize-request 1) #js {:getHeaders (fn [] #js {}) :raw #js {}})
         (mcp-server/handle-post-request
          shared-api-fn {:host "127.0.0.1" :port 12315}
-         (initialize-request 2) #js {:raw #js {}})
+         (initialize-request 2) #js {:getHeaders (fn [] #js {}) :raw #js {}})
         (is (= [shared-api-fn shared-api-fn] @created)
             "Each initialize request must build its own MCP server from the same API function.")
         (is (= [:fresh-1 :fresh-2] (mapv first @connected))

@@ -140,8 +140,13 @@
                  :deleted {}
                  :children {}
                  :affected-keys #{[:graph]}}
+          editor-info {:block-uuid current-block-id
+                       :container-id 1
+                       :start-pos 0
+                       :end-pos 3}
           original-flush-sync (.-flushSync react-dom)
-          calls (atom [])]
+          calls (atom [])
+          worker-calls (atom [])]
       (set! (.-flushSync react-dom)
             (fn [f]
               (swap! calls conj :commit-start)
@@ -155,13 +160,11 @@
                             true)
                           state/get-current-repo (constantly repo)
                           state/get-route-match (constantly nil)
-                          state/get-editor-info (constantly nil)
+                          state/get-editor-info (constantly editor-info)
                           state/<invoke-db-worker
-                          (fn [api & _args]
+                          (fn [api & args]
+                            (swap! worker-calls conj (into [api] args))
                             (case api
-                              :thread-api/undo-redo-set-pending-editor-info
-                              (p/resolved nil)
-
                               :thread-api/apply-outliner-ops
                               (p/resolved {:result ::persisted
                                            :delta delta
@@ -178,6 +181,10 @@
                             (fn [rows]
                               (swap! calls conj [:editor-callback rows]))})]
               (is (= ::persisted value))
+              (is (= 1 (count @worker-calls))
+                  "Pending editor info and the mutation must share one worker roundtrip.")
+              (is (= :thread-api/apply-outliner-ops (ffirst @worker-calls)))
+              (is (= editor-info (get-in @worker-calls [0 3 :pending-editor-info])))
               (is (= [:commit-start :delta :commit-end
                       :commit-start :editor-callback :commit-end]
                      (mapv #(if (vector? %) (first %) %) @calls)))

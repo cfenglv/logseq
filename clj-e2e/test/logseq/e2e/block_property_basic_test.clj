@@ -127,13 +127,14 @@
   [{:keys [child-uuid target-uuid]}]
   (let [target (ls-api-call! :editor.getBlock target-uuid)
         child (ls-api-call! :editor.getBlock child-uuid)]
-    (is (= "node embed target parent" (get target "content")))
-    (is (= "node embed target child" (get child "content")))))
+    (is (= "node embed target parent" (get target "content")) (pr-str target))
+    (is (= "node embed target child" (get child "content")) (pr-str child))))
 
 (deftest node-embed-selection-delete-keeps-the-canonical-target-test
   (testing "selection Delete removes only the rendered placeholder"
     (let [{:keys [embed-row target-uuid] :as fixture}
           (create-node-embed-fixture! "selection delete")]
+      (assert-node-embed-target-intact! fixture)
       (w/click (.first (.locator embed-row
                                  (format "#block-content-%s" target-uuid)))
                (doto (Locator$ClickOptions.)
@@ -548,6 +549,87 @@
         (is (= "kept"
                (block-value (get object "uuid")
                             inherited-property)))))))
+
+(deftest mounted-tag-view-refreshes-class-properties-test
+  (let [tag-name (str "LiveSchema" (random-uuid))
+        property-name (str "live-property-" (random-uuid))
+        tag (ls-api-call! :editor.createTag tag-name)
+        property (ls-api-call! :editor.upsertProperty property-name {})]
+    (page/goto-page tag-name)
+    (assert/assert-is-visible ".ls-view-body")
+    (let [route (w/eval-js "location.href")
+          column (loc/filter ".ls-table-header-cell" :has-text property-name)]
+      (ls-api-call! :editor.upsertBlockProperty
+                   (get tag "uuid") ":logseq.property.class/properties" [(get property "id")])
+      (assert/assert-is-visible column)
+      (is (= route (w/eval-js "location.href")))
+      (ls-api-call! :editor.removeBlockProperty
+                   (get tag "uuid") ":logseq.property.class/properties")
+      (assert/assert-have-count column 0)
+      (is (= route (w/eval-js "location.href"))))))
+
+(deftest inherited-class-properties-refresh-mounted-collapse-test
+  (let [parent (ls-api-call! :editor.createTag "CollapseParent")
+        child (ls-api-call! :editor.createTag "CollapseChild")
+        property (ls-api-call! :editor.upsertProperty "collapse-property" {})
+        object (ls-api-call! :editor.appendBlockInPage (current-page-name) "childless object")
+        uuid (get object "uuid")
+        assert-collapsable! (fn [expected]
+                             (.waitForFunction
+                              (w/get-page)
+                              "([id, expected]) => document.querySelector('.ls-block[blockid=\"'+id+'\"]')?.getAttribute('data-db-collapsable') === String(expected)"
+                              [uuid expected])
+                             (is (= (str expected)
+                                    (.getAttribute (w/-query (str ".ls-block[blockid='" uuid "']"))
+                                                   "data-db-collapsable"))))]
+    (ls-api-call! :editor.addTagExtends (get child "id") (get parent "id"))
+    (ls-api-call! :editor.upsertBlockProperty uuid "block/tags" (get child "id"))
+    (util/exit-edit)
+    (assert-collapsable! false)
+    (ls-api-call! :editor.upsertBlockProperty
+                 (get parent "uuid") "logseq.property.class/properties" [(get property "id")])
+    (assert-collapsable! true)
+    (ls-api-call! :editor.removeBlockProperty
+                 (get parent "uuid") "logseq.property.class/properties")
+    (assert-collapsable! false)
+    (util/refresh-until-graph-loaded)
+    (assert-collapsable! false)))
+
+(deftest query-input-error-isolation-and-recovery-test
+  (let [page-name (current-page-name)
+        anchor (ls-api-call! :editor.appendBlockInPage page-name "QueryRecoveryAnchor")
+        tag (ls-api-call! :editor.getTag "logseq.class/Query")
+        owners (mapv #(ls-api-call! :editor.appendBlockInPage page-name %
+                                    {:properties {"block/tags" (get tag "id")}})
+                     ["Valid query" "Invalid query"])
+        query-ids (mapv #(get % ":logseq.property/query") owners)
+        query-text (fn [matcher]
+                     (pr-str {:query '[:find (pull ?b [*]) :in $ ?matcher
+                                       :where [?b :block/title ?title]
+                                       [(re-pattern ?matcher) ?regex]
+                                       [(re-find ?regex ?title)]]
+                              :inputs [matcher]}))
+        result-selector (fn [owner]
+                          (str "#ls-block-" (get owner "uuid") " .custom-query-results"))
+        error-selector ".block-content-fallback-ui:has-text('Query error:')"]
+    (doseq [[id matcher] (map vector query-ids ["^QueryRecoveryAnchor$" "("])]
+      (ls-api-call! :editor.updateBlock id (query-text matcher))
+      (w/eval-js "id => frontend.handler.db_based.property.set_block_property_BANG_(id,cljs.core.keyword('logseq.property.node/display-type'),cljs.core.keyword('code'))" id))
+    (util/exit-edit)
+    (assert/assert-is-visible error-selector)
+    (assert/assert-have-count error-selector 1)
+    (assert/assert-is-visible (result-selector (first owners)))
+    (w/click (str "#block-content-" (get anchor "uuid")))
+    (util/move-cursor-to-end)
+    (k/press "Space")
+    (util/exit-edit)
+    (ls-api-call! :editor.updateBlock (second query-ids) (query-text "^QueryRecoveryAnchor"))
+    (w/wait-for-not-visible error-selector)
+    (assert/assert-is-visible (result-selector (second owners)))
+    (util/refresh-until-graph-loaded)
+    (assert/assert-have-count error-selector 0)
+    (doseq [owner owners]
+      (assert/assert-is-visible (result-selector owner)))))
 
 (deftest tag-template-dynamic-values-test
   (testing "a tag template is applied once and resolves dynamic date references"

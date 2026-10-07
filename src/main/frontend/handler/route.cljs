@@ -1,6 +1,7 @@
 (ns frontend.handler.route
   "Provides fns used for routing throughout the app"
   (:require [clojure.string :as string]
+            [electron.ipc :as ipc]
             [frontend.config :as config]
             [frontend.context.i18n :refer [t]]
             [frontend.date :as date]
@@ -15,9 +16,11 @@
             [frontend.util :as util]
             [logseq.common.config :as common-config]
             [logseq.common.util :as common-util]
+            [logseq.db :as ldb]
             [logseq.graph-parser.text :as text]
             [logseq.shui.ui :as shui]
             [promesa.core :as p]
+            [reitit.frontend :as rf]
             [reitit.frontend.easy :as rfe]))
 
 (defn redirect!
@@ -85,6 +88,43 @@
   [page-name]
   (when-let [repo (state/get-current-repo)]
     (state/<invoke-db-worker :thread-api/get-page-route-info repo page-name)))
+
+(defn- previous-app-route
+  [^js navigation]
+  ;; Read the browser's history; its length alone also counts forward entries.
+  (when (and navigation (.-canGoBack navigation))
+    (let [entry (aget (.entries navigation) (dec (.. navigation -currentEntry -index)))
+          url (js/URL. (.-url entry))
+          location js/window.location]
+      (when (and (= (.-origin url) (.-origin location))
+                 (= (.-pathname url) (.-pathname location))
+                 (= (.-search url) (.-search location)))
+        (rf/match-by-path (:router @rfe/history)
+                          (if (string/blank? (.-hash url)) "/" (subs (.-hash url) 1)))))))
+
+(defn <redirect-after-page-deletion!
+  "Return to a live route in this graph, or replace the deleted route with home."
+  []
+  (let [navigation (.-navigation js/window)
+        entry-id (some-> navigation .-currentEntry .-id)
+        href (.-href js/window.location)
+        repo (state/get-current-repo)
+        route (previous-app-route navigation)
+        page? (contains? #{:page :page-block} (get-in route [:data :name]))
+        graph-id (get-in route [:query-params :graph-id])
+        same-graph? (or (and (not page?) (nil? graph-id))
+                        (= graph-id (graph-handler/current-graph-id)))]
+    (p/let [block (when (and page? same-graph?)
+                   (db-async/<get-block repo (get-in route [:path-params :name])
+                                        :children? false))]
+      ;; The user may navigate or switch graphs while the worker query settles.
+      (when (and (= repo (state/get-current-repo))
+                 (= href (.-href js/window.location))
+                 (= entry-id (some-> navigation .-currentEntry .-id)))
+        (if (and route same-graph?
+                 (or (not page?) (and block (not (ldb/recycled? block)))))
+          (.back js/window.history)
+          (redirect! {:to :home :push false}))))))
 
 (defn redirect-to-page!
   "`page-name` can be a block uuid or name, prefer to use uuid than name when possible"
@@ -206,12 +246,30 @@
     (<page-route-title (:name path-params))
     (p/resolved (static-title name path-params))))
 
+(defonce ^:private *page-title-update-id (atom 0))
+
+(defn- apply-page-title!
+  [title]
+  (util/set-title! title)
+  (ipc/ipc :set-window-title title))
+
 (defn update-page-title!
   [route]
-  (let [{:keys [data path-params]} route]
+  (let [update-id (swap! *page-title-update-id inc)
+        {:keys [data path-params]} route]
     (p/let [title (get-title (:name data) path-params)
-            hls? (pdf-utils/hls-file? title)]
-      (util/set-title! (if hls? (pdf-utils/fix-local-asset-pagename title) title)))))
+            hls? (pdf-utils/hls-file? title)
+            title (if hls? (pdf-utils/fix-local-asset-pagename title) title)]
+      (when (= update-id @*page-title-update-id)
+        (apply-page-title! title)
+        ;; Chromium can restore the history-entry title after popstate and
+        ;; overwrite a same-turn document.title write. Re-apply on the next
+        ;; tick so Back/Forward keep the current page title.
+        (js/setTimeout
+         (fn []
+           (when (= update-id @*page-title-update-id)
+             (apply-page-title! title)))
+         0)))))
 
 (defn update-page-label!
   [route]

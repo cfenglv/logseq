@@ -5,6 +5,7 @@
             [electron.ipc :as ipc]
             [electron.listener :as el]
             [frontend.components.block :as block]
+            [frontend.components.block.breadcrumb :as block-breadcrumb]
             [frontend.components.content :as cp-content]
             [frontend.components.editor :as editor]
             [frontend.components.page :as page]
@@ -101,7 +102,7 @@
   (state/set-component! :block/linked-references reference/references)
   (state/set-component! :block/container block/block-container)
   (state/set-component! :block/inline-title block/inline-title)
-  (state/set-component! :block/breadcrumb block/breadcrumb)
+  (state/set-component! :block/breadcrumb block-breadcrumb/breadcrumb)
   (state/set-component! :block/reference block/block-reference)
   (state/set-component! :block/blocks-container block/blocks-container)
   (state/set-component! :block/properties-cp block/db-properties-cp)
@@ -170,13 +171,20 @@
           (p/then
            (fn []
              (p/let [t2 (util/time-ms)
+                     desktop? (util/electron?)
+                     desktop-renames (when desktop? (graph-handler/<get-graph-directory-renames))
+                     desktop-raw-url-target (when desktop? (current-url-target))
+                     desktop-registry (when desktop? (graph-handler/<get-graph-registry))
+                     desktop-url-target (when desktop?
+                                          (graph-handler/prepare-startup-repo!
+                                           desktop-registry desktop-raw-url-target desktop-renames))
                      _ (persist-db/<start-runtime!)
                      _ (log/info ::db-worker-spent-time (- (util/time-ms) t2))
                      repos (repo-handler/get-repos)
                      _ (state/set-repos! repos)
                      _ (mobile-util/hide-splash) ;; hide splash as early as ui is stable
-                     url-target (current-url-target)
-                     registry (graph-handler/<get-graph-registry)
+                     url-target (if desktop? desktop-url-target (current-url-target))
+                     registry (if desktop? desktop-registry (graph-handler/<get-graph-registry))
                      target-repo (when (seq url-target)
                                    (:repo (graph-handler/resolve-registry-target
                                            (concat registry

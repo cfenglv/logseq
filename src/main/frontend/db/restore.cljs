@@ -1,6 +1,7 @@
 (ns frontend.db.restore
   "Fns for DB restore(from text or sqlite)"
   (:require [cljs-time.core :as t]
+            [frontend.config :as config]
             [frontend.db.subs :as db-subs]
             [frontend.persist-db :as persist-db]
             [frontend.state :as state]
@@ -19,9 +20,12 @@
            _ (when-not (nat-int? projection-epoch)
                (throw (ex-info "No valid projection epoch found when reloading db"
                                {:repo repo :projection-epoch projection-epoch})))
-           conflicts-by-block (state/<invoke-db-worker
-                               :thread-api/db-sync-get-all-block-conflicts
-                               repo)
+           ;; Publishing graphs have no client-ops store; nothing can conflict
+           conflicts-by-block (if config/publishing?
+                                {}
+                                (state/<invoke-db-worker
+                                 :thread-api/db-sync-get-all-block-conflicts
+                                 repo))
            _ (state/set-current-repo! repo)
            _ (db-subs/reset-graph! repo projection-epoch)
            _ (state/set-sync-block-conflicts! repo conflicts-by-block)
