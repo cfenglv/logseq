@@ -89,7 +89,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
     const manifestObject = {
       "schema-version": 1,
       "target-source-full-sha": sourceSha,
-      "target-version": "2.0.1-selfhost.8",
+      "target-version": "2.0.2-selfhost.1",
       "release-line-id": releaseLineId,
       platform: "darwin",
       arch: process.arch,
@@ -104,7 +104,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
     const candidateRoot = path.join(root, "candidate");
     const candidate = path.join(candidateRoot, "Logseq.app");
     fs.mkdirSync(candidateRoot);
-    makeApp(candidate, "2.0.1-selfhost.8", manifest);
+    makeApp(candidate, "2.0.2-selfhost.1", manifest);
     const archive = path.join(root, "Logseq.zip");
     run("/usr/bin/ditto", ["-c", "-k", "--keepParent", candidate, archive]);
     const archiveBytes = fs.readFileSync(archive);
@@ -116,7 +116,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
       "key-id": keyId,
       "release-line-id": releaseLineId,
       "target-source-full-sha": sourceSha,
-      "target-version": "2.0.1-selfhost.8",
+      "target-version": "2.0.2-selfhost.1",
       platform: "darwin",
       arch: process.arch,
       "bundle-identity": bundleIdentity,
@@ -151,7 +151,7 @@ test("macOS helper verifies, replaces, and rolls back the signed target", { time
     assert.match(productionFaultAttempt.stderr, /invalid argument near --test-fail-after-swap/);
     run(helper, [...baseArgs, "--verify-only"]);
     run(helper, baseArgs);
-    assert.equal(installedVersion(target), "2.0.1-selfhost.8");
+    assert.equal(installedVersion(target), "2.0.2-selfhost.1");
 
     makeApp(target, "2.0.1-selfhost.7");
     const parentExitFailureAttempt = path.join(root, "attempt-parent-exit-failure");
