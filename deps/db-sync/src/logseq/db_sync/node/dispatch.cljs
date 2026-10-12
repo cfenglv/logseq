@@ -28,7 +28,8 @@
       (= path "/health")
       (http/json-response :worker/health {:ok true})
 
-      (or (= path "/graphs")
+      (or (= path "/user/profile")
+          (= path "/graphs")
           (string/starts-with? path "/graphs/"))
       (index-handler/handle-fetch index-self request)
 

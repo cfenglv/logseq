@@ -4,6 +4,7 @@
             [frontend.colors :as colors]
             [frontend.components.assets :as assets]
             [frontend.components.email :as email-component]
+            [frontend.components.user-profile :as user-profile]
             [frontend.components.shortcut :as shortcut]
             [frontend.components.svg :as svg]
             [frontend.config :as config]
@@ -18,6 +19,7 @@
             [frontend.handler.property :as property-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-profile :as profile-handler]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.core :as instrument]
             [frontend.modules.shortcut.data-helper :as shortcut-helper]
@@ -651,6 +653,7 @@
   "Push the current sync URL config to the db worker so changes take effect
    without restarting the app."
   []
+  (profile-handler/refresh-on-focus!)
   (state/<invoke-db-worker :thread-api/set-db-sync-config
                            {:enabled? true
                             :ws-url (config/db-sync-ws-url)
@@ -1221,7 +1224,7 @@
     (hooks/use-effect!
      #(do
         (p/let [graph-uuid (state/<invoke-db-worker :thread-api/get-rtc-graph-uuid current-repo)
-                _ (rtc-handler/<rtc-get-users-info)]
+                _ (profile-handler/<refresh-members!)]
           (set-graph-uuid! graph-uuid)
           (set-loading! false))
         nil)
@@ -1239,12 +1242,13 @@
         (for [{user-name :user/name
                user-email :user/email
                user-uuid :user/uuid
-               graph<->user-user-type :graph<->user/user-type} users]
+               graph<->user-user-type :graph<->user/user-type :as user} users]
           (let [member? (= :member graph<->user-user-type)
                 can-remove? (and manager? member?)]
             [:div.flex.flex-row.items-center.gap-2
              {:key (str "user-" (or user-uuid user-name))}
-             [:div user-name]
+             (user-profile/user-avatar user {:class "w-6 h-6" :tooltip? false})
+             [:div (user-profile/name-label user)]
              (when user-email
                (email-component/email-address {:email user-email
                                                :class "opacity-50 text-sm"}))
@@ -1267,7 +1271,7 @@
 	                                 (when (and graph-uuid member-id)
                                    (-> (rtc-handler/<rtc-remove-member! graph-uuid member-id)
                                        (p/then (fn []
-                                                 (rtc-handler/<rtc-get-users-info true)))
+                                                 (profile-handler/<refresh-members!)))
                                        (p/catch (fn [e]
                                                   (notification/show! (t :collaboration/remove-access-error) :error)
                                                   (log/error :db-sync/remove-member-failed {:error e

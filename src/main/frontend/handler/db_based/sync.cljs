@@ -274,6 +274,7 @@
      (p/let [graph-uuid (<get-rtc-graph-uuid repo)]
        (when graph-uuid
          (let [base (http-base)
+               account-id (user-handler/user-uuid)
                users-info (state/get-state :rtc/users-info)
                cached-users (get users-info repo)]
            (cond
@@ -286,15 +287,19 @@
                                       {:method "GET"}
                                       {:response-schema :graph-members/list})
                      members (:members resp)
-                     users (mapv (fn [{:keys [user-id role email username]}]
+                     users (mapv (fn [{:keys [user-id role email username] :as member}]
                                    (let [name (or username email user-id)
                                          user-type (some-> role keyword)]
-                                     (cond-> {:user/uuid user-id
+                                     (cond-> (merge {:user/uuid user-id
                                               :user/name name
                                               :graph<->user/user-type user-type}
+                                                    (select-keys member [:display-name :has-avatar? :profile-revision]))
                                        (string? email) (assoc :user/email email))))
                                  members)]
-               (state/set-state! :rtc/users-info users :nested-path repo)
+               (when (and (= repo (state/get-current-repo))
+                          (= base (http-base))
+                          (= account-id (user-handler/user-uuid)))
+                 (state/set-state! :rtc/users-info users :nested-path repo))
                users)
 
              :else

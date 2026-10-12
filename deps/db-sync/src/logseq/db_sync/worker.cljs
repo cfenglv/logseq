@@ -69,13 +69,13 @@
                          :debug-stack stack}
                         500))))))
   (webSocketMessage [this ws message]
-                    (try
-                      (ws-handler/handle-ws-message! this ws message)
-                      (catch :default e
+                    (-> (p/do (ws-handler/handle-ws-message! this ws message))
+                        (p/catch (fn [e]
                         (sentry/capture-exception! e)
                         (log/error :db-sync/ws-error e)
                         (js/console.error e)
-                        (ws/send! ws {:type "error" :message "server error"}))))
+                        (ws/send! ws {:type "error" :message (if (= "profile-refresh-failed" (ex-message e))
+                                                              "profile-refresh-failed" "server error")})))))
   (webSocketClose [this ws _code _reason]
                   (presence/remove-presence! this ws)
                   (presence/broadcast-online-users! this))

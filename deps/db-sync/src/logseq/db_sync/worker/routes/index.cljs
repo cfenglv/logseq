@@ -5,6 +5,9 @@
   [["/admin"
     ["/graphs/:graph-id" {:methods {"DELETE" :admin-graphs/delete}}]]
 
+   ["/user/profile" {:methods {"GET" :user-profile/get
+                               "PUT" :user-profile/save}}]
+
    ["/graphs"
     ["" {:methods {"GET" :graphs/list
                    "POST" :graphs/create}}]
@@ -14,6 +17,7 @@
                             "POST" :graph-members/create}}]
      ["/members/:member-id" {:methods {"PUT" :graph-members/update
                                        "DELETE" :graph-members/delete}}]
+     ["/members/:member-id/avatar" {:methods {"GET" :graph-members/avatar}}]
      ["" {:methods {"DELETE" :graphs/delete}}]]]
 
    ["/e2ee"

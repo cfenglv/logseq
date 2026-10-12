@@ -29,6 +29,10 @@
   [editing-block-uuid]
   (db-sync/update-presence! editing-block-uuid))
 
+(def-thread-api :thread-api/db-sync-refresh-profile
+  [context repo]
+  (db-sync/refresh-profile! context repo))
+
 (def-thread-api :thread-api/db-sync-request-asset-download
   [repo asset-uuid]
   (db-sync/request-asset-download! repo asset-uuid))

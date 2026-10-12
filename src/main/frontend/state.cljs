@@ -326,6 +326,7 @@
       :auth/oauth-domain                     nil
       :auth/oauth-client-id                  nil
       :auth/current-login-user               nil
+      :user-profile/state                    {:context nil :repo nil :profiles {} :avatars {}}
 
       ;; graph-uuid -> ...
       :rtc/state                             {}

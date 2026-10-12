@@ -127,6 +127,16 @@
         (p/catch (fn [_]
                    (<run-migration!))))))
 
+(defn- <ensure-user-profile-columns!
+  [db]
+  (p/let [result (common/<d1-all db "select name from pragma_table_info('users')")
+          columns (set (map #(aget % "name") (common/get-sql-rows result)))]
+    (p/doseq [[column definition] [["display_name" "TEXT"]
+                                 ["avatar_png_base64" "TEXT"]
+                                 ["profile_revision" "INTEGER NOT NULL DEFAULT 0"]]]
+      (when-not (contains? columns column)
+        (common/<d1-run db (str "alter table users add column " column " " definition))))))
+
 (defn <index-init! [db]
   (p/do!
    (common/<d1-run db
@@ -148,9 +158,13 @@
                         "email TEXT,"
                         "email_verified INTEGER,"
                         "username TEXT,"
-                        "created_at INTEGER"
+                        "created_at INTEGER,"
+                        "display_name TEXT,"
+                        "avatar_png_base64 TEXT,"
+                        "profile_revision INTEGER NOT NULL DEFAULT 0"
                         ");"))
    (<ensure-user-created-at-column! db)
+   (<ensure-user-profile-columns! db)
    (common/<d1-run db
                    (str "create table if not exists user_rsa_keys ("
                         "user_id TEXT primary key,"
@@ -442,6 +456,66 @@
       (when row
         (aget row "id")))))
 
+(defn- profile-row->metadata [row]
+  {:user-id (aget row "user_id")
+   :display-name (aget row "display_name")
+   :has-avatar? (= 1 (aget row "has_avatar"))
+   :profile-revision (aget row "profile_revision")})
+
+(defn <user-profile-metadata [db user-id]
+  (p/let [result (common/<d1-all db {:session "first-primary"}
+                                 (str "select id as user_id, display_name, "
+                                      "avatar_png_base64 is not null as has_avatar, profile_revision "
+                                      "from users where id = ?")
+                                 user-id)]
+    (when-let [row (first (common/get-sql-rows result))]
+      (profile-row->metadata row))))
+
+(def ^:private user-profile-select-sql
+  (str "select id as user_id, email, username, display_name, avatar_png_base64, "
+       "avatar_png_base64 is not null as has_avatar, profile_revision from users "))
+
+(defn- profile-row->profile [row]
+  (assoc (profile-row->metadata row)
+         :email (aget row "email")
+         :username (aget row "username")
+         :avatar-png-base64 (aget row "avatar_png_base64")))
+
+(defn <user-profile [db user-id]
+  (p/let [result (common/<d1-all db {:session "first-primary"}
+                                 (str user-profile-select-sql "where id = ?")
+                                 user-id)]
+    (when-let [row (first (common/get-sql-rows result))]
+      (profile-row->profile row))))
+
+(defn <graph-member-profile
+  "Read only while both accounts have access to this graph, on the primary database."
+  [db graph-id requester-id member-id]
+  (let [access-sql (str "exists (select graph_id from graphs where graph_id = ? and user_id = ? "
+                        "union select graph_id from graph_members where graph_id = ? and user_id = ?)")]
+    (p/let [result (common/<d1-all db {:session "first-primary"}
+                                   (str user-profile-select-sql "where id = ? and " access-sql " and " access-sql)
+                                   member-id graph-id requester-id graph-id requester-id
+                                   graph-id member-id graph-id member-id)]
+      (when-let [row (first (common/get-sql-rows result))]
+        (profile-row->profile row)))))
+
+(defn <user-profile-save!
+  "Atomically replace both profile fields. Nil means the expected revision did not match."
+  [db user-id {:keys [display-name avatar-png-base64 expected-revision]}]
+  (p/let [^js result (common/<d1-run db
+                               (str "update users set display_name = ?, avatar_png_base64 = ?, "
+                                    "profile_revision = profile_revision + 1 "
+                                    "where id = ? and profile_revision = ?")
+                               display-name avatar-png-base64 user-id expected-revision)
+          changes (if (some? (.-meta result))
+                    (aget (.-meta result) "changes")
+                    (.-changes result))]
+    (case changes
+      0 nil
+      1 (<user-profile db user-id)
+      (throw (ex-info "invalid user profile update result" {})))))
+
 (defn <user-rsa-key-pair-upsert!
   [db user-id public-key encrypted-private-key]
   (when (string? user-id)
@@ -529,20 +603,22 @@
 (defn <graph-members-list [db graph-id]
   (p/let [result (common/<d1-all db {:session "first-primary"}
                                  (str "select m.user_id, m.graph_id, m.role, m.invited_by, m.created_at, "
-                                      "u.email, u.username "
+                                      "u.email, u.username, u.display_name, u.profile_revision, "
+                                      "u.avatar_png_base64 is not null as has_avatar "
                                       "from graph_members m "
                                       "left join users u on m.user_id = u.id "
                                       "where m.graph_id = ? order by m.created_at asc")
                                  graph-id)
           rows (common/get-sql-rows result)]
     (mapv (fn [row]
-            {:user-id (aget row "user_id")
-             :graph-id (aget row "graph_id")
-             :role (aget row "role")
-             :invited-by (aget row "invited_by")
-             :created-at (aget row "created_at")
-             :email (aget row "email")
-             :username (aget row "username")})
+            (cond-> {:user-id (aget row "user_id")
+                     :graph-id (aget row "graph_id")
+                     :role (aget row "role")
+                     :invited-by (aget row "invited_by")
+                     :created-at (aget row "created_at")
+                     :email (aget row "email")
+                     :username (aget row "username")}
+              (some? (aget row "profile_revision")) (merge (profile-row->metadata row))))
           rows)))
 
 (defn <graph-member-update-role! [db graph-id user-id role]

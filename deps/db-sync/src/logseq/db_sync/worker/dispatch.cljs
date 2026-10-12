@@ -166,7 +166,8 @@
          (semantic-routes/match-public method path)
          (handle-semantic-request request env url (semantic-routes/match-public method path))
 
-         (or (= path "/graphs")
+         (or (= path "/user/profile")
+             (= path "/graphs")
              (string/starts-with? path "/graphs/"))
          (index-handler/handle-fetch #js {:env env :d1 (aget env "DB")} request)
 

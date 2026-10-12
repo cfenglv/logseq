@@ -226,6 +226,16 @@
       (send! ws {:type "presence"
                  :editing-block-uuid editing-block-uuid}))))
 
+(defn refresh-profile!
+  [context repo]
+  (let [client @worker-state/*db-sync-client
+        ws (:ws client)]
+    (boolean
+     (when (and (= context (:user-profile/context client)) (= repo (:repo client))
+                ws (sync-transport/ws-open? ws))
+       (send! ws {:type "profile/refresh"})
+       true))))
+
 (defn- ensure-client-state!
   [repo]
   {:repo repo
@@ -355,7 +365,9 @@
                                :token-exists? (some? (or token (auth-token)))})
   (when-let [token' (or token (auth-token))]
     (let [ws (platform/websocket-connect (platform/current) (sync-transport/append-token url token'))
-          updated (assoc client :ws ws)]
+          updated (assoc client :ws ws
+                                :user-profile/context [(sync-auth/http-base-url @worker-state/*db-sync-config)
+                                                       (sync-auth/get-user-uuid token')])]
       (attach-ws-handlers! repo updated ws url)
       (set! (.-onopen ws)
             (fn [_]

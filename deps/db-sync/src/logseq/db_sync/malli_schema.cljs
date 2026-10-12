@@ -1,6 +1,45 @@
 (ns logseq.db-sync.malli-schema
-  (:require [malli.core :as ma]
+  (:require [clojure.string :as string]
+            [logseq.common.defkeywords :refer [defkeyword]]
+            [malli.core :as ma]
             [malli.transform :as mt]))
+
+(defkeyword :display-name "Optional user-selected display name, separate from the login identity.")
+(defkeyword :avatar-png-base64 "Optional Base64-encoded 128 by 128 PNG user avatar.")
+(defkeyword :has-avatar? "Whether the current user profile contains an avatar, without its image data.")
+(defkeyword :profile-revision "Version of a user's saved display name and avatar.")
+(defkeyword :expected-revision "Profile version the user read before editing.")
+(defkeyword :user-profile/get "Read the authenticated user's profile.")
+(defkeyword :user-profile/save "Save the authenticated user's profile at an expected revision.")
+(defkeyword :graph-members/avatar "Read a current graph member's avatar and profile metadata.")
+
+(def avatar-base64-max-length 174764)
+
+(def display-name-schema
+  [:maybe [:and :string
+           [:fn (fn [value]
+                  (<= 1 (.-length (js/Array.from (string/trim value))) 64))]]])
+
+(def profile-revision-schema [:int {:min 0}])
+
+(def user-profile-save-request-schema
+  [:map {:closed true}
+   [:display-name display-name-schema]
+   [:avatar-png-base64 [:maybe [:string {:max avatar-base64-max-length}]]]
+   [:expected-revision profile-revision-schema]])
+
+(def user-profile-metadata-schema
+  [:map
+   [:user-id :string]
+   [:display-name display-name-schema]
+   [:has-avatar? :boolean]
+   [:profile-revision profile-revision-schema]])
+
+(def user-profile-response-schema
+  (into user-profile-metadata-schema
+        [[:email {:optional true} [:maybe :string]]
+         [:username {:optional true} [:maybe :string]]
+         [:avatar-png-base64 [:maybe [:string {:max avatar-base64-max-length}]]]]))
 
 (def tx-entry-schema
   [:map
@@ -21,6 +60,9 @@
 (def client-revision-entry
   [:client-revision {:optional true} :string])
 
+(def profile-refresh-message-schema
+  [:map {:closed true} [:type [:= "profile/refresh"]]])
+
 (def ws-client-message-schema
   [:multi {:dispatch :type}
    ["hello"
@@ -31,6 +73,8 @@
     [:map
      [:type [:= "presence"]]
      [:editing-block-uuid {:optional true} [:maybe :string]]]]
+   ["profile/refresh"
+    profile-refresh-message-schema]
    ["pull"
     [:map
      [:type [:= "pull"]]
@@ -69,7 +113,11 @@
    [:user-id :string]
    [:email {:optional true} [:maybe :string]]
    [:username {:optional true} [:maybe :string]]
-   [:name {:optional true} [:maybe :string]]])
+   [:name {:optional true} [:maybe :string]]
+   [:editing-block-uuid {:optional true} :string]
+   [:display-name {:optional true} display-name-schema]
+   [:has-avatar? {:optional true} :boolean]
+   [:profile-revision {:optional true} profile-revision-schema]])
 
 (def online-users-schema
   [:map
@@ -98,6 +146,8 @@
      [:capabilities {:optional true} [:sequential :string]]
      [:checksum {:optional true} :string]]]
    ["online-users" online-users-schema]
+   ["profile/updated"
+    (into [:map {:closed true}] (concat (rest user-profile-metadata-schema) [[:type [:= "profile/updated"]]]))]
    ["presence"
     [:map
      [:type [:= "presence"]]
@@ -149,7 +199,10 @@
    [:invited-by {:optional true} [:maybe :string]]
    [:created-at :int]
    [:email {:optional true} [:maybe :string]]
-   [:username {:optional true} [:maybe :string]]])
+   [:username {:optional true} [:maybe :string]]
+   [:display-name {:optional true} display-name-schema]
+   [:has-avatar? {:optional true} :boolean]
+   [:profile-revision {:optional true} profile-revision-schema]])
 
 (def graph-members-list-response-schema
   [:map
@@ -263,7 +316,8 @@
    [:metadata-proof :string]])
 
 (def http-request-schemas
-  {:graphs/create graph-create-request-schema
+  {:user-profile/save user-profile-save-request-schema
+   :graphs/create graph-create-request-schema
    :graph-members/create graph-member-create-request-schema
    :graph-members/update graph-member-update-request-schema
    :sync/tx-batch tx-batch-request-schema
@@ -272,7 +326,10 @@
    :e2ee/grant-access e2ee-grant-access-request-schema})
 
 (def http-response-schemas
-  {:graphs/list graphs-list-response-schema
+  {:user-profile/get user-profile-response-schema
+   :user-profile/save user-profile-response-schema
+   :graph-members/avatar user-profile-response-schema
+   :graphs/list graphs-list-response-schema
    :graphs/create graph-create-response-schema
    :graphs/access graph-access-response-schema
    :graphs/delete graph-delete-response-schema
@@ -302,20 +359,24 @@
    {:name :db-sync/json}
    mt/json-transformer))
 
-(defn- ->coercer [schema]
-  (ma/coercer schema json-transformer nil
-              #(ma/-fail! ::db-sync-malli-coerce
-                          (select-keys % [:value]))))
+(defn- ->coercer
+  ([schema] (->coercer schema false))
+  ([schema private-profile?]
+   (ma/coercer schema json-transformer nil
+               #(ma/-fail! ::db-sync-malli-coerce
+                           (if private-profile? {} (select-keys % [:value]))))))
 
 (def ws-client-message-coercer (->coercer ws-client-message-schema))
+(def profile-refresh-message-coercer (->coercer profile-refresh-message-schema true))
 (def ws-server-message-coercer (->coercer ws-server-message-schema))
 
 (def http-request-coercers
   (into {}
-        (map (fn [[k schema]] [k (->coercer schema)]))
+        (map (fn [[k schema]] [k (->coercer schema (= k :user-profile/save))]))
         http-request-schemas))
 
 (def http-response-coercers
   (into {}
-        (map (fn [[k schema]] [k (->coercer schema)]))
+        (map (fn [[k schema]]
+               [k (->coercer schema (contains? #{:user-profile/get :user-profile/save :graph-members/avatar} k))]))
         http-response-schemas))

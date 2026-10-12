@@ -1,0 +1,3 @@
+ALTER TABLE users ADD COLUMN display_name TEXT;
+ALTER TABLE users ADD COLUMN avatar_png_base64 TEXT;
+ALTER TABLE users ADD COLUMN profile_revision INTEGER NOT NULL DEFAULT 0;

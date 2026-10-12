@@ -22,6 +22,10 @@
         "ping"
         (ws/send! ws {:type "pong"})
 
+        "profile/refresh"
+        (-> (p/do (presence/<refresh-profile! self ws))
+            (p/catch (fn [_] (throw (ex-info "profile-refresh-failed" {})))))
+
         "presence"
         (let [editing-block-uuid (:editing-block-uuid message)
               user (presence/get-user self ws)]
@@ -64,16 +68,15 @@
     (p/let [ready-for-sync? (sync-handler/<ready-for-sync? self graph-id)]
       (if-not ready-for-sync?
         (http/error-response "graph not ready" 409)
-        (let [pair (js/WebSocketPair.)
+        (p/let [token (auth/token-from-request request)
+                claims (auth/unsafe-jwt-claims token)
+                user (presence/<connection-user (.. self -env -DB) claims)]
+         (let [pair (js/WebSocketPair.)
               client (aget pair 0)
               server (aget pair 1)
               state (.-state self)]
           (aset self "graph-id" graph-id)
           (.acceptWebSocket state server)
-          (let [token (auth/token-from-request request)
-                claims (auth/unsafe-jwt-claims token)
-                user (presence/claims->user claims)]
-            (when user
-              (presence/add-presence! self server user))
-            (presence/broadcast-online-users! self)
-            (js/Response. nil #js {:status 101 :webSocket client})))))))
+          (when user (presence/add-presence! self server user))
+          (presence/broadcast-online-users! self)
+          (js/Response. nil #js {:status 101 :webSocket client})))))))

@@ -1,8 +1,12 @@
 (ns logseq.db-sync.index-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as node-path]
+            [cljs.test :refer [async deftest is]]
             [clojure.string :as string]
             [logseq.db-sync.common :as common]
             [logseq.db-sync.index :as index]
+            [logseq.db-sync.node.storage :as node-storage]
             [promesa.core :as p]))
 
 (def ^:private graph-e2ee-migration-sql
@@ -211,3 +215,86 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))
+
+(deftest user-profile-real-sqlite-storage-test
+  (async done
+         (let [dir (.mkdtempSync fs (node-path/join (.tmpdir os) "db-sync-profile-test-"))
+               new-db (node-storage/open-index-db (node-path/join dir "new"))
+               old-db (node-storage/open-index-db (node-path/join dir "old"))
+               new-id (str "profile-new-" (random-uuid))
+               old-id (str "profile-old-" (random-uuid))]
+           (-> (p/let [_ (common/<d1-run old-db
+                                        (str "create table users (id TEXT primary key, email TEXT, "
+                                             "email_verified INTEGER, username TEXT, created_at INTEGER)"))
+                       _ (common/<d1-run old-db "insert into users (id, username) values (?, ?)"
+                                        old-id "Original")
+                       _ (index/<index-init! new-db)
+                       _ (index/<index-init! old-db)
+                       _ (index/<index-init! old-db)
+                       old-profile (index/<user-profile old-db old-id)
+                       _ (is (= {:display-name nil :avatar-png-base64 nil
+                                 :has-avatar? false :profile-revision 0 :username "Original"}
+                                (select-keys old-profile [:display-name :avatar-png-base64
+                                                          :has-avatar? :profile-revision :username])))
+                       _ (index/<user-upsert! new-db #js {:sub new-id :email "user@example.com"
+                                                        "cognito:username" "Account"})
+                       saved (index/<user-profile-save! new-db new-id
+                                                        {:display-name "测试 User" :avatar-png-base64 "cG5n"
+                                                         :expected-revision 0})
+                       _ (is (= 1 (:profile-revision saved)))
+                       _ (is (true? (:has-avatar? saved)))
+                       _ (index/<user-upsert! new-db #js {:sub new-id :email "changed@example.com"
+                                                        "cognito:username" "New account name"})
+                       after-login (index/<user-profile new-db new-id)
+                       _ (is (= (select-keys saved [:display-name :avatar-png-base64 :profile-revision])
+                                (select-keys after-login [:display-name :avatar-png-base64 :profile-revision])))
+                       _ (is (= "New account name" (:username after-login)))
+                       conflict (index/<user-profile-save! new-db new-id
+                                                           {:display-name "Stale" :avatar-png-base64 nil
+                                                            :expected-revision 0})
+                       _ (is (nil? conflict))
+                       after-conflict (index/<user-profile new-db new-id)
+                       _ (is (= after-login after-conflict))
+                       _ (index/<graph-member-upsert! new-db "profile-graph" new-id "member" nil)
+                       members (index/<graph-members-list new-db "profile-graph")
+                       _ (is (= "测试 User" (:display-name (first members))))
+                       _ (is (true? (:has-avatar? (first members))))
+                       _ (is (not (contains? (first members) :avatar-png-base64)))
+                       metadata (index/<user-profile-metadata new-db new-id)
+                       _ (is (= (select-keys saved [:user-id :display-name :has-avatar? :profile-revision]) metadata))
+                       removed (index/<user-profile-save! new-db new-id
+                                                          {:display-name nil :avatar-png-base64 nil
+                                                           :expected-revision 1})]
+                 (is (= {:display-name nil :avatar-png-base64 nil :has-avatar? false :profile-revision 2}
+                        (select-keys removed [:display-name :avatar-png-base64 :has-avatar? :profile-revision]))))
+               (p/catch (fn [error] (is false (str error))))
+               (p/finally (fn []
+                            (.close new-db)
+                            (.close old-db)
+                            (.rmSync fs dir #js {:recursive true})
+                            (done)))))))
+
+(deftest user-profile-d1-update-result-test
+  (async done
+         (-> (p/with-redefs [common/<d1-run (fn [_db _sql & _args]
+                                            (p/resolved #js {:success true :meta #js {:changes 1}}))
+                             index/<user-profile (fn [_db user-id]
+                                                   (p/resolved {:user-id user-id :profile-revision 1}))]
+               (p/let [saved (index/<user-profile-save! :db "profile-user"
+                                                      {:display-name "User" :avatar-png-base64 nil
+                                                       :expected-revision 0})]
+                 (is (= {:user-id "profile-user" :profile-revision 1} saved))))
+             (p/then (fn [_]
+                       (p/with-redefs [common/<d1-run (fn [& _]
+                                                      (p/resolved #js {:success true :meta #js {:changes 0}}))]
+                         (p/let [conflict (index/<user-profile-save! :db "profile-user" {})]
+                           (is (nil? conflict))))))
+             (p/then (fn [_]
+                       (p/doseq [result [#js {} #js {:meta #js {}} #js {:changes 2}]]
+                         (p/with-redefs [common/<d1-run (fn [& _] (p/resolved result))]
+                           (-> (index/<user-profile-save! :db "profile-user" {})
+                               (p/then (fn [_] (is false "Invalid database result must fail")))
+                               (p/catch (fn [error]
+                                          (is (= "invalid user profile update result" (ex-message error))))))))))
+             (p/catch (fn [error] (is false (str error))))
+             (p/finally done))))

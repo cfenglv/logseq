@@ -377,6 +377,12 @@
         "hello" (handle-hello! repo client local-tx remote-tx remote-checksum
                                (:capabilities message))
         "online-users" (handle-online-users! repo client message)
+        "profile/updated" (sync-presence/update-user-profile! broadcast-rtc-state! client message)
+        "error" (if (= "profile-refresh-failed" (:message message))
+                  (shared-service/broadcast-to-clients!
+                   :rtc-sync-state
+                   (assoc (sync-presence/rtc-state-payload sync-counts client) :user-profile/error true))
+                  (fail-fast :db-sync/invalid-field {:repo repo :type (:type message)}))
         "presence" (handle-presence! client message)
         "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx remote-checksum)
         "pull/ok" (handle-pull-ok! repo client local-tx remote-tx remote-checksum message)

@@ -82,19 +82,25 @@
 
 (defn- handle-ws-connection
   [ctx env request ^js socket]
-  (p/let [claims (auth/auth-claims request env)
-          user (presence/claims->user claims)]
-    (when user
-      (presence/add-presence! ctx socket user))
-    (presence/broadcast-online-users! ctx))
-  (.on socket "message"
+  (let [ready (-> (p/let [claims (auth/auth-claims request env)
+                          user (presence/<connection-user (aget env "DB") claims)]
+                    (when (and user (= 1 (.-readyState socket)))
+                      (presence/add-presence! ctx socket user)
+                      (presence/broadcast-online-users! ctx)
+                      user))
+                  (p/catch (fn [error]
+                             (log/error :db-sync/ws-error error)
+                             (.close socket 1011 "server error")
+                             nil)))]
+   (.on socket "message"
        (fn [data]
          (let [text (if (string? data) data (.toString data))]
-           (try
-             (ws-handler/handle-ws-message! ctx socket text)
-             (catch :default e
+           (-> (p/let [user ready]
+                 (when user (ws-handler/handle-ws-message! ctx socket text)))
+               (p/catch (fn [e]
                (log/error :db-sync/ws-error e)
-               (.send socket (js/JSON.stringify #js {:type "error" :message "server error"})))))))
+               (.send socket (js/JSON.stringify #js {:type "error" :message (if (= "profile-refresh-failed" (ex-message e))
+                                                                            "profile-refresh-failed" "server error")})))))))))
   (.on socket "close"
        (fn []
          (presence/remove-presence! ctx socket)

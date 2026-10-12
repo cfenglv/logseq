@@ -226,6 +226,7 @@
     :thread-api/db-sync-stop
     :thread-api/db-sync-list-remote-graphs
     :thread-api/db-sync-update-presence
+    :thread-api/db-sync-refresh-profile
     :thread-api/db-sync-ensure-user-rsa-keys
     :thread-api/list-db
     :thread-api/get-version

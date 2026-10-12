@@ -35,6 +35,7 @@
             [frontend.handler.shell :as shell-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-profile :as user-profile]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.posthog :as posthog]
             [frontend.modules.outliner.pipeline :as pipeline]
@@ -450,9 +451,10 @@
       (state/set-state! :rtc/editing-users-by-block new-user :nested-path block-id))))
 
 (defevent! :rtc/sync-state [[_ state]]
+  (user-profile/on-rtc-state! state)
   (when (contains? state :online-users)
     (sync-editing-users-by-block! (:online-users state)))
-  (doseq [[k value] state]
+  (doseq [[k value] (dissoc state :user-profile/context :user-profile/repo :user-profile/error)]
     (state/set-state! :rtc/state value :nested-path k)))
 
 (defevent! :rtc/presence-update [[_ {:keys [editing-block-uuid]}]]

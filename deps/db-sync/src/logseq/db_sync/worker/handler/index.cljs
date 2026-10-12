@@ -3,6 +3,7 @@
             [logseq.db-sync.common :as common]
             [logseq.db-sync.index :as index]
             [logseq.db-sync.worker.auth :as auth]
+            [logseq.db-sync.worker.handler.user-profile :as user-profile]
             [logseq.db-sync.worker.http :as http]
             [logseq.db-sync.worker.routes.index :as routes]
             [promesa.core :as p]))
@@ -90,6 +91,9 @@
         member-id (:member-id path-params)
         user-id (some-> claims (aget "sub"))]
     (case (:handler route)
+      (:user-profile/get :user-profile/save :graph-members/avatar)
+      (user-profile/handle {:db db :claims claims :request request :route route})
+
       :graphs/list
       (if (string? user-id)
         (p/let [graphs (index/<index-list db user-id)
@@ -399,25 +403,27 @@
               (http/unauthorized))
 
             :else
-            (p/let [claims (auth/auth-claims request env)
-                    _ (when claims
-                        (index/<user-upsert! db claims))]
-              (if (nil? claims)
-                (http/unauthorized)
-                (p/let [user-id (aget claims "sub")
-                        _ (<safe-user-activity-touch! db user-id)
-                        response (handle {:db db
-                                          :env env
-                                          :request request
-                                          :url url
-                                          :claims claims
-                                          :route route})
-                        graph-id (some-> route :path-params :graph-id)
-                        _ (when (and (string? user-id)
-                                     (string? graph-id)
-                                     (< (.-status response) 400))
-                            (<safe-graph-activity-touch! db graph-id))]
-                    response))))))
+            (cond-> (p/let [claims (auth/auth-claims request env)
+                            _ (when claims
+                                (index/<user-upsert! db claims))]
+                      (if (nil? claims)
+                        (http/unauthorized)
+                        (p/let [user-id (aget claims "sub")
+                                _ (<safe-user-activity-touch! db user-id)
+                                response (handle {:db db
+                                                  :env env
+                                                  :request request
+                                                  :url url
+                                                  :claims claims
+                                                  :route route})
+                                graph-id (some-> route :path-params :graph-id)
+                                _ (when (and (string? user-id)
+                                             (string? graph-id)
+                                             (< (.-status response) 400))
+                                    (<safe-graph-activity-touch! db graph-id))]
+                            response)))
+              (contains? #{:user-profile/get :user-profile/save :graph-members/avatar} (:handler route))
+              (p/catch (fn [_] (http/error-response "profile-server-error" 500)))))))
       (catch :default error
         (js/console.error "DEBUG handle-fetch error:" error)
         (log/error :db-sync/index-error error)

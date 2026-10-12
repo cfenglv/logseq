@@ -32,6 +32,7 @@
             [frontend.handler.route :as route-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-profile :as user-profile]
             [frontend.common.idb :as idb]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.core :as instrument]
@@ -161,6 +162,7 @@
       (instrument/init)
 
       (events/run!)
+      (user-profile/start!)
       ;; Cached tokens publish the login continuation synchronously, so the
       ;; event consumer must exist before restoring them.
       (user-handler/restore-tokens-from-localstorage)

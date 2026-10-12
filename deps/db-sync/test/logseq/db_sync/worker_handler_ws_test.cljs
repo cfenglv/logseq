@@ -2,6 +2,7 @@
   (:require [cljs-bean.core :as bean]
             [cljs.test :refer [async deftest is]]
             [datascript.core :as d]
+            [logseq.db-sync.index :as index]
             [logseq.db-sync.protocol :as protocol]
             [logseq.db-sync.storage :as storage]
             [logseq.db-sync.test-sql :as test-sql]
@@ -10,6 +11,55 @@
             [logseq.db-sync.worker.presence :as presence]
             [logseq.db-sync.worker.ws :as ws]
             [promesa.core :as p]))
+
+(deftest profile-refresh-updates-account-sockets-and-preserves-editor-attachments-test
+  (async done
+    (let [source-attachment (atom nil)
+          other-attachment (atom nil)
+          source #js {:readyState 1 :serializeAttachment #(reset! source-attachment %)}
+          same-account #js {:readyState 1 :serializeAttachment #(reset! other-attachment %)}
+          peer #js {:readyState 1 :serializeAttachment (fn [_])}
+          self #js {:env #js {:DB #js {}}
+                    :state #js {:getWebSockets (fn [] #js [source same-account peer])}}
+          sent (atom [])
+          profile {:user-id "user-1" :display-name nil :has-avatar? false :profile-revision 2}]
+      (presence/add-presence! self source {:user-id "user-1" :username "Account" :editing-block-uuid "block-a" :profile-revision 1})
+      (presence/add-presence! self same-account {:user-id "user-1" :editing-block-uuid "block-b" :profile-revision 1})
+      (presence/add-presence! self peer {:user-id "user-2" :editing-block-uuid "block-c"})
+      (-> (p/with-redefs [index/<user-profile-metadata
+                         (fn [_ user-id] (is (= "user-1" user-id)) (p/resolved profile))
+                         ws/send! (fn [socket message] (swap! sent conj [socket message]))]
+            (p/let [_ (ws-handler/handle-ws-message! self source (protocol/encode-message {:type "profile/refresh"}))]
+              (is (= [source same-account peer] (mapv first @sent)))
+              (is (= (repeat 3 (assoc profile :type "profile/updated")) (map second @sent)))
+              (is (= "block-a" (:editing-block-uuid (presence/get-user self source))))
+              (is (= "block-b" (:editing-block-uuid (presence/get-user self same-account))))
+              (is (= "Account" (:username (presence/get-user self source))))
+              (is (= 2 (:profile-revision (presence/attachment->user @source-attachment))))
+              (is (= "block-b" (:editing-block-uuid (presence/attachment->user @other-attachment))))
+              (is (= {:user-id "user-2" :editing-block-uuid "block-c"} (presence/get-user self peer)))
+              (is (not (contains? (second (first @sent)) :avatar-png-base64)))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
+(deftest profile-refresh-database-rejection-is-returned-as-a-promise-test
+  (async done
+    (let [socket #js {:serializeAttachment (fn [_])}
+          self #js {:env #js {:DB #js {}}}]
+      (presence/add-presence! self socket {:user-id "user-1"})
+      (-> (p/with-redefs [index/<user-profile-metadata (fn [& _] (p/rejected (ex-info "read failed" {})))]
+            (-> (ws-handler/handle-ws-message! self socket (protocol/encode-message {:type "profile/refresh"}))
+                (p/then (fn [_] (is false "Read error must reach the async message entry")))
+                (p/catch (fn [error] (is (= "profile-refresh-failed" (ex-message error)))))))
+          (p/finally done)))))
+
+(deftest profile-refresh-does-not-accept-client-supplied-profile-data-test
+  (let [socket #js {:readyState 1}
+        sent (atom [])]
+    (with-redefs [ws/send! (fn [_ message] (swap! sent conj message))]
+      (ws-handler/handle-ws-message! #js {} socket
+                                   (protocol/encode-message {:type "profile/refresh" :avatar-png-base64 "private-image"})))
+    (is (= [{:type "error" :message "invalid request"}] @sent))))
 
 (deftest presence-message-broadcast-excludes-source-client-test
   (let [source-ws #js {:readyState 1}

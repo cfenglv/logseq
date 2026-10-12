@@ -10,6 +10,7 @@
             [dommy.core :as dom]
             [electron.ipc :as ipc]
             [frontend.components.avatar :as avatar]
+            [frontend.components.user-profile :as user-profile]
             [frontend.components.block.asset :as block-asset]
             [frontend.components.block.breadcrumb :as block-breadcrumb]
             [frontend.components.block.comments :as block-comments]
@@ -2428,15 +2429,12 @@
           (shui/tabler-icon "message-circle" {:size 15})))))))
 
 (defn- editing-user-avatar
-  [{:user/keys [name uuid]}]
+  [{:user/keys [name uuid] :as user}]
   (let [user-name (or name uuid)]
     (when (avatar/initials user-name)
       [:span.block-editing-avatar-wrap
-       (avatar/user-avatar
+       (user-profile/user-avatar user
         {:class "block-editing-avatar w-4 h-4 flex-none"
-         :title user-name
-         :name user-name
-         :uuid uuid
          :fallback-props {:style {:font-size 9}}})])))
 
 (defn- block-control-with-icon?
