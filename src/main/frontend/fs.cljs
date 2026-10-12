@@ -126,7 +126,7 @@
     (let [file-fpath (common-util/path-normalize path)]
       ;; repo is nil because we don't want a backup file written
       (-> (p/do!
-           (mkdir-if-not-exists (path/parent file-fpath))
+           (mkdir-recur! (path/parent file-fpath))
            (ipc/ipc "writeFile" nil file-fpath content))
           (p/catch (fn [error]
                      (state/pub-event! [:capture-error {:error error

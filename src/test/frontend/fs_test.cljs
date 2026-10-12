@@ -65,13 +65,18 @@
   {:before (node-fixtures/setup-get-fs!)
    :after (node-fixtures/restore-get-fs!)}
   (let [repo-dir (node-path/resolve (test-node-helper/create-tmp-dir))
-        export-css-path (node-path/join repo-dir "logseq" "export.css")]
+        export-css-path (node-path/join repo-dir "logseq" "export.css")
+        ipc-calls (atom [])]
     (is (not (fs-node/existsSync (node-path/join repo-dir "logseq")))
         "precondition: logseq/ dir is missing")
     (-> (p/with-redefs [util/electron? (constantly true)
-                        ipc/ipc (fn [op _repo path content]
-                                  (is (= "writeFile" op))
-                                  (fsp/writeFile path content))]
+                        fs/get-fs (constantly fs/node-backend)
+                        ipc/ipc (fn [op & args]
+                                  (swap! ipc-calls conj op)
+                                  (case op
+                                    "stat" (p/resolved nil)
+                                    "mkdir-recur" (fsp/mkdir (first args) #js {:recursive true})
+                                    "writeFile" (fsp/writeFile (second args) (nth args 2))))]
           (p/do!
            (fs/write-file! export-css-path ".foo { color: red; }")
            (is (fs-node/existsSync (node-path/join repo-dir "logseq"))
@@ -79,7 +84,9 @@
            (is (fs-node/existsSync export-css-path)
                "first write creates missing export.css")
            (is (= ".foo { color: red; }"
-                  (str (fs-node/readFileSync export-css-path))))))
+                  (str (fs-node/readFileSync export-css-path))))
+           (is (= ["mkdir-recur" "writeFile"] @ipc-calls)
+               "first write uses the native recursive mkdir, not stat's nil-as-success result")))
         (p/finally
          (fn []
            (when (fs-node/existsSync repo-dir)
