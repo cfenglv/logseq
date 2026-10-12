@@ -96,10 +96,10 @@
                                  #js {:validateTargetBuildManifest
                                       (fn [_] (is false "mismatched target must stop before manifest validation"))})
                                 (p/then (fn [_] :unexpected-success))
-                                (p/catch identity))]
-                 (is (= :target-version-mismatch (:code (ex-data error)))))
-               (is (= archive-sha512-base64
-                      (.toString (js/Buffer.from (aget signed "archive-sha512") "hex") "base64"))))))
+                                (p/catch (fn [error] (:code (ex-data error)))))]
+                 (is (= :target-version-mismatch error))
+                 (is (= archive-sha512-base64
+                        (.toString (js/Buffer.from (aget signed "archive-sha512") "hex") "base64")))))))
           (p/catch (fn [error]
                      (is false (str "unexpected error: " error))))
           (p/finally done)))))
