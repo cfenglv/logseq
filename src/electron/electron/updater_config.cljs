@@ -1,8 +1,8 @@
 (ns electron.updater-config)
 
 (def release-line-id "selfhost-official-architecture-v1")
-(def source-version "2.0.1-selfhost.7")
-(def synthetic-forward-target-version "2.0.1-selfhost.8")
+(def source-version "2.0.2-selfhost.1")
+(def synthetic-forward-target-version "2.0.2-selfhost.2")
 
 (def ^:private supported-targets
   #{["darwin" "arm64"]

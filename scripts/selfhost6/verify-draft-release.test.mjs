@@ -24,7 +24,7 @@ const releasePolicy = readReleasePolicy(
 const releaseId = 424242;
 const sourceFullSha = "a".repeat(40);
 const replacementSourceFullSha = "b".repeat(40);
-const targetVersion = "2.0.1-selfhost.7";
+const targetVersion = "2.0.2-selfhost.1";
 
 function digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
@@ -95,6 +95,35 @@ test("frozen Draft identity and inventory pass before replacement", (context) =>
       .map(({ id }) => id)
       .sort((left, right) => left - right),
   );
+});
+
+test("an explicitly frozen empty Draft is admitted only before staging", (context) => {
+  const input = fixture();
+  context.after(() => fs.rmSync(input.directory, { recursive: true, force: true }));
+  const options = {
+    ...input,
+    assets: [],
+    releaseId: String(releaseId),
+    sourceFullSha,
+    replacementSourceFullSha: sourceFullSha,
+    targetVersion,
+    artifactDirectory: input.directory,
+    expectedAssets: [],
+    expectedInventorySha256: digest(Buffer.from("[]\n")),
+  };
+  assert.deepEqual(verifyDraftBeforeReplacement(options), { status: "draft-prewrite-verified" });
+  assert.throws(() => verifyDraftBeforeReplacement({
+    ...options, expectedInventorySha256: digest(Buffer.from("wrong")),
+  }), /inventory secret is inconsistent/);
+  assert.throws(() => verifyDraftAfterStaging(options), /traditional release inventory/);
+  const published = { ...input.release, draft: false, published_at: "2026-10-12T00:00:00Z" };
+  assert.throws(() => verifyPublishedRelease({
+    ...options,
+    release: published,
+    latestRelease: published,
+    releases: [published],
+    tagRefs: [{ ref: `refs/tags/${targetVersion}`, object: { sha: sourceFullSha } }],
+  }), /traditional release inventory/);
 });
 
 test("Draft replacement rejects identity or inventory drift", (context) => {

@@ -36,6 +36,11 @@ const { parseUpdateInfo } = require(path.join(
   repoRoot,
   "static/node_modules/.pnpm/electron-updater@6.8.3/node_modules/electron-updater/out/providers/Provider.js",
 ));
+const updaterRequire = createRequire(path.join(
+  repoRoot, "static/node_modules/.pnpm/electron-updater@6.8.3/node_modules/electron-updater/out/AppUpdater.js",
+));
+const { AppUpdater } = updaterRequire("./AppUpdater.js");
+const { parse } = updaterRequire("semver");
 const releasePolicy = readReleasePolicy(
   path.join(repoRoot, "resources/updater/selfhost-release-policy.json"),
 );
@@ -88,7 +93,7 @@ function fixture(targetVersion = releasePolicy.syntheticForwardTargetVersion) {
   return { directory, inputDirectory, descriptor, ...staged };
 }
 
-test("a content-addressed .7 target becomes one-time bridge metadata", () => {
+test("a content-addressed source target binds metadata to immutable bytes", () => {
   const item = fixture(releasePolicy.sourceVersion);
   const verified = verifyArtifactDescriptor({
     descriptor: item.descriptor,
@@ -96,7 +101,7 @@ test("a content-addressed .7 target becomes one-time bridge metadata", () => {
     releasePolicy,
     signingPolicy,
   });
-  assert.match(item.descriptor.assetName, /darwin-arm64-2\.0\.1-selfhost\.7\.zip$/);
+  assert.equal(item.descriptor.assetName, `Logseq-darwin-arm64-${releasePolicy.sourceVersion}.zip`);
   assert.ok(item.descriptor.immutableObjectKey.includes(verified["archive-sha256"]));
   assert.deepEqual(item.descriptor.provider, {
     kind: "github",
@@ -278,7 +283,7 @@ test("electron-updater GitHubProvider resolves latest Release metadata and immut
     {
       channel: `${releasePolicy.forwardUpdateChannel}-arm64`,
       allowPrerelease: false,
-      currentVersion: releasePolicy.sourceVersion,
+      currentVersion: "2.0.1-selfhost.7",
       fullChangelog: false,
     },
     { executor, platform: "darwin", isUseMultipleRangeRequest: false },
@@ -292,4 +297,26 @@ test("electron-updater GitHubProvider resolves latest Release metadata and immut
   assert.equal(path.basename(resolved[0].url.pathname), item.descriptor.assetName);
   const archiveBytes = Buffer.from(await executor.request({ path: resolved[0].url.pathname }));
   assert.deepEqual(archiveBytes, fs.readFileSync(item.artifactPath));
+});
+
+test("native AppUpdater accepts newer versions and rejects invalid versions or downgrades", async () => {
+  const updater = {
+    currentVersion: parse("2.0.1-selfhost.7"),
+    allowDowngrade: false,
+    isUpdateSupported: () => true,
+    isUserWithinRollout: () => true,
+  };
+  assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
+    version: releasePolicy.sourceVersion,
+  }), true);
+  updater.currentVersion = parse(releasePolicy.sourceVersion);
+  assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
+    version: releasePolicy.syntheticForwardTargetVersion,
+  }), true);
+  assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
+    version: "2.0.1-selfhost.7",
+  }), false);
+  await assert.rejects(AppUpdater.prototype.isUpdateAvailable.call(updater, {
+    version: "invalid",
+  }), { code: "ERR_UPDATER_INVALID_VERSION" });
 });

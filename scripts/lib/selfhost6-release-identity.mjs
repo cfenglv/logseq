@@ -17,8 +17,8 @@ export function readReleasePolicy(policyPath) {
   const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
   assert.equal(policy.schemaVersion, 1);
   assert.equal(policy.releaseLineId, "selfhost-official-architecture-v1");
-  assert.equal(policy.sourceVersion, "2.0.1-selfhost.7");
-  assert.equal(policy.syntheticForwardTargetVersion, "2.0.1-selfhost.8");
+  assert.equal(policy.sourceVersion, "2.0.2-selfhost.1");
+  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.2");
   assert.equal(policy.bundleIdentity, "com.logseq.logseq");
   assert.equal(policy.forwardUpdateChannel, policy.releaseLineId);
   assert.deepEqual(policy.provider, {
@@ -80,7 +80,7 @@ export function buildTargetManifest({
   assert.match(sourceFullSha, shaPattern, "source full SHA must be 40 lowercase hex characters");
   assert.ok(
     [policy.sourceVersion, policy.syntheticForwardTargetVersion].includes(targetVersion),
-    "target version must be the formal .7 or its synthetic .8 fixture",
+    "target version must be the current source or its synthetic forward fixture",
   );
   assert.ok(supportedTargets.has(`${platform}/${arch}`), "unsupported platform/arch");
   assert.equal(typeof signingKeyIdentity, "string");

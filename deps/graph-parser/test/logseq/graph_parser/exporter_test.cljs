@@ -1143,6 +1143,13 @@ abc
         (p/finally (fn [_]
                      (set! (.-write (.-stderr js/process)) original-stderr-write))))))
 
+(defn- imported-ontology
+  [db block-name entity-type?]
+  (some (fn [datom]
+          (let [entity (d/entity db (:e datom))]
+            (when (entity-type? entity) entity)))
+        (d/datoms db :avet :block/name block-name)))
+
 (deftest-async import-asset-links-in-page-and-block-property-values
   (let [pdf-bytes "%PDF-1.1\n%%EOF\n"
         graph-dir (write-temp-file-graph
@@ -1178,10 +1185,12 @@ abc
                           [:block/tags :logseq.property.asset/type]))
           "Block property asset has correct type")
       (is (= (page-ref/->page-ref (:block/uuid page-asset))
-             (:user.property/url (db-test/readable-properties page)))
+             (get (db-test/readable-properties page)
+                  (:db/ident (imported-ontology @conn "url" ldb/property?))))
           "Page property value references the imported asset")
       (is (= (page-ref/->page-ref (:block/uuid block-asset))
-             (:user.property/link (db-test/readable-properties block)))
+             (get (db-test/readable-properties block)
+                  (:db/ident (imported-ontology @conn "link" ldb/property?))))
           "Block property value references the imported asset")
       (is (= (str "body link " (page-ref/->page-ref (:block/uuid body-asset)))
              (:block/title body-block))
@@ -2611,7 +2620,7 @@ abc
           library (ldb/get-built-in-page @conn common-config/library-page-name)
           vehicle (db-test/find-page-by-title @conn "Vehicle")
           car (db-test/find-page-by-title @conn "Car")
-          city (d/entity @conn :user.property/city)
+          city (imported-ontology @conn "city" ldb/property?)
           berlin (db-test/find-page-by-title @conn "Berlin")
           country (db-test/find-page-by-title @conn "Country")]
     (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
@@ -2714,15 +2723,16 @@ abc
 
 (defn- assert-rolle-property-and-class-are-distinct
   [conn]
-  (let [klass (d/entity @conn :user.class/Rolle)
-        prop (d/entity @conn :user.property/rolle)
+  (let [klass (imported-ontology @conn "rolle" ldb/class?)
+        prop (imported-ontology @conn "rolle" ldb/property?)
         alice (or (db-test/find-page-by-title @conn "A_Alice")
                   (db-test/find-page-by-title @conn "Alice"))
         tagged-page-id (ffirst (d/q '[:find ?p
+                                      :in $ ?class
                                       :where
-                                      [?p :block/tags :user.class/Rolle]
+                                      [?p :block/tags ?class]
                                       [?p :block/name]]
-                                    @conn))]
+                                    @conn (:db/id klass)))]
     (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
         "Created graph has no validation errors")
     (is (and (some? klass) (ldb/class? klass) (not (ldb/property? klass)))
@@ -2733,7 +2743,7 @@ abc
         "Class and property are distinct entities")
     (is (some? tagged-page-id)
         "A page tagged Rolle references the class")
-    (is (some? (:user.property/rolle alice))
+    (is (some? (get alice (:db/ident prop)))
         "Alice's rolle value is on the property")))
 
 (deftest-async import-property-and-class-same-title-property-first

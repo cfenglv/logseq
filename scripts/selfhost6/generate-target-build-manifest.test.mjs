@@ -28,7 +28,7 @@ import {
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const policyPath = path.join(repoRoot, "resources/updater/selfhost-release-policy.json");
 
-test("formal .7 and synthetic .8 bind only the final public source identity", () => {
+test("source and synthetic forward versions bind only the final public source identity", () => {
   const policy = readReleasePolicy(policyPath);
   assert.deepEqual(policy.provider, {
     kind: "github",
@@ -60,8 +60,8 @@ test("formal .7 and synthetic .8 bind only the final public source identity", ()
   };
   const source = buildTargetManifest({ ...common, targetVersion: policy.sourceVersion });
   const target = buildTargetManifest({ ...common, targetVersion: policy.syntheticForwardTargetVersion });
-  assert.equal(policy.sourceVersion, "2.0.1-selfhost.7");
-  assert.equal(policy.syntheticForwardTargetVersion, "2.0.1-selfhost.8");
+  assert.equal(policy.sourceVersion, "2.0.2-selfhost.1");
+  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.2");
   assert.equal(source["release-line-id"], target["release-line-id"]);
   assert.equal(source["target-source-full-sha"], target["target-source-full-sha"]);
   assert.equal(source["target-source-full-sha"], finalPublicSourceSha);
@@ -71,7 +71,7 @@ test("formal .7 and synthetic .8 bind only the final public source identity", ()
   assert.deepEqual(source["readable-client-ops-formats"], ["official-client-ops-sqlite-v2+selfhost-upload-v1"]);
   assert.throws(
     () => buildTargetManifest({ ...common, targetVersion: "2.0.1-selfhost.6" }),
-    /formal \.7/,
+    /current source/,
   );
 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "selfhost6-version-identity-"));
@@ -177,7 +177,7 @@ test("future identity input fails closed without compatibility fallbacks", () =>
     signingKeyIdentity: "managed-test-key",
   };
   assert.throws(() => buildTargetManifest({ ...valid, sourceFullSha: "short" }), /40 lowercase hex/);
-  assert.throws(() => buildTargetManifest({ ...valid, targetVersion: "2.0.1-selfhost.6" }), /formal \.7/);
+  assert.throws(() => buildTargetManifest({ ...valid, targetVersion: "2.0.1-selfhost.6" }), /current source/);
   assert.throws(() => buildTargetManifest({ ...valid, platform: "ios", arch: "arm64" }), /unsupported/);
   assert.throws(() => buildTargetManifest({ ...valid, signingKeyIdentity: "" }), /required/);
 });
@@ -186,7 +186,7 @@ test("packaging configuration requires the generated target manifest", () => {
   const builder = fs.readFileSync(path.join(repoRoot, "resources/electron-builder.yml"), "utf8");
   assert.match(builder, /from: updater\/TARGET_BUILD_MANIFEST\.json\n\s+to: updater\/TARGET_BUILD_MANIFEST\.json/);
   const version = fs.readFileSync(path.join(repoRoot, "src/main/frontend/version.cljs"), "utf8");
-  assert.match(version, /defonce version "2\.0\.1-selfhost\.7"/);
+  assert.match(version, /defonce version "2\.0\.2-selfhost\.1"/);
   const gulpfile = fs.readFileSync(path.join(repoRoot, "gulpfile.js"), "utf8");
   assert.ok(gulpfile.includes('match(/defonce version "([^"]+)"/)?.[1]'));
 });

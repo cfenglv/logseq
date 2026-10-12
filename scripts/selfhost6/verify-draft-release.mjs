@@ -93,6 +93,7 @@ function normalizedRemoteAssets(assets) {
 
 function normalizedExpectedAssets(assets, targetVersion) {
   const normalized = normalizedRemoteAssets(assets);
+  if (normalized.length === 0) return normalized;
   if (normalized.length === 16) {
     assert.ok(normalized.every(({ name }) => name.startsWith("Logseq-")),
       "legacy Draft contains a non-formal asset");
