@@ -67,7 +67,7 @@
                                  :archive-size (.-size (fs/statSync archive))
                                  :target-build-manifest-sha256 (.-sha256 extracted)
                                  :target-source-full-sha (.repeat "b" 40)
-                                 :target-version "2.0.1-selfhost.8"
+                                 :target-version "2.0.2-selfhost.1"
                                  :release-line-id "selfhost-official-architecture-v1"
                                  :platform "darwin"
                                  :arch "arm64"
@@ -79,12 +79,25 @@
                                  :client-ops-write-format (aget manifest "client-ops-write-format")}
                      result (updater-target/preflight-downloaded-target-with-modules!
                              {:downloaded-file archive
+                              :version "2.0.2-selfhost.1"
                               :signed-metadata signed
                               :verified-archive-sha512 archive-sha512-base64
                               :archive-digest-verified true}
                              #js {:verifySignedUpdateMetadata (fn [_] signed)}
                              #js {:validateTargetBuildManifest (fn [_] manifest)})]
                (is (true? result))
+               (p/let [error (-> (updater-target/preflight-downloaded-target-with-modules!
+                                 {:downloaded-file archive
+                                  :version "2.0.1-selfhost.8"
+                                  :signed-metadata signed
+                                  :verified-archive-sha512 archive-sha512-base64
+                                  :archive-digest-verified true}
+                                 #js {:verifySignedUpdateMetadata (fn [_] signed)}
+                                 #js {:validateTargetBuildManifest
+                                      (fn [_] (is false "mismatched target must stop before manifest validation"))})
+                                (p/then (fn [_] :unexpected-success))
+                                (p/catch identity))]
+                 (is (= :target-version-mismatch (:code (ex-data error)))))
                (is (= archive-sha512-base64
                       (.toString (js/Buffer.from (aget signed "archive-sha512") "hex") "base64"))))))
           (p/catch (fn [error]

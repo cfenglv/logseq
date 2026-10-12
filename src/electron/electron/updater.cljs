@@ -113,6 +113,7 @@
             (reset! *downloaded-update payload)
             (reset! *downloaded-target
                     {:downloaded-file (.-downloadedFile ^js info)
+                     :version (.-version ^js info)
                      :signed-metadata signed-metadata
                      :verified-archive-sha512 (downloaded-file-sha512 info)
                      ;; electron-updater emits update-downloaded only after its

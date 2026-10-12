@@ -11,13 +11,6 @@ const rawEd25519SpkiPrefix = Buffer.from("302a300506032b6570032100", "hex");
 const fullShaPattern = /^[0-9a-f]{40}$/;
 const sha256Pattern = /^[0-9a-f]{64}$/;
 const sha512Pattern = /^[0-9a-f]{128}$/;
-// Keep the published .6 descriptor format verifiable while the live release
-// policy advances independently through .7 and its synthetic .8 target.
-const allowedVersions = new Set([
-  "2.0.1-selfhost.6",
-  "2.0.1-selfhost.7",
-  "2.0.1-selfhost.8",
-]);
 const allowedTargets = new Set([
   "darwin/arm64",
   "darwin/x64",
@@ -101,7 +94,7 @@ export function validateUnsignedMetadata(metadata, policy) {
   assert.equal(metadata["release-line-id"], policy.releaseLineId);
   assert.equal(metadata["bundle-identity"], policy.bundleIdentity);
   assert.match(metadata["target-source-full-sha"], fullShaPattern);
-  assert.ok(allowedVersions.has(metadata["target-version"]), "unsupported update target version");
+  requireString(metadata["target-version"], "target version");
   assert.ok(allowedTargets.has(`${metadata.platform}/${metadata.arch}`), "unsupported update target platform/arch");
   requireString(metadata["immutable-object-key"], "immutable object key");
   assert.ok(metadata["immutable-object-key"].includes(metadata["release-line-id"]), "object key must include release line");

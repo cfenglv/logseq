@@ -215,7 +215,7 @@
                            {:code :unsupported-updater-target-container})))))
 
 (defn ^:no-doc preflight-downloaded-target-with-modules!
-  [{:keys [downloaded-file signed-metadata archive-digest-verified
+  [{:keys [downloaded-file version signed-metadata archive-digest-verified
            verified-archive-sha512]}
    ^js signature-module
    ^js manifest-module]
@@ -226,6 +226,9 @@
                                                         #js {:signedMetadata signed-metadata})
           signed-sha512-base64 (.toString (js/Buffer.from (aget verified-metadata "archive-sha512") "hex")
                                           "base64")
+          _ (when-not (= version (aget verified-metadata "target-version"))
+              (throw (ex-info "electron-updater version differs from signed metadata"
+                              {:code :target-version-mismatch})))
           _ (when-not (= verified-archive-sha512 signed-sha512-base64)
               (throw (ex-info "electron-updater archive digest differs from signed metadata"
                               {:code :target-archive-digest-mismatch})))
