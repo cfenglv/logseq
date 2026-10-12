@@ -1143,13 +1143,6 @@ abc
         (p/finally (fn [_]
                      (set! (.-write (.-stderr js/process)) original-stderr-write))))))
 
-(defn- imported-ontology
-  [db block-name entity-type?]
-  (some (fn [datom]
-          (let [entity (d/entity db (:e datom))]
-            (when (entity-type? entity) entity)))
-        (d/datoms db :avet :block/name block-name)))
-
 (deftest-async import-asset-links-in-page-and-block-property-values
   (let [pdf-bytes "%PDF-1.1\n%%EOF\n"
         graph-dir (write-temp-file-graph
@@ -1185,12 +1178,10 @@ abc
                           [:block/tags :logseq.property.asset/type]))
           "Block property asset has correct type")
       (is (= (page-ref/->page-ref (:block/uuid page-asset))
-             (get (db-test/readable-properties page)
-                  (:db/ident (imported-ontology @conn "url" ldb/property?))))
+             (:user.property/url (db-test/readable-properties page)))
           "Page property value references the imported asset")
       (is (= (page-ref/->page-ref (:block/uuid block-asset))
-             (get (db-test/readable-properties block)
-                  (:db/ident (imported-ontology @conn "link" ldb/property?))))
+             (:user.property/link (db-test/readable-properties block)))
           "Block property value references the imported asset")
       (is (= (str "body link " (page-ref/->page-ref (:block/uuid body-asset)))
              (:block/title body-block))
@@ -1198,6 +1189,30 @@ abc
       (is (= 0 (count @(:ignored-assets import-state))) "No ignored assets")
       (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
           "Imported graph validates"))))
+
+(deftest-async import-org-asset-links-in-page-and-block-property-values
+  (let [graph-dir (write-temp-file-graph
+                   {"logseq/config.edn" "{:meta/version 1 :file/name-format :triple-lowbar}"
+                    "pages/Attachment.org"
+                    (str ":PROPERTIES:\n:url: [[../assets/a.pdf][a.pdf]]\n:END:\n\n"
+                         "* An org block\n:PROPERTIES:\n:Link: [[../assets/b.pdf][b.pdf]]\n:END:\n")
+                    "assets/a.pdf" "%PDF-1.1\n%%EOF\n"
+                    "assets/b.pdf" "%PDF-1.1\n%%EOF\n"})]
+    (-> (p/let [conn (db-test/create-conn)
+                {:keys [import-state]} (import-file-graph-to-db graph-dir conn {})
+                page (db-test/find-page-by-title @conn "Attachment")
+                block (db-test/find-block-by-content @conn "An org block")
+                page-asset (db-test/find-block-by-content @conn "a")
+                block-asset (db-test/find-block-by-content @conn "b")]
+          (is (some? page-asset))
+          (is (some? block-asset))
+          (is (= (page-ref/->page-ref (:block/uuid page-asset))
+                 (:user.property/url (db-test/readable-properties page))))
+          (is (= (page-ref/->page-ref (:block/uuid block-asset))
+                 (:user.property/link (db-test/readable-properties block))))
+          (is (empty? @(:ignored-assets import-state)))
+          (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))))
+        (p/finally #(fs/rmSync graph-dir #js {:recursive true :force true})))))
 
 (deftest extract-template-blocks
   (let [page-uuid (random-uuid)
@@ -2620,7 +2635,7 @@ abc
           library (ldb/get-built-in-page @conn common-config/library-page-name)
           vehicle (db-test/find-page-by-title @conn "Vehicle")
           car (db-test/find-page-by-title @conn "Car")
-          city (imported-ontology @conn "city" ldb/property?)
+          city (d/entity @conn :user.property/city)
           berlin (db-test/find-page-by-title @conn "Berlin")
           country (db-test/find-page-by-title @conn "Country")]
     (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
@@ -2723,16 +2738,15 @@ abc
 
 (defn- assert-rolle-property-and-class-are-distinct
   [conn]
-  (let [klass (imported-ontology @conn "rolle" ldb/class?)
-        prop (imported-ontology @conn "rolle" ldb/property?)
+  (let [klass (d/entity @conn :user.class/Rolle)
+        prop (d/entity @conn :user.property/rolle)
         alice (or (db-test/find-page-by-title @conn "A_Alice")
                   (db-test/find-page-by-title @conn "Alice"))
         tagged-page-id (ffirst (d/q '[:find ?p
-                                      :in $ ?class
                                       :where
-                                      [?p :block/tags ?class]
+                                      [?p :block/tags :user.class/Rolle]
                                       [?p :block/name]]
-                                    @conn (:db/id klass)))]
+                                    @conn))]
     (is (empty? (map :entity (:errors (db-validate/validate-local-db! @conn))))
         "Created graph has no validation errors")
     (is (and (some? klass) (ldb/class? klass) (not (ldb/property? klass)))
@@ -2743,7 +2757,7 @@ abc
         "Class and property are distinct entities")
     (is (some? tagged-page-id)
         "A page tagged Rolle references the class")
-    (is (some? (get alice (:db/ident prop)))
+    (is (some? (:user.property/rolle alice))
         "Alice's rolle value is on the property")))
 
 (deftest-async import-property-and-class-same-title-property-first

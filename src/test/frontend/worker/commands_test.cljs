@@ -409,7 +409,7 @@
   property `due`, set to journal day 20260910, and returns the commands' tx."
   [repeat-type now pages]
   (let [conn (db-test/create-conn-with-blocks
-              {:properties {:user.property/due {:logseq.property/type :date}}
+              {:properties {:due {:logseq.property/type :date}}
                :pages-and-blocks
                (into
                 (mapv (fn [day] {:page {:build/journal day}}) pages)
@@ -419,7 +419,7 @@
                             {:logseq.property.repeat/repeated? true
                              :logseq.property.repeat/recur-frequency 1
                              :logseq.property.repeat/recur-unit :logseq.property.repeat/recur-unit.week
-                             :user.property/due [:build/page {:build/journal 20260910}]
+                             :due [:build/page {:build/journal 20260910}]
                              :logseq.property/status :logseq.property/status.todo}}]}])})
         block (db-test/find-block-by-content @conn "weekly task")
         _ (d/transact! conn [[:db/add (:db/id block) :logseq.property.repeat/repeat-type repeat-type]

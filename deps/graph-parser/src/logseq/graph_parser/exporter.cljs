@@ -1587,10 +1587,13 @@
 
 (defn- update-asset-links-in-block-title [block-title asset-name-to-uuids ignored-assets]
   (reduce (fn [acc [asset-name asset-uuid]]
-            (let [new-title (string/replace acc
+            (let [escaped-name (common-util/escape-regex-chars asset-name)
+                  new-title (string/replace acc
                                             (re-pattern (str "!?\\[[^\\]]*?\\]\\([^\\)]*?"
-                                                             (common-util/escape-regex-chars asset-name)
-                                                             "\\)(\\{[^}]*\\})?"))
+                                                             escaped-name
+                                                             "\\)(\\{[^}]*\\})?"
+                                                             "|\\[\\[[^\\]]*?" escaped-name
+                                                             "\\](?:\\[[^\\]]*?\\])?\\]"))
                                             (page-ref/->page-ref asset-uuid))]
               (when (string/includes? new-title asset-name)
                 (swap! ignored-assets conj
@@ -1952,7 +1955,7 @@
     (p/resolved {:block pvalue})))
 
 (defn- <handle-assets-in-property-values
-  "Convert asset markdown links in property value entities the same way block
+  "Convert asset links in property value entities the same way block
    bodies are converted, and create the referenced Asset entities."
   [pvalues-tx import-state opts]
   (if (some property-value-asset-title? pvalues-tx)
