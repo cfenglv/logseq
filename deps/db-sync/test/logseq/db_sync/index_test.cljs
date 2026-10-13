@@ -55,15 +55,15 @@
                           (is false (str error))
                           (done)))))))
 
-(deftest semantic-graphs-list-is-bounded-and-excludes-e2ee-test
+(deftest semantic-graphs-list-is-bounded-and-includes-e2ee-test
   (async done
          (let [call (atom nil)
                rows #js [#js {"graph_id" "graph-1" "graph_name" "test-mcp"
                               "updated_at" 20 "created_at" 10 "schema_version" "65"
-                              "graph_ready_for_use" 1 "role" "manager" "invited_by" nil}
+                              "graph_e2ee" 0 "graph_ready_for_use" 1 "role" "manager" "invited_by" nil}
                          #js {"graph_id" "graph-2" "graph_name" "test-mcp-2"
                               "updated_at" 19 "created_at" 11 "schema_version" "65"
-                              "graph_ready_for_use" 1 "role" "member" "invited_by" "u2"}]]
+                              "graph_e2ee" 1 "graph_ready_for_use" 1 "role" "member" "invited_by" "u2"}]]
            (-> (p/with-redefs [common/<d1-all
                                (fn [_db sql & args]
                                  (reset! call {:sql sql :args args})
@@ -73,7 +73,8 @@
                (p/then (fn [{:keys [graphs next-cursor]}]
                          (is (= 1 (count graphs)))
                          (is (string? next-cursor))
-                         (is (string/includes? (:sql @call) "g.graph_e2ee = 0"))
+                         (is (not (string/includes? (:sql @call) "g.graph_e2ee = 0")))
+                         (is (string/includes? (:sql @call) "g.graph_e2ee"))
                          (is (string/includes? (:sql @call) "limit ?"))
                          (is (= 2 (last (:args @call))))
                          (done)))
@@ -215,6 +216,40 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))
+
+(deftest full-migration-filenames-preserve-profile-and-add-pat-test
+  ;; The db-sync test entry runs from this package, as do its other fixtures.
+  (let [migration-dir "worker/migrations"
+        filenames (sort (filter #(string/ends-with? % ".sql") (.readdirSync fs migration-dir)))
+        base (filter #(not (string/starts-with? % "0007_")) filenames)
+        profile "0007_add_user_profile.sql"
+        pat "0007_add_personal_access_tokens.sql"]
+    (doseq [old-profile? [false true]]
+      (let [sql (new node-storage/sqlite ":memory:")
+            apply-migration! (fn [filename]
+                               (.exec sql (.readFileSync fs (node-path/join migration-dir filename) "utf8"))
+                               (let [^js stmt (.prepare sql "insert into d1_migrations(name) values (?)")]
+                                 (.run stmt filename)))
+            pending (fn []
+                      (let [applied (set (map #(aget % "name")
+                                             (.all (.prepare sql "select name from d1_migrations"))))]
+                        (remove applied filenames)))]
+        (try
+          (.exec sql "create table d1_migrations(name text primary key)")
+          (run! apply-migration! base)
+          (when old-profile?
+            (apply-migration! profile)
+            (.exec sql "insert into users(id,display_name,avatar_png_base64,profile_revision) values ('synthetic-user','Original','cG5n',3)"))
+          (run! apply-migration! (pending))
+          (is (empty? (pending)))
+          (is (= 2 (aget (.get (.prepare sql "select count(*) as n from d1_migrations where name in (?,?)") profile pat) "n")))
+          (is (some? (.get (.prepare sql "select name from sqlite_master where name='personal_access_tokens'"))))
+          (when old-profile?
+            (let [saved (.get (.prepare sql "select display_name,avatar_png_base64,profile_revision from users where id='synthetic-user'"))]
+              (is (= "Original" (aget saved "display_name")))
+              (is (= "cG5n" (aget saved "avatar_png_base64")))
+              (is (= 3 (aget saved "profile_revision")))))
+          (finally (.close sql)))))))
 
 (deftest user-profile-real-sqlite-storage-test
   (async done

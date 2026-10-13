@@ -1,6 +1,7 @@
 (ns logseq.db-sync.malli-schema
   (:require [clojure.string :as string]
             [logseq.common.defkeywords :refer [defkeyword]]
+            [logseq.common.user-navigation :as navigation]
             [malli.core :as ma]
             [malli.transform :as mt]))
 
@@ -14,6 +15,53 @@
 (defkeyword :graph-members/avatar "Read a current graph member's avatar and profile metadata.")
 
 (def avatar-base64-max-length 174764)
+
+(defkeyword :user-navigation/init "Provision and conditionally initialize the authenticated user's private navigation graph.")
+(defkeyword :favorites-seed "Ordered UUID strings from legacy shared favorites, including an initialized empty vector.")
+(defkeyword :recents-seed "Ordered legacy recent UUID strings for one physical device, without invented times.")
+(defkeyword :transfer-id "Persistent UUID string binding one conditional local-to-RTC navigation transfer.")
+
+(def navigation-uuid-schema [:re #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"])
+(def navigation-seed-schema [:vector navigation-uuid-schema])
+(def navigation-stamp-schema [:or [:tuple [:= :seed] navigation-uuid-schema]
+                             [:tuple [:= :selection] navigation-uuid-schema]])
+(def navigation-visits-schema [:vector {:max navigation/recents-limit}
+                              [:tuple navigation-uuid-schema [:int {:min 0}]]])
+(def navigation-value-validators
+  (update-vals
+   {:favorite [:or [:map {:closed true} [:selected? [:= false]]]
+               [:map {:closed true} [:selected? [:= true]]
+                [:membership-id navigation-uuid-schema] [:added-at [:int {:min 0}]]]]
+    :order [:vector [:tuple navigation-uuid-schema navigation-stamp-schema]]
+    :visits navigation-visits-schema
+    :favorites-seed navigation-seed-schema
+    :recents-seed navigation-seed-schema
+    :transfer-once [:= true]}
+   ma/validator))
+
+(defn navigation-transfer-values-valid?
+  [values scope device-id]
+  (and (map? values)
+       (every? (fn [[key value]]
+                 (let [[family key-scope discriminator] (navigation/ident-parts key)
+                       validator (get navigation-value-validators family)]
+                   (and validator (= scope key-scope) (not= :transfer-once family)
+                        (= key (navigation/ident family key-scope discriminator))
+                        (case family
+                          :favorite (ma/validate navigation-uuid-schema discriminator)
+                          (:visits :recents-seed) (= device-id discriminator)
+                          (:order :favorites-seed) (nil? discriminator))
+                        (validator value)))) values)))
+
+(def user-navigation-init-request-schema
+  [:map {:closed true}
+   [:scopes [:vector [:map {:closed true}
+                     [:scope navigation-uuid-schema]
+                     [:device-id navigation-uuid-schema]
+                     [:favorites-seed navigation-seed-schema]
+                     [:recents-seed navigation-seed-schema]
+                     [:transfer-id {:optional true} navigation-uuid-schema]
+                     [:values {:optional true} :string]]]]])
 
 (def display-name-schema
   [:maybe [:and :string
@@ -273,7 +321,10 @@
 
 (def e2ee-graph-aes-key-response-schema
   [:map
-   [:encrypted-aes-key {:optional true} [:maybe :string]]])
+   [:encrypted-aes-key {:optional true} [:maybe :string]]
+   ;; base64 of the raw RSA-OAEP wrapped AES key, for agents that unwrap
+   ;; client-side with their RSA private key (no transit parsing needed)
+   [:encrypted-aes-key-base64 {:optional true} [:maybe :string]]])
 
 (def e2ee-grant-access-entry-schema
   [:map

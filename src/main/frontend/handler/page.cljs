@@ -15,6 +15,7 @@
             [frontend.handler.property :as property-handler]
             [frontend.handler.graph :as graph-handler]
             [frontend.handler.route :as route-handler]
+            [frontend.handler.user-navigation :as navigation]
             [frontend.modules.outliner.op :as outliner-op]
             [frontend.modules.outliner.ui :as ui-outliner-tx]
             [frontend.state :as state]
@@ -111,7 +112,9 @@
   "return page-block entities"
   []
   (when-let [repo (state/get-current-repo)]
-    (state/<invoke-db-worker :thread-api/get-favorite-pages repo)))
+    (if (navigation/enabled?)
+      (navigation/<nodes false)
+      (state/<invoke-db-worker :thread-api/get-favorite-pages repo))))
 
 (defn toggle-favorite! []
   ;; NOTE: in journals or settings, current-page is nil
@@ -136,7 +139,8 @@
 (defn <reorder-favorites!
   [favorites]
   (when-let [repo (state/get-current-repo)]
-    (p/let [_ (state/<invoke-db-worker :thread-api/reorder-favorites repo favorites)]
+    (p/let [_ (if (navigation/enabled?) (navigation/<reorder! favorites)
+                 (state/<invoke-db-worker :thread-api/reorder-favorites repo favorites))]
       (state/update-favorites-updated!))))
 
 (defn update-public-attribute!

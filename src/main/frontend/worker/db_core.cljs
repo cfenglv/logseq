@@ -27,6 +27,7 @@
    [frontend.worker.handler.sync]
    [frontend.worker.handler.transaction :as transaction-handler]
    [frontend.worker.handler.undo-redo]
+   [frontend.worker.handler.user-navigation :as navigation-handler]
    [frontend.worker.handler.view]
    [frontend.worker.pipeline :as worker-pipeline]
    [frontend.worker.platform :as platform]
@@ -90,7 +91,7 @@
   [graph]
   (if (node-runtime?)
     (graph-dir/repo->graph-dir-key graph)
-    (worker-util/get-pool-name graph)))
+    (worker-util/get-pool-name graph (platform/env-flag (platform/current) :user-navigation?))))
 
 (defn- get-storage-pool
   [graph]
@@ -1491,7 +1492,13 @@
 
 (defn- <create-or-open-db!
   [repo {:keys [config datoms debug-transit-raw sync-download-graph? creating-remote-graph?] :as opts}]
-  (let [datoms (or datoms
+  (let [navigation-context @worker-state/*user-navigation-context
+        navigation-config (or (:user-navigation/context opts)
+                              (when (= repo (:repo navigation-context))
+                                (assoc (select-keys navigation-context [:user-id :http-base])
+                                       :ws-url (:ws-url @worker-state/*db-sync-config))))
+        sync-download-graph? (or sync-download-graph? (some? navigation-config))
+        datoms (or datoms
                    (when debug-transit-raw
                      (debug-transit-raw->datoms debug-transit-raw)))]
     (when creating-remote-graph?
@@ -1568,6 +1575,9 @@
             (db-sync/reconcile-local-checksum! repo conn)
 
             (db-listener/listen-db-changes! repo conn)
+
+            (when navigation-config
+              (navigation-handler/configure! repo navigation-config))
 
             (<cleanup-previous-artifact! repo)))))))
 
@@ -1654,13 +1664,16 @@
   [repo opts]
   (when-not (graph-dir/same-repo? repo (worker-state/get-current-repo)) ; graph switched
     (reset! worker-state/*deleted-block-uuid->db-id {}))
+  (let [already-open? (some? (worker-state/get-datascript-conn repo))]
   (p/let [_ (start-db! repo opts)
+          _ (when (and already-open? (:user-navigation/context opts))
+              (navigation-handler/configure! repo (:user-navigation/context opts)))
           conn (or (worker-state/get-datascript-conn repo)
                    (throw (ex-info "Missing worker graph connection"
                                    {:type :db/missing-connection
                                     :repo repo})))]
     {:schema (:schema @conn)
-     :projection-epoch (worker-state/get-projection-epoch repo)}))
+     :projection-epoch (worker-state/get-projection-epoch repo)})))
 
 (def-thread-api :thread-api/get-projection-epoch
   [repo]

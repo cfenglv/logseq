@@ -1,7 +1,9 @@
 (ns electron.db-worker
   (:require ["@logseq/graph-lifecycle" :as lifecycle]
+            ["path" :as node-path]
             [logseq.cli.server :as cli-server]
             [logseq.common.graph-dir :as graph-dir]
+            [logseq.common.user-navigation :as navigation]
             [logseq.common.version :as version]
             [logseq.db-worker.daemon :as daemon]
             [promesa.core :as p]))
@@ -464,9 +466,32 @@
   ([repo window-id opts]
    (ensure-started! manager repo window-id opts)))
 
+(defn navigation-lease [window-id]
+  [:user-navigation/context window-id])
+
+(defn ensure-navigation-runtime!
+  "Root is inherited from this window's notes runtime, never from renderer options."
+  [mgr window-id service user-id]
+  (let [state (ensure-state @(:state mgr))
+        notes-repo (get-in state [:window->repo window-id])
+        root (get-in state [:repos notes-repo :runtime :root-dir])]
+    (when-not (seq root)
+      (throw (ex-info "Open a graph before requesting its private navigation runtime" {:code :missing-graph-runtime})))
+    (let [identity (navigation/graph-id (str root "\n" service "\n" user-id))
+          repo (str "logseq_db_user-navigation-" identity)
+          private-root (node-path/join root ".user-navigation" identity)
+          storage (cli-server/resolve-storage {:root-dir private-root})]
+      (p/do! (lifecycle/createGraph storage repo)
+             (ensure-started! mgr repo (navigation-lease window-id) {:root-dir private-root :create-empty-db? true})))))
+
+(defn release-navigation-runtime! [mgr window-id repo]
+  (ensure-stopped! mgr repo (navigation-lease window-id)))
+
 (defn release-window!
   [window-id]
-  (ensure-window-stopped! manager window-id))
+  (p/let [notes-stopped? (ensure-window-stopped! manager window-id)
+          private-stopped? (ensure-window-stopped! manager (navigation-lease window-id))]
+    (or notes-stopped? private-stopped?)))
 
 (defn release-runtime!
   ([repo window-id]

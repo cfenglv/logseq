@@ -84,6 +84,34 @@
       [(into #{} (map (fn [page] [:entity (:block/uuid page)])) pages)
        (mapv sidebar-page-summary pages)])))
 
+(defn- personal-navigation-targets
+  [db resource-key]
+  (let [targets (last resource-key)]
+    (when-not (and (vector? targets) (every? common-util/uuid-string? targets))
+      (common/fail! "Invalid personal navigation UUIDs" {}))
+    (let [uuids (mapv uuid targets)
+          watches (into (set (map #(vector :entity %) uuids))
+                        (mapcat (fn [id]
+                                  (map #(vector :entity (:block/uuid %)) (ldb/get-block-parents db id)))) uuids)
+          entities (->> uuids (keep #(d/entity db [:block/uuid %])) (remove ldb/hidden?) vec)]
+      [watches entities])))
+
+(defn- personal-favorites [db resource-key _runtime]
+  (let [[watches entities] (personal-navigation-targets db resource-key)]
+    [watches (mapv sidebar-page-summary entities)]))
+
+(defn- personal-recents [db resource-key _runtime]
+  (let [[watches entities] (personal-navigation-targets db resource-key)]
+    [watches (->> entities (filter ldb/page?)
+                  (remove #(string/blank? (:block/title %))) (mapv sidebar-page-summary))]))
+
+(defn- personal-favorite-status [db resource-key _runtime]
+  (let [[watches entities] (personal-navigation-targets db resource-key)
+        target (nth resource-key 3)]
+    (when-not (common-util/uuid-string? target)
+      (common/fail! "Invalid personal favorite UUID" {}))
+    [(conj watches [:entity (uuid target)]) (boolean (some #(= target (str (:block/uuid %))) entities))]))
+
 (defn- page-identity
   [db resource-key _runtime]
   (let [lookup (second resource-key)]
@@ -403,6 +431,9 @@
 
 (def resource-renderers
   {:favorites (common/renderer 1 favorites)
+   :user-navigation/favorites (common/renderer 4 personal-favorites)
+   :user-navigation/recents (common/renderer 4 personal-recents)
+   :user-navigation/favorite-status (common/renderer 5 personal-favorite-status)
    :favorite-status (common/renderer 2 favorite-status)
    :recent-pages (common/renderer 2 recent-pages)
    :page-identity (common/renderer 2 page-identity)

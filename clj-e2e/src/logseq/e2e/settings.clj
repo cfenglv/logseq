@@ -1,15 +1,20 @@
 (ns logseq.e2e.settings
-  (:require [clojure.string :as string]
-            [logseq.e2e.assert :as assert]
+  (:require [logseq.e2e.assert :as assert]
             [logseq.e2e.util :as util]
             [wally.main :as w]))
 
 (defn- e2e-init-script
   []
-  (let [sync-server-url (System/getenv "LOGSEQ_E2E_SYNC_SERVER_URL")]
-    (str "localStorage.setItem('preferred-language', '\"en\"'); localStorage.setItem('developer-mode', '\"true\"');"
-         (when-not (string/blank? sync-server-url)
-           (str " localStorage.setItem('sync-server-url', " (pr-str sync-server-url) ");")))))
+  "localStorage.setItem('preferred-language', '\"en\"'); localStorage.setItem('developer-mode', '\"true\"');")
+
+(defn- sync-init-script
+  "Point the app at the local db-sync server and log in the injected test
+  account. `sync` is the map returned by `sync-server/test-login`."
+  [{:keys [http-base id-token access-token refresh-token]}]
+  (str "localStorage.setItem('sync-server-url','" http-base "');"
+       "localStorage.setItem('id-token','" id-token "');"
+       "localStorage.setItem('access-token','" access-token "');"
+       "localStorage.setItem('refresh-token','" refresh-token "');"))
 
 (def ^:private refresh-ready-script
   "(() => document.documentElement.lang === 'en'
@@ -17,8 +22,9 @@
            && localStorage.getItem('developer-mode') === '\"true\"')()")
 
 (defn install-init-script!
-  [ctx]
-  (.addInitScript ctx (e2e-init-script)))
+  ([ctx] (install-init-script! ctx nil))
+  ([ctx sync]
+   (.addInitScript ctx (str (e2e-init-script) (when sync (sync-init-script sync))))))
 
 (defn wait-test-env-ready!
   []

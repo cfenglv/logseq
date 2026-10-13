@@ -192,19 +192,16 @@
   (reset! state/*db-worker-thread nil)
   (reset! state/*db-worker nil))
 
-(defn start-db-worker!
-  []
-  (when-not util/node-test?
-    (p/do!
-     (reload-app-if-old-db-worker-exists)
-     (stop-db-worker!)
-     (let [worker-url (if config/publishing? "static/js/db-worker.js" "js/db-worker.js")
+(defn create-worker-client!
+  "Reuse the original Comlink/Transit wrapper without installing the notes driver."
+  [private-navigation?]
+  (let [worker-url (if config/publishing? "static/js/db-worker.js" "js/db-worker.js")
            worker (js/Worker.
                    (str worker-url
                         "?electron=" (util/electron?)
                         "&capacitor=" (util/capacitor?)
-                        "&publishing=" config/publishing?))
-           _ (set-worker-fs worker)
+                        "&publishing=" config/publishing?
+                        (when private-navigation? "&userNavigation=true")))
            wrapped-worker* (Comlink/wrap worker)
            wrapped-worker (fn [qkw & args]
                             (cond
@@ -224,10 +221,20 @@
                                     (ldb/read-transit-str result))
                                   (p/catch (fn [error]
                                              (js/console.error "DB worker API failed:" (str qkw) error)
-                                             (throw error))))))
+                                             (throw error))))))]
+    (Comlink/expose #js{"remoteInvoke" thread-api/remote-function} worker)
+    {:worker worker :wrapped-worker wrapped-worker}))
+
+(defn start-db-worker!
+  []
+  (when-not util/node-test?
+    (p/do!
+     (reload-app-if-old-db-worker-exists)
+     (stop-db-worker!)
+     (let [{:keys [worker wrapped-worker]} (create-worker-client! false)
+           _ (set-worker-fs worker)
            t1 (util/time-ms)]
        (reset! state/*db-worker-thread worker)
-       (Comlink/expose #js{"remoteInvoke" thread-api/remote-function} worker)
        (worker-handler/handle-message! worker wrapped-worker)
        (reset! state/*db-worker wrapped-worker)
        (-> (p/let [_ (state/<invoke-db-worker :thread-api/init)

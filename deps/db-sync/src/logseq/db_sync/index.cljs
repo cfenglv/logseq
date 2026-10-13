@@ -1,5 +1,6 @@
 (ns logseq.db-sync.index
   (:require [clojure.string :as string]
+            [logseq.common.user-navigation :as navigation]
             [logseq.db-sync.common :as common]
             [promesa.core :as p]))
 
@@ -71,6 +72,22 @@
        ");"))
 (def ^:private daily-active-entities-create-index-sql
   "create index if not exists idx_daily_active_entities_type_day on daily_active_entities (entity_type, day_utc)")
+(def ^:private personal-access-tokens-create-table-sql
+  (str "create table if not exists personal_access_tokens ("
+       "id TEXT primary key,"
+       "user_id TEXT not null,"
+       "graph_id TEXT not null,"
+       "token_hash TEXT not null unique,"
+       "token_prefix TEXT not null,"
+       "permission TEXT not null,"
+       "created_at INTEGER not null,"
+       "expires_at INTEGER not null,"
+       "check (permission in ('read', 'write', 'both'))"
+       ")"))
+(def ^:private personal-access-tokens-user-index-sql
+  "create index if not exists idx_personal_access_tokens_user_created_at on personal_access_tokens (user_id, created_at desc)")
+(def ^:private personal-access-tokens-graph-index-sql
+  "create index if not exists idx_personal_access_tokens_graph_id on personal_access_tokens (graph_id)")
 
 (defn- duplicate-column-error?
   [error column-name]
@@ -199,7 +216,10 @@
                    "create index if not exists idx_graphs_user_id_updated_at on graphs (user_id, updated_at desc)")
    (common/<d1-run db
                    "create index if not exists idx_users_email on users (email)")
-   (common/<d1-run db daily-active-entities-create-index-sql)))
+   (common/<d1-run db daily-active-entities-create-index-sql)
+   (common/<d1-run db personal-access-tokens-create-table-sql)
+   (common/<d1-run db personal-access-tokens-user-index-sql)
+   (common/<d1-run db personal-access-tokens-graph-index-sql)))
 
 (defn- utc-day-str
   [timestamp-ms]
@@ -256,18 +276,43 @@
   [db graph-id]
   (<activity-touch! db "graph" graph-id))
 
+(defn- normal-graph-row? [row]
+  (or (not (navigation/reserved-id-shape? (aget row "graph_id")))
+      (not (navigation/reserved-graph? (aget row "graph_id") (aget row "user_id")))))
+
+(defn <private-navigation-graph?
+  [db graph-id]
+  ;; Ordinary creation uses v4; only potential reserved IDs need the owner read.
+  (if (navigation/reserved-id-shape? graph-id)
+    (p/let [result (common/<d1-all db "select graph_id,user_id from graphs where graph_id = ?" graph-id)
+            row (first (common/get-sql-rows result))]
+      (boolean (and row (not (normal-graph-row? row)))))
+    (p/resolved false)))
+
+(defn <provision-navigation-graph!
+  [db user-id]
+  (let [graph-id (navigation/graph-id user-id)
+        now (common/now-ms)]
+    (p/do!
+     (common/<d1-run db
+                     (str "insert into graphs(graph_id,graph_name,user_id,schema_version,graph_e2ee,graph_ready_for_use,created_at,updated_at) "
+                          "values (?, ?, ?, ?, 0, 1, ?, ?) on conflict(graph_id) do nothing")
+                     graph-id "User navigation" user-id "65" now now)
+     graph-id)))
+
 (defn <index-list [db user-id]
   (if (string? user-id)
     (p/let [result (common/<d1-all db
-                                   (str "select g.graph_id, g.graph_name, g.schema_version, g.graph_e2ee, g.graph_ready_for_use, g.created_at, g.updated_at, "
+                                   (str "select g.graph_id, g.user_id, g.graph_name, g.schema_version, g.graph_e2ee, g.graph_ready_for_use, g.created_at, g.updated_at, "
                                         "m.role, m.invited_by "
                                         "from graphs g "
                                         "left join graph_members m on g.graph_id = m.graph_id and m.user_id = ? "
-                                        "where g.user_id = ? or m.user_id = ? "
+                                        "where (g.user_id = ? or m.user_id = ?) and g.graph_id <> ? "
                                         "order by g.updated_at desc")
                                    user-id
                                    user-id
-                                   user-id)
+                                   user-id
+                                   (navigation/graph-id user-id))
             rows (common/get-sql-rows result)]
       (mapv (fn [row]
               {:graph-id (aget row "graph_id")
@@ -279,7 +324,7 @@
                :invited-by (aget row "invited_by")
                :created-at (aget row "created_at")
                :updated-at (aget row "updated_at")})
-            rows))
+            (filter normal-graph-row? rows)))
     []))
 
 (defn decode-semantic-graph-cursor [cursor]
@@ -302,29 +347,29 @@
   (let [cursor-key (when cursor (decode-semantic-graph-cursor cursor))
         [cursor-updated-at cursor-graph-id] cursor-key
         conditions (cond-> [(str "(g.user_id = ? or m.user_id = ?) ")
-                            "g.graph_e2ee = 0"
+                            "g.graph_id <> ?"
                             "g.graph_ready_for_use = 1"]
                      (string? name) (conj "lower(g.graph_name) = lower(?)")
                      cursor-key (conj "(g.updated_at < ? or (g.updated_at = ? and g.graph_id > ?))"))
-        args (cond-> [user-id user-id user-id]
+        args (cond-> [user-id user-id user-id (navigation/graph-id user-id)]
                (string? name) (conj name)
                cursor-key (conj cursor-updated-at cursor-updated-at cursor-graph-id)
                true (conj (inc limit)))
-        sql (str "select g.graph_id, g.graph_name, g.schema_version, g.graph_ready_for_use, "
+        sql (str "select g.graph_id, g.user_id, g.graph_name, g.schema_version, g.graph_e2ee, g.graph_ready_for_use, "
                  "g.created_at, g.updated_at, m.role, m.invited_by "
                  "from graphs g "
                  "left join graph_members m on g.graph_id = m.graph_id and m.user_id = ? "
                  "where " (string/join " and " conditions) " "
                  "order by g.updated_at desc, g.graph_id asc limit ?")]
     (p/let [result (apply common/<d1-all db sql args)
-            rows (vec (common/get-sql-rows result))
+            rows (vec (filter normal-graph-row? (common/get-sql-rows result)))
             more? (> (count rows) limit)
             selected (take limit rows)
             graphs (mapv (fn [row]
                            {:graph-id (aget row "graph_id")
                             :graph-name (aget row "graph_name")
                             :schema-version (aget row "schema_version")
-                            :graph-e2ee? false
+                            :graph-e2ee? (graph-e2ee-sql->bool (aget row "graph_e2ee"))
                             :graph-ready-for-use? (graph-ready-for-use-sql->bool (aget row "graph_ready_for_use"))
                             :role (aget row "role")
                             :invited-by (aget row "invited_by")
@@ -336,6 +381,84 @@
                      (let [row (nth rows (dec limit))]
                        (encode-semantic-graph-cursor (aget row "updated_at")
                                                      (aget row "graph_id"))))))))
+
+(defn <semantic-graph-get
+  [db user-id graph-id]
+  (when (and (string? user-id) (string? graph-id))
+    (p/let [result (common/<d1-all
+                           db
+                           (str "select g.graph_id, g.user_id, g.graph_name, g.schema_version, g.graph_e2ee, g.graph_ready_for_use, "
+                                "g.created_at, g.updated_at, m.role, m.invited_by "
+                                "from graphs g "
+                                "left join graph_members m on g.graph_id = m.graph_id and m.user_id = ? "
+                                "where g.graph_id = ? and (g.user_id = ? or m.user_id = ?) "
+                                "and g.graph_ready_for_use = 1")
+                           user-id graph-id user-id user-id)
+            row (first (common/get-sql-rows result))]
+      (when (and row (normal-graph-row? row))
+        {:graph-id (aget row "graph_id")
+         :graph-name (aget row "graph_name")
+         :schema-version (aget row "schema_version")
+         :graph-e2ee? (graph-e2ee-sql->bool (aget row "graph_e2ee"))
+         :graph-ready-for-use? (graph-ready-for-use-sql->bool (aget row "graph_ready_for_use"))
+         :role (aget row "role")
+         :invited-by (aget row "invited_by")
+         :created-at (aget row "created_at")
+         :updated-at (aget row "updated_at")}))))
+
+(defn <personal-access-token-create!
+  [db {:keys [id user-id graph-id token-hash token-prefix permission created-at expires-at]}]
+  (common/<d1-run
+   db
+   (str "insert into personal_access_tokens "
+        "(id, user_id, graph_id, token_hash, token_prefix, permission, created_at, expires_at) "
+        "values (?, ?, ?, ?, ?, ?, ?, ?)")
+   id user-id graph-id token-hash token-prefix permission created-at expires-at))
+
+(defn <personal-access-tokens-list
+  [db user-id]
+  (p/let [result (common/<d1-all
+                         db
+                         (str "select p.id, p.graph_id, g.graph_name, p.token_prefix, p.permission, "
+                              "p.created_at, p.expires_at "
+                              "from personal_access_tokens p "
+                              "left join graphs g on g.graph_id = p.graph_id "
+                              "where p.user_id = ? order by p.created_at desc")
+                         user-id)
+          rows (common/get-sql-rows result)]
+    (mapv (fn [row]
+            {:id (aget row "id")
+             :graph-id (aget row "graph_id")
+             :graph-name (aget row "graph_name")
+             :token-prefix (aget row "token_prefix")
+             :permission (aget row "permission")
+             :created-at (aget row "created_at")
+             :expires-at (aget row "expires_at")})
+          rows)))
+
+(defn <personal-access-token-delete!
+  [db id user-id]
+  (common/<d1-run db
+                  "delete from personal_access_tokens where id = ? and user_id = ?"
+                  id user-id))
+
+(defn <personal-access-token-by-hash
+  [db token-hash]
+  (p/let [result (common/<d1-all
+                         db
+                         (str "select id, user_id, graph_id, token_prefix, permission, "
+                              "created_at, expires_at "
+                              "from personal_access_tokens where token_hash = ?")
+                         token-hash)
+          row (first (common/get-sql-rows result))]
+    (when row
+      {:id (aget row "id")
+       :user-id (aget row "user_id")
+       :graph-id (aget row "graph_id")
+       :token-prefix (aget row "token_prefix")
+       :permission (aget row "permission")
+       :created-at (aget row "created_at")
+       :expires-at (aget row "expires_at")})))
 
 (defn <index-upsert!
   ([db graph-id graph-name user-id schema-version graph-e2ee?]
@@ -394,6 +517,7 @@
 
 (defn <graph-delete-metadata! [db graph-id]
   (p/do!
+   (common/<d1-run db "delete from personal_access_tokens where graph_id = ?" graph-id)
    (common/<d1-run db "delete from graph_aes_keys where graph_id = ?" graph-id)
    (common/<d1-run db "delete from graph_members where graph_id = ?" graph-id)))
 
@@ -404,11 +528,11 @@
   [db graph-name user-id]
   (when (and (string? graph-name) (string? user-id))
     (p/let [result (common/<d1-all db
-                                   "select graph_id from graphs where graph_name = ? and user_id = ?"
+                                   "select graph_id,user_id from graphs where graph_name = ? and user_id = ?"
                                    graph-name
                                    user-id)
             rows (common/get-sql-rows result)]
-      (boolean (seq rows)))))
+      (boolean (seq (filter normal-graph-row? rows))))))
 
 (defn <user-upsert! [db claims]
   (let [user-id (aget claims "sub")]
@@ -621,6 +745,22 @@
               (some? (aget row "profile_revision")) (merge (profile-row->metadata row))))
           rows)))
 
+(defn <graph-member-public-keys
+  "RSA public keys of every graph member that has uploaded a user key pair."
+  [db graph-id]
+  (when (string? graph-id)
+    (p/let [result (common/<d1-all db
+                                  (str "select k.user_id, k.public_key "
+                                       "from graph_members m "
+                                       "join user_rsa_keys k on k.user_id = m.user_id "
+                                       "where m.graph_id = ?")
+                                  graph-id)
+            rows (common/get-sql-rows result)]
+      (mapv (fn [row]
+              {:user-id (aget row "user_id")
+               :public-key (aget row "public_key")})
+            rows))))
+
 (defn <graph-member-update-role! [db graph-id user-id role]
   (common/<d1-run db
                   (str "update graph_members set role = ? "
@@ -649,23 +789,26 @@
 (defn <user-has-access-to-graph? [db graph-id user-id]
   (when (and (string? graph-id) (string? user-id))
     (p/let [result (common/<d1-all db
-                                   (str "select graph_id from graphs where graph_id = ? and user_id = ? "
-                                        "union select graph_id from graph_members where graph_id = ? and user_id = ?")
+                                   (str "select graph_id,user_id from graphs where graph_id = ? and user_id = ? "
+                                        "union select g.graph_id,g.user_id from graph_members m join graphs g on g.graph_id=m.graph_id "
+                                        "where m.graph_id = ? and m.user_id = ?")
                                    graph-id
                                    user-id
                                    graph-id
                                    user-id)
             rows (common/get-sql-rows result)]
-      (boolean (seq rows)))))
+      (boolean (some (fn [row]
+                       (or (normal-graph-row? row) (= user-id (aget row "user_id")))) rows)))))
 
 (defn <user-is-manager? [db graph-id user-id]
   (when (and (string? graph-id) (string? user-id))
     (p/let [result (common/<d1-all db
-                                   (str "select graph_id from graphs where graph_id = ? and user_id = ? "
-                                        "union select graph_id from graph_members where graph_id = ? and user_id = ? and role = 'manager'")
+                                   (str "select graph_id,user_id from graphs where graph_id = ? and user_id = ? "
+                                        "union select g.graph_id,g.user_id from graph_members m join graphs g on g.graph_id=m.graph_id "
+                                        "where m.graph_id = ? and m.user_id = ? and m.role = 'manager'")
                                    graph-id
                                    user-id
                                    graph-id
                                    user-id)
             rows (common/get-sql-rows result)]
-      (boolean (seq rows)))))
+      (boolean (seq (filter normal-graph-row? rows))))))

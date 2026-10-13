@@ -33,6 +33,7 @@
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
             [frontend.handler.user-profile :as user-profile]
+            [frontend.handler.user-navigation :as user-navigation]
             [frontend.common.idb :as idb]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.core :as instrument]
@@ -56,6 +57,7 @@
   [repo]
   (when repo
     (-> (p/let [_ (db-restore/restore-graph! repo)
+                _ (repo-handler/<restore-date-formatter! repo)
                 _ (graph-handler/<upsert-current-graph-registry!)]
           (graph-handler/remember-current-graph-id-in-tab!)
           (repo-config-handler/start {:repo repo}))
@@ -163,6 +165,7 @@
 
       (events/run!)
       (user-profile/start!)
+      (user-navigation/start!)
       ;; Cached tokens publish the login continuation synchronously, so the
       ;; event consumer must exist before restoring them.
       (user-handler/restore-tokens-from-localstorage)

@@ -369,9 +369,10 @@
      {:class "favorites"
       :count (count favorite-entities)
       :edit-fn
-      (fn [e]
-        (rfe/push-state :page {:name "Favorites"})
-        (util/stop e))}
+      (when-not (rfx/use-sub [:user-navigation/snapshot])
+        (fn [e]
+          (rfe/push-state :page {:name "Favorites"})
+          (util/stop e)))}
      (when (seq favorite-entities)
        (let [favorite-items (map
                              (fn [e]

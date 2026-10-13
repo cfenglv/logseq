@@ -16,6 +16,7 @@
             [frontend.util :as util]
             [frontend.util.cursor :as cursor]
             [frontend.util.entity :as entity]
+            [frontend.util.typography :as typography]
             [goog.dom :as gdom]
             [goog.object :as gobj]
             [logseq.common.config :as common-config]
@@ -32,6 +33,12 @@
 (defonce *db-worker-client-id (atom (storage/get :db-worker-client-id)))
 (defonce *editor-info (atom nil))
 (defonce app-ready-promise (p/deferred))
+
+(defn- load-editor-font! []
+  (let [stored (storage/get :ui/editor-font)
+        current (typography/normalize stored)]
+    (when (not= stored current) (storage/set :ui/editor-font current))
+    current))
 
 (def ^:private supported-locale-tags
   (into {}
@@ -155,7 +162,7 @@
       :ui/custom-theme                       (or (storage/get :ui/custom-theme) {:light {:mode "light"} :dark {:mode "dark"}})
       :ui/wide-mode?                         (storage/get :ui/wide-mode)
       :ui/radix-color                        (storage/get :ui/radix-color)
-      :ui/editor-font                        (storage/get :ui/editor-font)
+      :ui/editor-font                        (load-editor-font!)
 
       ;; ui/collapsed-blocks is to separate the collapse/expand state from db for:
       ;; 1. right sidebar
@@ -327,6 +334,8 @@
       :auth/oauth-client-id                  nil
       :auth/current-login-user               nil
       :user-profile/state                    {:context nil :repo nil :profiles {} :avatars {}}
+      :user-navigation/snapshot              nil
+      :user-navigation/source-identity       nil
 
       ;; graph-uuid -> ...
       :rtc/state                             {}
@@ -2076,9 +2085,8 @@ should be done through this fn in order to get global config and config defaults
   (swap-state! assoc :ui/radix-color color)
   (storage/set :ui/radix-color color))
 
-(defn set-editor-font! [config]
-  (let [config' (:ui/editor-font (rfx/snapshot))
-        config (if (map? config') (merge config' config) {})]
+(defn set-editor-font! [region field value]
+  (let [config (typography/set-value (:ui/editor-font (rfx/snapshot)) region field value)]
     (swap-state! assoc :ui/editor-font config)
     (storage/set :ui/editor-font config)))
 

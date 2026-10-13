@@ -11,6 +11,7 @@
             [frontend.state :as state]
             [frontend.ui :as ui]
             [frontend.util :as util]
+            [frontend.util.typography :as typography]
             [io.factorhouse.hsx.core :as hsx]
             [logseq.shui.hooks :as hooks]
             [logseq.shui.ui :as shui]))
@@ -67,10 +68,7 @@
 
     (hooks/use-effect!
      (fn []
-       (when-let [{:keys [type global]} editor-font]
-         (doto js/document.documentElement
-           (.setAttribute "data-font" (or type "default"))
-           (.setAttribute "data-font-global" (boolean global)))))
+       (typography/apply! js/document editor-font))
      [editor-font])
 
     (hooks/use-effect!

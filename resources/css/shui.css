@@ -346,12 +346,12 @@ div[data-radix-popper-content-wrapper] {
 /* Compact Keys - minimal text-only style */
 .shui-shortcut-compact {
   @apply flex items-start relative;
-  font-family: 'Inter', sans-serif;
+  font-family: var(--ls-interface-font-family, 'Inter'), sans-serif;
   font-weight: normal;
   line-height: 16px;
   font-style: normal;
   color: var(--lx-gray-12, var(--rx-gray-12));
-  font-size: 12px;
+  font-size: calc(var(--ls-interface-font-size, 16px) * 0.75);
   text-align: center;
   letter-spacing: -0.5px;
   white-space: nowrap;
@@ -362,9 +362,9 @@ div[data-radix-popper-content-wrapper] {
 kbd.shui-shortcut-key,
 .shui-shortcut-key {
   @apply text-xs font-normal h-5 flex items-center justify-center;
-  font-family: 'Inter', sans-serif;
+  font-family: var(--ls-interface-font-family, 'Inter'), sans-serif;
   color: var(--lx-gray-12, var(--rx-gray-12));
-  font-size: 12px;
+  font-size: calc(var(--ls-interface-font-size, 16px) * 0.75);
   text-align: center;
   letter-spacing: -0.5px;
   padding: 2px 4px;

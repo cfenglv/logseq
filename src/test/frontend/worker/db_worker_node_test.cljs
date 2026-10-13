@@ -10,8 +10,12 @@
             [frontend.worker.db-core :as db-core]
             [frontend.worker.db-worker-node :as db-worker-node]
             [frontend.worker.platform.node :as platform-node]
+            [frontend.worker.platform :as platform]
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync :as sync]
+            [frontend.worker.sync.util :as sync-util]
+            [frontend.worker.sync.upload :as sync-upload]
             [goog.object :as gobj]
             [logseq.cli.root-dir :as cli-root]
             [logseq.cli.server :as cli-server]
@@ -21,8 +25,10 @@
             [logseq.common.graph :as common-graph]
             [logseq.common.graph-dir :as graph-dir]
             [logseq.common.path :as path]
+            [logseq.common.user-navigation :as navigation]
             [logseq.common.version :as build-version]
             [logseq.db :as ldb]
+            [logseq.db-sync.checksum :as checksum]
             [logseq.outliner.recycle :as recycle]
             [logseq.db-worker.log :as db-worker-log]
             [logseq.db-worker.server-list :as server-list]
@@ -168,6 +174,149 @@
   (p/let [root (cli-root/ensure-root-dir! (:root-dir opts))
           _ (lifecycle/createGraph (lifecycle/resolveStorage root (node-path/join root "graphs")) (:repo opts))]
     (db-worker-node/start-daemon! (update opts :log-level #(or % "error")))))
+
+(deftest private-navigation-kv-journal-survives-native-reopen-test
+  (async done
+    (let [data-dir (node-helper/create-tmp-dir "private-navigation")
+          repo (str "logseq_db_user-navigation-" (random-uuid))
+          scope "11111111-1111-4111-8111-111111111111"
+          x "22222222-2222-4222-8222-222222222222"
+          y "33333333-3333-4333-8333-333333333333"
+          config {:user-id "synthetic-user" :http-base "https://sync.example.test" :ws-url "wss://sync.example.test/sync/%s"}
+          opts {:root-dir data-dir :repo repo :create-empty-db? true}
+          open-opts {:sync-download-graph? true :datoms [] :user-navigation/context config}
+          daemon (atom nil)
+          previous-context @worker-state/*user-navigation-context]
+      (reset! worker-state/*user-navigation-context nil)
+      (-> (p/let [first-daemon (start-daemon! opts)
+                  _ (reset! daemon first-daemon)
+                  {host :host port :port} first-daemon
+                  _ (invoke host port "thread-api/create-or-open-db" [repo open-opts])
+                  configured (invoke host port "thread-api/configure-user-navigation" [repo config])
+                  _ (invoke host port "thread-api/user-navigation-add-scope"
+                            [repo {:scope scope :favorites-seed [x] :recents-seed []
+                                   :values {(navigation/ident :favorite scope y) {:selected? true :membership-id y :added-at 100}
+                                            (navigation/ident :visits scope (:device-id configured)) [[x 10]]}}])
+                  _ (invoke host port "thread-api/user-navigation-set-favorite" [repo scope y true])
+                  _ (invoke host port "thread-api/user-navigation-set-favorite" [repo scope x false])
+                  before (invoke host port "thread-api/user-navigation-visit" [repo scope y])
+                  pending (client-op/get-pending-local-tx-count repo)
+                  _ (is (= [y] (:favorites before)))
+                  _ (is (= [y x] (:recents before)) "A first new visit retains the frozen actual visits before the first pull.")
+                  _ (is (= y (:membership-id (:kv/value (d/entity @(worker-state/get-datascript-conn repo)
+                                                                 (navigation/ident :favorite scope y)))))
+                        "A continuous selection retains its frozen membership stamp.")
+                  _ (is (= 3 pending) "Each action uses the original client_ops journal.")
+                  _ (is (= 0 (client-op/get-local-tx repo)))
+                  _ (is (empty? (d/datoms @(worker-state/get-datascript-conn repo) :avet :block/uuid)))
+                  _ (let [original-platform (platform/current)
+                          token (str "header." (js/btoa (js/JSON.stringify #js {:sub "synthetic-user"})) ".signature")]
+                      (platform/set-platform! (assoc-in original-platform [:websocket :connect]
+                                                       (fn [_] #js {:readyState 0 :close (fn [])})))
+                      (-> (p/with-redefs [sync/<resolve-ws-token (constantly (p/resolved token))
+                                          sync-util/fetch-json (fn [& _] (p/resolved {:graph-id (navigation/graph-id "synthetic-user") :scopes []}))]
+                            (p/do! (sync/start! repo)
+                                   (is (contains? @(:candidates @worker-state/*user-navigation-context) scope)
+                                       "Init HTTP success is not a locally committed pull.")
+                                   (is (= pending (client-op/get-pending-local-tx-count repo)))
+                                   (sync/stop!)))
+                          (p/finally #(platform/set-platform! original-platform))))
+                  _ (d/transact! (worker-state/get-datascript-conn repo)
+                                 [{:db/ident (navigation/ident :favorites-seed scope nil) :kv/value [x]}
+                                  {:db/ident (navigation/ident :recents-seed scope (:device-id configured)) :kv/value []}]
+                                 {:rtc-tx? true})
+                  _ (is (not (contains? @(:candidates @worker-state/*user-navigation-context) scope))
+                        "The actual original post-commit listener retires only pulled seeds.")
+                  _ ((:stop! first-daemon))
+                  _ (reset! daemon nil)
+                  _ (reset! worker-state/*user-navigation-context nil)
+                  reopened (start-daemon! opts)
+                  _ (reset! daemon reopened)
+                  {host :host port :port} reopened
+                  _ (invoke host port "thread-api/create-or-open-db" [repo open-opts])
+                  configured-again (invoke host port "thread-api/configure-user-navigation" [repo config])
+                  after (invoke host port "thread-api/user-navigation-snapshot" [repo scope])]
+            (is (= (:device-id configured) (:device-id configured-again)))
+            (is (= (select-keys before [:favorites :recents]) (select-keys after [:favorites :recents])))
+            (is (= pending (client-op/get-pending-local-tx-count repo)))
+            (is (= 0 (client-op/get-local-tx repo)))
+            (is (= (navigation/graph-id "synthetic-user") (client-op/get-graph-uuid repo)))
+            (is (empty? (d/datoms @(worker-state/get-datascript-conn repo) :avet :block/uuid))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn []
+                       (-> (if-let [stop! (:stop! @daemon)] (stop!) (p/resolved nil))
+                           (p/finally (fn []
+                                        (reset! worker-state/*user-navigation-context previous-context)
+                                        (.rmSync fs data-dir #js {:recursive true})
+                                        (done))))))))))
+
+(deftest navigation-source-account-binding-and-local-rtc-reopen-test
+  (async done
+    (let [data-dir (node-helper/create-tmp-dir "navigation-source")
+          repo (str "logseq_db_nav-source-" (random-uuid))
+          service "https://sync.example.test"
+          x (random-uuid)
+          y (random-uuid)
+          remote (random-uuid)
+          daemon (atom nil)
+          opts {:root-dir data-dir :repo repo}]
+      (-> (p/let [first-daemon (start-daemon! opts)
+                  _ (reset! daemon first-daemon)
+                  {host :host port :port} first-daemon
+                  _ (invoke host port "thread-api/create-or-open-db" [repo {}])
+                  conn (worker-state/get-datascript-conn repo)
+                  favorites-page (ldb/get-page @conn common-config/favorites-page-name)
+                  _ (d/transact! conn [{:db/id -1 :block/uuid x :block/title "Old page" :block/name "old page" :block/tags :logseq.class/Page}
+                                       {:block/uuid y :block/title "New page" :block/name "new page" :block/tags :logseq.class/Page}
+                                       {:block/uuid (random-uuid) :block/title "" :block/link -1
+                                        :block/parent (:db/id favorites-page) :block/page (:db/id favorites-page) :block/order "a0"}])
+                  x-id (:db/id (d/entity @conn [:block/uuid x]))
+                  legacy [x-id]
+                  anonymous (invoke host port "thread-api/user-navigation-source" [repo service nil legacy])
+                  a (invoke host port "thread-api/user-navigation-source" [repo service "account-a" legacy])
+                  b (invoke host port "thread-api/user-navigation-source" [repo service "account-b" legacy])
+                  _ (is (= [(str x)] (get-in anonymous [:snapshot :recents]) (get-in a [:snapshot :recents])))
+                  _ (is (empty? (get-in b [:snapshot :recents])))
+                  _ (is (= [(str x)] (get-in a [:snapshot :favorites]) (get-in b [:snapshot :favorites])))
+                  before-t (client-op/get-local-tx repo)
+                  before-pending (client-op/get-pending-local-tx-count repo)
+                  before-datoms (vec (d/datoms @conn :eavt))
+                  before-checksum (checksum/recompute-checksum @conn)
+                  before-export (invoke host port "thread-api/export-edn" [repo {:export-type :graph}])
+                  _ (is (not (contains? before-export :export-edn-error)))
+                  _ (invoke host port "thread-api/user-navigation-local" [repo service "account-a" legacy :favorite [(str x) false]])
+                  _ (invoke host port "thread-api/user-navigation-local" [repo service "account-a" legacy :favorite [(str y) true]])
+                  changed (invoke host port "thread-api/user-navigation-local" [repo service "account-a" legacy :visit [(str y)]])
+                  _ (is (= [(str y)] (:favorites changed)))
+                  _ (is (= [(str y) (str x)] (:recents changed)))
+                  _ (is (= before-t (client-op/get-local-tx repo)))
+                  _ (is (= before-pending (client-op/get-pending-local-tx-count repo)) "Personal local values do not change notes RTC journal.")
+                  _ (is (= before-datoms (vec (d/datoms @conn :eavt))))
+                  _ (is (= before-checksum (checksum/recompute-checksum @conn)))
+                  after-export (invoke host port "thread-api/export-edn" [repo {:export-type :graph}])
+                  _ (is (not (contains? after-export :export-edn-error)))
+                  _ (is (= before-export after-export) "Personal navigation does not change note body exports.")
+                  _ (#'sync-upload/persist-upload-graph-identity! repo (str remote) false)
+                  before (invoke host port "thread-api/user-navigation-source" [repo service "account-a" legacy])
+                  _ (is (= (str remote) (:remote-scope before)) "Switch at the existing early persisted upload identity, not snapshot completion.")
+                  _ ((:stop! first-daemon))
+                  _ (reset! daemon nil)
+                  reopened (start-daemon! opts)
+                  _ (reset! daemon reopened)
+                  {host :host port :port} reopened
+                  _ (invoke host port "thread-api/create-or-open-db" [repo {}])
+                  after (invoke host port "thread-api/user-navigation-source" [repo service "account-a" legacy])
+                  target-device (str (random-uuid))
+                  values (navigation/transfer-values (get-in after [:domain :values]) (str remote) target-device)]
+            (is (= before after))
+            (is (= {:selected? false} (get values (navigation/ident :favorite (str remote) (str x)))))
+            (is (= [(str y)] (navigation/favorites values (str remote))))
+            (is (= [(str y) (str x)] (navigation/recents values (str remote))))
+            (is (= [(str y)] (mapv first (get values (navigation/ident :visits (str remote) target-device))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn []
+                       (-> (if-let [stop! (:stop! @daemon)] (stop!) (p/resolved nil))
+                           (p/finally (fn [] (.rmSync fs data-dir #js {:recursive true}) (done))))))))))
 
 (defn- semantic-search-integration-enabled?
   []

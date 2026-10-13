@@ -291,6 +291,16 @@
     (p/rejected (ex-info "repo is required" {:code :missing-repo}))
     (db-worker/release-runtime! (canonical-repo repo) (.-id window))))
 
+(defmethod handle :user-navigation-db-runtime [^js window [_ {:keys [service user-id] :as context}]]
+  (if-not (and (= #{:service :user-id} (set (keys context)))
+               (every? #(and (string? %) (not (string/blank? %))) [service user-id]))
+    (p/rejected (ex-info "Invalid private navigation context" {:code :navigation-invalid-context}))
+    (p/let [runtime (db-worker/ensure-navigation-runtime! db-worker/manager (.-id window) service user-id)]
+      (select-keys runtime [:repo :root-dir :generation :base-url :auth-token :owned?]))))
+
+(defmethod handle :release-user-navigation-runtime [^js window [_ repo]]
+  (db-worker/release-navigation-runtime! db-worker/manager (.-id window) (canonical-repo repo)))
+
 (defmethod handle :db-export [window [_ repo force-backup?]]
   (when-let [repo (canonical-repo repo)]
     (db/ensure-graph-dir! repo)

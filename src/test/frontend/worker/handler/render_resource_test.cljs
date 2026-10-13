@@ -13,6 +13,7 @@
             [frontend.worker.state :as worker-state]
             [logseq.common.config :as common-config]
             [logseq.common.util :as common-util]
+            [logseq.common.user-navigation :as navigation]
             [logseq.db :as ldb]
             [logseq.db.common.reference :as db-reference]
             [logseq.db.common.view :as db-view]
@@ -796,6 +797,34 @@
              (:groups response)))
       (is (= {:value canonical-page} (get-in response [:slots block-key])))
       (is (= response (-> response ldb/write-transit-str ldb/read-transit-str))))))
+
+(deftest personal-navigation-resources-watch-hidden-missing-and-ancestor-targets-test
+  (let [conn (db-test/create-conn)
+        parent (random-uuid)
+        child (random-uuid)
+        missing (random-uuid)
+        scope (str (random-uuid))
+        snapshot {:scope scope :token ["test-runtime" 1] :favorites [(str child) (str missing)] :recents [(str parent)]}
+        favorites-key (navigation/resource-key snapshot [:favorites])
+        _ (d/transact! conn [{:db/id -1 :block/uuid parent :block/title "Parent" :block/name "parent"
+                             :block/tags :logseq.class/Page :logseq.property/deleted-at 100}
+                            {:block/uuid child :block/title "Child" :block/parent -1 :block/page -1}])
+        hidden (render-one-resource @conn favorites-key)]
+    (is (= 4 (count favorites-key)))
+    (is (empty? (:value hidden)))
+    (is (= #{[:entity child] [:entity parent] [:entity missing]} (:watch-keys hidden)))
+    (d/transact! conn [[:db/retract [:block/uuid parent] :logseq.property/deleted-at 100]])
+    (let [shown (render-one-resource @conn favorites-key)
+          status-key (navigation/resource-key snapshot [:favorite-status child])
+          recent-key (navigation/resource-key snapshot [:recent-pages []])]
+      (is (= [child] (mapv :block/uuid (:value shown))))
+      (is (= 5 (count status-key)))
+      (is (true? (:value (render-one-resource @conn status-key))))
+      (is (= [parent] (mapv :block/uuid (:value (render-one-resource @conn recent-key))))))
+    (d/transact! conn [{:block/uuid missing :block/title "Arrived" :block/name "arrived" :block/tags :logseq.class/Page}])
+    (is (= [child missing] (mapv :block/uuid (:value (render-one-resource @conn favorites-key)))))
+    (is (= [:favorites] (navigation/resource-key nil [:favorites])))
+    (is (nil? (navigation/resource-key {:loading? true} [:favorites])))))
 
 (deftest sidebar-page-resources-track-favorites-status-and-recent-page-content-test
   (when-let [api (render-resource-api)]
@@ -1617,6 +1646,23 @@
                                     false
                                     response))))))
 
+(deftest block-unlinked-ref-exists-resource-ignores-own-page-mentions-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn page view-row]} (render-resource-fixture)
+          page-id (entity-id @conn page)
+          row-id (entity-id @conn view-row)
+          resource-key [:block-unlinked-ref-exists page]
+          _ (d/transact! conn [[:db/add page-id :block/title "Reference target"]
+                               [:db/add row-id :block/title "Mentions reference target"]
+                               [:db/add row-id :block/page page-id]])]
+      (with-redefs [search-handler/search-blocks
+                    (fn [_repo _query _opts] [{:db/id row-id}])]
+        (let [response (call-resource-with-runtime api conn resource-key {:repo test-repo})]
+          (assert-resource-envelope @conn resource-key
+                                    #{}
+                                    false
+                                    response))))))
+
 (deftest block-comment-threads-resource-returns-only-ordered-thread-uuids-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn resource-block comment-thread]} (render-resource-fixture)
@@ -2189,6 +2235,31 @@
       (is (not-any? #(contains? (:slots (call-resource api conn offset-key)) [:block %])
                     offset-rows)))))
 
+(deftest all-pages-snapshot-skips-named-entities-without-uuid-test
+  (let [api (get @thread-api/*thread-apis :thread-api/get-render-snapshots)]
+    (if-not api
+      (is false "Missing thread API: get-render-snapshots")
+      (let [{:keys [conn page]} (render-resource-fixture)
+            view-uuid (add-view! conn :all-pages)
+            resource-key [:view-data view-uuid
+                          {:feature-type :all-pages
+                           :sorting [{:id :block/updated-at :asc? false}]}]
+            request {:blocks []
+                     :children []
+                     :resources [resource-key]}
+            snapshot (fn []
+                       (with-redefs [worker-state/get-datascript-conn (constantly conn)]
+                         (api test-repo request)))
+            before (get-in (snapshot) [:slots [:resource resource-key] :value :rows])
+            _ (d/transact! conn [{:block/name "external url"
+                                  :block/title "External URL"}])
+            after (get-in (snapshot) [:slots [:resource resource-key] :value :rows])]
+        (is (seq before))
+        (is (contains? (set before) page))
+        (is (every? uuid? before))
+        (is (= before after)
+            "A leftover :block/name entity without :block/uuid must not fail All Pages.")))))
+
 (deftest opaque-query-resource-declares-watch-all-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn view-row]} (render-resource-fixture)
@@ -2296,6 +2367,24 @@
         (is (not-any? map?
                       (mapcat :rows (:partitions group)))
             "Nested view rows cross the boundary only as UUIDs.")))))
+
+(deftest unlinked-reference-gate-excludes-links-to-page-alias-test
+  (let [conn (db-test/create-conn)
+        topic (random-uuid)
+        alias (random-uuid)
+        outside (random-uuid)
+        candidate (random-uuid)]
+    (d/transact! conn [{:db/id -1 :block/uuid topic :block/title "Topic" :block/name "topic"
+                       :block/alias [-2]}
+                      {:db/id -2 :block/uuid alias :block/title "Alias" :block/name "alias"}
+                      {:db/id -3 :block/uuid outside :block/title "Outside" :block/name "outside"}
+                      {:block/uuid candidate :block/title "Topic is already linked via Alias"
+                       :block/page -3 :block/refs [-2]}])
+    (let [db @conn
+          topic-id (:db/id (d/entity db [:block/uuid topic]))
+          candidate-id (:db/id (d/entity db [:block/uuid candidate]))]
+      (with-redefs [search-handler/search-blocks (fn [& _] [{:db/id candidate-id}])]
+        (is (false? (block-handler/unlinked-reference-exists? db "synthetic" topic-id)))))))
 
 (deftest unlinked-references-resource-normalizes-list-partitions-test
   (when-let [api (render-resource-api)]

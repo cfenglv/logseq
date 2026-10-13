@@ -3255,6 +3255,44 @@
       (is (false? (#'editor/block-eligible-for-move-up-down? comments-area focused-root-block)))
       (is (false? (#'editor/block-eligible-for-move-up-down? comment-block focused-root-block))))))
 
+(deftest queued-move-does-not-write-after-switching-graph-test
+  (async done
+         (let [context (atom ["graph-a" "/page-a"])
+               started (p/deferred)
+               read-result (p/deferred)
+               reads (atom [])
+               writes (atom [])
+               block {:db/id 10 :block/uuid (random-uuid) :block/title "Move me"}]
+           (-> (p/with-redefs [state/get-current-repo #(first @context)
+                             state/get-current-page #(second @context)
+                             state/get-route-match #(hash-map :path (second @context))
+                             state/get-edit-block (constantly nil)
+                             state/get-selection-block-ids (constantly [(:block/uuid block)])
+                             state/get-selection-direction (constantly :down)
+                             state/get-unsorted-selection-blocks (constantly [])
+                             state/pub-event! (constantly nil)
+                             util/stop (constantly nil)
+                             util/get-first-block-by-id (constantly nil)
+                             util/get-blocks-by-id (constantly [])
+                             block-handler/get-top-level-blocks identity
+                             db-async/<get-blocks (fn [repo _ _]
+                                                   (swap! reads conj repo)
+                                                   (if (= "graph-a" repo)
+                                                     (do (p/resolve! started true) read-result)
+                                                     (p/resolved [{:block block}])))
+                             frontend-outliner-op/move-blocks-up-down! (fn [& _] (swap! writes conj @context))
+                             db-transact/apply-outliner-ops (fn [& _] (p/resolved nil))]
+                 (let [first-move ((editor/move-up-down true) nil)
+                       second-move ((editor/move-up-down true) nil)]
+                   (p/let [_ started
+                         _ (reset! context ["graph-b" "/page-b"])
+                         _ (p/resolve! read-result [{:block block}])
+                         _ (p/all [first-move second-move])]
+                   (is (empty? @writes) "Neither delayed nor queued work may write the new graph.")
+                     (is (= ["graph-a"] @reads) "Queued work retains its original graph/page owner."))))
+               (p/catch #(is false (str %)))
+               (p/finally done)))))
+
 (deftest navigable-sibling-block-skips-comment-items-test
   (let [current-node (js-obj "id" "current")
         comment-node (js-obj "id" "comment"
@@ -3465,3 +3503,27 @@
     (is (not (editor/db-collapsable?
               {:block/title "hello"
                :logseq.property/created-from-property {:db/ident :user.property/p1}})))))
+
+(deftest moved-rows-are-found-in-the-view-they-were-selected-in-test
+  ;; a block can be drawn twice (an embed above it, the sidebar): the moved
+  ;; row is the one in the container the block was selected in
+  (let [container-of {"embed-row" 7 "page-row" 3 "old-row" 3}]
+    (with-redefs [util/rec-get-node (fn [node _class] node)
+                  editor/get-node-container-id (fn [node] (container-of node))
+                  dom/attr (fn [node _attr] (when (= node "old-row") "b"))]
+      (let [container-ids (#'editor/row-container-ids ["old-row"])]
+        (is (= {"b" 3} container-ids))
+        (is (= "page-row" (#'editor/row-in-container "b" ["embed-row" "page-row"] container-ids))
+            "not the embed's copy drawn first")
+        (is (= "embed-row" (#'editor/row-in-container "c" ["embed-row" "page-row"] container-ids))
+            "a block with no known container takes its first row")))))
+
+(deftest moved-rows-are-reselected-only-if-the-selection-is-unchanged-test
+  (let [before [:b-row :c-row]]
+    (is (true? (#'editor/reselect-moved-rows? ["b" "c"] [:b2 :c2] before before)))
+    (is (false? (#'editor/reselect-moved-rows? ["b" "c"] [:b2 :c2] before [:d-row]))
+        "a click on d during the move keeps d selected")
+    (is (false? (#'editor/reselect-moved-rows? ["b" "c"] [:b2 :c2] before nil))
+        "Escape during the move keeps nothing selected")
+    (is (false? (#'editor/reselect-moved-rows? ["b" "c"] [:b2] before before))
+        "a row not drawn yet: no partial selection")))

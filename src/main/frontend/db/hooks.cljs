@@ -2,7 +2,9 @@
   "Hooks for DB-backed React integration."
   (:require ["react" :as react]
             [frontend.db.subs :as subs]
-            [frontend.state :as state]))
+            [frontend.rfx :as rfx]
+            [frontend.state :as state]
+            [logseq.common.user-navigation :as navigation]))
 
 (defn- use-stable-key
   [key]
@@ -152,7 +154,10 @@
 
 (defn use-resource
   [resource-key]
-  (use-external-store subs/subscribe-resource! subs/resource-snapshot resource-key))
+  (let [snapshot (rfx/use-sub [:user-navigation/snapshot])
+        resource-key (navigation/resource-key (when (= (:repo snapshot) (state/get-current-repo)) snapshot) resource-key)]
+    (use-external-store (if resource-key subs/subscribe-resource! subscribe-nothing!)
+                        (if resource-key subs/resource-snapshot nil-snapshot) resource-key)))
 
 (defn use-block-projection-snapshot
   "Status-aware `use-block-projection`. A nil uuid reads as a ready nil value
@@ -164,7 +169,9 @@
 
 (defn use-resource-snapshot
   [resource-key]
-  (let [subscribe! (if resource-key
+  (let [snapshot (rfx/use-sub [:user-navigation/snapshot])
+        resource-key (navigation/resource-key (when (= (:repo snapshot) (state/get-current-repo)) snapshot) resource-key)
+        subscribe! (if resource-key
                      subs/subscribe-resource!
                      subscribe-nothing!)
         snapshot (if resource-key

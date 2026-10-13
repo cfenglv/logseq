@@ -14,6 +14,7 @@
    [frontend.worker.sync.presence :as sync-presence]
    [frontend.worker.sync.transport :as sync-transport]
    [frontend.worker.sync.upload :as sync-upload]
+   [frontend.worker.sync.user-navigation :as navigation-sync]
    [frontend.worker.sync.util :as sync-util]
    [lambdaisland.glogi :as log]
    [logseq.common.util :as common-util]
@@ -253,7 +254,16 @@
    :server-capabilities (atom #{})
    :ws-state (atom :closed)})
 
-(declare connect!)
+(declare connect! <connect-attempt! schedule-reconnect!)
+
+(defn- handle-private-connect-error! [repo client url error]
+  (when (navigation-sync/active-client? client)
+    (sync-util/set-last-sync-error! client error)
+    (if (navigation-sync/retryable-error? error)
+      (schedule-reconnect! repo client url :connect-failed)
+      (shared-service/broadcast-to-clients! :notification
+                                            [nil :warning true "user-navigation-online" 0
+                                             {:i18n-key :sync.navigation/online-error}]))))
 
 (defn- schedule-reconnect!
   [repo client url reason]
@@ -269,12 +279,13 @@
                             (when-let [current @worker-state/*db-sync-client]
                               (when (and (= (:repo current) repo)
                                          (= (:graph-id current) (:graph-id client)))
-                                (-> (p/let [token (<resolve-ws-token)
-                                            updated (connect! repo current url token)]
-                                      (reset! worker-state/*db-sync-client updated))
+                                (-> (<connect-attempt! repo current url)
                                     (p/catch (fn [error]
-                                               (log/error :db-sync/ws-reconnect-failed {:repo repo :error error})
-                                               (schedule-reconnect! repo current url :connect-failed)))))))
+                                               (if (navigation-sync/private-client? current)
+                                                 (handle-private-connect-error! repo current url error)
+                                                 (do
+                                                   (log/error :db-sync/ws-reconnect-failed {:repo repo :error error})
+                                                   (schedule-reconnect! repo current url :connect-failed)))))))))
                           delay)]
           (swap! reconnect assoc :timer timeout-id :attempt (inc attempt))
           (log/info :db-sync/ws-reconnect-scheduled
@@ -385,6 +396,34 @@
       (close-stale-ws-loop updated ws url))))
 
 (declare clear-catch-up-pull-timer!)
+
+(defn- <connect-attempt!
+  [repo client url]
+  (p/let [token (<resolve-ws-token)
+          private? (navigation-sync/private-client? client)
+          _ (when private? (navigation-sync/assert-active! client))
+          _ (when private? (navigation-sync/<initialize! client token))
+          _ (when private? (navigation-sync/assert-active! client))
+          connected (connect! repo client url token)]
+    (reset! worker-state/*db-sync-client connected)
+    connected))
+
+(defn initialize-private-navigation!
+  "A new live scope uses the same init promise; offline recovery owns no new timer."
+  [repo]
+  (when-let [client (current-client repo)]
+    (when (and (navigation-sync/private-client? client) (ws-open? (:ws client)))
+      (-> (p/let [token (<resolve-ws-token)]
+            (navigation-sync/assert-active! client)
+            (navigation-sync/<initialize! client token))
+          (p/catch (fn [error]
+                     (when (navigation-sync/active-client? client)
+                       (detach-ws-handlers! (:ws client))
+                       (.close (:ws client))
+                       (set-ws-state! client :closed)
+                       (clear-inflight! client)
+                       (handle-private-connect-error! repo client
+                                                      (sync-transport/format-ws-url (ws-base-url) (:graph-id client)) error))))))))
 
 (defn stop!
   []
@@ -505,12 +544,21 @@
               (p/let [client (ensure-client-state! repo)
                       url (sync-transport/format-ws-url base graph-id)
                       _ (ensure-client-graph-uuid! repo graph-id)
-                      connected (assoc client :graph-id graph-id)
-                      token (<resolve-ws-token)
-                      connected (connect! repo connected url token)]
-                (reset! worker-state/*db-sync-client connected)
-                (ensure-catch-up-pull-timer!)
-                (defer-repair-resume! repo)
+                      navigation-context @worker-state/*user-navigation-context
+                      private? (= repo (:repo navigation-context))
+                      connected (cond-> (assoc client :graph-id graph-id)
+                                  private? (assoc :user-navigation/context (:identity navigation-context)))
+                      _ (when private? (reset! worker-state/*db-sync-client connected))
+                      _ (-> (<connect-attempt! repo connected url)
+                            (p/catch (fn [error]
+                                       (if private?
+                                         (handle-private-connect-error! repo connected url error)
+                                         (throw error)))))]
+                (when (or (not private?)
+                          (and (navigation-sync/active-client? connected)
+                               (:ws @worker-state/*db-sync-client)))
+                  (ensure-catch-up-pull-timer!))
+                (when-not private? (defer-repair-resume! repo))
                 nil))
              (p/finally
                (fn []

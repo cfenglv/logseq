@@ -6,7 +6,7 @@
 }
 
 #root {
-  font-size: var(--ls-page-text-size);
+  font-size: var(--ls-interface-font-size, var(--ls-page-text-size));
 }
 
 #app-container {

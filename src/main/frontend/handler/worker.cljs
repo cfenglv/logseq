@@ -86,6 +86,10 @@
   (when-let [client-id (:client-id data)]
     (state/set-db-worker-client-id! client-id)))
 
+(defmethod handle :user-navigation/source-changed [_ _worker {:keys [repo graph-id]}]
+  (when (= repo (state/get-current-repo))
+    (state/set-state! :user-navigation/source-identity [repo graph-id])))
+
 (defmethod handle :capture-error [_ _worker data]
   (state/pub-event! [:capture-error data]))
 
@@ -228,17 +232,21 @@
          (get error-value "message"))))
 
 (defn handle-message!
-  [^js worker wrapped-worker]
+  ([worker wrapped-worker] (handle-message! worker wrapped-worker handle))
+  ([^js worker wrapped-worker dispatch]
   (assert worker "worker doesn't exists")
   (let [handle-worker-failure!
         (fn [event]
-          (when (identical? worker @state/*db-worker-thread)
+          (if (identical? worker @state/*db-worker-thread)
+            (do
             (log/error :db-worker/stopped-unexpectedly {:event event})
             (set! (.-onmessage worker) nil)
             (set! (.-onerror worker) nil)
             (set! (.-onmessageerror worker) nil)
             (reset! state/*db-worker-thread nil)
-            (reset! state/*db-worker nil)))]
+            (reset! state/*db-worker nil))
+            (dispatch :capture-error wrapped-worker
+                      {:error (ex-info "Database worker stopped" {:code :db-worker-unavailable})})))]
     (set! (.-onerror worker) handle-worker-failure!)
     (set! (.-onmessageerror worker) handle-worker-failure!))
   (set! (.-onmessage worker)
@@ -260,6 +268,6 @@
                     (js/console.error "Unexpected webworker error :" data))
                   (if (string? data)
                     (let [[e payload] (ldb/read-transit-str data)]
-                      (handle (keyword e) wrapped-worker payload))
+                      (dispatch (keyword e) wrapped-worker payload))
                     (when-not (string/starts-with? (.-type data) "MP_")
-                      (js/console.error "Worker received invalid data from worker: " data))))))))))
+                      (js/console.error "Worker received invalid data from worker: " data)))))))))))

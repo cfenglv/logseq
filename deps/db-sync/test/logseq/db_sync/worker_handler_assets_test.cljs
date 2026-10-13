@@ -11,6 +11,31 @@
                  (.enqueue controller payload)
                  (.close controller))}))
 
+(deftest upload-finishes-when-bucket-rejects-without-consuming-stream-test
+  (async done
+         (let [controller (atom nil)
+               body (js/ReadableStream.
+                     #js {:start (fn [source]
+                                   (reset! controller source)
+                                   (.enqueue source (.encode (js/TextEncoder.) "eA=="))
+                                   (.close source))})
+               failure (js/Error. "synthetic put rejection")
+               bucket #js {:put (fn [& _] (p/rejected failure))}
+               upload (-> (assets/<put-stream! bucket "synthetic/asset.txt" body
+                                               {:size 1 :asset-type "txt" :encoding "base64"})
+                          (p/then (constantly ::unexpected-success))
+                          (p/catch (fn [error] {:error error})))
+               timer (atom nil)
+               deadline (js/Promise. (fn [resolve]
+                                       (reset! timer (js/setTimeout #(resolve ::unfinished) 100))))]
+           (-> (p/let [result (js/Promise.race #js [upload deadline])]
+                 (js/clearTimeout @timer)
+                 (is (identical? failure (:error result)) "The original put error must reach the caller.")
+                 (when (= ::unfinished result)
+                   (.error @controller (js/Error. "fixture cleanup"))))
+               (p/catch #(is false (str %)))
+               (p/finally done)))))
+
 (defn- put-request-with-size
   [size]
   #js {:url "http://localhost/assets/graph-1/asset-1.bin"

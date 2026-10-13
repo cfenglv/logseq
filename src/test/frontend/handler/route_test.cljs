@@ -17,6 +17,18 @@
 (use-fixtures :each {:before test-helper/start-test-db!
                      :after test-helper/destroy-test-db!})
 
+(deftest route-change-clears-only-detached-selection-test
+  (doseq [[path cleared?] [["/page/other" true] ["/page/current" false]]]
+    (let [cleared (atom false)
+          route {:path path}]
+      (with-redefs [state/get-route-match (constantly {:path "/page/current"})
+                    state/clear-selection! #(reset! cleared true)
+                    state/swap-state! (fn [& _])
+                    route-handler/update-page-title! (fn [_])
+                    route-handler/update-page-label! (fn [_])]
+        (route-handler/set-route-match! route)
+        (is (= cleared? @cleared))))))
+
 (defn- test-db
   []
   (conn/get-db test-helper/test-db))

@@ -8,7 +8,91 @@
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.download :as sync-download]
             [frontend.worker.sync.util :as sync-util]
+            [logseq.common.user-navigation :as navigation]
             [promesa.core :as p]))
+
+(deftest private-first-offline-reuses-reconnect-and-stopped-init-cannot-install-test
+  (async done
+    (let [repo "logseq_db_user-navigation-test"
+          user "synthetic-user"
+          graph-id (navigation/graph-id user)
+          token (str "header." (js/btoa (js/JSON.stringify #js {:sub user})) ".signature")
+          previous-client @worker-state/*db-sync-client
+          previous-config @worker-state/*db-sync-config
+          previous-context @worker-state/*user-navigation-context
+          previous-platform (try (platform/current) (catch :default _ nil))
+          token-stage (atom :offline)
+          init-response (atom nil)
+          initialized (p/deferred)
+          timeouts (atom [])
+          sockets (atom [])
+          notices (atom [])
+          context {:repo repo :user-id user :http-base "https://sync.example.test"
+                   :identity [repo "https://sync.example.test" user graph-id]
+                   :candidates (atom {}) :denied-scopes (atom #{}) :initializing (atom nil)}]
+      (reset! worker-state/*db-sync-client nil)
+      (reset! worker-state/*user-navigation-context context)
+      (reset! worker-state/*db-sync-config {:ws-url "wss://sync.example.test/sync/%s"})
+      (platform/set-platform! {:env {:runtime :node} :storage {} :kv {} :broadcast {} :crypto {} :timers {} :sqlite {}
+                               :websocket {:connect (fn [_]
+                                                      (let [ws #js {:readyState 0 :close (fn [] nil)}]
+                                                        (swap! sockets conj ws) ws))}})
+      (-> (p/with-redefs [worker-state/get-client-ops-conn (constantly true)
+                          client-op/get-local-tx (constantly 0)
+                          client-op/get-pending-local-tx-count (constantly 0)
+                          client-op/get-unpushed-asset-ops-count (constantly 0)
+                          client-op/get-all-asset-ops (constantly [])
+                          client-op/get-local-checksum (constantly nil)
+                          client-op/update-graph-uuid (fn [& _])
+                          sync-util/get-graph-id (constantly graph-id)
+                          sync/<resolve-ws-token (fn []
+                                                  (if (= :offline @token-stage)
+                                                    (do (reset! token-stage :online) (p/rejected (js/Error. "synthetic offline")))
+                                                    (p/resolved token)))
+                          sync-util/fetch-json (fn [& _]
+                                                 (if-let [pending @init-response]
+                                                   (if (= :missing-route pending)
+                                                     (p/rejected (ex-info "synthetic old server" {:status 404}))
+                                                     (do (p/resolve! initialized true) pending))
+                                                   (p/resolved {:graph-id graph-id :scopes []})))
+                          shared-service/broadcast-to-clients! (fn [event payload]
+                                                                 (when (= :notification event) (swap! notices conj payload)))
+                          js/setTimeout (fn [f delay]
+                                          (swap! timeouts conj {:f f :delay delay}) (count @timeouts))
+                          js/clearTimeout (fn [_])]
+            (p/do!
+             (sync/start! repo)
+             (is (some? @worker-state/*db-sync-client) "A private owner exists before a socket exists.")
+             (is (= 1 (count @timeouts)))
+             (is (empty? @sockets))
+             (is (empty? @notices) "Normal offline startup stays quiet.")
+             ((:f (first @timeouts)))
+             (is (= 1 (count @sockets)) "The original reconnect callback runs init and opens the socket.")
+             (sync/stop!)
+             (let [pending-response (p/deferred)]
+               (reset! init-response pending-response)
+               (let [starting (sync/start! repo)]
+                 (p/do!
+                  initialized
+                  (sync/stop!)
+                  (p/resolve! pending-response {:graph-id graph-id :scopes []})
+                  starting
+                  (is (nil? @worker-state/*db-sync-client))
+                  (is (= 1 (count @sockets))))))
+             (reset! init-response :missing-route)
+             (sync/start! repo)
+             (is (= 1 (count @notices)))
+             (is (= :sync.navigation/online-error (:i18n-key (last (first @notices)))))
+             (is (nil? (:timer @(:reconnect @worker-state/*db-sync-client))) "Known missing route is not retried forever.")))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn []
+                       (-> (sync/stop!)
+                           (p/finally (fn []
+                                        (reset! worker-state/*db-sync-client previous-client)
+                                        (reset! worker-state/*db-sync-config previous-config)
+                                        (reset! worker-state/*user-navigation-context previous-context)
+                                        (when previous-platform (platform/set-platform! previous-platform))
+                                        (done))))))))))
 
 (deftest start-releases-caller-fence-before-resumed-repair-commit-test
   (async done

@@ -43,6 +43,7 @@
 
 (defonce *db-sync-config (atom {:ws-url nil}))
 (defonce *db-sync-client (atom nil))
+(defonce *user-navigation-context (atom nil))
 
 (defonce *sqlite (atom nil))
 ;; repo -> {:db conn :search conn :client-ops conn}

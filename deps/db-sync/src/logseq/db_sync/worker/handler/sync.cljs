@@ -13,6 +13,7 @@
             [logseq.db-sync.tx-sanitize :as tx-sanitize]
             [logseq.db-sync.worker.http :as http]
             [logseq.db-sync.worker.handler.semantic :as semantic-handler]
+            [logseq.db-sync.worker.handler.user-navigation :as navigation-handler]
             [logseq.db-sync.worker.routes.semantic :as semantic-routes]
             [logseq.db-sync.worker.routes.sync :as sync-routes]
             [logseq.db-sync.worker.ws :as ws]
@@ -1248,6 +1249,9 @@
 
 (defn handle [{:keys [^js self request url route]}]
   (case (:handler route)
+    :sync/user-navigation-init
+    (navigation-handler/handle-graph self request)
+
     :sync/health
     (http/json-response :sync/health {:ok true})
 

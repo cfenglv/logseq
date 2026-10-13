@@ -223,25 +223,10 @@
       (log/info :db-sync/stop-skipped {:reason :db-worker-not-ready})
       (p/resolved nil))))
 
-(defn- sync-app-state-payload
-  []
-  (let [payload (select-keys (state/get-state) [:git/current-repo :config
-                                                 :auth/id-token :auth/access-token :auth/refresh-token
-                                                 :auth/oauth-token-url :auth/oauth-domain :auth/oauth-client-id
-                                                 :user/info])]
-    (cond-> (if (nil? (:git/current-repo payload))
-              (dissoc payload :git/current-repo)
-              payload)
-      (seq config/OAUTH-DOMAIN)
-      (assoc :auth/oauth-domain config/OAUTH-DOMAIN)
-
-      (seq config/COGNITO-CLIENT-ID)
-      (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID))))
-
 (defn- <sync-auth-state-to-db-worker!
   []
   (p/let [_ (user-handler/<ensure-id&access-token!)
-          payload (sync-app-state-payload)]
+          payload (user-handler/sync-app-state-payload)]
     (state/<invoke-db-worker :thread-api/sync-app-state payload)))
 
 (defn <rtc-start!
@@ -402,6 +387,31 @@
           (p/finally
             (fn []
               (state/set-state! :rtc/loading-graphs? false)))))))
+
+(def ^:private personal-access-tokens-path "/api/v1/personal-access-tokens")
+
+(defn <personal-access-tokens
+  []
+  (p/let [_ (user-handler/<ensure-id&access-token!)]
+    (fetch-json (str (http-base) personal-access-tokens-path)
+                {:method "GET"}
+                {})))
+
+(defn <create-personal-access-token!
+  [request]
+  (p/let [_ (user-handler/<ensure-id&access-token!)]
+    (fetch-json (str (http-base) personal-access-tokens-path)
+                {:method "POST"
+                 :headers {"content-type" "application/json"}
+                 :body (js/JSON.stringify (clj->js request))}
+                {})))
+
+(defn <revoke-personal-access-token!
+  [token-id]
+  (p/let [_ (user-handler/<ensure-id&access-token!)]
+    (fetch-json (str (http-base) personal-access-tokens-path "/" token-id)
+                {:method "DELETE"}
+                {})))
 
 (defn <rtc-invite-email
   [graph-uuid email]

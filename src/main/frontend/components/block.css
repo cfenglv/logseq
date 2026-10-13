@@ -1124,40 +1124,40 @@ html.is-mobile .ls-block-content-indent {
 
 .ls-block h1,
 .editor-inner .h1.uniline-block {
-  font-size: 2rem;
+  font-size: calc(var(--ls-note-font-size, var(--ls-page-text-size)) * 2);
   min-height: 1.5em;
   line-height: 1.38em;
 }
 
 .ls-block h2,
 .editor-inner .h2.uniline-block {
-  font-size: 1.5rem;
+  font-size: calc(var(--ls-note-font-size, var(--ls-page-text-size)) * 1.5);
   min-height: 1.5em;
   line-height: 1.38em;
 }
 
 .ls-block h3,
 .editor-inner .h3.uniline-block {
-  font-size: 1.2rem;
+  font-size: calc(var(--ls-note-font-size, var(--ls-page-text-size)) * 1.2);
   min-height: 1.2em;
   line-height: 1.15em;
 }
 
 .ls-block h4,
 .editor-inner .h4.uniline-block {
-  font-size: 1rem;
+  font-size: var(--ls-note-font-size, var(--ls-page-text-size));
   min-height: 1em;
 }
 
 .ls-block h5,
 .editor-inner .h5.uniline-block {
-  font-size: 0.83rem;
+  font-size: calc(var(--ls-note-font-size, var(--ls-page-text-size)) * 0.83);
   min-height: 0.83em;
 }
 
 .ls-block h6,
 .editor-inner .h6.uniline-block {
-  font-size: 0.75rem;
+  font-size: calc(var(--ls-note-font-size, var(--ls-page-text-size)) * 0.75);
   min-height: 0.75rem;
 }
 

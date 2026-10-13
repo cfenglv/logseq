@@ -17,6 +17,43 @@
    :base-url (str "http://127.0.0.1/" repo)
    :auth-token (str "token-" repo)})
 
+(deftest navigation-lease-keeps-notes-and-other-window-independent-test
+  (async done
+    (let [starts (atom [])
+          stops (atom [])
+          creates (atom [])
+          storage #js {}
+          root (node-path/join (.tmpdir os) "synthetic-navigation-root")
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo opts]
+                                     (swap! starts conj [repo opts])
+                                     (p/resolved (assoc (runtime repo) :root-dir (or (:root-dir opts) root))))
+                    :stop-daemon! (fn [value] (swap! stops conj (:repo value)) (p/resolved true))})]
+      (-> (p/with-redefs [cli-server/resolve-storage (fn [_] storage)
+                          lifecycle/createGraph (fn [actual repo]
+                                                  (is (identical? storage actual))
+                                                  (swap! creates conj repo)
+                                                  (p/resolved "synthetic-generation"))]
+            (p/let [_ (db-worker/ensure-started! manager "notes" 1)
+                  _ (db-worker/ensure-started! manager "notes" 2)
+                  a1 (db-worker/ensure-navigation-runtime! manager 1 "https://sync.example.test" "user-a")
+                  a2 (db-worker/ensure-navigation-runtime! manager 2 "https://sync.example.test" "user-a")
+                  _ (is (= (:repo a1) (:repo a2)))
+                  _ (is (= [(:repo a1) (:repo a1)] @creates) "Use the original idempotent create before starting a private runtime.")
+                  _ (is (= 2 (count @starts)))
+                  _ (is (true? (:create-empty-db? (second (last @starts)))))
+                  _ (is (not= root (:root-dir a1)))
+                  _ (db-worker/ensure-started! manager "other-notes" 1)
+                  _ (is (= "other-notes" (get-in @(:state manager) [:window->repo 1])))
+                  _ (is (= (:repo a1) (str "logseq_db_" (get-in @(:state manager) [:window->repo (db-worker/navigation-lease 1)]))))
+                  _ (db-worker/release-navigation-runtime! manager 1 (:repo a1))
+                  _ (is (not (some #{(:repo a1)} @stops)))
+                  _ (db-worker/stop-all! manager)]
+            (is (some #{(:repo a1)} @stops))
+            (is (empty? (:repos @(:state manager))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
 (deftest prepare-startup-normalizes-before-outdated-worker-retirement
   (async done
     (let [calls (atom [])

@@ -12,6 +12,7 @@
             [frontend.handler.route :as route-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-navigation :as navigation]
             [frontend.modules.outliner.op :as outliner-op]
             [frontend.modules.outliner.ui :as ui-outliner-tx]
             [frontend.state :as state]
@@ -164,21 +165,25 @@
   [page-block-uuid]
   {:pre [(uuid? page-block-uuid)]}
   (when-let [repo (state/get-current-repo)]
-    (state/<invoke-db-worker :thread-api/favorited-page?
-                             repo
-                             page-block-uuid)))
+    (if (navigation/enabled?)
+      (navigation/<favorited? page-block-uuid)
+      (state/<invoke-db-worker :thread-api/favorited-page? repo page-block-uuid))))
 
 (defn <db-favorite-page!
   [page-block-uuid]
   {:pre [(uuid? page-block-uuid)]}
   (when-let [repo (state/get-current-repo)]
-    (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid true)))
+    (if (navigation/enabled?)
+      (navigation/<set-favorite! page-block-uuid true)
+      (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid true))))
 
 (defn <db-unfavorite-page!
   [page-block-uuid]
   {:pre [(uuid? page-block-uuid)]}
   (when-let [repo (state/get-current-repo)]
-    (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid false)))
+    (if (navigation/enabled?)
+      (navigation/<set-favorite! page-block-uuid false)
+      (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid false))))
 
 ;; favorites fns end ================
 
@@ -233,7 +238,8 @@
   (when-let [repo (state/get-current-repo)]
     (p/let [page (state/<invoke-db-worker :thread-api/pull repo [:block/uuid] (page-lookup-ref page-name))]
       (when-let [page-block-uuid (:block/uuid page)]
-        (<db-unfavorite-page! page-block-uuid)))))
+        (p/do! (<db-unfavorite-page! page-block-uuid)
+               (when (navigation/enabled?) (navigation/<remove-recents! [page-block-uuid])))))))
 
 (defn after-page-renamed!
   [repo {:keys [page-id old-name new-name]}]
