@@ -1,0 +1,95 @@
+(ns logseq.common.graph-registry
+  "Graph registry normalization and lookup helpers."
+  (:require [clojure.string :as string]))
+
+(def ^:private db-version-prefix
+  "logseq_db_")
+
+(defn- present-string?
+  [s]
+  (and (string? s) (not (string/blank? s))))
+
+(defn directory-renamed-repo
+  "Match an exact old repo against completed filesystem rename facts, before trim."
+  [renames repo]
+  (some (fn [{:keys [from to]}] (when (= from repo) to)) renames))
+
+(defn directory-renamed-identifier
+  [renames identifier]
+  (when (string? identifier)
+    (directory-renamed-repo
+     renames (if (string/starts-with? identifier db-version-prefix)
+               identifier
+               (str db-version-prefix identifier)))))
+
+(defn apply-directory-renames
+  [registry renames]
+  (mapv (fn [entry]
+          (if-let [repo (directory-renamed-repo renames (:repo entry))]
+            (assoc entry :repo repo :graph-name (subs repo (count db-version-prefix)))
+            entry))
+        registry))
+
+(defn normalize-entry
+  [entry]
+  (let [local-graph-id (:local-graph-id entry)
+        graph-id (or (when (present-string? (:graph-id entry)) (:graph-id entry))
+                     (when (present-string? local-graph-id) local-graph-id))]
+    (when-not graph-id
+      (throw (ex-info "Missing graph identity"
+                      {:entry entry})))
+    (-> entry
+        (assoc :graph-id graph-id)
+        (dissoc :rtc-graph-id)
+        (cond-> (string? (:repo entry)) (update :repo string/trim)
+                (string? (:graph-name entry)) (update :graph-name string/trim)))))
+
+(defn ^:api upsert-entry
+  [registry entry]
+  (let [entry' (normalize-entry entry)]
+    (->> (or registry [])
+         (remove #(or (= (:graph-id entry') (:graph-id %))
+                      (and (present-string? (:repo entry'))
+                           (= (:repo entry') (:repo %)))
+                      (and (present-string? (:local-graph-id entry'))
+                           (= (:local-graph-id entry') (:local-graph-id %)))))
+         (cons entry')
+         vec)))
+
+(defn- normalize-comparable
+  [s]
+  (some-> s str string/trim string/lower-case))
+
+(defn- canonical-repo
+  [s]
+  (when (seq s)
+    (let [trimmed (string/trim (str s))
+          stripped (loop [name' trimmed]
+                     (if (string/starts-with? name' db-version-prefix)
+                       (recur (string/trim (subs name' (count db-version-prefix))))
+                       name'))]
+      (str db-version-prefix stripped))))
+
+(defn- identifier-match?
+  [entry graph-identifier]
+  (let [identifier (normalize-comparable graph-identifier)
+        repo (normalize-comparable (:repo entry))
+        graph-name (normalize-comparable (:graph-name entry))
+        graph-id (normalize-comparable (:graph-id entry))
+        canonical-repo-name (normalize-comparable (canonical-repo graph-identifier))]
+    (or (= identifier repo)
+        (= identifier graph-name)
+        (= identifier graph-id)
+        (= canonical-repo-name repo))))
+
+(defn ^:api resolve-target
+  [registry {:keys [graph-id graph-identifier]}]
+  (cond
+    (present-string? graph-id)
+    (some #(when (= graph-id (:graph-id %)) %) registry)
+
+    (present-string? graph-identifier)
+    (some #(when (identifier-match? % graph-identifier) %) registry)
+
+    :else
+    nil))

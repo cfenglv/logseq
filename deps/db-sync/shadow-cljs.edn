@@ -1,0 +1,62 @@
+;; shadow-cljs configuration
+{:deps true
+ :http {:port 9632}
+ :nrepl {:port 8703}
+ :builds
+ {:db-sync {:target :esm
+            :output-dir "worker/dist/worker"
+            :compiler-options {:source-map true
+                               :warnings {:fn-deprecated false
+                                          :redef false}}
+            :modules {:main {:exports {default logseq.db-sync.worker/worker
+                                       SyncDO logseq.db-sync.worker/SyncDO}}}
+            :js-options {:js-provider :import}
+            :closure-defines {shadow.cljs.devtools.client.env/enabled false
+                              goog.debug.LOGGING_ENABLED true}
+            :devtools {:enabled false}}
+  :db-sync-node {:target :node-script
+                 :output-to "worker/dist/node-adapter.js"
+                 :main logseq.db-sync.node.entry/main
+                 :compiler-options {:source-map true
+                                    :warnings {:fn-deprecated false
+                                               :redef false}}
+                 :devtools {:enabled false}
+                 :closure-defines {goog.debug.LOGGING_ENABLED true}}
+  :db-sync-show-checksum {:target :node-script
+                          :output-to "worker/dist/show-sqlite-checksum.js"
+                          :main logseq.db-sync.node.show-checksum/main
+                          :compiler-options {:source-map true
+                                             :warnings {:fn-deprecated false
+                                                        :redef false}}
+                          :devtools {:enabled false}}
+  :db-sync-find-checksum-drift {:target :node-script
+                                :output-to "worker/dist/find-checksum-drift.js"
+                                :main logseq.db-sync.node.find-checksum-drift/main
+                                :compiler-options {:source-map true
+                                                   :warnings {:fn-deprecated false
+                                                              :redef false}}
+                                :devtools {:enabled false}}
+  :db-sync-recompute-log-checksum {:target :node-script
+                                   :output-to "worker/dist/recompute-log-checksum.js"
+                                   :main logseq.db-sync.node.recompute-log-checksum/main
+                                   :compiler-options {:source-map true
+                                                      :warnings {:fn-deprecated false
+                                                                 :redef false}}
+                                   :devtools {:enabled false}}
+  :db-sync-api-docs {:target :node-script
+                     :output-to "worker/dist/api-docs-spec.js"
+                     :main logseq.db-sync.node.api-docs/main
+                     :compiler-options {:warnings {:fn-deprecated false
+                                                  :redef false}}
+                     :devtools {:enabled false}}
+  :db-sync-test {:target :node-test
+                 :output-to "worker/dist/worker-test.js"
+                 :devtools {:enabled false}
+                 :main logseq.db-sync.test-runner/main}
+  :db-sync-large-op-memory-test {:target :node-script
+                                 :output-to "worker/dist/large-op-memory-test.js"
+                                 :main logseq.db-sync.worker-large-op-memory-test/main
+                                 :compiler-options {:source-map true
+                                                    :warnings {:fn-deprecated false
+                                                               :redef false}}
+                                 :devtools {:enabled false}}}}

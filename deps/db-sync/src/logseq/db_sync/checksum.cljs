@@ -1,0 +1,503 @@
+(ns logseq.db-sync.checksum
+  (:require [clojure.set :as set]
+            [datascript.core :as d]
+            [logseq.db :as ldb]
+            [promesa.core :as p]))
+
+(def ^:private fnv-offset 2166136261)
+(def ^:private djb-offset 5381)
+(def ^:private field-separator 31)
+(def ^:private recompute-yield-entity-count 256)
+(def ^:private large-title-byte-limit 4096)
+(def ^:private large-title-object-attr :logseq.property.sync/large-title-object)
+(def ^:private text-encoder (js/TextEncoder.))
+
+(defn- fnv-step
+  [h code]
+  (bit-or (js/Math.imul (bit-xor h code) 16777619) 0))
+
+(defn- djb-step
+  [h code]
+  (bit-or (+ (js/Math.imul h 33) code) 0))
+
+(defn- add-step
+  [acc value]
+  (bit-or (+ acc value) 0))
+
+(defn- sub-step
+  [acc value]
+  (bit-or (- acc value) 0))
+
+(defn- hash-code
+  [[fnv djb] code]
+  [(fnv-step fnv code)
+   (djb-step djb code)])
+
+(defn- digest-string
+  "Folds the char codes of value into state, as hash-code per char does,
+  with the 2 hashes kept in loop locals: a [fnv djb] vector per char made
+  hashing a large part of a full recompute."
+  [[fnv djb] value]
+  (let [value (or value "")
+        n (.-length value)]
+    (loop [idx 0
+           fnv fnv
+           djb djb]
+      (if (< idx n)
+        (let [code (.charCodeAt value idx)]
+          (recur (inc idx) (fnv-step fnv code) (djb-step djb code)))
+        [fnv djb]))))
+
+(defn- unsigned-hex
+  [n]
+  (-> (unsigned-bit-shift-right n 0)
+      (.toString 16)
+      (.padStart 8 "0")))
+
+(defn- parse-hex32
+  [s]
+  (when (= 8 (count s))
+    (bit-or (js/parseInt s 16) 0)))
+
+(defn- checksum->state
+  [checksum]
+  (if (and (string? checksum) (= 16 (count checksum)))
+    [(or (parse-hex32 (subs checksum 0 8)) 0)
+     (or (parse-hex32 (subs checksum 8 16)) 0)]
+    [0 0]))
+
+(defn- valid-checksum?
+  [checksum]
+  (boolean
+   (and (string? checksum)
+        (re-matches #"[0-9a-fA-F]{16}" checksum))))
+
+(defn- state->checksum
+  [[fnv djb]]
+  (str (unsigned-hex fnv)
+       (unsigned-hex djb)))
+
+(defn- relevant-attrs
+  [e2ee?]
+  (cond-> #{:block/uuid :block/parent :block/page :block/order}
+    (not e2ee?) (into #{:block/title :block/name})))
+
+(defn- get-block-uuid
+  "The :block/uuid of entity id eid, read from its datom rather than through
+  an entity: a full recompute asks this for every block, its parent and its
+  page."
+  [db eid]
+  (:v (first (d/datoms db :eavt eid :block/uuid))))
+
+(defn- parse-uuid-string
+  [value]
+  (when (string? value)
+    (try
+      (uuid value)
+      (catch :default _
+        nil))))
+
+(defn- entids
+  [db-before db-after value]
+  (let [lookup-ref (fn [db value]
+                     (when value
+                       (try
+                         (d/entid db value)
+                         (catch :default _
+                           nil))))
+        uuid-value (cond
+                     (uuid? value) value
+                     (string? value) (parse-uuid-string value)
+                     :else nil)]
+    (cond-> #{}
+      (integer? value) (conj value)
+      (lookup-ref db-before value) (conj (lookup-ref db-before value))
+      (lookup-ref db-after value) (conj (lookup-ref db-after value))
+      (and uuid-value (lookup-ref db-before [:block/uuid uuid-value]))
+      (conj (lookup-ref db-before [:block/uuid uuid-value]))
+      (and uuid-value (lookup-ref db-after [:block/uuid uuid-value]))
+      (conj (lookup-ref db-after [:block/uuid uuid-value])))))
+
+(defn- normalize-checksum-value
+  [db eid attr value]
+  (case attr
+    :block/parent (get-block-uuid db value)
+    :block/page (get-block-uuid db value)
+    :block/title
+    (let [marker (get (d/entity db eid) large-title-object-attr)]
+      ;; Keep the title tuple: offloaded wire and rehydrated titles both hash
+      ;; the empty transport placeholder. A short edit still hashes its text.
+      (if (and (map? marker)
+               (string? (:asset-uuid marker))
+               (string? (:asset-type marker))
+               (or (= "" value)
+                   (and (string? value)
+                        (> (.-length (.encode text-encoder value)) large-title-byte-limit))))
+        ""
+        value))
+    value))
+
+(defn- entity-values
+  [db eid e2ee?]
+  (let [attrs (relevant-attrs e2ee?)
+        datoms (d/datoms db :eavt eid)]
+    (reduce (fn [acc datom]
+              (let [attr (:a datom)]
+                (if (contains? attrs attr)
+                  (case attr
+                    :block/uuid (assoc acc :block/uuid (:v datom))
+                    :block/order (assoc acc :block/order (:v datom))
+                    :block/title (assoc acc :block/title (:v datom))
+                    :block/name (assoc acc :block/name (:v datom))
+                    :block/parent (assoc acc :block/parent (get-block-uuid db (:v datom)))
+                    :block/page (assoc acc :block/page (get-block-uuid db (:v datom)))
+                    acc)
+                  acc)))
+            {}
+            datoms)))
+
+(defonce ^:private page-tag-eids-cache (js/WeakMap.))
+
+(defn- page-tag-eids
+  "Entity ids of the tags ldb/page? looks for, computed once per db value:
+  callers of the 2-arity checksum-eligible-entity? ask for every entity."
+  [db]
+  (or (.get page-tag-eids-cache db)
+      (let [eids (set (keep #(d/entid db %)
+                            [:logseq.class/Page :logseq.class/Journal :logseq.class/Tag :logseq.class/Property]))]
+        (.set page-tag-eids-cache db eids)
+        eids)))
+
+(defn- checksum-eligible-entity?
+  "A non-built-in entity with a uuid that is a page (ldb/page?) or has
+  :block/page or :block/name. Read from datoms rather than through an
+  entity: an entity lookup of an absent property key such as
+  :logseq.property/built-in? also looks up the property's default value,
+  which made this check most of the time of a full recompute."
+  ([db eid]
+   (checksum-eligible-entity? db (page-tag-eids db) eid))
+  ([db tag-eids eid]
+   (and (uuid? (:v (first (d/datoms db :eavt eid :block/uuid))))
+        (not (:v (first (d/datoms db :eavt eid :logseq.property/built-in?))))
+        (or (boolean (some #(contains? tag-eids (:v %))
+                           (d/datoms db :eavt eid :block/tags)))
+            (some? (first (d/datoms db :eavt eid :block/page)))
+            (some? (first (d/datoms db :eavt eid :block/name)))))))
+
+(defn- entity-checksum-tuples
+  [db eid e2ee?]
+  (when-let [entity-uuid (get-block-uuid db eid)]
+    (let [attrs (relevant-attrs e2ee?)]
+      (->> (d/datoms db :eavt eid)
+           (keep (fn [{:keys [a v]}]
+                   (when (contains? attrs a)
+                     [entity-uuid
+                      a
+                      (normalize-checksum-value db eid a v)])))
+           set))))
+
+(defn- tuple-digest
+  [[entity-uuid attr value]]
+  (-> [fnv-offset djb-offset]
+      (digest-string (str entity-uuid))
+      (hash-code field-separator)
+      (digest-string (str attr))
+      (hash-code field-separator)
+      (digest-string (some-> value str))))
+
+(defn- subtract-digest
+  [[sum-fnv sum-djb] [fnv djb]]
+  [(sub-step sum-fnv fnv)
+   (sub-step sum-djb djb)])
+
+(defn- add-digest
+  [[sum-fnv sum-djb] [fnv djb]]
+  [(add-step sum-fnv fnv)
+   (add-step sum-djb djb)])
+
+(defn- db-checksum-tuples
+  [db e2ee?]
+  (let [tag-eids (page-tag-eids db)]
+    (->> (d/datoms db :avet :block/uuid)
+         (mapcat (fn [{:keys [e]}]
+                   (when (checksum-eligible-entity? db tag-eids e)
+                     (entity-checksum-tuples db e e2ee?)))))))
+
+(defn- tx-item-eids
+  [db-before db-after tx-item]
+  (if-let [eid (:e tx-item)]
+    #{eid}
+    (if (vector? tx-item)
+      (let [[op entity attr value] tx-item
+            entity-ids (entids db-before db-after entity)]
+        (cond-> entity-ids
+          (and (= op :db/add) (= attr :block/uuid))
+          (into (entids db-before db-after value))
+          (and (= op :db/retract) (= attr :block/uuid))
+          (into (entids db-before db-after value))))
+      #{})))
+
+(defn- tx-item-attr
+  [tx-item]
+  (if (vector? tx-item)
+    (nth tx-item 2 nil)
+    (:a tx-item)))
+
+(defn- touched-base-eids
+  [db-before db-after tx-data]
+  (let [before-eligible-cache (volatile! {})
+        after-eligible-cache (volatile! {})
+        cached-eligible? (fn [db cache eid]
+                           (if-some [cached (find @cache eid)]
+                             (val cached)
+                             (let [eligible? (boolean (checksum-eligible-entity? db eid))]
+                               (vswap! cache assoc eid eligible?)
+                               eligible?)))]
+    (reduce (fn [result tx-item]
+              (let [block-uuid-change? (= :block/uuid (tx-item-attr tx-item))]
+                (reduce (fn [eids eid]
+                          (cond-> eids
+                            (or block-uuid-change?
+                                (not= (get-block-uuid db-before eid)
+                                      (get-block-uuid db-after eid))
+                                (cached-eligible? db-before before-eligible-cache eid)
+                                (cached-eligible? db-after after-eligible-cache eid))
+                            (conj eid)))
+                        result
+                        (tx-item-eids db-before db-after tx-item))))
+            #{}
+            tx-data)))
+
+(defn- touched-checksum-uuids
+  [db-before db-after eids]
+  (->> eids
+       (mapcat (fn [eid]
+                 [(get-block-uuid db-before eid)
+                  (get-block-uuid db-after eid)]))
+       (remove nil?)
+       set))
+
+(defn- eids-with-changed-block-uuid
+  [db-before db-after eids]
+  (->> eids
+       (filter (fn [eid]
+                 (not= (get-block-uuid db-before eid)
+                       (get-block-uuid db-after eid))))
+       set))
+
+(defn- referrer-eids-by-target
+  [db target-eid]
+  (->> (concat (d/datoms db :avet :block/parent target-eid)
+               (d/datoms db :avet :block/page target-eid))
+       (map :e)
+       set))
+
+(defn- impacted-referrer-eids
+  [db-before db-after target-eids]
+  (->> target-eids
+       (mapcat (fn [target-eid]
+                 (concat (referrer-eids-by-target db-before target-eid)
+                         (referrer-eids-by-target db-after target-eid))))
+       set))
+
+(defn- eids-by-block-uuid
+  [db block-uuid]
+  (->> (d/datoms db :avet :block/uuid block-uuid)
+       (map :e)
+       set))
+
+(defn- block-uuid-datom-count
+  [db eid]
+  (count (d/datoms db :eavt eid :block/uuid)))
+
+(defn- duplicate-block-uuid?
+  [db-before db-after block-uuids]
+  (some (fn [uuid]
+          (or (> (count (d/datoms db-before :avet :block/uuid uuid)) 1)
+              (> (count (d/datoms db-after :avet :block/uuid uuid)) 1)))
+        block-uuids))
+
+(defn- tuple-set-for-eids
+  [db eids e2ee?]
+  (reduce (fn [tuples eid]
+            (if (checksum-eligible-entity? db eid)
+              (into tuples (or (entity-checksum-tuples db eid e2ee?) #{}))
+              tuples))
+          #{}
+          eids))
+
+(defn- tuple-counts-for-eids
+  [db eids e2ee?]
+  (reduce
+   (fn [counts eid]
+     (let [datom-count (block-uuid-datom-count db eid)]
+       (if (and (pos? datom-count)
+                (checksum-eligible-entity? db eid))
+         (reduce (fn [acc tuple]
+                   (update acc tuple (fnil + 0) datom-count))
+                 counts
+                 (or (entity-checksum-tuples db eid e2ee?) #{}))
+         counts)))
+   {}
+   eids))
+
+(defn- net-tuple-delta
+  [db-before db-after e2ee? tx-data]
+  ;; These derived attributes affect neither checksum tuples nor entity eligibility.
+  ;; Import finalization can write them for every block in the graph.
+  (let [tx-data (remove #(contains? #{:block/tx-id :block/refs} (tx-item-attr %)) tx-data)
+        base-eids (touched-base-eids db-before db-after tx-data)]
+    (if (empty? base-eids)
+      {:removed {}
+       :added {}}
+      (let [uuid-changed-eids (eids-with-changed-block-uuid db-before db-after base-eids)
+            dependent-eids (when (seq uuid-changed-eids)
+                             (->> (impacted-referrer-eids db-before db-after uuid-changed-eids)
+                                  (filter (fn [eid]
+                                            (or (checksum-eligible-entity? db-before eid)
+                                                (checksum-eligible-entity? db-after eid))))
+                                  set))
+            effective-eids (if (seq dependent-eids)
+                             (set/union base-eids dependent-eids)
+                             base-eids)
+            touched-uuids (touched-checksum-uuids db-before db-after effective-eids)]
+        (if (duplicate-block-uuid? db-before db-after touched-uuids)
+          (let [peer-eids (->> touched-uuids
+                               (mapcat (fn [uuid]
+                                         (concat (eids-by-block-uuid db-before uuid)
+                                                 (eids-by-block-uuid db-after uuid))))
+                               (filter (fn [eid]
+                                         (or (checksum-eligible-entity? db-before eid)
+                                             (checksum-eligible-entity? db-after eid))))
+                               set)
+                touched-eids (set/union effective-eids peer-eids)
+                before-counts (tuple-counts-for-eids db-before touched-eids e2ee?)
+                after-counts (tuple-counts-for-eids db-after touched-eids e2ee?)
+                all-tuples (set/union (set (keys before-counts))
+                                      (set (keys after-counts)))]
+            (reduce
+             (fn [{:keys [removed added]} tuple]
+               (let [before-count (get before-counts tuple 0)
+                     after-count (get after-counts tuple 0)]
+                 (cond
+                   (> before-count after-count)
+                   {:removed (assoc removed tuple (- before-count after-count))
+                    :added added}
+
+                   (> after-count before-count)
+                   {:removed removed
+                    :added (assoc added tuple (- after-count before-count))}
+
+                   :else
+                   {:removed removed
+                    :added added})))
+             {:removed {}
+              :added {}}
+             all-tuples))
+          (let [before-tuples (tuple-set-for-eids db-before effective-eids e2ee?)
+                after-tuples (tuple-set-for-eids db-after effective-eids e2ee?)
+                removed (set/difference before-tuples after-tuples)
+                added (set/difference after-tuples before-tuples)]
+            {:removed (into {} (map (fn [tuple] [tuple 1]) removed))
+             :added (into {} (map (fn [tuple] [tuple 1]) added))}))))))
+
+(defn- apply-digest-n
+  [checksum-state tuple count op]
+  (let [digest (tuple-digest tuple)]
+    (loop [n count
+           state checksum-state]
+      (if (pos? n)
+        (recur (dec n) (op state digest))
+        state))))
+
+(defn recompute-checksum
+  [db]
+  (let [e2ee? (ldb/get-graph-rtc-e2ee? db)
+        tuples (db-checksum-tuples db e2ee?)]
+    (->> tuples
+         (reduce (fn [checksum-state tuple]
+                   (add-digest checksum-state (tuple-digest tuple)))
+                 [0 0])
+         state->checksum)))
+
+(defn <recompute-checksum
+  "Recompute the official legacy checksum from one immutable DB value while
+  yielding between bounded entity batches. This is for mismatch/repair cold
+  paths; normal transactions continue to use `update-checksum`."
+  [db]
+  (let [e2ee? (ldb/get-graph-rtc-e2ee? db)]
+    (p/loop [remaining (seq (d/datoms db :avet :block/uuid))
+             checksum-state [0 0]
+             processed 0]
+      (if-let [{:keys [e]} (first remaining)]
+        (let [checksum-state'
+              (reduce (fn [state tuple]
+                        (add-digest state (tuple-digest tuple)))
+                      checksum-state
+                      (or (when (checksum-eligible-entity? db e)
+                            (entity-checksum-tuples db e e2ee?))
+                          []))
+              remaining' (next remaining)
+              processed' (inc processed)]
+          (if (and remaining'
+                   (zero? (mod processed' recompute-yield-entity-count)))
+            (p/let [_ (js/Promise. (fn [resolve]
+                                     (js/setTimeout resolve 0)))]
+              (p/recur remaining' checksum-state' processed'))
+            (p/recur remaining' checksum-state' processed')))
+        (state->checksum checksum-state)))))
+
+(defn recompute-checksum-diagnostics
+  [db]
+  (let [e2ee? (boolean (ldb/get-graph-rtc-e2ee? db))
+        attrs (relevant-attrs e2ee?)
+        eids (->> (d/datoms db :eavt)
+                  (keep (fn [datom]
+                          (when (contains? attrs (:a datom))
+                            (:e datom))))
+                  distinct)
+        blocks (->> eids
+                    (keep (fn [eid]
+                            (when (checksum-eligible-entity? db eid)
+                              (let [{:block/keys [uuid title name parent page order]}
+                                    (entity-values db eid e2ee?)]
+                                (cond-> {:block/uuid uuid
+                                         :block/parent parent
+                                         :block/page page
+                                         :block/order order}
+                                  (not e2ee?) (assoc :block/title title
+                                                     :block/name name))))))
+                    (sort-by (comp str :block/uuid))
+                    vec)]
+    {:checksum (recompute-checksum db)
+     :e2ee? e2ee?
+     :attrs (->> attrs (sort-by str) vec)
+     :blocks blocks}))
+
+(defn update-checksum
+  [checksum {:keys [db-before db-after tx-data]}]
+  (let [before-e2ee? (ldb/get-graph-rtc-e2ee? db-before)
+        after-e2ee? (ldb/get-graph-rtc-e2ee? db-after)
+        tx-data (or tx-data [])]
+    (cond
+      (not= before-e2ee? after-e2ee?)
+      ;; E2EE mode changes the global digest semantics, so incremental deltas are invalid.
+      (recompute-checksum db-after)
+
+      (empty? tx-data)
+      checksum
+
+      :else
+      (let [initial-state (if (valid-checksum? checksum)
+                            (checksum->state checksum)
+                            (checksum->state (recompute-checksum db-before)))
+            {:keys [removed added]} (net-tuple-delta db-before db-after after-e2ee? tx-data)
+            state-after-removals (reduce-kv (fn [checksum-state tuple count]
+                                              (apply-digest-n checksum-state tuple count subtract-digest))
+                                            initial-state
+                                            removed)
+            state-after-additions (reduce-kv (fn [checksum-state tuple count]
+                                               (apply-digest-n checksum-state tuple count add-digest))
+                                             state-after-removals
+                                             added)]
+        (state->checksum state-after-additions)))))

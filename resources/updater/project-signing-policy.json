@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "algorithm": "ed25519-selfhost-release-v1",
+  "payloadDomain": "logseq-selfhost-official-architecture-update-v1",
+  "releaseLineId": "selfhost-official-architecture-v1",
+  "bundleIdentity": "com.logseq.logseq",
+  "keyId": "ed25519:98a1ba119b8200592f180c8f60385afe0cf2da67e6624f764f260381fb00ac2e",
+  "publicKeyBase64": "N4ZNW7PG3rCixmGirw8fN3v/kexQm3yZasrbtdwTTPM="
+}

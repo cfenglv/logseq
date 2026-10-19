@@ -1,0 +1,191 @@
+(ns logseq.db-sync.worker-handler-ws-test
+  (:require [cljs-bean.core :as bean]
+            [cljs.test :refer [async deftest is]]
+            [datascript.core :as d]
+            [logseq.db-sync.protocol :as protocol]
+            [logseq.db-sync.storage :as storage]
+            [logseq.db-sync.test-sql :as test-sql]
+            [logseq.db-sync.worker.handler.sync :as sync-handler]
+            [logseq.db-sync.worker.handler.ws :as ws-handler]
+            [logseq.db-sync.worker.presence :as presence]
+            [logseq.db-sync.worker.ws :as ws]
+            [promesa.core :as p]))
+
+(deftest presence-message-broadcast-excludes-source-client-test
+  (let [source-ws #js {:readyState 1}
+        peer-ws #js {:readyState 1}
+        send-events (atom [])
+        self #js {:state #js {:getWebSockets (fn [] #js [source-ws peer-ws])}}
+        raw (protocol/encode-message {:type "presence"
+                                      :editing-block-uuid "block-1"})]
+    (with-redefs [presence/get-user (fn [_self _ws] {:user-id "user-1"})
+                  presence/update-presence! (fn [_self _ws _patch] nil)
+                  ws/send! (fn [target msg]
+                             (swap! send-events conj {:ws target
+                                                      :msg msg}))]
+      (ws-handler/handle-ws-message! self source-ws raw))
+
+    (is (= [peer-ws]
+           (mapv :ws @send-events)))
+    (is (= [{:type "presence"
+             :editing-block-uuid "block-1"
+             :user-id "user-1"}]
+           (mapv :msg @send-events)))))
+
+(deftest hello-message-includes-checksum-test
+  (let [sql (test-sql/make-sql)
+        conn (storage/open-conn sql)
+        ws #js {:readyState 1}
+        sent (atom nil)
+        self #js {:conn conn
+                  :schema-ready true
+                  :sql sql}
+        raw (protocol/encode-message {:type "hello"
+                                      :client "test"})]
+    (d/transact! conn [{:block/uuid (random-uuid)
+                        :block/title "hello"}])
+    (with-redefs [ws/send! (fn [_target msg]
+                             (reset! sent msg))]
+      (ws-handler/handle-ws-message! self ws raw))
+    (is (= "hello" (:type @sent)))
+    (is (number? (:t @sent)))
+    (is (= ["tx-upload-staged-v1"] (:capabilities @sent)))
+    (is (string? (:checksum @sent)))))
+
+(deftest hello-message-omits-nil-checksum-test
+  (let [sql (test-sql/make-sql)
+        conn (storage/open-conn sql)
+        ws #js {:readyState 1}
+        sent (atom nil)
+        self #js {:conn conn
+                  :schema-ready true
+                  :sql sql}
+        raw (protocol/encode-message {:type "hello"
+                                      :client "test"})]
+    (with-redefs [ws/send! (fn [_target msg]
+                             (reset! sent msg))]
+      (ws-handler/handle-ws-message! self ws raw))
+    (is (= "hello" (:type @sent)))
+    (is (false? (contains? @sent :checksum)))))
+
+(deftest tx-batch-message-adds-graph-and-user-context-to-transact-meta-test
+  (let [sql (test-sql/make-sql)
+        conn (storage/open-conn sql)
+        ws #js {:readyState 1}
+        sent (atom nil)
+        tx-metas (atom [])
+        self #js {:conn conn
+                  :graph-id "graph-ws"
+                  :schema-ready true
+                  :sql sql}
+        raw (protocol/encode-message
+             {:type "tx/batch"
+              :client-revision "revision-ws"
+              :t-before 0
+              :txs [{:tx (protocol/tx->transit [[:db/add -1 :block/title "ws context"]])
+                     :outliner-op :save-block}]})]
+    (with-redefs [presence/get-user (fn [_self _ws]
+                                      {:user-id "user-1"
+                                       :username "alice"})
+                  ws/broadcast! (fn [& _] nil)
+                  ws/send! (fn [_target msg]
+                             (reset! sent msg))]
+      (d/listen! conn ::capture-ws-context-tx-meta
+                 (fn [tx-report]
+                   (swap! tx-metas conj (:tx-meta tx-report))))
+      (try
+        (ws-handler/handle-ws-message! self ws raw)
+        (finally
+          (d/unlisten! conn ::capture-ws-context-tx-meta))))
+    (is (= "tx/batch/ok" (:type @sent)))
+    (is (some #(= {:op :apply-client-tx
+                   :outliner-op :save-block
+                   :graph-id "graph-ws"
+                   :client-revision "revision-ws"
+                   :username "alice"}
+                  (select-keys % [:op :outliner-op :graph-id :client-revision :username]))
+              @tx-metas))))
+
+(deftest ws-send-serializes-tx-reject-uuids-as-strings-test
+  (let [raw* (atom nil)
+        ws #js {:readyState 1
+                :send (fn [raw] (reset! raw* raw))}
+        success-tx-id (random-uuid)
+        failed-tx-id (random-uuid)]
+    (ws/send! ws {:type "tx/reject"
+                  :reason "db transact failed"
+                  :t 3
+                  :success-tx-ids [success-tx-id]
+                  :failed-tx-id failed-tx-id})
+    (let [message (-> @raw* js/JSON.parse (js->clj :keywordize-keys true))]
+      (is (= "tx/reject" (:type message)))
+      (is (= [(str success-tx-id)] (:success-tx-ids message)))
+      (is (= (str failed-tx-id) (:failed-tx-id message))))))
+
+(deftest online-users-broadcast-restored-attachment-user-test
+  (let [attachment* (atom nil)
+        ws #js {:readyState 1
+                :serializeAttachment (fn [attachment]
+                                       (reset! attachment* attachment))
+                :deserializeAttachment (fn []
+                                         @attachment*)}
+        self #js {}
+        restored-self #js {}
+        user {:user-id "user-1"
+              :email "user@example.com"
+              :username "alice"}
+        sent (atom nil)]
+    (presence/add-presence! self ws user)
+    (is (= {:presence/user user}
+           (bean/->clj (.deserializeAttachment ws))))
+    (swap! (presence/presence* restored-self)
+           assoc
+           ws
+           (presence/attachment->user (.deserializeAttachment ws)))
+    (with-redefs [ws/broadcast! (fn [_self _sender message]
+                                  (reset! sent message))]
+      (presence/broadcast-online-users! restored-self))
+    (is (= {:type "online-users"
+            :online-users [user]}
+           @sent))))
+
+(deftest websocket-connection-is-rejected-while-snapshot-upload-is-in-progress-test
+  (async done
+         (let [accepted (atom [])
+               presence-events (atom [])
+               self #js {:state #js {:acceptWebSocket (fn [socket]
+                                                        (swap! accepted conj socket))}}
+               request (js/Request. "http://localhost/sync/graph-1/ws?graph-id=graph-1"
+                                    #js {:method "GET"})]
+           (-> (p/with-redefs [sync-handler/<ready-for-sync? (fn [_ _] (p/resolved false))
+                               presence/add-presence! (fn [& _]
+                                                        (swap! presence-events conj :add))
+                               presence/broadcast-online-users! (fn [& _]
+                                                                  (swap! presence-events conj :broadcast))]
+                 (ws-handler/handle-ws self request))
+               (p/then (fn [response]
+                         (is (= 409 (.-status response)))
+                         (is (empty? @accepted))
+                         (is (empty? @presence-events))
+                         (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))
+
+(deftest websocket-connection-uses-graph-id-from-sync-path-test
+  (async done
+         (let [seen-graph-id (atom ::unset)
+               self #js {}
+               request (js/Request. "http://localhost/sync/graph-from-path"
+                                    #js {:method "GET"})]
+           (-> (p/with-redefs [sync-handler/<ready-for-sync? (fn [_self graph-id]
+                                                               (reset! seen-graph-id graph-id)
+                                                               (p/resolved false))]
+                 (ws-handler/handle-ws self request))
+               (p/then (fn [response]
+                         (is (= "graph-from-path" @seen-graph-id))
+                         (is (= 409 (.-status response)))
+                         (done)))
+               (p/catch (fn [error]
+                          (is false (str error))
+                          (done)))))))

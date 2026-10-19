@@ -1,0 +1,202 @@
+name: logseq/cli CI
+
+on:
+  # Path filters ensure jobs only kick off if a change is made to the CLI or
+  # its local dependencies.
+  push:
+    branches: [master]
+    paths:
+      - 'cli/**'
+      - 'src/main/logseq/cli/**'
+      - 'src/test/logseq/cli/**'
+      - 'cli-e2e/**'
+      - 'dist/logseq.js'
+      - 'scripts/prepare-cli-package.mjs'
+      - 'scripts/stage-cli-runtime.mjs'
+      - 'scripts/test-cli-release-config.mjs'
+      - '.github/workflows/deps-cli.yml'
+      - '!**/*.md'
+      # Deps that logseq/cli depends on should trigger this workflow.
+      - 'deps/outliner/**'
+      - 'deps/graph-parser/**'
+      - 'deps/db/**'
+      - 'deps/common/**'
+      - 'deps/db-sync/**'
+      - 'src/main/frontend/worker/**'
+      - 'src/main/logseq/db_worker/**'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'cli/**'
+      - 'src/main/logseq/cli/**'
+      - 'src/test/logseq/cli/**'
+      - 'cli-e2e/**'
+      - 'dist/logseq.js'
+      - 'scripts/prepare-cli-package.mjs'
+      - 'scripts/stage-cli-runtime.mjs'
+      - 'scripts/test-cli-release-config.mjs'
+      - '.github/workflows/deps-cli.yml'
+      - '!**/*.md'
+      # Deps that logseq/cli depends on should trigger this workflow.
+      - 'deps/outliner/**'
+      - 'deps/graph-parser/**'
+      - 'deps/db/**'
+      - 'deps/common/**'
+      - 'deps/db-sync/**'
+      - 'src/main/frontend/worker/**'
+      - 'src/main/logseq/db_worker/**'
+  workflow_dispatch:
+    inputs:
+      git-ref:
+        description: "Release Git Ref (Which branch to build?)"
+        required: true
+        default: "master"
+      release-tag:
+        type: choice
+        description: "Npm Release Tag (Use 'latest' for a stable release)"
+        required: true
+        options:
+          - alpha
+          - latest
+        default: "latest"
+
+env:
+  CLOJURE_VERSION: '1.12.4.1618'
+  JAVA_VERSION: '21'
+  NODE_VERSION: '24'
+  OCAML_VERSION: '5.4.0'
+  BABASHKA_VERSION: '1.12.215'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            cli/pnpm-lock.yaml
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ env.OCAML_VERSION }}
+
+      - name: Fetch OCaml deps
+        working-directory: cli
+        run: opam install . --deps-only --with-test --yes
+
+      - name: Fetch pnpm deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch CLI pnpm deps
+        run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
+
+      - name: Run logseq CLI tests
+        run: opam exec -- pnpm --dir cli test
+
+      - name: Build logseq CLI
+        run: |
+          opam exec -- pnpm cli:release
+          pnpm db-worker-node:release:bundle
+
+      - name: Verify CLI publish config
+        run: node scripts/test-cli-release-config.mjs
+
+      - name: Smoke test CLI
+        run: node dist/logseq.js --help
+
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            cli/pnpm-lock.yaml
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ env.OCAML_VERSION }}
+
+      - name: Fetch OCaml deps
+        working-directory: cli
+        run: opam install . --deps-only --with-test --yes
+
+      - name: Fetch pnpm deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch CLI pnpm deps
+        run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
+
+      - name: Build logseq CLI
+        run: |
+          opam exec -- pnpm cli:release
+          pnpm db-worker-node:release:bundle
+
+      - name: Prepare npm package
+        run: node scripts/prepare-cli-package.mjs
+
+      - name: Smoke test npm package
+        run: node dist/cli-package/dist/logseq.js --help
+
+      - name: Authenticate with registry
+        working-directory: dist/cli-package
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_CLI_TOKEN }}
+        run: echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" > .npmrc
+
+      - name: Publish package
+        working-directory: dist/cli-package
+        run: npm publish --tag "${{ github.event.inputs.release-tag || 'alpha' }}" --access public

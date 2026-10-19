@@ -1,0 +1,9 @@
+{:paths ["src"]
+ :deps
+ {logseq/db
+  {:local/root "../db"}
+  logseq/graph-parser
+  {:local/root "../graph-parser"}
+  metosin/malli                         {:git/url "https://github.com/metosin/malli"
+                                         :sha     "52ea58a36ff5172b38dfc526ca638afa7226a4a0"}
+  io.github.nextjournal/nbb-test-runner {:git/sha "b379325cfa5a3306180649da5de3bf5166414e71"}}}

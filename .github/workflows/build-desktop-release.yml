@@ -1,0 +1,1691 @@
+# This is the main desktop application release workflow for both nightly and beta/stable releases.
+
+name: Build-Desktop-Release
+run-name: Desktop release · ${{ github.event.inputs.build-target }} · ${{ github.event.inputs.selfhost-operation }} · ${{ github.event.inputs.git-ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build-target:
+        description: 'Build Target (Release Type)'
+        type: choice
+        required: true
+        options:
+          - stable
+          - beta
+          - nightly
+          - non-release
+        default: "non-release"
+      git-ref:
+        description: "Release Git Ref (Which branch or tag to build?)"
+        required: true
+        default: "master"
+      selfhost-operation:
+        description: 'Selfhost .7 operation'
+        type: choice
+        required: true
+        options:
+          - stage-draft
+          - bridge-published-.7
+        default: stage-draft
+      is-draft:
+        description: 'Draft Release?'
+        type: boolean
+        required: true
+        default: true
+      is-pre-release:
+        description: 'Pre Release? (labeled as "PreRelease")'
+        type: boolean
+        required: true
+        default: true
+      enable-file-sync-production:
+        description: 'File sync production mode'
+        type: boolean
+        required: true
+        default: true
+      enable-plugins:
+        description: 'Build with plugin system support'
+        type: boolean
+        required: true
+        default: true
+      build-android:
+        description: 'Build Android App'
+        type: boolean
+        required: true
+        default: true
+      publish-linux-stores:
+        description: 'Publish Flathub and Snap'
+        type: boolean
+        required: true
+        default: false
+  # schedule: # Every workday at the 2 P.M. (UTC) we run a scheduled nightly build
+  #   - cron: '0 14 * * MON-FRI'
+
+concurrency:
+  group: desktop-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CLOJURE_VERSION: '1.12.4.1618'
+  NODE_VERSION: '24'
+  JAVA_VERSION: '21'
+  BABASHKA_VERSION: '1.12.215'
+  OCAML_VERSION: '5.4.0'
+  OPAM_VERSION: '2.5.2'
+  OPAM_X86_64_LINUX_SHA512: '508a128cec8ddf06e763db56232818481a4eee7725fb725c08f543b4aefa0daa23042ec89a4dcb4fe8eac99c53c219196c715eec46b4f1f6769b47782f79943a'
+  SELFHOST6_TARGET_VERSION: '2.0.1-selfhost.7'
+
+permissions:
+  contents: read
+
+jobs:
+  upstream-compile-cljs:
+    name: compile-cljs (upstream desktop)
+    if: ${{ github.ref_name != 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref != 'release/2.0.1-selfhost.7' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check build options
+        if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'nightly' || github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') && github.event.inputs.git-ref != 'master' }}
+        run: |
+          echo "::error title=CheckFail::Nightly, Beta and Stable Release MUST be built from master"
+          exit 1
+
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.git-ref }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Get pnpm store directory path
+        id: pnpm-store-dir-path
+        run: echo "dir=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm store directory
+        uses: actions/cache@v4
+        id: pnpm-cache
+        with:
+          path: ${{ steps.pnpm-store-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Cache clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-clojure-lib-${{ hashFiles('**/deps.edn') }}
+
+      - name: Setup clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: ${{ env.OCAML_VERSION }}
+
+      - name: Fetch OCaml deps
+        working-directory: cli
+        run: opam install . --deps-only --with-test --yes
+
+      - name: Fetch CLI pnpm deps
+        run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(node ./scripts/get-pkg-version.js "${{ github.event.inputs.build-target }}")
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: Do Not Overwrite Existing Release
+        if: ${{ github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable' }}
+        run: |
+          if curl -f "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.ref.outputs.version }}" &>/dev/null; then
+            echo "::error title=CheckFail::Release already exists"
+            exit 1
+          fi
+
+      - name: Update Nightly APP Version
+        if: ${{ github.event.inputs.build-target == 'nightly' || github.event_name == 'schedule' }}
+        run: |
+          sed -i 's/defonce version ".*"/defonce version "${{ steps.ref.outputs.version }}"/g' src/main/frontend/version.cljs
+
+      - name: Set Build Environment Variables (only when workflow_dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        # if scheduled, use default settings
+        run: |
+          echo "ENABLE_PLUGINS=${{ github.event_name == 'schedule' || github.event.inputs.enable-plugins == 'true' }}" >> $GITHUB_ENV
+          echo "ENABLE_FILE_SYNC_PRODUCTION=${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}" >> $GITHUB_ENV
+
+      - name: Compile CLJS
+        run: |
+          pnpm install --frozen-lockfile
+          gulp build
+          pnpm cljs:release-electron
+          pnpm db-worker-node:bundle
+          opam exec -- pnpm cli:release
+          pnpm webpack-app-build
+          pnpm desktop:prepare-runtime-js
+        env:
+          LOGSEQ_SENTRY_DSN: ${{ secrets.LOGSEQ_SENTRY_DSN }}
+          LOGSEQ_POSTHOG_TOKEN: ${{ secrets.LOGSEQ_POSTHOG_TOKEN }}
+
+      - name: Verify bundled db-worker-node runtime
+        run: |
+          test -f ./dist/db-worker-node.js
+          test -f ./dist/db-worker-node-assets.json
+
+      - name: Verify bundled CLI
+        run: |
+          test -f ./static/js/logseq-cli.js
+          node ./static/js/logseq-cli.js --help >/tmp/logseq-cli-help.txt
+          grep -E "USAGE|Usage|COMMANDS|Commands" /tmp/logseq-cli-help.txt >/dev/null
+
+      - name: Verify desktop runtime script locations
+        run: |
+          test -f ./static/js/db-worker-node.js
+          test -f ./static/js/logseq-cli.js
+          test -f ./static/.agents/skills/logseq-cli/SKILL.md
+
+      - name: Update APP Version
+        run: |
+          sed -i 's/"version": "0.0.1"/"version": "${{ steps.ref.outputs.version }}"/g' ./package.json
+        working-directory: ./static
+
+      - name: Display Package.json
+        run: cat ./package.json
+        working-directory: ./static
+
+      - name: Save VERSION file
+        run: echo "${{ steps.ref.outputs.version }}" > ./VERSION
+        working-directory: ./static
+
+      - name: List Files
+        run: ls -al
+        working-directory: ./static
+
+      - name: Upload Sentry Sourcemaps (beta only)
+        # if: ${{ github.repository == 'logseq/logseq' && github.event_name == 'workflow_dispatch' && github.event.inputs.build-target == 'beta' }}
+        run: |
+          curl -sL https://sentry.io/get-cli/ | SENTRY_CLI_VERSION=2.58.4 bash
+          release_name="logseq@${{ steps.ref.outputs.version }}"
+          sentry-cli releases new "${release_name}"
+          sentry-cli releases files "${release_name}" upload-sourcemaps --ext map --ext js ./static/js --url-prefix '~/static/js'
+          sentry-cli releases finalize "${release_name}"
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: logseq
+          SENTRY_PROJECT: logseq
+
+      - name: Cache Static File
+        uses: actions/upload-artifact@v4
+        with:
+          name: static
+          path: |
+            static
+            deps/graph-lifecycle
+            sidecar
+          include-hidden-files: true
+
+  build-linux-x64:
+    runs-on: ubuntu-22.04
+    needs: [ upstream-compile-cljs ]
+    steps:
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: static
+          path: .
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(cat ./static/VERSION)
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      # - name: Cache Node Modules
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       **/node_modules
+      #     key: ${{ runner.os }}-node-modules
+
+      - name: Build/Release Electron App
+        run: pnpm install --frozen-lockfile && pnpm electron:make
+        working-directory: ./static
+
+      - name: Verify packaged embedding sidecar
+        run: test -f static/dist/linux-unpacked/resources/sidecar/embedding_server.py
+
+      - name: Save artifacts
+        run: |
+          mkdir -p builds
+          # NOTE: save VERSION file to builds directory
+          cp static/VERSION               ./builds/VERSION
+          mv static/dist/*.AppImage       ./builds/
+          shopt -s nullglob
+          blockmaps=(static/dist/*.blockmap)
+          if [ ${#blockmaps[@]} -gt 0 ]; then
+            mv static/dist/*.blockmap     ./builds/
+          fi
+          mv static/dist/latest-linux.yml ./builds/latest-linux.yml
+          mv static/dist/*.zip            ./builds/Logseq-linux-x86_64-${{ steps.ref.outputs.version }}.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logseq-linux-x64-builds
+          path: builds
+
+  build-linux-arm64:
+    runs-on: ubuntu-22.04
+    needs: [ upstream-compile-cljs ]
+    steps:
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: static
+          path: .
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(cat ./static/VERSION)
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Fetch deps
+        env:
+          npm_config_arch: arm64
+          npm_config_target_platform: linux
+        run: |
+          pnpm install --frozen-lockfile
+        working-directory: ./static
+
+      - name: Build/Release Electron App
+        run: pnpm electron:make-linux-arm64
+        working-directory: ./static
+
+      - name: Verify packaged embedding sidecar
+        run: test -f static/dist/linux-arm64-unpacked/resources/sidecar/embedding_server.py
+
+      - name: Save artifacts
+        run: |
+          mkdir -p builds
+          # NOTE: save VERSION file to builds directory
+          cp static/VERSION                     ./builds/VERSION
+          mv static/dist/*.AppImage             ./builds/Logseq-linux-arm64-${{ steps.ref.outputs.version }}.AppImage
+          shopt -s nullglob
+          blockmaps=(static/dist/*.blockmap)
+          if [ ${#blockmaps[@]} -gt 0 ]; then
+            mv static/dist/*.blockmap           ./builds/
+          fi
+          mv static/dist/latest-linux-arm64.yml ./builds/latest-linux-arm64.yml
+          mv static/dist/*.zip                  ./builds/Logseq-linux-arm64-${{ steps.ref.outputs.version }}.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logseq-linux-arm64-builds
+          path: builds
+
+  build-windows-x64:
+    runs-on: windows-latest
+    needs: [ upstream-compile-cljs ]
+    steps:
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: static
+          path: .
+
+      - name: Retrieve tag version
+        id: ref
+        run: echo "version=$(cat ./static/VERSION)" >> $env:GITHUB_OUTPUT
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      # - name: Cache Node Modules
+      #   uses: actions/cache@v4
+      #   with:
+      #    path: |
+      #      **/node_modules
+      #    key: ${{ runner.os }}-node-modules
+
+      - name: Deps Electron app
+        run: pnpm install --frozen-lockfile
+        working-directory: ./static
+
+      - name: Build/Release Electron app
+        shell: pwsh
+        run: |
+          $signCfg = @'
+          {
+            "extends": "./electron-builder.yml",
+            "win": {
+              "azureSignOptions": {
+                "publisherName": "Logseq, Inc.",
+                "endpoint": "https://eus.codesigning.azure.net/",
+                "certificateProfileName": "Logseq",
+                "codeSigningAccountName": "logseqwin"
+              }
+            }
+          }
+          '@
+          $signCfgPath = Join-Path $PWD "electron-builder.sign-win.json"
+          $signCfg | Out-File -FilePath $signCfgPath -Encoding utf8NoBOM
+          pnpm exec electron-builder --config $signCfgPath --publish never
+        working-directory: ./static
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Verify packaged embedding sidecar
+        run: |
+          if (-not (Test-Path "static/dist/win-unpacked/resources/sidecar/embedding_server.py")) { exit 1 }
+
+      - name: Save Artifact
+        run: |
+          mkdir builds
+          mv static\dist\*-nsis.exe   builds\Logseq-win-x64-${{ steps.ref.outputs.version }}-nsis.exe
+          mv static\dist\*.blockmap   builds\
+          mv static\dist\latest.yml   builds\latest-x64.yml
+          mv static\dist\*.zip        builds\Logseq-win-x64-${{ steps.ref.outputs.version }}.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logseq-win-x64-builds
+          path: builds
+
+  build-windows-arm64:
+    runs-on: windows-latest
+    needs: [ upstream-compile-cljs ]
+    steps:
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: static
+          path: .
+
+      - name: Retrieve tag version
+        id: ref
+        run: echo "version=$(cat ./static/VERSION)" >> $env:GITHUB_OUTPUT
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      # - name: Cache Node Modules
+      #   uses: actions/cache@v4
+      #   with:
+      #    path: |
+      #      **/node_modules
+      #    key: ${{ runner.os }}-node-modules
+
+      - name: Deps Electron app
+        run: pnpm install --frozen-lockfile
+        working-directory: ./static
+
+      - name: Build/Release Electron app
+        shell: pwsh
+        run: |
+          $signCfg = @'
+          {
+            "extends": "./electron-builder.yml",
+            "win": {
+              "azureSignOptions": {
+                "publisherName": "Logseq, Inc.",
+                "endpoint": "https://eus.codesigning.azure.net/",
+                "certificateProfileName": "Logseq",
+                "codeSigningAccountName": "logseqwin"
+              }
+            }
+          }
+          '@
+          $signCfgPath = Join-Path $PWD "electron-builder.sign-win.json"
+          $signCfg | Out-File -FilePath $signCfgPath -Encoding utf8NoBOM
+          pnpm exec electron-builder --config $signCfgPath --win nsis zip --arm64 --publish never
+        working-directory: ./static
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
+      - name: Verify packaged embedding sidecar
+        run: |
+          if (-not (Test-Path "static/dist/win-arm64-unpacked/resources/sidecar/embedding_server.py")) { exit 1 }
+
+      - name: Save Artifact
+        run: |
+          mkdir builds
+          mv static\dist\*-nsis.exe   builds\Logseq-win-arm64-${{ steps.ref.outputs.version }}-nsis.exe
+          mv static\dist\*.blockmap   builds\
+          mv static\dist\latest.yml   builds\latest-arm64.yml
+          mv static\dist\*.zip        builds\Logseq-win-arm64-${{ steps.ref.outputs.version }}.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logseq-win-arm64-builds
+          path: builds
+
+  build-macos-x64:
+    needs: [ upstream-compile-cljs ]
+    runs-on: macos-15-intel
+    steps:
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: static
+          path: .
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(cat ./static/VERSION)
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: List Static Files
+        run: ls -al ./static
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Get pnpm store directory path
+        id: pnpm-store-dir-path
+        run: echo "dir=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+      - name: Cache pnpm store directory
+        uses: actions/cache@v4
+        id: pnpm-cache
+        with:
+          path: ${{ steps.pnpm-store-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+
+      - name: Signing By Apple Developer ID
+        if: ${{ github.repository == 'logseq/logseq' }}
+        uses: apple-actions/import-codesign-certs@v1
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
+
+      # - name: Cache Node Modules
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       **/node_modules
+      #     key: ${{ runner.os }}-node-modules
+
+      - name: Build/Release Electron App for x64
+        run: pnpm install --frozen-lockfile && pnpm rebuild:all && pnpm electron:make
+        working-directory: ./static
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify packaged embedding sidecar
+        run: test -f static/dist/mac/Logseq.app/Contents/Resources/sidecar/embedding_server.py
+
+      - name: Save x64 artifacts
+        run: |
+          mkdir -p builds
+          cp static/VERSION              ./builds/VERSION
+          mv static/dist/*.dmg           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.dmg
+          mv static/dist/*.zip           ./builds/Logseq-darwin-x64-${{ steps.ref.outputs.version }}.zip
+          mv static/dist/*.blockmap      ./builds/
+          mv static/dist/latest-mac.yml  ./builds/latest-x64-mac.yml
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logseq-darwin-x64-builds
+          path: builds
+
+  build-macos-arm64:
+    needs: [ upstream-compile-cljs ]
+    runs-on: macos-14
+    steps:
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: static
+          path: .
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(cat ./static/VERSION)
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Get pnpm store directory path
+        id: pnpm-store-dir-path
+        run: echo "dir=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+      - name: Cache pnpm store directory
+        uses: actions/cache@v4
+        id: pnpm-cache
+        with:
+          path: ${{ steps.pnpm-store-dir-path.outputs.dir }}
+          key: ${{ runner.os }}-arm64-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-arm64-pnpm-
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Signing By Apple Developer ID
+        if: ${{ github.repository == 'logseq/logseq' }}
+        uses: apple-actions/import-codesign-certs@v1
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATES_P12 }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATES_P12_PASSWORD }}
+
+      # - name: Cache Node Modules
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: |
+      #       **/node_modules
+      #     key: ${{ runner.os }}-node-modules
+
+      - name: Fetch deps
+        run: pnpm install --frozen-lockfile --config.supportedArchitectures.os=darwin --config.supportedArchitectures.cpu=arm64 && pnpm rebuild:all
+        working-directory: ./static
+
+      - name: Build/Release Electron App for arm64
+        run: pnpm electron:make-macos-arm64
+        working-directory: ./static
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID_EMAIL }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Verify packaged embedding sidecar
+        run: test -f static/dist/mac-arm64/Logseq.app/Contents/Resources/sidecar/embedding_server.py
+
+      - name: Save arm64 artifacts
+        run: |
+          mkdir -p builds
+          cp static/VERSION              ./builds/VERSION
+          mv static/dist/*.dmg           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.dmg
+          mv static/dist/*.zip           ./builds/Logseq-darwin-arm64-${{ steps.ref.outputs.version }}.zip
+          mv static/dist/*.blockmap      ./builds/
+          mv static/dist/latest-mac.yml  ./builds/latest-arm64-mac.yml
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logseq-darwin-arm64-builds
+          path: builds
+
+  # reuse workflow via workflow_call
+  build-android:
+    uses: ./.github/workflows/build-android.yml
+    if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-android == 'true') && github.ref_name != 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref != 'release/2.0.1-selfhost.7' }}
+    with:
+      build-target: "${{ github.event.inputs.build-target }}"
+      # if scheduled, use production mode
+      enable-file-sync-production: "${{ github.event_name == 'schedule' || github.event.inputs.enable-file-sync-production == 'true' }}"
+    secrets:
+      ANDROID_KEYSTORE: "${{ secrets.ANDROID_KEYSTORE }}"
+      ANDROID_KEYSTORE_PASSWORD: "${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+      SENTRY_AUTH_TOKEN: "${{ secrets.SENTRY_AUTH_TOKEN }}"
+
+  resolve-release-source:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      source-ref: ${{ steps.source.outputs.ref }}
+      source-sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Resolve requested release source once
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Freeze requested release source
+        id: source
+        run: |
+          test "$GITHUB_REF_NAME" = 'release/2.0.1-selfhost.7'
+          echo "ref=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  source-preflight:
+    needs: [ resolve-release-source ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out exact release workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release-source.outputs.source-sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure and Babashka
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Install frozen dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir deps/db-sync install --frozen-lockfile
+          mkdir -p static
+          cp resources/package.json resources/pnpm-lock.yaml static/
+          pnpm --dir static install --frozen-lockfile --ignore-workspace
+
+      - name: Run the same RTC prepush gate used by local rehearsal
+        run: pnpm rtc:prepush
+
+  release-source-gate:
+    needs: [ resolve-release-source, source-preflight ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      source-ref: ${{ needs.resolve-release-source.outputs.source-ref }}
+      source-sha: ${{ needs.resolve-release-source.outputs.source-sha }}
+    steps:
+      - name: Confirm exact selected source after preflight
+        env:
+          SOURCE_REF: ${{ needs.resolve-release-source.outputs.source-ref }}
+          SOURCE_SHA: ${{ needs.resolve-release-source.outputs.source-sha }}
+        run: |
+          test "$SOURCE_REF" = 'release/2.0.1-selfhost.7'
+          test -n "$SOURCE_SHA"
+
+  rtc-browser-e2e:
+    needs: [ resolve-release-source ]
+    uses: ./.github/workflows/clj-rtc-e2e.yml
+    with:
+      source-ref: ${{ needs.resolve-release-source.outputs.source-sha }}
+    secrets:
+      SELFHOST_SYNC_SERVER_URL: ${{ secrets.SELFHOST_SYNC_SERVER_URL }}
+
+  compile-cljs:
+    needs: [ release-source-gate, rtc-browser-e2e ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out exact selected release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-source-gate.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Bind exact source and release version
+        run: |
+          test "$(git rev-parse HEAD)" = "${{ needs.release-source-gate.outputs.source-sha }}"
+          node scripts/selfhost6/set-candidate-version.mjs --version "${SELFHOST6_TARGET_VERSION}"
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Setup Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Install pinned opam and OCaml
+        shell: bash
+        run: |
+          opam_dir="$RUNNER_TEMP/selfhost6-opam"
+          opam_bin="$opam_dir/opam"
+          mkdir -p "$opam_dir"
+          curl --fail --location --silent --show-error \
+            "https://github.com/ocaml/opam/releases/download/${OPAM_VERSION}/opam-${OPAM_VERSION}-x86_64-linux" \
+            --output "$opam_bin"
+          echo "${OPAM_X86_64_LINUX_SHA512}  ${opam_bin}" | sha512sum --check --strict
+          chmod +x "$opam_bin"
+          echo "$opam_dir" >> "$GITHUB_PATH"
+          "$opam_bin" init --bare --disable-sandboxing --yes \
+            default git+https://github.com/ocaml/opam-repository.git
+          "$opam_bin" switch create . "ocaml-base-compiler.${OCAML_VERSION}" --yes
+
+      - name: Compile the release desktop owners
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir cli install --frozen-lockfile --ignore-workspace
+          opam install ./cli --deps-only --with-test --yes
+          pnpm exec gulp build
+          pnpm cljs:release-electron
+          pnpm db-worker-node:bundle
+          opam exec -- pnpm cli:release
+          pnpm webpack-app-build
+          pnpm desktop:prepare-runtime-js
+          node -e 'const fs=require("fs"); const p="static/package.json"; const x=JSON.parse(fs.readFileSync(p)); x.version=process.env.SELFHOST6_TARGET_VERSION; fs.writeFileSync(p, JSON.stringify(x,null,2)+"\n")'
+
+      - name: Upload compiled desktop tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost6-static-${{ env.SELFHOST6_TARGET_VERSION }}-${{ needs.release-source-gate.outputs.source-sha }}
+          path: static
+          include-hidden-files: true
+          if-no-files-found: error
+
+  selfhost-build-platform:
+    name: build-${{ matrix.id }}
+    needs: [ compile-cljs, release-source-gate ]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: darwin-x64
+            runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - id: darwin-arm64
+            runner: macos-14
+            platform: darwin
+            arch: arm64
+          - id: win32-x64
+            runner: windows-latest
+            platform: win32
+            arch: x64
+          - id: win32-arm64
+            runner: windows-11-arm
+            platform: win32
+            arch: arm64
+          - id: linux-x64
+            runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+          - id: linux-arm64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out exact selected release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-source-gate.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Check out qualification tool from this workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: selfhost6-qualification-tools
+          sparse-checkout: scripts/selfhost6/platform-sqlite-swap.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download compiled desktop tree
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost6-static-${{ env.SELFHOST6_TARGET_VERSION }}-${{ needs.release-source-gate.outputs.source-sha }}
+          path: static
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Install packaged runtime dependencies
+        working-directory: static
+        run: pnpm install --frozen-lockfile --ignore-workspace
+
+      - name: Build macOS release package
+        if: matrix.platform == 'darwin'
+        working-directory: static
+        run: ${{ matrix.arch == 'arm64' && 'pnpm electron:make-unsigned --mac dmg zip --arm64' || 'pnpm electron:make-unsigned --mac dmg zip --x64' }}
+        env:
+          SELFHOST6_SOURCE_FULL_SHA: ${{ needs.release-source-gate.outputs.source-sha }}
+          SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
+          SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
+
+      - name: Verify packaged macOS main-process dependencies
+        if: matrix.platform == 'darwin'
+        shell: bash
+        run: |
+          app_path="$(find "${GITHUB_WORKSPACE}/static/dist" -maxdepth 2 -type d -name 'Logseq.app' -print -quit)"
+          test -n "$app_path"
+          ELECTRON_RUN_AS_NODE=1 "$app_path/Contents/MacOS/Logseq" \
+            -e 'require(process.argv[1] + "/node_modules/electron-log"); console.log("packaged-runtime-ok")' \
+            "$app_path/Contents/Resources/app.asar"
+
+      - name: Build Linux release package
+        if: matrix.platform == 'linux'
+        working-directory: static
+        run: ${{ matrix.arch == 'arm64' && 'pnpm electron:make-linux-arm64' || 'pnpm electron:make' }}
+        env:
+          SELFHOST6_SOURCE_FULL_SHA: ${{ needs.release-source-gate.outputs.source-sha }}
+          SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
+          SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
+
+      - name: Build Windows x64 release package
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        working-directory: static
+        run: pnpm electron:make-unsigned --win nsis zip --${{ matrix.arch }}
+        env:
+          SELFHOST6_SOURCE_FULL_SHA: ${{ needs.release-source-gate.outputs.source-sha }}
+          SELFHOST6_TARGET_PLATFORM: ${{ matrix.platform }}
+          SELFHOST6_TARGET_ARCH: ${{ matrix.arch }}
+
+      - name: Normalize Unix release input
+        if: matrix.platform != 'win32'
+        shell: bash
+        run: |
+          mkdir -p release-input
+          cp static/updater/TARGET_BUILD_MANIFEST.json release-input/TARGET_BUILD_MANIFEST.json
+          if [ "${{ matrix.platform }}" = darwin ]; then
+            base="Logseq-darwin-${{ matrix.arch }}-${SELFHOST6_TARGET_VERSION}"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip' -print -quit)" "release-input/${base}.zip"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.dmg' -print -quit)" "release-input/${base}.dmg"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip.blockmap' -print -quit)" "release-input/${base}.zip.blockmap"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.dmg.blockmap' -print -quit)" "release-input/${base}.dmg.blockmap"
+            cp static/dist/latest-mac.yml release-input/native-update.yml
+          else
+            linux_arch="${{ matrix.arch }}"
+            if [ "$linux_arch" = x64 ]; then linux_arch=x86_64; fi
+            base="Logseq-linux-${linux_arch}-${SELFHOST6_TARGET_VERSION}"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.AppImage' -print -quit)" "release-input/${base}.AppImage"
+            cp "$(find static/dist -maxdepth 1 -type f -name '*.zip' -print -quit)" "release-input/${base}.zip"
+            cp "$(find static/dist -maxdepth 1 -type f -name 'latest-linux*.yml' -print -quit)" release-input/native-update.yml
+          fi
+
+      - name: Normalize Windows release input
+        if: matrix.platform == 'win32'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory release-input
+          Copy-Item static/updater/TARGET_BUILD_MANIFEST.json release-input/TARGET_BUILD_MANIFEST.json
+          $base = "Logseq-win-${{ matrix.arch }}-${env:SELFHOST6_TARGET_VERSION}"
+          Copy-Item (Get-ChildItem static/dist/*-nsis.exe | Select-Object -First 1) "release-input/${base}-nsis.exe"
+          Copy-Item (Get-ChildItem static/dist/*-nsis.exe.blockmap | Select-Object -First 1) "release-input/${base}-nsis.exe.blockmap"
+          Copy-Item (Get-ChildItem static/dist/*.zip | Select-Object -First 1) "release-input/${base}.zip"
+          Copy-Item static/dist/latest.yml release-input/native-update.yml
+
+      - name: Qualify native SQLite WAL swap boundary
+        shell: bash
+        run: |
+          node selfhost6-qualification-tools/scripts/selfhost6/platform-sqlite-swap.mjs \
+            --platform "${{ matrix.platform }}" \
+            --arch "${{ matrix.arch }}" \
+            --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" \
+            --output release-input/PLATFORM_SQLITE_SWAP_RECEIPT.json
+
+      - name: Upload unsigned release input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost6-unsigned-${{ matrix.id }}-${{ env.SELFHOST6_TARGET_VERSION }}-${{ needs.release-source-gate.outputs.source-sha }}
+          path: release-input
+          if-no-files-found: error
+
+  selfhost-release-signing:
+    needs: [ selfhost-build-platform, release-source-gate ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: selfhost-release-signing
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out exact selected release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-source-gate.outputs.source-sha }}
+          persist-credentials: false
+
+      - name: Download all six platform release inputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: selfhost6-unsigned-*-${{ env.SELFHOST6_TARGET_VERSION }}-${{ needs.release-source-gate.outputs.source-sha }}
+          path: unsigned
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Sign immutable artifact descriptors
+        shell: bash
+        env:
+          LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64: ${{ secrets.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 }}
+        run: |
+          mkdir -p signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.zip --target-manifest unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.zip --target-manifest unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.dmg --target-manifest unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.dmg --target-manifest unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}-nsis.exe --target-manifest unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-arm64-${SELFHOST6_TARGET_VERSION}-nsis.exe --target-manifest unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch arm64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch x64 --output-directory signed
+          node scripts/selfhost6/prepare-update-artifact.mjs --archive unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.AppImage --target-manifest unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/TARGET_BUILD_MANIFEST.json --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" --target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch arm64 --output-directory signed
+
+      - name: Retain native packages, blockmaps, and release-local metadata
+        shell: bash
+        run: |
+          cp unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/*.blockmap signed/
+          cp unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          cp unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-win-arm64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          cp unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          cp unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.zip signed/
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-x64-mac.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch x64 --descriptors signed/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json signed/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.dmg.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-arm64-mac.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform darwin --arch arm64 --descriptors signed/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json signed/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.dmg.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-x64.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch x64 --descriptors signed/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}-nsis.exe.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-arm64.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform win32 --arch arm64 --descriptors signed/Logseq-win-arm64-${SELFHOST6_TARGET_VERSION}-nsis.exe.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-linux.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch x64 --descriptors signed/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json
+          node scripts/selfhost6/finalize-traditional-update-metadata.mjs --metadata-input unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/native-update.yml --artifact-directory signed --output signed/selfhost-official-architecture-v1-linux-arm64.yml --expected-target-version "${SELFHOST6_TARGET_VERSION}" --platform linux --arch arm64 --descriptors signed/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json
+          printf '%s\n' "${SELFHOST6_TARGET_VERSION}" > signed/VERSION
+          printf '%s\n' "${{ needs.release-source-gate.outputs.source-sha }}" > signed/SOURCE_REVISION
+          (cd signed && sha256sum $(find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' | sort) > SHA256SUMS.txt)
+
+      - name: Bind native platform qualification receipts
+        shell: bash
+        run: |
+          mkdir -p signed/qualification-receipts
+          cp unsigned/selfhost6-unsigned-darwin-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/PLATFORM_SQLITE_SWAP_RECEIPT.json signed/qualification-receipts/darwin-x64.json
+          cp unsigned/selfhost6-unsigned-darwin-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/PLATFORM_SQLITE_SWAP_RECEIPT.json signed/qualification-receipts/darwin-arm64.json
+          cp unsigned/selfhost6-unsigned-win32-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/PLATFORM_SQLITE_SWAP_RECEIPT.json signed/qualification-receipts/win32-x64.json
+          cp unsigned/selfhost6-unsigned-win32-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/PLATFORM_SQLITE_SWAP_RECEIPT.json signed/qualification-receipts/win32-arm64.json
+          cp unsigned/selfhost6-unsigned-linux-x64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/PLATFORM_SQLITE_SWAP_RECEIPT.json signed/qualification-receipts/linux-x64.json
+          cp unsigned/selfhost6-unsigned-linux-arm64-${SELFHOST6_TARGET_VERSION}-${{ needs.release-source-gate.outputs.source-sha }}/PLATFORM_SQLITE_SWAP_RECEIPT.json signed/qualification-receipts/linux-arm64.json
+
+      - name: Upload finalized release asset set
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: signed
+          if-no-files-found: error
+          retention-days: 14
+
+  selfhost-release-verifier:
+    needs: [ selfhost-release-signing, release-source-gate ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      product-source-sha: ${{ needs.release-source-gate.outputs.source-sha }}
+      product-version: ${{ env.SELFHOST6_TARGET_VERSION }}
+      release-line-id: ${{ steps.identity.outputs.release-line-id }}
+    steps:
+      - name: Check out exact independent verifier
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download finalized release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: release-assets
+
+      - name: Independently verify every newly built archive, descriptor, and platform receipt
+        run: |
+          node scripts/selfhost6/verify-built-release.mjs \
+            --artifact-directory release-assets \
+            --source-full-sha "${{ needs.release-source-gate.outputs.source-sha }}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}" \
+            --output release-verification/receipt.json
+
+      - name: Export immutable release identity
+        id: identity
+        run: echo "release-line-id=$(node -p 'require("./resources/updater/selfhost-release-policy.json").releaseLineId')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload independent verifier receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-release-verifier-${{ github.run_id }}
+          path: release-verification/receipt.json
+          if-no-files-found: error
+
+  selfhost-release:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.event.inputs.is-draft == 'true' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
+    needs: [ release-source-gate, selfhost-release-verifier ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: selfhost-production
+    concurrency:
+      group: selfhost-release-selfhost-official-architecture-v1
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out exact release promotion tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-source-gate.outputs.source-sha }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Download verified finalized release artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-finalized-release-assets
+          path: release-assets
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Reverify retained release bytes after qualification approval
+        run: |
+          node release-source/scripts/selfhost6/verify-built-release.mjs \
+            --artifact-directory release-assets \
+            --source-full-sha "${{ needs.selfhost-release-verifier.outputs.product-source-sha }}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}" \
+            --output release-final-verification/receipt.json
+
+      - name: Verify the frozen Draft before replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+          SELFHOST_DRAFT_TARGET_FULL_SHA: ${{ secrets.SELFHOST_DRAFT_TARGET_FULL_SHA }}
+          SELFHOST_DRAFT_ASSET_INVENTORY_SHA256: ${{ secrets.SELFHOST_DRAFT_ASSET_INVENTORY_SHA256 }}
+          SELFHOST_DRAFT_ASSET_INVENTORY_JSON: ${{ secrets.SELFHOST_DRAFT_ASSET_INVENTORY_JSON }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-draft-tag-refs-before.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-releases-before.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Release inventory could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            > "${RUNNER_TEMP}/selfhost-draft-before.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Frozen Draft could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-draft-assets-before.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Frozen Draft assets could not be read"
+            exit 1
+          fi
+          node release-source/scripts/selfhost6/verify-draft-release.mjs \
+            --phase before \
+            --release-json "${RUNNER_TEMP}/selfhost-draft-before.json" \
+            --assets-json "${RUNNER_TEMP}/selfhost-draft-assets-before.json" \
+            --tag-refs-json "${RUNNER_TEMP}/selfhost-draft-tag-refs-before.json" \
+            --release-list-json "${RUNNER_TEMP}/selfhost-releases-before.json" \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${SELFHOST_DRAFT_TARGET_FULL_SHA}" \
+            --replacement-source-full-sha "${{ needs.selfhost-release-verifier.outputs.product-source-sha }}" \
+            --artifact-directory release-assets \
+            --delete-list-output "${RUNNER_TEMP}/selfhost-draft-obsolete-asset-ids.txt" \
+            --target-version "${SELFHOST6_TARGET_VERSION}" \
+            --expected-inventory-sha256 "${SELFHOST_DRAFT_ASSET_INVENTORY_SHA256}"
+
+      - name: Remove only obsolete assets from the verified Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          while IFS= read -r asset_id; do
+            if [ -n "$asset_id" ]; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" >/dev/null
+            fi
+          done < "${RUNNER_TEMP}/selfhost-draft-obsolete-asset-ids.txt"
+
+      - name: Create the reviewed release as a draft
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/VERSION
+            release-assets/SOURCE_REVISION
+            release-assets/SHA256SUMS.txt
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.blockmap
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.selfhost6.json
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.blockmap
+            release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.blockmap
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.dmg.selfhost6.json
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.blockmap
+            release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
+            release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
+            release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
+            release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
+            release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
+            release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.blockmap
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.selfhost6.json
+            release-assets/Logseq-win-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.blockmap
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.selfhost6.json
+            release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            release-assets/selfhost-official-architecture-v1-arm64-mac.yml
+            release-assets/selfhost-official-architecture-v1-arm64.yml
+            release-assets/selfhost-official-architecture-v1-linux-arm64.yml
+            release-assets/selfhost-official-architecture-v1-linux.yml
+            release-assets/selfhost-official-architecture-v1-x64-mac.yml
+            release-assets/selfhost-official-architecture-v1-x64.yml
+          tag_name: ${{ env.SELFHOST6_TARGET_VERSION }}
+          target_commitish: ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}
+          name: Logseq ${{ env.SELFHOST6_TARGET_VERSION }}
+          body: Source commit ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}.
+          draft: true
+          prerelease: false
+          make_latest: false
+          fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Bind and verify the exact reviewed Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+          EXPECTED_SOURCE_FULL_SHA: ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}
+        run: |
+          if ! gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            -f tag_name="${SELFHOST6_TARGET_VERSION}" \
+            -f target_commitish="${EXPECTED_SOURCE_FULL_SHA}" \
+            -f name="Logseq ${SELFHOST6_TARGET_VERSION}" \
+            -f body="Source commit ${EXPECTED_SOURCE_FULL_SHA}." \
+            -F draft=true \
+            -F prerelease=false \
+            -f make_latest=false >/dev/null 2>&1; then
+            echo "::error title=DraftBindFailed::Frozen Draft could not be bound"
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-draft-tag-refs-after.json"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-releases-after.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Release inventory could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            > "${RUNNER_TEMP}/selfhost-draft-after.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Bound Draft could not be read"
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-draft-assets-after.json" 2>/dev/null; then
+            echo "::error title=DraftReadFailed::Bound Draft assets could not be read"
+            exit 1
+          fi
+          node release-source/scripts/selfhost6/verify-draft-release.mjs \
+            --phase after \
+            --release-json "${RUNNER_TEMP}/selfhost-draft-after.json" \
+            --assets-json "${RUNNER_TEMP}/selfhost-draft-assets-after.json" \
+            --tag-refs-json "${RUNNER_TEMP}/selfhost-draft-tag-refs-after.json" \
+            --release-list-json "${RUNNER_TEMP}/selfhost-releases-after.json" \
+            --artifact-directory release-assets \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${EXPECTED_SOURCE_FULL_SHA}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}"
+
+  selfhost-release-bridge:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'bridge-published-.7' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: selfhost-production
+    concurrency:
+      group: selfhost-release-selfhost-official-architecture-v1
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Check out exact published release tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download and verify the published latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+        run: |
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-published-release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
+            > "${RUNNER_TEMP}/selfhost-latest-release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/selfhost-published-tag-refs.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-published-releases.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${RUNNER_TEMP}/selfhost-published-assets.json"
+          mkdir published-release-assets
+          gh release download "${SELFHOST6_TARGET_VERSION}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir published-release-assets
+          node scripts/selfhost6/verify-draft-release.mjs \
+            --phase published \
+            --release-json "${RUNNER_TEMP}/selfhost-published-release.json" \
+            --latest-release-json "${RUNNER_TEMP}/selfhost-latest-release.json" \
+            --assets-json "${RUNNER_TEMP}/selfhost-published-assets.json" \
+            --tag-refs-json "${RUNNER_TEMP}/selfhost-published-tag-refs.json" \
+            --release-list-json "${RUNNER_TEMP}/selfhost-published-releases.json" \
+            --artifact-directory published-release-assets \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${GITHUB_SHA}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}"
+
+      - name: Stage the one-time .6 bridge pointers
+        run: |
+          node scripts/selfhost6/promote-update-feed.mjs \
+            --artifact-directory published-release-assets \
+            --output-directory bridge-pointers \
+            --expected-target-version "${SELFHOST6_TARGET_VERSION}" \
+            --descriptors \
+            published-release-assets/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json \
+            published-release-assets/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json \
+            published-release-assets/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json \
+            published-release-assets/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json \
+            published-release-assets/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}-nsis.exe.selfhost6.json
+
+      - name: Promote exactly five updater assets and four pointers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_EXISTING_RELEASE_ID: ${{ secrets.SELFHOST_EXISTING_RELEASE_ID }}
+          SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA }}
+          SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA }}
+          SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA }}
+        run: |
+          node scripts/selfhost6/promote-existing-release.mjs \
+            --artifact-directory published-release-assets \
+            --pointer-directory bridge-pointers \
+            --release-line-id selfhost-official-architecture-v1 \
+            --expected-source-full-sha "${GITHUB_SHA}" \
+            --expected-version "${SELFHOST6_TARGET_VERSION}" \
+            --receipt "${RUNNER_TEMP}/selfhost6-bridge-receipt.json"
+
+  nightly-release:
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.build-target == 'nightly' }}
+    needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download MacOS x64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-darwin-x64-builds
+          path: ./
+
+      - name: Download MacOS arm64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-darwin-arm64-builds
+          path: ./
+
+      - name: Download The Linux x64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-linux-x64-builds
+          path: ./
+
+      - name: Download The Linux arm64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-linux-arm64-builds
+          path: ./
+
+      - name: Download The Windows Artifact x64
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-win-x64-builds
+          path: ./
+
+      - name: Download The Windows Artifact arm64
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-win-arm64-builds
+          path: ./
+
+      - name: Download Android Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-android-builds
+          path: ./
+
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum *-darwin-* > SHA256SUMS.txt
+          sha256sum *-win-* >> SHA256SUMS.txt
+          sha256sum *-linux-* >> SHA256SUMS.txt
+          sha256sum *.apk >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: List files
+        run: ls -rl
+
+      - name: Update Nightly Release
+        uses: andelf/nightly-release@5834076edc55cc05975561c9722043f072ac5c26 # main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: nightly
+          name: 'Desktop app Nightly Release $$'
+          draft: false
+          prerelease: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.is-pre-release) || (github.event_name == 'schedule')}}
+          body: |
+            This is a nightly release of the Logseq desktop app.
+            It's unstable compared to the official releases, **use it with caution**!
+          files: |
+            ./SHA256SUMS.txt
+            ./*.zip
+            ./*.dmg
+            ./*.exe
+            ./*.yml
+            ./*.blockmap
+            ./*.AppImage
+            ./*.apk
+
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
+    needs: [ build-macos-x64, build-macos-arm64, build-linux-x64, build-linux-arm64, build-windows-x64, build-windows-arm64 ]
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.ref.outputs.version }}
+    steps:
+      - name: Download MacOS x64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-darwin-x64-builds
+          path: ./
+
+      - name: Download MacOS arm64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-darwin-arm64-builds
+          path: ./
+
+      - name: Download The Linux x64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-linux-x64-builds
+          path: ./
+
+      - name: Download The Linux arm64 Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-linux-arm64-builds
+          path: ./
+
+      - name: Download The Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-win-x64-builds
+          path: ./
+
+      - name: Download The Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: logseq-win-arm64-builds
+          path: ./
+
+      - name: Download Android Artifacts
+        uses: actions/download-artifact@v4
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.build-android == 'true' }}
+        with:
+          name: logseq-android-builds
+          path: ./
+
+      - name: List files
+        run: ls -rl
+
+      - name: Retrieve tag version
+        id: ref
+        run: |
+          pkgver=$(cat VERSION)
+          echo "version=$pkgver" >> $GITHUB_OUTPUT
+
+      - name: Generate SHA256 checksums
+        run: |
+          sha256sum *-darwin-* > SHA256SUMS.txt
+          sha256sum *-win-* >> SHA256SUMS.txt
+          sha256sum *-linux-* >> SHA256SUMS.txt
+          sha256sum *.apk >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release Draft
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.ref.outputs.version }}
+          name: ${{ github.event.inputs.build-target == 'beta' && format('Desktop APP {0} (Beta Testing)', steps.ref.outputs.version) || format('Desktop APP {0}', steps.ref.outputs.version) }}
+          body: "TODO: Fill this changelog. Sorry for the inconvenience!"
+          draft: ${{ github.event.inputs.is-draft }}
+          prerelease: ${{ github.event.inputs.is-pre-release }}
+          files: |
+            ./VERSION
+            ./SHA256SUMS.txt
+            ./*.zip
+            ./*.dmg
+            ./*.exe
+            ./*.yml
+            ./*.blockmap
+            ./*.AppImage
+            ./*.apk
+
+  trigger-flathub-release:
+    runs-on: ubuntu-22.04
+    needs: [ release ]
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish-linux-stores == 'true' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
+    steps:
+      - name: Trigger Flathub release
+        run: |
+          if [ -z "${FLATHUB_WORKFLOW_TOKEN:-}" ]; then
+            echo "::error title=CheckFail::FLATHUB_WORKFLOW_TOKEN is required to trigger Flathub release"
+            exit 1
+          fi
+
+          if [ "${BUILD_TARGET}" = "stable" ]; then
+            flathub_ref=master
+          else
+            flathub_ref=beta
+          fi
+
+          payload=$(jq -n \
+            --arg ref "$flathub_ref" \
+            --arg version "$VERSION" \
+            '{ref: $ref, inputs: {force: true, version: $version}}')
+
+          response=$(mktemp)
+          status=$(curl -sS -o "$response" -w "%{http_code}" -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${FLATHUB_WORKFLOW_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/flathub/com.logseq.Logseq/actions/workflows/update.yml/dispatches \
+            -d "$payload") || status=000
+
+          echo "Flathub dispatch returned HTTP ${status}"
+          if [ -s "$response" ]; then
+            cat "$response"
+          fi
+
+          if [ "$status" != "204" ]; then
+            echo "::error title=FlathubDispatchFailed::Failed to trigger Flathub release workflow"
+            exit 1
+          fi
+        env:
+          BUILD_TARGET: ${{ github.event.inputs.build-target }}
+          VERSION: ${{ needs.release.outputs.version }}
+          FLATHUB_WORKFLOW_TOKEN: ${{ secrets.FLATHUB_WORKFLOW_TOKEN }}
+
+  publish-linux-snap:
+    runs-on: ubuntu-22.04
+    needs: [ release ]
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish-linux-stores == 'true' && (github.event.inputs.build-target == 'beta' || github.event.inputs.build-target == 'stable') }}
+    steps:
+      - name: Download The Static Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: static
+          path: .
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Publish Snap
+        run: |
+          if [ -z "${SNAPCRAFT_STORE_CREDENTIALS:-}" ]; then
+            echo "::error title=CheckFail::SNAPCRAFT_STORE_CREDENTIALS is required to publish snap"
+            exit 1
+          fi
+
+          if [ "${BUILD_TARGET}" = "stable" ]; then
+            snap_grade=stable
+            snap_channel=stable
+          else
+            snap_grade=devel
+            snap_channel=beta
+          fi
+
+          printf '%s\n' \
+            'extends: ./electron-builder.yml' \
+            'snap:' \
+            "  grade: ${snap_grade}" \
+            '  publish:' \
+            '    provider: snapStore' \
+            '    channels:' \
+            "      - ${snap_channel}" \
+            > electron-builder.snap.yml
+
+          pnpm install --frozen-lockfile
+          pnpm electron:publish-snap -- --config electron-builder.snap.yml
+        working-directory: ./static
+        env:
+          BUILD_TARGET: ${{ github.event.inputs.build-target }}
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}

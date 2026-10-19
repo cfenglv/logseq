@@ -1,0 +1,47 @@
+;; Used by shadow-cljs
+electron.core/main
+electron.core/start
+electron.core/stop
+;; Used by shadow-cljs
+frontend.core/stop
+;; For repl
+frontend.db.utils/q
+;; For debugging
+frontend.debug/defn
+frontend.debug/print
+;; Lazily loaded
+frontend.extensions.code/editor
+;; Protocol fn wrapper that could be used
+frontend.fs/readdir
+;; Used in macro
+frontend.handler.user/<ensure-id&access-token
+;; Referenced in comment
+frontend.image/get-orientation
+;; placeholder fn
+frontend.publishing/stop
+;; For debugging
+frontend.util/d
+;; Test runners used by shadow
+frontend.test.node-test-runner/main
+frontend.test.frontend-node-test-runner/main
+;; Public adapter API asserted by remove_ui_db_test
+frontend.modules.outliner.tree/filter-top-level-blocks
+;; For debugging
+frontend.db.model/get-all-classes
+;; Initial loaded
+frontend.ui/_emoji-init-data
+;; Used by shadow.cljs
+frontend.worker.db-worker/init
+;; Used by shadow.cljs (node entrypoint)
+frontend.worker.db-worker-node/main
+;; Future use?
+frontend.worker.rtc.hash/hash-blocks
+;; Repl fn
+frontend.rum/use-atom-in
+;; missionary utils
+frontend.common.missionary/<!
+;; only used in deps/common
+frontend.common.missionary/background-task-running?
+;; defonce
+mobile.components.popup/native-sheet-listener
+mobile.bottom-tabs/add-tab-listeners!

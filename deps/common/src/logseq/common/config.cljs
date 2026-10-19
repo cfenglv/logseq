@@ -1,0 +1,142 @@
+(ns logseq.common.config
+  "Common config constants and fns that are shared between deps and app"
+  (:require [clojure.string :as string]))
+
+(goog-define PUBLISHING false)
+
+(defn hidden?
+  [path patterns]
+  (let [path (if (and (string? path)
+                      (= \/ (first path)))
+               (subs path 1)
+               path)]
+    (some (fn [pattern]
+            (let [pattern (if (and (string? pattern)
+                                   (not= \/ (first pattern)))
+                            (str "/" pattern)
+                            pattern)]
+              (string/starts-with? (str "/" path) pattern))) patterns)))
+
+(defn remove-hidden-files
+  "Removes files that match a pattern specified by :hidden config"
+  [files config get-path-fn]
+  (if-let [patterns (seq (:hidden config))]
+    (remove (fn [file]
+              (let [path (get-path-fn file)]
+                (hidden? path patterns))) files)
+    files))
+
+(def app-name "logseq")
+
+(defonce asset-protocol "assets://")
+
+(defonce db-version-prefix "logseq_db_")
+(defonce file-version-prefix "logseq_local_")
+
+(defn strip-leading-db-version-prefix
+  "Trim `s` and strip exactly one leading db prefix for display values."
+  [s]
+  (if (string? s)
+    (let [trimmed (string/trim s)]
+      (string/trim
+       (if (string/starts-with? trimmed db-version-prefix)
+         (subs trimmed (count db-version-prefix))
+         trimmed)))
+    s))
+
+(defn canonicalize-db-version-repo
+  "Trim a repo/graph name and normalize it to exactly one leading db prefix."
+  [s]
+  (when-let [trimmed (some-> s str string/trim not-empty)]
+    (let [stripped (loop [graph-name trimmed]
+                     (if (string/starts-with? graph-name db-version-prefix)
+                       (recur (string/trim (subs graph-name (count db-version-prefix))))
+                       graph-name))]
+      (when (seq stripped)
+        (str db-version-prefix stripped)))))
+
+(defonce default-graphs-dir "~/logseq/graphs")
+(defonce local-assets-dir "assets")
+(defonce unlinked-graphs-dir "Unlinked graphs")
+
+(defonce favorites-page-name "$$$favorites")
+(defonce views-page-name "$$$views")
+(defonce library-page-name "Library")
+(defonce quick-add-page-name "Quick add")
+(defonce recycle-page-name "Recycle")
+
+(defn local-relative-asset?
+  [s]
+  (and (string? s)
+       (not (string/includes? s "://"))
+       (re-find (re-pattern (str "^[./]*" local-assets-dir)) s)))
+
+(defn local-protocol-asset?
+  [s]
+  (when (string? s)
+    (string/starts-with? s asset-protocol)))
+
+(defn protocol-path?
+  [s]
+  (try
+    (let [url (js/URL. s)]
+      (some? (.-protocol url)))
+    (catch :default _
+      false)))
+
+(defn remove-asset-protocol
+  [s]
+  (if (local-protocol-asset? s)
+    (-> s
+        (string/replace-first asset-protocol "file://"))
+    s))
+
+(defn text-formats
+  []
+  #{:json :org :md :yml :dat :asciidoc :rst :txt :markdown :adoc :html :js :ts :edn :clj :ml :rb :ex :erl :java :php :c :css
+    :tldr :sh})
+
+(defn img-formats
+  []
+  #{:gif :svg :jpeg :ico :png :jpg :bmp :webp :avif :cr2 :jxl})
+
+(defonce block-pattern "-")
+
+(def unused-in-db-graphs-deprecation
+  "is not used in DB graphs")
+
+(def file-only-config
+  "File only config keys that are deprecated in DB graphs along with
+  descriptions for their deprecation."
+  (merge
+   (zipmap
+    [:file/name-format
+     :file-sync/ignore-files
+     :hidden
+     :ignored-page-references-keywords
+     :journal/file-name-format
+     :journal/page-title-format
+     :journals-directory
+     :logbook/settings
+     :org-mode/insert-file-link?
+     :pages-directory
+     :preferred-workflow
+     :property/separated-by-commas
+     :property-pages/excludelist
+     :srs/learning-fraction
+     :srs/initial-interval
+     :whiteboards-directory
+     :feature/enable-whiteboards?]
+    (repeat unused-in-db-graphs-deprecation))
+   {:preferred-format
+    "is not used in DB graphs as there is only markdown mode."
+    :property-pages/enabled?
+    "is not used in DB graphs as all properties have pages"
+    :block-hidden-properties
+    "is not used in DB graphs as hiding a property is done in its configuration"
+    :feature/enable-block-timestamps?
+    "is not used in DB graphs as it is always enabled"
+    :favorites
+    "is not stored in config for DB graphs"
+    :default-templates
+    "is replaced by #Template and the `Apply template to tags` property"}))

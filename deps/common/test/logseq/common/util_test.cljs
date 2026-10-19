@@ -1,0 +1,82 @@
+(ns logseq.common.util-test
+  (:require [clojure.test :refer [deftest are testing is]]
+            [logseq.common.util :as common-util]))
+
+(deftest valid-edn-keyword?
+  (are [x y]
+       (= (common-util/valid-edn-keyword? x) y)
+
+    ":foo-bar"  true
+    ":foo!"     true
+    ":foo,bar"  false
+    "4"         false
+    "foo bar"   false
+    "`property" false))
+
+(deftest extract-file-extension?
+  (are [x y]
+       (= (common-util/path->file-ext x) y)
+    "foo.bar" "bar"
+    "foo"     nil
+    "foo.bar.baz" "baz"
+    "../assets/audio.mp3" "mp3"
+       ;; From https://www.w3.org/TR/media-frags/
+    "../assets/audio.mp3?t=10,20" "mp3"
+    "../assets/audio.mp3?t=10,20#t=10" "mp3"
+    "/root/Documents/audio.mp3" "mp3"
+    "C:\\Users\\foo\\Documents\\audio.mp3" "mp3"
+    "/root/Documents/audio" nil
+    "/root/Documents/audio." nil
+    "special/characters/aäääöüß.7z" "7z"
+    "asldk lakls .lsad" "lsad"
+    "中文asldk lakls .lsad" "lsad"))
+
+(deftest url?
+  (are [x y]
+       (= (common-util/url? x) y)
+    "http://logseq.com" true
+    "prop:: value" false
+    "a:" false))
+
+(deftest escape-regex-chars
+  (testing "ensure the result is a valid regex string"
+    (are [x]
+         (some? (re-find (re-pattern  (common-util/escape-regex-chars x)) x))
+      "[[page-name]]"
+      "end-with-backslash\\"
+      "\\[]{}().+*?|$^")))
+
+(deftest safe-subs
+  (testing "behaves like subs for in-range indices"
+    (are [args y]
+         (= (apply common-util/safe-subs args) y)
+      ["hello" 1 3] "el"
+      ["hello" 2]   "llo"
+      ["hello" 0 5] "hello"))
+  (testing "clamps out-of-range indices instead of throwing"
+    (are [args y]
+         (= (apply common-util/safe-subs args) y)
+      ["hello" 0 99]  "hello"
+      ["hello" 99 99] ""
+      ["hello" 99]    ""))
+  (testing "returns \"\" for a non-string instead of throwing"
+    (are [args y]
+         (= (apply common-util/safe-subs args) y)
+      [nil 0 0] ""
+      [nil 0 5] ""
+      [nil 0]   ""
+      [42 0 1]  "")))
+
+(deftest timestamp-ms
+  (testing "keeps positive epoch-ms numbers"
+    (is (= 1577934245000 (common-util/timestamp-ms 1577934245000))))
+  (testing "reads Date.getTime"
+    (is (= 1577934245000 (common-util/timestamp-ms (js/Date. "2020-01-02T03:04:05.000Z")))))
+  (testing "treats missing and non-positive values as absent"
+    (are [x] (nil? (common-util/timestamp-ms x))
+      nil
+      0
+      -1
+      (js/Date. 0)
+      "2020-01-02T03:04:05.000Z"
+      js/NaN)))

@@ -1,0 +1,722 @@
+(ns logseq.outliner.core-test
+  (:require [cljs.test :refer [deftest is testing]]
+            [datascript.core :as d]
+            [logseq.db :as ldb]
+            [logseq.db.test.helper :as db-test]
+            [logseq.outliner.core :as outliner-core]
+            [logseq.outliner.op :as outliner-op]
+            [logseq.outliner.page :as outliner-page]
+            [logseq.common.config :as common-config]
+            [logseq.common.util :as common-util]
+            [logseq.common.util.date-time :as date-time-util]
+            [logseq.common.uuid :as common-uuid]
+            [logseq.graph-parser.block :as gp-block]))
+
+(deftest insert-blocks-does-not-trust-stale-right-order
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "target"}
+                         {:block/title "original right"}]}])
+        target (db-test/find-block-by-content @conn "target")
+        stale-right-order (:block/order (db-test/find-block-by-content @conn "original right"))]
+    (outliner-core/insert-blocks!
+     conn
+     [{:block/uuid (random-uuid)
+       :block/title "concurrent right"}]
+     target
+     {:sibling? true
+      :keep-uuid? true})
+    (let [target (db-test/find-block-by-content @conn "target")
+          current-right (ldb/get-right-sibling target)
+          {:keys [blocks]} (outliner-core/insert-blocks
+                            @conn
+                            [{:block/uuid (random-uuid)
+                              :block/title "inserted"}]
+                            target
+                            {:sibling? true
+                             :keep-uuid? true
+                             :end-order-state [:known stale-right-order]})
+          inserted (first blocks)]
+      (is (= "concurrent right" (:block/title current-right)))
+      (is (neg? (compare (:block/order inserted) (:block/order current-right)))
+          "A stale renderer boundary must not place the new block after the current right sibling."))))
+
+(deftest insert-blocks-finds-right-order-on-1k-sibling-page
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks (mapv (fn [idx]
+                                {:block/title (str "block " idx)})
+                              (range 1000))}])
+        target (db-test/find-block-by-content @conn "block 0")
+        insert! #(outliner-core/insert-blocks
+                  @conn
+                  [{:block/uuid (random-uuid)
+                    :block/title "inserted"}]
+                  target
+                  {:sibling? true
+                   :keep-uuid? true})
+        _ (insert!)
+        started-at (.now js/performance)
+        {:keys [blocks]} (insert!)
+        elapsed-ms (- (.now js/performance) started-at)
+        right (ldb/get-right-sibling target)]
+    (is (neg? (compare (:block/order (first blocks)) (:block/order right))))
+    (is (< elapsed-ms 100)
+        (str "1k sibling insertion order lookup took " elapsed-ms "ms"))))
+
+(deftest blocks-with-level-handles-10k-deep-tree
+  (let [blocks (mapv (fn [id]
+                       {:db/id id
+                        :block/uuid (str id)
+                        :block/parent {:db/id (dec id)}})
+                     (range 1 10001))
+        started-at (.now js/performance)
+        result (outliner-core/blocks-with-level blocks)
+        elapsed-ms (- (.now js/performance) started-at)]
+    (is (= 1 (:block/level (first result))))
+    (is (= 10000 (:block/level (last result))))
+    (is (< elapsed-ms 250) (str "10k level calculation took " elapsed-ms "ms"))))
+
+(deftest existing-inline-class-uses-its-canonical-uuid
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"} :blocks []}])
+        class-uuid (random-uuid)
+        parsed-uuid (random-uuid)
+        ref {:block/type "page"
+             :block/name "existing"
+             :block/title "Existing"
+             :block/uuid parsed-uuid}
+        _ (d/transact! conn [{:db/ident :user.class/existing
+                              :block/name "existing"
+                              :block/title "Existing"
+                              :block/uuid class-uuid
+                              :block/tags :logseq.class/Tag}])
+        {:keys [block page-txs]}
+        (#'outliner-core/resolve-page-refs
+         @conn
+         {:block/title (str "#[[" parsed-uuid "]]")
+          :block/refs [ref]
+          :block/tags [ref]})]
+    (is (empty? page-txs))
+    (is (= (str "#[[" class-uuid "]]") (:block/title block)))
+    (is (= class-uuid (-> block :block/refs first :block/uuid)))
+    (is (= class-uuid (-> block :block/tags first :block/uuid)))))
+
+(defn- page-uuids-named
+  [db title]
+  (d/q '[:find [?uuid ...]
+         :in $ ?name
+         :where
+         [?e :block/name ?name]
+         [?e :block/uuid ?uuid]
+         [?e :block/tags :logseq.class/Page]]
+       db
+       (common-util/page-name-sanity-lc title)))
+
+(deftest insert-blocks-reuses-page-created-after-reference-parsing
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "host"}]}])
+        parsed-ref (gp-block/page-name->map "Esc Dup" @conn true
+                                            date-time-util/default-journal-title-formatter)
+        parsed-uuid (:block/uuid parsed-ref)
+        [_ existing-uuid] (outliner-page/create! conn "Esc Dup" {})
+        host (db-test/find-block-by-content @conn "host")
+        result (outliner-core/insert-blocks
+                @conn
+                [{:block/uuid (random-uuid)
+                  :block/title (str "[[" parsed-uuid "]]")
+                  :block/raw-title (str "[[" parsed-uuid "]]")
+                  :block/refs [parsed-ref]}]
+                host
+                {:sibling? true
+                 :keep-uuid? true})]
+    (d/transact! conn (:tx-data result))
+    (is (= [existing-uuid] (page-uuids-named @conn "Esc Dup")))
+    (is (= (str "[[" existing-uuid "]]")
+           (:block/title (first (:blocks result)))
+           (:block/raw-title (first (:blocks result)))))
+    (is (= existing-uuid
+           (:block/uuid (first (:block/refs (first (:blocks result)))))))))
+
+(deftest insert-blocks-reuses-page-when-ref-tags-are-a-scalar-keyword
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "host"}]}])
+        [_ existing-uuid] (outliner-page/create! conn "Esc Dup" {})
+        parsed-uuid (random-uuid)
+        host (db-test/find-block-by-content @conn "host")
+        result (outliner-core/insert-blocks
+                @conn
+                [{:block/uuid (random-uuid)
+                  :block/title (str "[[" parsed-uuid "]]")
+                  :block/raw-title (str "[[" parsed-uuid "]]")
+                  :block/refs [{:block/uuid parsed-uuid
+                                :block/title "Esc Dup"
+                                :block/name "esc dup"
+                                :block/tags :logseq.class/Page}]}]
+                host
+                {:sibling? true
+                 :keep-uuid? true})]
+    (d/transact! conn (:tx-data result))
+    (is (= [existing-uuid] (page-uuids-named @conn "Esc Dup")))
+    (is (= existing-uuid
+           (:block/uuid (first (:block/refs (first (:blocks result)))))))))
+
+(deftest insert-blocks-resolves-journal-class-tagged-refs
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "host"}]}])
+        journal-title "Dec 16th, 2024"
+        journal-day 20241216
+        canonical-uuid (common-uuid/gen-uuid :journal-page-uuid journal-day)
+        journal-ref (fn [page-uuid]
+                      {:block/uuid page-uuid
+                       :block/title journal-title
+                       :block/name (common-util/page-name-sanity-lc journal-title)
+                       :block/journal-day journal-day
+                       :block/tags [:logseq.class/Journal]})
+        host (db-test/find-block-by-content @conn "host")
+        insert-ref! (fn [page-uuid]
+                      (let [result (outliner-core/insert-blocks
+                                    @conn
+                                    [{:block/uuid (random-uuid)
+                                      :block/title (str "[[" page-uuid "]]")
+                                      :block/raw-title (str "[[" page-uuid "]]")
+                                      :block/refs [(journal-ref page-uuid)]}]
+                                    host
+                                    {:sibling? true
+                                     :keep-uuid? true})]
+                        (d/transact! conn (:tx-data result))
+                        result))]
+    (testing "creates a missing journal with the journal-day uuid"
+      (let [parsed-uuid (random-uuid)
+            result (insert-ref! parsed-uuid)
+            journal (ldb/get-journal-page-by-day @conn journal-day)]
+        (is (not= parsed-uuid canonical-uuid))
+        (is (= canonical-uuid (:block/uuid journal)))
+        (is (= 1 (count (d/datoms @conn :avet :block/journal-day journal-day))))
+        (is (= [:logseq.class/Journal] (map :db/ident (:block/tags journal))))
+        (is (= canonical-uuid
+               (:block/uuid (first (:block/refs (first (:blocks result)))))))))
+    (testing "reuses the existing journal instead of minting another uuid"
+      (let [parsed-uuid (random-uuid)
+            result (insert-ref! parsed-uuid)
+            journal (ldb/get-journal-page-by-day @conn journal-day)]
+        (is (= canonical-uuid (:block/uuid journal)))
+        (is (= 1 (count (d/datoms @conn :avet :block/journal-day journal-day))))
+        (is (= canonical-uuid
+               (:block/uuid (first (:block/refs (first (:blocks result)))))))))))
+
+(deftest insert-blocks-missing-uuid-refs-become-broken
+  ;; Both ref shapes produced for a uuid with no entity — a generated page map
+  ;; and a [:block/uuid id] lookup — are dropped, and the title keeps the uuid
+  ;; the user typed so it renders as a broken ref.
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "host"}]}])
+        missing-uuid (random-uuid)
+        missing-uuid-2 (random-uuid)
+        gen-uuid (random-uuid)
+        ;; mirrors the frontend parse of [[<uuid>]] when the entity doesn't exist
+        parsed-ref {:block/type "page"
+                    :block/name (str missing-uuid)
+                    :block/title (str missing-uuid)
+                    :block/uuid gen-uuid}
+        host (db-test/find-block-by-content @conn "host")
+        result (outliner-core/insert-blocks
+                @conn
+                [{:block/uuid (random-uuid)
+                  :block/title (str "a [[" gen-uuid "]] b ((" missing-uuid-2 "))")
+                  :block/raw-title (str "a [[" gen-uuid "]] b ((" missing-uuid-2 "))")
+                  :block/refs [parsed-ref
+                               [:block/uuid missing-uuid]
+                               [:block/uuid missing-uuid-2]]}]
+                host
+                {:sibling? true
+                 :keep-uuid? true})]
+    (d/transact! conn (:tx-data result))
+    (let [inserted (first (:blocks result))]
+      (is (= (str "a [[" missing-uuid "]] b ((" missing-uuid-2 "))")
+             (:block/title inserted)
+             (:block/raw-title inserted)))
+      (is (empty? (:block/refs inserted)))
+      (is (nil? (d/entity @conn [:block/uuid missing-uuid])))
+      (is (nil? (d/entity @conn [:block/uuid missing-uuid-2]))))))
+
+(deftest insert-blocks-preserves-valid-refs
+  ;; A db/id ref, [:block/uuid] lookups to an entity created by this batch or
+  ;; by a page-ref in the same block, and a uuid-named ref resolving to an
+  ;; existing entity must all survive ref resolution.
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "host"}
+                         {:block/title "linked"}]}])
+        linked (db-test/find-block-by-content @conn "linked")
+        linked-uuid (:block/uuid linked)
+        host (db-test/find-block-by-content @conn "host")
+        sibling-uuid (random-uuid)
+        page-uuid (random-uuid)
+        gen-uuid (random-uuid)
+        result (outliner-core/insert-blocks
+                @conn
+                [{:block/uuid sibling-uuid
+                  :block/title "sibling"}
+                 {:block/uuid (random-uuid)
+                  :block/title (str "[[" gen-uuid "]]")
+                  :block/raw-title (str "[[" gen-uuid "]]")
+                  :block/refs [{:db/id (:db/id linked)}
+                               [:block/uuid sibling-uuid]
+                               {:block/type "page"
+                                :block/name (str linked-uuid)
+                                :block/title (str linked-uuid)
+                                :block/uuid gen-uuid}
+                               {:block/type "page"
+                                :block/name "newpage"
+                                :block/title "newpage"
+                                :block/uuid page-uuid}
+                               [:block/uuid page-uuid]]}]
+                host
+                {:sibling? true
+                 :keep-uuid? true})]
+    (d/transact! conn (:tx-data result))
+    (let [inserted (second (:blocks result))
+          inserted-entity (d/entity @conn [:block/uuid (:block/uuid inserted)])]
+      (is (= (str "[[" linked-uuid "]]") (:block/title inserted)))
+      (is (= #{linked-uuid sibling-uuid page-uuid}
+             (set (map :block/uuid (:block/refs inserted-entity))))))))
+
+(deftest test-delete-block-with-default-property
+  (testing "Delete block with default property hard retracts the block subtree"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "b1" :build/properties {:default "test block"}}]}])
+          block (db-test/find-block-by-content @conn "b1")]
+      (outliner-core/delete-blocks! conn [block] {})
+      (is (nil? (db-test/find-block-by-content @conn "b1"))))))
+
+(deftest test-delete-page-with-outliner-core
+  (testing "Deleting pages through outliner-core/delete-blocks detaches page position only"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "b1"}]}
+                 {:page {:block/title "page2"}
+                  :blocks [{:block/title "b3"}
+                           {:block/title "b4"}]}])
+          page2 (ldb/get-page @conn "page2")
+          _ (d/transact! conn [{:db/id (:db/id page2)
+                                :block/order "a1"
+                                :block/parent (:db/id (ldb/get-page @conn "page1"))}])
+          b3 (db-test/find-block-by-content @conn "b3")
+          b4 (db-test/find-block-by-content @conn "b4")]
+      (outliner-core/delete-blocks! conn [b3 b4 page2] {})
+      (is (some? (db-test/find-block-by-content @conn "b3")))
+      (is (some? (db-test/find-block-by-content @conn "b4")))
+      (let [page2' (ldb/get-page @conn "page2")]
+        (is (= "page2" (:block/title page2')))
+        (is (nil? (:block/parent page2')))
+        (is (nil? (:block/order page2')))))))
+
+(defn- child-titles
+  [conn parent]
+  (->> (:block/_parent (d/entity @conn (:db/id parent)))
+       ldb/sort-by-order
+       (mapv :block/title)))
+
+(defn- nested-outline-conn
+  "Page with a (children a1; a2 with child a2x), b, c."
+  []
+  (db-test/create-conn-with-blocks
+   [{:page {:block/title "page1"}
+     :blocks [{:block/title "a"
+               :build/children [{:block/title "a1"}
+                                {:block/title "a2"
+                                 :build/children [{:block/title "a2x"}]}]}
+              {:block/title "b"}
+              {:block/title "c"}]}]))
+
+(deftest delete-blocks-deletes-grandchild-when-selected-page-ancestor-does-not-retract-it
+  (testing "Page A contains page B contains X; deleting A+X still deletes X"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page-a"}
+                  :blocks [{:block/title "a-child"}]}
+                 {:page {:block/title "page-b"}
+                  :blocks [{:block/title "x"}]}])
+          page-a (ldb/get-page @conn "page-a")
+          page-b (ldb/get-page @conn "page-b")
+          _ (d/transact! conn [{:db/id (:db/id page-b)
+                                :block/order "a1"
+                                :block/parent (:db/id page-a)}])
+          x (db-test/find-block-by-content @conn "x")]
+      (outliner-core/delete-blocks! conn [page-a x] {})
+      (is (nil? (db-test/find-block-by-content @conn "x")))
+      (is (some? (ldb/get-page @conn "page-a")))
+      (is (nil? (:block/parent (ldb/get-page @conn "page-a"))))
+      (is (some? (ldb/get-page @conn "page-b"))))))
+
+(deftest delete-blocks-hard-retracts-subtree
+  (let [user-uuid (random-uuid)
+        conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "parent"
+                          :build/children [{:block/title "child"}]}]}])
+        parent (db-test/find-block-by-content @conn "parent")]
+    (d/transact! conn [{:block/uuid user-uuid
+                        :block/title "Alice"}])
+    (outliner-core/delete-blocks! conn [parent] {:deleted-by-uuid user-uuid})
+    (let [parent' (db-test/find-block-by-content @conn "parent")
+          child' (db-test/find-block-by-content @conn "child")]
+      (is (nil? parent'))
+      (is (nil? child')))))
+
+(deftest delete-blocks-removes-range-comments-when-all-targets-are-deleted
+  (let [now (js/Date.now)
+        comments-uuid (random-uuid)
+        comment-uuid (random-uuid)
+        conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "target 1"}
+                         {:block/title "target 2"}]}])
+        page (ldb/get-page @conn "page1")
+        target-1 (db-test/find-block-by-content @conn "target 1")
+        target-2 (db-test/find-block-by-content @conn "target 2")]
+    (d/transact! conn [{:db/ident :logseq.class/Comments
+                        :block/uuid (random-uuid)
+                        :block/title "Comments"}
+                       {:db/id -1
+                        :block/uuid comments-uuid
+                        :block/title "Comments"
+                        :block/page (:db/id page)
+                        :block/parent (:db/id page)
+                        :block/order "a3"
+                        :block/created-at now
+                        :block/updated-at now
+                        :block/tags #{:logseq.class/Comments}
+                        :logseq.property.comments/blocks #{(:db/id target-1)
+                                                           (:db/id target-2)}}
+                       {:block/uuid comment-uuid
+                        :block/title "comment"
+                        :block/page (:db/id page)
+                        :block/parent -1
+                        :block/order "a0"
+                        :block/created-at now
+                        :block/updated-at now}])
+    (outliner-core/delete-blocks! conn [target-1 target-2] {})
+    (is (nil? (d/entity @conn [:block/uuid comments-uuid])))
+    (is (nil? (d/entity @conn [:block/uuid comment-uuid])))))
+
+(deftest delete-blocks-keeps-range-comments-when-some-targets-remain
+  (let [now (js/Date.now)
+        comments-uuid (random-uuid)
+        comment-uuid (random-uuid)
+        conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "target 1"}
+                         {:block/title "target 2"}]}])
+        page (ldb/get-page @conn "page1")
+        target-1 (db-test/find-block-by-content @conn "target 1")
+        target-2 (db-test/find-block-by-content @conn "target 2")]
+    (d/transact! conn [{:db/ident :logseq.class/Comments
+                        :block/uuid (random-uuid)
+                        :block/title "Comments"}
+                       {:db/id -1
+                        :block/uuid comments-uuid
+                        :block/title "Comments"
+                        :block/page (:db/id page)
+                        :block/parent (:db/id page)
+                        :block/order "a3"
+                        :block/created-at now
+                        :block/updated-at now
+                        :block/tags #{:logseq.class/Comments}
+                        :logseq.property.comments/blocks #{(:db/id target-1)
+                                                           (:db/id target-2)}}
+                       {:block/uuid comment-uuid
+                        :block/title "comment"
+                        :block/page (:db/id page)
+                        :block/parent -1
+                        :block/order "a0"
+                        :block/created-at now
+                        :block/updated-at now}])
+    (outliner-core/delete-blocks! conn [target-1] {})
+    (is (some? (d/entity @conn [:block/uuid comments-uuid])))
+    (is (some? (d/entity @conn [:block/uuid comment-uuid])))
+    (is (some? (d/entity @conn (:db/id target-2))))))
+
+(deftest delete-blocks-rejects-built-in-entities
+  (let [conn (db-test/create-conn)]
+    (testing "built-in page is rejected"
+      (let [recycle-page (ldb/get-page @conn common-config/recycle-page-name)]
+        (is (true? (:logseq.property/built-in? recycle-page)))
+        (is (thrown-with-msg? js/Error #"Built-in nodes can't be deleted"
+                              (db-test/silence-stderr (outliner-core/delete-blocks! conn [recycle-page] {}))))))
+
+    (testing "built-in idents that are not a class or property like empty-placeholder are rejected"
+      (let [placeholder (d/entity @conn :logseq.property/empty-placeholder)]
+        (is (some? (:block/uuid placeholder)))
+        (is (thrown-with-msg? js/Error #"Built-in nodes can't be deleted"
+                              (db-test/silence-stderr (outliner-core/delete-blocks! conn [placeholder] {}))))))
+
+    (testing "file entity is rejected"
+      (let [file (->> (d/datoms @conn :avet :file/path)
+                      first
+                      :e
+                      (d/entity @conn))]
+        (is (some? (:file/path file)))
+        (is (thrown-with-msg? js/Error #"Built-in nodes can't be deleted"
+                              (db-test/silence-stderr (outliner-core/delete-blocks! conn [file] {}))))))
+
+    (testing "KV entity is rejected"
+      (let [kv (d/entity @conn :logseq.kv/db-type)]
+        (is (some? (:db/id kv)))
+        (is (thrown-with-msg? js/Error #"Built-in nodes can't be deleted"
+                              (db-test/silence-stderr (outliner-core/delete-blocks! conn [kv] {}))))))))
+
+(deftest save-block-rejects-built-in-entity
+  (let [conn (db-test/create-conn)
+        placeholder (d/entity @conn :logseq.property/description)]
+    (is (thrown-with-msg? js/Error #"Built-in.*can't be modified"
+          (db-test/silence-stderr
+            (outliner-core/save-block! conn {:db/id (:db/id placeholder) :block/title "hacked"}))))))
+
+(deftest move-blocks-rejects-built-in-entity
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "target"}]}])
+        placeholder (d/entity @conn :logseq.property/description)
+        target (db-test/find-block-by-content @conn "target")]
+    (is (thrown-with-msg? js/Error #"Built-in.*can't be modified"
+          (db-test/silence-stderr
+            (outliner-core/move-blocks! conn [placeholder] target {:sibling? true}))))))
+
+(deftest moves-keep-selected-descendants-under-their-ancestor
+  (doseq [[operation reversed? expected-order]
+          [[:move false ["b" "a" "c"]]
+           [:move true ["b" "a" "c"]]
+           [:up false ["a" "b" "c"]]
+           [:down false ["b" "a" "c"]]]]
+    (testing (str operation ", reversed selection: " reversed?)
+      (let [conn (nested-outline-conn)
+            page (db-test/find-page-by-title @conn "page1")
+            a (db-test/find-block-by-content @conn "a")
+            a2 (db-test/find-block-by-content @conn "a2")
+            a2x (db-test/find-block-by-content @conn "a2x")
+            b (db-test/find-block-by-content @conn "b")
+            selection (if reversed? [a2x a] [a a2x])]
+        (case operation
+          :move (outliner-core/move-blocks! conn selection b {:sibling? true})
+          :up (outliner-core/move-blocks-up-down! conn selection true)
+          :down (outliner-core/move-blocks-up-down! conn selection false))
+        (is (= expected-order (child-titles conn page)))
+        (is (= ["a1" "a2"] (child-titles conn a)))
+        (is (= ["a2x"] (child-titles conn a2)))))))
+
+(deftest move-blocks-protects-comment-blocks
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "page1"}
+                :blocks [{:block/title "target"}
+                         {:block/title "tagged comment"}
+                         {:block/title "normal parent"
+                          :build/children [{:block/title "ordinary"}]}
+                         {:block/title "Comments"}]}])
+        page (ldb/get-page @conn "page1")
+        target (db-test/find-block-by-content @conn "target")
+        tagged-comment (db-test/find-block-by-content @conn "tagged comment")
+        ordinary (db-test/find-block-by-content @conn "ordinary")
+        comments-area (db-test/find-block-by-content @conn "Comments")
+        original-comment-parent-id (:db/id (:block/parent tagged-comment))]
+    (d/transact! conn [{:db/id -1
+                        :db/ident :logseq.class/Tag
+                        :block/uuid (random-uuid)
+                        :block/title "Tag"
+                        :block/tags #{-1}}
+                       {:db/ident :logseq.class/Comments
+                        :block/uuid (random-uuid)
+                        :block/title "Comments"
+                        :block/tags #{-1}}
+                       {:db/ident :logseq.class/Comment
+                        :block/uuid (random-uuid)
+                        :block/title "Comment"
+                        :block/tags #{-1}}
+                       [:db/add (:db/id comments-area) :block/tags :logseq.class/Comments]
+                       [:db/add (:db/id tagged-comment) :block/tags :logseq.class/Comment]])
+
+    (testing "#Comment blocks cannot be moved after creation"
+      (outliner-core/move-blocks! conn [tagged-comment] target {:sibling? false})
+      (is (= original-comment-parent-id
+             (:db/id (:block/parent (d/entity @conn (:db/id tagged-comment)))))))
+
+    (testing "#Comments blocks cannot be moved as children"
+      (outliner-core/move-blocks! conn [comments-area] target {:sibling? false})
+      (let [comments-area' (d/entity @conn (:db/id comments-area))]
+        (is (= (:db/id page)
+               (:db/id (:block/parent comments-area'))))))
+
+    (testing "#Comments blocks can be moved as siblings"
+      (outliner-core/move-blocks! conn [comments-area] target {:sibling? true})
+      (let [page' (d/entity @conn (:db/id page))
+            children (->> (:block/_parent page')
+                          ldb/sort-by-order
+                          (mapv :block/title))]
+        (is (= ["target" "Comments" "tagged comment" "normal parent"] children))))
+
+    (testing "ordinary blocks can be moved as siblings of #Comments blocks"
+      (outliner-core/move-blocks! conn [ordinary] comments-area {:sibling? true})
+      (let [ordinary' (d/entity @conn (:db/id ordinary))]
+        (is (= (:db/id page)
+               (:db/id (:block/parent ordinary'))))))
+
+    (testing "ordinary blocks cannot be moved as children of #Comments blocks"
+      (outliner-core/move-blocks! conn [ordinary] comments-area {:sibling? false})
+      (is (= (:db/id page)
+             (:db/id (:block/parent (d/entity @conn (:db/id ordinary)))))))
+
+    (testing "ordinary blocks cannot be moved to #Comment blocks"
+      (outliner-core/move-blocks! conn [ordinary] tagged-comment {:sibling? false})
+      (is (= (:db/id page)
+             (:db/id (:block/parent (d/entity @conn (:db/id ordinary)))))))))
+
+(defn- reset-page-updated-at!
+  [conn page]
+  (d/transact! conn [{:db/id (:db/id page)
+                      :block/updated-at 1}])
+  (:block/updated-at (d/entity @conn (:db/id page))))
+
+(defn- page-updated-at
+  [conn page]
+  (:block/updated-at (d/entity @conn (:db/id page))))
+
+(deftest page-updated-at-bumps-on-child-insert-reorder-and-move
+  (testing "inserting a child block bumps the page updated-at"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "parent"}]}])
+          page (db-test/find-page-by-title @conn "page1")
+          parent (db-test/find-block-by-content @conn "parent")
+          before (reset-page-updated-at! conn page)]
+      (outliner-core/insert-blocks!
+       conn
+       [{:block/uuid (random-uuid)
+         :block/title "inserted-child"}]
+       parent
+       {:sibling? false
+        :keep-uuid? true})
+      (is (some? (db-test/find-block-by-content @conn "inserted-child")))
+      (is (> (page-updated-at conn page) before)
+          "Adding a child block must bump the page :block/updated-at")))
+
+  (testing "reordering sibling blocks bumps the page updated-at"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "first"}
+                           {:block/title "second"}]}])
+          page (db-test/find-page-by-title @conn "page1")
+          second-block (db-test/find-block-by-content @conn "second")
+          before (reset-page-updated-at! conn page)]
+      (outliner-core/move-blocks-up-down! conn [second-block] true)
+      (is (= "second"
+             (:block/title (first (ldb/sort-by-order (:block/_parent (d/entity @conn (:db/id page))))))))
+      (is (> (page-updated-at conn page) before)
+          "Changing block order must bump the page :block/updated-at")))
+
+  (testing "move-blocks bumps source and destination page updated-at"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "moved"}]}
+                 {:page {:block/title "page2"}
+                  :blocks [{:block/title "dest"}]}])
+          page1 (db-test/find-page-by-title @conn "page1")
+          page2 (db-test/find-page-by-title @conn "page2")
+          moved (db-test/find-block-by-content @conn "moved")
+          dest (db-test/find-block-by-content @conn "dest")
+          before-src (reset-page-updated-at! conn page1)
+          before-dest (reset-page-updated-at! conn page2)]
+      (outliner-core/move-blocks! conn [moved] dest {:sibling? false})
+      (is (= (:db/id dest)
+             (:db/id (:block/parent (db-test/find-block-by-content @conn "moved")))))
+      (is (> (page-updated-at conn page1) before-src)
+          "Removing a block must bump the source page :block/updated-at")
+      (is (> (page-updated-at conn page2) before-dest)
+          "Adding a block must bump the destination page :block/updated-at")))
+
+  (testing "apply-ops move-blocks bumps page updated-at"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "first"}
+                           {:block/title "second"}]}])
+          page (db-test/find-page-by-title @conn "page1")
+          first-block (db-test/find-block-by-content @conn "first")
+          second-block (db-test/find-block-by-content @conn "second")
+          before (reset-page-updated-at! conn page)]
+      (outliner-op/apply-ops!
+       conn
+       [[:move-blocks [[(:block/uuid second-block)]
+                       (:block/uuid first-block)
+                       {:sibling? false}]]]
+       {})
+      (is (= (:db/id first-block)
+             (:db/id (:block/parent (db-test/find-block-by-content @conn "second")))))
+      (is (> (page-updated-at conn page) before)
+          "move-blocks via apply-ops must bump the page :block/updated-at")))
+
+  (testing "moving a page between parent pages bumps both parents"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "Projects"}}
+                 {:page {:block/title "Alpha"}}
+                 {:page {:block/title "Archive"}}])
+          projects (db-test/find-page-by-title @conn "Projects")
+          alpha (db-test/find-page-by-title @conn "Alpha")
+          archive (db-test/find-page-by-title @conn "Archive")]
+      (outliner-core/move-blocks! conn [alpha] projects {:sibling? false})
+      (is (= (:db/id projects)
+             (:db/id (:block/parent (d/entity @conn (:db/id alpha))))))
+      (let [before-src (reset-page-updated-at! conn projects)
+            before-dest (reset-page-updated-at! conn archive)
+            before-moved (reset-page-updated-at! conn alpha)]
+        (outliner-core/move-blocks! conn [alpha] archive {:sibling? false})
+        (is (= (:db/id archive)
+               (:db/id (:block/parent (d/entity @conn (:db/id alpha))))))
+        (is (> (page-updated-at conn projects) before-src)
+            "Removing a nested page must bump the former parent page :block/updated-at")
+        (is (> (page-updated-at conn archive) before-dest)
+            "Adding a nested page must bump the destination page :block/updated-at")
+        (is (= before-moved (page-updated-at conn alpha))
+            "Relocating a page does not rewrite that page's own :block/updated-at")))))
+
+(deftest page-updated-at-bumps-source-page-on-keep-uuid-reparent
+  (testing "keep-uuid insert of a live block stamps the source and destination pages"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "source"}
+                  :blocks [{:block/title "moved"}]}
+                 {:page {:block/title "dest"}
+                  :blocks [{:block/title "anchor"}]}])
+          source (db-test/find-page-by-title @conn "source")
+          dest (db-test/find-page-by-title @conn "dest")
+          moved (db-test/find-block-by-content @conn "moved")
+          dest-anchor (db-test/find-block-by-content @conn "anchor")
+          before-src (reset-page-updated-at! conn source)
+          before-dest (reset-page-updated-at! conn dest)]
+      (outliner-core/insert-blocks!
+       conn
+       [moved]
+       dest-anchor
+       {:sibling? true
+        :keep-uuid? true})
+      (is (= (:db/id dest)
+             (:db/id (:block/page (d/entity @conn (:db/id moved))))))
+      (is (> (page-updated-at conn source) before-src)
+          "Reparenting a live block must bump the source page :block/updated-at")
+      (is (> (page-updated-at conn dest) before-dest)
+          "Reparenting a live block must bump the destination page :block/updated-at"))))
+
+(deftest page-updated-at-bumps-on-child-delete
+  (testing "deleting a child block bumps the page updated-at"
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "page1"}
+                  :blocks [{:block/title "doomed"}]}])
+          page (db-test/find-page-by-title @conn "page1")
+          doomed (db-test/find-block-by-content @conn "doomed")
+          before (reset-page-updated-at! conn page)]
+      (outliner-core/delete-blocks! conn [doomed] {})
+      (is (nil? (db-test/find-block-by-content @conn "doomed")))
+      (is (> (page-updated-at conn page) before)
+          "Deleting a child block must bump the page :block/updated-at"))))

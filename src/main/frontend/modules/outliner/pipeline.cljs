@@ -1,0 +1,173 @@
+(ns frontend.modules.outliner.pipeline
+  (:require [clojure.string :as string]
+            [frontend.db.subs :as db-subs]
+            [frontend.handler.route :as route-handler]
+            [frontend.handler.ui :as ui-handler]
+            [frontend.state :as state]
+            [frontend.util :as util]
+            [logseq.db :as ldb]))
+
+(defn- update-editing-block-title-if-changed!
+  [blocks]
+  (when-let [editing-block-uuid (:block/uuid (state/get-edit-block))]
+    (when-let [title (:block/title (get blocks editing-block-uuid))]
+      (let [editing-title (state/get-edit-content)]
+        (when (not= (string/trim (or editing-title ""))
+                    (string/trim title))
+          (state/set-edit-content! title))))))
+
+(defonce ^:private *recovered-dirty-draft (atom nil))
+
+(defn- claim-dirty-draft-recovery!
+  [editing-block-uuid draft]
+  (if-let [input (state/get-input)]
+    (let [claim {:input input
+                 :block-uuid editing-block-uuid
+                 :draft draft}]
+      (when (not= claim @*recovered-dirty-draft)
+        (reset! *recovered-dirty-draft claim)
+        true))
+    ;; The normal renderer path always has an active input. Keep non-DOM callers
+    ;; functional without creating a process-wide fallback identity.
+    true))
+
+(defn- editing-block-before-delta
+  []
+  (when-let [editing-block-uuid (:block/uuid (state/get-edit-block))]
+    (let [{:keys [status value]} (db-subs/block-snapshot editing-block-uuid)]
+      (when (= :ready status)
+        value))))
+
+(defn- recover-dirty-edit-if-needed!
+  [editing-block-before blocks deleted delta-applied?]
+  (when (and (state/editing?) editing-block-before)
+    (when-let [{editing-block-uuid :block/uuid
+                :as editing-block} (state/get-edit-block)]
+      (let [draft (state/get-edit-content)
+            canonical-title-before (:block/title editing-block-before)
+            dirty? (and (string? draft)
+                        (not= draft canonical-title-before))]
+        (when dirty?
+          (cond
+            (contains? deleted editing-block-uuid)
+            (do
+              (when (and delta-applied?
+                         (claim-dirty-draft-recovery!
+                          editing-block-uuid draft))
+                (state/pub-event!
+                 [:editor/recover-deleted-dirty-draft editing-block draft]))
+              true)
+
+            (when-let [incoming-title
+                       (:block/title (get blocks editing-block-uuid))]
+              (not= incoming-title canonical-title-before))
+            (do
+              (when (and delta-applied?
+                         (claim-dirty-draft-recovery!
+                          editing-block-uuid draft))
+                (state/pub-event! [:editor/save-current-block]))
+              true)
+
+            :else
+            false))))))
+
+(defn- current-page-uuid-string
+  []
+  (when-let [page (state/get-current-page)]
+    (if (util/uuid-string? page)
+      page
+      (let [{:keys [status value]}
+            (db-subs/resource-snapshot [:page-identity (util/page-name-sanity-lc page)])]
+        (when (= :ready status)
+          (some-> value str))))))
+
+(defn- current-page-deleted?
+  [current-page deleted]
+  (and current-page
+       (some #(= current-page (str %)) (keys deleted))))
+
+(defn- current-page-recycled?
+  [current-page blocks]
+  (and current-page
+       (some (fn [[block-uuid block]]
+               (and (= current-page (str block-uuid))
+                    (ldb/recycled? block)))
+             blocks)))
+
+(defn- publish-plugin-hook!
+  [tx-meta {:keys [blocks deleted]}]
+  (when (and state/lsp-enabled?
+             (seq blocks)
+             (<= (count blocks) 1000))
+    (state/pub-event!
+     [:plugin/hook-db-tx
+      {:blocks (vec (vals blocks))
+       :deleted-block-uuids (set (keys deleted))
+       :tx-data []
+       :tx-meta tx-meta}])))
+
+(defn invoke-hooks
+  [{:keys [repo tx-meta delta]}]
+  (if (and delta (db-subs/future-projection? delta))
+    ;; A missed compact cutover broadcast is recovered from the next official
+    ;; delta. Drop this one response and let mounted slots reload from G+1.
+    (state/pub-event!
+     [:db/projection-committed
+      {:repo repo :projection-epoch (:projection-epoch delta)}])
+    (let [current-projection? (or (nil? delta)
+                                  (db-subs/current-projection? delta))
+          ;; Named routes use the mounted identity before deletion invalidates it.
+          current-page (when current-projection? (current-page-uuid-string))
+          editing-block-before (when delta (editing-block-before-delta))
+          delta-applied? (when delta
+                           (db-subs/apply-delta! delta))]
+      (when current-projection?
+      (let [{:keys [initial-pages? end?]} tx-meta
+            blocks (:blocks delta)
+            deleted (:deleted delta)]
+        (when (= repo (state/get-current-repo))
+          (let [deleted-ids (not-empty (keep :db/id (vals deleted)))
+                recycled-ids (keep (fn [block]
+                                     (when (and (ldb/page? block)
+                                                (ldb/recycled? block))
+                                       (:db/id block)))
+                                   (vals blocks))]
+            (when deleted-ids
+              (state/sidebar-remove-deleted-block! deleted-ids))
+            (when-let [removed-page-ids (not-empty (concat deleted-ids recycled-ids))]
+              (state/remove-pages-from-recent! removed-page-ids)))
+          (when (or (current-page-deleted? current-page deleted)
+                    (and (not initial-pages?)
+                         (current-page-recycled? current-page blocks)))
+            (route-handler/<redirect-after-page-deletion!))
+
+          (cond
+            initial-pages?
+            (when end?
+              (state/pub-event! [:init/commands])
+              (ui-handler/re-render-root!))
+
+            :else
+            (do
+              (let [external-edit? (not= (:client-id tx-meta)
+                                         (:client-id (state/get-state)))
+                    refresh-edit? (or external-edit?
+                                      (= :apply-template (:outliner-op tx-meta)))
+                    recovered-dirty-edit?
+                    (and external-edit?
+                         (recover-dirty-edit-if-needed!
+                          editing-block-before blocks deleted delta-applied?))]
+                (when (and refresh-edit?
+                           (not recovered-dirty-edit?))
+                  (update-editing-block-title-if-changed! blocks)))
+
+              (state/set-state! :editor/start-pos nil)
+
+              (when-not (:graph/importing (state/get-state))
+                (publish-plugin-hook! tx-meta delta)))))
+
+        (when (= (:outliner-op tx-meta) :delete-page)
+          (state/pub-event! [:page/deleted (:deleted-page tx-meta) tx-meta]))
+
+        (when (= (:outliner-op tx-meta) :rename-page)
+          (state/pub-event! [:page/renamed repo (:data tx-meta)])))))))

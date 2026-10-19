@@ -1,0 +1,101 @@
+(ns logseq.db.frontend.class-test
+  (:require [cljs.test :refer [deftest is testing]]
+            [datascript.core :as d]
+            [logseq.db.frontend.class :as db-class]
+            [logseq.db.test.helper :as db-test]))
+
+(defn- parent-class-id [db]
+  (:db/id (d/entity db :user.class/Parent)))
+
+(deftest get-class-objects-dedupes-inherited-tags-test
+  (let [conn (db-test/create-conn-with-blocks
+              {:classes {:Parent {:block/title "Parent"}
+                         :Child {:block/title "Child"
+                                 :build/class-extends [:Parent]}}
+               :pages-and-blocks [{:page {:block/title "Object1"
+                                          :build/tags [:Parent :Child]}}]})
+        objects (db-class/get-class-objects @conn (parent-class-id @conn))
+        ids (map :db/id objects)]
+    (testing "an object tagged by both parent and child class is returned once"
+      (is (= 1 (count ids)))
+      (is (= 1 (count (distinct ids)))))
+    (testing "id-only lookup matches object entities"
+      (is (= ids (db-class/get-class-object-ids @conn (parent-class-id @conn)))))))
+
+(deftest get-class-object-ids-does-not-hydrate-each-object-test
+  (let [pages (mapv (fn [idx]
+                      {:page {:block/title (str "Object " idx)
+                              :build/tags [:Parent]}})
+                    (range 80))
+        conn (db-test/create-conn-with-blocks
+              {:classes {:Parent {:block/title "Parent"}}
+               :pages-and-blocks pages})
+        class-id (parent-class-id @conn)
+        entity* d/entity
+        calls (atom 0)]
+    (with-redefs [d/entity (fn [db x]
+                             (swap! calls inc)
+                             (entity* db x))]
+      (let [ids (db-class/get-class-object-ids @conn class-id)]
+        (is (= 80 (count ids)))
+        (is (zero? @calls)
+            "First-window Tags queries must not hydrate one entity per object.")))))
+
+(deftest get-class-objects-filters-hidden-objects-test
+  (let [conn (db-test/create-conn-with-blocks
+              {:classes {:Parent {:block/title "Parent"}
+                         :Child {:block/title "Child"
+                                 :build/class-extends [:Parent]}}
+               :pages-and-blocks [{:page {:block/title "Visible"
+                                          :build/tags [:Child]}}
+                                  {:page {:block/title "Deleted"
+                                          :build/tags [:Child]
+                                          :logseq.property/deleted-at 1}}
+                                  {:page {:block/title "Hidden"
+                                          :build/tags [:Child]
+                                          :logseq.property/hide? true}}
+                                  {:page {:block/title "Hidden parent"
+                                          :logseq.property/hide? true}
+                                   :blocks [{:block/title "Nested hidden"
+                                             :build/tags [:Child]}]}
+                                  {:page {:block/title "Visible parent"}
+                                   :blocks [{:block/title "Nested visible"
+                                             :build/tags [:Child]}]}]})
+        titles (->> (db-class/get-class-objects @conn (parent-class-id @conn))
+                    (map :block/title)
+                    set)]
+    (is (= #{"Visible" "Nested visible"} titles))))
+
+(deftest get-class-objects-includes-hide-by-default-properties-test
+  (let [conn (db-test/create-conn-with-blocks
+              {:properties {:keywords {:logseq.property/type :default
+                                       :logseq.property/hide? true}
+                            :author {:logseq.property/type :default}
+                            :deleted-prop {:logseq.property/type :default}}})
+        deleted (d/entity @conn :user.property/deleted-prop)
+        _ (d/transact! conn [[:db/add (:db/id deleted) :logseq.property/deleted-at 1]])
+        property-class-id (:db/id (d/entity @conn :logseq.class/Property))
+        titles (->> (db-class/get-class-objects @conn property-class-id)
+                    (map :block/title)
+                    set)]
+    (testing "hide-by-default user properties still appear in the Property table"
+      (is (contains? titles "keywords"))
+      (is (contains? titles "author")))
+    (testing "deleted properties stay out of the Property table"
+      (is (not (contains? titles "deleted-prop"))))
+    (testing "private built-in properties stay out of the Property table"
+      (is (not (contains? titles "Property type"))))))
+
+(deftest private-create-page-tag-test
+  (testing "ident is authoritative"
+    (is (true? (db-class/private-create-page-tag? {:db/ident :logseq.class/Tag
+                                                   :block/title "Tag"})))
+    (is (false? (db-class/private-create-page-tag? {:db/ident :user.class/MyTag
+                                                    :block/title "Tag"})))
+    (is (false? (db-class/private-create-page-tag? {:db/ident :logseq.class/Page
+                                                    :block/title "Page"}))))
+  (testing "title is a fallback only when ident is missing"
+    (is (true? (db-class/private-create-page-tag? {:block/title "Tag"})))
+    (is (true? (db-class/private-create-page-tag? {:block/title "Property"})))
+    (is (false? (db-class/private-create-page-tag? {:block/title "Page"})))
+    (is (false? (db-class/private-create-page-tag? {:block/title "Task"})))))

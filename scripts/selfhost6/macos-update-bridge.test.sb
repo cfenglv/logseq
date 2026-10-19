@@ -1,0 +1,24 @@
+(version 1)
+(allow default)
+(deny network*)
+(deny process-exec (subpath "/Applications"))
+(deny process-exec
+  (require-all (require-any (subpath "/Users") (subpath "/Volumes"))
+    (require-not (subpath (param "root")))))
+(deny file-read-data
+  (require-all
+    (require-any (subpath "/Users") (subpath "/Volumes")
+      (subpath "/private/tmp") (subpath "/tmp") (subpath "/private/var/folders")
+      (subpath "/System/Volumes/Data/Users"))
+    (require-not (subpath (param "root")))))
+(deny file-write*
+  (require-all (require-not (subpath (param "root")))
+    (require-not (literal "/dev/null")) (require-not (literal "/dev/dtracehelper"))))
+(deny signal (require-not (target same-sandbox)))
+(deny user-preference-write)
+(deny mach-lookup
+  (global-name "com.apple.lsd.modifydb")
+  (global-name "com.apple.lsd.open")
+  (global-name "com.apple.lsd.openurl")
+  (global-name "com.apple.securityd")
+  (global-name "com.apple.SecurityServer"))

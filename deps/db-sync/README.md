@@ -1,0 +1,152 @@
+# Logseq DB Sync (deps/db-sync)
+
+This package contains the DB sync server code and tests used by Logseq.
+It includes the Cloudflare Worker implementation and a Node.js adapter for self-hosting.
+
+## Requirements
+- Node.js (see repo root for required version)
+- Clojure (for shadow-cljs builds)
+
+## Build and Test
+
+### Cloudflare Worker
+
+```bash
+cd deps/db-sync
+pnpm watch
+
+# open another terminal
+cd deps/db-sync/worker
+wrangler dev
+```
+
+### D1 Schema (Worker)
+
+The worker no longer initializes schema at request time. Apply the D1 schema
+via migrations during deployment/CI.
+
+```bash
+cd deps/db-sync/worker
+wrangler d1 migrations apply logseq-sync-graph-meta-staging --env staging
+wrangler d1 migrations apply logseq-sync-graphs-prod --env prod
+```
+
+For local development, run `wrangler d1 migrations apply DB --local`.
+
+### Production Graph Lookup
+
+Show the graphs available to a production user by `username` or `user id`:
+
+```bash
+cd deps/db-sync
+pnpm show-graphs-for-user --username alice
+pnpm show-graphs-for-user --user-id us-east-1:example-user-id
+```
+
+The script uses `worker/wrangler.toml`, runs against the remote D1 binding `DB`,
+defaults to `--env prod`, and prints JSON when `--json` is added.
+
+Show usage totals (total users, total graphs, users created today, graphs created today):
+
+```bash
+cd deps/db-sync
+pnpm show-usage-stats
+pnpm show-usage-stats --days 7
+pnpm show-usage-stats --json
+```
+
+`created today` uses UTC day boundaries from D1 (`date('now')`).
+`active_*_last_n_days` uses deduplicated UTC-day activity rows from
+`daily_active_entities` with the provided `--days` window.
+
+Download a graph snapshot into a local sqlite debug file matching local graph DB schema (`kvs` table only):
+
+```bash
+cd deps/db-sync
+pnpm run download-graph-db -- --graph-id 6f2d7f6f-xxxx-xxxx-xxxx-xxxxxxxxxxxx --admin-token <admin-token>
+```
+
+You can also pass `--admin-token <token>` or set `DB_SYNC_ADMIN_TOKEN`. The output defaults to
+`tmp/graph-<graph-id>.snapshot.sqlite` and can be changed with `--output`.
+
+Show stored and recomputed checksum for a local sqlite graph db:
+
+```bash
+cd deps/db-sync
+pnpm run show-sqlite-checksum -- --db ~/Downloads/test.sqlite
+```
+
+Delete the graphs owned by a production user after an explicit confirmation:
+
+```bash
+cd deps/db-sync
+pnpm delete-graphs-for-user --username alice
+pnpm delete-graphs-for-user --user-id us-east-1:example-user-id
+```
+
+The delete script shows the owned graphs first and requires typing `DELETE`
+before it calls the worker delete endpoint for each graph. Set
+`DB_SYNC_BASE_URL` and `DB_SYNC_ADMIN_TOKEN` or pass `--base-url` and
+`--admin-token` when running it.
+
+Delete a user completely (owned graphs, memberships, keys, and user row):
+
+```bash
+cd deps/db-sync
+pnpm run delete-user-totally -- --username alice
+pnpm run delete-user-totally -- --user-id us-east-1:example-user-id
+```
+
+The script prints all linked graphs first, deletes owned graphs through the
+admin graph delete endpoint, then removes the user's remaining D1 references.
+It requires typing `DELETE` as confirmation.
+
+### Node.js Adapter (self-hosted)
+
+Build the adapter:
+
+```bash
+cd deps/db-sync
+pnpm build:node-adapter
+```
+
+Run the adapter with Cognito auth:
+
+```bash
+DB_SYNC_PORT=8787 \
+COGNITO_ISSUER=https://cognito-idp.us-east-1.amazonaws.com/us-east-1_dtagLnju8 \
+COGNITO_CLIENT_ID=69cs1lgme7p8kbgld8n5kseii6 \
+COGNITO_JWKS_URL=https://cognito-idp.us-east-1.amazonaws.com/us-east-1_dtagLnju8/.well-known/jwks.json \
+node worker/dist/node-adapter.js
+```
+
+### Tests
+
+Run db-sync tests (includes Node adapter tests):
+
+```bash
+cd deps/db-sync
+pnpm test:node-adapter
+```
+
+## Environment Variables
+
+| Variable | Purpose |
+| --- | --- |
+| DB_SYNC_PORT | HTTP server port |
+| DB_SYNC_BASE_URL | External base URL for asset links |
+| DB_SYNC_ADMIN_TOKEN | Admin-only token for operator graph deletion endpoints |
+| DB_SYNC_DATA_DIR | Data directory for sqlite + assets |
+| DB_SYNC_STORAGE_DRIVER | Storage backend selection (sqlite) |
+| DB_SYNC_ASSETS_DRIVER | Assets backend selection (filesystem) |
+| SENTRY_DSN | Sentry DSN |
+| SENTRY_RELEASE | Release identifier for Sentry events and sourcemaps |
+| SENTRY_ENVIRONMENT | Sentry environment name (prod, staging, etc.) |
+| SENTRY_TRACES_SAMPLE_RATE | Traces sample rate (0.0 - 1.0) |
+| COGNITO_ISSUER | Cognito issuer URL |
+| COGNITO_CLIENT_ID | Cognito client id |
+| COGNITO_JWKS_URL | Cognito JWKS URL |
+
+## Notes
+- Protocol definitions live in `docs/agent-guide/db-sync/protocol.md`.
+- DB sync implementation guide is in `docs/agent-guide/db-sync/db-sync-guide.md`.

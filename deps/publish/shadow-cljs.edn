@@ -1,0 +1,17 @@
+;; shadow-cljs configuration
+{:deps true
+ :http {:port 9631}
+ :nrepl {:port 8702}
+ :builds
+ {:publish-worker {:target :esm
+                   :output-dir "worker/dist/worker"
+                   :modules {:main {:exports {default logseq.publish.worker/worker
+                                              PublishMetaDO logseq.publish.worker/PublishMetaDO}}}
+                   :js-options {:js-provider :import}
+                   :closure-defines {shadow.cljs.devtools.client.env/enabled false}
+                   :devtools {:enabled false}}
+  :publish-test {:target :node-test
+                 :output-to "worker/dist/worker-test.js"
+                 :devtools {:enabled false}
+                 :compiler-options {:static-fns false}
+                 :main logseq.publish.test-runner/main}}}
