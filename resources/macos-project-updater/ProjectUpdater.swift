@@ -339,7 +339,10 @@ private func validateExtractedApp(_ app: URL, metadata: SignedMetadata) throws {
           bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == metadata.targetVersion else {
         try fail("extracted App bundle identity does not match target metadata")
     }
+    // Intel packages preserve the unsigned runtime used by existing Keychain items.
+#if arch(arm64)
     _ = try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+#endif
 }
 
 private func waitForParent(_ pid: pid_t) throws {

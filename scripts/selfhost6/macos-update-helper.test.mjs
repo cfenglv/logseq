@@ -42,7 +42,7 @@ function infoPlist(version) {
 `;
 }
 
-function makeApp(appPath, version, manifest) {
+function makeApp(appPath, version, manifest, sign = true) {
   fs.rmSync(appPath, { recursive: true, force: true });
   const contents = path.join(appPath, "Contents");
   const macos = path.join(contents, "MacOS");
@@ -55,7 +55,9 @@ function makeApp(appPath, version, manifest) {
   if (manifest) {
     fs.writeFileSync(path.join(updater, "TARGET_BUILD_MANIFEST.json"), manifest);
   }
-  run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", appPath]);
+  run("/usr/bin/codesign", sign
+    ? ["--force", "--deep", "--sign", "-", appPath]
+    : ["--remove-signature", path.join(macos, "Logseq")]);
 }
 
 function installedVersion(appPath) {
@@ -107,7 +109,7 @@ test("macOS helper and thin bridge preserve native install contracts", { timeout
     const candidateRoot = path.join(root, "candidate");
     const candidate = path.join(candidateRoot, "Logseq.app");
     fs.mkdirSync(candidateRoot);
-    makeApp(candidate, "2.0.2-selfhost.1", manifest);
+    makeApp(candidate, "2.0.2-selfhost.1", manifest, process.arch !== "x64");
     const archive = path.join(root, "Logseq.zip");
     run("/usr/bin/ditto", ["-c", "-k", "--keepParent", candidate, archive]);
     const archiveBytes = fs.readFileSync(archive);
@@ -204,13 +206,16 @@ test("macOS helper and thin bridge preserve native install contracts", { timeout
     assert.equal(installedVersion(path.join(path.dirname(target), backups[0])), "2.0.1-selfhost.7");
 
     const handoffTest = path.join(root, "handoff-test");
-    run("/usr/bin/xcrun", ["clang", "-O2", "-Wall", "-Wextra", "-Werror",
+    const clangArch = process.arch === "x64" ? "x86_64" : process.arch;
+    run("/usr/bin/xcrun", ["clang", "-arch", clangArch, "-O2", "-Wall", "-Wextra", "-Werror",
       path.join(repoRoot, "scripts/selfhost6/macos-update-bridge-handoff.test.c"), "-o", handoffTest]);
     fs.copyFileSync(handoffTest, path.join(candidate, "Contents/MacOS/Logseq"));
     const finalPayloadDirectory = path.join(candidate, "Contents/Resources/payload");
     fs.mkdirSync(finalPayloadDirectory);
     fs.writeFileSync(path.join(finalPayloadDirectory, "synthetic-sentinel"), "final-owned-resource\n");
-    run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", candidate]);
+    if (process.arch !== "x64") {
+      run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", candidate]);
+    }
     const bridgePayload = path.join(root, `Logseq-darwin-${process.arch}-2.0.2-selfhost.1.zip`);
     run("/usr/bin/ditto", ["-c", "-k", "--keepParent", candidate, bridgePayload]);
     const bridgeArchiveBytes = fs.readFileSync(bridgePayload);
@@ -295,7 +300,7 @@ test("macOS helper and thin bridge preserve native install contracts", { timeout
     fs.writeFileSync(canary, "synthetic-outside-canary\n", { flag: "wx" });
     run("/usr/bin/sandbox-exec", sandbox(handoffTest, ["--boundary", canary]));
     const boundary = path.join(root, "bridge-boundary.dylib");
-    run("/usr/bin/xcrun", ["clang", "-dynamiclib", "-Wall", "-Wextra", "-Werror", "-framework", "CoreFoundation",
+    run("/usr/bin/xcrun", ["clang", "-arch", clangArch, "-dynamiclib", "-Wall", "-Wextra", "-Werror", "-framework", "CoreFoundation",
       path.join(repoRoot, "scripts/selfhost6/macos-update-bridge-boundary.test.c"), "-o", boundary]);
     run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", bridgeApp]);
     fs.mkdirSync(path.join(root, "home")); fs.mkdirSync(path.join(root, "tmp"));
