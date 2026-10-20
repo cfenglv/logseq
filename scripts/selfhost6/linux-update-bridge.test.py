@@ -56,7 +56,7 @@ mv "$BRIDGE_TEST_RESULT.tmp" "$BRIDGE_TEST_RESULT"
                 '#define BRIDGE_ERROR_TITLE_ZH_CN "更新错误"\n'
                 '#define BRIDGE_ERROR_DESC_ZH_CN "请重新打开应用。"\n')
             command = ['cc', '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror',
-                       '-Wl,--wrap=g_file_get_contents', '-I', str(case), str(source), '-o', str(case / 'test')]
+                       '-Wl,--wrap=getdelim', '-I', str(case), str(source), '-o', str(case / 'test')]
             if name == 'postcommit':
                 command.append('-DTEST_POSTCOMMIT_FAILURE')
             run(command + flags)

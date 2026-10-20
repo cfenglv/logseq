@@ -9,13 +9,13 @@ static gboolean exit_race;
 static unsigned race_stat_reads;
 static int race_release_fd = -1;
 
-gboolean __real_g_file_get_contents(const gchar *, gchar **, gsize *, GError **);
+ssize_t __real_getdelim(char **, size_t *, int, FILE *);
 
-gboolean __wrap_g_file_get_contents(const gchar *filename, gchar **contents, gsize *length, GError **error) {
-    const gboolean result = __real_g_file_get_contents(filename, contents, length, error);
+ssize_t __wrap_getdelim(char **contents, size_t *capacity, int delimiter, FILE *stream) {
+    const ssize_t result = __real_getdelim(contents, capacity, delimiter, stream);
     /* Release the real parent only after the second live state has been captured. */
-    if (exit_race && g_str_has_suffix(filename, "/stat") && ++race_stat_reads == 2) {
-        g_assert_true(result);
+    if (exit_race && ++race_stat_reads == 2) {
+        g_assert_cmpint(result, >, 0);
         const char release = 'x';
         g_assert_cmpint(write(race_release_fd, &release, 1), ==, 1);
     }
@@ -186,6 +186,30 @@ static void source_exit_during_identity_read(void) {
 
 static gboolean title_seen, description_seen;
 
+static void reaped_source_is_finished(void) {
+    const pid_t source = fork();
+    g_assert_cmpint(source, >=, 0);
+    if (source == 0) {
+        for (;;) pause();
+    }
+    g_autofree char *process_path = g_strdup_printf("/proc/%ld", (long)source);
+    const int process_fd = open(process_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    g_assert_cmpint(process_fd, >=, 0);
+    g_autoptr(GError) error = NULL;
+    g_assert_cmpint(source_finished(process_fd, &error), ==, 0);
+    g_assert_no_error(error);
+    g_assert_cmpint(kill(source, SIGTERM), ==, 0);
+    int status;
+    g_assert_cmpint(waitpid(source, &status, 0), ==, source);
+    g_assert_true(WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+    const int finished = source_finished(process_fd, &error);
+    if (error != NULL) fprintf(stderr, "reaped source: %s\n", error->message);
+    close(process_fd);
+    g_assert_no_error(error);
+    g_assert_cmpint(finished, ==, 1);
+    puts("PASS pinned-reaped-source-is-finished");
+}
+
 static void inspect_dialog_labels(GtkWidget *widget) {
     if (GTK_IS_LABEL(widget)) {
         const char *text = gtk_label_get_text(GTK_LABEL(widget));
@@ -237,6 +261,7 @@ int main(int argc, char **argv) {
     run_case("identical-final-is-not-replaced", TRUE, FALSE, TEST_PAYLOAD, FALSE);
     run_case("locked-entry-preserves-bridge-and-releases", FALSE, FALSE, NULL, TRUE);
     source_exit_during_identity_read();
+    reaped_source_is_finished();
 #endif
     return 0;
 }

@@ -38,11 +38,26 @@ static gboolean read_proc(int process_fd, const char *name, char **data, GError 
 
 /* A pinned /proc directory cannot start referring to a reused PID. */
 static int source_finished(int process_fd, GError **error) {
+    g_autofree char *file = g_strdup_printf("/proc/self/fd/%d/stat", process_fd);
     g_autofree char *data = NULL;
-    g_autoptr(GError) read_error = NULL;
-    if (!read_proc(process_fd, "stat", &data, &read_error)) {
-        if (g_error_matches(read_error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) return 1;
-        g_propagate_error(error, g_steal_pointer(&read_error));
+    size_t capacity = 0;
+    FILE *stream = fopen(file, "re");
+    ssize_t count = -1;
+    int saved_errno = errno;
+    if (stream != NULL) {
+        errno = 0;
+        count = getdelim(&data, &capacity, '\0', stream);
+        saved_errno = errno;
+        fclose(stream);
+    }
+    if (count < 0) {
+        if (saved_errno == ENOENT || saved_errno == ESRCH) return 1;
+        if (saved_errno != 0) {
+            errno = saved_errno;
+            fail_errno(error, "Read source process state");
+        } else {
+            fail(error, "Invalid source process state");
+        }
         return -1;
     }
     const char *tail = strrchr(data, ')');
