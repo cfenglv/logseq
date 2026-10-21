@@ -3,6 +3,7 @@
             [cljs.test :refer [deftest is]]
             [frontend.db.hooks :as db-hooks]
             [frontend.db.subs :as subs]
+            [frontend.rfx :as rfx]
             [goog.object :as gobj]))
 
 (defn- with-use-sync-external-store
@@ -15,7 +16,7 @@
     (gobj/set react "useCallback" (fn [callback _deps] callback))
     (gobj/set react "useSyncExternalStore" replacement)
     (try
-      (f)
+      (with-redefs [rfx/use-sub (constantly nil)] (f))
       (finally
         (gobj/set react "useRef" original-use-ref)
         (gobj/set react "useCallback" original-use-callback)
@@ -73,7 +74,7 @@
                   (reset! previous-unsubscribe (subscribe listener)))
                 (get-snapshot)))
     (try
-      (f reset-render!)
+      (with-redefs [rfx/use-sub (constantly nil)] (f reset-render!))
       (finally
         (when-let [unsubscribe @previous-unsubscribe]
           (unsubscribe))

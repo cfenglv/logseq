@@ -12,6 +12,7 @@
             [frontend.db.hooks :as db-hooks]
             [frontend.db.subs :as subs]
             [frontend.modules.outliner.op :as outliner-op]
+            [frontend.rfx :as rfx]
             [frontend.state :as state]
             [frontend.util :as util]
             [frontend.worker.handler.block :as worker-block]
@@ -59,7 +60,7 @@
     (gobj/set react "useCallback" (fn [callback _deps] callback))
     (gobj/set react "useSyncExternalStore" replacement)
     (try
-      (f)
+      (with-redefs [rfx/use-sub (constantly nil)] (f))
       (finally
         (gobj/set react "useRef" original-use-ref)
         (gobj/set react "useCallback" original-use-callback)
@@ -1293,7 +1294,8 @@
       (render-static
        (views/view {:view-parent-uuid owner-uuid
                     :view-feature-type :class-objects}))
-      (is (= [[:views owner-uuid :class-objects]] @resource-calls))
+      (is (= [[:views owner-uuid :class-objects] nil] @resource-calls)
+          "The inactive reference-data hook remains mounted without a resource key.")
       (is (= [view-uuid] @block-calls)
           "use-block still hydrates the view definition.")
       (is (= {:block/uuid view-uuid} (first @rendered))

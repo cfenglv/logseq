@@ -5,6 +5,7 @@
             [frontend.components.block :as block-component]
             [frontend.db.hooks :as db-hooks]
             [frontend.db.subs :as subs]
+            [frontend.rfx :as rfx]
             [goog.object :as gobj]
             [promesa.core :as p]))
 
@@ -63,7 +64,7 @@
     (gobj/set react "useCallback" (fn [callback _deps] callback))
     (gobj/set react "useSyncExternalStore" replacement)
     (try
-      (f)
+      (with-redefs [rfx/use-sub (constantly nil)] (f))
       (finally
         (gobj/set react "useRef" original-use-ref)
         (gobj/set react "useCallback" original-use-callback)

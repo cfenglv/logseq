@@ -19,6 +19,7 @@
 (def test-db "logseq_db_test-db")
 
 (defonce ^:private *initial-dbs (atom {}))
+(defonce ^:private *previous-transact-pipeline (atom nil))
 
 (defn- initial-db
   "The DB value a test starts from, built once per schema and reused:
@@ -40,6 +41,7 @@
         db-conn (d/conn-from-db (initial-db schema build-init-data?))]
     (conn/destroy-all!)
     (swap! conn/conns assoc db-name db-conn)
+    (reset! *previous-transact-pipeline @ldb/*transact-pipeline-fn)
     (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
     (d/listen! db-conn ::listen-db-changes!
                (fn [tx-report]
@@ -47,7 +49,9 @@
 
 (defn destroy-test-db!
   []
-  (conn/destroy-all!))
+  (conn/destroy-all!)
+  (reset! ldb/*transact-pipeline-fn @*previous-transact-pipeline)
+  (reset! *previous-transact-pipeline nil))
 
 (def file-to-db-statuses
   {"TODO" :logseq.property/status.todo

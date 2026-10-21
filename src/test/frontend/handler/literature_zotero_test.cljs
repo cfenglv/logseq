@@ -174,19 +174,19 @@
                                     :firstName "Ada"
                                     :lastName "Lovelace"}]
                         :DOI "10.5555/round79.performance"})
-        started (.now js/performance)
+        started (.cpuUsage js/process)
         accepted (->> (range 10000)
                       (map (fn [_]
                              (zotero/normalize-item
                               local-library-binding item)))
                       (filter #(= :ready (:status %)))
                       count)
-        elapsed (- (.now js/performance) started)]
+        used (.cpuUsage js/process started)
+        elapsed (/ (+ (.-user used) (.-system used)) 1000)]
     (js/console.log
-     (str "literature-zotero normalize 10000 items: " elapsed "ms"))
+     (str "literature-zotero normalize 10000 items: " elapsed " CPU ms"))
     (is (= 10000 accepted))
-    ;; This is intentionally loose enough for ordinary CI variance while still
-    ;; rejecting a per-item network, storage or database lookup.
+    ;; Measure this process's work, not time spent waiting behind other CI jobs.
     (is (< elapsed 500))))
 
 (deftest-async local-api-request-is-fixed-origin-read-only-and-bounded

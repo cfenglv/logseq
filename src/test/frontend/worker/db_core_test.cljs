@@ -2961,7 +2961,7 @@
   (async done
     (-> (restoring-worker-state
          (fn []
-           (let [conn (d/create-conn db-schema/schema)
+           (let [conn (db-test/create-conn)
                  page-uuid (random-uuid)
                  target-uuid (random-uuid)
                  ref-uuid (random-uuid)

@@ -6,6 +6,7 @@
             [frontend.components.page :as page]
             [frontend.db.hooks :as db-hooks]
             [frontend.db.subs :as subs]
+            [frontend.rfx :as rfx]
             [frontend.ui :as ui]
             [frontend.util :as util]
             [goog.object :as gobj]
@@ -47,7 +48,7 @@
     (gobj/set react "useCallback" (fn [callback _deps] callback))
     (gobj/set react "useSyncExternalStore" replacement)
     (try
-      (f)
+      (with-redefs [rfx/use-sub (constantly nil)] (f))
       (finally
         (gobj/set react "useRef" original-use-ref)
         (gobj/set react "useCallback" original-use-callback)

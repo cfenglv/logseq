@@ -8197,9 +8197,8 @@
 
 (deftest apply-remote-tx-does-not-clear-pending-without-ack-test
   (testing "apply-remote-tx should not clear local pending txs before tx/batch/ok ack"
-    (let [{:keys [conn client-ops-conn parent]} (setup-parent-child)
+    (let [{:keys [conn client-ops-conn parent child1]} (setup-parent-child)
           parent-uuid (:block/uuid parent)
-          block-uuid (random-uuid)
           remote-conn (d/conn-from-db @conn)
           *remote-tx (atom nil)]
       (d/listen! remote-conn ::capture-remote-same-insert
@@ -8213,28 +8212,22 @@
       (try
         (with-datascript-conns conn client-ops-conn
           (fn []
-            (outliner-core/insert-blocks! conn
-                                          [{:block/title "same insert"
-                                            :block/uuid block-uuid}]
-                                          parent
-                                          {:sibling? false
-                                           :keep-uuid? true})
+            (d/transact! conn [[:db/add (:db/id child1) :block/title "Local pending edit"]]
+                         {:outliner-op :save-block})
             (let [pending-before (#'sync-apply/pending-txs test-repo)
                   pending-before-tx-ids (mapv :tx-id pending-before)
                   remote-parent (d/entity @remote-conn [:block/uuid parent-uuid])]
               (is (= 1 (count pending-before)))
-              (outliner-core/insert-blocks! remote-conn
-                                            [{:block/title "same insert"
-                                              :block/uuid block-uuid}]
-                                            remote-parent
-                                            {:sibling? false
-                                             :keep-uuid? true})
+              (d/transact! remote-conn [[:db/add (:db/id remote-parent) :block/title "Remote parent edit"]]
+                           {:outliner-op :save-block})
               (is (seq @*remote-tx))
               (#'sync-apply/apply-remote-tx! test-repo nil @*remote-tx)
               (let [pending-after (#'sync-apply/pending-txs test-repo)]
                 (is (= pending-before-tx-ids
                        (mapv :tx-id pending-after)))
-                (is (= 1 (count pending-after)))))))
+                (is (= 1 (count pending-after)))
+                (is (= "Local pending edit" (:block/title (d/entity @conn (:db/id child1)))))
+                (is (= "Remote parent edit" (:block/title (d/entity @conn (:db/id parent)))))))))
         (finally
           (d/unlisten! remote-conn ::capture-remote-same-insert))))))
 

@@ -298,7 +298,10 @@
                   {:persist-op? true})
           (let [saved (snapshot)
                 marker-uuid (:block/uuid (d/entity @conn :logseq.property/literature-item?))]
-            (is (contains? (:refs saved) marker-uuid))
+            (is (true? (:marker saved)))
+            (is (not (contains? (:refs saved) marker-uuid))
+                "A private built-in marker is not a user-facing reference.")
+            (is (= (if (= title "Manual no-PDF paper") #{} #{page-uuid}) (:refs saved)))
             (is (= page-uuid (:parent saved) (:page saved)))
             (worker-undo-redo/undo test-repo)
             (is (nil? (d/entity @conn [:block/uuid paper-uuid])))
@@ -326,6 +329,7 @@
                   :build/tags [:logseq.class/Asset]
                   :build/properties
                   {:logseq.property.asset/type "pdf"
+                   :logseq.property.asset/size 100
                    :logseq.property.asset/checksum "synthetic-manual-pdf"}}]}]})
     (worker-undo-redo/clear-history! test-repo)
     (let [result (register! test-repo asset-uuid "Manual paper"
@@ -363,6 +367,7 @@
                   :build/tags [:logseq.class/Asset]
                   :build/properties
                   {:logseq.property.asset/type "pdf"
+                   :logseq.property.asset/size 100
                    :logseq.property.asset/checksum "synthetic-unknown-pdf"}}]}]})
     (worker-undo-redo/clear-history! test-repo)
     (let [result (register! test-repo asset-uuid "User supplied title" {})
