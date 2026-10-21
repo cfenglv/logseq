@@ -11,14 +11,10 @@
   "Property values mount a nested .ls-block .block-content. Clicking that
   0-width editor is not opening the last page block."
   []
-  (let [blocks (w/-query ".ls-page-blocks .page-blocks-inner .ls-block .block-content")]
-    (loop [i (dec (.count blocks))]
-      (when (neg? i)
-        (throw (ex-info "No page block content" {})))
-      (let [el (.nth blocks i)]
-        (if (.evaluate el "el => !el.closest('.property-block-container')")
-          el
-          (recur (dec i)))))))
+  (let [blocks (w/-query ".ls-page-blocks .page-blocks-inner .ls-block .block-content:not(.property-block-container, .property-block-container *)")]
+    (when (zero? (.count blocks))
+      (throw (ex-info "No page block content" {})))
+    (.last blocks)))
 
 (defn open-last-block
   "Open the last existing block or pressing add button to create a new block"
