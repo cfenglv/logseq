@@ -11,6 +11,8 @@ import {
   draftInventorySha256,
   obsoleteDraftAssetIds,
   verifyDraftAfterStaging,
+  verifyDraftBeforeBinding,
+  verifyDraftBeforeCreation,
   verifyDraftBeforeReplacement,
   verifyPublishedRelease,
 } from "./verify-draft-release.mjs";
@@ -70,6 +72,41 @@ function fixture() {
   };
   return { directory, assets, replacementAssets, release, releases: [release], tagRefs: [] };
 }
+
+test("first creation accepts only an absent version with a complete local asset set", (context) => {
+  const input = fixture();
+  context.after(() => fs.rmSync(input.directory, { recursive: true, force: true }));
+  const options = {
+    releases: [{ ...input.release, tag_name: "2.0.1-selfhost.7" }],
+    tagRefs: [], sourceFullSha: replacementSourceFullSha,
+    targetVersion, artifactDirectory: input.directory,
+  };
+  assert.deepEqual(verifyDraftBeforeCreation(options), { status: "draft-creation-verified" });
+  assert.throws(() => verifyDraftBeforeCreation({ ...options, releases: [input.release] }), /frozen binding/);
+  assert.throws(() => verifyDraftBeforeCreation({
+    ...options, tagRefs: [{ ref: `refs/tags/${targetVersion}` }],
+  }), /unexpectedly has a tag ref/);
+  fs.unlinkSync(path.join(input.directory, input.replacementAssets[0].name));
+  assert.throws(() => verifyDraftBeforeCreation(options), /local Draft input/);
+});
+
+test("binding checks the action-selected Draft before any metadata write", (context) => {
+  const input = fixture();
+  context.after(() => fs.rmSync(input.directory, { recursive: true, force: true }));
+  const options = {
+    release: input.release, releaseId: String(releaseId), sourceFullSha,
+    replacementSourceFullSha, targetVersion,
+  };
+  assert.deepEqual(verifyDraftBeforeBinding(options), { status: "draft-binding-verified" });
+  assert.deepEqual(verifyDraftBeforeBinding({
+    ...options, release: { ...input.release, target_commitish: replacementSourceFullSha },
+  }), { status: "draft-binding-verified" });
+  for (const change of [{ id: releaseId + 1 }, { tag_name: "2.0.1-selfhost.7" },
+    { draft: false }, { prerelease: true }, { published_at: "2026-01-01T00:00:00Z" },
+    { target_commitish: "c".repeat(40) }]) {
+    assert.throws(() => verifyDraftBeforeBinding({ ...options, release: { ...input.release, ...change } }));
+  }
+});
 
 test("frozen Draft identity and inventory pass before replacement", (context) => {
   const input = fixture();

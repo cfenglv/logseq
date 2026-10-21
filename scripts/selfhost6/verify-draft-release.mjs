@@ -41,8 +41,23 @@ function parseArgs(argv) {
     else if (flag === "--expected-inventory-sha256") result.expectedInventorySha256 = value;
     else throw new Error(`unknown argument: ${flag}`);
   }
-  assert.ok(["before", "after", "published"].includes(result.phase),
-    "--phase must be before, after, or published");
+  assert.ok(["create", "binding", "before", "after", "published"].includes(result.phase),
+    "--phase must be create, binding, before, after, or published");
+  if (result.phase === "create" || result.phase === "binding") {
+    const fields = result.phase === "create"
+      ? ["releaseListJson", "tagRefsJson", "artifactDirectory", "deleteListOutput"]
+      : ["releaseJson", "releaseId", "replacementSourceFullSha"];
+    for (const field of [...fields, "sourceFullSha", "targetVersion"]) {
+      assert.ok(result[field], `${field} is required`);
+    }
+    if (result.phase === "create") {
+      for (const field of ["SELFHOST_DRAFT_RELEASE_ID", "SELFHOST_DRAFT_TARGET_FULL_SHA",
+        "SELFHOST_DRAFT_ASSET_INVENTORY_SHA256", "SELFHOST_DRAFT_ASSET_INVENTORY_JSON"]) {
+        assert.equal(process.env[field] ?? "", "", "first creation must not have a frozen Draft binding");
+      }
+    }
+    return result;
+  }
   for (const field of [
     "releaseJson",
     "assetsJson",
@@ -169,6 +184,37 @@ export function draftInventorySha256(assets) {
   return sha256Bytes(Buffer.from(`${JSON.stringify(normalized)}\n`));
 }
 
+export function verifyDraftBeforeCreation(options) {
+  assert.equal(options.targetVersion, releasePolicy.sourceVersion, "Draft target version changed");
+  assert.match(options.sourceFullSha, fullShaPattern, "Draft target source must be a full SHA");
+  assert.ok(Array.isArray(options.releases), "release list response must be an array");
+  assert.ok(options.releases.length < 100, "release list exceeded the bounded uniqueness gate");
+  assert.equal(options.releases.some(({ tag_name: tagName }) => tagName === options.targetVersion),
+    false, "an existing version Draft requires its frozen binding");
+  assert.ok(Array.isArray(options.tagRefs), "matching tag refs response must be an array");
+  assert.equal(options.tagRefs.some(({ ref }) => ref === `refs/tags/${options.targetVersion}`),
+    false, "version Draft unexpectedly has a tag ref");
+  normalizedLocalAssets(options.artifactDirectory, options.targetVersion);
+  return { status: "draft-creation-verified" };
+}
+
+export function verifyDraftBeforeBinding(options) {
+  const expectedReleaseId = Number(options.releaseId);
+  assert.match(options.releaseId, /^[1-9][0-9]*$/, "Draft release id must be a positive decimal integer");
+  assert.ok(Number.isSafeInteger(expectedReleaseId), "Draft release id is invalid");
+  assert.equal(options.release.id, expectedReleaseId, "Draft release id changed");
+  assert.equal(options.release.tag_name, options.targetVersion, "Draft tag name changed");
+  assert.equal(options.release.draft, true, "version Release must remain a Draft");
+  assert.equal(options.release.prerelease, false, "version Draft must not be a prerelease");
+  assert.equal(options.release.published_at, null, "version Draft must remain unpublished");
+  assert.match(options.sourceFullSha, fullShaPattern, "frozen Draft target source must be a full SHA");
+  assert.match(options.replacementSourceFullSha, fullShaPattern,
+    "replacement Draft target source must be a full SHA");
+  assert.ok([options.sourceFullSha, options.replacementSourceFullSha]
+    .includes(options.release.target_commitish), "Draft target source is neither frozen nor replacement source");
+  return { status: "draft-binding-verified" };
+}
+
 export function verifyDraftBeforeReplacement(options) {
   verifyReleaseEnvelope(options);
   assert.match(options.sourceFullSha, fullShaPattern, "frozen Draft target source must be a full SHA");
@@ -253,6 +299,23 @@ export function verifyPublishedRelease(options) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  if (options.phase === "create" || options.phase === "binding") {
+    const receipt = options.phase === "create"
+      ? verifyDraftBeforeCreation({
+        ...options,
+        releases: JSON.parse(fs.readFileSync(options.releaseListJson, "utf8")),
+        tagRefs: JSON.parse(fs.readFileSync(options.tagRefsJson, "utf8")),
+      })
+      : verifyDraftBeforeBinding({
+        ...options,
+        release: JSON.parse(fs.readFileSync(options.releaseJson, "utf8")),
+      });
+    if (options.phase === "create") {
+      fs.writeFileSync(options.deleteListOutput, "", { flag: "wx", mode: 0o600 });
+    }
+    process.stdout.write(`${JSON.stringify(receipt)}\n`);
+    return;
+  }
   const release = JSON.parse(fs.readFileSync(options.releaseJson, "utf8"));
   const assets = JSON.parse(fs.readFileSync(options.assetsJson, "utf8"));
   const tagRefs = JSON.parse(fs.readFileSync(options.tagRefsJson, "utf8"));

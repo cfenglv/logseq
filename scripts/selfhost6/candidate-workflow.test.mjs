@@ -277,10 +277,11 @@ test("the mature desktop action stages one complete traditional draft and stops"
     /concurrency:\n\s+group: selfhost-release-selfhost-official-architecture-v1\n\s+cancel-in-progress: false/,
   );
   assert.match(selfhostReleaseJobs, /github\.event\.inputs\.is-draft == 'true'/);
-  assert.match(selfhostReleaseJobs, /Verify the frozen Draft before replacement/);
+  assert.match(selfhostReleaseJobs, /Verify Draft before creation or replacement/);
   assert.equal((selfhostReleaseJobs.match(/git\/matching-refs\/tags\/\$\{SELFHOST6_TARGET_VERSION\}/g) ?? []).length, 2);
   assert.equal((selfhostReleaseJobs.match(/releases\?per_page=100/g) ?? []).length, 2);
-  assert.equal((selfhostReleaseJobs.match(/--release-list-json/g) ?? []).length, 2);
+  assert.equal((selfhostReleaseJobs.match(/--release-list-json/g) ?? []).length, 3);
+  assert.match(selfhostReleaseJobs, /--phase create/);
   assert.match(selfhostReleaseJobs, /verify-draft-release\.mjs[\s\S]*--phase before/);
   assert.match(selfhostReleaseJobs, /--delete-list-output/);
   assert.match(selfhostReleaseJobs, /Remove only obsolete assets from the verified Draft/);
@@ -313,7 +314,8 @@ test("the mature desktop action stages one complete traditional draft and stops"
   assert.match(selfhostReleaseJobs, /fail_on_unmatched_files: true/);
   assert.match(selfhostReleaseJobs, /overwrite_files: true/);
   assert.match(selfhostReleaseJobs, /Bind and verify the exact reviewed Draft/);
-  assert.doesNotMatch(selfhostReleaseJobs, /steps\.draft\.outputs\.id|ACTION_DRAFT_RELEASE_ID/);
+  assert.match(selfhostReleaseJobs, /SELFHOST_DRAFT_RELEASE_ID: \$\{\{ steps\.publish-draft\.outputs\.id \}\}/);
+  assert.match(selfhostReleaseJobs, /--phase binding/);
   assert.match(selfhostReleaseJobs, /verify-draft-release\.mjs[\s\S]*--phase after/);
   assert.match(selfhostReleaseJobs, /-f tag_name="\$\{SELFHOST6_TARGET_VERSION\}"/);
   assert.match(selfhostReleaseJobs, /-f name="Logseq \$\{SELFHOST6_TARGET_VERSION\}"/);
@@ -326,7 +328,7 @@ test("the mature desktop action stages one complete traditional draft and stops"
   ]) assert.match(selfhostReleaseJobs, new RegExp(`${name}: \\$\\{\\{ secrets\\.${name} \\}\\}`));
   assert.match(
     selfhostReleaseJobs,
-    /Verify the frozen Draft before replacement[\s\S]*Remove only obsolete assets from the verified Draft[\s\S]*Create the reviewed release as a draft[\s\S]*Bind and verify the exact reviewed Draft/,
+    /Verify Draft before creation or replacement[\s\S]*Remove only obsolete assets from the verified Draft[\s\S]*Create the reviewed release as a draft[\s\S]*Bind and verify the exact reviewed Draft/,
   );
   assert.doesNotMatch(selfhostReleaseJobs, /Stage four source-version channel pointers|promote-update-feed\.mjs/);
   assert.doesNotMatch(selfhostReleaseJobs, /Promote immutable assets after the draft is staged|promote-existing-release\.mjs/);

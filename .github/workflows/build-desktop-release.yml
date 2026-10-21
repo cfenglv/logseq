@@ -1633,13 +1633,14 @@ jobs:
             --target-version "${SELFHOST6_TARGET_VERSION}" \
             --output release-final-verification/receipt.json
 
-      - name: Verify the frozen Draft before replacement
+      - name: Verify Draft before creation or replacement
         env:
           GH_TOKEN: ${{ github.token }}
           SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
           SELFHOST_DRAFT_TARGET_FULL_SHA: ${{ secrets.SELFHOST_DRAFT_TARGET_FULL_SHA }}
           SELFHOST_DRAFT_ASSET_INVENTORY_SHA256: ${{ secrets.SELFHOST_DRAFT_ASSET_INVENTORY_SHA256 }}
           SELFHOST_DRAFT_ASSET_INVENTORY_JSON: ${{ secrets.SELFHOST_DRAFT_ASSET_INVENTORY_JSON }}
+          EXPECTED_SOURCE_FULL_SHA: ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
             > "${RUNNER_TEMP}/selfhost-draft-tag-refs-before.json"
@@ -1647,6 +1648,17 @@ jobs:
             > "${RUNNER_TEMP}/selfhost-releases-before.json" 2>/dev/null; then
             echo "::error title=DraftReadFailed::Release inventory could not be read"
             exit 1
+          fi
+          if [ -z "${SELFHOST_DRAFT_RELEASE_ID}" ]; then
+            node release-source/scripts/selfhost6/verify-draft-release.mjs \
+              --phase create \
+              --tag-refs-json "${RUNNER_TEMP}/selfhost-draft-tag-refs-before.json" \
+              --release-list-json "${RUNNER_TEMP}/selfhost-releases-before.json" \
+              --source-full-sha "${EXPECTED_SOURCE_FULL_SHA}" \
+              --artifact-directory release-assets \
+              --delete-list-output "${RUNNER_TEMP}/selfhost-draft-obsolete-asset-ids.txt" \
+              --target-version "${SELFHOST6_TARGET_VERSION}"
+            exit 0
           fi
           if ! gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
             > "${RUNNER_TEMP}/selfhost-draft-before.json" 2>/dev/null; then
@@ -1666,7 +1678,7 @@ jobs:
             --release-list-json "${RUNNER_TEMP}/selfhost-releases-before.json" \
             --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
             --source-full-sha "${SELFHOST_DRAFT_TARGET_FULL_SHA}" \
-            --replacement-source-full-sha "${{ needs.selfhost-release-verifier.outputs.product-source-sha }}" \
+            --replacement-source-full-sha "${EXPECTED_SOURCE_FULL_SHA}" \
             --artifact-directory release-assets \
             --delete-list-output "${RUNNER_TEMP}/selfhost-draft-obsolete-asset-ids.txt" \
             --target-version "${SELFHOST6_TARGET_VERSION}" \
@@ -1683,6 +1695,7 @@ jobs:
           done < "${RUNNER_TEMP}/selfhost-draft-obsolete-asset-ids.txt"
 
       - name: Create the reviewed release as a draft
+        id: publish-draft
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -1734,9 +1747,25 @@ jobs:
       - name: Bind and verify the exact reviewed Draft
         env:
           GH_TOKEN: ${{ github.token }}
-          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ steps.publish-draft.outputs.id }}
+          FROZEN_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+          FROZEN_SOURCE_FULL_SHA: ${{ secrets.SELFHOST_DRAFT_TARGET_FULL_SHA }}
           EXPECTED_SOURCE_FULL_SHA: ${{ needs.selfhost-release-verifier.outputs.product-source-sha }}
         run: |
+          if [ -n "${FROZEN_DRAFT_RELEASE_ID}" ] && \
+            [ "${SELFHOST_DRAFT_RELEASE_ID}" != "${FROZEN_DRAFT_RELEASE_ID}" ]; then
+            echo "::error title=DraftBindFailed::Created Draft differs from the frozen binding"
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            > "${RUNNER_TEMP}/selfhost-draft-before-binding.json"
+          node release-source/scripts/selfhost6/verify-draft-release.mjs \
+            --phase binding \
+            --release-json "${RUNNER_TEMP}/selfhost-draft-before-binding.json" \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${FROZEN_SOURCE_FULL_SHA:-$EXPECTED_SOURCE_FULL_SHA}" \
+            --replacement-source-full-sha "${EXPECTED_SOURCE_FULL_SHA}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}"
           if ! gh api --method PATCH \
             "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
             -f tag_name="${SELFHOST6_TARGET_VERSION}" \
