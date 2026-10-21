@@ -141,9 +141,23 @@
 
 (deftest-async consecutive-arxiv-lookups-are-spaced-without-a-background-task
   (let [sent-at (atom [])
+        waits (atom [])
+        clock (atom 10000)
+        original-now (.-now js/Date)
+        last-request-at @#'metadata/arxiv-last-request-at
+        lookup-tail @#'metadata/arxiv-lookup-tail
+        original-last-request @last-request-at
+        original-lookup-tail @lookup-tail
         original-parser (aget js/globalThis "DOMParser")]
     (aset js/globalThis "DOMParser" xmldom/DOMParser)
-    (-> (p/with-redefs [ipc/ipc (fn [& _args]
+    (set! (.-now js/Date) (fn [] @clock))
+    (reset! last-request-at 0)
+    (reset! lookup-tail (p/resolved nil))
+    (-> (p/with-redefs [p/delay (fn [ms]
+                                (swap! waits conj ms)
+                                (swap! clock + ms)
+                                (p/resolved nil))
+                        ipc/ipc (fn [& _args]
                                   (swap! sent-at conj (.now js/Date))
                                   (p/resolved {:ok true
                                                :body (arxiv-body {})}))]
@@ -153,8 +167,13 @@
                                    {:arxiv "2401.12345v2"} nil)])]
             (is (= [:ready :ready] (mapv :status results)))
             (is (= 2 (count @sent-at)))
+            (is (= [0 3000] @waits))
             (is (>= (- (second @sent-at) (first @sent-at)) 3000))))
-        (p/finally #(aset js/globalThis "DOMParser" original-parser)))))
+        (p/finally (fn []
+                     (aset js/globalThis "DOMParser" original-parser)
+                     (set! (.-now js/Date) original-now)
+                     (reset! last-request-at original-last-request)
+                     (reset! lookup-tail original-lookup-tail))))))
 
 (deftest old-arxiv-and-field-selected-conference-records
   (let [old (metadata/parse-arxiv-record

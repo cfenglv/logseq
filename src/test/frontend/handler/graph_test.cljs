@@ -271,29 +271,26 @@
           local-graph-uuid #uuid "11111111-1111-1111-1111-111111111111"
           registry-entry (atom nil)]
       (is (fn? upsert-current-f) "Current graph registry upsert should exist")
-      (p/with-redefs [state/get-current-repo (constantly "logseq_db_broken")
-                      state/<invoke-db-worker
-                      (fn [api repo]
-                        (is (= "logseq_db_broken" repo))
-                        (case api
-                          :thread-api/ensure-local-graph-uuid (p/resolved local-graph-uuid)
-                          :thread-api/get-graph-uuid (p/resolved local-graph-uuid)
-                          (throw (ex-info "Unexpected worker API" {:api api}))))
-                      frontend.handler.graph/<upsert-graph-registry-entry!
-                      (fn [entry]
-                        (reset! registry-entry entry)
-                        (p/resolved nil))]
-        (-> (upsert-current-f)
-            (.then (fn [_]
-                     (is (= {:repo "logseq_db_broken"
-                             :graph-name "broken"
-                             :local-graph-id (str local-graph-uuid)
-                             :graph-id (str local-graph-uuid)}
-                            @registry-entry))
-                     (done)))
-            (.catch (fn [e]
-                      (is false (str e))
-                      (done))))))))
+      (-> (p/with-redefs [state/get-current-repo (constantly "logseq_db_broken")
+                         state/<invoke-db-worker
+                         (fn [api repo]
+                           (is (= "logseq_db_broken" repo))
+                           (case api
+                             :thread-api/ensure-local-graph-uuid (p/resolved local-graph-uuid)
+                             :thread-api/get-graph-uuid (p/resolved local-graph-uuid)
+                             (throw (ex-info "Unexpected worker API" {:api api}))))
+                         frontend.handler.graph/<upsert-graph-registry-entry!
+                         (fn [entry]
+                           (reset! registry-entry entry)
+                           (p/resolved nil))]
+            (p/let [_ (upsert-current-f)]
+              (is (= {:repo "logseq_db_broken"
+                      :graph-name "broken"
+                      :local-graph-id (str local-graph-uuid)
+                      :graph-id (str local-graph-uuid)}
+                     @registry-entry))))
+          (p/catch (fn [e] (is false (str e))))
+          (p/finally done)))))
 
 (deftest resolve-startup-repo-prefers-tab-repo-before-global-current-test
   (let [resolve-f (some-> (resolve 'frontend.handler.graph/resolve-startup-repo) deref)]
