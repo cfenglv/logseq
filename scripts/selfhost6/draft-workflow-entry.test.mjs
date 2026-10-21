@@ -32,15 +32,32 @@ const sha256 = (bytes) => `sha256:${createHash("sha256").update(bytes).digest("h
 // workflow shell and verifier CLI, using physical files (not import-only tests).
 const fakeGh = `#!/usr/bin/env node
 const fs = require("node:fs");
+const path = require("node:path");
 const args = process.argv.slice(2);
 const state = JSON.parse(fs.readFileSync(process.env.DRAFT_TEST_STATE));
 const methodIndex = args.indexOf("--method");
 const method = methodIndex < 0 ? "GET" : args[methodIndex + 1];
 const route = args.find((value) => value.startsWith("repos/"));
-if (args[0] !== "api" || !route?.startsWith("repos/example/release-fixture/")) process.exit(90);
-state.calls.push({ method, route });
 const save = () => fs.writeFileSync(process.env.DRAFT_TEST_STATE, JSON.stringify(state));
 const reply = (value) => { save(); process.stdout.write(JSON.stringify(value) + "\\n"); };
+const denyDraftRead = () => {
+  save(); process.stderr.write("Resource not accessible by integration (HTTP 403)\\n"); process.exit(1);
+};
+if (args[0] === "release" && args[1] === "download") {
+  if (args[args.indexOf("--repo") + 1] !== "example/release-fixture") process.exit(90);
+  if (process.env.DRAFT_TEST_CONTENTS_PERMISSION !== "write") denyDraftRead();
+  const release = state.releases.find((item) => item.tag_name === args[2]);
+  const destination = args[args.indexOf("--dir") + 1];
+  if (!release || !fs.statSync(destination).isDirectory()) process.exit(92);
+  for (const asset of release.assets) fs.copyFileSync(
+    path.join(process.env.DRAFT_TEST_DOWNLOAD_DIRECTORY, asset.name), path.join(destination, asset.name));
+  state.calls.push({ method: "DOWNLOAD", route: "repos/example/release-fixture/releases/" + release.id });
+  save(); process.exit(0);
+}
+if (args[0] !== "api" || !route?.startsWith("repos/example/release-fixture/")) process.exit(90);
+state.calls.push({ method, route });
+if (method === "GET" && /\\/releases\\/[0-9]+/.test(route) &&
+    process.env.DRAFT_TEST_CONTENTS_PERMISSION !== "write") denyDraftRead();
 if (method === "GET" && route.includes("/git/matching-refs/tags/")) reply(state.tagRefs);
 else if (method === "GET" && route.endsWith("/releases?per_page=100")) reply(state.releases);
 else if (method === "DELETE" && /\\/releases\\/assets\\/[0-9]+$/.test(route)) {
@@ -136,6 +153,7 @@ function fixture(context, mode) {
       PATH: `${path.join(root, "bin")}${path.delimiter}${process.env.PATH}`,
       GH_TOKEN: "synthetic-token", GITHUB_REPOSITORY: "example/release-fixture",
       RUNNER_TEMP: path.join(root, "temp"), SELFHOST6_TARGET_VERSION: version,
+      DRAFT_TEST_CONTENTS_PERMISSION: workflow.jobs["selfhost-release"].permissions.contents,
       DRAFT_TEST_STATE: statePath,
       ...Object.fromEntries(Object.entries(step.env ?? {}).map(([key, value]) => [key, expand(value)])),
     };
@@ -251,4 +269,35 @@ test("actual Draft workflow: absent or partial binding cannot adopt an existing 
     assert.equal(input.state().calls.every(({ method }) => method === "GET"), true);
     assert.deepEqual(input.state().releases, initial);
   }
+});
+
+test("actual bridge input workflow: protected Draft access downloads and verifies all thirty-five files", (context) => {
+  const input = fixture(context, "create");
+  for (const name of ["scripts", "resources"]) fs.cpSync(
+    path.join(input.root, "release-source", name), path.join(input.root, name), { recursive: true });
+  input.action();
+  const originalReleases = input.state().releases;
+  const job = workflow.jobs["selfhost-bridge-build-inputs"];
+  const download = job.steps.find(({ name }) => name === "Download and verify the existing final Draft");
+  const run = (permission) => input.run({
+    ...download,
+    env: {
+      ...download.env,
+      SELFHOST_DRAFT_RELEASE_ID: String(releaseId), FINAL_SOURCE_FULL_SHA: newSource,
+      DRAFT_TEST_CONTENTS_PERMISSION: permission,
+      DRAFT_TEST_DOWNLOAD_DIRECTORY: path.join(input.root, "release-assets"),
+    },
+  });
+  const denied = run("read");
+  assert.equal(denied.status, 1);
+  assert.match(denied.stderr, /Resource not accessible by integration \(HTTP 403\)/);
+  assert.equal(fs.existsSync(path.join(input.root, "final-release-assets")), false);
+  const result = run(job.permissions.contents);
+  success(result);
+  assert.deepEqual(JSON.parse(result.stdout), { status: "draft-staging-verified" });
+  assert.deepEqual(fs.readdirSync(path.join(input.root, "final-release-assets")).sort(),
+    input.assets.map(({ name }) => name).sort());
+  assert.equal(input.state().calls.filter(({ method }) => method === "DOWNLOAD").length, 1);
+  assert.equal(input.state().calls.every(({ method }) => method === "GET" || method === "DOWNLOAD"), true);
+  assert.deepEqual(input.state().releases, originalReleases);
 });

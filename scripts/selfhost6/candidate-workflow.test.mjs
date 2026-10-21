@@ -436,7 +436,9 @@ test("the desktop action builds native bridge inputs without promoting a partial
   assert.match(inputs, /github\.ref_name == 'release\/2\.0\.2-selfhost\.1'/);
   assert.match(inputs, /git-ref == 'release\/2\.0\.2-selfhost\.1'/);
   assert.match(inputs, /environment: selfhost-production/);
-  assert.match(inputs, /permissions:\n\s+contents: read/);
+  assert.match(inputs, /permissions:\n\s+contents: write/);
+  assert.match(inputs, /GH_TOKEN: \$\{\{ github\.token \}\}/);
+  assert.doesNotMatch(inputs, /gh release (?:create|upload|edit|delete)|gh api[^\n]*--method (?:POST|PUT|PATCH|DELETE)/);
   assert.match(inputs, /build-offline-bridge\.mjs inputs[\s\S]*Download and verify the existing final Draft[\s\S]*verify-draft-release\.mjs[\s\S]*--phase after[\s\S]*Retain exact final macOS arm64 input/);
   assert.match(inputs, /--source-full-sha "\$\{FINAL_SOURCE_FULL_SHA\}"/);
   assert.doesNotMatch(inputs, /--source-full-sha "\$\{GITHUB_SHA\}"/);
@@ -485,7 +487,9 @@ test("the desktop action builds native bridge inputs without promoting a partial
   assert.match(windows, /run: node scripts\/selfhost6\/build-offline-bridge\.mjs build/);
   assert.match(windows, /name: selfhost-offline-bridge-input-win32-x64-\$\{\{ env\.BRIDGE_SOURCE_FULL_SHA \}\}-\$\{\{ env\.FINAL_SOURCE_FULL_SHA \}\}[\s\S]*path: bridge-build-input[\s\S]*if-no-files-found: error/);
   assert.doesNotMatch(windows, /arm64|matrix|strategy/);
-  assert.doesNotMatch(jobs, /contents: write|--publish always|action-gh-release|promote-update-feed|promote-existing-release/);
+  assert.equal((jobs.match(/contents: write/g) ?? []).length, 1);
+  assert.doesNotMatch(jobs.slice(inputs.length), /contents: write/);
+  assert.doesNotMatch(jobs, /--publish always|action-gh-release|promote-update-feed|promote-existing-release/);
   assert.doesNotMatch(jobs, /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY|prepare-update-artifact|cljs:release|rtc:prepush/);
   assert.doesNotMatch(jobs, /name: selfhost-offline-bridge-\$\{\{/);
 });

@@ -883,8 +883,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     environment: selfhost-production
+    # Draft visibility requires push access; this job only reads release assets.
     permissions:
-      contents: read
+      contents: write
     env:
       BRIDGE_SOURCE_FULL_SHA: ${{ github.event.inputs.bridge-source-full-sha }}
       FINAL_SOURCE_FULL_SHA: ${{ github.event.inputs.final-source-full-sha }}
