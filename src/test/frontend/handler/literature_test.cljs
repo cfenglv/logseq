@@ -546,6 +546,126 @@
      :paper-uuid #uuid "79000000-0000-4000-8000-000000000021"
      :placement-uuid #uuid "79000000-0000-4000-8000-000000000022"}))
 
+(defn- <assert-three-entrypoint-pdf-reuse!
+  [{:keys [repo registered children-reads files reads source-path saved-path checksum content-checks links asset-uuid paper-uuid binding source-record readbacks placement-queries native-inserts writes byte-values]}]
+  (p/let [results (p/loop [entries (seq [:now :refresh :notify]) results []]
+                   (if-let [entry (first entries)]
+                     (p/let [result (case entry
+                                     :now (literature/<import-zotero-now! repo)
+                                     :refresh (literature/<refresh-zotero-items! repo ["AAAA1111"])
+                                     :notify (literature/<poll-zotero-notifications-once!
+                                              repo {:session "synthetic-session" :cursor 7}))]
+                       (p/recur (next entries) (conj results result)))
+                     results))]
+    (is (= [:complete :complete :complete] (mapv :status results)))
+    (is (= 3 (count @registered)))
+    (is (= 3 @children-reads) "Already imported sources still read current PDF children")
+    (is (= 3 (count @files)))
+    (is (= 3 (get (frequencies @reads) source-path 0)))
+    (is (zero? (get (frequencies @reads) saved-path 0))
+        "Existing file bytes are not copied into the renderer")
+    (is (= (repeat 3 [saved-path 9 checksum]) @content-checks)
+        "Existing file bytes are verified by the native streaming helper")
+    (is (= 3 (count @links)))
+    (doseq [[graph actual-asset actual-paper options] @links]
+      (is (= [repo asset-uuid paper-uuid] [graph actual-asset actual-paper])
+          "The source commit uses the existing Asset UUID")
+      (is (true? (:automatic? options)))
+      (is (= {:binding-uuid (:graph-binding-uuid binding)
+              :source-key (:source-key source-record)}
+             (dissoc (:source-context options) :reference-uuid :asset-block)))
+      (is (= [asset-uuid "Supplementary Information"]
+             ((juxt :block/uuid :block/title) (get-in options [:source-context :asset-block]))))
+      (is (uuid? (get-in options [:source-context :reference-uuid]))))
+    (is (>= (count (filter #(= [repo asset-uuid {:children? false}] %) @readbacks)) 3))
+    (is (empty? @placement-queries) "Paper placement is part of the source commit")
+    (is (zero? @native-inserts) "The renderer does not separately insert Paper attachments")
+    (is (zero? @writes))
+    (p/loop [remaining (seq @files)]
+      (when-let [^js file (first remaining)]
+        (is (instance? js/File file))
+        (is (= "中文 paper#?%.pdf" (.-name file)))
+        (is (= "application/pdf" (.-type file)))
+        (p/let [buffer (.arrayBuffer file)]
+          (is (= byte-values (js->clj (js/Array.from (js/Uint8Array. buffer)))))
+          (p/recur (next remaining)))))))
+
+(defn- <with-reusable-zotero-pdf!
+  [{:keys [stored repo reviews repo-dir admit! children-reads binding source-record attachment registered paper-uuid source-path saved-path content-checks checksum reads payload files original-prepare native-asset writes readbacks asset-uuid links placement-queries placement-uuid native-inserts byte-values]}]
+  (p/with-redefs [storage/get (fn [key] (get @stored key))
+                 state/get-current-repo (constantly repo)
+                 state/get-state (fn [path]
+                                   (if (= :db/restoring? path) false
+                                       (get-in @reviews (if (coll? path) path [path]))))
+                 state/update-state! (fn [path f & args]
+                                       (swap! reviews update-in path #(apply f % args)))
+                 util/electron? (constantly true)
+                 config/db-based-graph? (constantly true)
+                 config/get-repo-dir (constantly repo-dir)
+                 zotero/<import-scope! admit!
+                 zotero/<import-item-keys! (fn [binding' _keys authorized? register!]
+                                           (admit! binding' authorized? register!))
+                 zotero/<process-notifier-cycle!
+                 (fn [binding' notification-state authorized? register! _signal]
+                   (p/let [result (admit! binding' authorized? register!)]
+                     (assoc result :notification-state (assoc notification-state :cursor 8))))
+                 zotero/<read-pdf-attachments!
+                 (fn [binding' source-key authorized? & _]
+                   (swap! children-reads inc)
+                   (is (= binding binding'))
+                   (is (= (:source-key source-record) source-key))
+                   (is (true? (authorized?)))
+                   (p/resolved {:status :ready :parent-item-key "AAAA1111" :attachments [attachment]}))
+                 db-async/<register-literature-source-record
+                 (fn [repo' binding-uuid destination record]
+                   (swap! registered conj [repo' binding-uuid destination record])
+                   (p/resolved {:status :already-imported :paper-uuid paper-uuid}))
+                 ipc/ipc (fn [method path & [size actual-checksum]]
+                           (is (contains? #{source-path saved-path} path))
+                           (case method
+                             :stat (p/resolved {:size 9})
+                             :fileContentMatches
+                             (do
+                               (swap! content-checks conj [path size actual-checksum])
+                               (p/resolved (= [saved-path 9 checksum]
+                                              [path size actual-checksum])))
+                             :readFileRaw (do (swap! reads conj path) (p/resolved payload))
+                             (throw (ex-info "Unexpected native request" {:method method}))))
+                 assets/prepare-asset-block (fn [repo' file opts]
+                                              (swap! files conj (if (map? file) (:src file) file))
+                                              (original-prepare repo' file opts))
+                 assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
+                 db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                 db-async/<find-reusable-pdf-by-checksum
+                 (fn [repo' actual-checksum]
+                   (is (= [repo checksum] [repo' actual-checksum]))
+                   (p/resolved {:status :found :literature-status :found
+                                :assets [(select-keys native-asset [:block/uuid :block/title
+                                                                   :logseq.property.asset/size
+                                                                   :logseq.property.asset/checksum])]}))
+                 fs/file-exists? (fn [& _] (p/resolved true))
+                 fs/write-asset-file! (fn [& _] (swap! writes inc) (p/resolved nil))
+                 db-async/<get-block
+                 (fn [repo' uuid opts]
+                   (swap! readbacks conj [repo' uuid opts])
+                   (p/resolved (if (= uuid asset-uuid) native-asset
+                                   {:db/id 102 :block/uuid uuid :block/title "Target"})))
+                 db-async/<link-pdf-to-literature
+                 (fn [repo' actual-asset-uuid actual-paper-uuid options]
+                   (swap! links conj [repo' actual-asset-uuid actual-paper-uuid options])
+                   (p/resolved {:status :already-linked :paper {:block/uuid paper-uuid}}))
+                 db-async/<q (fn [repo' _opts _query & params]
+                               (swap! placement-queries conj [repo' params])
+                               (p/resolved placement-uuid))
+                 state/<invoke-db-worker (fn [& _]
+                                           (swap! native-inserts inc)
+                                           (p/resolved {:result :synthetic-insert-complete}))]
+    (<assert-three-entrypoint-pdf-reuse! {:repo repo :registered registered :children-reads children-reads
+      :files files :reads reads :source-path source-path :saved-path saved-path :checksum checksum
+      :content-checks content-checks :links links :asset-uuid asset-uuid :paper-uuid paper-uuid
+      :binding binding :source-record source-record :readbacks readbacks :placement-queries placement-queries
+      :native-inserts native-inserts :writes writes :byte-values byte-values})))
+
 (deftest-async zotero-three-entrypoints-read-already-imported-pdf-and-reuse-its-native-asset
   (let [{:keys [repo binding stored source-record context attachment source-path repo-dir
                 payload byte-values checksum asset-uuid paper-uuid placement-uuid]}
@@ -573,115 +693,13 @@
                  (is (true? (still-authorized?)))
                  (p/let [result (register! (:graph-binding-uuid binding) source-record context)]
                    {:status :complete :worker-result result}))]
-    (p/with-redefs [storage/get (fn [key] (get @stored key))
-                   state/get-current-repo (constantly repo)
-                   state/get-state (fn [path]
-                                     (if (= :db/restoring? path) false
-                                         (get-in @reviews (if (coll? path) path [path]))))
-                   state/update-state! (fn [path f & args]
-                                         (swap! reviews update-in path #(apply f % args)))
-                   util/electron? (constantly true)
-                   config/db-based-graph? (constantly true)
-                   config/get-repo-dir (constantly repo-dir)
-                   zotero/<import-scope! admit!
-                   zotero/<import-item-keys! (fn [binding' _keys authorized? register!]
-                                             (admit! binding' authorized? register!))
-                   zotero/<process-notifier-cycle!
-                   (fn [binding' notification-state authorized? register! _signal]
-                     (p/let [result (admit! binding' authorized? register!)]
-                       (assoc result :notification-state (assoc notification-state :cursor 8))))
-                   zotero/<read-pdf-attachments!
-                   (fn [binding' source-key authorized? & _]
-                     (swap! children-reads inc)
-                     (is (= binding binding'))
-                     (is (= (:source-key source-record) source-key))
-                     (is (true? (authorized?)))
-                     (p/resolved {:status :ready :parent-item-key "AAAA1111" :attachments [attachment]}))
-                   db-async/<register-literature-source-record
-                   (fn [repo' binding-uuid destination record]
-                     (swap! registered conj [repo' binding-uuid destination record])
-                     (p/resolved {:status :already-imported :paper-uuid paper-uuid}))
-                   ipc/ipc (fn [method path & [size actual-checksum]]
-                             (is (contains? #{source-path saved-path} path))
-                             (case method
-                               :stat (p/resolved {:size 9})
-                               :fileContentMatches
-                               (do
-                                 (swap! content-checks conj [path size actual-checksum])
-                                 (p/resolved (= [saved-path 9 checksum]
-                                                [path size actual-checksum])))
-                               :readFileRaw (do (swap! reads conj path) (p/resolved payload))
-                               (throw (ex-info "Unexpected native request" {:method method}))))
-                   assets/prepare-asset-block (fn [repo' file opts]
-                                                (swap! files conj (if (map? file) (:src file) file))
-                                                (original-prepare repo' file opts))
-                   assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
-                   db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
-                   db-async/<find-reusable-pdf-by-checksum
-                   (fn [repo' actual-checksum]
-                     (is (= [repo checksum] [repo' actual-checksum]))
-                     (p/resolved {:status :found :literature-status :found
-                                  :assets [(select-keys native-asset [:block/uuid :block/title
-                                                                     :logseq.property.asset/size
-                                                                     :logseq.property.asset/checksum])]}))
-                   fs/file-exists? (fn [& _] (p/resolved true))
-                   fs/write-asset-file! (fn [& _] (swap! writes inc) (p/resolved nil))
-                   db-async/<get-block
-                   (fn [repo' uuid opts]
-                     (swap! readbacks conj [repo' uuid opts])
-                     (p/resolved (if (= uuid asset-uuid) native-asset
-                                     {:db/id 102 :block/uuid uuid :block/title "Target"})))
-                   db-async/<link-pdf-to-literature
-                   (fn [repo' actual-asset-uuid actual-paper-uuid options]
-                     (swap! links conj [repo' actual-asset-uuid actual-paper-uuid options])
-                     (p/resolved {:status :already-linked :paper {:block/uuid paper-uuid}}))
-                   db-async/<q (fn [repo' _opts _query & params]
-                                 (swap! placement-queries conj [repo' params])
-                                 (p/resolved placement-uuid))
-                   state/<invoke-db-worker (fn [& _]
-                                             (swap! native-inserts inc)
-                                             (p/resolved {:result :synthetic-insert-complete}))]
-      (p/let [results (p/loop [entries (seq [:now :refresh :notify]) results []]
-                       (if-let [entry (first entries)]
-                         (p/let [result (case entry
-                                         :now (literature/<import-zotero-now! repo)
-                                         :refresh (literature/<refresh-zotero-items! repo ["AAAA1111"])
-                                         :notify (literature/<poll-zotero-notifications-once!
-                                                  repo {:session "synthetic-session" :cursor 7}))]
-                           (p/recur (next entries) (conj results result)))
-                         results))]
-        (is (= [:complete :complete :complete] (mapv :status results)))
-        (is (= 3 (count @registered)))
-        (is (= 3 @children-reads) "Already imported sources still read current PDF children")
-        (is (= 3 (count @files)))
-        (is (= 3 (get (frequencies @reads) source-path 0)))
-        (is (zero? (get (frequencies @reads) saved-path 0))
-            "Existing file bytes are not copied into the renderer")
-        (is (= (repeat 3 [saved-path 9 checksum]) @content-checks)
-            "Existing file bytes are verified by the native streaming helper")
-        (is (= 3 (count @links)))
-        (doseq [[graph actual-asset actual-paper options] @links]
-          (is (= [repo asset-uuid paper-uuid] [graph actual-asset actual-paper])
-              "The source commit uses the existing Asset UUID")
-          (is (true? (:automatic? options)))
-          (is (= {:binding-uuid (:graph-binding-uuid binding)
-                  :source-key (:source-key source-record)}
-                 (dissoc (:source-context options) :reference-uuid :asset-block)))
-          (is (= [asset-uuid "Supplementary Information"]
-                 ((juxt :block/uuid :block/title) (get-in options [:source-context :asset-block]))))
-          (is (uuid? (get-in options [:source-context :reference-uuid]))))
-        (is (>= (count (filter #(= [repo asset-uuid {:children? false}] %) @readbacks)) 3))
-        (is (empty? @placement-queries) "Paper placement is part of the source commit")
-        (is (zero? @native-inserts) "The renderer does not separately insert Paper attachments")
-        (is (zero? @writes))
-        (p/loop [remaining (seq @files)]
-          (when-let [^js file (first remaining)]
-            (is (instance? js/File file))
-            (is (= "中文 paper#?%.pdf" (.-name file)))
-            (is (= "application/pdf" (.-type file)))
-            (p/let [buffer (.arrayBuffer file)]
-              (is (= byte-values (js->clj (js/Array.from (js/Uint8Array. buffer)))))
-              (p/recur (next remaining)))))))))
+    (<with-reusable-zotero-pdf! {:stored stored :repo repo :reviews reviews :repo-dir repo-dir :admit! admit!
+      :children-reads children-reads :binding binding :source-record source-record :attachment attachment
+      :registered registered :paper-uuid paper-uuid :source-path source-path :saved-path saved-path
+      :content-checks content-checks :checksum checksum :reads reads :payload payload :files files
+      :original-prepare original-prepare :native-asset native-asset :writes writes :readbacks readbacks
+      :asset-uuid asset-uuid :links links :placement-queries placement-queries :placement-uuid placement-uuid
+      :native-inserts native-inserts :byte-values byte-values})))
 
 (deftest-async zotero-kept-pdf-skips-automatic-placement-and-advances-notifier-cursor
   (let [{:keys [repo binding stored source-record context attachment source-path repo-dir
@@ -996,6 +1014,135 @@
             (is (= byte-values (js->clj (js/Array.from (js/Uint8Array. buffer)))))
             (is (= byte-values (js->clj (js/Array.from (js/Uint8Array. (nth (first @writes) 2))))))))))))
 
+(defn- <assert-uncommitted-zotero-recycling!
+  [{:keys [mode active-files readbacks unlinks repo notification-state write-failure writes prepared recycled-files notifier-requests inserts cleanup-failure cleanup-warnings links]}]
+  (p/let [_ (p/loop [remaining (seq [{:entry :now} {:entry :refresh} {:entry :notify} {:entry :notify}
+                           {:entry :refresh :cleanup-reject? true}
+                           {:entry :refresh :write-reject? true}])]
+    (when-let [scenario (first remaining)]
+      (reset! mode scenario)
+      (let [files-before @active-files
+            reads-before (count @readbacks)
+            cleanup-before (count @unlinks)]
+        (p/let [outcome (-> (case (:entry scenario)
+                             :now (literature/<import-zotero-now! repo)
+                             :refresh (literature/<refresh-zotero-items! repo ["AAAA1111"])
+                             :notify (literature/<poll-zotero-notifications-once! repo notification-state))
+                           (p/then (fn [value] {:fulfilled? true :value value}))
+                           (p/catch (fn [error] {:fulfilled? false :error error})))]
+          (is (false? (:fulfilled? outcome)) "Failed imports cannot fulfill with a next notifier cursor")
+          (if (:write-reject? scenario)
+            (do
+              (is (identical? write-failure (:error outcome)))
+              (is (= reads-before (count @readbacks)) "A failed write adds no lookup")
+              (is (= cleanup-before (count @unlinks)) "A failed write adds no recycle")
+              (is (= files-before @active-files)))
+            (let [written (last @writes)
+                  actual-uuid (get-in @prepared [:asset-block :block/uuid])]
+              (is (= :literature-zotero/attachment-insert-failed (some-> outcome :error ex-data :type)))
+              (is (= "Zotero attachment was not inserted at its destination" (.-message (:error outcome)))
+                  "Cleanup failure must preserve the insertion error")
+              (is (= (str actual-uuid ".pdf") (:filename written)))
+              (is (= written (last @unlinks)))
+              (if (:cleanup-reject? scenario)
+                (is (= written (get @active-files (:path written))))
+                (do
+                  (is (= files-before @active-files) "Retry leaves no new PDF in active assets")
+                  (is (= written (last @recycled-files))
+                      "Existing unlink semantics preserve bytes in recycle, rather than erase the disk")))))
+          (p/recur (next remaining))))))]
+    (is (= [notification-state notification-state] @notifier-requests)
+        "Both failed notifier attempts ACK the original cursor, never the response cursor")
+    (is (= 5 (count @inserts)))
+    (is (= 5 (count @unlinks)))
+    (is (= 4 (count @recycled-files)))
+    (is (= [cleanup-failure] @cleanup-warnings)
+        "Successful recycle must not report the original insert error as a cleanup failure")
+    (is (= 6 (count (set (map :filename @writes)))) "Each retry owns a different new UUID file")
+    (is (zero? @links))))
+
+(defn- <with-uncommitted-zotero-pdfs!
+  [{:keys [stored repo repo-dir cleanup-warnings admit! notifier-requests standalone-attachment source-path payload original-prepare prepared checksum byte-values writes mode write-failure active-files inserts readbacks unlinks cleanup-failure recycled-files links notification-state]}]
+  (p/with-redefs [storage/get (fn [key] (get @stored key))
+                 state/get-current-repo (constantly repo)
+                 state/get-state (constantly false)
+                 util/electron? (constantly true)
+                 config/db-based-graph? (constantly true)
+                 config/get-repo-dir (constantly repo-dir)
+                 log/log (fn [_ _ data _]
+                           (when-let [error (:literature-zotero/asset-cleanup-failed data)]
+                             (swap! cleanup-warnings conj error))
+                           nil)
+                 zotero/<import-scope! admit!
+                 zotero/<import-item-keys! (fn [binding' _keys authorized? register!]
+                                           (admit! binding' authorized? register!))
+                 zotero/<notifier-request!
+                 (fn [current-state & _]
+                   (swap! notifier-requests conj current-state)
+                   (p/resolved {:session "synthetic-session" :cursor 8
+                                :rescan false :zotero-library-key "LOCAL001" :keys ["AAAA1111"]}))
+                 zotero/<read-pdf-attachments! (fn [& _]
+                                               (p/resolved {:status :ready :attachments [standalone-attachment]}))
+                 ipc/ipc (fn [method path & _]
+                           (is (= source-path path))
+                           (case method :stat (p/resolved {:size 9})
+                                 :fileContentMatches (p/resolved true)
+                                 :readFileRaw (p/resolved payload)
+                                 (throw (ex-info "Unexpected native request" {:method method}))))
+                 assets/prepare-asset-block
+                 (fn [repo' file opts]
+                   (p/let [candidate (original-prepare repo' file opts)]
+                     (reset! prepared candidate)
+                     candidate))
+                 assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
+                 db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                 db-async/<find-reusable-pdf-by-checksum (fn [& _]
+                                                        (p/resolved {:status :missing :assets []}))
+                 fs/write-asset-file!
+                 (fn [repo' filename buffer]
+                   (p/let [actual-checksum (db-asset/<get-file-array-buffer-checksum buffer)]
+                     (let [file {:repo repo' :filename filename :path (str repo-dir "/assets/" filename)
+                                 :checksum actual-checksum
+                                 :payload (js->clj (js/Array.from (assets/->uint8 buffer)))}]
+                       (is (= [repo checksum byte-values] [repo' actual-checksum (:payload file)]))
+                       (swap! writes conj file)
+                       (if (:write-reject? @mode)
+                         (p/rejected write-failure)
+                         (do (swap! active-files assoc (:path file) file)
+                             (p/resolved nil))))))
+                 state/<invoke-db-worker
+                 (fn [api repo' ops _opts]
+                   (is (= [:thread-api/apply-outliner-ops repo] [api repo']))
+                   (let [[op [[block] target _]] (first ops)]
+                     (is (= :insert-blocks op))
+                     (is (= destination-page-uuid target))
+                     (swap! inserts conj (:block/uuid block)))
+                   (p/resolved {:result nil}))
+                 db-async/<get-block
+                 (fn [repo' actual-uuid opts]
+                   (swap! readbacks conj [repo' actual-uuid opts])
+                   (js/Promise.resolve nil))
+                 fs/unlink!
+                 (fn [repo' filepath _opts]
+                   (let [file (get @active-files filepath)]
+                     (is (= repo repo'))
+                     (is (some? file) "Cleanup addresses exactly a file written by this import")
+                     (is (= [repo (get-in @prepared [:asset-block :block/uuid]) {:children? false}]
+                            (last @readbacks))
+                         "The current UUID is checked before its owned file is recycled")
+                     (swap! unlinks conj file)
+                     (if (:cleanup-reject? @mode)
+                       (p/rejected cleanup-failure)
+                       (do (swap! active-files dissoc filepath)
+                           (swap! recycled-files conj file)
+                           (p/resolved nil)))))
+                 db-async/<link-pdf-to-literature (fn [& _] (swap! links inc)
+                                                 (p/resolved {:status :linked}))]
+    (<assert-uncommitted-zotero-recycling! {:mode mode :active-files active-files :readbacks readbacks
+      :unlinks unlinks :repo repo :notification-state notification-state :write-failure write-failure
+      :writes writes :prepared prepared :recycled-files recycled-files :notifier-requests notifier-requests
+      :inserts inserts :cleanup-failure cleanup-failure :cleanup-warnings cleanup-warnings :links links})))
+
 (deftest-async zotero-uncommitted-new-pdf-is-recycled-before-retry-and-notifier-ack
   (let [{:keys [repo binding stored context attachment source-path repo-dir payload byte-values checksum]}
         (zotero-native-pdf-fixture)
@@ -1021,125 +1168,161 @@
                  (is (true? (authorized?)))
                  (p/let [result (register! (:graph-binding-uuid binding) nil standalone-context)]
                    {:status :complete :worker-result result}))]
-    (p/with-redefs [storage/get (fn [key] (get @stored key))
-                   state/get-current-repo (constantly repo)
-                   state/get-state (constantly false)
-                   util/electron? (constantly true)
-                   config/db-based-graph? (constantly true)
-                   config/get-repo-dir (constantly repo-dir)
-                   log/log (fn [_ _ data _]
-                             (when-let [error (:literature-zotero/asset-cleanup-failed data)]
-                               (swap! cleanup-warnings conj error))
-                             nil)
-                   zotero/<import-scope! admit!
-                   zotero/<import-item-keys! (fn [binding' _keys authorized? register!]
-                                             (admit! binding' authorized? register!))
-                   zotero/<notifier-request!
-                   (fn [current-state & _]
-                     (swap! notifier-requests conj current-state)
-                     (p/resolved {:session "synthetic-session" :cursor 8
-                                  :rescan false :zotero-library-key "LOCAL001" :keys ["AAAA1111"]}))
-                   zotero/<read-pdf-attachments! (fn [& _]
-                                                 (p/resolved {:status :ready :attachments [standalone-attachment]}))
-                   ipc/ipc (fn [method path & _]
-                             (is (= source-path path))
-                             (case method :stat (p/resolved {:size 9})
-                                   :fileContentMatches (p/resolved true)
-                                   :readFileRaw (p/resolved payload)
-                                   (throw (ex-info "Unexpected native request" {:method method}))))
-                   assets/prepare-asset-block
-                   (fn [repo' file opts]
-                     (p/let [candidate (original-prepare repo' file opts)]
-                       (reset! prepared candidate)
-                       candidate))
-                   assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
-                   db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
-                   db-async/<find-reusable-pdf-by-checksum (fn [& _]
-                                                          (p/resolved {:status :missing :assets []}))
-                   fs/write-asset-file!
-                   (fn [repo' filename buffer]
-                     (p/let [actual-checksum (db-asset/<get-file-array-buffer-checksum buffer)]
-                       (let [file {:repo repo' :filename filename :path (str repo-dir "/assets/" filename)
-                                   :checksum actual-checksum
-                                   :payload (js->clj (js/Array.from (assets/->uint8 buffer)))}]
-                         (is (= [repo checksum byte-values] [repo' actual-checksum (:payload file)]))
-                         (swap! writes conj file)
-                         (if (:write-reject? @mode)
-                           (p/rejected write-failure)
-                           (do (swap! active-files assoc (:path file) file)
-                               (p/resolved nil))))))
-                   state/<invoke-db-worker
-                   (fn [api repo' ops _opts]
-                     (is (= [:thread-api/apply-outliner-ops repo] [api repo']))
-                     (let [[op [[block] target _]] (first ops)]
-                       (is (= :insert-blocks op))
-                       (is (= destination-page-uuid target))
-                       (swap! inserts conj (:block/uuid block)))
-                     (p/resolved {:result nil}))
-                   db-async/<get-block
-                   (fn [repo' actual-uuid opts]
-                     (swap! readbacks conj [repo' actual-uuid opts])
-                     (js/Promise.resolve nil))
-                   fs/unlink!
-                   (fn [repo' filepath _opts]
-                     (let [file (get @active-files filepath)]
-                       (is (= repo repo'))
-                       (is (some? file) "Cleanup addresses exactly a file written by this import")
-                       (is (= [repo (get-in @prepared [:asset-block :block/uuid]) {:children? false}]
-                              (last @readbacks))
-                           "The current UUID is checked before its owned file is recycled")
-                       (swap! unlinks conj file)
-                       (if (:cleanup-reject? @mode)
-                         (p/rejected cleanup-failure)
-                         (do (swap! active-files dissoc filepath)
-                             (swap! recycled-files conj file)
-                             (p/resolved nil)))))
-                   db-async/<link-pdf-to-literature (fn [& _] (swap! links inc)
-                                                   (p/resolved {:status :linked}))]
-      (p/let [_ (p/loop [remaining (seq [{:entry :now} {:entry :refresh} {:entry :notify} {:entry :notify}
-                               {:entry :refresh :cleanup-reject? true}
-                               {:entry :refresh :write-reject? true}])]
-        (when-let [scenario (first remaining)]
-          (reset! mode scenario)
-          (let [files-before @active-files
-                reads-before (count @readbacks)
-                cleanup-before (count @unlinks)]
-            (p/let [outcome (-> (case (:entry scenario)
-                                 :now (literature/<import-zotero-now! repo)
-                                 :refresh (literature/<refresh-zotero-items! repo ["AAAA1111"])
-                                 :notify (literature/<poll-zotero-notifications-once! repo notification-state))
-                               (p/then (fn [value] {:fulfilled? true :value value}))
-                               (p/catch (fn [error] {:fulfilled? false :error error})))]
-              (is (false? (:fulfilled? outcome)) "Failed imports cannot fulfill with a next notifier cursor")
-              (if (:write-reject? scenario)
-                (do
-                  (is (identical? write-failure (:error outcome)))
-                  (is (= reads-before (count @readbacks)) "A failed write adds no lookup")
-                  (is (= cleanup-before (count @unlinks)) "A failed write adds no recycle")
-                  (is (= files-before @active-files)))
-                (let [written (last @writes)
-                      actual-uuid (get-in @prepared [:asset-block :block/uuid])]
-                  (is (= :literature-zotero/attachment-insert-failed (some-> outcome :error ex-data :type)))
-                  (is (= "Zotero attachment was not inserted at its destination" (.-message (:error outcome)))
-                      "Cleanup failure must preserve the insertion error")
-                  (is (= (str actual-uuid ".pdf") (:filename written)))
-                  (is (= written (last @unlinks)))
-                  (if (:cleanup-reject? scenario)
-                    (is (= written (get @active-files (:path written))))
-                    (do
-                      (is (= files-before @active-files) "Retry leaves no new PDF in active assets")
-                      (is (= written (last @recycled-files))
-                          "Existing unlink semantics preserve bytes in recycle, rather than erase the disk")))))
-              (p/recur (next remaining))))))]
-        (is (= [notification-state notification-state] @notifier-requests)
-            "Both failed notifier attempts ACK the original cursor, never the response cursor")
-        (is (= 5 (count @inserts)))
-        (is (= 5 (count @unlinks)))
-        (is (= 4 (count @recycled-files)))
-        (is (= [cleanup-failure] @cleanup-warnings)
-            "Successful recycle must not report the original insert error as a cleanup failure")
-        (is (= 6 (count (set (map :filename @writes)))) "Each retry owns a different new UUID file")
-        (is (zero? @links))))))
+    (<with-uncommitted-zotero-pdfs! {:stored stored :repo repo :repo-dir repo-dir :cleanup-warnings cleanup-warnings
+      :admit! admit! :notifier-requests notifier-requests :standalone-attachment standalone-attachment
+      :source-path source-path :payload payload :original-prepare original-prepare :prepared prepared
+      :checksum checksum :byte-values byte-values :writes writes :mode mode :write-failure write-failure
+      :active-files active-files :inserts inserts :readbacks readbacks :unlinks unlinks
+      :cleanup-failure cleanup-failure :recycled-files recycled-files :links links
+      :notification-state notification-state})))
+
+(defn- <assert-rejected-zotero-commits!
+  [{:keys [mode stored initial-stored files committed readbacks unlinks renderer-inserts source-commits repo notification-state readback-failure failure notifier-requests prepared repo-dir byte-values checksum]}]
+  (p/loop [remaining (seq [{:flow :standalone :state :committed}
+                          {:flow :standalone :state :lookup-rejected}
+                          {:flow :paper :state :uncommitted}
+                          {:flow :paper :state :committed}
+                          {:flow :paper :state :lookup-rejected}
+                          {:flow :paper :state :readback-rejected}
+                          {:flow :paper :state :binding-closed}])]
+    (when-let [scenario (first remaining)]
+      (reset! mode scenario)
+      (reset! stored initial-stored)
+      (reset! files {})
+      (reset! committed {})
+      (reset! readbacks [])
+      (reset! unlinks [])
+      (reset! renderer-inserts 0)
+      (reset! source-commits 0)
+      (p/let [outcome (-> (literature/<poll-zotero-notifications-once! repo notification-state)
+                         (p/then (fn [value] {:fulfilled? true :value value}))
+                         (p/catch (fn [error] {:fulfilled? false :error error})))]
+        (if (= :binding-closed (:state scenario))
+          (do
+            (is (true? (:fulfilled? outcome)))
+            (is (= :cancelled (get-in outcome [:value :status])))
+            (is (nil? (get-in outcome [:value :notification-state]))
+                "Disabling after the write cannot ACK the response cursor"))
+          (do
+            (is (false? (:fulfilled? outcome)))
+            (is (identical? (if (= :readback-rejected (:state scenario)) readback-failure failure)
+                            (:error outcome))
+                "The original error survives the current-UUID cleanup check")))
+        (is (= (repeat (count @notifier-requests) notification-state) @notifier-requests)
+            "A rejected import never ACKs the response cursor")
+        (is (= (if (and (= :paper (:flow scenario))
+                        (not= :binding-closed (:state scenario))) 1 0)
+               @source-commits))
+        (is (= (if (= :standalone (:flow scenario)) 1 0) @renderer-inserts))
+        (let [actual-uuid (get-in @prepared [:asset-block :block/uuid])
+              filepath (str repo-dir "/assets/" actual-uuid ".pdf")]
+          (is (= [repo actual-uuid {:children? false}] (last @readbacks)))
+          (if (contains? #{:uncommitted :binding-closed} (:state scenario))
+            (do
+              (is (empty? @files))
+              (is (= [filepath] @unlinks)))
+            (do
+              (is (= {filepath {:payload byte-values :checksum checksum}} @files)
+                  "Committed or unconfirmed UUIDs keep their exact written bytes")
+              (is (empty? @unlinks))))
+          (when (contains? #{:committed :readback-rejected} (:state scenario))
+            (is (= actual-uuid (:block/uuid (get @committed actual-uuid))))))
+        (p/recur (next remaining))))))
+
+(defn- <with-rejected-zotero-commits!
+  [{:keys [stored repo repo-dir binding mode source-record context standalone-context notifier-requests paper-uuid attachment source-path payload original-prepare prepared files renderer-inserts committed failure source-commits readbacks lookup-failure readback-failure unlinks initial-stored notification-state byte-values checksum]}]
+  (p/with-redefs [storage/get (fn [key] (get @stored key))
+                 state/get-current-repo (constantly repo)
+                 state/get-state (constantly false)
+                 util/electron? (constantly true)
+                 config/db-based-graph? (constantly true)
+                 config/get-repo-dir (constantly repo-dir)
+                 zotero/<import-scope!
+                 (fn [_ _ register!]
+                   (p/let [result (register! (:graph-binding-uuid binding)
+                                            (when (= :paper (:flow @mode)) source-record)
+                                            (if (= :paper (:flow @mode)) context standalone-context))]
+                     {:status :complete :worker-result result}))
+                 zotero/<import-item-keys!
+                 (fn [binding' _keys authorized? register!]
+                   (zotero/<import-scope! binding' authorized? register!))
+                 zotero/<notifier-request!
+                 (fn [current-state & _]
+                   (swap! notifier-requests conj current-state)
+                   (p/resolved {:session "synthetic-session" :cursor 8
+                                :rescan false :zotero-library-key "LOCAL001" :keys ["AAAA1111"]}))
+                 db-async/<register-literature-source-record
+                 (fn [& _] (p/resolved {:status :already-imported :paper-uuid paper-uuid}))
+                 zotero/<read-pdf-attachments! (fn [& _]
+                                               (p/resolved {:status :ready :attachments [attachment]}))
+                 ipc/ipc (fn [method path & _]
+                           (is (= source-path path))
+                           (case method :stat (p/resolved {:size 9})
+                                 :fileContentMatches (p/resolved true)
+                                 :readFileRaw (p/resolved payload)
+                                 (throw (ex-info "Unexpected native request" {:method method}))))
+                 assets/prepare-asset-block (fn [repo' file opts]
+                                              (p/let [candidate (original-prepare repo' file opts)]
+                                                (reset! prepared candidate)
+                                                candidate))
+                 assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
+                 db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                 db-async/<find-reusable-pdf-by-checksum (fn [& _]
+                                                        (p/resolved {:status :missing :assets []}))
+                 fs/write-asset-file!
+                 (fn [repo' filename buffer]
+                   (p/let [actual-checksum (db-asset/<get-file-array-buffer-checksum buffer)]
+                     (is (= repo repo'))
+                     (swap! files assoc (str repo-dir "/assets/" filename)
+                            {:payload (js->clj (js/Array.from (assets/->uint8 buffer)))
+                             :checksum actual-checksum})
+                     (when (= :binding-closed (:state @mode))
+                       (swap! stored update-in [:ls-literature-settings repo] dissoc :zotero-binding))))
+                 state/<invoke-db-worker
+                 (fn [_ _ ops _opts]
+                   (swap! renderer-inserts inc)
+                   (when (= :committed (:state @mode))
+                     (let [[_ [[block] target _]] (first ops)]
+                       (swap! committed assoc (:block/uuid block)
+                              (assoc block :db/id 103 :block/parent {:block/uuid target}
+                                           :block/tags [{:db/ident :logseq.class/Asset}]))))
+                   (p/rejected failure))
+                 db-async/<link-pdf-to-literature
+                 (fn [graph actual-uuid target options]
+                   (swap! source-commits inc)
+                   (is (= [repo paper-uuid] [graph target]))
+                   (is (true? (:automatic? options)))
+                   (is (= {:binding-uuid (:graph-binding-uuid binding)
+                           :source-key (:source-key source-record)}
+                          (select-keys (:source-context options) [:binding-uuid :source-key])))
+                   (is (uuid? (get-in options [:source-context :reference-uuid])))
+                   (is (= actual-uuid (get-in options [:source-context :asset-block :block/uuid])))
+                   (when (contains? #{:committed :readback-rejected} (:state @mode))
+                     (swap! committed assoc actual-uuid
+                            (assoc (get-in options [:source-context :asset-block])
+                                   :block/parent {:block/uuid target}
+                                   :block/tags [{:db/ident :logseq.class/Asset}])))
+                   (if (= :readback-rejected (:state @mode))
+                     (p/resolved {:status :linked})
+                     (p/rejected failure)))
+                 db-async/<get-block
+                 (fn [repo' actual-uuid opts]
+                   (swap! readbacks conj [repo' actual-uuid opts])
+                   (case (:state @mode)
+                     :lookup-rejected (p/rejected lookup-failure)
+                     :readback-rejected (if (= 1 (count @readbacks))
+                                          (p/rejected readback-failure)
+                                          (p/resolved (get @committed actual-uuid)))
+                     (p/resolved (get @committed actual-uuid))))
+                 fs/unlink! (fn [_ filepath _]
+                              (swap! unlinks conj filepath)
+                              (swap! files dissoc filepath)
+                              (p/resolved nil))]
+    (<assert-rejected-zotero-commits! {:mode mode :stored stored :initial-stored initial-stored :files files
+      :committed committed :readbacks readbacks :unlinks unlinks :renderer-inserts renderer-inserts
+      :source-commits source-commits :repo repo :notification-state notification-state
+      :readback-failure readback-failure :failure failure :notifier-requests notifier-requests
+      :prepared prepared :repo-dir repo-dir :byte-values byte-values :checksum checksum})))
 
 (deftest-async zotero-rejected-pdf-commit-recycles-only-a-confirmed-unregistered-file
   (let [{:keys [repo binding stored source-record context attachment source-path repo-dir payload byte-values
@@ -1161,143 +1344,14 @@
         failure (ex-info "Synthetic native commit reply failed" {:type :synthetic/commit-reply-failed})
         readback-failure (ex-info "Synthetic committed UUID read failed" {:type :synthetic/committed-read-failed})
         lookup-failure (ex-info "Synthetic current UUID read failed" {:type :synthetic/read-failed})]
-    (p/with-redefs [storage/get (fn [key] (get @stored key))
-                   state/get-current-repo (constantly repo)
-                   state/get-state (constantly false)
-                   util/electron? (constantly true)
-                   config/db-based-graph? (constantly true)
-                   config/get-repo-dir (constantly repo-dir)
-                   zotero/<import-scope!
-                   (fn [_ _ register!]
-                     (p/let [result (register! (:graph-binding-uuid binding)
-                                              (when (= :paper (:flow @mode)) source-record)
-                                              (if (= :paper (:flow @mode)) context standalone-context))]
-                       {:status :complete :worker-result result}))
-                   zotero/<import-item-keys!
-                   (fn [binding' _keys authorized? register!]
-                     (zotero/<import-scope! binding' authorized? register!))
-                   zotero/<notifier-request!
-                   (fn [current-state & _]
-                     (swap! notifier-requests conj current-state)
-                     (p/resolved {:session "synthetic-session" :cursor 8
-                                  :rescan false :zotero-library-key "LOCAL001" :keys ["AAAA1111"]}))
-                   db-async/<register-literature-source-record
-                   (fn [& _] (p/resolved {:status :already-imported :paper-uuid paper-uuid}))
-                   zotero/<read-pdf-attachments! (fn [& _]
-                                                 (p/resolved {:status :ready :attachments [attachment]}))
-                   ipc/ipc (fn [method path & _]
-                             (is (= source-path path))
-                             (case method :stat (p/resolved {:size 9})
-                                   :fileContentMatches (p/resolved true)
-                                   :readFileRaw (p/resolved payload)
-                                   (throw (ex-info "Unexpected native request" {:method method}))))
-                   assets/prepare-asset-block (fn [repo' file opts]
-                                                (p/let [candidate (original-prepare repo' file opts)]
-                                                  (reset! prepared candidate)
-                                                  candidate))
-                   assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
-                   db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
-                   db-async/<find-reusable-pdf-by-checksum (fn [& _]
-                                                          (p/resolved {:status :missing :assets []}))
-                   fs/write-asset-file!
-                   (fn [repo' filename buffer]
-                     (p/let [actual-checksum (db-asset/<get-file-array-buffer-checksum buffer)]
-                       (is (= repo repo'))
-                       (swap! files assoc (str repo-dir "/assets/" filename)
-                              {:payload (js->clj (js/Array.from (assets/->uint8 buffer)))
-                               :checksum actual-checksum})
-                       (when (= :binding-closed (:state @mode))
-                         (swap! stored update-in [:ls-literature-settings repo] dissoc :zotero-binding))))
-                   state/<invoke-db-worker
-                   (fn [_ _ ops _opts]
-                     (swap! renderer-inserts inc)
-                     (when (= :committed (:state @mode))
-                       (let [[_ [[block] target _]] (first ops)]
-                         (swap! committed assoc (:block/uuid block)
-                                (assoc block :db/id 103 :block/parent {:block/uuid target}
-                                             :block/tags [{:db/ident :logseq.class/Asset}]))))
-                     (p/rejected failure))
-                   db-async/<link-pdf-to-literature
-                   (fn [graph actual-uuid target options]
-                     (swap! source-commits inc)
-                     (is (= [repo paper-uuid] [graph target]))
-                     (is (true? (:automatic? options)))
-                     (is (= {:binding-uuid (:graph-binding-uuid binding)
-                             :source-key (:source-key source-record)}
-                            (select-keys (:source-context options) [:binding-uuid :source-key])))
-                     (is (uuid? (get-in options [:source-context :reference-uuid])))
-                     (is (= actual-uuid (get-in options [:source-context :asset-block :block/uuid])))
-                     (when (contains? #{:committed :readback-rejected} (:state @mode))
-                       (swap! committed assoc actual-uuid
-                              (assoc (get-in options [:source-context :asset-block])
-                                     :block/parent {:block/uuid target}
-                                     :block/tags [{:db/ident :logseq.class/Asset}])))
-                     (if (= :readback-rejected (:state @mode))
-                       (p/resolved {:status :linked})
-                       (p/rejected failure)))
-                   db-async/<get-block
-                   (fn [repo' actual-uuid opts]
-                     (swap! readbacks conj [repo' actual-uuid opts])
-                     (case (:state @mode)
-                       :lookup-rejected (p/rejected lookup-failure)
-                       :readback-rejected (if (= 1 (count @readbacks))
-                                            (p/rejected readback-failure)
-                                            (p/resolved (get @committed actual-uuid)))
-                       (p/resolved (get @committed actual-uuid))))
-                   fs/unlink! (fn [_ filepath _]
-                                (swap! unlinks conj filepath)
-                                (swap! files dissoc filepath)
-                                (p/resolved nil))]
-      (p/loop [remaining (seq [{:flow :standalone :state :committed}
-                              {:flow :standalone :state :lookup-rejected}
-                              {:flow :paper :state :uncommitted}
-                              {:flow :paper :state :committed}
-                              {:flow :paper :state :lookup-rejected}
-                              {:flow :paper :state :readback-rejected}
-                              {:flow :paper :state :binding-closed}])]
-        (when-let [scenario (first remaining)]
-          (reset! mode scenario)
-          (reset! stored initial-stored)
-          (reset! files {})
-          (reset! committed {})
-          (reset! readbacks [])
-          (reset! unlinks [])
-          (reset! renderer-inserts 0)
-          (reset! source-commits 0)
-          (p/let [outcome (-> (literature/<poll-zotero-notifications-once! repo notification-state)
-                             (p/then (fn [value] {:fulfilled? true :value value}))
-                             (p/catch (fn [error] {:fulfilled? false :error error})))]
-            (if (= :binding-closed (:state scenario))
-              (do
-                (is (true? (:fulfilled? outcome)))
-                (is (= :cancelled (get-in outcome [:value :status])))
-                (is (nil? (get-in outcome [:value :notification-state]))
-                    "Disabling after the write cannot ACK the response cursor"))
-              (do
-                (is (false? (:fulfilled? outcome)))
-                (is (identical? (if (= :readback-rejected (:state scenario)) readback-failure failure)
-                                (:error outcome))
-                    "The original error survives the current-UUID cleanup check")))
-            (is (= (repeat (count @notifier-requests) notification-state) @notifier-requests)
-                "A rejected import never ACKs the response cursor")
-            (is (= (if (and (= :paper (:flow scenario))
-                            (not= :binding-closed (:state scenario))) 1 0)
-                   @source-commits))
-            (is (= (if (= :standalone (:flow scenario)) 1 0) @renderer-inserts))
-            (let [actual-uuid (get-in @prepared [:asset-block :block/uuid])
-                  filepath (str repo-dir "/assets/" actual-uuid ".pdf")]
-              (is (= [repo actual-uuid {:children? false}] (last @readbacks)))
-              (if (contains? #{:uncommitted :binding-closed} (:state scenario))
-                (do
-                  (is (empty? @files))
-                  (is (= [filepath] @unlinks)))
-                (do
-                  (is (= {filepath {:payload byte-values :checksum checksum}} @files)
-                      "Committed or unconfirmed UUIDs keep their exact written bytes")
-                  (is (empty? @unlinks))))
-              (when (contains? #{:committed :readback-rejected} (:state scenario))
-                (is (= actual-uuid (:block/uuid (get @committed actual-uuid))))))
-            (p/recur (next remaining))))))))
+    (<with-rejected-zotero-commits! {:stored stored :repo repo :repo-dir repo-dir :binding binding :mode mode
+      :source-record source-record :context context :standalone-context standalone-context
+      :notifier-requests notifier-requests :paper-uuid paper-uuid :attachment attachment
+      :source-path source-path :payload payload :original-prepare original-prepare :prepared prepared
+      :files files :renderer-inserts renderer-inserts :committed committed :failure failure
+      :source-commits source-commits :readbacks readbacks :lookup-failure lookup-failure
+      :readback-failure readback-failure :unlinks unlinks :initial-stored initial-stored
+      :notification-state notification-state :byte-values byte-values :checksum checksum})))
 
 (deftest-async zotero-reused-pdf-keeps-existing-bytes-after-source-commit-failure
   (let [{:keys [repo binding stored source-record context attachment source-path repo-dir payload byte-values
@@ -1388,6 +1442,164 @@
           (is (zero? @inserts) "A rejected source commit adds no renderer placement")
           (is (zero? @placement-queries)))))))
 
+(defn- <assert-delayed-stale-zotero-commits!
+  [{:keys [mode files saved-path original-file writes unlinks commits reads readbacks pending repo notification-state renderer-ops placement-queries blocked cleanup-failure lookup-failure source-path paper-uuid binding source-record repo-dir asset-uuid notifier-requests]}]
+  (p/let [_ (p/loop [scenarios (seq [:new :reused :new-cleanup-rejected :new-cleanup-read-unknown])]
+              (when-let [scenario (first scenarios)]
+                (let [resolve-commit (atom nil)
+                      resolve-started (atom nil)
+                      started (js/Promise. (fn [resolve _] (reset! resolve-started resolve)))
+                      waiting (js/Promise. (fn [resolve _] (reset! resolve-commit resolve)))
+                      completed? (atom false)]
+                  (reset! mode scenario)
+                  (reset! files {saved-path original-file})
+                  (doseq [a [writes unlinks commits reads readbacks]] (reset! a []))
+                  (reset! pending {:started @resolve-started :promise waiting})
+                  (let [attempt (-> (literature/<poll-zotero-notifications-once! repo notification-state)
+                                    (p/then (fn [result]
+                                              (reset! completed? true)
+                                              {:fulfilled? true :value result}))
+                                    (p/catch (fn [error]
+                                               (reset! completed? true)
+                                               {:fulfilled? false :error error})))]
+                    (p/let [_ started
+                            _ (do
+                                (is (false? @completed?) "Notifier remains pending until source commit replies")
+                                (is (= 1 (count @commits)))
+                                (is (zero? @renderer-ops))
+                                (is (zero? @placement-queries))
+                                (@resolve-commit blocked))
+                            outcome attempt]
+                      (if (contains? #{:new :reused} scenario)
+                        (do
+                          (is (true? (:fulfilled? outcome)))
+                          (is (= :complete (get-in outcome [:value :status])))
+                          (is (= {:session "synthetic-session" :cursor 8}
+                                 (get-in outcome [:value :notification-state])))
+                          (is (= {:blocked 1} (get-in outcome [:value :import :result-counts])))
+                          (is (= [:source-link-unavailable]
+                                 (mapv :reason (get-in outcome [:value :import :results])))))
+                        (do
+                          (is (false? (:fulfilled? outcome)))
+                          (is (identical? (if (= :new-cleanup-rejected scenario)
+                                            cleanup-failure lookup-failure)
+                                          (:error outcome)))
+                          (is (nil? (:value outcome))
+                              "A failed normal stale cleanup cannot return an advanced notifier cursor")))
+                      (is (= 1 (count (filter #(= [:readFileRaw source-path] %) @reads))))
+                      (let [[graph actual-asset actual-paper options] (first @commits)
+                            context (:source-context options)]
+                        (is (= [repo paper-uuid] [graph actual-paper]))
+                        (is (true? (:automatic? options)))
+                        (is (= {:binding-uuid (:graph-binding-uuid binding)
+                                :source-key (:source-key source-record)}
+                               (select-keys context [:binding-uuid :source-key])))
+                        (is (uuid? (:reference-uuid context)))
+                        (if (not= :reused scenario)
+                          (let [filepath (str repo-dir "/assets/" actual-asset ".pdf")]
+                            (is (= actual-asset (get-in context [:asset-block :block/uuid])))
+                            (is (= [filepath] @writes))
+                            (if (= :new-cleanup-read-unknown scenario)
+                              (is (empty? @unlinks))
+                              (is (= [filepath] @unlinks)))
+                            (if (= :new scenario)
+                              (is (= {saved-path original-file} @files))
+                              (is (= {saved-path original-file filepath original-file} @files)
+                                  "A failed cleanup retains the exact new and existing PDF bytes")))
+                          (do
+                            (is (= asset-uuid actual-asset))
+                            (is (= asset-uuid (get-in context [:asset-block :block/uuid])))
+                            (is (empty? @writes))
+                            (is (empty? @unlinks))
+                            (is (= {saved-path original-file} @files)))))
+                      (p/recur (next scenarios)))))))]
+    (is (= (repeat 4 notification-state) @notifier-requests))
+    (is (zero? @renderer-ops))
+    (is (zero? @placement-queries))))
+
+(defn- <with-delayed-zotero-commits!
+  [{:keys [stored repo repo-dir notifier-requests source-record paper-uuid attachment reads source-path saved-path payload mode native-asset checksum writes files readbacks lookup-failure asset-uuid commits pending unlinks cleanup-failure renderer-ops placement-queries original-file notification-state blocked binding]}]
+  (p/with-redefs [storage/get (fn [key] (get @stored key))
+                 state/get-current-repo (constantly repo)
+                 state/get-state (constantly false)
+                 util/electron? (constantly true)
+                 config/db-based-graph? (constantly true)
+                 config/get-repo-dir (constantly repo-dir)
+                 zotero/<notifier-request!
+                 (fn [current-state & _]
+                   (swap! notifier-requests conj current-state)
+                   (p/resolved {:session "synthetic-session" :cursor 8
+                                :rescan false :zotero-library-key "LOCAL001" :keys ["AAAA1111"]}))
+                 zotero/<local-api-request!
+                 (fn [& _]
+                   (p/resolved (js/JSON.stringify
+                                (clj->js [{:key "AAAA1111" :library {:type "user" :id 0}
+                                           :data {:key "AAAA1111" :itemType "journalArticle"
+                                                  :title (:title source-record) :creators []}}]))))
+                 db-async/<register-literature-source-record
+                 (fn [& _] (p/resolved {:status :already-imported :paper-uuid paper-uuid}))
+                 zotero/<read-pdf-attachments!
+                 (fn [& _]
+                   (p/resolved {:status :ready
+                                :attachments [attachment (assoc attachment :item-key "CCCC3333"
+                                                                :filename "second.pdf"
+                                                                :file-url "file:///synthetic/zotero/second.pdf")]}))
+                 ipc/ipc
+                 (fn [method filepath & _]
+                   (swap! reads conj [method filepath])
+                   (is (contains? #{source-path saved-path} filepath)
+                       "A stale first attachment must not start the second attachment")
+                   (case method :stat (p/resolved {:size 9})
+                         :fileContentMatches (p/resolved true)
+                         :readFileRaw (p/resolved payload)
+                         (throw (ex-info "Unexpected native request" {:method method}))))
+                 assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
+                 db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                 db-async/<find-reusable-pdf-by-checksum
+                 (fn [& _]
+                   (p/resolved (if (= :reused @mode)
+                                 {:status :found :literature-status :found :assets [native-asset]}
+                                 {:status :missing :assets []})))
+                 fs/write-asset-file!
+                 (fn [graph filename buffer]
+                   (p/let [actual-checksum (db-asset/<get-file-array-buffer-checksum buffer)]
+                     (is (= [repo checksum] [graph actual-checksum]))
+                     (let [filepath (str repo-dir "/assets/" filename)
+                           file {:payload (js->clj (js/Array.from (assets/->uint8 buffer)))
+                                 :checksum actual-checksum}]
+                       (swap! writes conj filepath)
+                       (swap! files assoc filepath file))))
+                 db-async/<get-block
+                 (fn [_ uuid _]
+                   (swap! readbacks conj uuid)
+                   (if (= :new-cleanup-read-unknown @mode)
+                     (p/rejected lookup-failure)
+                     (p/resolved (when (= uuid asset-uuid) native-asset))))
+                 db-async/<link-pdf-to-literature
+                 (fn [graph actual-asset actual-paper options]
+                   (swap! commits conj [graph actual-asset actual-paper options])
+                   ((:started @pending))
+                   (:promise @pending))
+                 fs/unlink!
+                 (fn [_ filepath _]
+                   (is (not= saved-path filepath) "Existing PDF bytes cannot be recycled")
+                   (is (= (last @readbacks) (second (last @commits)))
+                       "Cleanup first checks the exact new Asset UUID")
+                   (swap! unlinks conj filepath)
+                   (if (= :new-cleanup-rejected @mode)
+                     (p/rejected cleanup-failure)
+                     (do (swap! files dissoc filepath)
+                         (p/resolved nil))))
+                 state/<invoke-db-worker (fn [& _] (swap! renderer-ops inc) (p/resolved nil))
+                 db-async/<q (fn [& _] (swap! placement-queries inc) (p/resolved nil))]
+    (<assert-delayed-stale-zotero-commits! {:mode mode :files files :saved-path saved-path
+      :original-file original-file :writes writes :unlinks unlinks :commits commits :reads reads
+      :readbacks readbacks :pending pending :repo repo :notification-state notification-state
+      :renderer-ops renderer-ops :placement-queries placement-queries :blocked blocked
+      :cleanup-failure cleanup-failure :lookup-failure lookup-failure :source-path source-path
+      :paper-uuid paper-uuid :binding binding :source-record source-record :repo-dir repo-dir
+      :asset-uuid asset-uuid :notifier-requests notifier-requests})))
+
 (deftest-async zotero-delayed-stale-source-commit-stops-attachments-and-completes-notifier
   (let [{:keys [repo binding stored source-record attachment source-path repo-dir payload byte-values
                 checksum asset-uuid paper-uuid]}
@@ -1414,151 +1626,13 @@
         notifier-requests (atom [])
         renderer-ops (atom 0)
         placement-queries (atom 0)]
-    (p/with-redefs [storage/get (fn [key] (get @stored key))
-                   state/get-current-repo (constantly repo)
-                   state/get-state (constantly false)
-                   util/electron? (constantly true)
-                   config/db-based-graph? (constantly true)
-                   config/get-repo-dir (constantly repo-dir)
-                   zotero/<notifier-request!
-                   (fn [current-state & _]
-                     (swap! notifier-requests conj current-state)
-                     (p/resolved {:session "synthetic-session" :cursor 8
-                                  :rescan false :zotero-library-key "LOCAL001" :keys ["AAAA1111"]}))
-                   zotero/<local-api-request!
-                   (fn [& _]
-                     (p/resolved (js/JSON.stringify
-                                  (clj->js [{:key "AAAA1111" :library {:type "user" :id 0}
-                                             :data {:key "AAAA1111" :itemType "journalArticle"
-                                                    :title (:title source-record) :creators []}}]))))
-                   db-async/<register-literature-source-record
-                   (fn [& _] (p/resolved {:status :already-imported :paper-uuid paper-uuid}))
-                   zotero/<read-pdf-attachments!
-                   (fn [& _]
-                     (p/resolved {:status :ready
-                                  :attachments [attachment (assoc attachment :item-key "CCCC3333"
-                                                                  :filename "second.pdf"
-                                                                  :file-url "file:///synthetic/zotero/second.pdf")]}))
-                   ipc/ipc
-                   (fn [method filepath & _]
-                     (swap! reads conj [method filepath])
-                     (is (contains? #{source-path saved-path} filepath)
-                         "A stale first attachment must not start the second attachment")
-                     (case method :stat (p/resolved {:size 9})
-                           :fileContentMatches (p/resolved true)
-                           :readFileRaw (p/resolved payload)
-                           (throw (ex-info "Unexpected native request" {:method method}))))
-                   assets/ensure-assets-dir! (fn [_] (p/resolved [repo-dir "assets"]))
-                   db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
-                   db-async/<find-reusable-pdf-by-checksum
-                   (fn [& _]
-                     (p/resolved (if (= :reused @mode)
-                                   {:status :found :literature-status :found :assets [native-asset]}
-                                   {:status :missing :assets []})))
-                   fs/write-asset-file!
-                   (fn [graph filename buffer]
-                     (p/let [actual-checksum (db-asset/<get-file-array-buffer-checksum buffer)]
-                       (is (= [repo checksum] [graph actual-checksum]))
-                       (let [filepath (str repo-dir "/assets/" filename)
-                             file {:payload (js->clj (js/Array.from (assets/->uint8 buffer)))
-                                   :checksum actual-checksum}]
-                         (swap! writes conj filepath)
-                         (swap! files assoc filepath file))))
-                   db-async/<get-block
-                   (fn [_ uuid _]
-                     (swap! readbacks conj uuid)
-                     (if (= :new-cleanup-read-unknown @mode)
-                       (p/rejected lookup-failure)
-                       (p/resolved (when (= uuid asset-uuid) native-asset))))
-                   db-async/<link-pdf-to-literature
-                   (fn [graph actual-asset actual-paper options]
-                     (swap! commits conj [graph actual-asset actual-paper options])
-                     ((:started @pending))
-                     (:promise @pending))
-                   fs/unlink!
-                   (fn [_ filepath _]
-                     (is (not= saved-path filepath) "Existing PDF bytes cannot be recycled")
-                     (is (= (last @readbacks) (second (last @commits)))
-                         "Cleanup first checks the exact new Asset UUID")
-                     (swap! unlinks conj filepath)
-                     (if (= :new-cleanup-rejected @mode)
-                       (p/rejected cleanup-failure)
-                       (do (swap! files dissoc filepath)
-                           (p/resolved nil))))
-                   state/<invoke-db-worker (fn [& _] (swap! renderer-ops inc) (p/resolved nil))
-                   db-async/<q (fn [& _] (swap! placement-queries inc) (p/resolved nil))]
-      (p/let [_ (p/loop [scenarios (seq [:new :reused :new-cleanup-rejected :new-cleanup-read-unknown])]
-                  (when-let [scenario (first scenarios)]
-                    (let [resolve-commit (atom nil)
-                          resolve-started (atom nil)
-                          started (js/Promise. (fn [resolve _] (reset! resolve-started resolve)))
-                          waiting (js/Promise. (fn [resolve _] (reset! resolve-commit resolve)))
-                          completed? (atom false)]
-                      (reset! mode scenario)
-                      (reset! files {saved-path original-file})
-                      (doseq [a [writes unlinks commits reads readbacks]] (reset! a []))
-                      (reset! pending {:started @resolve-started :promise waiting})
-                      (let [attempt (-> (literature/<poll-zotero-notifications-once! repo notification-state)
-                                        (p/then (fn [result]
-                                                  (reset! completed? true)
-                                                  {:fulfilled? true :value result}))
-                                        (p/catch (fn [error]
-                                                   (reset! completed? true)
-                                                   {:fulfilled? false :error error})))]
-                        (p/let [_ started
-                                _ (do
-                                    (is (false? @completed?) "Notifier remains pending until source commit replies")
-                                    (is (= 1 (count @commits)))
-                                    (is (zero? @renderer-ops))
-                                    (is (zero? @placement-queries))
-                                    (@resolve-commit blocked))
-                                outcome attempt]
-                          (if (contains? #{:new :reused} scenario)
-                            (do
-                              (is (true? (:fulfilled? outcome)))
-                              (is (= :complete (get-in outcome [:value :status])))
-                              (is (= {:session "synthetic-session" :cursor 8}
-                                     (get-in outcome [:value :notification-state])))
-                              (is (= {:blocked 1} (get-in outcome [:value :import :result-counts])))
-                              (is (= [:source-link-unavailable]
-                                     (mapv :reason (get-in outcome [:value :import :results])))))
-                            (do
-                              (is (false? (:fulfilled? outcome)))
-                              (is (identical? (if (= :new-cleanup-rejected scenario)
-                                                cleanup-failure lookup-failure)
-                                              (:error outcome)))
-                              (is (nil? (:value outcome))
-                                  "A failed normal stale cleanup cannot return an advanced notifier cursor")))
-                          (is (= 1 (count (filter #(= [:readFileRaw source-path] %) @reads))))
-                          (let [[graph actual-asset actual-paper options] (first @commits)
-                                context (:source-context options)]
-                            (is (= [repo paper-uuid] [graph actual-paper]))
-                            (is (true? (:automatic? options)))
-                            (is (= {:binding-uuid (:graph-binding-uuid binding)
-                                    :source-key (:source-key source-record)}
-                                   (select-keys context [:binding-uuid :source-key])))
-                            (is (uuid? (:reference-uuid context)))
-                            (if (not= :reused scenario)
-                              (let [filepath (str repo-dir "/assets/" actual-asset ".pdf")]
-                                (is (= actual-asset (get-in context [:asset-block :block/uuid])))
-                                (is (= [filepath] @writes))
-                                (if (= :new-cleanup-read-unknown scenario)
-                                  (is (empty? @unlinks))
-                                  (is (= [filepath] @unlinks)))
-                                (if (= :new scenario)
-                                  (is (= {saved-path original-file} @files))
-                                  (is (= {saved-path original-file filepath original-file} @files)
-                                      "A failed cleanup retains the exact new and existing PDF bytes")))
-                              (do
-                                (is (= asset-uuid actual-asset))
-                                (is (= asset-uuid (get-in context [:asset-block :block/uuid])))
-                                (is (empty? @writes))
-                                (is (empty? @unlinks))
-                                (is (= {saved-path original-file} @files)))))
-                          (p/recur (next scenarios)))))))]
-        (is (= (repeat 4 notification-state) @notifier-requests))
-        (is (zero? @renderer-ops))
-        (is (zero? @placement-queries))))))
+    (<with-delayed-zotero-commits! {:stored stored :repo repo :repo-dir repo-dir
+      :notifier-requests notifier-requests :source-record source-record :paper-uuid paper-uuid
+      :attachment attachment :reads reads :source-path source-path :saved-path saved-path :payload payload
+      :mode mode :native-asset native-asset :checksum checksum :writes writes :files files :readbacks readbacks
+      :lookup-failure lookup-failure :asset-uuid asset-uuid :commits commits :pending pending :unlinks unlinks
+      :cleanup-failure cleanup-failure :renderer-ops renderer-ops :placement-queries placement-queries
+      :original-file original-file :notification-state notification-state :blocked blocked :binding binding})))
 
 (deftest-async changing-the-destination-invalidates-the-in-flight-import
   (let [repo "synthetic-repo"
@@ -1866,7 +1940,7 @@
                     state/get-current-repo (constantly repo)
                     state/get-state (fn [key] (get (rfx/snapshot) key))
                     zotero/<process-notifier-cycle!
-                    (fn [_ notification-state _ _ signal]
+                    (fn [_ _notification-state _ _ signal]
                       (case (swap! calls inc)
                         1 (p/rejected (ex-info "Synthetic unavailable notifier" {:status 503}))
                         2 (do (p/resolve! retried true) healthy)

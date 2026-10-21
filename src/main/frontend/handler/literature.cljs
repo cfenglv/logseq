@@ -10,7 +10,7 @@
             [electron.ipc :as ipc]
             [frontend.fs :as fs]
             [frontend.handler.assets :as assets-handler]
-            [frontend.handler.common.page :as common-page]
+            [frontend.handler.common.page :as page-common-handler]
             [frontend.handler.literature-metadata :as metadata]
             [frontend.handler.literature-zotero :as zotero]
             [frontend.modules.outliner.op :as outliner-op]
@@ -335,6 +335,48 @@
     (throw (ex-info "Zotero PDF Asset identity changed"
                     {:type :literature-zotero/attachment-identity-changed}))))
 
+(defn- <link-saved-zotero-pdf!
+  [paper-uuid repo binding asset-uuid source-context candidate status file repo-dir asset-dir
+   file-path]
+  (when paper-uuid
+    (-> (p/then
+         (p/resolved nil)
+         (fn [_]
+           (require-zotero-import-active! repo binding)
+           (db-async/<link-pdf-to-literature
+            repo asset-uuid paper-uuid
+            {:automatic? true
+             :source-context (assoc source-context
+                                    :reference-uuid (ldb/new-block-id)
+                                    :asset-block (-> (:asset-block candidate)
+                                                     (assoc :block/uuid asset-uuid)
+                                                     (dissoc :logseq.property.asset/external-url)))})))
+        (p/then
+         (fn [result]
+           (when-not (or (contains? #{:linked :already-linked} (:status result))
+                         (and (= :blocked (:status result))
+                              (contains? #{:automatic-excluded :source-link-unavailable}
+                                         (:reason result))))
+             (throw (ex-info "Zotero PDF was not associated with its literature item"
+                             {:type :literature-zotero/attachment-link-failed
+                              :status (:status result) :reason (:reason result)})))
+           (p/let [_checked
+                   (when (and (= :missing status)
+                              (contains? #{:linked :already-linked} (:status result)))
+                     (p/let [saved (db-async/<get-block repo asset-uuid {:children? false})]
+                       (require-zotero-pdf-identity!
+                        asset-uuid saved (:checksum candidate) (.-size file))))]
+             result)))
+        (p/catch
+         (fn [error]
+           (-> (if (= :missing status)
+                 (<recycle-unregistered-zotero-file!
+                  repo asset-uuid repo-dir asset-dir file-path)
+                 (p/resolved nil))
+               (p/catch (fn [cleanup-error]
+                          (log/warn :literature-zotero/asset-cleanup-failed cleanup-error)))
+               (p/then (fn [_] (throw error)))))))))
+
 (defn- <save-zotero-pdf!
   [repo binding paper-uuid source-context attachment]
   (p/let [^js file (<read-zotero-pdf-file! repo binding attachment)
@@ -386,44 +428,7 @@
                           (when-not matches?
                             (throw (ex-info "Existing PDF bytes do not match their Asset"
                                             {:type :literature-zotero/attachment-identity-changed})))))))))
-               linked (when paper-uuid
-                        (-> (p/then
-                             (p/resolved nil)
-                             (fn [_]
-                               (require-zotero-import-active! repo binding)
-                               (db-async/<link-pdf-to-literature
-                                repo asset-uuid paper-uuid
-                                {:automatic? true
-                                 :source-context (assoc source-context
-                                                        :reference-uuid (ldb/new-block-id)
-                                                        :asset-block (-> (:asset-block candidate)
-                                                                         (assoc :block/uuid asset-uuid)
-                                                                         (dissoc :logseq.property.asset/external-url)))})))
-                            (p/then
-                             (fn [result]
-                               (when-not (or (contains? #{:linked :already-linked} (:status result))
-                                             (and (= :blocked (:status result))
-                                                  (contains? #{:automatic-excluded :source-link-unavailable}
-                                                             (:reason result))))
-                                 (throw (ex-info "Zotero PDF was not associated with its literature item"
-                                                 {:type :literature-zotero/attachment-link-failed
-                                                  :status (:status result) :reason (:reason result)})))
-                               (p/let [_checked
-                                       (when (and (= :missing status)
-                                                  (contains? #{:linked :already-linked} (:status result)))
-                                         (p/let [saved (db-async/<get-block repo asset-uuid {:children? false})]
-                                           (require-zotero-pdf-identity!
-                                            asset-uuid saved (:checksum candidate) (.-size file))))]
-                                 result)))
-                            (p/catch
-                             (fn [error]
-                               (-> (if (= :missing status)
-                                     (<recycle-unregistered-zotero-file!
-                                      repo asset-uuid repo-dir asset-dir file-path)
-                                     (p/resolved nil))
-                                   (p/catch (fn [cleanup-error]
-                                              (log/warn :literature-zotero/asset-cleanup-failed cleanup-error)))
-                                   (p/then (fn [_] (throw error))))))))
+               linked (<link-saved-zotero-pdf! paper-uuid repo binding asset-uuid source-context candidate status file repo-dir asset-dir file-path)
                excluded? (= [:blocked :automatic-excluded]
                             [(:status linked) (:reason linked)])
                stale? (= [:blocked :source-link-unavailable]
@@ -1167,7 +1172,7 @@
       (when (current-graph? repo)
         (if (and configured (false? (:hidden? info)))
           (db-async/<get-block repo configured {:children? false})
-          (common-page/<create! (t :literature/default-page-title)
+          (page-common-handler/<create! (t :literature/default-page-title)
                                {:redirect? false :edit? false :expected-repo repo}))))))
 
 (def library-hidden-rules

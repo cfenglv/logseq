@@ -22,23 +22,24 @@
   :user-profile/repo {:doc "Graph context of received profile metadata."}
   :user-profile/error {:doc "A live profile refresh failed without reversing the saved profile."})
 
+(defkeyword :literature "The shared bibliography route.")
+(defkeyword :literature-manual "Explicit manual bibliography entry dialog.")
+(defkeyword :literature-organization "Explicit one-off organization dialog.")
+(defkeyword :allow-online? "Identifier-only metadata lookup permission for the current explicit operation.")
+(defkeyword :explicit? "A one-off user action independent of background import settings.")
+(defkeyword :register? "Apply verified recognition after extraction, rather than only preparing a manual form.")
+(defkeyword :organization-error "The current organization stopped with an unexpected error.")
+(defkeyword :literature-options "This graph's local import settings dialog.")
+(defkeyword :literature-pdf-reference-choice "One incoming PDF reference choice; no historical cleanup.")
+(defkeyword :notifier-error? "The current local Zotero notification task has not recovered from its last failure.")
+(defkeyword :literature-attachment? "Asset render context supplied by the bibliography attachment property.")
+(defkeyword :literature-action? "Explicit one-shot literature intent in the native Asset save options.")
+(defkeyword :on-assets-saved "Completion callback receiving inserted native Asset/link records.")
+(defkeyword :pdf-choices "Checksums mapped to the PDF identities chosen for this save only.")
+(defkeyword :include-kept? "Include explicitly ordinary PDFs in this on-demand metadata page.")
+(defkeyword :expected-repo "Graph captured by an explicit asynchronous page creation action.")
+
 (defkeywords
-  :literature {:doc "The shared bibliography route."}
-  :literature-manual {:doc "Explicit manual bibliography entry dialog."}
-  :literature-organization {:doc "Explicit one-off organization dialog."}
   :literature/organization {:doc "This device's current explicit PDF organization progress."}
-  :allow-online? {:doc "Identifier-only metadata lookup permission for the current explicit operation."}
-  :explicit? {:doc "A one-off user action independent of background import settings."}
-  :register? {:doc "Apply verified recognition after extraction, rather than only preparing a manual form."}
-  :organization-error {:doc "The current organization stopped with an unexpected error."}
   :literature/file-not-local {:doc "The selected local PDF could not be read through the native Asset protocol."}
-  :literature-options {:doc "This graph's local import settings dialog."}
-  :literature-pdf-reference-choice {:doc "One incoming PDF reference choice; no historical cleanup."}
-  :literature/import-state {:doc "Transient projection of the existing local Zotero import result."}
-  :notifier-error? {:doc "The current local Zotero notification task has not recovered from its last failure."}
-  :literature-attachment? {:doc "Asset render context supplied by the bibliography attachment property."}
-  :literature-action? {:doc "Explicit one-shot literature intent in the native Asset save options."}
-  :on-assets-saved {:doc "Completion callback receiving inserted native Asset/link records."}
-  :pdf-choices {:doc "Checksums mapped to the PDF identities chosen for this save only."}
-  :include-kept? {:doc "Include explicitly ordinary PDFs in this on-demand metadata page."}
-  :expected-repo {:doc "Graph captured by an explicit asynchronous page creation action."})
+  :literature/import-state {:doc "Transient projection of the existing local Zotero import result."})

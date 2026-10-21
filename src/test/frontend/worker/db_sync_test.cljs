@@ -2521,6 +2521,49 @@
                                   (is nil (str error)))))))
                (p/finally done)))))
 
+(defn- <assert-upload-timeout-recovery!
+  [client sent tx-id timeout-ms timeout-callback queued events]
+  (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+    (is (= "tx/batch" (:type (first @sent))))
+    (is (= [tx-id] @(:inflight client)))
+    (is (= (* 20 1000) @timeout-ms))
+    (is (fn? @timeout-callback))
+    (@timeout-callback)
+    (is (= [] @(:inflight client)))
+    (is (= [[test-repo client]] @queued))
+    (is (= 1 (count @events)))
+    (let [[type payload] (first @events)]
+      (is (= :capture-error type))
+      (is (= "db-sync" (get-in payload [:payload :source])))
+      (is (= "upload-tx-batch" (get-in payload [:payload :operation])))
+      (is (= test-repo (get-in payload [:payload :repo])))
+      (is (= "graph-1" (get-in payload [:payload :graph-id])))
+      (is (= 1 (get-in payload [:payload :tx-count])))
+      (is (= "save-block" (get-in payload [:payload :outliner-op])))
+      (is (= (* 20 1000) (get-in payload [:payload :timeout-ms])))
+      (is (= [(str tx-id)] (get-in payload [:extra :tx-ids])))
+      (is (= ["save-block"] (get-in payload [:extra :outliner-ops])))
+      (is (= "Sync upload request did not get response"
+             (ex-message (:error payload)))))
+    (reset! events [])
+    (reset! sent [])
+    (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
+      (is (= 1 (count @sent)))
+      (is (= "tx/batch" (:type (first @sent))))
+      (is (= (str tx-id) (get-in (first @sent) [:txs 0 :tx-id])))
+      (is (= [tx-id] @(:inflight client)))
+      (aset (:ws client) "readyState" 3)
+      (reset! worker-state/*db-sync-client (assoc client :ws (js-obj)))
+      (#'sync-apply/start-upload-response-timeout!
+       client
+       {:tx-ids [tx-id]
+        :outliner-ops [:save-block]
+        :t-before 0})
+      (@timeout-callback)
+      (is (= [[test-repo client]] @queued)
+          "An expired socket owner must not schedule another flush")
+      (is (empty? @events)))))
+
 (deftest flush-pending-reports-upload-response-timeout-test
   (async done
          (let [{:keys [conn client-ops-conn child1]} (setup-parent-child)
@@ -2577,46 +2620,7 @@
                         [[:db/add [:block/uuid (:block/uuid child1)]
                           :block/title
                           "pending upload timeout report"]]}])
-                     (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
-                       (is (= "tx/batch" (:type (first @sent))))
-                       (is (= [tx-id] @(:inflight client)))
-                       (is (= (* 20 1000) @timeout-ms))
-                       (is (fn? @timeout-callback))
-                       (@timeout-callback)
-                       (is (= [] @(:inflight client)))
-                       (is (= [[test-repo client]] @queued))
-                       (is (= 1 (count @events)))
-                       (let [[type payload] (first @events)]
-                         (is (= :capture-error type))
-                         (is (= "db-sync" (get-in payload [:payload :source])))
-                         (is (= "upload-tx-batch" (get-in payload [:payload :operation])))
-                         (is (= test-repo (get-in payload [:payload :repo])))
-                         (is (= "graph-1" (get-in payload [:payload :graph-id])))
-                         (is (= 1 (get-in payload [:payload :tx-count])))
-                         (is (= "save-block" (get-in payload [:payload :outliner-op])))
-                         (is (= (* 20 1000) (get-in payload [:payload :timeout-ms])))
-                         (is (= [(str tx-id)] (get-in payload [:extra :tx-ids])))
-                         (is (= ["save-block"] (get-in payload [:extra :outliner-ops])))
-                         (is (= "Sync upload request did not get response"
-                                (ex-message (:error payload)))))
-                       (reset! events [])
-                       (reset! sent [])
-                       (p/let [_ (#'sync-apply/flush-pending! test-repo client)]
-                         (is (= 1 (count @sent)))
-                         (is (= "tx/batch" (:type (first @sent))))
-                         (is (= (str tx-id) (get-in (first @sent) [:txs 0 :tx-id])))
-                         (is (= [tx-id] @(:inflight client)))
-                         (aset (:ws client) "readyState" 3)
-                         (reset! worker-state/*db-sync-client (assoc client :ws (js-obj)))
-                         (#'sync-apply/start-upload-response-timeout!
-                          client
-                          {:tx-ids [tx-id]
-                           :outliner-ops [:save-block]
-                           :t-before 0})
-                         (@timeout-callback)
-                         (is (= [[test-repo client]] @queued)
-                             "An expired socket owner must not schedule another flush")
-                         (is (empty? @events)))))
+                     (<assert-upload-timeout-recovery! client sent tx-id timeout-ms timeout-callback queued events))
                    (p/catch (fn [error]
                               (is nil (str error))))
                    (p/finally
@@ -6571,6 +6575,87 @@
                    (:reason (#'sync-apply/replay-canonical-outliner-op! conn op nil))))
             (is (nil? (d/entity @conn [:block/uuid paper-uuid])))))))))
 
+(defn- assert-rebased-pdf-source!
+  [conn paper-a binding-uuid paper-b retained-asset-uuid ops-conn op asset-uuid new-asset?
+   reference-uuid annotation-uuid correction source-key]
+  (let [source-node (first (:logseq.property/literature-source-key
+                           (d/entity @conn [:block/uuid paper-a])))
+        source-node-uuid (:block/uuid source-node)]
+    (outliner-property/set-block-property!
+     conn (:db/id source-node) :logseq.property/literature-source-target
+     (:db/id (d/entity @conn [:block/uuid binding-uuid])))
+    (outliner-property/set-block-property!
+     conn [:block/uuid paper-b] :logseq.property/literature-assets
+     (:db/id (d/entity @conn [:block/uuid retained-asset-uuid])))
+    (with-datascript-conns conn ops-conn
+      (fn []
+        (is (= :linked (:status
+                       (outliner-op/apply-ops!
+                        conn [op] {:persist-op? true :gen-undo-ops? false}))))
+        (is (= paper-a (-> (literature/find-paper-by-asset @conn asset-uuid)
+                          :papers first :block/uuid)))
+        (if new-asset?
+          (is (= paper-a (:block/uuid (:block/parent
+                                      (d/entity @conn [:block/uuid asset-uuid])))))
+          (let [reference (d/entity @conn [:block/uuid reference-uuid])]
+            (is (= paper-a (:block/uuid (:block/parent reference))))
+            (is (= asset-uuid (:block/uuid (:block/link reference))))))
+        (let [pending (first (#'sync-apply/pending-txs test-repo))
+              tx-id (:tx-id pending)
+              remote-correction
+              (cond-> [[:db/retract [:block/uuid paper-a]
+                        :logseq.property/literature-source-key
+                        [:block/uuid source-node-uuid]]
+                       [:db/add [:block/uuid annotation-uuid]
+                        :block/title "Remote PDF annotation preserved"]]
+                (= correction :reassign)
+                (conj [:db/add [:block/uuid paper-b]
+                       :logseq.property/literature-source-key
+                       [:block/uuid source-node-uuid]])
+                (not new-asset?)
+                (conj [:db/add [:block/uuid paper-b]
+                       :logseq.property/literature-assets [:block/uuid asset-uuid]]))]
+          (is (= [op] (:forward-outliner-ops pending)))
+          (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
+          (client-op/put-client-tx-upload-state!
+           test-repo tx-id
+           {:format-version 1 :kind :single-wire-v1
+            :source-digest (sync-protocol/tx-payload-digest
+                            (:outliner-op pending) (vec (:tx pending)))
+            :outliner-op (:outliner-op pending)
+            :wire-entry {:tx "synthetic-frozen-source-attachment" :tx-id (str tx-id)}})
+          (is (some? (client-op/get-client-tx-upload-state test-repo tx-id)))
+          (#'sync-apply/apply-remote-tx! test-repo nil remote-correction)
+          (is (empty? (:logseq.property/literature-assets
+                       (d/entity @conn [:block/uuid paper-a]))))
+          (is (nil? (d/entity @conn [:block/uuid reference-uuid])))
+          (if new-asset?
+            (is (nil? (d/entity @conn [:block/uuid asset-uuid]))
+                "Blocked replay must not revive the newly inserted PDF at its former Paper.")
+            (do
+              (is (= paper-b (:block/uuid (:block/parent
+                                          (d/entity @conn [:block/uuid asset-uuid])))))
+              (is (= paper-b (-> (literature/find-paper-by-asset @conn asset-uuid)
+                                :papers first :block/uuid)))))
+          (is (= paper-b (-> (literature/find-paper-by-asset @conn retained-asset-uuid)
+                            :papers first :block/uuid)))
+          (let [annotation (d/entity @conn [:block/uuid annotation-uuid])]
+            (is (= "Remote PDF annotation preserved" (:block/title annotation)))
+            (is (= retained-asset-uuid (:block/uuid (:block/parent annotation))))
+            (is (= 1 (:logseq.property.pdf/hl-page annotation))))
+          (is (= (if (= correction :reassign) :found :missing)
+                 (:status (literature/find-paper-by-source-key @conn source-key))))
+          (when (= correction :reassign)
+            (is (= paper-b (-> (literature/find-paper-by-source-key @conn source-key)
+                              :papers first :block/uuid))))
+          (is (empty? (#'sync-apply/pending-txs test-repo)))
+          (is (zero? (client-op/get-pending-local-tx-count test-repo)))
+          (is (nil? (client-op/get-client-tx-upload-state test-repo tx-id)))
+          (let [before @conn]
+            (is (= {:status :blocked :reason :source-link-unavailable}
+                   (#'sync-apply/replay-canonical-outliner-op! conn op nil)))
+            (is (identical? before @conn))))))))
+
 (deftest source-pdf-rebase-drops-frozen-attachment-after-source-correction
   (doseq [new-asset? [true false]
           correction [:reassign :unlink]]
@@ -6624,83 +6709,7 @@
                              (conj {:block/uuid asset-uuid :block/title "Synthetic late PDF"
                                     :build/tags [:logseq.class/Asset]
                                     :build/properties asset-properties}))}]}]})
-        (let [source-node (first (:logseq.property/literature-source-key
-                                 (d/entity @conn [:block/uuid paper-a])))
-              source-node-uuid (:block/uuid source-node)]
-          (outliner-property/set-block-property!
-           conn (:db/id source-node) :logseq.property/literature-source-target
-           (:db/id (d/entity @conn [:block/uuid binding-uuid])))
-          (outliner-property/set-block-property!
-           conn [:block/uuid paper-b] :logseq.property/literature-assets
-           (:db/id (d/entity @conn [:block/uuid retained-asset-uuid])))
-          (with-datascript-conns conn ops-conn
-            (fn []
-              (is (= :linked (:status
-                             (outliner-op/apply-ops!
-                              conn [op] {:persist-op? true :gen-undo-ops? false}))))
-              (is (= paper-a (-> (literature/find-paper-by-asset @conn asset-uuid)
-                                :papers first :block/uuid)))
-              (if new-asset?
-                (is (= paper-a (:block/uuid (:block/parent
-                                            (d/entity @conn [:block/uuid asset-uuid])))))
-                (let [reference (d/entity @conn [:block/uuid reference-uuid])]
-                  (is (= paper-a (:block/uuid (:block/parent reference))))
-                  (is (= asset-uuid (:block/uuid (:block/link reference))))))
-              (let [pending (first (#'sync-apply/pending-txs test-repo))
-                    tx-id (:tx-id pending)
-                    remote-correction
-                    (cond-> [[:db/retract [:block/uuid paper-a]
-                              :logseq.property/literature-source-key
-                              [:block/uuid source-node-uuid]]
-                             [:db/add [:block/uuid annotation-uuid]
-                              :block/title "Remote PDF annotation preserved"]]
-                      (= correction :reassign)
-                      (conj [:db/add [:block/uuid paper-b]
-                             :logseq.property/literature-source-key
-                             [:block/uuid source-node-uuid]])
-                      (not new-asset?)
-                      (conj [:db/add [:block/uuid paper-b]
-                             :logseq.property/literature-assets [:block/uuid asset-uuid]]))]
-                (is (= [op] (:forward-outliner-ops pending)))
-                (is (= 1 (client-op/get-pending-local-tx-count test-repo)))
-                (client-op/put-client-tx-upload-state!
-                 test-repo tx-id
-                 {:format-version 1 :kind :single-wire-v1
-                  :source-digest (sync-protocol/tx-payload-digest
-                                  (:outliner-op pending) (vec (:tx pending)))
-                  :outliner-op (:outliner-op pending)
-                  :wire-entry {:tx "synthetic-frozen-source-attachment" :tx-id (str tx-id)}})
-                (is (some? (client-op/get-client-tx-upload-state test-repo tx-id)))
-                (#'sync-apply/apply-remote-tx! test-repo nil remote-correction)
-                (is (empty? (:logseq.property/literature-assets
-                             (d/entity @conn [:block/uuid paper-a]))))
-                (is (nil? (d/entity @conn [:block/uuid reference-uuid])))
-                (if new-asset?
-                  (is (nil? (d/entity @conn [:block/uuid asset-uuid]))
-                      "Blocked replay must not revive the newly inserted PDF at its former Paper.")
-                  (do
-                    (is (= paper-b (:block/uuid (:block/parent
-                                                (d/entity @conn [:block/uuid asset-uuid])))))
-                    (is (= paper-b (-> (literature/find-paper-by-asset @conn asset-uuid)
-                                      :papers first :block/uuid)))))
-                (is (= paper-b (-> (literature/find-paper-by-asset @conn retained-asset-uuid)
-                                  :papers first :block/uuid)))
-                (let [annotation (d/entity @conn [:block/uuid annotation-uuid])]
-                  (is (= "Remote PDF annotation preserved" (:block/title annotation)))
-                  (is (= retained-asset-uuid (:block/uuid (:block/parent annotation))))
-                  (is (= 1 (:logseq.property.pdf/hl-page annotation))))
-                (is (= (if (= correction :reassign) :found :missing)
-                       (:status (literature/find-paper-by-source-key @conn source-key))))
-                (when (= correction :reassign)
-                  (is (= paper-b (-> (literature/find-paper-by-source-key @conn source-key)
-                                    :papers first :block/uuid))))
-                (is (empty? (#'sync-apply/pending-txs test-repo)))
-                (is (zero? (client-op/get-pending-local-tx-count test-repo)))
-                (is (nil? (client-op/get-client-tx-upload-state test-repo tx-id)))
-                (let [before @conn]
-                  (is (= {:status :blocked :reason :source-link-unavailable}
-                         (#'sync-apply/replay-canonical-outliner-op! conn op nil)))
-                  (is (identical? before @conn)))))))))))
+        (assert-rebased-pdf-source! conn paper-a binding-uuid paper-b retained-asset-uuid ops-conn op asset-uuid new-asset? reference-uuid annotation-uuid correction source-key)))))
 
 (defn- setup-no-id-source-correction
   []

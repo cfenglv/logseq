@@ -1227,7 +1227,8 @@
       (is (= :ready (:status plan)))
       (is (= :create (:action plan))))))
 
-(deftest source-record-registration-is-current-db-checked-and-idempotent
+(defn- assert-initial-source-registration!
+  []
   (testing "a new identifier seeds present metadata only once"
     (let [conn (create-literature-conn)
           binding-uuid (block-uuid-by-title @conn "Synthetic source binding A")
@@ -1279,7 +1280,10 @@
       (is (= :already-imported
              (:status (literature/build-register-source-record-plan
                        @conn binding-uuid destination-page source-record))))
-      (is (empty? (:errors (db-validate/validate-db @conn))))))
+      (is (empty? (:errors (db-validate/validate-db @conn)))))))
+
+(deftest source-record-registration-is-current-db-checked-and-idempotent
+  (assert-initial-source-registration!)
 
   (testing "an exact identifier links the source without creating another paper"
     (let [conn (create-literature-conn)
@@ -2122,6 +2126,45 @@
                      (assoc complete-auto-evidence
                             :author-texts ["Malice Example"])))))))
 
+(defn- assert-current-pdf-catalog-ownership!
+  []
+  (testing "missing catalog metadata and current asset ownership are rechecked"
+    (let [conn (create-literature-conn)
+          incomplete-paper-id (:db/id (d/entity @conn [:block/uuid paper-incomplete]))
+          incomplete-evidence (assoc complete-auto-evidence
+                                     :identifiers {:doi "10.7777/incomplete"}
+                                     :title "Incomplete paper")]
+      (is (= {:status :blocked :reason :missing-type}
+             (literature/build-auto-link-pdf-plan
+              @conn pdf-duplicate incomplete-evidence)))
+      (outliner-property/set-block-property!
+       conn incomplete-paper-id :logseq.property/literature-type "dataset")
+      (is (= {:status :blocked :reason :unsupported-type}
+             (literature/build-auto-link-pdf-plan
+              @conn pdf-duplicate incomplete-evidence)))
+      (outliner-property/set-block-property!
+       conn incomplete-paper-id :logseq.property/literature-type "journal-article")
+      (is (= {:status :blocked :reason :missing-authors}
+             (literature/build-auto-link-pdf-plan
+              @conn pdf-duplicate incomplete-evidence)))
+      (is (= {:status :blocked :reason :asset-linked-to-another-paper}
+             (select-keys
+              (literature/build-auto-link-pdf-plan
+               @conn pdf-a
+               (assoc complete-auto-evidence
+                      :identifiers {:doi "10.9999/other"}
+                      :title "Paper B"
+                      :author-texts ["Carol Example"]))
+              [:status :reason])))
+      (outliner-property/set-block-property!
+       conn
+       (:db/id (d/entity @conn [:block/uuid pdf-duplicate]))
+       :logseq.property/deleted-at
+       1)
+      (is (= {:status :blocked :reason :asset-unavailable}
+             (literature/build-auto-link-pdf-plan
+              @conn pdf-duplicate complete-auto-evidence))))))
+
 (deftest automatic-pdf-link-requires-complete-bibliographic-evidence
   (testing "all identifiers, title, author and type link one existing item only"
     (let [conn (create-literature-conn)
@@ -2186,42 +2229,7 @@
                  @conn pdf-duplicate evidence)
                 [:status :reason]))))))
 
-  (testing "missing catalog metadata and current asset ownership are rechecked"
-    (let [conn (create-literature-conn)
-          incomplete-paper-id (:db/id (d/entity @conn [:block/uuid paper-incomplete]))
-          incomplete-evidence (assoc complete-auto-evidence
-                                     :identifiers {:doi "10.7777/incomplete"}
-                                     :title "Incomplete paper")]
-      (is (= {:status :blocked :reason :missing-type}
-             (literature/build-auto-link-pdf-plan
-              @conn pdf-duplicate incomplete-evidence)))
-      (outliner-property/set-block-property!
-       conn incomplete-paper-id :logseq.property/literature-type "dataset")
-      (is (= {:status :blocked :reason :unsupported-type}
-             (literature/build-auto-link-pdf-plan
-              @conn pdf-duplicate incomplete-evidence)))
-      (outliner-property/set-block-property!
-       conn incomplete-paper-id :logseq.property/literature-type "journal-article")
-      (is (= {:status :blocked :reason :missing-authors}
-             (literature/build-auto-link-pdf-plan
-              @conn pdf-duplicate incomplete-evidence)))
-      (is (= {:status :blocked :reason :asset-linked-to-another-paper}
-             (select-keys
-              (literature/build-auto-link-pdf-plan
-               @conn pdf-a
-               (assoc complete-auto-evidence
-                      :identifiers {:doi "10.9999/other"}
-                      :title "Paper B"
-                      :author-texts ["Carol Example"]))
-              [:status :reason])))
-      (outliner-property/set-block-property!
-       conn
-       (:db/id (d/entity @conn [:block/uuid pdf-duplicate]))
-       :logseq.property/deleted-at
-       1)
-      (is (= {:status :blocked :reason :asset-unavailable}
-             (literature/build-auto-link-pdf-plan
-              @conn pdf-duplicate complete-auto-evidence)))))
+  (assert-current-pdf-catalog-ownership!)
 
   (testing "CJK layout spaces do not cause a false title or author mismatch"
     (let [conn (create-literature-conn)

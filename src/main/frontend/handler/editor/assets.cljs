@@ -490,6 +490,173 @@
                                             entry)) %))
               (update :pdf-filenames #(into {} (map (fn [[id names]] [(replace-id id) names])) %))))))))
 
+(defn- <insert-saved-asset-blocks!
+  [blocks empty-target? insert-to-current-block-page? edit-context edit-content edit-block
+   target pdf-filenames repo identify-pdf? new-pdf-identifications on-literature-identification
+   repo-dir asset-dir-rpath on-assets-saved files repair-writes]
+  (when (seq blocks)
+    (p/do!
+     (ui-outliner-tx/transact!
+      (cond-> {:outliner-op :insert-blocks}
+        (and empty-target? insert-to-current-block-page?)
+        (assoc :editor/edit-block-fn
+               (fn [rows]
+                 (when (and (= edit-context [(state/get-current-repo)
+                                            (state/get-route-match)
+                                            (state/get-state :editor/editing?)])
+                            (= edit-content (state/get-edit-content)))
+                   (when-let [asset (some #(when (= (:block/uuid edit-block) (:block/uuid %)) %) rows)]
+                     (editor/edit-block! asset :max {:skip-load? true
+                                                    :save-current-block? false}))))))
+      (outliner-op/insert-blocks! blocks target {:keep-uuid? true
+                                                 :bottom? true
+                                                 :sibling? (boolean (and edit-block (= edit-block target)))
+                                                 :replace-empty-target? insert-to-current-block-page?}))
+     (when (seq pdf-filenames)
+       (db-async/<add-literature-pdf-filenames repo pdf-filenames))
+     (p/let [results (db-async/<get-blocks repo (map :block/uuid blocks) {:children? false})
+             blocks (editor/unwrap-block-results results)]
+       (when (= edit-context [(state/get-current-repo)
+                             (state/get-route-match)
+                             (state/get-state :editor/editing?)])
+         (when-let [block (when (= edit-content (state/get-edit-content))
+                           (some (fn [block] (when (= (:block/uuid block) (:block/uuid edit-block)) block)) blocks))]
+           (editor/edit-block! block :max {:skip-load? true})))
+       (when (and identify-pdf?
+                  (seq new-pdf-identifications))
+         ;; This background task reads the saved path and never retains the
+         ;; incoming File while it waits. The default callback may ask the
+         ;; DB worker to link only a fully confirmed existing bibliography item.
+         (let [remaining (atom (count new-pdf-identifications))
+               counts (atom {})
+               store-result!
+               (or on-literature-identification
+                   (fn [extracted]
+                     (p/let [result (literature-handler/<store-and-maybe-auto-link!
+                                    repo repo-dir asset-dir-rpath extracted)]
+                       (if (= 1 (count new-pdf-identifications))
+                         (notify-literature-result! repo result)
+                         (let [kind (case (:status result)
+                                      :created :created
+                                      (:linked :already-linked) :linked
+                                      :pending)]
+                           (swap! counts update kind (fnil inc 0))
+                           (when (and (zero? (swap! remaining dec)) (= repo (state/get-current-repo)))
+                             (notification/show!
+                              (t :literature.library/batch-results
+                                 (get @counts :created 0) (get @counts :linked 0) (get @counts :pending 0))
+                              :info))))
+                       result)))]
+           ;; The small pending record makes manual registration available
+           ;; even if the bounded extractor is busy or cannot read the PDF.
+           (when-not on-literature-identification
+             (doseq [entry new-pdf-identifications]
+               (literature-handler/store-review-result!
+                repo repo-dir asset-dir-rpath
+                (assoc entry
+                       :extraction {:status :pending :reason :pending}
+                       :candidates {:status :pending
+                                    :reason :pending
+                                    :usable? false
+                                    :identifiers []}))))
+           (literature-handler/schedule-new-pdf-identification!
+            repo
+            repo-dir
+            asset-dir-rpath
+            new-pdf-identifications
+            :on-result store-result!)))
+       (when (and (not on-assets-saved) (some native-pdf-file files)
+                  (not (and identify-pdf? (seq new-pdf-identifications)))
+                  (= repo (state/get-current-repo)))
+         (notification/show!
+          (if (seq repair-writes)
+            (t :literature.library/reused-pdf)
+            (t :literature.library/saved-pdf))
+          :success))
+       (p/do! (when on-assets-saved (on-assets-saved blocks)) blocks)))))
+
+(defn- <prepare-and-save-assets!
+  [{:keys [bounded-pdf? current! initial-edit-save empty-target? repo edit-block candidate-opts files pdf-choices reuse-pdf? identify-pdf? has-unsaved-edit? unsaved-edit-block unsaved-edit-content target-block pdf-area? save-to-page edit-context edit-content on-literature-identification on-assets-saved opts]}]
+  (->
+   (p/let [_ (when bounded-pdf? (current!))
+           _ initial-edit-save
+           live-target (when (and bounded-pdf? empty-target?)
+                         (db-async/<get-block repo (:block/uuid edit-block) {:children? false}))
+           prepare-opts (if (and bounded-pdf? empty-target?
+                                 (not (and live-target
+                                           (string/blank? (:block/title live-target))
+                                           (nil? (:block/link live-target))
+                                           (nil? (:logseq.property.asset/type live-target)))))
+                          (constantly {})
+                          candidate-opts)
+           plan
+               (if bounded-pdf?
+                 (<prepare-and-write-pdfs! repo files prepare-opts current! pdf-choices)
+                 (p/let [candidates (p/all
+                    (for [[idx file] (medley/indexed files)]
+                      (assets-handler/prepare-asset-block repo file (candidate-opts idx))))
+         reuse-results (<pdf-reuse-results repo candidates reuse-pdf?
+                                          identify-pdf?)]
+   (build-asset-insert-plan candidates reuse-results)))
+               [repo-dir asset-dir-rpath] (assets-handler/ensure-assets-dir! repo)
+               asset-page (db-async/<invoke-db-worker :thread-api/pull repo
+                                     [:block/uuid] :logseq.class/Asset)
+               _saved (when (and has-unsaved-edit? (not bounded-pdf?))
+        (editor/save-block-aux! unsaved-edit-block unsaved-edit-content nil))
+               ;; An empty paste target can become a note while PDF IO runs.
+               ;; Keep that note and give the prepared Asset its own native UUID.
+               _latest-edit (when (and bounded-pdf?
+                       (= (:block/uuid edit-block) (:block/uuid (state/get-edit-block))))
+              (editor/save-block-aux! (state/get-edit-block) (state/get-edit-content) nil))
+               {:keys [blocks new-writes repair-writes existing-assets
+       new-pdf-identifications pdf-filenames]}
+               (if (and bounded-pdf? empty-target?)
+                 (<preserve-edited-pdf-target! repo repo-dir asset-dir-rpath (:block/uuid edit-block) plan)
+                 plan)
+               _notified (doseq [existing-asset existing-assets]
+           (notification/show! (t :asset/already-exists
+                                  (:block/title existing-asset)
+                                  (:block/uuid existing-asset))
+                               :warning
+                               false))
+               _written (p/all
+         (concat
+          (map (fn [{:keys [file file-path]}]
+                 (assets-handler/db-based-write-asset! repo file-path file))
+               new-writes)
+          (map #(assets-handler/<restore-reused-asset-file! repo repo-dir asset-dir-rpath %)
+               repair-writes)))
+               insert-to-current-block-page? (boolean (and (not target-block) (:block/uuid edit-block) (not pdf-area?)))
+               target (cond
+        target-block
+        target-block
+
+        insert-to-current-block-page?
+        edit-block
+
+        save-to-page
+        save-to-page
+
+        :else
+        asset-page)]
+         (when-not target
+           (throw (ex-info "invalid target" {:files files
+                             :asset-page asset-page
+                             :edit-block edit-block})))
+         (when bounded-pdf? (current!))
+         (<insert-saved-asset-blocks! blocks empty-target? insert-to-current-block-page? edit-context edit-content edit-block target pdf-filenames repo identify-pdf? new-pdf-identifications on-literature-identification repo-dir asset-dir-rpath on-assets-saved files repair-writes))
+       (p/catch
+        (fn [error]
+          (let [data (ex-data error)]
+            (if (= :literature/duplicate-pdf-conflict (:type data))
+              (show-duplicate-pdf-conflict!
+               repo
+               files
+               (asset-conflict-resume-opts
+                opts target-block edit-block has-unsaved-edit?)
+               data)
+              (p/rejected error)))))))
+
 (defn- <db-based-save-assets!
   [repo files {:keys [pdf-area? last-edit-block resume-unsaved-edit?
                       reuse-existing-pdf? save-to-page target-block
@@ -536,164 +703,14 @@
         initial-edit-save (when (and bounded-pdf? has-unsaved-edit?)
                             (editor/save-block-aux! unsaved-edit-block unsaved-edit-content nil))
         save! (fn []
-                (->
-                 (p/let [_ (when bounded-pdf? (current!))
-                         _ initial-edit-save
-                         live-target (when (and bounded-pdf? empty-target?)
-                                       (db-async/<get-block repo (:block/uuid edit-block) {:children? false}))
-                         prepare-opts (if (and bounded-pdf? empty-target?
-                                               (not (and live-target
-                                                         (string/blank? (:block/title live-target))
-                                                         (nil? (:block/link live-target))
-                                                         (nil? (:logseq.property.asset/type live-target)))))
-                                        (constantly {})
-                                        candidate-opts)
-                         plan
-             (if bounded-pdf?
-               (<prepare-and-write-pdfs! repo files prepare-opts current! pdf-choices)
-               (p/let [candidates (p/all
-                                  (for [[idx file] (medley/indexed files)]
-                                    (assets-handler/prepare-asset-block repo file (candidate-opts idx))))
-                       reuse-results (<pdf-reuse-results repo candidates reuse-pdf?
-                                                        identify-pdf?)]
-                 (build-asset-insert-plan candidates reuse-results)))
-             [repo-dir asset-dir-rpath] (assets-handler/ensure-assets-dir! repo)
-             asset-page (db-async/<invoke-db-worker :thread-api/pull repo
-                                                   [:block/uuid] :logseq.class/Asset)
-             _saved (when (and has-unsaved-edit? (not bounded-pdf?))
-                      (editor/save-block-aux! unsaved-edit-block unsaved-edit-content nil))
-             ;; An empty paste target can become a note while PDF IO runs.
-             ;; Keep that note and give the prepared Asset its own native UUID.
-             _latest-edit (when (and bounded-pdf?
-                                     (= (:block/uuid edit-block) (:block/uuid (state/get-edit-block))))
-                            (editor/save-block-aux! (state/get-edit-block) (state/get-edit-content) nil))
-             {:keys [blocks new-writes repair-writes existing-assets
-                     new-pdf-identifications pdf-filenames]}
-             (if (and bounded-pdf? empty-target?)
-               (<preserve-edited-pdf-target! repo repo-dir asset-dir-rpath (:block/uuid edit-block) plan)
-               plan)
-             _notified (doseq [existing-asset existing-assets]
-                         (notification/show! (t :asset/already-exists
-                                                (:block/title existing-asset)
-                                                (:block/uuid existing-asset))
-                                             :warning
-                                             false))
-             _written (p/all
-                       (concat
-                        (map (fn [{:keys [file file-path]}]
-                               (assets-handler/db-based-write-asset! repo file-path file))
-                             new-writes)
-                        (map #(assets-handler/<restore-reused-asset-file! repo repo-dir asset-dir-rpath %)
-                             repair-writes)))
-             insert-to-current-block-page? (boolean (and (not target-block) (:block/uuid edit-block) (not pdf-area?)))
-             target (cond
-                      target-block
-                      target-block
-
-                      insert-to-current-block-page?
-                      edit-block
-
-                      save-to-page
-                      save-to-page
-
-                      :else
-                      asset-page)]
-       (when-not target
-         (throw (ex-info "invalid target" {:files files
-                                           :asset-page asset-page
-                                           :edit-block edit-block})))
-       (when bounded-pdf? (current!))
-       (when (seq blocks)
-         (p/do!
-          (ui-outliner-tx/transact!
-           (cond-> {:outliner-op :insert-blocks}
-             (and empty-target? insert-to-current-block-page?)
-             (assoc :editor/edit-block-fn
-                    (fn [rows]
-                      (when (and (= edit-context [(state/get-current-repo)
-                                                 (state/get-route-match)
-                                                 (state/get-state :editor/editing?)])
-                                 (= edit-content (state/get-edit-content)))
-                        (when-let [asset (some #(when (= (:block/uuid edit-block) (:block/uuid %)) %) rows)]
-                          (editor/edit-block! asset :max {:skip-load? true
-                                                         :save-current-block? false}))))))
-           (outliner-op/insert-blocks! blocks target {:keep-uuid? true
-                                                      :bottom? true
-                                                      :sibling? (boolean (and edit-block (= edit-block target)))
-                                                      :replace-empty-target? insert-to-current-block-page?}))
-          (when (seq pdf-filenames)
-            (db-async/<add-literature-pdf-filenames repo pdf-filenames))
-          (p/let [results (db-async/<get-blocks repo (map :block/uuid blocks) {:children? false})
-                  blocks (editor/unwrap-block-results results)]
-            (when (= edit-context [(state/get-current-repo)
-                                  (state/get-route-match)
-                                  (state/get-state :editor/editing?)])
-              (when-let [block (when (= edit-content (state/get-edit-content))
-                                (some (fn [block] (when (= (:block/uuid block) (:block/uuid edit-block)) block)) blocks))]
-                (editor/edit-block! block :max {:skip-load? true})))
-            (when (and identify-pdf?
-                       (seq new-pdf-identifications))
-              ;; This background task reads the saved path and never retains the
-              ;; incoming File while it waits. The default callback may ask the
-              ;; DB worker to link only a fully confirmed existing bibliography item.
-              (let [remaining (atom (count new-pdf-identifications))
-                    counts (atom {})
-                    store-result!
-                    (or on-literature-identification
-                        (fn [extracted]
-                          (p/let [result (literature-handler/<store-and-maybe-auto-link!
-                                         repo repo-dir asset-dir-rpath extracted)]
-                            (if (= 1 (count new-pdf-identifications))
-                              (notify-literature-result! repo result)
-                              (let [kind (case (:status result)
-                                           :created :created
-                                           (:linked :already-linked) :linked
-                                           :pending)]
-                                (swap! counts update kind (fnil inc 0))
-                                (when (and (zero? (swap! remaining dec)) (= repo (state/get-current-repo)))
-                                  (notification/show!
-                                   (t :literature.library/batch-results
-                                      (get @counts :created 0) (get @counts :linked 0) (get @counts :pending 0))
-                                   :info))))
-                            result)))]
-                ;; The small pending record makes manual registration available
-                ;; even if the bounded extractor is busy or cannot read the PDF.
-                (when-not on-literature-identification
-                  (doseq [entry new-pdf-identifications]
-                    (literature-handler/store-review-result!
-                     repo repo-dir asset-dir-rpath
-                     (assoc entry
-                            :extraction {:status :pending :reason :pending}
-                            :candidates {:status :pending
-                                         :reason :pending
-                                         :usable? false
-                                         :identifiers []}))))
-                (literature-handler/schedule-new-pdf-identification!
-                 repo
-                 repo-dir
-                 asset-dir-rpath
-                 new-pdf-identifications
-                 :on-result store-result!)))
-            (when (and (not on-assets-saved) (some native-pdf-file files)
-                       (not (and identify-pdf? (seq new-pdf-identifications)))
-                       (= repo (state/get-current-repo)))
-              (notification/show!
-               (if (seq repair-writes)
-                 (t :literature.library/reused-pdf)
-                 (t :literature.library/saved-pdf))
-               :success))
-            (p/do! (when on-assets-saved (on-assets-saved blocks)) blocks)))))
-     (p/catch
-      (fn [error]
-        (let [data (ex-data error)]
-          (if (= :literature/duplicate-pdf-conflict (:type data))
-            (show-duplicate-pdf-conflict!
-             repo
-             files
-             (asset-conflict-resume-opts
-              opts target-block edit-block has-unsaved-edit?)
-             data)
-            (p/rejected error)))))))]
+                (<prepare-and-save-assets! {:bounded-pdf? bounded-pdf? :current! current! :initial-edit-save initial-edit-save
+                  :empty-target? empty-target? :repo repo :edit-block edit-block :candidate-opts candidate-opts
+                  :files files :pdf-choices pdf-choices :reuse-pdf? reuse-pdf? :identify-pdf? identify-pdf?
+                  :has-unsaved-edit? has-unsaved-edit? :unsaved-edit-block unsaved-edit-block
+                  :unsaved-edit-content unsaved-edit-content :target-block target-block :pdf-area? pdf-area?
+                  :save-to-page save-to-page :edit-context edit-context :edit-content edit-content
+                  :on-literature-identification on-literature-identification :on-assets-saved on-assets-saved
+                  :opts opts}))]
     (if bounded-pdf?
       (<serialize-pdf-save! save!)
       (save!))))

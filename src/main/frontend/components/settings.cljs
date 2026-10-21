@@ -267,6 +267,32 @@
       (ui/render-keyboard-shortcut (shortcut-helper/gen-shortcut-seq :ui/toggle-wide-mode)
                                    :shortcut-id :ui/toggle-wide-mode)])])
 
+(defn- custom-font-controls
+  [t region family field-id choose! close-custom! font-error chooser query set-query!]
+  [:div.font-custom-controls
+   {:on-key-down #(when (= "Escape" (.-key %)) (.stopPropagation %) (close-custom!))}
+   [:input.form-input.is-small.min-w-0
+    {:key [region family] :id (str field-id "-name") :type "text" :auto-focus true
+     :default-value (if (string? family) family "") :aria-label (t :settings.general/font-custom)
+     :placeholder (t :settings.general/font-name-placeholder)
+     :on-blur #(let [value (string/trim (.. % -target -value))]
+                 (when (not= value (if (string? family) family ""))
+                   (state/set-editor-font! region :family (when (seq value) value))))
+     :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
+   [:div.flex.flex-wrap.gap-1
+    (shui/button {:variant :outline :size :sm :on-click choose!} (t :settings.general/font-installed))
+    (shui/button {:variant :ghost :size :sm :on-click close-custom!} (t :ui/close))]
+   (when (= region (:region font-error)) [:p.text-xs {:role "status"} (t (:i18n-key font-error))])
+   (when (= region (:region chooser))
+     [:div.font-installed-list
+      [:input.form-input.is-small {:type "search" :value query :auto-focus true
+                                  :aria-label (t :settings.general/font-search) :placeholder (t :settings.general/font-search)
+                                  :on-change #(set-query! (.. % -target -value))}]
+      [:div.flex.flex-col.max-h-48.overflow-y-auto
+       (for [font (:families chooser) :when (string/includes? (string/lower-case font) (string/lower-case query))]
+         (shui/button {:key font :variant :ghost :size :sm
+                       :on-click #(do (state/set-editor-font! region :family font) (close-custom!))} font))]])])
+
 (hsx/defc editor-font-family-row [t settings]
   (let [_preferred-language (rfx/use-sub [:preferred-language])
         [region set-region!] (hooks/use-state :editor)
@@ -357,29 +383,8 @@
                         :aria-label (t :settings.general/font-reset-size)}
                        (ui/icon "rotate-clockwise" {:size 14}))])
         (when (= region custom-region)
-          [:div.font-custom-controls
-           {:on-key-down #(when (= "Escape" (.-key %)) (.stopPropagation %) (close-custom!))}
-           [:input.form-input.is-small.min-w-0
-            {:key [region family] :id (str field-id "-name") :type "text" :auto-focus true
-             :default-value (if (string? family) family "") :aria-label (t :settings.general/font-custom)
-             :placeholder (t :settings.general/font-name-placeholder)
-             :on-blur #(let [value (string/trim (.. % -target -value))]
-                         (when (not= value (if (string? family) family ""))
-                           (state/set-editor-font! region :family (when (seq value) value))))
-             :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
-           [:div.flex.flex-wrap.gap-1
-            (shui/button {:variant :outline :size :sm :on-click choose!} (t :settings.general/font-installed))
-            (shui/button {:variant :ghost :size :sm :on-click close-custom!} (t :ui/close))]
-           (when (= region (:region font-error)) [:p.text-xs {:role "status"} (t (:i18n-key font-error))])
-           (when (= region (:region chooser))
-             [:div.font-installed-list
-              [:input.form-input.is-small {:type "search" :value query :auto-focus true
-                                          :aria-label (t :settings.general/font-search) :placeholder (t :settings.general/font-search)
-                                          :on-change #(set-query! (.. % -target -value))}]
-              [:div.flex.flex-col.max-h-48.overflow-y-auto
-               (for [font (:families chooser) :when (string/includes? (string/lower-case font) (string/lower-case query))]
-                 (shui/button {:key font :variant :ghost :size :sm
-                               :on-click #(do (state/set-editor-font! region :family font) (close-custom!))} font))]])])
+          (custom-font-controls t region family field-id choose! close-custom!
+                                font-error chooser query set-query!))
         [:p.font-preview.text-sm
          {:style (cond-> {:font-family (if code?
                                         (or (typography/family-css family "monospace") "var(--ls-code-font-family, monospace)")

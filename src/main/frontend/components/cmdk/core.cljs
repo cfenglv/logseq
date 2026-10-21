@@ -1497,6 +1497,24 @@
                (contains? #{nil :nodes :current-page :codes :literature} filter-group))
       (load-results (or filter-group :nodes) state))))
 
+(defn- initialize-search!
+  [state opts search-mode search-args]
+  (let [{input :input filter-group :filter} (cmdk-state/build-initial-cmdk-search
+                                           opts
+                                           (or search-mode :global)
+                                           search-args
+                                           (state/get-current-repo))]
+    (reset! (::input state) input)
+    (reset! (::filter state) filter-group)
+    (reset! (::highlighted-item state) nil)
+    (reset! (::focus-source state) :keyboard)
+    (reset! (::results state) default-results)
+    ;; Results were just wiped, so any memoized refresh key is stale.
+    (reset! (::last-refresh-key state) nil)
+    (when-let [input-ref @(::input-ref state)]
+      (set! (.-value input-ref) input))
+    (refresh-results! state)))
+
 (hsx/defc cmdk
   [{:keys [sidebar?] :as opts}]
   (let [state (hooks/use-memo #(cmdk-init-state opts) [])
@@ -1538,22 +1556,7 @@
          (state/set-state! :search/mode :global)))
      [])
     (hooks/use-effect!
-     (fn []
-       (let [{input :input filter-group :filter} (cmdk-state/build-initial-cmdk-search
-                                                  opts
-                                                  (or search-mode :global)
-                                                  search-args
-                                                  (state/get-current-repo))]
-         (reset! (::input state) input)
-         (reset! (::filter state) filter-group)
-         (reset! (::highlighted-item state) nil)
-         (reset! (::focus-source state) :keyboard)
-         (reset! (::results state) default-results)
-         ;; Results were just wiped, so any memoized refresh key is stale.
-         (reset! (::last-refresh-key state) nil)
-         (when-let [input-ref @(::input-ref state)]
-           (set! (.-value input-ref) input))
-         (refresh-results! state)))
+     (fn [] (initialize-search! state opts search-mode search-args))
      [search-mode search-args])
     (hooks/use-effect!
      (fn []

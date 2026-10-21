@@ -59,7 +59,6 @@
             [frontend.handler.editor.assets :as editor-assets]
             [frontend.handler.editor.format :as editor-format]
             [frontend.handler.export.common :as export-common-handler]
-            [frontend.handler.literature :as literature-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.property :as property-handler]

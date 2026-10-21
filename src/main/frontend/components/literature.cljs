@@ -105,6 +105,236 @@
 
 (declare open-doi-review!)
 
+(defn- review-paper-search-effect
+  [*paper-search-request debounced-paper-query set-paper-search! repo current?]
+  (fn []
+    (let [request-id (swap! *paper-search-request inc)
+          query (string/trim debounced-paper-query)]
+      (if (< (count query) 2)
+        (set-paper-search! {:status :idle
+                            :papers []
+                            :truncated? false})
+        (do
+          (set-paper-search! #(assoc % :status :loading))
+          (-> (literature-handler/<search-existing-papers! repo query)
+              (p/then
+               (fn [result]
+                 (when (and (current?) (= request-id @*paper-search-request))
+                   (set-paper-search! result))))
+              (p/catch
+               (fn [error]
+                 (log/error :literature-paper-search-failed error)
+                 (when (and (current?) (= request-id @*paper-search-request))
+                   (set-paper-search! {:status :unavailable
+                                       :papers []
+                                       :truncated? false})))))))
+      (fn []
+        (when (= request-id @*paper-search-request)
+          (swap! *paper-search-request inc))))))
+
+(defn- review-registration-handler
+  [current? set-working! set-error-message!]
+  (fn [result]
+    (when (current?)
+      (set-working! false)
+      (case (:status result)
+        :created
+        (do
+          (notification/show! (t :asset.literature/created) :success)
+          (shui/dialog-close! :literature-review))
+
+        :linked
+        (do
+          (notification/show! (t :asset.literature/linked) :success)
+          (shui/dialog-close! :literature-review))
+
+        :already-linked
+        (do
+          (notification/show! (t :asset.literature/already-linked) :success)
+          (shui/dialog-close! :literature-review))
+
+        (set-error-message! (t :asset.literature/register-error))))))
+
+(defn- review-existing-paper-picker
+  [doi-record paper-query working? set-paper-query! paper-search link-existing!]
+  (when-not doi-record
+  [:div.flex.flex-col.gap-2
+   [:div.text-sm.font-medium (t :asset.literature/existing-label)]
+   [:div.text-sm.opacity-60 (t :asset.literature/existing-description)]
+   (shui/input
+    {:data-literature-field "existing-paper"
+     :aria-label (t :asset.literature/existing-label)
+     :placeholder (t :asset.literature/existing-placeholder)
+     :value paper-query
+     :disabled working?
+     :on-change #(set-paper-query! (.. % -target -value))})
+   (case (:status paper-search)
+     :idle
+     (when (seq paper-query)
+       [:div.text-xs.opacity-60
+        (t :asset.literature/search-more-characters)])
+
+     (:ok :loading)
+     [:<>
+      (if (seq (:papers paper-search))
+        [:div.flex.flex-col.gap-1
+         (for [{paper-uuid :block/uuid
+                paper-title :block/title
+                paper-detail :literature/detail}
+               (:papers paper-search)]
+           (shui/button
+            {:key (str paper-uuid)
+             :variant :outline
+             :size :sm
+             :class "h-auto justify-start whitespace-normal text-left"
+             :data-literature-existing-paper (str paper-uuid)
+             :disabled working?
+             :on-click #(link-existing! paper-uuid)}
+            [:span.flex.flex-col.items-start
+             [:span paper-title]
+             (when paper-detail
+               [:span.text-xs.font-normal.opacity-60 paper-detail])]))]
+        (when-not (:truncated? paper-search)
+          [:div.text-xs.opacity-60
+           (t (if (= :loading (:status paper-search))
+                :asset.literature/searching :asset.literature/search-empty))]))
+      (when (:truncated? paper-search)
+        [:div.text-xs.opacity-60
+         (t :asset.literature/search-truncated)])]
+
+     [:div.text-xs.text-red-600
+      (t :asset.literature/search-unavailable)])]))
+
+(defn- review-keep-button
+  [working? current? set-error-message! set-working! repo asset-uuid]
+  (shui/button
+   {:variant :ghost
+    :size :sm
+    :data-literature-action "keep"
+     :disabled working?
+     :on-click (fn []
+                 (when (current?)
+                   (set-error-message! nil)
+                   (set-working! true)
+                   (-> (literature-handler/<keep-pdf! repo asset-uuid)
+                       (p/then
+                        (fn [result]
+                          (when (current?)
+                            (set-working! false)
+                            (if (= :kept (:status result))
+                              (shui/dialog-close! :literature-review)
+                              (set-error-message!
+                               (t (if (= :asset-already-linked (:reason result))
+                                    :asset.literature/already-linked
+                                    :asset.literature/keep-error)))))))
+                       (p/catch
+                        (fn [error]
+                          (log/error :literature-keep-failed error)
+                          (when (current?)
+                            (set-working! false)
+                            (set-error-message!
+                             (t :asset.literature/keep-error))))))))}
+   (t :asset.literature/keep-action)))
+
+(defn- review-retry-button
+  [working? current? set-error-message! set-working! repo asset-uuid]
+  (shui/button
+   {:variant :outline
+    :size :sm
+    :data-literature-action "retry"
+    :disabled working?
+    :on-click (fn []
+                (when (current?)
+                  (set-error-message! nil)
+                  (set-working! true)
+                  (-> (literature-handler/<retry-review-candidate!
+                       repo asset-uuid)
+                      (p/then
+                       (fn [result]
+                         (when (current?)
+                           (set-working! false)
+                           (cond
+                             (= :content-mismatch (get-in result [:results 0 :extraction :reason]))
+                             (set-error-message!
+                              (t :asset.literature/content-mismatch-error))
+
+                             (and (= :complete (:status result))
+                                  (= :complete (get-in result [:results 0 :extraction :status])))
+                             (shui/dialog-close! :literature-review)
+
+                             :else
+                             (set-error-message!
+                              (t :asset.literature/retry-error))))))
+                      (p/catch
+                       (fn [error]
+                         (log/error :literature-identification-retry-failed error)
+                         (when (current?)
+                           (set-working! false)
+                           (set-error-message!
+                            (t :asset.literature/retry-error))))))))}
+   (t :asset.literature/retry-action)))
+
+(defn- review-identify-button
+  [working? current? set-working! set-error-message! repo asset-uuid finish-registration! title
+   asset-block set-title! doi set-doi! arxiv set-arxiv!]
+  (shui/button
+   {:size :sm
+    :data-literature-action "identify-add"
+    :disabled working?
+    :on-click
+    (fn []
+      (when (current?)
+        (set-working! true)
+        (set-error-message! nil)
+        (-> (literature-handler/<retry-review-candidate!
+             repo asset-uuid {:register? true :allow-online? (util/electron?)})
+            (p/then
+             (fn [result]
+               (let [applied (:automatic-result result)]
+                 (if (contains? #{:created :linked :already-linked} (:status applied))
+                   (finish-registration! applied)
+                   (when (current?)
+                     (set-working! false)
+                     (when-let [fresh (literature-handler/review-candidate repo asset-uuid)]
+                       (when (= title (:block/title asset-block))
+                         (when-let [value (literature-handler/review-title fresh)] (set-title! value)))
+                       (let [identifiers (literature-handler/review-identifiers fresh)]
+                         (when (string/blank? doi) (set-doi! (or (:doi identifiers) "")))
+                         (when (string/blank? arxiv) (set-arxiv! (or (:arxiv identifiers) "")))))
+                     (set-error-message!
+                      (t (if (contains? #{:metadata-unavailable :metadata-request-cancelled} (:reason applied))
+                           :literature.organization/network-paused
+                           :literature.organization/needs-review))))))))
+            (p/catch (fn [error]
+                       (log/error :literature-identify-and-add-failed error)
+                       (when (current?)
+                         (set-working! false)
+                         (set-error-message! (t :asset.literature/retry-error))))))))}
+   (t :literature.organization/identify-action)))
+
+(defn- review-register-button
+  [doi-record working? title current? set-error-message! set-working! repo asset-uuid doi arxiv
+   finish-registration!]
+  (shui/button
+   {:size :sm :variant (if doi-record :default :outline)
+    :data-literature-action "add"
+    :disabled (or working? (string/blank? title))
+    :on-click (fn []
+                (when (current?)
+                  (set-error-message! nil)
+                  (set-working! true)
+                  (-> (literature-handler/<register-pdf!
+                       repo asset-uuid title {:doi doi :arxiv arxiv} doi-record)
+                      (p/then finish-registration!)
+                      (p/catch
+                       (fn [error]
+                         (log/error :literature-registration-failed error)
+                         (when (current?)
+                           (set-working! false)
+                           (set-error-message!
+                            (t :asset.literature/register-error))))))))}
+   (t :asset.literature/add-action)))
+
 (hsx/defc literature-review-dialog
   [repo asset-block review current?]
   (let [[title set-title!] (hooks/use-state
@@ -126,53 +356,11 @@
         *paper-search-request (hooks/use-memo #(atom 0) [])
         debounced-paper-query (hooks/use-debounced-value paper-query 200)
         _ (hooks/use-effect!
-           (fn []
-             (let [request-id (swap! *paper-search-request inc)
-                   query (string/trim debounced-paper-query)]
-               (if (< (count query) 2)
-                 (set-paper-search! {:status :idle
-                                     :papers []
-                                     :truncated? false})
-                 (do
-                   (set-paper-search! #(assoc % :status :loading))
-                   (-> (literature-handler/<search-existing-papers! repo query)
-                       (p/then
-                        (fn [result]
-                          (when (and (current?) (= request-id @*paper-search-request))
-                            (set-paper-search! result))))
-                       (p/catch
-                        (fn [error]
-                          (log/error :literature-paper-search-failed error)
-                          (when (and (current?) (= request-id @*paper-search-request))
-                            (set-paper-search! {:status :unavailable
-                                                :papers []
-                                                :truncated? false})))))))
-               (fn []
-                 (when (= request-id @*paper-search-request)
-                   (swap! *paper-search-request inc)))))
+           (review-paper-search-effect *paper-search-request debounced-paper-query set-paper-search! repo current?)
            [debounced-paper-query repo])
         extraction-status (get-in review [:extraction :status])
         finish-registration!
-        (fn [result]
-          (when (current?)
-            (set-working! false)
-            (case (:status result)
-              :created
-              (do
-                (notification/show! (t :asset.literature/created) :success)
-                (shui/dialog-close! :literature-review))
-
-              :linked
-              (do
-                (notification/show! (t :asset.literature/linked) :success)
-                (shui/dialog-close! :literature-review))
-
-              :already-linked
-              (do
-                (notification/show! (t :asset.literature/already-linked) :success)
-                (shui/dialog-close! :literature-review))
-
-              (set-error-message! (t :asset.literature/register-error)))))
+        (review-registration-handler current? set-working! set-error-message!)
         link-existing!
         (fn [paper-uuid]
           (when (current?)
@@ -223,53 +411,7 @@
         :value arxiv
         :disabled working?
         :on-change #(set-arxiv! (.. % -target -value))}))]
-     (when-not doi-record
-     [:div.flex.flex-col.gap-2
-      [:div.text-sm.font-medium (t :asset.literature/existing-label)]
-      [:div.text-sm.opacity-60 (t :asset.literature/existing-description)]
-      (shui/input
-       {:data-literature-field "existing-paper"
-        :aria-label (t :asset.literature/existing-label)
-        :placeholder (t :asset.literature/existing-placeholder)
-        :value paper-query
-        :disabled working?
-        :on-change #(set-paper-query! (.. % -target -value))})
-      (case (:status paper-search)
-        :idle
-        (when (seq paper-query)
-          [:div.text-xs.opacity-60
-           (t :asset.literature/search-more-characters)])
-
-        (:ok :loading)
-        [:<>
-         (if (seq (:papers paper-search))
-           [:div.flex.flex-col.gap-1
-            (for [{paper-uuid :block/uuid
-                   paper-title :block/title
-                   paper-detail :literature/detail}
-                  (:papers paper-search)]
-              (shui/button
-               {:key (str paper-uuid)
-                :variant :outline
-                :size :sm
-                :class "h-auto justify-start whitespace-normal text-left"
-                :data-literature-existing-paper (str paper-uuid)
-                :disabled working?
-                :on-click #(link-existing! paper-uuid)}
-               [:span.flex.flex-col.items-start
-                [:span paper-title]
-                (when paper-detail
-                  [:span.text-xs.font-normal.opacity-60 paper-detail])]))]
-           (when-not (:truncated? paper-search)
-             [:div.text-xs.opacity-60
-              (t (if (= :loading (:status paper-search))
-                   :asset.literature/searching :asset.literature/search-empty))]))
-         (when (:truncated? paper-search)
-           [:div.text-xs.opacity-60
-            (t :asset.literature/search-truncated)])]
-
-        [:div.text-xs.text-red-600
-         (t :asset.literature/search-unavailable)])])
+     (review-existing-paper-picker doi-record paper-query working? set-paper-query! paper-search link-existing!)
      (when (and (not doi-record)
                 (or (= :failed extraction-status)
                     (= :skipped extraction-status)
@@ -283,124 +425,12 @@
      (when (and (util/electron?) (not doi-record))
        [:p.text-xs.opacity-60 (t :literature.organization/privacy-description)])
      [:div.flex.flex-wrap.justify-end.gap-2
-      (shui/button
-       {:variant :ghost
-        :size :sm
-        :data-literature-action "keep"
-         :disabled working?
-         :on-click (fn []
-                     (when (current?)
-                       (set-error-message! nil)
-                       (set-working! true)
-                       (-> (literature-handler/<keep-pdf! repo asset-uuid)
-                           (p/then
-                            (fn [result]
-                              (when (current?)
-                                (set-working! false)
-                                (if (= :kept (:status result))
-                                  (shui/dialog-close! :literature-review)
-                                  (set-error-message!
-                                   (t (if (= :asset-already-linked (:reason result))
-                                        :asset.literature/already-linked
-                                        :asset.literature/keep-error)))))))
-                           (p/catch
-                            (fn [error]
-                              (log/error :literature-keep-failed error)
-                              (when (current?)
-                                (set-working! false)
-                                (set-error-message!
-                                 (t :asset.literature/keep-error))))))))}
-       (t :asset.literature/keep-action))
+      (review-keep-button working? current? set-error-message! set-working! repo asset-uuid)
       (when-not doi-record
-      (shui/button
-       {:variant :outline
-        :size :sm
-        :data-literature-action "retry"
-        :disabled working?
-        :on-click (fn []
-                    (when (current?)
-                      (set-error-message! nil)
-                      (set-working! true)
-                      (-> (literature-handler/<retry-review-candidate!
-                           repo asset-uuid)
-                          (p/then
-                           (fn [result]
-                             (when (current?)
-                               (set-working! false)
-                               (cond
-                                 (= :content-mismatch (get-in result [:results 0 :extraction :reason]))
-                                 (set-error-message!
-                                  (t :asset.literature/content-mismatch-error))
-
-                                 (and (= :complete (:status result))
-                                      (= :complete (get-in result [:results 0 :extraction :status])))
-                                 (shui/dialog-close! :literature-review)
-
-                                 :else
-                                 (set-error-message!
-                                  (t :asset.literature/retry-error))))))
-                          (p/catch
-                           (fn [error]
-                             (log/error :literature-identification-retry-failed error)
-                             (when (current?)
-                               (set-working! false)
-                               (set-error-message!
-                                (t :asset.literature/retry-error))))))))}
-       (t :asset.literature/retry-action)))
+      (review-retry-button working? current? set-error-message! set-working! repo asset-uuid))
       (when-not doi-record
-      (shui/button
-       {:size :sm
-        :data-literature-action "identify-add"
-        :disabled working?
-        :on-click
-        (fn []
-          (when (current?)
-            (set-working! true)
-            (set-error-message! nil)
-            (-> (literature-handler/<retry-review-candidate!
-                 repo asset-uuid {:register? true :allow-online? (util/electron?)})
-                (p/then
-                 (fn [result]
-                   (let [applied (:automatic-result result)]
-                     (if (contains? #{:created :linked :already-linked} (:status applied))
-                       (finish-registration! applied)
-                       (when (current?)
-                         (set-working! false)
-                         (when-let [fresh (literature-handler/review-candidate repo asset-uuid)]
-                           (when (= title (:block/title asset-block))
-                             (when-let [value (literature-handler/review-title fresh)] (set-title! value)))
-                           (let [identifiers (literature-handler/review-identifiers fresh)]
-                             (when (string/blank? doi) (set-doi! (or (:doi identifiers) "")))
-                             (when (string/blank? arxiv) (set-arxiv! (or (:arxiv identifiers) "")))))
-                         (set-error-message!
-                          (t (if (contains? #{:metadata-unavailable :metadata-request-cancelled} (:reason applied))
-                               :literature.organization/network-paused
-                               :literature.organization/needs-review))))))))
-                (p/catch (fn [error]
-                           (log/error :literature-identify-and-add-failed error)
-                           (when (current?)
-                             (set-working! false)
-                             (set-error-message! (t :asset.literature/retry-error))))))))}
-       (t :literature.organization/identify-action)))
-      (shui/button
-       {:size :sm :variant (if doi-record :default :outline)
-        :data-literature-action "add"
-        :disabled (or working? (string/blank? title))
-        :on-click (fn []
-                    (when (current?)
-                      (set-error-message! nil)
-                      (set-working! true)
-                      (-> (literature-handler/<register-pdf!
-                           repo asset-uuid title {:doi doi :arxiv arxiv} doi-record)
-                          (p/then finish-registration!)
-                          (p/catch
-                           (fn [error]
-                             (log/error :literature-registration-failed error)
-                             (when (current?)
-                               (set-working! false)
-                               (set-error-message!
-                                (t :asset.literature/register-error))))))))}
-       (t :asset.literature/add-action))]]))
+      (review-identify-button working? current? set-working! set-error-message! repo asset-uuid finish-registration! title asset-block set-title! doi set-doi! arxiv set-arxiv!))
+      (review-register-button doi-record working? title current? set-error-message! set-working! repo asset-uuid doi arxiv finish-registration!)]]))
 
 (hsx/defc review-entry-dialog
   [repo asset-uuid dialog-close]
@@ -734,8 +764,7 @@
                 (when (current?)
                   (if (= :source-owner kind)
                     (open-source-review! repo paper-uuid)
-                    (do
-                      (route-handler/redirect-to-page! paper-uuid)))))}
+                    (route-handler/redirect-to-page! paper-uuid))))}
    [:span (if (string/blank? title) (t :ui/untitled) title)]
    (when (= :source-owner kind)
      [:span.shrink-0 (t :literature.source/entry-action)])))
@@ -819,6 +848,88 @@
             (for [paper (:papers member)]
               (history-paper-choice repo kind member paper current?))]))])))
 
+(defn- history-conflict-toolbar
+  [kind reading? set-kind! graph-current? *request-id set-page! set-detail! load-page!]
+  [:div.flex.items-center.justify-between.gap-3
+   (if (= :checksum kind)
+     [:span.text-sm.opacity-60 (t :literature.history/checksum-label)]
+     (shui/button {:variant :ghost :size :sm
+                   :on-click #(when-not reading? (set-kind! :checksum))}
+                  (ui/icon "arrow-left" {:size 16})
+                  (t :literature.history/checksum-label)))
+   [:div.flex.items-center.gap-1
+    (shui/dropdown-menu
+     (shui/dropdown-menu-trigger {:as-child true}
+       (shui/button {:variant :ghost :size :sm :disabled reading?
+                     :data-literature-history-check true}
+                    (t :literature.history/check-associations)
+                    (ui/icon "chevron-down" {:size 14})))
+     (shui/dropdown-menu-content
+      (for [option [:asset-owner :source-owner]]
+        (shui/dropdown-menu-item
+         {:key (name option) :data-literature-history-kind (name option)
+          :on-click #(when (graph-current?)
+                       (swap! *request-id inc)
+                       (set-kind! option)
+                       (set-page! {:status :idle})
+                       (set-detail! nil))}
+         (history-kind-label option)))))
+    (shui/button
+     {:variant :ghost :size :sm :class "px-2"
+      :data-literature-history-refresh true
+      :aria-label (t :ui/refresh) :title (t :ui/refresh)
+      :disabled (or reading? (not (graph-current?)))
+      :on-click #(load-page! nil)}
+     (ui/icon "refresh" {:size 16}))]])
+
+(defn- history-conflict-results
+  [page-status page detail *request-id set-detail! read-detail! kind detail-status
+   context-current? request-current? repo load-page! reading?]
+  (case (if (and (= :loading page-status) (seq (:entries page))) :ok page-status)
+    :idle nil
+    :loading [:div.flex.justify-center.py-8 {:role "status" :aria-label (t :ui/loading)}
+              (ui/icon "loader-2" {:size 20 :class "animate-spin opacity-50"})]
+    :ok
+    [:div.flex.flex-col.gap-3
+     (if (seq (:entries page))
+       (for [{group-identity :identity :keys [title count] :as entry} (:entries page)
+             :let [expanded? (= group-identity (:identity detail))]]
+         [:div.rounded-lg.border
+          {:key (str group-identity) :data-literature-history-card (str group-identity)}
+          (shui/button
+           {:variant :ghost :class "h-auto w-full justify-between gap-3 whitespace-normal px-4 py-3 text-left"
+            :data-literature-history-entry (str group-identity)
+            :style {:justifyContent "space-between" :whiteSpace "normal"}
+            :aria-expanded expanded?
+            :disabled (= :loading page-status)
+            :on-click #(if expanded?
+                         (do (swap! *request-id inc) (set-detail! nil))
+                         (read-detail! entry))}
+           [:span.flex.min-w-0.flex-col.items-start.gap-1
+            [:span.break-words (if (= kind :source-owner)
+                                (history-kind-label kind)
+                                (if (string/blank? title) (t :ui/untitled) title))]
+            (when (= :checksum kind)
+              [:span.text-xs.font-normal.opacity-60 (t :literature.history/copies-count count)])]
+           (ui/icon (if expanded? "chevron-up" "chevron-down") {:size 16 :class "shrink-0 opacity-50"}))
+          (when expanded?
+            [:div.border-t.px-4
+             (case detail-status
+               :loading [:div.py-4.text-sm.opacity-60 (t :ui/loading)]
+               :ok (let [current? #(and (context-current? (:projection-context detail))
+                                       (request-current? (:request-id detail)))]
+                     (history-conflict-group repo kind detail current?
+                                             #(when (current?) (load-page! nil))))
+               [:div.py-4.text-sm.text-red-600 (t :literature.history/detail-error)])])])
+       [:div.flex.flex-col.items-center.gap-3.py-10.opacity-60
+        (ui/icon "circle-check" {:size 28})
+        [:span.text-sm (t :literature.history/page-empty)]])
+     (when-let [cursor (:next-cursor page)]
+       (shui/button {:variant :outline :data-literature-history-next true
+                     :disabled reading? :on-click #(load-page! cursor)}
+                    (t :literature.history/next-action)))]
+    [:div.text-sm.text-red-600 (t :literature.history/load-error)]))
+
 (hsx/defc history-conflicts
   [repo]
   (let [[kind set-kind!] (hooks/use-state :checksum)
@@ -890,83 +1001,10 @@
      [repo])
     (hooks/use-effect! (fn [] (when kind (load-page! nil)) nil) [repo kind])
     [:div.flex.flex-col.gap-3
-     [:div.flex.items-center.justify-between.gap-3
-      (if (= :checksum kind)
-        [:span.text-sm.opacity-60 (t :literature.history/checksum-label)]
-        (shui/button {:variant :ghost :size :sm
-                      :on-click #(when-not reading? (set-kind! :checksum))}
-                     (ui/icon "arrow-left" {:size 16})
-                     (t :literature.history/checksum-label)))
-      [:div.flex.items-center.gap-1
-       (shui/dropdown-menu
-        (shui/dropdown-menu-trigger {:as-child true}
-          (shui/button {:variant :ghost :size :sm :disabled reading?
-                        :data-literature-history-check true}
-                       (t :literature.history/check-associations)
-                       (ui/icon "chevron-down" {:size 14})))
-        (shui/dropdown-menu-content
-         (for [option [:asset-owner :source-owner]]
-           (shui/dropdown-menu-item
-            {:key (name option) :data-literature-history-kind (name option)
-             :on-click #(when (graph-current?)
-                          (swap! *request-id inc)
-                          (set-kind! option)
-                          (set-page! {:status :idle})
-                          (set-detail! nil))}
-            (history-kind-label option)))))
-       (shui/button
-        {:variant :ghost :size :sm :class "px-2"
-         :data-literature-history-refresh true
-         :aria-label (t :ui/refresh) :title (t :ui/refresh)
-         :disabled (or reading? (not (graph-current?)))
-         :on-click #(load-page! nil)}
-        (ui/icon "refresh" {:size 16}))]]
+     (history-conflict-toolbar kind reading? set-kind! graph-current? *request-id set-page! set-detail! load-page!)
      (when-not (= :checksum kind)
        [:h3.text-sm.font-medium (history-kind-label kind)])
-     (case (if (and (= :loading page-status) (seq (:entries page))) :ok page-status)
-       :idle nil
-       :loading [:div.flex.justify-center.py-8 {:role "status" :aria-label (t :ui/loading)}
-                 (ui/icon "loader-2" {:size 20 :class "animate-spin opacity-50"})]
-       :ok
-       [:div.flex.flex-col.gap-3
-        (if (seq (:entries page))
-          (for [{group-identity :identity :keys [title count] :as entry} (:entries page)
-                :let [expanded? (= group-identity (:identity detail))]]
-            [:div.rounded-lg.border
-             {:key (str group-identity) :data-literature-history-card (str group-identity)}
-             (shui/button
-              {:variant :ghost :class "h-auto w-full justify-between gap-3 whitespace-normal px-4 py-3 text-left"
-               :data-literature-history-entry (str group-identity)
-               :style {:justifyContent "space-between" :whiteSpace "normal"}
-               :aria-expanded expanded?
-               :disabled (= :loading page-status)
-               :on-click #(if expanded?
-                            (do (swap! *request-id inc) (set-detail! nil))
-                            (read-detail! entry))}
-              [:span.flex.min-w-0.flex-col.items-start.gap-1
-               [:span.break-words (if (= kind :source-owner)
-                                   (history-kind-label kind)
-                                   (if (string/blank? title) (t :ui/untitled) title))]
-               (when (= :checksum kind)
-                 [:span.text-xs.font-normal.opacity-60 (t :literature.history/copies-count count)])]
-              (ui/icon (if expanded? "chevron-up" "chevron-down") {:size 16 :class "shrink-0 opacity-50"}))
-             (when expanded?
-               [:div.border-t.px-4
-                (case detail-status
-                  :loading [:div.py-4.text-sm.opacity-60 (t :ui/loading)]
-                  :ok (let [current? #(and (context-current? (:projection-context detail))
-                                          (request-current? (:request-id detail)))]
-                        (history-conflict-group repo kind detail current?
-                                                #(when (current?) (load-page! nil))))
-                  [:div.py-4.text-sm.text-red-600 (t :literature.history/detail-error)])])])
-          [:div.flex.flex-col.items-center.gap-3.py-10.opacity-60
-           (ui/icon "circle-check" {:size 28})
-           [:span.text-sm (t :literature.history/page-empty)]])
-        (when-let [cursor (:next-cursor page)]
-          (shui/button {:variant :outline :data-literature-history-next true
-                        :disabled reading? :on-click #(load-page! cursor)}
-                       (t :literature.history/next-action)))]
-       [:div.text-sm.text-red-600 (t :literature.history/load-error)])]))
+     (history-conflict-results page-status page detail *request-id set-detail! read-detail! kind detail-status context-current? request-current? repo load-page! reading?)]))
 
 (declare settings-section open-zotero-review! item-actions)
 
@@ -1115,6 +1153,118 @@
         (keep #(get-in metadata [% :block/title]))
         (remove string/blank?) (string/join " · "))})
 
+(defn- library-pdf-change-handler
+  [set-operation! repo]
+  (fn [event]
+    (when-let [file (some-> event .-target .-files (aget 0))]
+      (set! (.. event -target -value) "")
+      (set-operation! :saving)
+      (-> (p/let [target (literature-handler/<default-destination! repo)]
+            (when (= repo (state/get-current-repo))
+              (editor-assets-handler/db-based-save-assets!
+               repo [file] :target-block target :reuse-existing-pdf? true
+               :literature-action? true :auto-identify-literature? false
+               :on-assets-saved #(<review-added-pdf! repo %))))
+          (p/catch (fn [error]
+                     (log/error :literature-library-pdf-failed error)
+                     (when (= repo (state/get-current-repo))
+                       (notification/show! (t :literature.library/pdf-save-error) :error))))
+          (p/finally #(set-operation! nil))))))
+
+(defn- library-toolbar
+  [*file save-pdf! operation *add-trigger repo local-options!]
+  [:div.flex.flex-wrap.items-center.justify-between.gap-3.mb-5
+   [:h1.text-2xl.font-semibold (t :nav/literature)]
+   [:div.flex.items-center.gap-2
+    [:input.hidden {:type "file" :accept ".pdf,application/pdf" :ref *file :on-change save-pdf!}]
+    (shui/dropdown-menu
+     (shui/dropdown-menu-trigger {:as-child true}
+      (shui/button {:variant :outline :disabled (some? operation) :ref *add-trigger
+                    :data-literature-add true}
+                   (ui/icon "plus" {:size 16})
+                   (t :literature.library/add-action)
+                   (ui/icon "chevron-down" {:size 14})))
+     (shui/dropdown-menu-content
+      (when (util/electron?)
+        (shui/dropdown-menu-item {:data-literature-action "add-by-doi"
+                                  :on-click #(open-manual-paper! repo *add-trigger true)}
+                                 (t :literature.doi/add-action)))
+      (shui/dropdown-menu-item {:on-click #(some-> (hooks/deref *file) .click)}
+                               (t :literature.library/pdf-action))
+      (when (util/electron?)
+        (shui/dropdown-menu-item {:on-click #(local-options! *add-trigger)} (t :literature.library/zotero-action)))
+      (shui/dropdown-menu-item {:on-click #(open-manual-paper! repo *add-trigger)}
+                               (t :literature.library/manual-action))))
+    (shui/button {:variant :ghost :size :sm
+                  :on-click #(local-options! (constantly (.-currentTarget %)))
+                  :data-literature-local-options true}
+                 (ui/icon "settings" {:size 16})
+                 (t :literature.library/local-options-action))]])
+
+(defn- library-tab-content
+  [tab binding local-settings repo query set-composing! operation searching? search-result
+   window-snapshot rows-snapshot window rows change-tab! page-index set-before! set-page-index!
+   eids]
+  (case tab
+    "pending"
+    [:div.flex.flex-col.gap-3
+     (when (and binding (:enabled? local-settings))
+       (shui/button {:variant :outline :on-click #(open-zotero-review! repo binding)}
+                    (t :literature.source/review-zotero-action)))
+     (unregistered-pdfs repo)]
+    "duplicates" (history-conflicts repo)
+    [:div.flex.flex-col.gap-3
+     (shui/input {:value query :aria-label (t :literature.library/search-placeholder)
+                  :placeholder (t :literature.library/search-placeholder)
+                  :data-literature-library-search true
+                  :on-composition-start #(set-composing! true)
+                  :on-composition-end #(set-composing! false)
+                  :on-change #(route-handler/redirect!
+                               {:to :literature :push false
+                                :query-params {:tab "all" :q (util/evalue %)}})})
+     (when (some? operation) [:div.text-sm.opacity-60 (t :settings.literature/working)])
+     (if searching?
+       (case (:status search-result)
+         (:ok :loading :idle)
+         [:div {:aria-busy (not= :ok (:status search-result))}
+          (if (seq (:papers search-result))
+            (map #(paper-row repo %) (:papers search-result))
+            [:p.text-sm.opacity-60
+             (t (if (= :ok (:status search-result))
+                  :asset.literature/search-empty :asset.literature/searching))])
+          (when (or (seq (:papers search-result)) (= :ok (:status search-result)))
+            [:p.text-xs.opacity-60 (t :literature.library/search-limit-description)])]
+         [:p.text-sm.text-red-600 (t :asset.literature/search-unavailable)])
+       (cond
+         (or (= :error (:status window-snapshot)) (get-in window-snapshot [:value :error])
+             (= :error (:status rows-snapshot)) (get-in rows-snapshot [:value :error]))
+         [:p.text-sm.text-red-600 (t :literature.library/load-error)]
+         (or (not= :ready (:status window-snapshot))
+             (and (seq window) (not= :ready (:status rows-snapshot))))
+         [:p.text-sm.opacity-60 (t :ui/loading)]
+         :else
+         [:div
+          (when (= 1 (count (string/trim query)))
+            [:p.text-sm.opacity-60 (t :asset.literature/search-more-characters)])
+          (map #(paper-row repo %) rows)
+          (when (empty? rows)
+            [:div.flex.flex-col.items-center.gap-3.py-10
+             (ui/icon "books" {:size 32 :class "opacity-40"})
+             [:p.text-sm.opacity-60 (t :literature.library/empty-description)]
+             (shui/button {:variant :outline :size :sm :data-literature-open-pdf-inbox true
+                           :on-click #(change-tab! "pending")}
+                          (ui/icon "file-type-pdf" {:size 16})
+                          (t :literature.library/open-pdf-inbox-action))])
+          [:div.flex.justify-end.gap-2.mt-4
+           (when (pos? page-index)
+             (shui/button {:variant :ghost :size :sm
+                           :on-click #(do (set-before! nil) (set-page-index! 0))}
+                          (t :literature.library/first-page-action)))
+           (when (> (count eids) 50)
+             (shui/button {:variant :outline :size :sm :data-literature-library-next true
+                           :on-click #(do (set-before! (peek window)) (set-page-index! inc))}
+                          (t :literature/pending-next-page)))]]))]))
+
 (hsx/defc library-content
   [repo route-match]
   (let [_language (rfx/use-sub [:preferred-language])
@@ -1152,21 +1302,7 @@
         binding (:zotero-binding local-settings)
         change-tab! #(route-handler/redirect! {:to :literature :query-params {:tab %}})
         local-options! #(open-local-options! repo (fn [] (bump-settings! inc)) %)
-        save-pdf! (fn [event]
-                    (when-let [file (some-> event .-target .-files (aget 0))]
-                      (set! (.. event -target -value) "")
-                      (set-operation! :saving)
-                      (-> (p/let [target (literature-handler/<default-destination! repo)]
-                            (when (= repo (state/get-current-repo))
-                              (editor-assets-handler/db-based-save-assets!
-                               repo [file] :target-block target :reuse-existing-pdf? true
-                               :literature-action? true :auto-identify-literature? false
-                               :on-assets-saved #(<review-added-pdf! repo %))))
-                          (p/catch (fn [error]
-                                     (log/error :literature-library-pdf-failed error)
-                                     (when (= repo (state/get-current-repo))
-                                       (notification/show! (t :literature.library/pdf-save-error) :error))))
-                          (p/finally #(set-operation! nil)))))]
+        save-pdf! (library-pdf-change-handler set-operation! repo)]
     (hooks/use-effect!
      (fn []
        (set-before! nil) (set-page-index! 0) (set-page-context! context)
@@ -1191,33 +1327,7 @@
      [repo tab debounced-query composing? (:build-id index-build)])
     [:div.ls-literature.w-full.max-w-5xl.mx-auto
      {:on-key-down native-control-key-down}
-     [:div.flex.flex-wrap.items-center.justify-between.gap-3.mb-5
-      [:h1.text-2xl.font-semibold (t :nav/literature)]
-      [:div.flex.items-center.gap-2
-       [:input.hidden {:type "file" :accept ".pdf,application/pdf" :ref *file :on-change save-pdf!}]
-       (shui/dropdown-menu
-        (shui/dropdown-menu-trigger {:as-child true}
-         (shui/button {:variant :outline :disabled (some? operation) :ref *add-trigger
-                       :data-literature-add true}
-                      (ui/icon "plus" {:size 16})
-                      (t :literature.library/add-action)
-                      (ui/icon "chevron-down" {:size 14})))
-        (shui/dropdown-menu-content
-         (when (util/electron?)
-           (shui/dropdown-menu-item {:data-literature-action "add-by-doi"
-                                     :on-click #(open-manual-paper! repo *add-trigger true)}
-                                    (t :literature.doi/add-action)))
-         (shui/dropdown-menu-item {:on-click #(some-> (hooks/deref *file) .click)}
-                                  (t :literature.library/pdf-action))
-         (when (util/electron?)
-           (shui/dropdown-menu-item {:on-click #(local-options! *add-trigger)} (t :literature.library/zotero-action)))
-         (shui/dropdown-menu-item {:on-click #(open-manual-paper! repo *add-trigger)}
-                                  (t :literature.library/manual-action))))
-       (shui/button {:variant :ghost :size :sm
-                     :on-click #(local-options! (constantly (.-currentTarget %)))
-                     :data-literature-local-options true}
-                    (ui/icon "settings" {:size 16})
-                    (t :literature.library/local-options-action))]]
+     (library-toolbar *file save-pdf! operation *add-trigger repo local-options!)
      (when binding
        [:button.text-sm.opacity-70.mb-4
         {:on-click #(local-options! (constantly (.-currentTarget %))) :data-literature-import-summary true}
@@ -1246,65 +1356,7 @@
                       :data-literature-tab id :on-click #(change-tab! id)}
                      (ui/icon icon {:size 16}) label))]
      (pdf-organization repo (= tab "pending"))
-     (case tab
-       "pending"
-       [:div.flex.flex-col.gap-3
-        (when (and binding (:enabled? local-settings))
-          (shui/button {:variant :outline :on-click #(open-zotero-review! repo binding)}
-                       (t :literature.source/review-zotero-action)))
-        (unregistered-pdfs repo)]
-       "duplicates" (history-conflicts repo)
-       [:div.flex.flex-col.gap-3
-        (shui/input {:value query :aria-label (t :literature.library/search-placeholder)
-                     :placeholder (t :literature.library/search-placeholder)
-                     :data-literature-library-search true
-                     :on-composition-start #(set-composing! true)
-                     :on-composition-end #(set-composing! false)
-                     :on-change #(route-handler/redirect!
-                                  {:to :literature :push false
-                                   :query-params {:tab "all" :q (util/evalue %)}})})
-        (when (some? operation) [:div.text-sm.opacity-60 (t :settings.literature/working)])
-        (if searching?
-          (case (:status search-result)
-            (:ok :loading :idle)
-            [:div {:aria-busy (not= :ok (:status search-result))}
-             (if (seq (:papers search-result))
-               (map #(paper-row repo %) (:papers search-result))
-               [:p.text-sm.opacity-60
-                (t (if (= :ok (:status search-result))
-                     :asset.literature/search-empty :asset.literature/searching))])
-             (when (or (seq (:papers search-result)) (= :ok (:status search-result)))
-               [:p.text-xs.opacity-60 (t :literature.library/search-limit-description)])]
-            [:p.text-sm.text-red-600 (t :asset.literature/search-unavailable)])
-          (cond
-            (or (= :error (:status window-snapshot)) (get-in window-snapshot [:value :error])
-                (= :error (:status rows-snapshot)) (get-in rows-snapshot [:value :error]))
-            [:p.text-sm.text-red-600 (t :literature.library/load-error)]
-            (or (not= :ready (:status window-snapshot))
-                (and (seq window) (not= :ready (:status rows-snapshot))))
-            [:p.text-sm.opacity-60 (t :ui/loading)]
-            :else
-            [:div
-             (when (= 1 (count (string/trim query)))
-               [:p.text-sm.opacity-60 (t :asset.literature/search-more-characters)])
-             (map #(paper-row repo %) rows)
-             (when (empty? rows)
-               [:div.flex.flex-col.items-center.gap-3.py-10
-                (ui/icon "books" {:size 32 :class "opacity-40"})
-                [:p.text-sm.opacity-60 (t :literature.library/empty-description)]
-                (shui/button {:variant :outline :size :sm :data-literature-open-pdf-inbox true
-                              :on-click #(change-tab! "pending")}
-                             (ui/icon "file-type-pdf" {:size 16})
-                             (t :literature.library/open-pdf-inbox-action))])
-             [:div.flex.justify-end.gap-2.mt-4
-              (when (pos? page-index)
-                (shui/button {:variant :ghost :size :sm
-                              :on-click #(do (set-before! nil) (set-page-index! 0))}
-                             (t :literature.library/first-page-action)))
-              (when (> (count eids) 50)
-                (shui/button {:variant :outline :size :sm :data-literature-library-next true
-                              :on-click #(do (set-before! (peek window)) (set-page-index! inc))}
-                             (t :literature/pending-next-page)))]]))])]))
+     (library-tab-content tab binding local-settings repo query set-composing! operation searching? search-result window-snapshot rows-snapshot window rows change-tab! page-index set-before! set-page-index! eids)]))
 
 (hsx/defc library-page
   [route-match]
@@ -1344,6 +1396,43 @@
     (t :literature.metadata/missing)
     (str value)))
 
+
+(defn- doi-review-plan
+  [repo current-repo plan asset-uuid working? set-asset!]
+  (when (= repo current-repo)
+    (case (:status plan)
+      :manual
+      [:dl.grid.grid-cols-1.gap-3.overflow-y-auto {:class "max-h-[45vh]"}
+       (for [{:keys [field current source]} (:changes plan)]
+         [:div {:key (name field) :data-literature-doi-change (name field)}
+          [:dt.text-sm.font-medium (metadata-field-label field)]
+          [:dd.text-sm.break-words
+           [:span.text-muted-foreground (metadata-value-label current)]
+           [:span.mx-2 "→"]
+           [:span (metadata-value-label source)]]])]
+      :existing
+      [:div.flex.flex-col.gap-3
+       [:div.text-sm.text-muted-foreground (t :literature.doi/existing)]
+       (shui/button {:variant :link :class "h-auto justify-start whitespace-normal text-left p-0"
+                     :on-click #(do (shui/dialog-close! :literature-review)
+                                    (route-handler/redirect-to-page! (get-in plan [:paper :block/uuid])))}
+                    (get-in plan [:paper :block/title]))
+       (when (seq (:assets plan))
+         [:div.flex.flex-col.gap-1
+          [:label.text-sm {:for "literature-doi-pdf"} (t :literature.doi/select-pdf)]
+          [:select.ui__input.w-full.min-w-0 {:id "literature-doi-pdf" :data-literature-field "doi-pdf"
+                             :value (str asset-uuid) :disabled working?
+                             :on-change #(set-asset! (let [value (util/evalue %)]
+                                                      (when-not (string/blank? value) (uuid value))))}
+           [:option {:value ""} (t :literature.doi/select-pdf)]
+           (for [asset (:assets plan)]
+             [:option {:key (str (:block/uuid asset)) :value (str (:block/uuid asset))}
+              (:block/title asset)])]])]
+      :already-imported [:div.text-sm.text-muted-foreground (t :literature.doi/up-to-date)]
+      :blocked [:div.text-sm.text-red-600 {:role "alert"}
+                (t (if (= :identifier-conflict (:reason plan))
+                     :literature.doi/conflict :literature.doi/stale))]
+      nil)))
 
 (hsx/defc doi-review-dialog
   [repo paper-uuid dialog-close]
@@ -1409,40 +1498,7 @@
      (doi-lookup-input repo doi set-doi!
                        #(do (set-record! nil) (set-plan! nil) (set-asset! nil) (set-error! nil))
                        read-record! current? working? set-working!)
-     (when (= repo current-repo)
-       (case (:status plan)
-         :manual
-         [:dl.grid.grid-cols-1.gap-3.overflow-y-auto {:class "max-h-[45vh]"}
-          (for [{:keys [field current source]} (:changes plan)]
-            [:div {:key (name field) :data-literature-doi-change (name field)}
-             [:dt.text-sm.font-medium (metadata-field-label field)]
-             [:dd.text-sm.break-words
-              [:span.text-muted-foreground (metadata-value-label current)]
-              [:span.mx-2 "→"]
-              [:span (metadata-value-label source)]]])]
-         :existing
-         [:div.flex.flex-col.gap-3
-          [:div.text-sm.text-muted-foreground (t :literature.doi/existing)]
-          (shui/button {:variant :link :class "h-auto justify-start whitespace-normal text-left p-0"
-                        :on-click #(do (shui/dialog-close! :literature-review)
-                                       (route-handler/redirect-to-page! (get-in plan [:paper :block/uuid])))}
-                       (get-in plan [:paper :block/title]))
-          (when (seq (:assets plan))
-            [:div.flex.flex-col.gap-1
-             [:label.text-sm {:for "literature-doi-pdf"} (t :literature.doi/select-pdf)]
-             [:select.ui__input.w-full.min-w-0 {:id "literature-doi-pdf" :data-literature-field "doi-pdf"
-                                :value (str asset-uuid) :disabled working?
-                                :on-change #(set-asset! (let [value (util/evalue %)]
-                                                         (when-not (string/blank? value) (uuid value))))}
-              [:option {:value ""} (t :literature.doi/select-pdf)]
-              (for [asset (:assets plan)]
-                [:option {:key (str (:block/uuid asset)) :value (str (:block/uuid asset))}
-                 (:block/title asset)])]])]
-         :already-imported [:div.text-sm.text-muted-foreground (t :literature.doi/up-to-date)]
-         :blocked [:div.text-sm.text-red-600 {:role "alert"}
-                   (t (if (= :identifier-conflict (:reason plan))
-                        :literature.doi/conflict :literature.doi/stale))]
-         nil))
+     (doi-review-plan repo current-repo plan asset-uuid working? set-asset!)
      (when error-message [:div.text-sm.text-red-600 {:role "alert"} error-message])
      [:div.flex.justify-end.gap-2
       (shui/button {:variant :outline
@@ -1462,6 +1518,81 @@
    {:id :literature-review :title (t :literature.doi/review-title)
     :content-props (when final-focus {:finalFocus final-focus})
     :align :center :class "lg:max-w-2xl"}))
+
+(defn- metadata-review-content
+  [plan selected-fields applying? set-selected-fields! accepted-changes apply! check!]
+  (case (:status plan)
+    :loading
+    [:div.text-sm.opacity-60 (t :literature.metadata/checking)]
+
+    :manual
+    (if (= :metadata-review (:reason plan))
+      [:<>
+       [:p.text-sm.opacity-70 (t :literature.metadata/review-description)]
+        [:div.flex.flex-col.gap-2
+         {:style {:max-height "50vh" :overflow-y "auto"}}
+         (for [{:keys [field current source]} (:changes plan)]
+          ^{:key (name field)}
+          [:label.flex.items-start.gap-3.rounded.border.p-3.cursor-pointer
+           {:data-literature-metadata-field (name field)}
+           (shui/checkbox
+            {:checked (contains? selected-fields field)
+             :disabled applying?
+             :on-checked-change
+             (fn [checked?]
+               (set-selected-fields!
+                (if (true? checked?)
+                  (conj selected-fields field)
+                  (disj selected-fields field))))})
+           [:span.flex.flex-col.gap-1.min-w-0
+            [:span.text-sm.font-medium (metadata-field-label field)]
+            [:span.text-xs.opacity-60.break-words
+             (t :literature.metadata/current-value
+                (metadata-value-label current))]
+            [:span.text-sm.break-words
+             (t :literature.metadata/zotero-value
+                (metadata-value-label source))]]])]
+       [:div.flex.justify-end.gap-2
+        (shui/button
+         {:variant :ghost
+          :data-literature-action "cancel-metadata"
+          :disabled applying?
+          :on-click #(shui/dialog-close! :literature-metadata-review)}
+         (t :ui/cancel))
+        (shui/button
+         {:data-literature-action "apply-metadata"
+          :disabled (or applying? (empty? accepted-changes))
+          :on-click apply!}
+         (if applying?
+           (t :settings.literature/working)
+           (t :literature.metadata/apply-selected)))]]
+      [:div.text-sm.text-red-600 (t :literature.metadata/unavailable)])
+
+    :already-imported
+    [:div.flex.flex-col.gap-3
+     [:div.text-sm (t :literature.metadata/up-to-date)]
+     [:div.flex.justify-end
+      (shui/button
+       {:variant :outline
+        :data-literature-action "close-metadata"
+        :on-click #(shui/dialog-close! :literature-metadata-review)}
+       (t :ui/close))]]
+
+    [:div.flex.flex-col.gap-3
+     [:div.text-sm.text-red-600
+      (if (= :identifier-metadata-conflict (:reason plan))
+        (t :literature.metadata/identity-conflict)
+        (t :literature.metadata/unavailable))]
+     [:div.flex.justify-end.gap-2
+      (shui/button
+       {:variant :ghost
+        :on-click #(shui/dialog-close! :literature-metadata-review)}
+       (t :ui/cancel))
+      (shui/button
+       {:variant :outline
+        :data-literature-action "recheck-metadata"
+        :on-click check!}
+       (t :literature.metadata/check-again))]]))
 
 (hsx/defc metadata-review-dialog
   [repo paper-uuid]
@@ -1518,78 +1649,7 @@
        #(reset! *active? false))
      [repo paper-uuid])
     [:div.flex.flex-col.gap-4.min-w-0
-     (case (:status plan)
-       :loading
-       [:div.text-sm.opacity-60 (t :literature.metadata/checking)]
-
-       :manual
-       (if (= :metadata-review (:reason plan))
-         [:<>
-          [:p.text-sm.opacity-70 (t :literature.metadata/review-description)]
-           [:div.flex.flex-col.gap-2
-            {:style {:max-height "50vh" :overflow-y "auto"}}
-            (for [{:keys [field current source]} (:changes plan)]
-             ^{:key (name field)}
-             [:label.flex.items-start.gap-3.rounded.border.p-3.cursor-pointer
-              {:data-literature-metadata-field (name field)}
-              (shui/checkbox
-               {:checked (contains? selected-fields field)
-                :disabled applying?
-                :on-checked-change
-                (fn [checked?]
-                  (set-selected-fields!
-                   (if (true? checked?)
-                     (conj selected-fields field)
-                     (disj selected-fields field))))})
-              [:span.flex.flex-col.gap-1.min-w-0
-               [:span.text-sm.font-medium (metadata-field-label field)]
-               [:span.text-xs.opacity-60.break-words
-                (t :literature.metadata/current-value
-                   (metadata-value-label current))]
-               [:span.text-sm.break-words
-                (t :literature.metadata/zotero-value
-                   (metadata-value-label source))]]])]
-          [:div.flex.justify-end.gap-2
-           (shui/button
-            {:variant :ghost
-             :data-literature-action "cancel-metadata"
-             :disabled applying?
-             :on-click #(shui/dialog-close! :literature-metadata-review)}
-            (t :ui/cancel))
-           (shui/button
-            {:data-literature-action "apply-metadata"
-             :disabled (or applying? (empty? accepted-changes))
-             :on-click apply!}
-            (if applying?
-              (t :settings.literature/working)
-              (t :literature.metadata/apply-selected)))]]
-         [:div.text-sm.text-red-600 (t :literature.metadata/unavailable)])
-
-       :already-imported
-       [:div.flex.flex-col.gap-3
-        [:div.text-sm (t :literature.metadata/up-to-date)]
-        [:div.flex.justify-end
-         (shui/button
-          {:variant :outline
-           :data-literature-action "close-metadata"
-           :on-click #(shui/dialog-close! :literature-metadata-review)}
-          (t :ui/close))]]
-
-       [:div.flex.flex-col.gap-3
-        [:div.text-sm.text-red-600
-         (if (= :identifier-metadata-conflict (:reason plan))
-           (t :literature.metadata/identity-conflict)
-           (t :literature.metadata/unavailable))]
-        [:div.flex.justify-end.gap-2
-         (shui/button
-          {:variant :ghost
-           :on-click #(shui/dialog-close! :literature-metadata-review)}
-          (t :ui/cancel))
-         (shui/button
-          {:variant :outline
-           :data-literature-action "recheck-metadata"
-           :on-click check!}
-          (t :literature.metadata/check-again))]])]))
+     (metadata-review-content plan selected-fields applying? set-selected-fields! accepted-changes apply! check!)]))
 
 (defn open-metadata-review!
   [repo paper-uuid & [final-focus]]
@@ -1602,6 +1662,136 @@
     :class "lg:max-w-2xl"}))
 
 (defkeyword :literature-source-review)
+
+(defn- source-correction-handler
+  [current? source *source-request set-working! set-error! repo paper-uuid read-sources!]
+  (fn [action target-uuid]
+    (when (and (current?) (:active? source))
+      (let [request-id @*source-request]
+        (set-working! true)
+        (set-error! nil)
+        (-> (literature-handler/<correct-paper-source!
+             repo paper-uuid source action target-uuid)
+            (p/then (fn [result]
+                      (when (and (current?) (= request-id @*source-request))
+                        (if (= :updated (:status result))
+                          (do
+                            (read-sources!)
+                            (notification/show! (t :literature.source/update-success) :success))
+                          (set-error! (t :literature.source/update-error))))))
+            (p/catch (fn [error]
+                       (log/error :literature-source-correction-failed error)
+                       (when (and (current?) (= request-id @*source-request))
+                         (set-error! (t :literature.source/update-error)))))
+            (p/finally #(when (current?) (set-working! false))))))))
+
+(defn- source-search-effect
+  [*search-request debounced-query set-target! current? source set-search-result! repo
+   paper-uuid]
+  (fn []
+    (let [request-id (swap! *search-request inc)
+          query' (string/trim debounced-query)]
+      (set-target! nil)
+      (if (or (not (current?)) (nil? source) (< (count query') 2))
+        (set-search-result! (empty-search-result :idle))
+        (do
+          (set-search-result! #(assoc % :status :loading))
+          (-> (literature-handler/<search-existing-papers! repo query')
+              (p/then (fn [result]
+                        (when (and (current?) (= request-id @*search-request))
+                          (set-search-result!
+                           (update result :papers
+                                   #(filterv (fn [paper] (not= paper-uuid (:block/uuid paper))) %))))))
+              (p/catch (fn [error]
+                         (log/error :literature-source-search-failed error)
+                         (when (and (current?) (= request-id @*search-request))
+                           (set-search-result! (empty-search-result :unavailable))))))))
+      (fn []
+        (when (= request-id @*search-request)
+          (swap! *search-request inc))))))
+
+(defn- source-review-content
+  [repo current-repo restoring? current? plan source working? *search-request set-source!
+   set-query! set-target! set-error! correct! query search-result target]
+  (case (if (and (= repo current-repo) (not restoring?) (current?))
+          (:status plan) :unavailable)
+    :loading [:div.text-sm.opacity-60 (t :ui/loading)]
+    :ok
+    (if (seq (:sources plan))
+      [:div.flex.flex-col.gap-2
+       (for [{:keys [key-uuid source-key active?] :as item} (:sources plan)]
+         (shui/button
+          {:key (str key-uuid)
+           :variant (if (= key-uuid (:key-uuid source)) :default :outline)
+           :class "h-auto justify-between whitespace-normal text-left"
+           :data-literature-source (str key-uuid)
+           :data-literature-source-state (if active? "active" "inactive")
+           :disabled (or working? (not active?))
+           :on-click (fn []
+                       (swap! *search-request inc)
+                       (set-source! item)
+                       (set-query! "")
+                       (set-target! nil)
+                       (set-error! nil))}
+          [:span.flex.flex-col.items-start
+           [:span (t :literature.source/zotero-item (last (string/split source-key #":")))]
+           [:code.text-xs.font-normal.opacity-60 (str key-uuid)]]
+          [:span.text-xs (t (if active?
+                             :literature.source/active-status
+                             :literature.source/inactive-status))]))
+       (if source
+         [:div.flex.flex-col.gap-3.border-t.pt-3
+          (shui/button
+           {:variant :outline
+            :data-literature-action "unlink-source-owner"
+            :disabled working?
+            :on-click #(correct! :unlink-owner nil)}
+           (t :literature.source/unlink-owner-action))
+          (shui/button
+           {:variant :outline
+            :data-literature-action "unlink-source"
+            :disabled working?
+            :on-click #(correct! :unlink nil)}
+           (t :literature.source/unlink-action))
+          (shui/input
+           {:data-literature-source-search true
+            :placeholder (t :literature.source/search-placeholder)
+            :value query
+            :disabled working?
+            :on-change (fn [event]
+                         (swap! *search-request inc)
+                         (set-query! (util/evalue event))
+                         (set-target! nil))})
+          (case (:status search-result)
+            :idle [:div.text-xs.opacity-60 (t :literature.source/search-hint)]
+            (:ok :loading)
+            [:div.flex.flex-col.gap-2
+             (if (seq (:papers search-result))
+               (for [{target-uuid :block/uuid title :block/title detail :literature/detail}
+                     (:papers search-result)]
+                 (shui/button
+                  {:key (str target-uuid)
+                   :variant (if (= target-uuid target) :default :outline)
+                   :class "h-auto justify-start whitespace-normal text-left"
+                   :data-literature-source-target (str target-uuid)
+                   :disabled working?
+                   :on-click #(set-target! target-uuid)}
+                  [:span.flex.flex-col.items-start
+                   [:span (if (string/blank? title) (t :ui/untitled) title)]
+                   (when detail [:span.text-xs.font-normal.opacity-60 detail])]))
+               [:div.text-xs.opacity-60
+                (t (if (= :loading (:status search-result)) :ui/loading :search/no-result))])
+             (when (:truncated? search-result)
+               [:div.text-xs.opacity-60 (t :literature.source/search-truncated)])]
+            [:div.text-sm.text-red-600 (t :literature.source/search-error)])
+          (shui/button
+           {:data-literature-action "reassign-source"
+            :disabled (or working? (nil? target))
+            :on-click #(correct! :reassign target)}
+           (t :literature.source/reassign-action))]
+         [:div.text-sm.opacity-60 (t :literature.source/select-prompt)])]
+      [:div.text-sm.opacity-60 (t :literature.source/empty)])
+    [:div.text-sm.text-red-600 (t :literature.source/load-error)]))
 
 (hsx/defc source-review-dialog
   [repo paper-uuid dialog-close]
@@ -1652,25 +1842,7 @@
                              (when (and (current?) (= request-id @*source-request))
                                (set-plan! {:status :unavailable}))))))))
         correct!
-        (fn [action target-uuid]
-          (when (and (current?) (:active? source))
-            (let [request-id @*source-request]
-              (set-working! true)
-              (set-error! nil)
-              (-> (literature-handler/<correct-paper-source!
-                   repo paper-uuid source action target-uuid)
-                  (p/then (fn [result]
-                            (when (and (current?) (= request-id @*source-request))
-                              (if (= :updated (:status result))
-                                (do
-                                  (read-sources!)
-                                  (notification/show! (t :literature.source/update-success) :success))
-                                (set-error! (t :literature.source/update-error))))))
-                  (p/catch (fn [error]
-                             (log/error :literature-source-correction-failed error)
-                             (when (and (current?) (= request-id @*source-request))
-                               (set-error! (t :literature.source/update-error)))))
-                  (p/finally #(when (current?) (set-working! false)))))))]
+        (source-correction-handler current? source *source-request set-working! set-error! repo paper-uuid read-sources!)]
     (hooks/use-effect!
      (fn []
        (reset! *active? true)
@@ -1686,109 +1858,11 @@
          (some-> (hooks/deref *close-button) (.focus))))
      [working?])
     (hooks/use-effect!
-     (fn []
-       (let [request-id (swap! *search-request inc)
-             query' (string/trim debounced-query)]
-         (set-target! nil)
-         (if (or (not (current?)) (nil? source) (< (count query') 2))
-           (set-search-result! (empty-search-result :idle))
-           (do
-             (set-search-result! #(assoc % :status :loading))
-             (-> (literature-handler/<search-existing-papers! repo query')
-                 (p/then (fn [result]
-                           (when (and (current?) (= request-id @*search-request))
-                             (set-search-result!
-                              (update result :papers
-                                      #(filterv (fn [paper] (not= paper-uuid (:block/uuid paper))) %))))))
-                 (p/catch (fn [error]
-                            (log/error :literature-source-search-failed error)
-                            (when (and (current?) (= request-id @*search-request))
-                              (set-search-result! (empty-search-result :unavailable))))))))
-         (fn []
-           (when (= request-id @*search-request)
-             (swap! *search-request inc)))))
+     (source-search-effect *search-request debounced-query set-target! current? source set-search-result! repo paper-uuid)
      [repo paper-uuid debounced-query (:key-uuid source) completed-build-id])
     [:div.flex.flex-col.gap-4.min-w-0
      [:p.text-sm.opacity-70 (t :literature.source/review-desc)]
-     (case (if (and (= repo current-repo) (not restoring?) (current?))
-             (:status plan) :unavailable)
-       :loading [:div.text-sm.opacity-60 (t :ui/loading)]
-       :ok
-       (if (seq (:sources plan))
-         [:div.flex.flex-col.gap-2
-          (for [{:keys [key-uuid source-key active?] :as item} (:sources plan)]
-            (shui/button
-             {:key (str key-uuid)
-              :variant (if (= key-uuid (:key-uuid source)) :default :outline)
-              :class "h-auto justify-between whitespace-normal text-left"
-              :data-literature-source (str key-uuid)
-              :data-literature-source-state (if active? "active" "inactive")
-              :disabled (or working? (not active?))
-              :on-click (fn []
-                          (swap! *search-request inc)
-                          (set-source! item)
-                          (set-query! "")
-                          (set-target! nil)
-                          (set-error! nil))}
-             [:span.flex.flex-col.items-start
-              [:span (t :literature.source/zotero-item (last (string/split source-key #":")))]
-              [:code.text-xs.font-normal.opacity-60 (str key-uuid)]]
-             [:span.text-xs (t (if active?
-                                :literature.source/active-status
-                                :literature.source/inactive-status))]))
-          (if source
-            [:div.flex.flex-col.gap-3.border-t.pt-3
-             (shui/button
-              {:variant :outline
-               :data-literature-action "unlink-source-owner"
-               :disabled working?
-               :on-click #(correct! :unlink-owner nil)}
-              (t :literature.source/unlink-owner-action))
-             (shui/button
-              {:variant :outline
-               :data-literature-action "unlink-source"
-               :disabled working?
-               :on-click #(correct! :unlink nil)}
-              (t :literature.source/unlink-action))
-             (shui/input
-              {:data-literature-source-search true
-               :placeholder (t :literature.source/search-placeholder)
-               :value query
-               :disabled working?
-               :on-change (fn [event]
-                            (swap! *search-request inc)
-                            (set-query! (util/evalue event))
-                            (set-target! nil))})
-             (case (:status search-result)
-               :idle [:div.text-xs.opacity-60 (t :literature.source/search-hint)]
-               (:ok :loading)
-               [:div.flex.flex-col.gap-2
-                (if (seq (:papers search-result))
-                  (for [{target-uuid :block/uuid title :block/title detail :literature/detail}
-                        (:papers search-result)]
-                    (shui/button
-                     {:key (str target-uuid)
-                      :variant (if (= target-uuid target) :default :outline)
-                      :class "h-auto justify-start whitespace-normal text-left"
-                      :data-literature-source-target (str target-uuid)
-                      :disabled working?
-                      :on-click #(set-target! target-uuid)}
-                     [:span.flex.flex-col.items-start
-                      [:span (if (string/blank? title) (t :ui/untitled) title)]
-                      (when detail [:span.text-xs.font-normal.opacity-60 detail])]))
-                  [:div.text-xs.opacity-60
-                   (t (if (= :loading (:status search-result)) :ui/loading :search/no-result))])
-                (when (:truncated? search-result)
-                  [:div.text-xs.opacity-60 (t :literature.source/search-truncated)])]
-               [:div.text-sm.text-red-600 (t :literature.source/search-error)])
-             (shui/button
-              {:data-literature-action "reassign-source"
-               :disabled (or working? (nil? target))
-               :on-click #(correct! :reassign target)}
-              (t :literature.source/reassign-action))]
-            [:div.text-sm.opacity-60 (t :literature.source/select-prompt)])]
-         [:div.text-sm.opacity-60 (t :literature.source/empty)])
-       [:div.text-sm.text-red-600 (t :literature.source/load-error)])
+     (source-review-content repo current-repo restoring? current? plan source working? *search-request set-source! set-query! set-target! set-error! correct! query search-result target)
      (when error-message [:div.text-sm.text-red-600 error-message])
      [:div.flex.justify-end.gap-2
       (shui/button
@@ -1815,6 +1889,56 @@
     :title (t :literature.source/review-title)
     :align :center
     :class "lg:max-w-2xl"}))
+
+(defn- pdf-comparison-content
+  [status assets keep-id set-keep! other-id set-other! working? set-result! repo selected
+   current? result]
+  (cond
+    (= :loading status) [:div.text-sm.opacity-60 (t :ui/loading)]
+    (contains? #{:error :unavailable} status)
+    [:p.text-sm.text-red-600 (t :literature.pdf-merge/error)]
+    (< (count assets) 2) [:p.text-sm.opacity-70 (t :literature.pdf-merge/needs-pair)]
+    :else
+    [:<>
+     (for [{:keys [i18n-key id set-id!]}
+           [{:i18n-key :asset.duplicate-pdf/primary-copy :id keep-id :set-id! set-keep!}
+            {:i18n-key :literature.pdf-merge/other-copy :id other-id :set-id! set-other!}]]
+       [:div.flex.flex-col.gap-2 {:key (name i18n-key)}
+        [:label.text-sm.font-medium (t i18n-key)]
+        [:div.flex.items-center.gap-2
+         [:select.form-select.flex-1.min-w-0
+          {:value id :disabled working? :aria-label (t i18n-key)
+           :data-literature-pdf-selection (if (= i18n-key :asset.duplicate-pdf/primary-copy) "main" "other")
+           :on-change #(do (set-id! (util/evalue %)) (set-result! {:status :idle}))
+           :on-key-down native-control-key-down}
+          (for [asset assets :let [uuid (str (:block/uuid asset))]]
+            [:option {:key uuid :value uuid}
+             (str (:block/title asset) " · "
+                  (t :asset.duplicate-pdf/usage
+                     (i18n/locale-format-number (:annotation-count asset))
+                     (i18n/locale-format-number (:reference-count asset))))])]
+         (shui/button
+          {:size :sm :variant :ghost :disabled working?
+           :aria-label (t :literature.library/open-pdf-action)
+           :title (t :literature.library/open-pdf-action)
+           :on-click #(p/let [asset (db-async/<get-block repo (:block/uuid (selected id)) {:children? false})]
+                        (when (current?) (state/pub-event! [:asset/show-preview asset])))}
+          (ui/icon "eye" {:size 16}))]
+        (when-let [aliases (seq (keep :block/title (:block/alias (selected id))))]
+          [:div.text-xs.opacity-60.break-words (string/join " · " aliases)])])
+     (case status
+       :checking [:div.flex.items-center.gap-2.text-sm
+                  (ui/icon "loader-2" {:size 16 :class "animate-spin"})
+                  (if (:page result)
+                    (t :literature.pdf-merge/progress (:page result) (:total result))
+                    (t :ui/loading))]
+       :equal [:div.flex.items-center.gap-2.text-sm
+               (ui/icon "check" {:size 16}) (t :literature.pdf-merge/equal)]
+       :different [:p.text-sm.opacity-70 (t :literature.pdf-merge/different)]
+       :unsupported [:p.text-sm.opacity-70 (t :literature.pdf-merge/unsupported)]
+       :changed [:p.text-sm.text-amber-600 (t :asset.duplicate-pdf/changed-warning)]
+       (:error :unreadable :unavailable) [:p.text-sm.text-red-600 (t :literature.pdf-merge/error)]
+       nil)]))
 
 (hsx/defc pdf-comparison-dialog
   [repo paper-uuid dialog-close]
@@ -1891,52 +2015,7 @@
          (when-let [controller (hooks/deref *controller)] (.abort controller))))
      [repo paper-uuid current-repo restoring? dialog-close])
     [:div.flex.flex-col.gap-4 {:data-literature-pdf-comparison (name status)}
-     (cond
-       (= :loading status) [:div.text-sm.opacity-60 (t :ui/loading)]
-       (contains? #{:error :unavailable} status)
-       [:p.text-sm.text-red-600 (t :literature.pdf-merge/error)]
-       (< (count assets) 2) [:p.text-sm.opacity-70 (t :literature.pdf-merge/needs-pair)]
-       :else
-       [:<>
-        (for [{:keys [i18n-key id set-id!]}
-              [{:i18n-key :asset.duplicate-pdf/primary-copy :id keep-id :set-id! set-keep!}
-               {:i18n-key :literature.pdf-merge/other-copy :id other-id :set-id! set-other!}]]
-          [:div.flex.flex-col.gap-2 {:key (name i18n-key)}
-           [:label.text-sm.font-medium (t i18n-key)]
-           [:div.flex.items-center.gap-2
-            [:select.form-select.flex-1.min-w-0
-             {:value id :disabled working? :aria-label (t i18n-key)
-              :data-literature-pdf-selection (if (= i18n-key :asset.duplicate-pdf/primary-copy) "main" "other")
-              :on-change #(do (set-id! (util/evalue %)) (set-result! {:status :idle}))
-              :on-key-down native-control-key-down}
-             (for [asset assets :let [uuid (str (:block/uuid asset))]]
-               [:option {:key uuid :value uuid}
-                (str (:block/title asset) " · "
-                     (t :asset.duplicate-pdf/usage
-                        (i18n/locale-format-number (:annotation-count asset))
-                        (i18n/locale-format-number (:reference-count asset))))])]
-            (shui/button
-             {:size :sm :variant :ghost :disabled working?
-              :aria-label (t :literature.library/open-pdf-action)
-              :title (t :literature.library/open-pdf-action)
-              :on-click #(p/let [asset (db-async/<get-block repo (:block/uuid (selected id)) {:children? false})]
-                           (when (current?) (state/pub-event! [:asset/show-preview asset])))}
-             (ui/icon "eye" {:size 16}))]
-           (when-let [aliases (seq (keep :block/title (:block/alias (selected id))))]
-             [:div.text-xs.opacity-60.break-words (string/join " · " aliases)])])
-        (case status
-          :checking [:div.flex.items-center.gap-2.text-sm
-                     (ui/icon "loader-2" {:size 16 :class "animate-spin"})
-                     (if (:page result)
-                       (t :literature.pdf-merge/progress (:page result) (:total result))
-                       (t :ui/loading))]
-          :equal [:div.flex.items-center.gap-2.text-sm
-                  (ui/icon "check" {:size 16}) (t :literature.pdf-merge/equal)]
-          :different [:p.text-sm.opacity-70 (t :literature.pdf-merge/different)]
-          :unsupported [:p.text-sm.opacity-70 (t :literature.pdf-merge/unsupported)]
-          :changed [:p.text-sm.text-amber-600 (t :asset.duplicate-pdf/changed-warning)]
-          (:error :unreadable :unavailable) [:p.text-sm.text-red-600 (t :literature.pdf-merge/error)]
-          nil)])
+     (pdf-comparison-content status assets keep-id set-keep! other-id set-other! working? set-result! repo selected current? result)
      [:div.flex.justify-end.gap-2
       (shui/button
        {:variant :ghost :disabled (= :merging status)
@@ -2024,6 +2103,81 @@
           :on-click #(open-metadata-review! repo paper-uuid *trigger)}
          (t :literature.metadata/check-action)))))))
 
+(defn- zotero-review-content
+  [repo current-repo restoring? current? page source working? *search-request set-source!
+   set-query! set-search-result! set-error! adopt! query search-result]
+  (case (if (and (= repo current-repo) (not restoring?) (current?))
+          (:status page) :unavailable)
+    :loading [:div.text-sm.opacity-60 (t :ui/loading)]
+    :complete
+    [:<>
+     (if (seq (:items page))
+       [:div.flex.flex-col.gap-2.max-h-60.overflow-y-auto
+        (for [{:keys [source-key title type] :as record} (:items page)]
+          (shui/button
+           {:key source-key
+            :variant (if (= source-key (:source-key source)) :default :outline)
+            :class "h-auto justify-start whitespace-normal text-left"
+            :data-literature-zotero-item source-key
+            :disabled working?
+            :on-click (fn []
+                        (swap! *search-request inc)
+                        (set-source! record)
+                        (set-query! title)
+                        (set-search-result! (empty-search-result :idle))
+                        (set-error! nil))}
+           [:span.flex.flex-col.items-start
+            [:span title]
+            (when type [:span.text-xs.font-normal.opacity-60 type])]))]
+       [:div.text-sm.opacity-60 (t :literature.source/zotero-review-empty)])
+     (when source
+       [:div.flex.flex-col.gap-3.border-t.pt-3
+        [:dl.text-sm.grid.grid-cols-2.gap-2
+         (for [field [:title :authors :date :publication :type :url :citekey]
+               :let [value (get source field)]
+               :when value]
+           ^{:key (name field)}
+           [:<>
+            [:dt.opacity-60 (metadata-field-label field)]
+            [:dd.break-words value]])]
+        (shui/button
+         {:data-literature-action "adopt-zotero-new"
+          :disabled working?
+          :on-click #(adopt! (random-uuid) true)}
+         (t :literature.source/zotero-add-action))
+        (shui/input
+         {:data-literature-source-search true
+          :placeholder (t :literature.source/search-placeholder)
+          :value query
+          :disabled working?
+          :on-change (fn [event]
+                       (swap! *search-request inc)
+                       (set-query! (util/evalue event))
+                       (set-search-result! (empty-search-result :idle)))})
+        (case (:status search-result)
+          :idle [:div.text-xs.opacity-60 (t :literature.source/search-hint)]
+          :loading [:div.text-xs.opacity-60 (t :ui/loading)]
+          :ok
+          [:div.flex.flex-col.gap-2
+           (if (seq (:papers search-result))
+             (for [{paper-uuid :block/uuid title :block/title detail :literature/detail}
+                   (:papers search-result)]
+               (shui/button
+                {:key (str paper-uuid)
+                 :variant :outline
+                 :class "h-auto justify-start whitespace-normal text-left"
+                 :data-literature-source-target (str paper-uuid)
+                 :disabled working?
+                 :on-click #(adopt! paper-uuid false)}
+                [:span.flex.flex-col.items-start
+                 [:span (t :literature.source/zotero-use-existing-action title)]
+                 (when detail [:span.text-xs.font-normal.opacity-60 detail])]))
+             [:div.text-xs.opacity-60 (t :search/no-result)])
+           (when (:truncated? search-result)
+             [:div.text-xs.opacity-60 (t :literature.source/search-truncated)])]
+          [:div.text-sm.text-red-600 (t :literature.source/search-error)])])]
+    [:div.text-sm.text-red-600 (t :literature.source/zotero-review-error)]))
+
 (hsx/defc zotero-review-dialog
   [repo binding dialog-close]
   (let [[page set-page!] (hooks/use-state {:status :loading})
@@ -2105,77 +2259,7 @@
      [repo debounced-query (:source-key source)])
     [:div.flex.flex-col.gap-4.min-w-0
      [:p.text-sm.opacity-70 (t :literature.source/zotero-review-desc)]
-     (case (if (and (= repo current-repo) (not restoring?) (current?))
-             (:status page) :unavailable)
-       :loading [:div.text-sm.opacity-60 (t :ui/loading)]
-       :complete
-       [:<>
-        (if (seq (:items page))
-          [:div.flex.flex-col.gap-2.max-h-60.overflow-y-auto
-           (for [{:keys [source-key title type] :as record} (:items page)]
-             (shui/button
-              {:key source-key
-               :variant (if (= source-key (:source-key source)) :default :outline)
-               :class "h-auto justify-start whitespace-normal text-left"
-               :data-literature-zotero-item source-key
-               :disabled working?
-               :on-click (fn []
-                           (swap! *search-request inc)
-                           (set-source! record)
-                           (set-query! title)
-                           (set-search-result! (empty-search-result :idle))
-                           (set-error! nil))}
-              [:span.flex.flex-col.items-start
-               [:span title]
-               (when type [:span.text-xs.font-normal.opacity-60 type])]))]
-          [:div.text-sm.opacity-60 (t :literature.source/zotero-review-empty)])
-        (when source
-          [:div.flex.flex-col.gap-3.border-t.pt-3
-           [:dl.text-sm.grid.grid-cols-2.gap-2
-            (for [field [:title :authors :date :publication :type :url :citekey]
-                  :let [value (get source field)]
-                  :when value]
-              ^{:key (name field)}
-              [:<>
-               [:dt.opacity-60 (metadata-field-label field)]
-               [:dd.break-words value]])]
-           (shui/button
-            {:data-literature-action "adopt-zotero-new"
-             :disabled working?
-             :on-click #(adopt! (random-uuid) true)}
-            (t :literature.source/zotero-add-action))
-           (shui/input
-            {:data-literature-source-search true
-             :placeholder (t :literature.source/search-placeholder)
-             :value query
-             :disabled working?
-             :on-change (fn [event]
-                          (swap! *search-request inc)
-                          (set-query! (util/evalue event))
-                          (set-search-result! (empty-search-result :idle)))})
-           (case (:status search-result)
-             :idle [:div.text-xs.opacity-60 (t :literature.source/search-hint)]
-             :loading [:div.text-xs.opacity-60 (t :ui/loading)]
-             :ok
-             [:div.flex.flex-col.gap-2
-              (if (seq (:papers search-result))
-                (for [{paper-uuid :block/uuid title :block/title detail :literature/detail}
-                      (:papers search-result)]
-                  (shui/button
-                   {:key (str paper-uuid)
-                    :variant :outline
-                    :class "h-auto justify-start whitespace-normal text-left"
-                    :data-literature-source-target (str paper-uuid)
-                    :disabled working?
-                    :on-click #(adopt! paper-uuid false)}
-                   [:span.flex.flex-col.items-start
-                    [:span (t :literature.source/zotero-use-existing-action title)]
-                    (when detail [:span.text-xs.font-normal.opacity-60 detail])]))
-                [:div.text-xs.opacity-60 (t :search/no-result)])
-              (when (:truncated? search-result)
-                [:div.text-xs.opacity-60 (t :literature.source/search-truncated)])]
-             [:div.text-sm.text-red-600 (t :literature.source/search-error)])])]
-       [:div.text-sm.text-red-600 (t :literature.source/zotero-review-error)])
+     (zotero-review-content repo current-repo restoring? current? page source working? *search-request set-source! set-query! set-search-result! set-error! adopt! query search-result)
      (when error-message [:div.text-sm.text-red-600 error-message])
      [:div.flex.justify-end.gap-2
       (when (:next-offset page)
@@ -2301,6 +2385,266 @@
         :on-click #(load-page! 0 nil)}
        (t :ui/refresh))]]))
 
+(defn- literature-activation-handler
+  [set-error! set-operation! repo current? reload-settings!]
+  (fn [enable-automatic?]
+    (set-error! nil)
+    (set-operation! :activating)
+    (-> (p/do! (literature-handler/<activate! repo)
+               (when (and enable-automatic? (current?))
+                 (literature-handler/set-auto-identification-enabled! repo true)))
+        (p/then (fn [_]
+                  (when (current?)
+                    (reload-settings!)
+                    (set-operation! nil))))
+        (p/catch #(operation-error!
+                   :literature-activation-ui-failed
+                   current? set-operation! set-error! %)))))
+
+(defn- zotero-connection-handler
+  [set-error! set-operation! repo pending-binding-uuid collection-scope? collection-key
+   selected-collection current? reload-settings! set-pending-binding-uuid!]
+  (fn []
+    (set-error! nil)
+    (set-operation! :connecting)
+    (-> (p/do!
+         (when-not (:enabled? (literature-handler/load-settings repo))
+           (literature-handler/<activate! repo))
+         ;; Saving the binding starts the existing notifier, whose first
+         ;; response imports the scope. A second import here races it.
+         (literature-handler/<connect-local-zotero!
+          repo pending-binding-uuid
+          (when collection-scope? collection-key)
+          (when collection-scope? (:zotero-library-key selected-collection))))
+        (p/then
+         (fn [result]
+           (when (current?)
+             (if (= :connected (:status result))
+               (do
+                 (reload-settings!)
+                 (set-pending-binding-uuid!
+                  (get-in result [:binding :graph-binding-uuid]))
+                 (set-operation! nil)
+                 (notification/show!
+                  (t :settings.literature/zotero-connected)
+                  :success))
+               (do
+                 (set-operation! nil)
+                 (set-error! (zotero-error-message (:reason result))))))))
+        (p/catch #(operation-error!
+                   :literature-zotero-connect-ui-failed
+                   current? set-operation! set-error! %)))))
+
+(defn- zotero-import-handler
+  [set-error! set-operation! repo current? reload-settings!]
+  (fn []
+    (set-error! nil)
+    (set-operation! :importing)
+    (-> (literature-handler/<import-zotero-now! repo)
+        (p/then
+         (fn [result]
+           (when (current?)
+             (set-operation! nil)
+             (if (contains? #{:complete :idle} (:status result))
+               (let [manual-count (get-in result [:result-counts :manual] 0)
+                     blocked-count (get-in result [:result-counts :blocked] 0)]
+                 (if (pos? (+ manual-count blocked-count))
+                   (notification/show!
+                    (t :settings.literature/import-needs-attention
+                       manual-count blocked-count)
+                    :warning)
+                   (notification/show!
+                    (t :settings.literature/import-complete)
+                    :success)))
+               (set-error! (zotero-error-message (:reason result))))
+             (reload-settings!))))
+        (p/catch #(operation-error!
+                   :literature-zotero-import-ui-failed
+                   current? set-operation! set-error! %)))))
+
+(defn- pdf-identification-settings
+  [settings paused? operation enabled? activate! repo reload-settings!]
+  [:section.flex.flex-col.gap-3
+   {:aria-labelledby "literature-pdf-label"}
+   [:div.flex.items-center.justify-between.gap-4
+    [:label#literature-pdf-label.flex.items-center.gap-2.text-sm.font-medium
+     {:for "literature-auto-pdf"}
+     (ui/icon "file-search" {:size 18 :class "opacity-60"})
+     (t :settings.literature/auto-identification)]
+    (shui/switch
+     {:id "literature-auto-pdf" :size "sm"
+      :aria-label (t :settings.literature/auto-identification)
+      :data-literature-setting "auto-pdf"
+      :checked (true? (:auto-identification? settings))
+      :disabled (or paused? (some? operation))
+      :on-checked-change
+      (fn [checked?]
+        (if (and (true? checked?) (not enabled?))
+          (activate! true)
+          (do
+            (literature-handler/set-auto-identification-enabled! repo (true? checked?))
+            (reload-settings!))))})]
+   (when (and (util/electron?) enabled? (:auto-identification? settings))
+     [:div.flex.flex-col.gap-2.pl-6
+      [:div.flex.items-center.justify-between.gap-4
+       [:label.text-sm {:for "literature-online-metadata"}
+        (t :settings.literature/online-metadata)]
+       (shui/switch
+        {:id "literature-online-metadata" :size "sm"
+         :aria-label (t :settings.literature/online-metadata)
+         :data-literature-setting "online-metadata"
+         :checked (true? (:online-metadata? settings))
+         :on-checked-change (fn [checked?]
+                              (literature-handler/set-online-metadata-enabled! repo (true? checked?))
+                              (reload-settings!))})]
+      [:p.text-xs.opacity-60 (t :literature.organization/privacy-description)]])])
+
+(defn- connected-zotero-settings
+  [enabled? binding selected-collection operation import-now! repo set-error! reload-settings!]
+  [:div.flex.flex-col.gap-3
+   {:data-literature-zotero-connected true}
+   [:div.flex.items-center.justify-between.gap-3
+    [:h3.flex.items-center.gap-2.text-sm.font-medium
+     (ui/icon "books" {:size 18 :class "opacity-60"})
+     (t :settings.literature/zotero-title)]
+    (when enabled?
+      [:span.flex.items-center.gap-1.text-xs.opacity-60
+       (ui/icon "circle-check" {:size 14})
+       (t :settings.literature/connected-status)])]
+   [:div.flex.flex-wrap.items-center.gap-2.text-sm.opacity-70
+    [:span
+     (if (= :collection (get-in binding [:scope :kind]))
+       (if (and (= (:key selected-collection) (get-in binding [:scope :key]))
+                (= (:zotero-library-key selected-collection) (:zotero-library-key binding)))
+         (:name selected-collection)
+         (t :literature.library/configured-collection))
+       (t :settings.literature/zotero-library))]
+    (when (= :collection (get-in binding [:scope :kind]))
+      [:details.text-xs
+       [:summary.cursor-pointer {:on-key-down toggle-setup-help!}
+        (t :literature.library/details-action)]
+       [:code (get-in binding [:scope :key])]])]
+   [:div.flex.flex-wrap.items-center.gap-2
+    (shui/button {:size :sm :data-literature-action "import-now"
+                  :disabled (or (not enabled?) (some? operation))
+                  :on-click import-now!}
+                 (ui/icon "refresh" {:size 16})
+                 (t :settings.literature/import-now))
+    (shui/button {:size :sm :variant :outline
+                  :data-literature-action "review-zotero-items"
+                  :disabled (or (not enabled?) (some? operation))
+                  :on-click #(open-zotero-review! repo binding)}
+                 (t :literature.source/review-zotero-action))
+    (shui/button {:size :sm :variant :ghost
+                  :data-literature-action "disconnect"
+                  :disabled (some? operation)
+                  :on-click (fn []
+                              (set-error! nil)
+                              (literature-handler/set-zotero-binding! repo nil)
+                              (reload-settings!))}
+                 (t :settings.literature/disconnect))]])
+
+(defn- zotero-setup-settings
+  [set-setup-open! setup-status scope-kind operation set-scope-kind! collection-scope? repo
+   current? set-collection-key! set-selected-collection! set-error! selected-collection
+   collection-key proposed-binding connect! set-operation! check-setup!]
+  [:details.group
+   {:data-literature-zotero-setup true
+    :on-toggle #(set-setup-open! (.-open (.-currentTarget %)))}
+   [:summary.flex.items-center.justify-between.gap-3.cursor-pointer.list-none
+    {:on-key-down toggle-setup-help!}
+    [:span.flex.items-center.gap-2.text-sm.font-medium
+     (ui/icon "books" {:size 18 :class "opacity-60"})
+     (t :settings.literature/zotero-title)]
+    [:span.flex.items-center.gap-1.text-sm.text-primary
+     (t :settings.literature/connection-action)
+     (ui/icon "chevron-down" {:size 16 :class "transition-transform group-open:rotate-180"})]]
+   [:div.flex.flex-col.gap-3.pt-4
+    (if (= :ready setup-status)
+      [:div.flex.flex-col.gap-3
+    [:label.text-xs.opacity-60 {:for "literature-zotero-scope"}
+     (t :settings.literature/zotero-scope-label)]
+    [:div.flex.flex-wrap.items-center.gap-2
+     [:select#literature-zotero-scope.form-select.flex-1.min-w-0
+      {:data-literature-field "scope"
+       :aria-label (t :settings.literature/zotero-scope-label)
+       :value (name scope-kind) :disabled (some? operation)
+       :on-change #(set-scope-kind! (keyword (util/evalue %)))}
+      [:option {:value "library"} (t :settings.literature/zotero-library)]
+      [:option {:value "collection"} (t :settings.literature/zotero-collection-option)]]
+     (when collection-scope?
+       (shui/button
+        {:variant :outline :size :sm :class "max-w-full"
+         :data-literature-action "choose-collection"
+         :disabled (some? operation)
+         :on-click (fn [event]
+                     (shui/dialog-open!
+                      (fn [_]
+                        (zotero-collection-picker
+                         repo current?
+                         (fn [collection]
+                           (set-collection-key! (:key collection))
+                           (set-selected-collection! collection)
+                           (set-error! nil))))
+                      {:id :literature-zotero-collections
+                       :title (t :zotero.local-import/choose-collection)
+                       :content-props {:finalFocus (constantly (.-currentTarget event))}
+                       :class "lg:max-w-xl"}))}
+        [:span.truncate
+         (if selected-collection
+           (:name selected-collection)
+           (if (string/blank? collection-key)
+             (t :zotero.local-import/choose-collection)
+             (t :literature.library/configured-collection)))]))]
+    [:p.text-xs.opacity-60 (t :zotero.local-import/setup-shared-data)]
+    [:div.flex.justify-end
+     (shui/button {:size :sm :data-literature-action "connect"
+                   :disabled (or (some? operation) (nil? proposed-binding))
+                   :on-click connect!}
+                  (ui/icon "arrow-right" {:size 16})
+                  (t :settings.literature/connect))]
+    (when collection-scope?
+      [:details.text-xs
+       [:summary.cursor-pointer {:on-key-down toggle-setup-help!}
+        (t :zotero.local-import/collection-manual)]
+       [:div.pt-2
+        (shui/input
+         {:data-literature-field "collection-key"
+          :aria-label (t :settings.literature/collection-label)
+          :placeholder (t :settings.literature/collection-placeholder)
+          :value collection-key :disabled (some? operation)
+          :on-change (fn [event]
+                       (let [value (string/upper-case (util/evalue event))]
+                         (set-selected-collection! nil)
+                         (set-collection-key! (subs value 0 (min 8 (count value))))))})]])]
+      [:div.flex.flex-col.gap-3
+       {:data-literature-zotero-step (name setup-status)}
+       (if (contains? #{:idle :checking} setup-status)
+         [:div.text-sm.opacity-60 {:role "status"} (t :ui/loading)]
+         [:<>
+          [:p.text-sm
+           (t (case setup-status
+                :local-access :zotero.local-import/setup-local-access
+                :companion :zotero.local-import/install-companion-description
+                :zotero.local-import/setup-start))]
+          [:div.flex.flex-wrap.items-center.gap-2
+           (when (= :companion setup-status)
+             (shui/button
+              {:size :sm :variant :outline
+               :data-literature-action "show-companion"
+               :on-click #(-> (zotero/<show-companion!)
+                              (p/catch (fn [error]
+                                         (operation-error!
+                                          :literature-show-companion-failed current?
+                                          set-operation! set-error! error))))}
+              (ui/icon "folder-open" {:size 16})
+              (t :zotero.local-import/show-companion-action)))
+           (shui/button {:size :sm :variant :ghost
+                         :data-literature-action "check-zotero"
+                         :on-click check-setup!}
+                        (ui/icon "refresh" {:size 16})
+                        (t :zotero.local-import/recheck-action))]])])]])
+
 (hsx/defc settings-section
   [repo]
   (let [initial-settings (literature-handler/load-settings repo)
@@ -2341,75 +2685,11 @@
             (-> (zotero/<check-setup!)
                 (p/then #(when (current?) (set-setup-status! %))))))
         activate!
-        (fn [enable-automatic?]
-          (set-error! nil)
-          (set-operation! :activating)
-          (-> (p/do! (literature-handler/<activate! repo)
-                     (when (and enable-automatic? (current?))
-                       (literature-handler/set-auto-identification-enabled! repo true)))
-              (p/then (fn [_]
-                        (when (current?)
-                          (reload-settings!)
-                          (set-operation! nil))))
-              (p/catch #(operation-error!
-                         :literature-activation-ui-failed
-                         current? set-operation! set-error! %))))
+        (literature-activation-handler set-error! set-operation! repo current? reload-settings!)
         connect!
-        (fn []
-          (set-error! nil)
-          (set-operation! :connecting)
-          (-> (p/do!
-               (when-not (:enabled? (literature-handler/load-settings repo))
-                 (literature-handler/<activate! repo))
-               ;; Saving the binding starts the existing notifier, whose first
-               ;; response imports the scope. A second import here races it.
-               (literature-handler/<connect-local-zotero!
-                repo pending-binding-uuid
-                (when collection-scope? collection-key)
-                (when collection-scope? (:zotero-library-key selected-collection))))
-              (p/then
-               (fn [result]
-                 (when (current?)
-                   (if (= :connected (:status result))
-                     (do
-                       (reload-settings!)
-                       (set-pending-binding-uuid!
-                        (get-in result [:binding :graph-binding-uuid]))
-                       (set-operation! nil)
-                       (notification/show!
-                        (t :settings.literature/zotero-connected)
-                        :success))
-                     (do
-                       (set-operation! nil)
-                       (set-error! (zotero-error-message (:reason result))))))))
-              (p/catch #(operation-error!
-                         :literature-zotero-connect-ui-failed
-                         current? set-operation! set-error! %))))
+        (zotero-connection-handler set-error! set-operation! repo pending-binding-uuid collection-scope? collection-key selected-collection current? reload-settings! set-pending-binding-uuid!)
         import-now!
-        (fn []
-          (set-error! nil)
-          (set-operation! :importing)
-          (-> (literature-handler/<import-zotero-now! repo)
-              (p/then
-               (fn [result]
-                 (when (current?)
-                   (set-operation! nil)
-                   (if (contains? #{:complete :idle} (:status result))
-                     (let [manual-count (get-in result [:result-counts :manual] 0)
-                           blocked-count (get-in result [:result-counts :blocked] 0)]
-                       (if (pos? (+ manual-count blocked-count))
-                         (notification/show!
-                          (t :settings.literature/import-needs-attention
-                             manual-count blocked-count)
-                          :warning)
-                         (notification/show!
-                          (t :settings.literature/import-complete)
-                          :success)))
-                     (set-error! (zotero-error-message (:reason result))))
-                   (reload-settings!))))
-              (p/catch #(operation-error!
-                         :literature-zotero-import-ui-failed
-                         current? set-operation! set-error! %))))]
+        (zotero-import-handler set-error! set-operation! repo current? reload-settings!)]
     (hooks/use-effect!
      (fn []
        (reset! *active? true)
@@ -2446,182 +2726,13 @@
                       :on-click #(activate! false)}
                      (ui/icon "player-play" {:size 16})
                      (t :settings.literature/enable))])
-     [:section.flex.flex-col.gap-3
-      {:aria-labelledby "literature-pdf-label"}
-      [:div.flex.items-center.justify-between.gap-4
-       [:label#literature-pdf-label.flex.items-center.gap-2.text-sm.font-medium
-        {:for "literature-auto-pdf"}
-        (ui/icon "file-search" {:size 18 :class "opacity-60"})
-        (t :settings.literature/auto-identification)]
-       (shui/switch
-        {:id "literature-auto-pdf" :size "sm"
-         :aria-label (t :settings.literature/auto-identification)
-         :data-literature-setting "auto-pdf"
-         :checked (true? (:auto-identification? settings))
-         :disabled (or paused? (some? operation))
-         :on-checked-change
-         (fn [checked?]
-           (if (and (true? checked?) (not enabled?))
-             (activate! true)
-             (do
-               (literature-handler/set-auto-identification-enabled! repo (true? checked?))
-               (reload-settings!))))})]
-      (when (and (util/electron?) enabled? (:auto-identification? settings))
-        [:div.flex.flex-col.gap-2.pl-6
-         [:div.flex.items-center.justify-between.gap-4
-          [:label.text-sm {:for "literature-online-metadata"}
-           (t :settings.literature/online-metadata)]
-          (shui/switch
-           {:id "literature-online-metadata" :size "sm"
-            :aria-label (t :settings.literature/online-metadata)
-            :data-literature-setting "online-metadata"
-            :checked (true? (:online-metadata? settings))
-            :on-checked-change (fn [checked?]
-                                 (literature-handler/set-online-metadata-enabled! repo (true? checked?))
-                                 (reload-settings!))})]
-         [:p.text-xs.opacity-60 (t :literature.organization/privacy-description)]])]
+     (pdf-identification-settings settings paused? operation enabled? activate! repo reload-settings!)
      (when (util/electron?)
        [:section.border-t.pt-4.min-w-0
         {:aria-label (t :settings.literature/zotero-title)}
         (if binding
-          [:div.flex.flex-col.gap-3
-           {:data-literature-zotero-connected true}
-           [:div.flex.items-center.justify-between.gap-3
-            [:h3.flex.items-center.gap-2.text-sm.font-medium
-             (ui/icon "books" {:size 18 :class "opacity-60"})
-             (t :settings.literature/zotero-title)]
-            (when enabled?
-              [:span.flex.items-center.gap-1.text-xs.opacity-60
-               (ui/icon "circle-check" {:size 14})
-               (t :settings.literature/connected-status)])]
-           [:div.flex.flex-wrap.items-center.gap-2.text-sm.opacity-70
-            [:span
-             (if (= :collection (get-in binding [:scope :kind]))
-               (if (and (= (:key selected-collection) (get-in binding [:scope :key]))
-                        (= (:zotero-library-key selected-collection) (:zotero-library-key binding)))
-                 (:name selected-collection)
-                 (t :literature.library/configured-collection))
-               (t :settings.literature/zotero-library))]
-            (when (= :collection (get-in binding [:scope :kind]))
-              [:details.text-xs
-               [:summary.cursor-pointer {:on-key-down toggle-setup-help!}
-                (t :literature.library/details-action)]
-               [:code (get-in binding [:scope :key])]])]
-           [:div.flex.flex-wrap.items-center.gap-2
-            (shui/button {:size :sm :data-literature-action "import-now"
-                          :disabled (or (not enabled?) (some? operation))
-                          :on-click import-now!}
-                         (ui/icon "refresh" {:size 16})
-                         (t :settings.literature/import-now))
-            (shui/button {:size :sm :variant :outline
-                          :data-literature-action "review-zotero-items"
-                          :disabled (or (not enabled?) (some? operation))
-                          :on-click #(open-zotero-review! repo binding)}
-                         (t :literature.source/review-zotero-action))
-            (shui/button {:size :sm :variant :ghost
-                          :data-literature-action "disconnect"
-                          :disabled (some? operation)
-                          :on-click (fn []
-                                      (set-error! nil)
-                                      (literature-handler/set-zotero-binding! repo nil)
-                                      (reload-settings!))}
-                         (t :settings.literature/disconnect))]]
-          [:details.group
-           {:data-literature-zotero-setup true
-            :on-toggle #(set-setup-open! (.-open (.-currentTarget %)))}
-           [:summary.flex.items-center.justify-between.gap-3.cursor-pointer.list-none
-            {:on-key-down toggle-setup-help!}
-            [:span.flex.items-center.gap-2.text-sm.font-medium
-             (ui/icon "books" {:size 18 :class "opacity-60"})
-             (t :settings.literature/zotero-title)]
-            [:span.flex.items-center.gap-1.text-sm.text-primary
-             (t :settings.literature/connection-action)
-             (ui/icon "chevron-down" {:size 16 :class "transition-transform group-open:rotate-180"})]]
-           [:div.flex.flex-col.gap-3.pt-4
-            (if (= :ready setup-status)
-              [:div.flex.flex-col.gap-3
-            [:label.text-xs.opacity-60 {:for "literature-zotero-scope"}
-             (t :settings.literature/zotero-scope-label)]
-            [:div.flex.flex-wrap.items-center.gap-2
-             [:select#literature-zotero-scope.form-select.flex-1.min-w-0
-              {:data-literature-field "scope"
-               :aria-label (t :settings.literature/zotero-scope-label)
-               :value (name scope-kind) :disabled (some? operation)
-               :on-change #(set-scope-kind! (keyword (util/evalue %)))}
-              [:option {:value "library"} (t :settings.literature/zotero-library)]
-              [:option {:value "collection"} (t :settings.literature/zotero-collection-option)]]
-             (when collection-scope?
-               (shui/button
-                {:variant :outline :size :sm :class "max-w-full"
-                 :data-literature-action "choose-collection"
-                 :disabled (some? operation)
-                 :on-click (fn [event]
-                             (shui/dialog-open!
-                              (fn [_]
-                                (zotero-collection-picker
-                                 repo current?
-                                 (fn [collection]
-                                   (set-collection-key! (:key collection))
-                                   (set-selected-collection! collection)
-                                   (set-error! nil))))
-                              {:id :literature-zotero-collections
-                               :title (t :zotero.local-import/choose-collection)
-                               :content-props {:finalFocus (constantly (.-currentTarget event))}
-                               :class "lg:max-w-xl"}))}
-                [:span.truncate
-                 (if selected-collection
-                   (:name selected-collection)
-                   (if (string/blank? collection-key)
-                     (t :zotero.local-import/choose-collection)
-                     (t :literature.library/configured-collection)))]))]
-            [:p.text-xs.opacity-60 (t :zotero.local-import/setup-shared-data)]
-            [:div.flex.justify-end
-             (shui/button {:size :sm :data-literature-action "connect"
-                           :disabled (or (some? operation) (nil? proposed-binding))
-                           :on-click connect!}
-                          (ui/icon "arrow-right" {:size 16})
-                          (t :settings.literature/connect))]
-            (when collection-scope?
-              [:details.text-xs
-               [:summary.cursor-pointer {:on-key-down toggle-setup-help!}
-                (t :zotero.local-import/collection-manual)]
-               [:div.pt-2
-                (shui/input
-                 {:data-literature-field "collection-key"
-                  :aria-label (t :settings.literature/collection-label)
-                  :placeholder (t :settings.literature/collection-placeholder)
-                  :value collection-key :disabled (some? operation)
-                  :on-change (fn [event]
-                               (let [value (string/upper-case (util/evalue event))]
-                                 (set-selected-collection! nil)
-                                 (set-collection-key! (subs value 0 (min 8 (count value))))))})]])]
-              [:div.flex.flex-col.gap-3
-               {:data-literature-zotero-step (name setup-status)}
-               (if (contains? #{:idle :checking} setup-status)
-                 [:div.text-sm.opacity-60 {:role "status"} (t :ui/loading)]
-                 [:<>
-                  [:p.text-sm
-                   (t (case setup-status
-                        :local-access :zotero.local-import/setup-local-access
-                        :companion :zotero.local-import/install-companion-description
-                        :zotero.local-import/setup-start))]
-                  [:div.flex.flex-wrap.items-center.gap-2
-                   (when (= :companion setup-status)
-                     (shui/button
-                      {:size :sm :variant :outline
-                       :data-literature-action "show-companion"
-                       :on-click #(-> (zotero/<show-companion!)
-                                      (p/catch (fn [error]
-                                                 (operation-error!
-                                                  :literature-show-companion-failed current?
-                                                  set-operation! set-error! error))))}
-                      (ui/icon "folder-open" {:size 16})
-                      (t :zotero.local-import/show-companion-action)))
-                   (shui/button {:size :sm :variant :ghost
-                                 :data-literature-action "check-zotero"
-                                 :on-click check-setup!}
-                                (ui/icon "refresh" {:size 16})
-                                (t :zotero.local-import/recheck-action))]])])]])])
+          (connected-zotero-settings enabled? binding selected-collection operation import-now! repo set-error! reload-settings!)
+          (zotero-setup-settings set-setup-open! setup-status scope-kind operation set-scope-kind! collection-scope? repo current? set-collection-key! set-selected-collection! set-error! selected-collection collection-key proposed-binding connect! set-operation! check-setup!))])
      (when operation
        [:div.text-xs.opacity-60 {:role "status"} (t :settings.literature/working)])
      (when error-message
