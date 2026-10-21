@@ -427,7 +427,7 @@ test("the desktop action builds native bridge inputs without promoting a partial
     assert.match(root, /if: .*selfhost-operation != 'build-offline-bridge'/);
   }
   const jobs = legacyWorkflow.match(
-    /  selfhost-bridge-build-inputs:[\s\S]*?\n  compile-cljs:/,
+    /  selfhost-bridge-build-inputs:[\s\S]*?\n  selfhost-bridge-signing:/,
   )[0];
   const inputs = jobs.split("\n  selfhost-bridge-build-macos:")[0];
   assert.match(inputs, /selfhost-operation == 'build-offline-bridge'/);

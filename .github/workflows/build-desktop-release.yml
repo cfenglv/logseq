@@ -1234,6 +1234,113 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  selfhost-bridge-signing:
+    needs: [ selfhost-bridge-build-inputs, selfhost-bridge-build-macos, selfhost-bridge-build-linux, selfhost-bridge-build-windows ]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: selfhost-release-signing
+    permissions:
+      actions: read
+      contents: read
+    env:
+      BRIDGE_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.bridge-source-sha }}
+      FINAL_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.final-source-sha }}
+    steps:
+      - name: Check out exact bridge workflow tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out exact bridge signing policy and CLI
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRIDGE_SOURCE_FULL_SHA }}
+          path: bridge-source
+          persist-credentials: false
+
+      - name: Download all five unsigned native bridge inputs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: selfhost-offline-bridge-input-*-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: unsigned-bridge
+
+      - name: Download exact final archives and descriptors
+        uses: actions/download-artifact@v4
+        with:
+          pattern: selfhost-offline-final-*-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: published-release-assets
+          merge-multiple: true
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Install frozen archive verification tools
+        run: |
+          mkdir -p static
+          cp resources/package.json resources/pnpm-lock.yaml resources/pnpm-workspace.yaml static/
+          pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
+
+      - name: Sign the five native bridge descriptors
+        shell: bash
+        env:
+          LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64: ${{ secrets.LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64 }}
+        run: |
+          while read -r platform arch archive; do
+            input="unsigned-bridge/selfhost-offline-bridge-input-${platform}-${arch}-${BRIDGE_SOURCE_FULL_SHA}-${FINAL_SOURCE_FULL_SHA}"
+            node bridge-source/scripts/selfhost6/prepare-update-artifact.mjs \
+              --archive "$input/$archive" --target-manifest "$input/TARGET_BUILD_MANIFEST.json" \
+              --source-full-sha "$BRIDGE_SOURCE_FULL_SHA" --target-version 2.0.1-selfhost.7 \
+              --platform "$platform" --arch "$arch" --output-directory bridge-release-assets
+          done <<'TARGETS'
+          darwin arm64 Logseq-darwin-arm64-2.0.1-selfhost.7.zip
+          darwin x64 Logseq-darwin-x64-2.0.1-selfhost.7.zip
+          linux arm64 Logseq-linux-arm64-2.0.1-selfhost.7.AppImage
+          linux x64 Logseq-linux-x86_64-2.0.1-selfhost.7.AppImage
+          win32 x64 Logseq-win-x64-2.0.1-selfhost.7-nsis.exe
+          TARGETS
+
+      - name: Verify exact bridge and final payload pairs
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { pathToFileURL } from 'node:url';
+          import { readReleasePolicy } from './scripts/lib/selfhost6-release-identity.mjs';
+          import { loadProjectSigningPolicy } from './resources/updater/project-update-signature.mjs';
+          import { getBridgeArchiveReader, verifyOfflineBridgeSet } from './scripts/selfhost6/verify-offline-bridge.mjs';
+          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: 'bridge-source', encoding: 'utf8' }).trim(),
+            process.env.BRIDGE_SOURCE_FULL_SHA);
+          const { readReleasePolicy: readBridgePolicy } = await import('./bridge-source/scripts/lib/selfhost6-release-identity.mjs');
+          const signingPolicy = loadProjectSigningPolicy();
+          assert.deepEqual(loadProjectSigningPolicy(pathToFileURL(
+            `${process.cwd()}/bridge-source/resources/updater/project-signing-policy.json`)), signingPolicy);
+          await verifyOfflineBridgeSet({
+            bridgeSourceFullSha: process.env.BRIDGE_SOURCE_FULL_SHA,
+            finalSourceFullSha: process.env.FINAL_SOURCE_FULL_SHA,
+            bridgeDirectory: 'bridge-release-assets', finalDirectory: 'published-release-assets',
+            bridgeReleasePolicy: readBridgePolicy('bridge-source/resources/updater/selfhost-release-policy.json'),
+            finalReleasePolicy: readReleasePolicy('resources/updater/selfhost-release-policy.json'),
+            signingPolicy, reader: await getBridgeArchiveReader(),
+          });
+          console.log(JSON.stringify({ status: 'offline-bridge-set-verified' }));
+          NODE
+
+      - name: Archive the signed and paired bridge set
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-bridge-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: bridge-release-assets
+          if-no-files-found: error
+          retention-days: 14
+
   compile-cljs:
     needs: [ release-source-gate, rtc-browser-e2e ]
     runs-on: ubuntu-22.04
