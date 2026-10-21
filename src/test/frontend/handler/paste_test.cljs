@@ -450,6 +450,38 @@
                                           :files files}})]
         (is (= files (js->clj @pasted-file)))))))
 
+(deftest-async file-paste-completion-preserves-the-current-editor
+  (let [origin #uuid "72000000-0000-4000-8000-000000000081"
+        other #uuid "72000000-0000-4000-8000-000000000082"
+        asset {:block/uuid #uuid "72000000-0000-4000-8000-000000000083"}
+        files #js [#js {:name "paper.pdf" :type "application/pdf"}]]
+    (p/loop [cases (seq [false true])]
+      (when-some [switch-editor? (first cases)]
+        (let [editing (atom {[1 origin] true})
+              upload (p/deferred)
+              focused (atom [])]
+          (p/let [_ (p/with-redefs
+                      [state/get-current-repo (constantly "synthetic-repo")
+                       state/get-route-match (constantly {:name :page})
+                       state/get-state (fn [_] @editing)
+                       state/get-edit-block (constantly {:block/uuid origin})
+                       editor-assets/upload-asset! (fn [_ incoming & _]
+                                                    (is (identical? files incoming))
+                                                    upload)
+                       editor-handler/edit-block! (fn [block pos opts]
+                                                    (swap! focused conj [block pos opts]))
+                       util/stop (constantly nil)]
+                      (#'paste-handler/paste-file-if-exists
+                       "synthetic-editor" #js {:clipboardData #js {:files files}})
+                      (is (empty? @focused))
+                      (when switch-editor? (reset! editing {[1 other] true}))
+                      (p/resolve! upload [asset])
+                      (p/let [_ (p/delay 0)]
+                        (is (= (if switch-editor? [] [[asset :max {:skip-load? true}]])
+                               @focused)
+                            "Upload completion may focus its asset only while the original editor remains active")))]
+            (p/recur (next cases))))))))
+
 (deftest-async editor-on-paste-firefox-html-with-line-breaks
   (testing "Firefox paste with soft line breaks should not create unwanted line breaks"
     (let [clipboard-html "<meta charset='utf-8'><p>Delegated access\n management means you can select a subset of roles for a given project \nand allow the granted organization to self-manage those roles for their \nusers.</p>"

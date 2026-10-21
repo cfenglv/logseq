@@ -51,6 +51,7 @@
                fetch-urls (atom [])
                claims (atom [])
                repair-runs (atom [])
+               committed (atom [])
                config-prev @worker-state/*db-sync-config]
            (reset! worker-state/*db-sync-config
                    {:http-base "https://sync.example.test"})
@@ -78,29 +79,33 @@
                          :thread-api/db-sync-commit-repair
                          (fn [run-repo operation-id]
                            (swap! repair-runs conj [run-repo operation-id])
-                           (p/resolved {:completed? true}))})]
+                           (p/resolved {:rename-count 1}))})]
                  (sync-download/<claim-repair-after-checksum-mismatch!
-                  repo client 9 "remote-full"))
+                  repo client 9 "remote-full"
+                  (fn [result] (swap! committed conj result))))
                (p/then
                 (fn [result]
-                  (is (= 1 @fetch-count))
-                  (is (= ["https://sync.example.test/sync/graph-1/checksum/diagnostics?proof-only=true"]
-                         @fetch-urls))
-                  (is (= 1 (count @claims)))
-                  (is (= [[repo #uuid "90000000-0000-4000-8000-000000000001"]]
-                         @repair-runs))
-                  (is (true? (:claimed? result)))
-                  (is (= {:remote-t 9
-                          :server-checkpoint-identity "checkpoint-9"
-                          :journal-high-water 14
-                          :checksum-basis
-                          {:version 1
-                           :legacy-checksum "local-full"
-                           :server-recomputed-checksum "remote-full"
-                           :server-t 9
-                           :legacy-anchor "remote-full"
-                           :metadata-proof "proof-9"}}
-                         (nth (first @claims) 2)))))
+                  (p/then (p/delay 5)
+                          (fn [_]
+                            (is (= 1 @fetch-count))
+                            (is (= ["https://sync.example.test/sync/graph-1/checksum/diagnostics?proof-only=true"]
+                                   @fetch-urls))
+                            (is (= 1 (count @claims)))
+                            (is (= [[repo #uuid "90000000-0000-4000-8000-000000000001"]]
+                                   @repair-runs))
+                            (is (= [{:rename-count 1}] @committed))
+                            (is (true? (:claimed? result)))
+                            (is (= {:remote-t 9
+                                    :server-checkpoint-identity "checkpoint-9"
+                                    :journal-high-water 14
+                                    :checksum-basis
+                                    {:version 1
+                                     :legacy-checksum "local-full"
+                                     :server-recomputed-checksum "remote-full"
+                                     :server-t 9
+                                     :legacy-anchor "remote-full"
+                                     :metadata-proof "proof-9"}}
+                                   (nth (first @claims) 2)))))))
                (p/catch (fn [error]
                           (is false (str error))))
                (p/finally (fn []
@@ -219,10 +224,12 @@
                     :thread-api/db-sync-commit-repair
                     (fn [_repo id]
                       (swap! commits conj id)
-                      (if (= 1 (count @commits))
+                      (if (< (count @commits) 3)
                         (p/rejected
                          (ex-info "remote moved"
-                                  {:type :db-sync/repair-staging-remote-advanced}))
+                                  {:type (if (= 1 (count @commits))
+                                           :db-sync/repair-remote-tail-moved
+                                           :db-sync/repair-staging-remote-advanced)}))
                         (p/resolved {:completed? true})))
                     :thread-api/db-sync-record-repair-failure
                     (fn [_repo _id transition]
@@ -239,10 +246,11 @@
           (p/then
            (fn [result]
              (is (= {:completed? true} result))
-             (is (= [operation-id operation-id] @commits))
-             (is (= 1 (count @delays)))
+             (is (= [operation-id operation-id operation-id] @commits))
+             (is (= 2 (count @delays)))
              (is (<= 0 (first @delays) 1000))
-             (is (= 2 (:attempt-count @operation*)))))
+             (is (<= 0 (second @delays) 5000))
+             (is (= 3 (:attempt-count @operation*)))))
           (p/catch (fn [error]
                      (is false (str error))))
           (p/finally done)))))
@@ -725,6 +733,65 @@
                          (:v (first (d/datoms @conn :eavt 1001 :block/name)))))
                   (is (= entity-count
                          (count (d/datoms @conn :aevt :block/tx-id))))))
+               (p/catch (fn [error]
+                          (is false (str error))))
+               (p/finally done)))))
+
+(deftest repair-snapshot-preserves-literature-assets-and-reused-pdf-links-test
+  (async done
+         (let [literature-assets :logseq.property/literature-assets
+               conn (d/create-conn
+                     (assoc db-schema/schema
+                            literature-assets
+                            {:db/valueType :db.type/ref
+                             :db/cardinality :db.cardinality/many}))
+               asset-id 1
+               paper-id 2
+               link-id 3
+               asset-uuid #uuid "94000000-0000-4000-8000-000000000001"
+               paper-uuid #uuid "94000000-0000-4000-8000-000000000002"
+               link-uuid #uuid "94000000-0000-4000-8000-000000000003"]
+           (d/transact! conn
+                        [{:db/id asset-id
+                          :block/uuid asset-uuid
+                          :block/title "encrypted-asset-title"
+                          :logseq.property.asset/type "pdf"
+                          :logseq.property.asset/checksum "synthetic-checksum"}
+                         {:db/id paper-id
+                          :block/uuid paper-uuid
+                          :block/title "encrypted-paper-title"
+                          literature-assets #{asset-id}}
+                         {:db/id link-id
+                          :block/uuid link-uuid
+                          :block/title "encrypted-link-title"
+                          :block/link asset-id}])
+           (-> (p/with-redefs
+                 [sync-crypt/<decrypt-snapshot-datoms-batch
+                  (fn [_aes-key datoms]
+                    (p/resolved
+                     (mapv #(update % :v
+                                    {"encrypted-asset-title" "paper.pdf"
+                                     "encrypted-paper-title" "Private paper"
+                                     "encrypted-link-title" ""})
+                           datoms)))]
+                 (p/let [_ (#'sync-download/<transform-snapshot-attr!
+                            conn :aes-key :block/title)
+                         _ (#'sync-download/<add-snapshot-local-revisions! conn)]
+                   nil))
+               (p/then
+                (fn []
+                  (let [asset (d/entity @conn [:block/uuid asset-uuid])
+                        paper (d/entity @conn [:block/uuid paper-uuid])
+                        link (d/entity @conn [:block/uuid link-uuid])]
+                    (is (= "paper.pdf" (:block/title asset)))
+                    (is (= "Private paper" (:block/title paper)))
+                    (is (= "" (:block/title link)))
+                    (is (= asset-id (:db/id (:block/link link))))
+                    (is (= #{asset-id}
+                           (set (map :db/id (literature-assets paper)))))
+                    (is (= "synthetic-checksum"
+                           (:logseq.property.asset/checksum asset)))
+                    (is (every? :block/tx-id [asset paper link])))))
                (p/catch (fn [error]
                           (is false (str error))))
                (p/finally done)))))

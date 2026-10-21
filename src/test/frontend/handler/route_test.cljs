@@ -285,7 +285,7 @@
              (is (= [[:thread-api/get-route-title "test" "Page"]
                      [:thread-api/get-route-title "test" "Page"]
                      [:thread-api/get-route-title "test" (str block-id)]]
-                    @calls))
+                    (filterv #(= :thread-api/get-route-title (first %)) @calls)))
              (is (= "Page" (.-page (.-dataset (.-body document)))))
              (is (= (str (subs block-title 0 48) "...")
                     (.-title document)))))

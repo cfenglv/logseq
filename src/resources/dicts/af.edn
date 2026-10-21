@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "Wysig uitvoer-CSS"
  :settings.general/edit-global-config-edn "Wysig globale config.edn"
  :settings.general/editor-font "Redigeerder-lettertipe"
- :settings.general/editor-font-set-global "Stel as globale lettertipefamilie"
  :settings.general/export-theme "Voer tema uit"
  :settings.general/language "Taal"
  :settings.general/native-titlebar "Stelseltitelbalk"

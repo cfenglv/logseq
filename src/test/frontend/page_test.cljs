@@ -26,6 +26,20 @@
            zoomed?
            (assoc :block/page {:db/id 1}))})
 
+(deftest painted-page-title-key-only-tracks-ready-page-title-test
+  (let [paint (ready-paint page-uuid "Notes")
+        key-for #'page/painted-page-title-key]
+    (is (= [page-uuid "Notes"] (key-for paint)))
+    (is (= (key-for paint)
+           (key-for (update paint :page assoc :block/updated-at 100 :block/tx-id 42)))
+        "Body-save metadata must not trigger window-title worker calls.")
+    (is (= [page-uuid "Renamed"] (key-for (ready-paint page-uuid "Renamed"))))
+    (is (nil? (key-for {:status :loading :page (:page paint)})))
+    (is (nil? (key-for {:status :ready :page nil})))
+    (is (nil? (key-for (ready-paint parent-uuid "Typing" :zoomed? true))))
+    (is (nil? (key-for (ready-paint parent-uuid "Typing more" :zoomed? true)))
+        "Typing a zoomed block must not add window-title worker calls.")))
+
 (deftest route-view-key-stays-stable-when-page-title-path-changes-test
   (let [paint (ready-paint page-uuid "Notes")
         by-uuid (page-route (str page-uuid))

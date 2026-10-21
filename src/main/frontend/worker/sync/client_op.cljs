@@ -663,6 +663,21 @@
        :created-at created-at'
        :should-inc-pending? should-inc-pending?})))
 
+(defn replace-rebased-local-tx-entry!
+  "Replace a frozen literature transaction with its semantic replay, keeping
+  the same pending row and ordering key. The new datoms need a new wire ID."
+  [repo previous-tx-id {:keys [tx-id] :as entry}]
+  (sqlite-with-tx!
+   (sqlite-store-or-throw repo)
+   (fn [store]
+     (sqlite-run! store
+                  "update client_ops set tx_id = ? where kind = 'tx' and tx_id = ?"
+                  [(str tx-id) (str previous-tx-id)])
+     (sqlite-run! store
+                  "delete from client_tx_upload_state where logical_tx_id = ?"
+                  [(str previous-tx-id)])
+     (upsert-local-tx-entry! repo entry))))
+
 (defn get-local-tx-entry
   [repo tx-id]
   (when (uuid? tx-id)
@@ -821,14 +836,14 @@
        (= format-version (:format-version state))
        (= kind (:kind state))
        (= source-digest (:source-digest state))
+       (or (nil? (:outliner-op state))
+           (keyword? (:outliner-op state)))
        (case kind
          :single-wire-v1
-         (and (keyword? (:outliner-op state))
-              (map? (:wire-entry state)))
+         (map? (:wire-entry state))
 
          :staged-large-upload-v1
-         (and (keyword? (:outliner-op state))
-              (string? (:session-id state))
+         (and (string? (:session-id state))
               (vector? (:boundaries state))
               (integer? (:source-next-index state))
               (integer? (:chunk-seq state)))

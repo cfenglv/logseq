@@ -8,6 +8,7 @@
             [frontend.rfx :as rfx]
             [frontend.state :as state]
             [frontend.util.email :as email-util]
+            [lambdaisland.glogi :as log]
             [logseq.db-sync.malli-schema :as schema]
             [malli.core :as ma]
             [promesa.core :as p]))
@@ -181,7 +182,9 @@
 (defn- refresh-current! []
   (when (current-context)
     (-> (p/all [(<get-own!) (<refresh-members!)])
-        (p/catch (fn [_] (notification/show! (t :account/profile-load-error) :error))))))
+        ;; Background reads must not interrupt ordinary offline editing.
+        ;; Explicit profile loads and saves still report their failures in the UI.
+        (p/catch (fn [error] (log/warn :profile-refresh-failed error))))))
 
 (defn refresh-on-focus! []
   (sync-context!)

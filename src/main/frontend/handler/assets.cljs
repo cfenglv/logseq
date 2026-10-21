@@ -1,12 +1,20 @@
 (ns ^:no-doc frontend.handler.assets
-  (:require [clojure.string :as string]
+  (:require ["path" :as node-path]
+            [clojure.string :as string]
+            [electron.ipc :as ipc]
             [frontend.config :as config]
+            [frontend.context.i18n :refer [t]]
+            [frontend.date :as date]
+            [frontend.db.async :as db-async]
             [frontend.fs :as fs]
+            [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [frontend.util :as util]
+            [lambdaisland.glogi :as log]
             [logseq.common.config :as common-config]
             [logseq.common.path :as path]
             [logseq.common.util :as common-util]
+            [logseq.db :as ldb]
             [logseq.db.frontend.asset :as db-asset]
             [medley.core :as medley]
             [promesa.core :as p]))
@@ -249,6 +257,97 @@
   (-> (if (string? file) file (.arrayBuffer file))
       (p/then db-asset/<get-file-array-buffer-checksum)))
 
+(defn db-based-write-asset!
+  ([repo file-path file]
+   (p/let [content (.arrayBuffer file)]
+     (db-based-write-asset! repo file-path file content)))
+  ([repo file-path _file content]
+   (fs/write-asset-file! repo file-path content)))
+
+(defn prepare-asset-block
+  [repo ^js file {:keys [external-url] :as opts}]
+  ;; WARN file name maybe fully qualified path when paste file
+  (p/let [[file title] (if (map? file) [(:src file) (:title file)] [file nil])
+          [file external-url] (if (string? file) [nil file] [file external-url])
+          file-name (node-path/basename (or (some-> file (.-name)) (str external-url)))
+          file-name-without-ext* (db-asset/asset-name->title file-name)
+          file-name-without-ext (if (= file-name-without-ext* "image")
+                                  (date/get-date-time-string-2)
+                                  file-name-without-ext*)
+          checksum (or (:checksum opts)
+                       (some-> (or file external-url) (get-file-checksum)))
+          size (or (some-> file (.-size)) 0)
+          existing-asset (some->> checksum (db-async/<get-asset-with-checksum repo))
+          block-id (or (:block/uuid opts) (ldb/new-block-id))
+          ext (when file-name (db-asset/asset-path->type file-name))]
+    {:file file
+     :file-name file-name
+     :ext ext
+     :checksum checksum
+     :existing-asset existing-asset
+     :asset-block
+     {:block/title (or title file-name-without-ext)
+      :block/uuid block-id
+      :logseq.property.asset/type ext
+      :logseq.property.asset/external-url external-url
+      :logseq.property.asset/size size
+      :logseq.property.asset/checksum checksum
+      ;; Use stable class ident in tx payload to avoid leaking numeric eids
+      ;; into outliner history ops shared with the worker sync pipeline.
+      :block/tags #{:logseq.class/Asset}}}))
+
+(declare ->uint8)
+
+(defn <asset-file-content-matches?
+  [repo-dir file-rpath size checksum]
+  (if (util/electron?)
+    (ipc/ipc "fileContentMatches" (path/path-join repo-dir file-rpath) size checksum)
+    (p/let [exists? (fs/file-exists? repo-dir file-rpath)
+            local-checksum (when exists?
+                             (p/let [local-bytes (fs/read-file-raw repo-dir file-rpath {})]
+                               (db-asset/<get-file-array-buffer-checksum (->uint8 local-bytes))))]
+      (= checksum local-checksum))))
+
+(defn <ensure-asset-file-content!
+  "Checks one local asset and restores its registered bytes when available."
+  [repo asset-block]
+  (if (and (:block/uuid asset-block)
+           (:logseq.property.asset/checksum asset-block)
+           (string/blank? (:logseq.property.asset/external-url asset-block)))
+    (let [repo-dir (config/get-repo-dir repo)
+          file-rpath (path/path-join common-config/local-assets-dir
+                                    (str (:block/uuid asset-block) "."
+                                         (:logseq.property.asset/type asset-block)))
+          matches? #(<asset-file-content-matches?
+                     repo-dir file-rpath (:logseq.property.asset/size asset-block)
+                     (:logseq.property.asset/checksum asset-block))]
+      (p/let [local-matches? (matches?)]
+        (when-not local-matches?
+          (p/let [restored? (when (:logseq.property.asset/remote-metadata asset-block)
+                             (-> (p/let [_ (state/<invoke-db-worker
+                                            :thread-api/db-sync-request-asset-download
+                                            repo (:block/uuid asset-block) true)]
+                                   (matches?))
+                                 (p/catch (fn [error]
+                                            (log/error :db-sync/request-asset-download-failed error)
+                                            false))))]
+            (when-not restored?
+              (throw (doto (js/Error. file-rpath)
+                       (aset "name" "AssetContentMismatchError"))))))))
+    (p/resolved nil)))
+
+(defn <restore-reused-asset-file!
+  "Restores a missing or damaged file while leaving matching bytes untouched."
+  ([repo repo-dir asset-dir-rpath write]
+   (<restore-reused-asset-file! repo repo-dir asset-dir-rpath write nil))
+  ([repo repo-dir asset-dir-rpath {:keys [file file-path checksum]} content]
+   (p/let [matches? (<asset-file-content-matches?
+                    repo-dir (path/path-join asset-dir-rpath file-path) (.-size file) checksum)]
+     (when-not matches?
+       (if content
+         (db-based-write-asset! repo file-path file content)
+         (db-based-write-asset! repo file-path file))))))
+
 (defn- field-value
   [payload field-name]
   (or (get payload field-name)
@@ -378,8 +477,18 @@
   [repo asset-block file-ready?]
   (let [progress (get (or (state/get-state :rtc/asset-upload-download-progress) {}) repo)]
     (when (should-request-remote-asset-download? repo asset-block file-ready? progress)
-      (state/<invoke-db-worker
-       :thread-api/db-sync-request-asset-download
-       repo
-       (:block/uuid asset-block))
+      (-> (state/<invoke-db-worker
+           :thread-api/db-sync-request-asset-download
+           repo
+           (:block/uuid asset-block))
+          (p/catch
+           (fn [error]
+             (log/error :db-sync/request-asset-download-failed error)
+             (when (= repo (state/get-current-repo))
+               (notification/show!
+                (t :asset/missing-file
+                   (path/path-join common-config/local-assets-dir
+                                   (str (:block/uuid asset-block) "."
+                                        (:logseq.property.asset/type asset-block))))
+                :error)))))
       true)))

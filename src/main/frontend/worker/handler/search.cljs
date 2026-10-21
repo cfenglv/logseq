@@ -10,6 +10,7 @@
    [frontend.worker.state :as worker-state]
    [lambdaisland.glogi :as log]
    [logseq.common.util :as common-util]
+   [logseq.db.frontend.literature :as literature]
    [promesa.core :as p]))
 
 (def search-db-version
@@ -301,9 +302,44 @@
     (p/resolved nil)
     (<search-blocks repo q option)))
 
+(def ^:private literature-search-candidate-limit 200)
+(def ^:private literature-search-result-limit 10)
+
+(def-thread-api :thread-api/literature-search-papers
+  [repo q]
+  (let [conn (worker-state/get-datascript-conn repo)
+        search-db (get-search-db repo)]
+    (cond
+      (or (nil? conn) (nil? search-db))
+      {:status :unavailable :reason :missing-index}
+
+      (search-index-build-active? repo)
+      {:status :unavailable :reason :index-rebuilding}
+
+      (not (literature/available? @conn))
+      {:status :disabled :papers [] :truncated? false}
+
+      :else
+      (let [{:keys [candidates truncated?]}
+            (search/search-title-candidates
+             search-db q literature-search-candidate-limit)
+            papers (->> candidates
+                        (mapcat (fn [{:keys [id]}]
+                                  (when (common-util/uuid-string? id)
+                                    (map search/literature-paper-result
+                                         (literature/search-papers-for-candidate
+                                          @conn (uuid id))))))
+                        distinct
+                        (take literature-search-result-limit)
+                        vec)]
+        {:status :ok
+         :papers papers
+         :truncated? truncated?}))))
+
 (def-thread-api :thread-api/search-upsert-blocks
   [repo blocks]
   (when-let [db (get-search-db repo)]
+    (search/delete-vector-blocks! (worker-state/get-vector-index repo) (map :id blocks))
     (search/upsert-blocks! db (bean/->js blocks))
     (schedule-vector-index-upsert! repo blocks)
     nil))
@@ -408,7 +444,7 @@
                                                            search-index-build-time-budget-ms)
                processed' (+ processed (count batch))
                indexed (vec (keep #(search/block->index % index-opts) batch))
-               indexed-blocks' (into indexed-blocks indexed)
+               indexed-blocks' (cond-> indexed-blocks vector-index (into indexed))
                progress (progress-for-fts processed')
                should-report? (> progress last-progress)]
            (p/let [_ (when (seq indexed)

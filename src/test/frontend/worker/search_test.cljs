@@ -1838,3 +1838,109 @@
             (.close db))
           (p/catch (fn [e] (is false (str e))))
           (p/finally done)))))
+
+
+(deftest literature-title-candidates-are-bounded-and-report-truncation
+  (let [calls (atom [])
+        exact-id "70000000-0000-4000-8000-000000000001"
+        candidate-ids (mapv #(str "70000000-0000-4000-8000-"
+                                  (.padStart (str %) 12 "0"))
+                            (range 2 8))
+        db (js-obj)
+        _ (aset db "exec"
+                (fn [opts]
+                  (let [sql (aget opts "sql")
+                        bind (js->clj (aget opts "bind"))]
+                    (swap! calls conj {:sql sql :bind bind})
+                    (clj->js
+                     (if (string/includes? sql "COLLATE NOCASE")
+                       [[exact-id exact-id "Paper exact"]]
+                       (into [[exact-id exact-id "Paper exact"]]
+                             (map-indexed
+                              (fn [idx id]
+                                [id id (str "Paper candidate " idx)])
+                              candidate-ids)))))))]
+    (testing "fewer than two characters do not query SQLite"
+      (is (= {:candidates [] :truncated? false}
+             (search/search-title-candidates db "p" 5)))
+      (is (empty? @calls)))
+    (testing "exact title is first, the window is capped, and overflow is explicit"
+      (let [result (search/search-title-candidates db "Paper" 5)]
+        (is (= 5 (count (:candidates result))))
+        (is (= {:id exact-id :title "Paper exact"}
+               (first (:candidates result))))
+        (is (true? (:truncated? result)))
+        (is (= [["Paper" 6] ["\"Paper\"*" 6]]
+               (mapv :bind @calls)))))))
+
+(deftest literature-title-candidates-treat-input-as-literal-title-text
+  (let [calls (atom [])
+        db #js {:exec (fn [opts]
+                       (swap! calls conj {:sql (aget opts "sql")
+                                          :bind (js->clj (aget opts "bind"))})
+                       #js [])}]
+    (doseq [[title phrase] [["Released .6 and .7 overlap paper"
+                            "\"Released .6 and .7 overlap paper\"*"]
+                           ["DNA AND RNA: a comparison"
+                            "\"DNA AND RNA: a comparison\"*"]
+                           ["An \"OR\" example"
+                            "\"An \"\"OR\"\" example\"*"]]]
+      (reset! calls [])
+      (is (= {:candidates [] :truncated? false}
+             (search/search-title-candidates db title 5)))
+      (is (= [[title 6] [phrase 6]] (mapv :bind @calls)))
+      (is (= 2 (count @calls)) "Literal input retains the two bounded index queries"))))
+
+(deftest literature-two-character-prefix-reuses-the-title-index
+  (async done
+    (let [page (str (random-uuid))
+          [a b c d] (repeatedly 4 #(str (random-uuid)))]
+      (-> (p/let [db (<open-search-db)]
+            (search/create-tables-and-triggers! db)
+            (search/upsert-blocks! db (index-rows page [[a "李明 手动文献"] [b "李明"]
+                                                       [c "另一位李明"] [d "李% literal"]]))
+            (let [result (search/search-title-candidates db "李明" 10)]
+              (is (= b (get-in result [:candidates 0 :id])) "Exact matches remain first")
+              (is (= #{a b} (set (map :id (:candidates result))))))
+            (is (= [d] (mapv :id (:candidates (search/search-title-candidates db "李%" 10))))
+                "A percent character is literal user input")
+            (is (some #(string/includes? (str %) "blocks_title_nocase_idx")
+                      (query-rows db "EXPLAIN QUERY PLAN select id, page, title from blocks where title like ? escape '\\' limit ?"
+                                  "李明%" 201))
+                "Two-character searches use the existing title index")
+            (.close db))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
+(deftest literature-result-detail-preserves-pulled-property-values-test
+  (let [paper {:block/uuid #uuid "11111111-1111-1111-1111-111111111111"
+               :block/title "Shared paper"
+               :logseq.property/literature-authors {:block/title "Example, Ada"}
+               :logseq.property/literature-date {:block/title "2026"}}
+        result (search/literature-paper-result paper)]
+    (is (= "Example, Ada · 2026" (:literature/detail result))
+        "Global search uses pulled property maps, while library search can return entities.")
+    (is (= "Shared paper" (:block/title result)))
+    (is (= (:block/uuid paper) (:block/uuid result)))))
+
+(deftest pdf-search-summary-excludes-hidden-literature-owners
+  (let [id #uuid "11111111-1111-1111-1111-111111111112"
+        db (d/db-with (d/empty-db {:block/uuid {:db/unique :db.unique/identity}
+                                  :block/page {:db/valueType :db.type/ref}
+                                  :block/parent {:db/valueType :db.type/ref}
+                                  :block/tags {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+                                  :block/alias {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+                                  :logseq.property/literature-authors {:db/valueType :db.type/ref}
+                                  :logseq.property/literature-date {:db/valueType :db.type/ref}
+                                  :logseq.property/literature-citekey {:db/valueType :db.type/ref}
+                                  :logseq.property/literature-assets {:db/valueType :db.type/ref
+                                                                     :db/cardinality :db.cardinality/many}})
+                      [{:db/id 1 :block/uuid id :block/title "PDF attachment" :logseq.property.asset/type "pdf"}
+                       {:db/id 2 :block/title "Visible paper" :logseq.property/literature-item? true :logseq.property/literature-assets [1]}
+                       {:db/id 3 :block/title "Hidden paper" :logseq.property/literature-item? true :logseq.property/literature-assets [1] :logseq.property/hide? true}
+                       {:db/id 4 :block/title "Hidden parent" :logseq.property/hide? true}
+                       {:db/id 5 :block/title "Hidden descendant paper" :block/parent 4 :logseq.property/literature-item? true :logseq.property/literature-assets [1]}])
+        pulled (get (#'search/pull-search-result-blocks db [{:id (str id)}]) (str id))
+        context (#'search/search-content-context pulled)]
+    (is (= "Visible paper" (:literature/detail context)))
+    (is (= "pdf" (:logseq.property.asset/type context)))))

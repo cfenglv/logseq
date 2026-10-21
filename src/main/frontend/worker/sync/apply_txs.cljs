@@ -26,6 +26,7 @@
    [logseq.db-sync.tx-sanitize :as tx-sanitize]
    [logseq.db.common.entity-plus :as entity-plus]
    [logseq.db.common.normalize :as db-normalize]
+   [logseq.db.frontend.literature :as literature]
    [logseq.db.sqlite.util :as sqlite-util]
    [logseq.outliner.core :as outliner-core]
    [logseq.outliner.op :as outliner-op]
@@ -57,6 +58,7 @@
   (true? (get @*repo->upload-stopped? repo)))
 
 (declare apply-remote-txs!
+         enqueue-flush-pending!
          attach-frozen-wire-cache
          cap-upload-request-tx-entries
          ref-attr?
@@ -213,14 +215,12 @@
                      (when (= request' (dissoc @*upload-request :timer))
                        (reset! *upload-request nil)
                        (report-upload-response-timeout! client request')
-                       ;; Lost response while the WebSocket stayed open: release
-                       ;; the in-memory inflight gate and retry the same pending
-                       ;; rows with the same logical tx ids on the next existing
-                       ;; flush trigger (background start!, hello or pull). The
-                       ;; server applies exact-once effects by tx id, so a resend
-                       ;; is safe.
+                       ;; Reuse the existing queue and frozen logical tx ids;
+                       ;; a quiet connection must not wait for another edit.
                        (when-let [*inflight (:inflight client)]
-                         (reset! *inflight []))))
+                         (reset! *inflight []))
+                       (when (identical? client (current-client (:repo client)))
+                         (enqueue-flush-pending! (:repo client) client))))
                    upload-response-timeout-ms)]
         (reset! *upload-request (assoc request' :timer timer))))))
 
@@ -302,10 +302,11 @@
    repo graph-id {:get-conn-f worker-state/get-datascript-conn
                   :rehydrate-large-titles!-f rehydrate-large-titles!}))
 
-(defn request-asset-download! [repo asset-uuid]
+(defn request-asset-download! [repo asset-uuid & [replace-existing?]]
   (sync-assets/request-asset-download!
    repo asset-uuid
-   {:current-client-f current-client
+   {:replace-existing? replace-existing?
+    :current-client-f current-client
     :enqueue-asset-task-f sync-assets/enqueue-asset-task!
     :broadcast-rtc-state!-f broadcast-rtc-state!}))
 
@@ -313,10 +314,52 @@
   [db-before db-after tx-data tx-meta]
   (op-construct/derive-history-outliner-ops db-before db-after tx-data tx-meta))
 
+(defn- normalize-save-op-for-rebase
+  [local-tx db-before [op [block opts] :as entry]]
+  (if (and (= :save-block op) (some nil? (:block/refs block)))
+    (let [block-id (:block/uuid block)
+          lookup [:block/uuid block-id]
+          block-tx (filter #(= lookup (second %)) (:tx local-tx))
+          titles (distinct (keep (fn [[action _ attr value]]
+                                   (when (and (= :db/add action) (= :block/title attr)) value))
+                                 block-tx))
+          saves (filter #(and (= :save-block (first %))
+                               (= block-id (get-in % [1 0 :block/uuid])))
+                        (:forward-outliner-ops local-tx))
+          refs (reduce (fn [refs [action _ attr value]]
+                         (if (= :block/refs attr)
+                           ((if (= :db/add action) conj disj) refs value)
+                           refs))
+                       (set (keep identity (:block/refs block)))
+                       block-tx)
+          ref-blocks (mapv #(select-keys (d/entity db-before %)
+                                        [:block/uuid :block/title :db/ident]) refs)
+          ref-uuids (set (map :block/uuid ref-blocks))
+          created-refs (into [] (keep (fn [[action _ attr value]]
+                                       (when (and (= :db/add action) (= :block/uuid attr)
+                                                  (contains? ref-uuids value)) value)))
+                             (:tx local-tx))]
+      ;; This known recording defect has correct durable datoms. Ambiguous
+      ;; records must abort the outer atomic rebase, not enter its drop catch.
+      (when-not (and (= 1 (count titles)) (string? (first titles))
+                     (= 1 (count saves)) (every? :block/uuid ref-blocks))
+        (throw (ex-info "Cannot normalize save history from its transaction"
+                        {:tx-id (:tx-id local-tx) :block/uuid block-id})))
+      [:save-block
+       [(cond-> (assoc (dissoc block op-construct/rebase-created-refs-key)
+                        :block/title (first titles)
+                        :block/refs refs
+                        op-construct/rebase-refs-key ref-blocks)
+          (seq created-refs) (assoc op-construct/rebase-created-refs-key created-refs))
+        opts]])
+    entry))
+
 (defn- rebase-history-ops
   [local-tx db-before]
   {:forward-ops (seq (op-construct/canonicalize-insert-ops
-                     db-before (:tx local-tx) (:forward-outliner-ops local-tx)))
+                     db-before (:tx local-tx)
+                     (mapv #(normalize-save-op-for-rebase local-tx db-before %)
+                           (:forward-outliner-ops local-tx))))
    :inverse-ops (seq (:inverse-outliner-ops local-tx))})
 
 (defn- normalize-tx-data-for-rebase
@@ -367,41 +410,61 @@
   (when (and goog.DEBUG (:perf-id data))
     (log/info :db-worker/outliner-op-perf data)))
 
+(defn- source-correction-context
+  [[op [_ tx-meta]]]
+  (when (= :transact op)
+    (:literature/correct-source-record tx-meta)))
+
 (defn- persist-local-tx!
   [repo {:keys [db-before db-after tx-data tx-meta] :as tx-report} normalized-tx-data reversed-datoms]
   (when (client-ops-conn repo)
     (let [started-at (perf-time-ms)
-          tx-id (or (:db-sync/tx-id tx-meta) (random-uuid))
+          previous-tx-id (or (:db-sync/tx-id tx-meta) (random-uuid))
           now (.now js/Date)
           outliner-op (tx-meta-outliner-op tx-meta)
           {:keys [forward-outliner-ops inverse-outliner-ops]}
           (derive-history-outliner-ops db-before db-after tx-data tx-meta)
           history-at (perf-time-ms)
           inferred-outliner-ops?' (inferred-outliner-ops? tx-meta)
-          ;; A frozen wire entry may already have reached the server. Rebase the
-          ;; canonical DB, but keep its exact journal source until ACK/reject.
-          preserve-frozen-source? (and (:db-sync/rebased-local? tx-meta)
-                                       (some? (client-op/get-client-tx-upload-state
-                                               repo tx-id)))
+          frozen-state (when (:db-sync/rebased-local? tx-meta)
+                         (client-op/get-client-tx-upload-state repo previous-tx-id))
+          ;; Replanned semantic operations and unapplied new inserts must not
+          ;; send their former wire datoms under the same frozen ID.
+          replace-frozen-source? (and (= :single-wire-v1 (:kind frozen-state))
+                                      (or (:db-sync/rebased-new-insert? tx-meta)
+                                          (some #(or (source-correction-context %)
+                                                 (contains? #{:literature-register-source-record
+                                                              :literature-register-identified-pdf
+                                                              :literature-auto-link-pdf
+                                                              :literature-merge-duplicate-pdf
+                                                              :literature-register-verified-pdf}
+                                                            (first %)))
+                                                forward-outliner-ops)))
+          tx-id (if replace-frozen-source? (random-uuid) previous-tx-id)
+          entry {:tx-id tx-id
+                 :created-at now
+                 :pending? true
+                 :failed? false
+                 :outliner-op outliner-op
+                 :undo-redo (cond
+                              (:undo? tx-meta) :undo
+                              (:redo? tx-meta) :redo
+                              :else :none)
+                 :forward-outliner-ops forward-outliner-ops
+                 :inverse-outliner-ops inverse-outliner-ops
+                 :inferred-outliner-ops? inferred-outliner-ops?'
+                 :normalized-tx-data normalized-tx-data
+                 :reversed-tx-data reversed-datoms}
           {:keys [should-inc-pending?]}
-          (if preserve-frozen-source?
+          (cond
+            replace-frozen-source?
+            (client-op/replace-rebased-local-tx-entry! repo previous-tx-id entry)
+
+            frozen-state
             {:should-inc-pending? false}
-            (client-op/upsert-local-tx-entry!
-             repo
-             {:tx-id tx-id
-              :created-at now
-              :pending? true
-              :failed? false
-              :outliner-op outliner-op
-              :undo-redo (cond
-                           (:undo? tx-meta) :undo
-                           (:redo? tx-meta) :redo
-                           :else :none)
-              :forward-outliner-ops forward-outliner-ops
-              :inverse-outliner-ops inverse-outliner-ops
-              :inferred-outliner-ops? inferred-outliner-ops?'
-              :normalized-tx-data normalized-tx-data
-              :reversed-tx-data reversed-datoms}))
+
+            :else
+            (client-op/upsert-local-tx-entry! repo entry))
           upsert-at (perf-time-ms)]
       ;; (prn :debug :forward-outliner-ops)
       ;; (cljs.pprint/pprint forward-outliner-ops)
@@ -1141,8 +1204,9 @@
             ops (->> (if undo? inverse-outliner-ops forward-outliner-ops)
                      (filter (fn [op-entry]
                                (and (sequential? op-entry)
-                                    (contains? op-construct/semantic-outliner-ops
-                                               (first op-entry)))))
+                                    (or (source-correction-context op-entry)
+                                        (contains? op-construct/semantic-outliner-ops
+                                                   (first op-entry))))))
                      seq)
             tx-data (-> (if undo? reversed-tx tx)
                         normalize-tx-data-for-rebase)
@@ -1186,14 +1250,15 @@
           (try
             (when (seq ops)
               (op-construct/assert-no-numeric-entity-ids! @conn ops :history-action-ops))
-            (ldb/batch-transact-with-temp-conn!
-             conn
-             tx-meta'
-             (fn [conn]
-               (doseq [op ops']
-                 (replay-canonical-outliner-op! conn op nil))))
-            {:applied? true
-             :history-tx-id history-tx-id}
+            (let [tx-report (ldb/batch-transact-with-temp-conn!
+                             conn
+                             tx-meta'
+                             (fn [conn]
+                               (doseq [op ops']
+                                 (replay-canonical-outliner-op! conn op nil))))]
+              (if (and (some source-correction-context ops) (nil? tx-report))
+                {:applied? false :reason :source-correction-blocked}
+                {:applied? true :history-tx-id history-tx-id}))
             (catch :default e
               (let [reason (history-action-error-reason e)]
                 (when-not (expected-history-action-error-reason? reason)
@@ -1833,8 +1898,50 @@
       (assoc :block/uuid block-uuid))))
 
 (defn- ^:large-vars/cleanup-todo replay-canonical-outliner-op!
-  [conn [op args] rebase-db-before]
+  [conn [op args] rebase-db-before & [remote-deleted-block-uuids]]
   (case op
+    :literature-merge-duplicate-pdf
+    (apply outliner-op/merge-duplicate-pdf! conn args)
+
+    :literature-register-source-record
+    (let [paper-uuid (literature/source-registration-paper-uuid (nth args 2))]
+      (when (and paper-uuid
+                 (contains? remote-deleted-block-uuids paper-uuid)
+                 (nil? (d/entity @conn [:block/uuid paper-uuid])))
+        (invalid-rebase-op! op {:reason :remote-paper-deleted
+                                :paper-uuid paper-uuid}))
+      (apply outliner-op/register-literature-source-record! conn
+             (conj (vec args) rebase-db-before)))
+
+    :literature-register-identified-pdf
+    (let [paper-uuid (literature/source-record-paper-uuid (nth args 2))]
+      (when (and paper-uuid
+                 (contains? remote-deleted-block-uuids paper-uuid)
+                 (nil? (d/entity @conn [:block/uuid paper-uuid])))
+        (invalid-rebase-op! op {:reason :remote-paper-deleted
+                                :paper-uuid paper-uuid}))
+      (apply outliner-op/register-literature-identified-pdf! conn args))
+
+    :literature-auto-link-pdf
+    (apply outliner-op/auto-link-literature-pdf! conn args)
+
+    :literature-register-verified-pdf
+    (let [[_ evidence metadata] args
+          identifiers (if (seq metadata) (select-keys metadata [:doi :arxiv]) (:identifiers evidence))
+          generated-uuid (literature/source-record-paper-uuid identifiers)
+          previous (when (and (seq metadata) rebase-db-before)
+                     (literature/find-paper-by-identifiers rebase-db-before identifiers))
+          previous-uuid (when (= :found (:status previous)) (:block/uuid (first (:papers previous))))
+          existing-target (when (and previous-uuid (not= previous-uuid generated-uuid)) previous-uuid)
+          paper-uuid (or existing-target generated-uuid)
+          target (when paper-uuid (d/entity @conn [:block/uuid paper-uuid]))]
+      (when (and paper-uuid
+                 (or existing-target (contains? remote-deleted-block-uuids paper-uuid))
+                 (or (nil? target) (some? (:logseq.property/deleted-at target))))
+        (invalid-rebase-op! op {:reason :remote-paper-deleted
+                                :paper-uuid paper-uuid}))
+      (apply outliner-op/register-literature-verified-pdf! conn args))
+
     :save-block
     (let [[block opts] args
           db @conn
@@ -2013,30 +2120,58 @@
         (ldb/transact! conn tx-data
                        {:outliner-op :recycle-delete-permanently})))
 
-    (let [[tx-data tx-meta] args
-          tx-data (expand-block-retracts-to-descendants @conn tx-data)]
-      (when-let [tx-data (seq tx-data)]
-        (ldb/transact! conn tx-data tx-meta)))))
+    (let [[tx-data tx-meta] args]
+      (if-let [context (source-correction-context [op args])]
+        (let [plan (literature/build-correct-source-record-replay-plan @conn context)]
+          (when (= :ready (:status plan))
+            (ldb/transact! conn (:tx-data plan) tx-meta)))
+        (when-let [tx-data (seq (expand-block-retracts-to-descendants @conn tx-data))]
+          (ldb/transact! conn tx-data tx-meta))))))
+
+(defn- pending-new-insert-ops?
+  [local-tx forward-ops]
+  (let [created (into #{} (keep tx-item-retract-entity-block-uuid) (:reversed-tx local-tx))]
+    (and (seq forward-ops)
+         (every? (fn [[op [blocks _ opts]]]
+                   (and (= :insert-blocks op) (:keep-uuid? opts)
+                        (not (:replace-empty-target? opts))
+                        (= 1 (count blocks))
+                        (contains? created (:block/uuid (first blocks)))))
+                 forward-ops))))
 
 (defn- rebase-local-op!
-  [_repo conn local-tx rebase-db-before]
+  [repo conn local-tx rebase-db-before remote-deleted-block-uuids]
   (if (= :fix (:outliner-op local-tx))
     {:tx-id (:tx-id local-tx)
      :status :kept}
     (let [{:keys [forward-ops inverse-ops]} (rebase-history-ops local-tx rebase-db-before)
+          new-insert? (and repo (pending-new-insert-ops? local-tx forward-ops)
+                           (contains? #{nil :single-wire-v1}
+                                      (:kind (client-op/get-client-tx-upload-state repo (:tx-id local-tx)))))
+          ;; After reversal, a creation still present in the remote projection
+          ;; was already accepted. Replaying it would overwrite later edits.
+          forward-ops (if new-insert?
+                        (filterv (fn [[_ [blocks]]]
+                                   (let [id (:block/uuid (first blocks))]
+                                     (and (nil? (d/entity @conn [:block/uuid id]))
+                                          (not (contains? remote-deleted-block-uuids id)))))
+                                 forward-ops)
+                        forward-ops)
           tx-meta (cond-> {:outliner-op :rebase
                            :original-outliner-op (:outliner-op local-tx)
                            :db-sync/rebased-local? true
-                           ;; Keep stable tx-id across rebases so one logical pending op
-                           ;; doesn't fan out into duplicated pending rows.
+                           ;; Persistence replaces changed literature wire payloads
+                           ;; in the same pending position with a new tx-id.
                            :db-sync/tx-id (:tx-id local-tx)
                            :db-sync/forward-outliner-ops forward-ops
                            :db-sync/inverse-outliner-ops inverse-ops}
+                    new-insert?
+                    (assoc :db-sync/rebased-new-insert? true)
                     ;; Replayed recorded tx-data already contains the transact
                     ;; pipeline's effects for the original tx.
                     (not (seq forward-ops))
                     (assoc :db-sync/replayed-tx-data? true))
-          forward-ops' (if (seq forward-ops)
+          forward-ops' (if (or new-insert? (seq forward-ops))
                          forward-ops
                          (let [tx-data (-> (:tx local-tx) normalize-tx-data-for-rebase)]
                            [[:transact [tx-data (assoc tx-meta
@@ -2049,7 +2184,8 @@
                tx-meta
                (fn [conn]
                  (doseq [op forward-ops']
-                   (replay-canonical-outliner-op! conn op rebase-db-before))))
+                   (replay-canonical-outliner-op! conn op rebase-db-before
+                                                 remote-deleted-block-uuids))))
               status (if rebase-tx-report :rebased :no-op)]
           {:tx-id (:tx-id local-tx)
            :status status})
@@ -2065,10 +2201,13 @@
              :status :failed}))))))
 
 (defn- rebase-local-txs!
-  [repo conn local-txs rebase-db-before]
-  (mapv (fn [local-tx]
-          (rebase-local-op! repo conn local-tx rebase-db-before))
-        local-txs))
+  ([repo conn local-txs rebase-db-before]
+   (rebase-local-txs! repo conn local-txs rebase-db-before #{}))
+  ([repo conn local-txs rebase-db-before remote-deleted-block-uuids]
+   (mapv (fn [local-tx]
+           (rebase-local-op! repo conn local-tx rebase-db-before
+                             remote-deleted-block-uuids))
+         local-txs)))
 
 (def ^:private repair-replay-batch-size 16)
 
@@ -2175,6 +2314,9 @@
         *rebase-results (atom [])
         *remote-tx-results (atom [])
         rebase-db-before @conn
+        remote-deleted-block-uuids (into #{}
+                                         (keep tx-item-retract-entity-block-uuid)
+                                         (mapcat :tx-data remote-txs))
         conflicts (remote-sync-conflicts rebase-db-before local-txs remote-txs)]
     (try
       (when (seq conflicts)
@@ -2191,7 +2333,8 @@
                                                        :db-before-local-reversal rebase-db-before))
 
                          (reset! *rebase-results
-                                 (rebase-local-txs! repo conn local-txs rebase-db-before)))
+                                 (rebase-local-txs! repo conn local-txs rebase-db-before
+                                                    remote-deleted-block-uuids)))
 
                        {:listen-db (fn [{:keys [tx-meta tx-data] :as tx-report}]
                                      (when (and (= :rebase (:outliner-op tx-meta))

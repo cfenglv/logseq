@@ -8,17 +8,30 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
-function fixture(packageVersion) {
+function fixture(context, packageVersion) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "selfhost6-target-build-"));
-  const updater = path.join(root, "updater");
-  fs.mkdirSync(updater);
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const updater = path.join(root, "static/updater");
+  fs.mkdirSync(updater, { recursive: true });
   for (const file of [
     "prepare-target-build-manifest.mjs",
     "selfhost-release-policy.json",
     "project-signing-policy.json",
   ]) fs.copyFileSync(path.join(repoRoot, "resources/updater", file), path.join(updater, file));
-  fs.writeFileSync(path.join(root, "package.json"), `${JSON.stringify({ version: packageVersion })}\n`);
-  return { root, script: path.join(updater, "prepare-target-build-manifest.mjs") };
+  fs.writeFileSync(path.join(root, "static/package.json"), `${JSON.stringify({ version: packageVersion })}\n`);
+  const scripts = path.join(root, "scripts/lib");
+  fs.mkdirSync(scripts, { recursive: true });
+  // Only test the manifest owner's build-call contract here. Actual pinned reader
+  // preparation/execution is covered by its unit tests and the native probe.
+  fs.writeFileSync(path.join(scripts, "windows-archive-reader.mjs"), `
+import fs from "node:fs";
+import path from "node:path";
+export async function prepareWindowsArchiveReader({arch, outputDirectory}) {
+  fs.mkdirSync(outputDirectory, {recursive:true});
+  fs.writeFileSync(path.join(outputDirectory,"prepared.json"),JSON.stringify({arch}));
+}
+`);
+  return { root, updater, script: path.join(updater, "prepare-target-build-manifest.mjs") };
 }
 
 function fakeGit(root, { sourceFullSha = "b".repeat(40), dirty = false } = {}) {
@@ -34,8 +47,8 @@ else process.exitCode = 2;
   return bin;
 }
 
-test("packaging writes the exact platform target manifest and rejects a version split", () => {
-  const valid = fixture("2.0.2-selfhost.2");
+test("packaging writes the exact platform target manifest and rejects a version split", context => {
+  const valid = fixture(context, "2.0.2-selfhost.2");
   const environment = {
     ...process.env,
     SELFHOST6_SOURCE_FULL_SHA: "a".repeat(40),
@@ -46,21 +59,22 @@ test("packaging writes the exact platform target manifest and rejects a version 
   const result = spawnSync(process.execPath, [valid.script], { encoding: "utf8", env: environment });
   assert.equal(result.status, 0, result.stderr);
   const manifest = JSON.parse(
-    fs.readFileSync(path.join(valid.root, "updater/TARGET_BUILD_MANIFEST.json"), "utf8"),
+    fs.readFileSync(path.join(valid.updater, "TARGET_BUILD_MANIFEST.json"), "utf8"),
   );
   assert.equal(manifest["target-source-full-sha"], "a".repeat(40));
   assert.equal(manifest["target-version"], "2.0.2-selfhost.2");
   assert.equal(manifest.platform, "linux");
   assert.equal(manifest.arch, "arm64");
 
-  const invalid = fixture("2.0.2-selfhost.1");
+  assert.equal(fs.existsSync(path.join(valid.updater, "windows")), false);
+  const invalid = fixture(context, "2.0.2-selfhost.1");
   const rejected = spawnSync(process.execPath, [invalid.script], { encoding: "utf8", env: environment });
   assert.notEqual(rejected.status, 0);
   assert.match(rejected.stderr, /static package version must equal/);
 });
 
-test("packaging infers immutable build identity when callers omit repeated parameters", () => {
-  const valid = fixture("2.0.2-selfhost.1");
+test("packaging infers immutable build identity when callers omit repeated parameters", context => {
+  const valid = fixture(context, "2.0.2-selfhost.1");
   const bin = fakeGit(valid.root);
   const environment = {
     ...process.env,
@@ -73,12 +87,12 @@ test("packaging infers immutable build identity when callers omit repeated param
   const result = spawnSync(process.execPath, [valid.script], { encoding: "utf8", env: environment });
   assert.equal(result.status, 0, result.stderr);
   const manifest = JSON.parse(
-    fs.readFileSync(path.join(valid.root, "updater/TARGET_BUILD_MANIFEST.json"), "utf8"),
+    fs.readFileSync(path.join(valid.updater, "TARGET_BUILD_MANIFEST.json"), "utf8"),
   );
   assert.equal(manifest["target-source-full-sha"], "b".repeat(40));
   assert.equal(manifest["target-version"], "2.0.2-selfhost.1");
 
-  const dirty = fixture("2.0.2-selfhost.1");
+  const dirty = fixture(context, "2.0.2-selfhost.1");
   const dirtyBin = fakeGit(dirty.root, { dirty: true });
   const dirtyResult = spawnSync(process.execPath, [dirty.script], {
     encoding: "utf8",
@@ -88,8 +102,8 @@ test("packaging infers immutable build identity when callers omit repeated param
   assert.match(dirtyResult.stderr, /checkout must be clean/);
 });
 
-test("win32 arm64 is an admitted packaging target", () => {
-  const valid = fixture("2.0.2-selfhost.1");
+test("win32 arm64 prepares the native reader before the admitted target manifest", context => {
+  const valid = fixture(context, "2.0.2-selfhost.1");
   const environment = {
     ...process.env,
     SELFHOST6_SOURCE_FULL_SHA: "a".repeat(40),
@@ -100,8 +114,9 @@ test("win32 arm64 is an admitted packaging target", () => {
   const result = spawnSync(process.execPath, [valid.script], { encoding: "utf8", env: environment });
   assert.equal(result.status, 0, result.stderr);
   const manifest = JSON.parse(
-    fs.readFileSync(path.join(valid.root, "updater/TARGET_BUILD_MANIFEST.json"), "utf8"),
+    fs.readFileSync(path.join(valid.updater, "TARGET_BUILD_MANIFEST.json"), "utf8"),
   );
   assert.equal(manifest.platform, "win32");
   assert.equal(manifest.arch, "arm64");
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(valid.updater, "windows/arm64/prepared.json"))), { arch: "arm64" });
 });

@@ -549,6 +549,42 @@ ALTER TABLE blocks_fts_next RENAME TO blocks_fts;"))
       (prn :debug "Exact title search blocks failed: ")
       (js/console.error e))))
 
+(defn search-title-candidates
+  "Returns a bounded title-only candidate window from the existing search
+   tables. The caller must validate candidate identities against the current
+   Datascript db. `:truncated?` means absence from this window is not evidence
+   that no matching record exists."
+  [db q limit]
+  (let [q (some-> q str string/trim)
+        limit (-> (or limit 1) (max 1) (min 200))]
+    (if (< (count q) 2)
+      {:candidates [] :truncated? false}
+      (let [candidate-limit (inc limit)
+            exact (->> (exec-search-blocks-fuzzy
+                        db
+                        "select id, page, title from blocks where title = ? COLLATE NOCASE limit ?"
+                        [q candidate-limit])
+                       (fuzzy-block-rows->results q))
+            matches (->> (if (= 2 (count q))
+                           ;; FTS trigrams cannot match two characters. The
+                           ;; existing NOCASE title index serves this prefix.
+                           (exec-search-blocks-fuzzy
+                            db
+                            "select id, page, title from blocks where title like ? escape '\\' limit ?"
+                            [(str (apply str (map like-escape-char q)) "%") candidate-limit])
+                           (exec-search-blocks-fuzzy
+                            db
+                            "select id, page, title from blocks_fts where title match ? limit ?"
+                            [(fts-phrase-input q) candidate-limit]))
+                         (fuzzy-block-rows->results q))
+            candidates (->> (concat exact matches)
+                            (common-util/distinct-by :id)
+                            vec)]
+        {:candidates (->> candidates
+                          (take limit)
+                          (mapv #(select-keys % [:id :title])))
+         :truncated? (> (count candidates) limit)}))))
+
 (defn- search-blocks-fuzzy-aux
   [db q page limit]
   (let [q (some-> q
@@ -661,6 +697,52 @@ ALTER TABLE blocks_fts_next RENAME TO blocks_fts;"))
 
 (def ^:private search-result-block-key ::block)
 
+(defn- literature-value-text
+  [paper attribute]
+  (let [value (get paper attribute)
+        values (if (and (coll? value) (not (map? value))) value [value])]
+    (->> values
+         (keep (fn [item]
+                 (cond
+                   (string? item) item
+                   item (:block/title item))))
+         (remove string/blank?)
+         distinct
+         sort
+         (string/join ", ")
+         not-empty)))
+
+(defn literature-paper-result
+  [paper]
+  (let [detail (->> [:logseq.property/literature-authors
+                     :logseq.property/literature-date
+                     :logseq.property/literature-citekey]
+                    (keep #(literature-value-text paper %))
+                    (string/join " · ")
+                    not-empty)]
+    (cond-> (select-keys paper [:block/uuid :block/title])
+      detail (assoc :literature/detail detail))))
+
+(defn- search-content-context
+  [block]
+  (cond
+    (true? (:logseq.property/literature-item? block))
+    (assoc (select-keys (literature-paper-result block) [:literature/detail])
+           :logseq.property/literature-item? true)
+
+    (= "pdf" (:logseq.property.asset/type block))
+    (let [detail (->> (:logseq.property/_literature-assets block)
+                      (filter #(true? (:logseq.property/literature-item? %)))
+                      (remove ldb/hidden?)
+                      (map :block/title)
+                      distinct
+                      (string/join " · ")
+                      not-empty)]
+      (cond-> {:logseq.property.asset/type "pdf"}
+        detail (assoc :literature/detail detail)))
+
+    :else {}))
+
 (def ^:private search-result-pull-selector
   '[:db/id
     :block/uuid
@@ -671,6 +753,18 @@ ALTER TABLE blocks_fts_next RENAME TO blocks_fts;"))
     {:block/tags [:db/id :db/ident :block/title :logseq.property/icon]}
     {:block/alias [:block/uuid :block/title]}
     {:block/_alias [:block/uuid :block/title]}
+    :logseq.property/literature-item?
+    :logseq.property.asset/type
+    {:logseq.property/literature-authors [:block/title]}
+    {:logseq.property/literature-date [:block/title]}
+    {:logseq.property/literature-citekey [:block/title]}
+    {:logseq.property/_literature-assets [:block/uuid :block/title
+                                         :logseq.property/literature-item?
+                                         :logseq.property/hide?
+                                         {:block/parent [:db/id :logseq.property/hide?
+                                                         :logseq.property/deleted-at
+                                                         {:block/parent ...}]}
+                                         :logseq.property/deleted-at]}
     :logseq.property/icon
     :logseq.property.node/display-type
     :logseq.property/hide?
@@ -921,7 +1015,12 @@ ALTER TABLE blocks_fts_next RENAME TO blocks_fts;"))
                                            :logseq.property/icon])
                           (:block/tags block)))
               icon (:logseq.property/icon block)
-              alias (or alias-source alias-match)
+              content-context (search-content-context
+                               (if alias-source
+                                 (d/entity @conn [:block/uuid (:block/uuid alias-source)])
+                                 block))
+              alias (when-let [matched (or alias-source alias-match)]
+                      (merge matched content-context))
               unique-title (db-block-title/block-unique-title
                             @conn
                             block
@@ -930,12 +1029,13 @@ ALTER TABLE blocks_fts_next RENAME TO blocks_fts;"))
                              :truncate? false})
               breadcrumb-ancestors (when (:include-breadcrumb? option)
                                    (block-breadcrumb/block-breadcrumb @conn block))]
-          (cond-> {:db/id (:db/id block)
+          (cond-> (merge {:db/id (:db/id block)
                    :block/uuid (:block/uuid block)
                    :block/title display-title
                    :block.temp/original-title (:block/title block)
                    :block.temp/unique-title unique-title
-                   :page? (ldb/page? block)}
+                         :page? (ldb/page? block)}
+                        content-context)
             (:include-breadcrumb? option)
             (assoc :block.temp/breadcrumb breadcrumb-ancestors
                    :block.temp/breadcrumb-ref-titles

@@ -388,6 +388,9 @@
               {:classes {:First {:block/uuid first-uuid}
                          :Second {:block/uuid second-uuid}}
                :pages-and-blocks []})
+        _ (d/transact! conn [{:db/ident :logseq.class/Class
+                             :block/uuid (random-uuid)
+                             :block/title "Synthetic class"}])
         db-before @conn
         first-id (:db/id (d/entity db-before [:block/uuid first-uuid]))
         second-id (:db/id (d/entity db-before [:block/uuid second-uuid]))
@@ -398,7 +401,7 @@
              [[first-id second-id] #{first-ref second-ref}]
              [first-ref first-ref]
              [[first-ref second-ref] #{first-ref second-ref}]
-             [[:logseq.class/Tag :logseq.class/Task] #{:logseq.class/Tag :logseq.class/Task}]
+             [[:logseq.class/Tag :logseq.class/Class] #{:logseq.class/Tag :logseq.class/Class}]
              [first-id first-ref]
              [#{first-id} #{first-ref}]
              [(list first-id) #{first-ref}]

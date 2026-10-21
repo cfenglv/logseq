@@ -26,6 +26,7 @@
             [frontend.handler.events.rtc-error :as rtc-error]
             [frontend.handler.export :as export]
             [frontend.handler.graph :as graph-handler]
+            [frontend.handler.literature :as literature-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.page :as page-handler]
             [frontend.handler.plugin :as plugin-handler]
@@ -125,6 +126,7 @@
 
 (defn- graph-switch
   [graph]
+  (literature-handler/stop-zotero-sync! :graph-switch)
   (state/set-current-repo! graph)
   (page-handler/init-commands!)
   ;; load config
@@ -145,7 +147,7 @@
    (state/set-state! :sync-graph/init? false)
    (when (:rtc-download? opts)
      (repo-handler/refresh-repos!)
-     (p/do!
+      (p/do!
       (p/let [repo (state/get-current-repo)
               _ (<build-search-index! repo)]
         (when state/lsp-enabled?
@@ -198,7 +200,9 @@
 (defevent! :graph/ready
   [[_ repo]]
   ;; FIXME: an ugly implementation for redirecting to page on new window is restored
-  (repo-handler/graph-ready! repo))
+  (let [result (repo-handler/graph-ready! repo)]
+    (literature-handler/reconcile-zotero-lifecycle! repo)
+    result))
 
 (defevent! :instrument [[_ {:keys [type payload] :as opts}]]
   (when-not (empty? (dissoc opts :type :payload))

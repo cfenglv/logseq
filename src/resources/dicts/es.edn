@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "Editar export.css"
  :settings.general/edit-global-config-edn "Editar config.edn global"
  :settings.general/editor-font "Fuente del editor"
- :settings.general/editor-font-set-global "Establecer como fuente global"
  :settings.general/export-theme "Tema exportación"
  :settings.general/language "Idioma"
  :settings.general/native-titlebar "Barra de título nativa"

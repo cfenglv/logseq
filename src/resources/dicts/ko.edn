@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "export.css 수정"
  :settings.general/edit-global-config-edn "전역 config.edn 수정"
  :settings.general/editor-font "편집기 글꼴"
- :settings.general/editor-font-set-global "전체 글꼴로 설정"
  :settings.general/export-theme "웹 배포 테마"
  :settings.general/language "언어"
  :settings.general/native-titlebar "기본 타이틀바"

@@ -242,12 +242,15 @@
 (defn ensure-started!
   ([manager repo window-id] (ensure-started! manager repo window-id nil))
   ([manager repo window-id opts]
-   (try
-     (begin-runtime-claim! manager)
-     (-> (ensure-started-without-claim! manager repo window-id opts)
-         (p/finally (fn [] (end-runtime-claim! manager))))
-     (catch :default error
-       (p/rejected error)))))
+   (if-let [quit-finished (:quit-finished @(:claim-state manager))]
+     (p/let [_ quit-finished]
+       (ensure-started! manager repo window-id opts))
+     (try
+       (begin-runtime-claim! manager)
+       (-> (ensure-started-without-claim! manager repo window-id opts)
+           (p/finally (fn [] (end-runtime-claim! manager))))
+       (catch :default error
+         (p/rejected error))))))
 
 (defn- parse-runtime-lock
   [{:keys [base-url]}]
@@ -288,28 +291,18 @@
 (defn- close-runtime-claim-gate!
   [{:keys [claim-state]}]
   (js/Promise.
-   (fn [resolve reject]
-     (let [accepted? (atom false)
-           ready? (atom false)]
+   (fn [resolve _reject]
+     (let [ready? (atom false)]
        (swap! claim-state
               (fn [state]
-                (if (:open? state)
+                (if (zero? (:inflight state))
                   (do
-                    (reset! accepted? true)
-                    (if (zero? (:inflight state))
-                      (do
-                        (reset! ready? true)
-                        (assoc state :open? false))
-                      (-> state
-                          (assoc :open? false)
-                          (update :waiters conj resolve))))
-                  state)))
-       (cond
-         (not @accepted?)
-         (reject (ex-info "db-worker runtime claim gate is already closed"
-                          {:code :updater-quiescing}))
-
-         @ready?
+                    (reset! ready? true)
+                    (assoc state :open? false))
+                  (-> state
+                      (assoc :open? false)
+                      (update :waiters conj resolve)))))
+       (when @ready?
          (resolve true))))))
 
 (defn- active-owner-token
@@ -324,18 +317,21 @@
   (when @install-attempt
     (throw (ex-info "an updater quiesce attempt is already active"
                     {:code :updater-quiescing})))
-  (-> (close-runtime-claim-gate! manager)
-      (p/then
-       (fn [_]
-         (let [state' (ensure-state @state)
-               token (active-owner-token state')
-               repo-options (into {}
-                                  (map (fn [[repo entry]] [repo (:opts entry)]))
-                                  (:repos state'))]
-           (reset! install-attempt {:token token
-                                    :repo-options repo-options
-                                    :phase :captured})
-           token)))))
+  (if (update-quiescing? manager)
+    (p/rejected (ex-info "db-worker runtime claim gate is already closed"
+                         {:code :updater-quiescing}))
+    (-> (close-runtime-claim-gate! manager)
+        (p/then
+         (fn [_]
+           (let [state' (ensure-state @state)
+                 token (active-owner-token state')
+                 repo-options (into {}
+                                    (map (fn [[repo entry]] [repo (:opts entry)]))
+                                    (:repos state'))]
+             (reset! install-attempt {:token token
+                                      :repo-options repo-options
+                                      :phase :captured})
+             token))))))
 
 (defn- require-active-attempt!
   [{:keys [install-attempt]} token]
@@ -384,20 +380,37 @@
 (defn ensure-repo-stopped!
   [{:keys [state stop-daemon!]} repo]
   (let [key (repo-key repo)
-        runtime (get-in (ensure-state @state) [:repos key :runtime])]
-    (if-not runtime
-      (p/resolved false)
-      (p/let [stopped? (if (owned-runtime? runtime)
-                         (stop-daemon! runtime)
-                         (p/resolved true))]
-        (when-not (true? stopped?)
-          (throw (ex-info "Worker stop did not complete" {:code :server-stop-failed :repo repo})))
-        (when-let [close! (:close-observer! runtime)] (close!))
-        (swap! state (fn [current]
-                       (if (identical? runtime (get-in current [:repos key :runtime]))
-                         (first (detach-repo current key))
-                         current)))
-        true))))
+        entry (get-in (ensure-state @state) [:repos key])
+        runtime (:runtime entry)
+        require-stop! (fn [stopped?]
+                        (when-not (true? stopped?)
+                          (throw (ex-info "Worker stop did not complete"
+                                          {:code :server-stop-failed :repo repo})))
+                        true)]
+    (cond
+      (not runtime) (p/resolved false)
+      (:stopping entry) (p/then (:stopping entry) require-stop!)
+      :else
+      (let [stopping (p/deferred)]
+        (swap! state assoc-in [:repos key :stopping] stopping)
+        (-> (p/let [stopped? (if (owned-runtime? runtime)
+                              (stop-daemon! runtime)
+                              (p/resolved true))]
+              (require-stop! stopped?)
+              (when-let [close! (:close-observer! runtime)] (close!))
+              (swap! state (fn [current]
+                             (if (identical? runtime (get-in current [:repos key :runtime]))
+                               (first (detach-repo current key))
+                               current)))
+              (p/resolve! stopping true)
+              true)
+            (p/catch (fn [error]
+                       (swap! state (fn [current]
+                                      (if (identical? stopping (get-in current [:repos key :stopping]))
+                                        (update-in current [:repos key] dissoc :stopping)
+                                        current)))
+                       (p/resolve! stopping false)
+                       (throw error))))))))
 
 (defn stop-all!
   [{:keys [state] :as manager}]
@@ -410,6 +423,25 @@
                 (if-let [error (some :error results)]
                   (throw error)
                   true)))))
+
+(defn <stop-for-quit!
+  "Stop new claims and drain started claims before stopping owned runtimes.
+  New claims wait for an ordinary quit to finish, so a cancelled quit can recover.
+  Joining a gate already closed by the updater still waits for its claims."
+  [{:keys [claim-state] :as manager}]
+  (let [closed-here? (:open? @claim-state)
+        quit-finished (when closed-here? (p/deferred))]
+    (when quit-finished
+      (swap! claim-state assoc :quit-finished quit-finished))
+    (-> (close-runtime-claim-gate! manager)
+        (p/then (fn [_] (stop-all! manager)))
+        (p/handle (fn [result error]
+                    (when (and error closed-here?)
+                      (swap! claim-state assoc :open? true))
+                    (when quit-finished
+                      (swap! claim-state dissoc :quit-finished)
+                      (p/resolve! quit-finished true))
+                    (if error (throw error) result))))))
 
 (defn invalidate-repo!
   [{:keys [state]} repo & {:keys [keep-observer?]}]

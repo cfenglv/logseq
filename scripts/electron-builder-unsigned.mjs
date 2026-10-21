@@ -33,10 +33,15 @@ const unsignedElectronBuilderBaseArgs = [
   "-c.mac.hardenedRuntime=false",
 ];
 
-export const unsignedElectronBuilderArgs = (extraArgs = []) => [
-  ...unsignedElectronBuilderBaseArgs,
-  ...extraArgs,
-];
+export const unsignedElectronBuilderArgs = (extraArgs = []) => {
+  const x64Only = extraArgs.includes("--x64") &&
+    !extraArgs.some((value) => /(?:^--(?:arm64|universal)(?:=|$)|:(?:arm64|universal)$)/.test(value));
+  return [
+    ...unsignedElectronBuilderBaseArgs,
+    ...(x64Only ? [] : ["-c.mac.identity=-"]),
+    ...extraArgs,
+  ];
+};
 
 export const unsignedBuildEnv = (baseEnv = process.env) => {
   const env = {

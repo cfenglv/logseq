@@ -27,6 +27,56 @@
       :blocks [{:block/title "other-linked mentions [[SelfRefTarget]]"}
                {:block/title "other-unlinked mentions SelfRefTarget"}]}]}))
 
+(deftest literature-references-include-existing-pdf-and-annotation-usage
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "Literature"}
+                 :blocks [{:block/title "Paper"}
+                          {:block/title "PDF one"}
+                          {:block/title "PDF two"}
+                          {:block/title "PDF annotation"}]}
+                {:page {:block/title "Reading notes"}
+                 :blocks [{:block/title "Paper and PDF"}
+                          {:block/title "Other PDF"}
+                          {:block/title "Quoted annotation"}
+                          {:block/title "Deleted note"}]}]})
+        eid (fn [title] (:db/id (db-test/find-block-by-content @conn (re-pattern (str "^" title "$")))))
+        paper (eid "Paper")
+        pdf-one (eid "PDF one")
+        pdf-two (eid "PDF two")
+        annotation (eid "PDF annotation")
+        note-one (eid "Paper and PDF")
+        note-two (eid "Other PDF")
+        note-three (eid "Quoted annotation")
+        deleted-note (eid "Deleted note")]
+    (d/transact! conn [[:db/add paper :logseq.property/literature-item? true]
+                       [:db/add paper :logseq.property/literature-assets pdf-one]
+                       [:db/add paper :logseq.property/literature-assets pdf-two]
+                       [:db/add paper :block/refs pdf-one]
+                       [:db/add annotation :logseq.property/ls-type :annotation]
+                       [:db/add annotation :logseq.property/asset pdf-one]
+                       [:db/add annotation :block/refs pdf-one]
+                       [:db/add note-one :block/refs paper]
+                       [:db/add note-one :block/refs pdf-one]
+                       [:db/add note-two :block/refs pdf-two]
+                       [:db/add note-three :block/refs annotation]
+                       [:db/add deleted-note :block/refs pdf-one]
+                       [:db/add deleted-note :logseq.property/deleted-at 1]])
+    (is (= #{note-one note-two note-three}
+           (ref-block-ids (db-reference/get-linked-references @conn paper))))
+    (is (= 3 (count (db-reference/literature-reference-block-ids @conn paper))))
+    (is (= 1 (common-initial-data/get-block-refs-count @conn paper)))
+    (is (= 1 (common-initial-data/get-block-refs-count @conn paper 2)))
+    (is (= 1 (common-initial-data/get-block-refs-count @conn paper 3)))
+    (is (= 1 (count (common-initial-data/get-block-refs @conn paper))))
+    (d/transact! conn [[:db/retract paper :logseq.property/literature-assets pdf-one]])
+    (is (= #{note-one note-two}
+           (ref-block-ids (db-reference/get-linked-references @conn paper))))
+    (is (= 2 (count (db-reference/literature-reference-block-ids @conn paper))))
+    (is (= 1 (common-initial-data/get-block-refs-count @conn paper)))
+    (is (= #{paper pdf-one} (set (map :db/id (:block/refs (d/entity @conn note-one)))))
+        "Detaching a PDF must not rewrite the note's original references.")))
+
 (deftest get-linked-references-excludes-blocks-on-the-page-itself
   (let [conn (create-self-ref-conn)
         target (db-test/find-page-by-title @conn "SelfRefTarget")

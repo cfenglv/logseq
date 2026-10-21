@@ -14,6 +14,7 @@
    [logseq.common.config :as common-config]
    [logseq.common.util :as common-util]
    [logseq.db :as ldb]
+   [logseq.db.frontend.asset :as db-asset]
    [promesa.core :as p]))
 
 (def max-asset-size (* 100 1024 1024))
@@ -359,7 +360,7 @@
         length))))
 
 (defn download-remote-asset!
-  [repo graph-id asset-uuid asset-type]
+  [repo graph-id asset-uuid asset-type & [verify-content?]]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
     (if (and (seq base) (seq graph-id) (seq asset-type))
       (-> (p/let [aes-key (graph-aes-key
@@ -388,7 +389,18 @@
                   (if (not aes-key)
                     body
                     (let [asset-file-untransited (ldb/read-transit-str (.decode (js/TextDecoder.) body))]
-                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))]
+                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))
+                  ent (when verify-content?
+                        (let [conn (worker-state/get-datascript-conn repo)]
+                          (d/entity @conn [:block/uuid asset-uuid])))
+                  checksum (:logseq.property.asset/checksum ent)
+                  file-checksum (when (and verify-content? checksum)
+                                  (db-asset/<get-file-array-buffer-checksum asset-file))
+                  _ (when (and verify-content? checksum (not= checksum file-checksum))
+                      (throw (ex-info "downloaded asset content mismatch"
+                                      {:type :rtc.exception/download-asset-failed
+                                       :data {:reason :content-mismatch
+                                              :asset-uuid asset-uuid}})))]
             (<write-asset-bytes! repo asset-id asset-type asset-file))
           (p/catch
            (fn [e]
@@ -412,7 +424,7 @@
               :error error}))
 
 (defn request-asset-download!
-  [repo asset-uuid {:keys [current-client-f enqueue-asset-task-f broadcast-rtc-state!-f]}]
+  [repo asset-uuid {:keys [replace-existing? current-client-f enqueue-asset-task-f broadcast-rtc-state!-f]}]
   (when-let [client (current-client-f repo)]
     (when-let [graph-id (:graph-id client)]
       (enqueue-asset-task-f
@@ -427,12 +439,14 @@
                                  (platform/asset-stat (platform/current)
                                                       repo
                                                       (asset-file-name asset-id asset-type)))
-                          missing-local? (and should-download? (nil? meta))
-                          _ (when missing-local?
-                              (download-remote-asset! repo graph-id asset-uuid asset-type))
-                          _ (when missing-local?
+                          download? (and should-download? (or replace-existing? (nil? meta)))
+                          _ (when download?
+                              (if (and replace-existing? (= "pdf" asset-type))
+                                (download-remote-asset! repo graph-id asset-uuid asset-type true)
+                                (download-remote-asset! repo graph-id asset-uuid asset-type)))
+                          _ (when download?
                               (client-op/remove-asset-op repo asset-uuid))
-                          _ (when missing-local?
+                          _ (when download?
                               (broadcast-rtc-state!-f client))]
                     nil)
                   (p/catch (fn [e]

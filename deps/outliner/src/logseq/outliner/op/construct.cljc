@@ -11,7 +11,12 @@
             [logseq.db.frontend.property :as db-property]))
 
 (def ^:api semantic-outliner-ops
-  #{:save-block
+  #{:literature-register-source-record
+    :literature-register-identified-pdf
+    :literature-register-verified-pdf
+    :literature-auto-link-pdf
+    :literature-merge-duplicate-pdf
+    :save-block
     :insert-blocks
     :apply-template
     :move-blocks
@@ -221,7 +226,10 @@
 
 (defn- sanitize-insert-block-payload
   [db tx-data created-uuids block]
-  (let [block' (sanitize-block-payload db block {:created-uuids created-uuids
+  (let [paper (when (:logseq.property/literature-item? block)
+                (d/entity db [:block/uuid (:block/uuid block)]))
+        block (cond-> block paper (assoc :block/refs (:block/refs paper)))
+        block' (sanitize-block-payload db block {:created-uuids created-uuids
                                                :tx-data tx-data})]
     (if (map? block')
       (dissoc block' :block/page :block/order)
@@ -627,6 +635,46 @@
 (defn- ^:large-vars/cleanup-todo canonicalize-semantic-outliner-op
   [db tx-data [op args]]
   (case op
+    :literature-register-source-record
+    (let [[binding-uuid destination-page-uuid source-record] args
+          created-paper? (some (fn [{:keys [e a v added]}]
+                                 (when (and added (= a :logseq.property/literature-item?) (true? v))
+                                   (some #(= (:source-key source-record) (:block/title %))
+                                         (:logseq.property/literature-source-key (d/entity db e)))))
+                               tx-data)
+          fields (cond-> [:classification :source-key :doi :arxiv :paper-uuid :create?]
+                   created-paper? (into [:title :authors :date :publication :type :url :citekey]))]
+      [op [binding-uuid destination-page-uuid
+           (select-keys source-record fields)]])
+
+    :literature-register-identified-pdf
+    (let [[asset-uuid title identifiers metadata] args]
+      [op (cond-> [asset-uuid title (select-keys identifiers [:doi :arxiv])]
+            (seq metadata)
+            (conj (select-keys metadata [:authors :date :publication :type :url])))])
+
+    :literature-auto-link-pdf
+    (let [[asset-uuid paper-uuid context] args]
+      [op [asset-uuid paper-uuid
+           (cond-> (select-keys context [:binding-uuid :source-key :reference-uuid])
+             (:asset-block context)
+             (assoc :asset-block (select-keys (:asset-block context)
+                                             [:block/uuid :block/title :block/tags
+                                              :logseq.property.asset/type
+                                              :logseq.property.asset/size
+                                              :logseq.property.asset/checksum])))]])
+
+    :literature-register-verified-pdf
+    (let [[asset-uuid evidence metadata] args]
+      [op [asset-uuid
+           (-> (select-keys evidence [:identifiers :title :author-texts
+                                      :extraction-status :usable?
+                                      :title-conflict? :identifier-ambiguous?])
+               (update :identifiers select-keys [:doi :arxiv]))
+           (select-keys metadata [:provider :doi :arxiv :arxiv-record-id
+                                  :title :authors
+                                  :type :date :publication :url])]])
+
     :save-block
     (let [[block opts] args
           created-uuids (created-block-uuids-from-tx-data tx-data)]

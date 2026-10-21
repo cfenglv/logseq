@@ -7,6 +7,7 @@
             [frontend.components.e2ee :as e2ee]
             [frontend.components.email :as email-component]
             [frontend.components.user-profile :as user-profile]
+            [frontend.components.literature :as literature-component]
             [frontend.components.shortcut :as shortcut]
             [frontend.components.svg :as svg]
             [frontend.config :as config]
@@ -267,70 +268,124 @@
                                    :shortcut-id :ui/toggle-wide-mode)])])
 
 (hsx/defc editor-font-family-row [t settings]
-  (let [[chooser set-chooser!] (hooks/use-state nil)
+  (let [_preferred-language (rfx/use-sub [:preferred-language])
+        [region set-region!] (hooks/use-state :editor)
+        [custom-region set-custom-region!] (hooks/use-state nil)
+        [chooser set-chooser!] (hooks/use-state nil)
         [query set-query!] (hooks/use-state "")
         [font-error set-font-error!] (hooks/use-state nil)
-        choose! (fn [region]
+        family-select (hooks/use-ref nil)
+        {:keys [family size]} (get settings region)
+        code? (= region :code)
+        field-id (str "font-" (name region))
+        regions [[:editor (t :settings.general/font-notes)]
+                 [:interface (t :settings.general/font-interface)]
+                 [:code (t :settings.general/font-code)]]
+        description (case region
+                      :editor (t :settings.general/font-notes-description)
+                      :interface (t :settings.general/font-interface-description)
+                      :code (t :settings.general/font-code-desc))
+        switch! (fn [next-region]
+                  (set-region! next-region)
+                  (set-custom-region! nil)
+                  (set-chooser! nil)
+                  (set-query! "")
+                  (set-font-error! nil))
+        close-custom! (fn []
+                        (set-custom-region! nil)
+                        (set-chooser! nil)
+                        (set-font-error! nil)
+                        (.focus (.-current family-select)))
+        choose! (fn []
                   (set-font-error! nil)
                   (if-not (fn? (.-queryLocalFonts js/window))
-                    (set-font-error! :settings.general/font-list-unavailable)
+                    (set-font-error! {:region region :i18n-key :settings.general/font-list-unavailable})
                     (-> (p/let [fonts (js/window.queryLocalFonts)]
                           (set-query! "")
                           (set-chooser! {:region region :families (->> (array-seq fonts) (map #(.-family %)) distinct sort vec)}))
-                        (p/catch (fn [_] (set-font-error! :settings.general/font-list-denied))))))]
-    [:div.it.font-settings.flex.flex-col.gap-4
-     [:h3.font-medium (t :settings.general/editor-font)]
-     (for [[region label description] [[:editor :settings.general/font-notes :settings.general/font-notes-description]
-                                      [:interface :settings.general/font-interface :settings.general/font-interface-description]]
-           :let [{:keys [family size]} (get settings region)
-                 field-id (str "font-" (name region))]]
-       [:section.flex.flex-col.gap-2 {:key region :data-font-region (name region)}
-        [:h4.font-medium (t label)]
-        [:p.text-sm.opacity-70 (t description)]
-        [:div.flex.flex-wrap.gap-2
-         [:label.sr-only {:for (str field-id "-preset")} (t :settings.general/font-family)]
-         [:select.rounded.border.px-2.py-1 {:id (str field-id "-preset") :value (if (keyword? family) (name family) (if (string? family) "custom" "default"))
-                                           :on-change #(state/set-editor-font! region :family (keyword (.. % -target -value)))}
-          [:option {:value "default"} (t :settings.general/font-default)]
-          [:option {:value "serif"} (t :settings.general/font-serif)]
-          [:option {:value "mono"} (t :settings.general/font-mono)]
-          (when (string? family) [:option {:value "custom" :disabled true} (t :settings.general/font-custom)])]
-         [:input.rounded.border.px-2.py-1 {:key family :id (str field-id "-name") :type "text" :default-value (if (string? family) family "")
-                                         :aria-label (t :settings.general/font-family)
-                                         :placeholder (t :settings.general/font-name-placeholder)
-                                         :on-blur #(let [value (string/trim (.. % -target -value))]
-                                                     (when (not= value (if (string? family) family ""))
-                                                       (state/set-editor-font! region :family (when (seq value) value))))
-                                         :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
-         (shui/button {:variant :outline :on-click #(choose! region)} (t :settings.general/font-installed))
-         (shui/button {:variant :ghost :on-click #(state/set-editor-font! region :family nil)} (t :settings.general/font-reset-family))]
-        [:div.flex.items-center.gap-2
-         [:label {:for (str field-id "-size")} (t :settings.general/font-size)]
-         [:input.rounded.border.px-2.py-1.w-24 {:key size :id (str field-id "-size") :type "number" :min 8 :max 48 :step 1
-                                             :default-value (or size "") :placeholder (t :settings.general/font-default)
-                                             :on-blur #(let [input (.-target %)]
-                                                         (if (.checkValidity input)
-                                                           (state/set-editor-font! region :size (when (seq (.-value input)) (.-valueAsNumber input)))
-                                                           (.reportValidity input)))
-                                             :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
-         [:span (t :settings.general/font-size-unit)]
-         (shui/button {:variant :ghost :on-click #(state/set-editor-font! region :size nil)} (t :settings.general/font-reset-size))]
-        [:p.font-preview {:style (cond-> {:font-family (or (typography/family-css family) "var(--ls-font-family)")}
-                                  size (assoc :font-size (str size "px")))} (t :settings.general/font-preview)]])
-     (when font-error [:p.text-sm {:role "status"} (t font-error)])
-     (when chooser
-       [:div.rounded.border.p-3.flex.flex-col.gap-2 {:role "dialog" :aria-label (t :settings.general/font-installed)}
-        [:div.flex.gap-2
-         [:input.rounded.border.px-2.py-1.flex-1 {:type "search" :value query :auto-focus true
-                                                 :aria-label (t :settings.general/font-search)
-                                                 :placeholder (t :settings.general/font-search)
-                                                 :on-change #(set-query! (.. % -target -value))}]
-         (shui/button {:variant :ghost :on-click #(set-chooser! nil)} (t :window/close))]
-        [:div.flex.flex-col.max-h-48.overflow-y-auto
-         (for [family (:families chooser) :when (string/includes? (string/lower-case family) (string/lower-case query))]
-           (shui/button {:key family :variant :ghost
-                         :on-click #(do (state/set-editor-font! (:region chooser) :family family) (set-chooser! nil))} family))]])
-     [:p.text-xs.opacity-70 (t :settings.general/font-local-description)]]))
+                        (p/catch (fn [_] (set-font-error! {:region region :i18n-key :settings.general/font-list-denied}))))))]
+    [:div.it.font-settings.flex.flex-col.gap-3.sm:grid.sm:grid-cols-3.sm:gap-6
+     {:on-key-down #(when (and (contains? #{"BUTTON" "SELECT"} (.. % -target -tagName))
+                              (contains? #{"Enter" "ArrowUp" "ArrowDown" "ArrowLeft" "ArrowRight"} (.-key %)))
+                      ;; Keep native control activation ahead of the outliner shortcuts.
+                      (.stopPropagation %))}
+     [:h3.text-sm.font-medium.leading-5.opacity-70 (t :settings.general/editor-font)]
+     [:div.font-settings-content.sm:col-span-2.min-w-0
+      [:section.font-settings-layout.font-region-editor.min-w-0 {:data-font-region (name region)}
+       [:p.sr-only {:id (str field-id "-description")} description]
+       [:div.font-region-controls
+        [:label.sr-only {:for "font-region"} (t :settings.general/font-region-label)]
+        [:select#font-region.form-select.is-small {:value (name region) :on-change #(switch! (keyword (.. % -target -value)))}
+         (for [[item label] regions] [:option {:key item :value (name item)} label])]]
+       [:div.font-family-controls
+        [:label.sr-only {:for (str field-id "-preset")} (t :settings.general/font-family)]
+        [:select.form-select.is-small.min-w-0
+         {:ref family-select :id (str field-id "-preset")
+          :aria-describedby (str field-id "-description")
+          :value (if (keyword? family) (name family) (if (string? family) "custom" "default"))
+          :on-change #(let [value (.. % -target -value)]
+                        (if (= value "other")
+                          (set-custom-region! region)
+                          (do (set-custom-region! nil)
+                              (state/set-editor-font! region :family (when-not (= value "default") (keyword value))))))}
+         [:option {:value "default"} (if code? (t :settings.general/font-code-default) (t :settings.general/font-default))]
+         (when-not code? [:option {:value "serif"} (t :settings.general/font-serif)])
+         [:option {:value "mono"} (t :settings.general/font-mono)]
+         (when (string? family) [:option {:value "custom" :disabled true} family])
+         [:option {:value "other"} (t :settings.general/font-other-action)]]
+        (shui/button {:variant :ghost :size :icon :class "font-reset"
+                      :title (t :settings.general/font-reset-family)
+                      :aria-label (t :settings.general/font-reset-family)
+                      :on-click #(state/set-editor-font! region :family nil)}
+                     (ui/icon "rotate-clockwise" {:size 14}))]
+       (when-not code?
+         [:form.font-size-controls {:on-submit #(.preventDefault %)
+                                    :on-reset #(state/set-editor-font! region :size nil)}
+          [:label.sr-only {:for (str field-id "-size")} (t :settings.general/font-size)]
+          [:input.form-input.is-small
+           {:key [region size] :id (str field-id "-size") :type "number" :min 8 :max 48 :step 1
+            :style {:width "5rem" :flex "none"}
+            :default-value (or size "") :placeholder (t :settings.general/font-size-placeholder)
+            :on-blur #(let [input (.-target %)]
+                        (if (.checkValidity input)
+                          (state/set-editor-font! region :size (when (seq (.-value input)) (.-valueAsNumber input)))
+                          (.reportValidity input)))
+            :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
+          [:span.whitespace-nowrap (t :settings.general/font-size-unit)]
+          (shui/button {:type "reset" :variant :ghost :size :icon :class "font-reset"
+                        :title (t :settings.general/font-reset-size)
+                        :aria-label (t :settings.general/font-reset-size)}
+                       (ui/icon "rotate-clockwise" {:size 14}))])
+        (when (= region custom-region)
+          [:div.font-custom-controls
+           {:on-key-down #(when (= "Escape" (.-key %)) (.stopPropagation %) (close-custom!))}
+           [:input.form-input.is-small.min-w-0
+            {:key [region family] :id (str field-id "-name") :type "text" :auto-focus true
+             :default-value (if (string? family) family "") :aria-label (t :settings.general/font-custom)
+             :placeholder (t :settings.general/font-name-placeholder)
+             :on-blur #(let [value (string/trim (.. % -target -value))]
+                         (when (not= value (if (string? family) family ""))
+                           (state/set-editor-font! region :family (when (seq value) value))))
+             :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
+           [:div.flex.flex-wrap.gap-1
+            (shui/button {:variant :outline :size :sm :on-click choose!} (t :settings.general/font-installed))
+            (shui/button {:variant :ghost :size :sm :on-click close-custom!} (t :ui/close))]
+           (when (= region (:region font-error)) [:p.text-xs {:role "status"} (t (:i18n-key font-error))])
+           (when (= region (:region chooser))
+             [:div.font-installed-list
+              [:input.form-input.is-small {:type "search" :value query :auto-focus true
+                                          :aria-label (t :settings.general/font-search) :placeholder (t :settings.general/font-search)
+                                          :on-change #(set-query! (.. % -target -value))}]
+              [:div.flex.flex-col.max-h-48.overflow-y-auto
+               (for [font (:families chooser) :when (string/includes? (string/lower-case font) (string/lower-case query))]
+                 (shui/button {:key font :variant :ghost :size :sm
+                               :on-click #(do (state/set-editor-font! region :family font) (close-custom!))} font))]])])
+        [:p.font-preview.text-sm
+         {:style (cond-> {:font-family (if code?
+                                        (or (typography/family-css family "monospace") "var(--ls-code-font-family, monospace)")
+                                        (or (typography/family-css family) "var(--ls-font-family)"))}
+                   size (assoc :font-size (str size "px")))}
+         (t :settings.general/font-preview)]]]]))
 
 (hsx/defc switch-spell-check-row
   [t]
@@ -1215,6 +1270,13 @@
        (http-server-switcher-row))
      (when (util/electron?)
        (markdown-mirror-row t))
+     (when current-repo
+       [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4
+        [:label.text-sm.font-medium (t :settings.literature/title)]
+        [:div.sm:col-span-2
+         (shui/button {:variant :outline :size :sm
+                       :on-click #(literature-component/open-library! current-repo)}
+                      (t :settings.literature/browse))]])
      (flashcards-switcher-row enable-flashcards?)
      (when (semantic-search-setting-supported? app-base-info)
        (semantic-search-row t semantic-search-enabled?))
@@ -1374,7 +1436,7 @@
        :items items
        :on-value-change on-value-change}
       (shui/select-trigger
-       {:class "h-9 w-full"}
+       {:class "h-9 w-full" :aria-label label}
        (shui/select-value (fn [selected] (get labels selected selected))))
       (shui/select-content
        {:container (.-body js/document)}
@@ -1428,6 +1490,7 @@
          [:label.text-sm.opacity-70 (t :sync.personal-access-token/expiration)]
          (shui/input
           {:type "date"
+           :aria-label (t :sync.personal-access-token/expiration)
            :value expiration
            :min (local-date-str (js/Date.))
            :max (local-date-str (js/Date. (+ (.now js/Date) pat-one-year-ms)))
@@ -1439,6 +1502,18 @@
        :on-click create!}
       (ui/icon "key" {:size 16})
       (t :sync.personal-access-token/create))]))
+
+(defn <copy-personal-access-token!
+  [token]
+  (-> (util/copy-to-clipboard! token)
+      (p/then (fn [copied?]
+                (notification/show!
+                 (t (if copied?
+                      :sync.personal-access-token/copied
+                      :sync.personal-access-token/copy-error))
+                 (if copied? :success :error))))
+      (p/catch (fn [_]
+                 (notification/show! (t :sync.personal-access-token/copy-error) :error)))))
 
 (hsx/defc personal-access-token-created
   [created-token]
@@ -1452,11 +1527,7 @@
        {:variant "outline"
         :size :sm
         :title (t :ui/copy)
-        :on-click (fn []
-                    (util/copy-to-clipboard! token)
-                    (notification/show!
-                     (t :sync.personal-access-token/copied)
-                     :success))}
+        :on-click #(<copy-personal-access-token! token)}
        (ui/icon "copy" {:size 16}))]]))
 
 (hsx/defc personal-access-token-list

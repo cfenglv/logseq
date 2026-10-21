@@ -1616,7 +1616,6 @@
  :settings.general/edit-export-css "export.cssを編集"
  :settings.general/edit-global-config-edn "グローバルなconfig.ednを編集"
  :settings.general/editor-font "エディターフォント"
- :settings.general/editor-font-set-global "グローバルフォントファミリーとして設定"
  :settings.general/export-theme "テーマの出力"
  :settings.general/language "言語"
  :settings.general/native-titlebar "ネイティブタイトルバー"

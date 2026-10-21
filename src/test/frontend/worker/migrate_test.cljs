@@ -6,6 +6,7 @@
             [frontend.worker.pipeline :as worker-pipeline]
             [logseq.db :as ldb]
             [logseq.db.common.order :as db-order]
+            [logseq.db.frontend.property :as db-property]
             [logseq.db.frontend.schema :as db-schema]
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]))
 
@@ -18,6 +19,43 @@
           [?e ?attr]]
         db
         attr)))
+
+(deftest literature-migration-preserves-existing-data-and-stable-identities
+  (let [conn (d/create-conn db-schema/schema)
+        asset-uuid #uuid "76000000-0000-4000-8000-000000000001"
+        note-uuid #uuid "76000000-0000-4000-8000-000000000002"]
+    (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+    (d/transact! conn
+                 (mapv (fn [ident] [:db/retractEntity ident])
+                       db-property/literature-property-idents))
+    (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                        :kv/value {:major 65 :minor 33}}
+                       {:block/uuid asset-uuid
+                        :block/title "Existing PDF"
+                        :block/tags :logseq.class/Asset
+                        :logseq.property.asset/type "pdf"
+                        :logseq.property.asset/size 120
+                        :logseq.property.asset/checksum "synthetic-existing-content"}
+                       {:block/uuid note-uuid
+                        :block/title "Existing citation and annotation text"
+                        :block/link [:block/uuid asset-uuid]}])
+    (let [before @conn
+          other (d/conn-from-db before)
+          asset-before (d/pull before '[*] [:block/uuid asset-uuid])
+          note-before (d/pull before '[*] [:block/uuid note-uuid])]
+      (db-migrate/migrate conn :target-version {:major 65 :minor 35})
+      (db-migrate/migrate other :target-version {:major 65 :minor 35})
+      (is (= {:major 65 :minor 35}
+             (:kv/value (d/entity @conn :logseq.kv/schema-version))))
+      (is (= asset-before (d/pull @conn '[*] [:block/uuid asset-uuid])))
+      (is (= note-before (d/pull @conn '[*] [:block/uuid note-uuid])))
+      (doseq [ident db-property/literature-property-idents]
+        (is (true? (:logseq.property/built-in? (d/entity @conn ident))))
+        (is (= (:block/uuid (d/entity @conn ident))
+               (:block/uuid (d/entity @other ident)))))
+      (let [after @conn]
+        (is (nil? (db-migrate/migrate conn :target-version {:major 65 :minor 35})))
+        (is (= after @conn))))))
 
 (defn- extends-idents
   [db entity]

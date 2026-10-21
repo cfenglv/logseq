@@ -1,6 +1,7 @@
 (ns frontend.components.block.drop
   (:require [frontend.handler.editor :as editor-handler]
- [frontend.handler.editor.assets :as editor-assets]
+            [frontend.handler.editor.assets :as editor-assets]
+            [frontend.handler.literature :as literature-handler]
             [frontend.state :as state]
             [frontend.util :as util]
             [lambdaisland.glogi :as log]
@@ -12,10 +13,14 @@
 
 (defn- save-files!
   [files target-block]
-  (-> (editor-assets/db-based-save-assets! (state/get-current-repo) files
-                                            :last-edit-block target-block)
+  (let [repo (state/get-current-repo)]
+    (-> (editor-assets/db-based-save-assets! repo files
+                                            :last-edit-block target-block
+                                            :reuse-existing-pdf? true
+                                            :auto-identify-literature?
+                                            (literature-handler/auto-identification-enabled? repo))
       (p/catch (fn [error]
-                 (log/error :block/drop-files-failed {:error error}))))
+                 (log/error :block/drop-files-failed {:error error})))))
   nil)
 
 (defn handle-data-transfer-drop!

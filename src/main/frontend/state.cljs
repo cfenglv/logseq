@@ -135,6 +135,9 @@
                                               :progress 0
                                               :processed 0
                                               :total 0}
+      :literature/review-candidates          {}
+      :literature/import-state               {}
+      :literature/organization               {}
 
       ;; modals
       :modal/dropdowns                       {}

@@ -1,5 +1,5 @@
 (ns frontend.util.typography
-  "The two local typography settings and the known legacy conversion."
+  "Local typography overrides and the known legacy conversion."
   (:require [clojure.string :as string]))
 
 (def presets {:serif "Lyon-Text, Georgia, ui-serif, serif"
@@ -21,31 +21,36 @@
       (when-not (and family (or (nil? (:global value)) (boolean? (:global value))))
         (throw (ex-info "Invalid legacy typography" {})))
       (cond-> {:editor {:family family}} (:global value) (assoc :interface {:family family})))
-    (and (map? value) (every? #{:editor :interface} (keys value))
-         (every? (fn [[_ group]]
-                   (and (map? group) (every? #{:family :size} (keys group))
+    (and (map? value) (every? #{:editor :interface :code} (keys value))
+         (every? (fn [[region group]]
+                   (and (map? group) (every? (if (= region :code) #{:family} #{:family :size}) (keys group))
                         (every? (fn [[field setting]] (valid-value? field setting)) group))) value)) value
     :else (throw (ex-info "Invalid typography settings" {}))))
 
 (defn set-value [settings region field value]
-  (when-not (and (#{:editor :interface} region) (#{:family :size} field) (valid-value? field value))
+  (when-not (and (#{:editor :interface :code} region)
+                ((if (= region :code) #{:family} #{:family :size}) field)
+                (valid-value? field value))
     (throw (ex-info "Invalid typography value" {})))
   (let [group (if (nil? value) (dissoc (get settings region {}) field)
                   (assoc (get settings region {}) field value))]
     (if (seq group) (assoc settings region group) (dissoc settings region))))
 
-(defn family-css [family]
-  (cond
-    (or (nil? family) (= :default family)) nil
-    (keyword? family) (get presets family)
-    :else (str "\"" (-> family (string/replace "\\" "\\\\") (string/replace "\"" "\\\"")
-                            (string/replace #"[\n\r\f]" " ")) "\", var(--ls-font-family), sans-serif")))
+(defn family-css
+  ([family] (family-css family "var(--ls-font-family), sans-serif"))
+  ([family fallback]
+   (cond
+     (or (nil? family) (= :default family)) nil
+     (keyword? family) (get presets family)
+     :else (str "\"" (-> family (string/replace "\\" "\\\\") (string/replace "\"" "\\\"")
+                             (string/replace #"[\n\r\f]" " ")) "\", " fallback))))
 
 (defn css-properties [settings]
   {"--ls-note-font-family" (family-css (get-in settings [:editor :family]))
    "--ls-note-font-size" (some-> (get-in settings [:editor :size]) (str "px"))
    "--ls-interface-font-family" (family-css (get-in settings [:interface :family]))
-   "--ls-interface-font-size" (some-> (get-in settings [:interface :size]) (str "px"))})
+   "--ls-interface-font-size" (some-> (get-in settings [:interface :size]) (str "px"))
+   "--ls-code-font-family" (family-css (get-in settings [:code :family]) "monospace")})
 
 (defn apply! [document settings]
   (let [root (.-documentElement document)

@@ -9,6 +9,7 @@
             [frontend.components.editor :as editor]
             [frontend.components.graph-actions :as graph-actions]
             [frontend.components.library :as library]
+            [frontend.components.literature :as literature-component]
             [frontend.components.objects :as objects]
             [frontend.components.plugins :as plugins]
             [frontend.components.property :as property-component]
@@ -538,6 +539,11 @@
 
             (when (and block? (not sidebar?))
               (block-breadcrumb/breadcrumb {} repo (:block/uuid page) {:block page}))
+
+            (when (and (not sidebar?)
+                       (true? (:logseq.property/literature-item? page)))
+              [:div.flex.flex-wrap.items-center.justify-end.gap-2
+               (literature-component/item-actions repo (:block/uuid page))])
 
             (when (ldb/library? page)
               (library/add-pages page))

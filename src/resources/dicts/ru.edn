@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "Редактировать export.css"
  :settings.general/edit-global-config-edn "Редактировать глобальный config.edn"
  :settings.general/editor-font "Шрифт редактора"
- :settings.general/editor-font-set-global "Установить как глобальный шрифт"
  :settings.general/export-theme "Экспорт темы"
  :settings.general/language "Язык"
  :settings.general/native-titlebar "Нативный заголовок окна"

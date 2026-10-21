@@ -25,6 +25,7 @@
             [frontend.components.block.video :as block-video]
             [frontend.components.icon :as icon-component]
             [frontend.components.lazy-editor :as lazy-editor]
+            [frontend.components.literature :as literature-component]
             [frontend.components.macro :as macro]
             [frontend.components.plugins :as plugins]
             [frontend.components.property :as property-component]
@@ -58,6 +59,7 @@
             [frontend.handler.editor.assets :as editor-assets]
             [frontend.handler.editor.format :as editor-format]
             [frontend.handler.export.common :as export-common-handler]
+            [frontend.handler.literature :as literature-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.property :as property-handler]
@@ -586,6 +588,26 @@
                          (p/then load$)))))
                (js/console.error _e))))))))
 
+(hsx/defc literature-review-button
+  [repo asset-block]
+  (let [review (rfx/use-sub [:literature/review-candidates
+                             repo
+                             (str (:block/uuid asset-block))])
+]
+    (when repo
+      (shui/button
+       {:variant :ghost
+        :size :sm
+        :aria-label (t :asset.literature/review-action)
+        :data-literature-review (str (:block/uuid asset-block))
+        :data-literature-manual (str (nil? review))
+        :class "h-6 px-1.5 text-xs opacity-70 hover:opacity-100"
+        :on-click (fn [e]
+                    (util/stop e)
+                    (literature-component/open-review!
+                     repo (:block/uuid asset-block)))}
+       (t :asset.literature/review-action)))))
+
 (hsx/defc asset-link
   [config title href metadata full_text]
   (let [src* (hooks/use-memo #(atom nil) [href])
@@ -633,15 +655,18 @@
           (resizable-image config title src metadata full_text true)
 
           (= ext :pdf)
-          [:a.asset-ref.is-pdf
-           {:data-href href
-            :data-url src
-            :draggable true
-            :on-drag-start #(.setData (gobj/get % "dataTransfer") "file" href)
-            :on-click (fn [e]
-                        (util/stop e)
-                        (open-pdf-file e (:asset-block config) src))}
-           title]
+          [:span.inline-flex.items-center.gap-1
+           [:a.asset-ref.is-pdf
+            {:data-href href
+             :data-url src
+             :draggable true
+             :on-drag-start #(.setData (gobj/get % "dataTransfer") "file" href)
+             :on-click (fn [e]
+                         (util/stop e)
+                         (open-pdf-file e asset-block src))}
+            title]
+           (when-not (:literature-attachment? config)
+             (literature-review-button repo asset-block))]
 
           (util/mobile?)
           [:a.asset-ref {:href src
@@ -1377,13 +1402,20 @@
                 (notification/show! (t :block/ref-not-exist) :warning))}
    (str "[[" uuid-or-title "]]")])
 
+(hsx/defc linked-page-reference
+  [config uuid-or-title label source-uuid]
+  (when-let [source (db-hooks/use-block source-uuid)]
+    (page-reference-content config uuid-or-title label source)))
+
 (hsx/defc subscribed-page-reference
   [config uuid-or-title label page-uuid fallback-block]
   (let [{:keys [status value error]} (db-hooks/use-block-projection-snapshot page-uuid identity)]
     (case status
       :error (throw error)
       :missing (broken-page-reference config uuid-or-title)
-      (page-reference-content config uuid-or-title label (or value fallback-block)))))
+      (if-let [source-uuid (get-in value [:block/link :block/uuid])]
+        [linked-page-reference config uuid-or-title label source-uuid]
+        (page-reference-content config uuid-or-title label (or value fallback-block))))))
 
 (defn referenced-block
   [block uuid-or-title]
@@ -2824,6 +2856,10 @@
 
       (:logseq.property/query-block? block)
       (query-builder-component/builder block {})
+
+      (and (true? (:logseq.property/literature-item? block))
+           (string/blank? (:block/title block)))
+      [:span.block-title-wrap.opacity-75 (t :ui/untitled)]
 
       :else
       (block-title-aux config block {:query? query?

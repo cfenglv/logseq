@@ -12,7 +12,8 @@
             [frontend.worker.handler.render-resource.common :as common]
             [logseq.common.config :as common-config]
             [logseq.common.util :as common-util]
-            [logseq.db :as ldb]))
+            [logseq.db :as ldb]
+            [logseq.db.common.reference :as db-reference]))
 
 (defn- sidebar-page-summary
   [page]
@@ -234,16 +235,24 @@
   [db resource-key _runtime]
   (let [block-uuid (second resource-key)
         block (common/entity-by-uuid! db :block-uuid block-uuid)]
-    [#{[:refs block-uuid]}
+    [(if (:logseq.property/literature-item? block)
+       (into #{[:property-membership :logseq.property/asset]}
+             (mapcat (fn [id]
+                       (let [target-uuid (:block/uuid (d/entity db id))]
+                         [[:entity target-uuid] [:refs target-uuid]])))
+             (db-reference/literature-reference-target-ids db (:db/id block)))
+       #{[:refs block-uuid]})
      ;; Property pages keep Linked References hidden: the objects table
      ;; already lists every node that uses the property. Class/tag pages
      ;; still need this count so [[tag]] page-link refs can mount Linked
      ;; References. Tagged #tag instances are already excluded by
      ;; get-block-refs-count / get-linked-references, so they stay in the
      ;; objects table instead of double-listing here.
-     (if (ldb/property? block)
-       0
-       (ldb/get-block-refs-count db (:db/id block)))]))
+     (cond
+       (ldb/property? block) 0
+       (:logseq.property/literature-item? block)
+       (count (db-reference/literature-reference-block-ids db (:db/id block)))
+       :else (ldb/get-block-refs-count db (:db/id block)))]))
 
 (defn- block-unlinked-ref-exists
   [db resource-key {:keys [repo]}]

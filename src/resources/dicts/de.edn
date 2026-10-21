@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "export.css bearbeiten"
  :settings.general/edit-global-config-edn "Globale config.edn bearbeiten"
  :settings.general/editor-font "Schriftart"
- :settings.general/editor-font-set-global "Als globale Schriftart festlegen"
  :settings.general/export-theme "Theme exportieren"
  :settings.general/language "Sprache"
  :settings.general/native-titlebar "Native Titelleiste"

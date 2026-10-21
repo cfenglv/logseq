@@ -12,7 +12,53 @@
             [frontend.util :as util]
             [lambdaisland.glogi :as log]
             [logseq.db-sync.malli-schema :as db-sync-schema]
+            [logseq.shui.ui :as shui]
             [promesa.core :as p]))
+
+(defn ^:export request-repair!
+  []
+  (if-let [repo (when (util/electron?) (state/get-current-repo))]
+    (-> (shui/dialog-confirm!
+         (t :sync/repair-confirm-desc)
+         {:id :sync-repair
+          :title (t :sync/repair-confirm-title)
+          :cancel-label (t :ui/cancel)
+          :ok-label (t :ui/confirm)})
+        (p/then
+         (fn [_]
+           (if-not (= repo (state/get-current-repo))
+             (notification/show! (t :sync/repair-context-changed-warning) :warning)
+             (p/let [{local-operation :operation} (state/<invoke-db-worker :thread-api/db-sync-repair-status repo)]
+               (if-not (= repo (state/get-current-repo))
+                 (notification/show! (t :sync/repair-context-changed-warning) :warning)
+                 (if (= :local-only (:disposition local-operation))
+                   (do
+                     (notification/show! (t :sync/repair-start-feedback) :info)
+                     (state/<invoke-db-worker :thread-api/db-sync-retry-repair repo (:operation-id local-operation)))
+                   (p/let [{:keys [claimed? operation reason]}
+                           (state/<invoke-db-worker :thread-api/db-sync-request-repair repo)]
+                     (when (= repo (state/get-current-repo))
+                       (cond
+                         claimed?
+                         (notification/show! (t :sync/repair-start-feedback) :info)
+
+                         (= :local-only (:disposition operation))
+                         (notification/show! (t :sync/repair-local-only-warning) :warning false)
+
+                         operation
+                         (notification/show! (t :sync/repair-busy-feedback) :info)
+
+                         (= :context-changed reason)
+                         (notification/show! (t :sync/repair-context-changed-warning) :warning)
+
+                         :else
+                         (notification/show! (t :sync/repair-unavailable-warning) :warning))))))))))
+        (p/catch (fn [error]
+                   ;; The existing confirmation dialog rejects with false/nil on cancel.
+                   (when error
+                     (log/error :db-sync/repair-request-failed error)
+                     (notification/show! (t :sync/repair-request-error) :error)))))
+    (notification/show! (t :sync/repair-unavailable-warning) :warning)))
 
 (defn- ws->http-base [ws-url]
   (when (string? ws-url)

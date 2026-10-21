@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "Sunting export.css"
  :settings.general/edit-global-config-edn "Sunting global config.edn"
  :settings.general/editor-font "Font editor"
- :settings.general/editor-font-set-global "Atur sebagai keluarga font global"
  :settings.general/export-theme "Ekspor tema"
  :settings.general/language "Bahasa"
  :settings.general/native-titlebar "Bilah judul asli"

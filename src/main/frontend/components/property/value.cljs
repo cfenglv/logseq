@@ -1940,6 +1940,7 @@
            (seq (:block/tags value)))
        (when value
          (let [opts {:disable-preview? true
+                     :literature-attachment? (= :logseq.property/literature-assets (:db/ident property))
                      :tag? tag?
                      :with-tags? false
                      :property-position property-position

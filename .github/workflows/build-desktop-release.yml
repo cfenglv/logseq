@@ -21,13 +21,34 @@ on:
         required: true
         default: "master"
       selfhost-operation:
-        description: 'Selfhost .7 operation'
+        description: 'Selfhost release operation'
         type: choice
         required: true
         options:
           - stage-draft
+          - build-offline-bridge
           - bridge-published-.7
         default: stage-draft
+      bridge-source-full-sha:
+        description: 'Exact source commit for the one-time .7 bridge'
+        type: string
+        required: false
+      final-source-full-sha:
+        description: 'Exact source commit of the final release'
+        type: string
+        required: false
+      bridge-build-run-id:
+        description: 'Desktop release run that produced the bridge bundle'
+        type: string
+        required: false
+      bridge-build-artifact-id:
+        description: 'Exact bridge bundle artifact ID'
+        type: string
+        required: false
+      bridge-build-artifact-sha256:
+        description: 'Bridge artifact digest (sha256:...)'
+        type: string
+        required: false
       is-draft:
         description: 'Draft Release?'
         type: boolean
@@ -81,7 +102,7 @@ permissions:
 jobs:
   upstream-compile-cljs:
     name: compile-cljs (upstream desktop)
-    if: ${{ github.ref_name != 'release/2.0.2-selfhost.1' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.1' }}
+    if: ${{ github.ref_name != 'release/2.0.2-selfhost.1' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.1' && github.event.inputs.selfhost-operation != 'build-offline-bridge' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Check build options
@@ -698,7 +719,7 @@ jobs:
   # reuse workflow via workflow_call
   build-android:
     uses: ./.github/workflows/build-android.yml
-    if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-android == 'true') && github.ref_name != 'release/2.0.2-selfhost.1' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.1' }}
+    if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-android == 'true') && github.ref_name != 'release/2.0.2-selfhost.1' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.1' && github.event.inputs.selfhost-operation != 'build-offline-bridge' }}
     with:
       build-target: "${{ github.event.inputs.build-target }}"
       # if scheduled, use production mode
@@ -797,6 +818,421 @@ jobs:
       source-ref: ${{ needs.resolve-release-source.outputs.source-sha }}
     secrets:
       SELFHOST_SYNC_SERVER_URL: ${{ secrets.SELFHOST_SYNC_SERVER_URL }}
+
+  selfhost-windows-bridge-probe:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'build-offline-bridge' && github.event.inputs.build-target == 'non-release' && github.event.inputs.is-draft == 'true' && github.event.inputs.git-ref == github.ref_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            arch: x64
+          - runner: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      WINDOWS_PROBE_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Require a private test context
+        shell: pwsh
+        run: |
+          if ('${{ github.event.repository.private }}' -ne 'true') {
+            throw 'private-windows-test-context-required'
+          }
+
+      - name: Check out exact Windows probe tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install native Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Install existing frozen packaging tools
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path static | Out-Null
+          Copy-Item -LiteralPath resources/package.json,resources/pnpm-lock.yaml,resources/pnpm-workspace.yaml -Destination static
+          npm exec --yes --package=pnpm@10.33.0 -- pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'windows-probe-tools-install-failed' }
+
+      - name: Check probe contracts
+        run: node --test scripts/selfhost6/windows-nsis-probe.test.mjs
+
+      - name: Run the isolated native NSIS probe
+        run: node scripts/selfhost6/windows-nsis-probe.mjs
+
+      - name: Retain private probe diagnostics
+        if: ${{ always() && github.event.repository.private }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis-probe-${{ matrix.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-nsis-probe-report
+          if-no-files-found: warn
+          retention-days: 3
+
+  selfhost-bridge-build-inputs:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'build-offline-bridge' && github.event.inputs.build-target == 'stable' && github.event.inputs.is-draft == 'true' && github.ref_name == 'release/2.0.2-selfhost.1' && github.event.inputs.git-ref == 'release/2.0.2-selfhost.1' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: selfhost-production
+    permissions:
+      contents: read
+    env:
+      BRIDGE_SOURCE_FULL_SHA: ${{ github.event.inputs.bridge-source-full-sha }}
+      FINAL_SOURCE_FULL_SHA: ${{ github.event.inputs.final-source-full-sha }}
+    outputs:
+      bridge-source-sha: ${{ steps.sources.outputs.bridge-source-sha }}
+      final-source-sha: ${{ steps.sources.outputs.final-source-sha }}
+    steps:
+      - name: Check out exact bridge workflow tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Bind independent bridge and final sources
+        id: sources
+        run: |
+          node scripts/selfhost6/build-offline-bridge.mjs inputs
+          printf 'bridge-source-sha=%s\nfinal-source-sha=%s\n' \
+            "$BRIDGE_SOURCE_FULL_SHA" "$FINAL_SOURCE_FULL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify the existing final Draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
+        run: |
+          test "${SELFHOST6_TARGET_VERSION}" = '2.0.2-selfhost.1'
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}" \
+            > "${RUNNER_TEMP}/bridge-final-draft.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${SELFHOST_DRAFT_RELEASE_ID}/assets?per_page=100" \
+            > "${RUNNER_TEMP}/bridge-final-assets.json"
+          gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${SELFHOST6_TARGET_VERSION}" \
+            > "${RUNNER_TEMP}/bridge-final-tag-refs.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "${RUNNER_TEMP}/bridge-final-releases.json"
+          mkdir final-release-assets
+          gh release download "${SELFHOST6_TARGET_VERSION}" --repo "${GITHUB_REPOSITORY}" \
+            --dir final-release-assets
+          node scripts/selfhost6/verify-draft-release.mjs \
+            --phase after \
+            --release-json "${RUNNER_TEMP}/bridge-final-draft.json" \
+            --assets-json "${RUNNER_TEMP}/bridge-final-assets.json" \
+            --tag-refs-json "${RUNNER_TEMP}/bridge-final-tag-refs.json" \
+            --release-list-json "${RUNNER_TEMP}/bridge-final-releases.json" \
+            --artifact-directory final-release-assets \
+            --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
+            --source-full-sha "${FINAL_SOURCE_FULL_SHA}" \
+            --target-version "${SELFHOST6_TARGET_VERSION}"
+
+      - name: Retain exact final macOS arm64 input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-final-darwin-arm64-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: |
+            final-release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            final-release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain exact final macOS x64 input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-final-darwin-x64-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: |
+            final-release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
+            final-release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain exact final Linux arm64 input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-final-linux-arm64-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: |
+            final-release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
+            final-release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain exact final Linux x64 input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-final-linux-x64-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: |
+            final-release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
+            final-release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain exact final Windows x64 input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-final-win32-x64-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: |
+            final-release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe
+            final-release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.selfhost6.json
+          if-no-files-found: error
+          retention-days: 14
+
+  selfhost-bridge-build-macos:
+    needs: [ selfhost-bridge-build-inputs ]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: darwin-arm64
+            runner: macos-14
+            arch: arm64
+          - id: darwin-x64
+            runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      BRIDGE_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.bridge-source-sha }}
+      FINAL_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.final-source-sha }}
+    steps:
+      - name: Check out exact bridge workflow tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out exact native bridge source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRIDGE_SOURCE_FULL_SHA }}
+          path: bridge-source
+          persist-credentials: false
+
+      - name: Download exact final archive and descriptor
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-offline-final-${{ matrix.id }}-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: final-release-assets
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Babashka
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Install frozen bridge packaging tools
+        run: |
+          mkdir -p static
+          cp resources/package.json resources/pnpm-lock.yaml resources/pnpm-workspace.yaml static/
+          pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
+
+      - name: Export existing native update strings
+        working-directory: bridge-source
+        run: bb lang:export-native-update-strings "$RUNNER_TEMP/offline-bridge-native-strings.json"
+
+      - name: Build the native bridge without project signing or publishing
+        run: node scripts/selfhost6/build-offline-bridge.mjs build
+
+      - name: Retain unsigned native bridge input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-bridge-input-${{ matrix.id }}-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: bridge-build-input
+          if-no-files-found: error
+          retention-days: 14
+
+  selfhost-bridge-build-linux:
+    needs: [ selfhost-bridge-build-inputs ]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+          - id: linux-x64
+            runner: ubuntu-22.04
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    container: debian:bullseye-slim
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      BRIDGE_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.bridge-source-sha }}
+      FINAL_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.final-source-sha }}
+    steps:
+      - name: Prepare the native compiler baseline
+        run: |
+          sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list
+          apt-get -o Acquire::Check-Valid-Until=false update
+          DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --yes \
+            ca-certificates curl git unzip build-essential pkg-config libglib2.0-dev libgtk-3-dev
+          apt-get clean
+
+      - name: Check out exact bridge workflow tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out exact native bridge source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRIDGE_SOURCE_FULL_SHA }}
+          path: bridge-source
+          persist-credentials: false
+
+      - name: Download exact final archive and descriptor
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-offline-final-${{ matrix.id }}-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: final-release-assets
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Babashka
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Install frozen bridge packaging tools
+        run: |
+          mkdir -p static
+          cp resources/package.json resources/pnpm-lock.yaml resources/pnpm-workspace.yaml static/
+          pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
+
+      - name: Export existing native update strings
+        working-directory: bridge-source
+        run: bb lang:export-native-update-strings "$RUNNER_TEMP/offline-bridge-native-strings.json"
+
+      - name: Build the native bridge without project signing or publishing
+        run: node scripts/selfhost6/build-offline-bridge.mjs build
+
+      - name: Retain unsigned native bridge input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-bridge-input-${{ matrix.id }}-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: bridge-build-input
+          if-no-files-found: error
+          retention-days: 14
+
+  selfhost-bridge-build-windows:
+    needs: [ selfhost-bridge-build-inputs ]
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BRIDGE_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.bridge-source-sha }}
+      FINAL_SOURCE_FULL_SHA: ${{ needs.selfhost-bridge-build-inputs.outputs.final-source-sha }}
+    steps:
+      - name: Check out exact bridge workflow tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Check out exact native bridge source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRIDGE_SOURCE_FULL_SHA }}
+          path: bridge-source
+          persist-credentials: false
+
+      - name: Download exact final archive and descriptor
+        uses: actions/download-artifact@v4
+        with:
+          name: selfhost-offline-final-win32-x64-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: final-release-assets
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          architecture: x64
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Babashka
+        uses: DeLaGuardo/setup-clojure@13.5
+        with:
+          bb: ${{ env.BABASHKA_VERSION }}
+
+      - name: Install frozen bridge packaging tools
+        run: |
+          New-Item -ItemType Directory -Path static | Out-Null
+          Copy-Item -LiteralPath resources/package.json,resources/pnpm-lock.yaml,resources/pnpm-workspace.yaml -Destination static
+          pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'windows-bridge-tools-install-failed' }
+
+      - name: Export existing native update strings
+        working-directory: bridge-source
+        run: bb lang:export-native-update-strings "$env:RUNNER_TEMP/offline-bridge-native-strings.json"
+
+      - name: Build the native bridge without project signing or publishing
+        run: node scripts/selfhost6/build-offline-bridge.mjs build
+
+      - name: Retain unsigned native bridge input
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-offline-bridge-input-win32-x64-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
+          path: bridge-build-input
+          if-no-files-found: error
+          retention-days: 14
 
   compile-cljs:
     needs: [ release-source-gate, rtc-browser-e2e ]
@@ -1342,7 +1778,7 @@ jobs:
             --target-version "${SELFHOST6_TARGET_VERSION}"
 
   selfhost-release-bridge:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'bridge-published-.7' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.1-selfhost.7' && github.event.inputs.git-ref == 'release/2.0.1-selfhost.7' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'bridge-published-.7' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.2-selfhost.1' && github.event.inputs.git-ref == 'release/2.0.2-selfhost.1' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     environment: selfhost-production
@@ -1351,8 +1787,15 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: write
+      actions: read
+    env:
+      BRIDGE_SOURCE_FULL_SHA: ${{ github.event.inputs.bridge-source-full-sha }}
+      FINAL_SOURCE_FULL_SHA: ${{ github.event.inputs.final-source-full-sha }}
+      BRIDGE_BUILD_RUN_ID: ${{ github.event.inputs.bridge-build-run-id }}
+      BRIDGE_BUILD_ARTIFACT_ID: ${{ github.event.inputs.bridge-build-artifact-id }}
+      BRIDGE_BUILD_ARTIFACT_SHA256: ${{ github.event.inputs.bridge-build-artifact-sha256 }}
     steps:
-      - name: Check out exact published release tools
+      - name: Check out exact release workflow tools
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -1363,12 +1806,22 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Download and verify the published latest release
+      - name: Validate explicit bridge build inputs
+        run: node scripts/selfhost6/verify-offline-bridge.mjs inputs
+
+      - name: Check out exact bridge source and its .7 policy tools
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRIDGE_SOURCE_FULL_SHA }}
+          path: bridge-source
+          persist-credentials: false
+
+      - name: Download and verify the published final latest release
         env:
           GH_TOKEN: ${{ github.token }}
           SELFHOST_DRAFT_RELEASE_ID: ${{ secrets.SELFHOST_DRAFT_RELEASE_ID }}
         run: |
-          test "${SELFHOST6_TARGET_VERSION}" = '2.0.1-selfhost.7'
+          test "${SELFHOST6_TARGET_VERSION}" = '2.0.2-selfhost.1'
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SELFHOST6_TARGET_VERSION}" \
             > "${RUNNER_TEMP}/selfhost-published-release.json"
@@ -1393,21 +1846,50 @@ jobs:
             --release-list-json "${RUNNER_TEMP}/selfhost-published-releases.json" \
             --artifact-directory published-release-assets \
             --release-id "${SELFHOST_DRAFT_RELEASE_ID}" \
-            --source-full-sha "${GITHUB_SHA}" \
+            --source-full-sha "${FINAL_SOURCE_FULL_SHA}" \
             --target-version "${SELFHOST6_TARGET_VERSION}"
+
+      - name: Download and verify the exact bridge build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BRIDGE_BUILD_RUN_ID}" \
+            > "${RUNNER_TEMP}/offline-bridge-run.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${BRIDGE_BUILD_ARTIFACT_ID}" \
+            > "${RUNNER_TEMP}/offline-bridge-artifact.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts/${BRIDGE_BUILD_ARTIFACT_ID}/zip" \
+            > "${RUNNER_TEMP}/offline-bridge-artifact.zip"
+          node scripts/selfhost6/verify-offline-bridge.mjs download
+
+      - name: Unpack only the bridge input filenames
+        run: unzip -q -n -j "${RUNNER_TEMP}/offline-bridge-artifact.zip" -d bridge-release-assets
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+
+      - name: Install the frozen archive-reader dependency
+        run: |
+          mkdir -p static
+          cp resources/package.json resources/pnpm-lock.yaml resources/pnpm-workspace.yaml static/
+          pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
+
+      - name: Verify both sources and the exact embedded final bytes
+        run: node scripts/selfhost6/verify-offline-bridge.mjs payloads
 
       - name: Stage the one-time .6 bridge pointers
         run: |
-          node scripts/selfhost6/promote-update-feed.mjs \
-            --artifact-directory published-release-assets \
+          node bridge-source/scripts/selfhost6/promote-update-feed.mjs \
+            --artifact-directory bridge-release-assets \
             --output-directory bridge-pointers \
-            --expected-target-version "${SELFHOST6_TARGET_VERSION}" \
+            --expected-target-version '2.0.1-selfhost.7' \
             --descriptors \
-            published-release-assets/Logseq-darwin-arm64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json \
-            published-release-assets/Logseq-darwin-x64-${SELFHOST6_TARGET_VERSION}.zip.selfhost6.json \
-            published-release-assets/Logseq-linux-arm64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json \
-            published-release-assets/Logseq-linux-x86_64-${SELFHOST6_TARGET_VERSION}.AppImage.selfhost6.json \
-            published-release-assets/Logseq-win-x64-${SELFHOST6_TARGET_VERSION}-nsis.exe.selfhost6.json
+            bridge-release-assets/Logseq-darwin-arm64-2.0.1-selfhost.7.zip.selfhost6.json \
+            bridge-release-assets/Logseq-darwin-x64-2.0.1-selfhost.7.zip.selfhost6.json \
+            bridge-release-assets/Logseq-linux-arm64-2.0.1-selfhost.7.AppImage.selfhost6.json \
+            bridge-release-assets/Logseq-linux-x86_64-2.0.1-selfhost.7.AppImage.selfhost6.json \
+            bridge-release-assets/Logseq-win-x64-2.0.1-selfhost.7-nsis.exe.selfhost6.json
 
       - name: Promote exactly five updater assets and four pointers
         env:
@@ -1417,12 +1899,12 @@ jobs:
           SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_OBJECT_FULL_SHA }}
           SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA: ${{ secrets.SELFHOST_EXISTING_TAG_PEELED_COMMIT_FULL_SHA }}
         run: |
-          node scripts/selfhost6/promote-existing-release.mjs \
-            --artifact-directory published-release-assets \
+          node bridge-source/scripts/selfhost6/promote-existing-release.mjs \
+            --artifact-directory bridge-release-assets \
             --pointer-directory bridge-pointers \
             --release-line-id selfhost-official-architecture-v1 \
-            --expected-source-full-sha "${GITHUB_SHA}" \
-            --expected-version "${SELFHOST6_TARGET_VERSION}" \
+            --expected-source-full-sha "${BRIDGE_SOURCE_FULL_SHA}" \
+            --expected-version '2.0.1-selfhost.7' \
             --receipt "${RUNNER_TEMP}/selfhost6-bridge-receipt.json"
 
   nightly-release:

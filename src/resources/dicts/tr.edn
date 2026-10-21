@@ -1757,7 +1757,6 @@
  :settings.general/edit-export-css "export.css dosyasını düzenle"
  :settings.general/edit-global-config-edn "Genel config.edn dosyasını düzenle"
  :settings.general/editor-font "Editör yazı tipi"
- :settings.general/editor-font-set-global "Genel yazı tipi ailesi olarak ayarla"
  :settings.general/export-theme "Temayı dışarı aktar"
  :settings.general/language "Dil"
  :settings.general/native-titlebar "Yerel başlık çubuğu"

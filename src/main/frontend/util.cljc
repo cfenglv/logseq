@@ -749,7 +749,8 @@
      ([data] (write-clipboard data nil))
      ([data owner-window]
       (if (.isNativePlatform ^js Capacitor)
-        (.write (gobj/get CapacitorClipboard "Clipboard") #js {:string (gobj/get data "text")})
+        (p/then (.write (gobj/get CapacitorClipboard "Clipboard") #js {:string (gobj/get data "text")})
+                (fn [_] true))
         (utils/writeClipboard data owner-window)))))
 
 #?(:cljs

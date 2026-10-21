@@ -570,7 +570,7 @@
         (when (seq tx-data)
           (swap! *txs-state (fn [txs] (concat txs tx-data)))))
 
-      this))
+      m))
 
   (-del [this *txs-state db]
     (assert (ds/outliner-txs-state? *txs-state)
@@ -680,9 +680,16 @@
       (let [*txs-state (atom [])
             block' (if (de/entity? block)
                      block
-                     (merge entity block))]
-        (otree/-save block' *txs-state db opts)
-        {:tx-data @*txs-state}))))
+                     (merge entity block))
+            saved-block (otree/-save block' *txs-state db opts)
+            ;; Record this save's resolved values, not its parser placeholders
+            ;; or fields inherited from the entity that were not edited.
+            saved-op-block (assoc (select-keys saved-block (if (de/entity? block)
+                                                            (keys (.-kv ^js block))
+                                                            (keys block)))
+                                  :block/uuid (:block/uuid entity))]
+        {:tx-data @*txs-state
+         :tx-meta {:outliner-ops [[:save-block [saved-op-block opts]]]}}))))
 
 (defn- get-right-siblings
   "Get `node`'s right siblings."
@@ -1040,6 +1047,20 @@
     (some? created-from-property)
     (d/entity db created-from-property)))
 
+(defn- canonical-pdf-annotation-insert
+  [db blocks target opts]
+  (let [annotation (when (= 1 (count blocks)) (first blocks))
+        asset (when (= :annotation (:logseq.property/ls-type annotation))
+                (d/entity db (:logseq.property/asset annotation)))
+        canonical (:block/link asset)]
+    (if (and canonical (ldb/asset? canonical)
+             (= "pdf" (:logseq.property.asset/type canonical))
+             (nil? (:logseq.property/deleted-at canonical)))
+      [[(assoc annotation :logseq.property/asset (:db/id canonical))]
+       (if (and (not (:sibling? opts)) (= (:db/id asset) (:db/id target)))
+         canonical target)]
+      [blocks target])))
+
 (defn ^:api ^:large-vars/cleanup-todo insert-blocks
   "Insert blocks as children (or siblings) of target-node.
   Args:
@@ -1097,6 +1118,7 @@
                   (or (= outliner-op :paste)
                       insert-template?)
                   (remove ldb/asset?))
+         [blocks target-block] (canonical-pdf-annotation-insert db blocks target-block opts)
          [target-block sibling?] (get-target-block db blocks target-block opts)
          _ (assert (some? target-block) (str "Invalid target: " target-block))
          replace-empty-target? (if (and (some? replace-empty-target?)

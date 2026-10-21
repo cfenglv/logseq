@@ -137,6 +137,33 @@
                                  "select count(*) as c from client_tx_upload_state where logical_tx_id = ?"
                                  (str malformed-id)))))))))
 
+(deftest frozen-upload-state-optional-outliner-op-test
+  (doseq [kind [:single-wire-v1 :staged-large-upload-v1]
+          outliner-op [nil :save-block "save-block" 42 false]]
+    (with-client-ops-db
+      "optional-outliner-op-repo"
+      (fn [db]
+        (let [repo "optional-outliner-op-repo"
+              tx-id (random-uuid)
+              state (merge {:format-version 1 :kind kind
+                            :source-digest "synthetic-source-digest"
+                            :outliner-op outliner-op}
+                           (if (= kind :single-wire-v1)
+                             {:wire-entry {:tx-id (str tx-id) :tx "synthetic-wire"}}
+                             {:session-id "synthetic-session" :boundaries [1]
+                              :source-next-index 0 :chunk-seq 0}))]
+          (client-op/put-client-tx-upload-state! repo tx-id state)
+          (if (or (nil? outliner-op) (keyword? outliner-op))
+            (do
+              (is (= state (client-op/get-client-tx-upload-state repo tx-id)))
+              (is (= {tx-id state} (client-op/get-client-tx-upload-states repo [tx-id]))))
+            (do
+              (is (thrown-with-msg? js/Error #"Invalid client transaction upload state"
+                                   (client-op/get-client-tx-upload-state repo tx-id)))
+              (is (thrown-with-msg? js/Error #"Invalid client transaction upload state"
+                                   (client-op/get-client-tx-upload-states repo [tx-id])))))
+          (is (= 1 (sqlite-count db "select count(*) as c from client_tx_upload_state"))))))))
+
 (deftest sqlite-sync-meta-roundtrip-test
   (let [repo "repo-1"]
     (with-client-ops-db

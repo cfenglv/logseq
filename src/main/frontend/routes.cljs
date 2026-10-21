@@ -7,6 +7,7 @@
             [frontend.components.home :as home]
             [frontend.components.imports :as imports]
             [frontend.components.journal :as journal]
+            [frontend.components.literature :as literature]
             [frontend.components.page :as page]
             [frontend.components.plugins :as plugins]
             [frontend.components.repo :as repo]
@@ -60,6 +61,10 @@
    ["/all-pages"
     {:name :all-pages
      :view all-pages/all-pages}]
+
+   ["/literature"
+    {:name :literature
+     :view literature/library-page}]
 
    ["/graph"
     {:name :graph

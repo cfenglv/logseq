@@ -959,7 +959,7 @@
           redirects (atom [])
           input-id "edit-block-test"
           input #js {:value (str "Open [[" page-title "]]")}]
-      (p/with-redefs [state/get-edit-block (constantly {:block/uuid (random-uuid)})
+      (-> (p/with-redefs [state/get-edit-block (constantly {:block/uuid (random-uuid)})
                       state/get-edit-input-id (constantly input-id)
                       gdom/getElement (fn [id]
                                         (when (= input-id id)
@@ -987,8 +987,8 @@
                (is (= [[page-title]] @redirects))))
             (p/catch
              (fn [error]
-               (is false (str error))))
-            (p/finally done))))))
+               (is false (str error))))))
+          (p/finally done)))))
 
 (defn- keyup-handler
   "Spied version of editor/keyup-handler"
@@ -2861,6 +2861,158 @@
                 (fn [error]
                   (is false (str error))))
                (p/finally done)))))
+(deftest literature-pdf-reuse-planner-is-minimal-and-conflict-aware
+  (let [existing-uuid #uuid "bf00e846-9d3a-47c9-aea2-b4ff4cb2c69d"
+        first-uuid #uuid "08c2aeae-f53c-4d45-b852-f124166c3d9f"
+        second-uuid #uuid "d052339a-ebd5-4917-b18c-71e87b29a4a2"
+        file #js {:name "paper.pdf" :size 100}
+        candidate (fn [uuid ext checksum existing-asset]
+                    {:file file
+                     :file-name (str "paper." ext)
+                     :ext ext
+                     :checksum checksum
+                     :existing-asset existing-asset
+                     :asset-block {:block/uuid uuid
+                                   :block/title "paper"
+                                   :logseq.property.asset/type ext}})]
+    (with-redefs [assets-handler/exceed-limit-size? (constantly false)]
+      (testing "an existing PDF becomes one native link and at most one repair write"
+        (let [plan (#'editor-assets/build-asset-insert-plan
+                    [(candidate first-uuid "pdf" "same" {:block/uuid existing-uuid})
+                     (candidate second-uuid "pdf" "same" {:block/uuid existing-uuid})]
+                    {"same" {:status :found
+                             :assets [{:block/uuid existing-uuid}]}})]
+          (is (= [{:block/uuid first-uuid
+                   :block/title ""
+                   :block/link [:block/uuid existing-uuid]}
+                  {:block/uuid second-uuid
+                   :block/title ""
+                   :block/link [:block/uuid existing-uuid]}]
+                 (:blocks plan)))
+        (is (= [{:file file :file-path (str existing-uuid ".pdf") :checksum "same"}]
+                 (:repair-writes plan)))
+          (is (empty? (:new-writes plan)))))
+      (testing "same-batch identical PDFs create one Asset and one link"
+        (let [plan (#'editor-assets/build-asset-insert-plan
+                    [(candidate first-uuid "pdf" "new" nil)
+                     (candidate second-uuid "pdf" "new" nil)]
+                    {"new" {:status :missing :assets []}})]
+          (is (= first-uuid (get-in plan [:blocks 0 :block/uuid])))
+          (is (= [:block/uuid first-uuid]
+                 (get-in plan [:blocks 1 :block/link])))
+          (is (= [(str first-uuid ".pdf")]
+                 (mapv :file-path (:new-writes plan))))
+          (is (= 1 (count (:new-pdf-identifications plan)))
+              "An omitted MIME keeps the existing PDF identification path")))
+      (testing "a PDF filename with a conflicting MIME remains an ordinary saved attachment"
+        (let [png-mime-file #js {:name "paper.pdf" :size 100 :type "image/png"}
+              normal-file #js {:name "paper.pdf" :size 100 :type "application/pdf"}
+              make-plan (fn [file]
+                          (#'editor-assets/build-asset-insert-plan
+                           [(assoc (candidate first-uuid "pdf" "new" nil) :file file)]
+                           {"new" {:status :missing :assets []}}))
+              mismatch-plan (make-plan png-mime-file)
+              normal-plan (make-plan normal-file)]
+          (is (= [{:file png-mime-file :file-path (str first-uuid ".pdf")}]
+                 (:new-writes mismatch-plan)))
+          (is (empty? (:new-pdf-identifications mismatch-plan)))
+          (is (= 1 (count (:new-pdf-identifications normal-plan))))))
+      (testing "images never enter PDF reuse lookup"
+        (is (empty? (#'editor-assets/pdf-reuse-checksums
+                     [(candidate first-uuid "png" "image" {:block/uuid existing-uuid})]))))
+      (testing "disabled reuse preserves the previous duplicate behavior"
+        (let [existing {:block/uuid existing-uuid}
+              plan (#'editor-assets/build-asset-insert-plan
+                    [(candidate first-uuid "pdf" "same" existing)]
+                    {"same" {:status :disabled :assets []}})]
+          (is (empty? (:blocks plan)))
+          (is (= [existing] (:existing-assets plan)))))
+      (testing "ambiguous checksum matches stop instead of choosing an Asset"
+        (let [error (try
+                      (#'editor-assets/build-asset-insert-plan
+                       [(candidate first-uuid "pdf" "same" nil)]
+                       {"same" {:status :conflict
+                                :assets [{:block/uuid existing-uuid}
+                                         {:block/uuid second-uuid}]}})
+                      nil
+                      (catch :default error error))]
+          (is (some? error))
+          (is (= #{existing-uuid second-uuid}
+                 (set (:asset-uuids (ex-data error))))))))))
+
+(deftest duplicate-pdf-choice-resumes-the-original-editor-location
+  (let [edit-block {:block/uuid #uuid "762fd0c4-4b73-4a86-a069-3aca8939739a"
+                    :block/title "unsaved text"}
+        opts {:reuse-existing-pdf? true}]
+    (is (= {:reuse-existing-pdf? true
+            :last-edit-block edit-block
+            :resume-unsaved-edit? true}
+           (#'editor-assets/asset-conflict-resume-opts
+            opts nil edit-block true)))
+    (is (= opts
+           (#'editor-assets/asset-conflict-resume-opts
+            opts {:block/uuid (random-uuid)} edit-block true))
+        "An explicit drop/comment target remains authoritative")))
+
+(deftest pasted-asset-replaces-empty-editor-before-escape-test
+  (async done
+    (let [block-uuid #uuid "8789a99e-5147-41a1-a836-4e0a6f03fe90"
+          draft {:db/id 42 :block/uuid block-uuid :block/title ""}
+          asset (assoc draft :block/title "paper" :logseq.property.asset/type "pdf")
+          origin {[1 block-uuid] true}
+          editing (atom origin)
+          edit-block (atom draft)
+          content (atom "")
+          input #js {:value ""}
+          focused (atom [])
+          saved (atom [])]
+      (-> (p/with-redefs
+            [state/get-current-repo (constantly "synthetic-asset-repo")
+             state/get-route-match (constantly {:name :page})
+             state/get-state (fn [_] @editing)
+             state/get-editor-info (constantly nil)
+             state/get-edit-block (fn [] @edit-block)
+             state/get-edit-content (fn [] @content)
+             state/get-edit-input-id (constantly "synthetic-editor")
+             state/editor-in-composition? (constantly false)
+             state/get-editor-action (constantly nil)
+             gdom/getElement (constantly input)
+             assets-handler/get-file-checksum (constantly nil)
+             assets-handler/ensure-assets-dir!
+             (fn [_] (p/resolved ["/tmp/synthetic-asset-graph" "assets"]))
+             db-async/<invoke-db-worker (fn [& _] (p/resolved {:block/uuid (random-uuid)}))
+             db-async/<get-blocks (fn [& _] (p/resolved [asset]))
+             frontend-outliner-op/insert-blocks! (fn [& _])
+             editor/edit-block!
+             (fn [block pos opts]
+               (swap! focused conj [block pos opts])
+               (reset! edit-block block)
+               (reset! content (:block/title block))
+               (set! (.-value input) (:block/title block)))
+             editor/save-block-aux! (fn [_ value _] (swap! saved conj value))
+             db-transact/apply-outliner-ops
+             (fn [_ _ opts]
+               (let [update-editor! (:editor/edit-block-fn opts)]
+                 (is (fn? update-editor!) "The insert response must update the reused empty editor before another worker read")
+                 (when update-editor! (update-editor! [asset]))
+                 ;; Escape can arrive here, before the later asset lookup finishes.
+                 (editor/save-current-block!)
+                 (is (= ["paper"] @saved) "Escape must save the filename, not the old empty input")
+                 (is (= [[asset :max {:skip-load? true :save-current-block? false}]] @focused))
+                 (when update-editor!
+                   (reset! focused [])
+                   (reset! editing nil)
+                   (update-editor! [asset])
+                   (is (empty? @focused) "Do not reopen an editor the user already left")
+                   (reset! editing origin)
+                   (reset! content "User draft")
+                   (update-editor! [asset])
+                   (is (empty? @focused) "Do not overwrite text entered while the attachment was saving"))
+                 (p/resolved nil)))]
+            (editor-assets/db-based-save-assets! "synthetic-asset-repo" ["paper.pdf"]
+                                                 :reuse-existing-pdf? false))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
 
 (deftest db-based-save-assets-honors-explicit-target-block
   (async done
@@ -2874,7 +3026,7 @@
           original-<get-today-journal-title db-async/<get-today-journal-title
           original-<get-journal-page-by-day db-async/<get-journal-page-by-day
           original-<invoke-db-worker db-async/<invoke-db-worker
-          original-db-based-write-asset! editor-assets/db-based-write-asset!
+          original-db-based-write-asset! assets-handler/db-based-write-asset!
           original-insert-blocks! frontend-outliner-op/insert-blocks!
           original-<get-blocks db-async/<get-blocks
           original-get-edit-block state/get-edit-block
@@ -2889,7 +3041,7 @@
       (set! db-async/<get-journal-page-by-day (fn [_repo _journal-day]
                                                 (p/resolved {:block/uuid #uuid "f43caf78-18c4-4724-99d2-b2f61f697a0e"})))
       (set! db-async/<invoke-db-worker (fn [& _] (p/resolved nil)))
-      (set! editor-assets/db-based-write-asset! (fn [& _args]
+      (set! assets-handler/db-based-write-asset! (fn [& _args]
                                            (p/resolved nil)))
       (set! frontend-outliner-op/insert-blocks! (fn [blocks target opts]
                                          (reset! inserted {:blocks blocks
@@ -2922,7 +3074,7 @@
                        (set! db-async/<get-today-journal-title original-<get-today-journal-title)
                        (set! db-async/<get-journal-page-by-day original-<get-journal-page-by-day)
                        (set! db-async/<invoke-db-worker original-<invoke-db-worker)
-                       (set! editor-assets/db-based-write-asset! original-db-based-write-asset!)
+                       (set! assets-handler/db-based-write-asset! original-db-based-write-asset!)
                        (set! frontend-outliner-op/insert-blocks! original-insert-blocks!)
                        (set! db-async/<get-blocks original-<get-blocks)
                        (set! state/get-edit-block original-get-edit-block)
@@ -2943,7 +3095,7 @@
           original-<get-today-journal-title db-async/<get-today-journal-title
           original-<get-journal-page-by-day db-async/<get-journal-page-by-day
           original-<invoke-db-worker db-async/<invoke-db-worker
-          original-db-based-write-asset! editor-assets/db-based-write-asset!
+          original-db-based-write-asset! assets-handler/db-based-write-asset!
           original-insert-blocks! frontend-outliner-op/insert-blocks!
           original-<get-blocks db-async/<get-blocks
           original-get-edit-block state/get-edit-block
@@ -2958,7 +3110,7 @@
       (set! db-async/<get-journal-page-by-day (fn [_repo _journal-day]
                                                 (p/resolved {:block/uuid #uuid "f43caf78-18c4-4724-99d2-b2f61f697a0e"})))
       (set! db-async/<invoke-db-worker (fn [& _] (p/resolved nil)))
-      (set! editor-assets/db-based-write-asset! (fn [& _args]
+      (set! assets-handler/db-based-write-asset! (fn [& _args]
                                            (p/resolved nil)))
       (set! frontend-outliner-op/insert-blocks! (fn [blocks target opts]
                                          (reset! inserted {:blocks blocks
@@ -2989,7 +3141,7 @@
                        (set! db-async/<get-today-journal-title original-<get-today-journal-title)
                        (set! db-async/<get-journal-page-by-day original-<get-journal-page-by-day)
                        (set! db-async/<invoke-db-worker original-<invoke-db-worker)
-                       (set! editor-assets/db-based-write-asset! original-db-based-write-asset!)
+                       (set! assets-handler/db-based-write-asset! original-db-based-write-asset!)
                        (set! frontend-outliner-op/insert-blocks! original-insert-blocks!)
                        (set! db-async/<get-blocks original-<get-blocks)
                        (set! state/get-edit-block original-get-edit-block)
@@ -3143,7 +3295,7 @@
                                :block/name "paste target"}}
           clipboard "- ## [[2026-06-15]]\n\t- Nudeln mit Soße"
           inserted (atom nil)]
-      (p/with-redefs [state/get-edit-block (constantly target)
+      (-> (p/with-redefs [state/get-edit-block (constantly target)
                       state/get-edit-content (constantly (:block/title target))
                       state/get-block-op-type (constantly nil)
                       state/set-block-op-type! (constantly nil)
@@ -3172,12 +3324,11 @@
                         (select-keys heading-block [:block/title :logseq.property/heading])))
                  (is (= [20260615]
                         (mapv :block/journal-day (:block/refs heading-block))))
-                 (is (= target (:target @inserted)))
-                 (done))))
+                 (is (= target (:target @inserted))))))
             (p/catch
              (fn [e]
-               (is false (str e))
-               (done))))))))
+               (is false (str e))))))
+          (p/finally done)))))
 
 (deftest paste-og-copied-heading-page-refs-uses-default-journal-title
   (async done
@@ -3188,7 +3339,7 @@
                                :block/name "paste target"}}
           clipboard "- ## [[2026-06-15]]\n\t- Nudeln mit Soße"
           inserted (atom nil)]
-      (p/with-redefs [state/get-edit-block (constantly target)
+      (-> (p/with-redefs [state/get-edit-block (constantly target)
                       state/get-edit-content (constantly (:block/title target))
                       state/get-block-op-type (constantly nil)
                       state/set-block-op-type! (constantly nil)
@@ -3217,12 +3368,11 @@
                         (select-keys heading-block [:block/title :logseq.property/heading])))
                  (is (= [20260615]
                         (mapv :block/journal-day (:block/refs heading-block))))
-                 (is (= target (:target @inserted)))
-                 (done))))
+                 (is (= target (:target @inserted))))))
             (p/catch
              (fn [e]
-               (is false (str e))
-               (done))))))))
+               (is false (str e))))))
+          (p/finally done)))))
 
 (deftest focused-root-block-operation-guards-test
   (let [root-block {:db/id 1}

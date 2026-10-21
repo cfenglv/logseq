@@ -11,7 +11,46 @@
             [frontend.handler.user :as user-handler]
             [frontend.state :as state]
             [frontend.util :as util]
+            [logseq.shui.ui :as shui]
             [promesa.core :as p]))
+
+(deftest repair-confirmation-cancel-and-graph-switch-do-not-call-worker
+  (async done
+    (let [*repo (atom "original")
+          *confirm (atom #(p/rejected false))
+          *status (atom #(p/resolved {}))
+          operation-id #uuid "90500000-0000-4000-8000-000000000001"
+          calls (atom [])]
+      (-> (p/with-redefs [util/electron? (constantly true)
+                         state/get-current-repo (fn [] @*repo)
+                         shui/dialog-confirm! (fn [& _] (@*confirm))
+                         notification/show! (fn [& _] nil)
+                         state/<invoke-db-worker (fn [method & args]
+                                                   (swap! calls conj (into [method] args))
+                                                   (if (= :thread-api/db-sync-repair-status method)
+                                                     (@*status)
+                                                     (p/resolved {:claimed? true})))]
+            (p/let [_ (db-sync/request-repair!)]
+              (is (empty? @calls))
+              (reset! *confirm #(do (reset! *repo "different") (p/resolved true)))
+              (p/let [_ (db-sync/request-repair!)]
+                (is (empty? @calls))
+                (reset! *confirm #(p/resolved true))
+                (p/let [_ (db-sync/request-repair!)]
+                  (is (= [[:thread-api/db-sync-repair-status "different"]
+                          [:thread-api/db-sync-request-repair "different"]] @calls))
+                  (reset! calls [])
+                  (reset! *status #(p/resolved {:operation {:operation-id operation-id :disposition :local-only}}))
+                  (p/let [_ (db-sync/request-repair!)]
+                    (is (= [[:thread-api/db-sync-repair-status "different"]
+                            [:thread-api/db-sync-retry-repair "different" operation-id]] @calls))
+                    (reset! calls [])
+                    (reset! *status #(do (reset! *repo "third")
+                                         (p/resolved {:operation {:operation-id operation-id :disposition :local-only}})))
+                    (p/let [_ (db-sync/request-repair!)]
+                      (is (= [[:thread-api/db-sync-repair-status "different"]] @calls))))))))
+          (p/catch #(is false (str %)))
+          (p/finally done)))))
 
 (defn- finish-async-test!
   [done]

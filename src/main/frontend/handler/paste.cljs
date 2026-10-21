@@ -275,12 +275,18 @@
 (defn- paste-file-if-exists [id e]
   (when id
     (let [clipboard-data (gobj/get e "clipboardData")
-          files (.-files clipboard-data)]
+          files (.-files clipboard-data)
+          edit-context [(state/get-current-repo)
+                        (state/get-route-match)
+                        (state/get-state :editor/editing?)]]
       (p/let [blocks (editor-assets/upload-asset! id files
                                                    (get (state/get-edit-block) :block/format :markdown)
                                                    editor-handler/*asset-uploading? true)]
-        (when-let [asset (first blocks)]
-          (editor-handler/edit-block! asset :max {})))
+        (when (= edit-context [(state/get-current-repo)
+                              (state/get-route-match)
+                              (state/get-state :editor/editing?)])
+          (when-let [asset (first blocks)]
+            (editor-handler/edit-block! asset :max {:skip-load? true}))))
       (util/stop e))))
 
 (defn editor-on-paste!

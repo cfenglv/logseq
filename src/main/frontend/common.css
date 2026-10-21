@@ -588,8 +588,7 @@ mark {
   border-radius: 3px;
   font-size: 0.9em;
   font-style: normal;
-  font-family: MonoLisa, 'Fira Code', Monaco, Menlo, Consolas, 'COURIER NEW',
-  monospace;
+  font-family: var(--ls-code-font-family, MonoLisa, 'Fira Code', Monaco, Menlo, Consolas, 'COURIER NEW', monospace);
   letter-spacing: 0;
   background-color: var(--lx-gray-06, var(--ls-page-inline-code-bg-color, var(--rx-gray-05)));
   color: var(--lx-gray-11, var(--ls-page-inline-code-color, var(--rx-gray-11)));

@@ -308,6 +308,15 @@
             :icon "calendar"
             :shortcut :go/journals})))
 
+      (when (and repo (not config/publishing?))
+        (sidebar-item
+         {:class "literature-nav"
+          :title (t :nav/literature)
+          :href (rfe/href :literature)
+          :active (and (not srs-open?) (= route-name :literature))
+          :icon "books"
+          :shortcut :go/shared-literature}))
+
       (for [nav checked-navs]
         (cond
           (= nav :flashcards)

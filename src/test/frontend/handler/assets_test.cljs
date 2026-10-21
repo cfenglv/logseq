@@ -11,6 +11,42 @@
   [^js payload]
   (js->clj (js/Array.from payload)))
 
+(deftest damaged-asset-recovery-must-restore-registered-content-test
+  (async done
+    (let [repo "content-recovery-repo"
+          asset-uuid (random-uuid)
+          asset {:block/uuid asset-uuid
+                 :logseq.property.asset/type "pdf"
+                 :logseq.property.asset/size 1983
+                 :logseq.property.asset/checksum "registered-checksum"
+                 :logseq.property.asset/remote-metadata {:type "pdf"}}
+          checks (atom [false true false false])
+          requests (atom [])]
+      (-> (p/with-redefs
+            [config/get-repo-dir (constantly "/tmp/content-recovery-graph")
+             assets/<asset-file-content-matches?
+             (fn [repo-dir file-rpath size checksum]
+               (is (= ["/tmp/content-recovery-graph" (str "assets/" asset-uuid ".pdf")
+                       1983 "registered-checksum"]
+                      [repo-dir file-rpath size checksum]))
+               (let [result (first @checks)]
+                 (swap! checks subvec 1)
+                 (p/resolved result)))
+             state/<invoke-db-worker
+             (fn [& args]
+               (swap! requests conj args)
+               (p/resolved nil))]
+            (p/let [_ (assets/<ensure-asset-file-content! repo asset)
+                    failed-name (-> (assets/<ensure-asset-file-content! repo asset)
+                                    (p/then (fn [_] nil))
+                                    (p/catch (fn [error] (.-name error))))]
+              (is (= "AssetContentMismatchError" failed-name))
+              (is (= (repeat 2 [:thread-api/db-sync-request-asset-download repo asset-uuid true])
+                     @requests))
+              (is (empty? @checks))))
+          (p/catch (fn [error] (is false (str "unexpected error: " error))))
+          (p/finally done)))))
+
 (deftest coerce-array-buffer-to-uint8-test
   (let [source (js/Uint8Array. #js [1 2 3])
         output (#'assets/->uint8 (.-buffer source))]

@@ -1646,7 +1646,6 @@
  :settings.general/edit-export-css "編輯 export.css"
  :settings.general/edit-global-config-edn "編輯 global config.edn"
  :settings.general/editor-font "編輯器字型"
- :settings.general/editor-font-set-global "設為全域字型"
  :settings.general/export-theme "匯出主題"
  :settings.general/language "語言"
  :settings.general/native-titlebar "原生標題欄"

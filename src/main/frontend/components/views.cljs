@@ -1043,10 +1043,12 @@
           :onSelect (fn [e] (.preventDefault e))}
          label))))))
 
+(declare reference-view-menu-items)
+
 (hsx/defc more-actions
   [view-entity columns {:keys [column-visible? column-toggle-visibility
                                full-data-loading?] :as table}
-   {:keys [display-type group-by-property-ident]}]
+   {:keys [display-type group-by-property-ident view-feature-type] :as option}]
   (let [table? (= display-type :logseq.property.view/type.table)
         gallery? (= display-type :logseq.property.view/type.gallery)
         group-by-columns (->> (concat (when (or
@@ -1062,6 +1064,8 @@
       {:asChild true}
       (shui/button
        {:variant "ghost"
+        :title (t :view/more-options)
+        :aria-label (t :view/more-options)
         :class "text-muted-foreground !px-1"
         :size :sm}
        (ui/icon "dots" {:size 15})))
@@ -1069,6 +1073,10 @@
       {:align "end"
        :onCloseAutoFocus #(.preventDefault %)}
       (shui/dropdown-menu-group
+       (when (contains? #{:linked-references :unlinked-references} view-feature-type)
+         [:<>
+          (reference-view-menu-items view-entity option)
+          (shui/dropdown-menu-separator)])
        (when table?
          (shui/dropdown-menu-sub
           (shui/dropdown-menu-sub-trigger
@@ -1839,8 +1847,13 @@
 
 (hsx/defc filter-properties
   [view-entity columns table opts]
-  (shui/button
-   {:variant "ghost"
+  (let [references? (contains? #{:linked-references :unlinked-references} (:view-feature-type opts))
+        active? (boolean (seq (get-in opts [:filters :filters])))]
+   (shui/button
+   {:variant (if active? "secondary" "ghost")
+    :title (t :view.filter/filter)
+    :aria-label (t :view.filter/filter)
+    :aria-pressed active?
     :class "text-muted-foreground !px-1"
     :size :sm
     :on-click (fn [e]
@@ -1850,7 +1863,8 @@
                                   {:align :end
                                    :focus-trigger? false
                                    :content-props {:onCloseAutoFocus #(.preventDefault %)}}))}
-   (ui/icon "filter")))
+   (ui/icon "filter")
+   (when references? (t :view.filter/filter)))))
 
 (defn operator->text
   [operator]
@@ -3344,9 +3358,11 @@
       [:span.ml-1 (t :view.table/delete-sort)])]))
 
 (hsx/defc view-sorting
-  [table columns sorting]
+  [table columns sorting references?]
   (shui/button
    {:variant "ghost"
+    :title (t :view/sort)
+    :aria-label (t :view/sort)
     :class "text-muted-foreground !px-1"
     :size :sm
     :on-click (fn [e]
@@ -3355,7 +3371,8 @@
                                   {:align :end
                                    :focus-trigger? false
                                    :content-props {:onCloseAutoFocus #(.preventDefault %)}}))}
-   (ui/icon "arrows-up-down")))
+   (ui/icon "arrows-up-down")
+   (when references? (t :view/sort))))
 
 (hsx/defc view-cp
   [view-entity table option* {:keys [*scroller-ref display-type row-selection]}]
@@ -3391,7 +3408,7 @@
   (get default-view-title-key-by-feature-type view-feature-type))
 
 (defn- create-view!
-  [view-parent view-feature-type {:keys [auto-triggered?]}]
+  [view-parent view-feature-type {:keys [auto-triggered? title] :or {title ""}}]
   (p/let [repo (state/get-current-repo)
           page (db-async/<get-block repo common-config/views-page-name {:children? false})]
     (when page
@@ -3407,7 +3424,7 @@
                                   :logseq.property.view/group-by-property (:db/id block-page-property)))
             view-title (if auto-triggered?
                          (some-> (default-view-title-key view-feature-type) t)
-                         "")
+                         title)
             view-block-id (common-uuid/gen-uuid :view-block-uuid (str (:block/uuid view-parent) view-feature-type))
             result (editor-handler/api-insert-new-block! view-title
                                                          (cond->
@@ -3445,6 +3462,82 @@
       :else
       title)))
 
+(hsx/defc view-name-form
+  [initial-name submit-label submit! close!]
+  (let [[value set-value!] (hooks/use-state initial-name)
+        [saving? set-saving!] (hooks/use-state false)
+        name (string/trim value)]
+    [:form.flex.flex-col.gap-4
+     {:on-submit (fn [e]
+                   (.preventDefault e)
+                   (when-not (or saving? (string/blank? name))
+                     (set-saving! true)
+                     (-> (submit! name)
+                         (p/then close!)
+                         (p/finally #(set-saving! false)))))}
+     (shui/input
+      {:auto-focus true
+       :aria-label (t :view/name)
+       :placeholder (t :view/name)
+       :value value
+       :on-change #(set-value! (util/evalue %))})
+     [:div.flex.justify-end.gap-2
+      (shui/button {:variant "outline" :type "button" :on-click close!}
+                   (t :ui/cancel))
+      (shui/button {:type "submit" :disabled (or saving? (string/blank? name))}
+                   submit-label)]]))
+
+(defn- reference-view-menu-items
+  [view-entity {:keys [view-parent-uuid view-feature-type view-uuids
+                      set-current-view-uuid! foldable-options]}]
+  [:<>
+   (shui/dropdown-menu-item
+    {:on-click
+     (fn []
+       (shui/dialog-open!
+        (fn [{:keys [close]}]
+          (view-name-form
+           "" (t :ui/create)
+           (fn [name]
+             (p/let [parent (db-async/<get-block (state/get-current-repo) view-parent-uuid {:children? false})
+                     view (create-view! parent view-feature-type {:auto-triggered? false :title name})]
+               ((:on-pointer-down foldable-options) false)
+               (set-current-view-uuid! (:block/uuid view))))
+           close))
+        {:title (t :view/add-new-view)}))}
+    (t :view/add-new-view))
+   (shui/dropdown-menu-item
+    {:on-click
+     (fn []
+       (p/let [view (db-async/<get-block (state/get-current-repo) (:block/uuid view-entity) {:children? false})]
+         (shui/dialog-open!
+          (fn [{:keys [close]}]
+            (view-name-form (display-view-title view) (t :ui/save)
+                            #(editor-handler/save-block! (state/get-current-repo) view %)
+                            close))
+          {:title (t :view/rename)})))}
+    (t :view/rename))
+   (when (> (count view-uuids) 1)
+     (shui/dropdown-menu-item
+      {:on-click
+       (fn []
+         (p/let [view (db-async/<get-block (state/get-current-repo) (:block/uuid view-entity) {:children? false})]
+           (editor-handler/delete-block-aux! view)
+           (set-current-view-uuid! (first (remove #{(:block/uuid view-entity)} view-uuids)))))}
+      (t :ui/delete)))])
+
+(hsx/defc reference-view-menu
+  [view-entity option]
+  (shui/dropdown-menu
+   (shui/dropdown-menu-trigger
+    {:asChild true}
+    (shui/button {:variant "ghost" :size :sm :class "text-muted-foreground !px-1"
+                  :title (t :view/more-options) :aria-label (t :view/more-options)}
+                 (ui/icon "dots" {:size 15})))
+   (shui/dropdown-menu-content
+    {:align "end" :onCloseAutoFocus #(.preventDefault %)}
+    (reference-view-menu-items view-entity option))))
+
 (hsx/defc view-tab-button
   [view-parent current-view-uuid view-uuid
    {:keys [view-uuids data items-count set-current-view-uuid!
@@ -3452,15 +3545,30 @@
   (let [hydrated-view (db-hooks/use-block view-uuid)
         view (or hydrated-view {:block/uuid view-uuid})
         refs-total-count (:refs-total-count config)
-        current-view? (= current-view-uuid view-uuid)]
-    (shui/button
+        current-view? (= current-view-uuid view-uuid)
+        label (if hydrated-view
+                  (display-view-title view)
+                  [:span.inline-block.w-8])
+        count-label (when (and current-view? show-items-count? (> items-count 0) (seq data))
+                      [:span.text-muted-foreground.text-xs
+                       items-count
+                       (when (and refs-total-count (> refs-total-count items-count))
+                         [:span
+                          [:span "/"]
+                          [:span {:title (t :view.table/total-refs-count)} refs-total-count]])])]
+    (if (and references? (= 1 (count view-uuids)))
+       [:span.flex.items-center.gap-2.text-sm.font-medium
+        {:data-view-tab-id (str "view-tab-" view-uuid)}
+        label count-label]
+      (shui/button
      {:key (str "view-tab-" view-uuid)
       :data-view-tab-id (str "view-tab-" view-uuid)
       :variant :text
       :size :sm
+      :aria-pressed (when references? current-view?)
       :class (str "text-sm px-0 py-0 h-6 " (when-not current-view? "text-muted-foreground"))
       :on-click (fn [e]
-                  (if (and hydrated-view current-view? (not= (:db/id view) (:db/id view-parent)))
+                  (if (and (not references?) hydrated-view current-view? (not= (:db/id view) (:db/id view-parent)))
                     (shui/popup-show!
                      (.-target e)
                      (fn []
@@ -3495,29 +3603,20 @@
          (when-let [icon (:logseq.property/icon (built-in-property display-type))]
            (icon-component/icon icon {:color? true
                                       :size 15}))))
-     (if hydrated-view
-       (display-view-title view)
-       [:span.inline-block.w-8])
-     (when (and current-view? show-items-count? (> items-count 0) (seq data))
-       [:span.text-muted-foreground.text-xs
-        items-count
-        (when (and refs-total-count
-                   (> refs-total-count items-count))
-          [:span
-           [:span "/"]
-           [:span {:title (t :view.table/total-refs-count)} refs-total-count]])]))))
+     label count-label))))
 
 (hsx/defc views-tab
   [view-parent current-view-uuid
-   {:keys [view-uuids set-current-view-uuid! view-feature-type opacity] :as opts}]
+   {:keys [view-uuids set-current-view-uuid! view-feature-type opacity references?] :as opts}]
   (into
-   [:div.views]
+   [:div.views {:class (when references? "flex flex-wrap items-center gap-2")}]
    (concat
     (map (fn [view-uuid]
            ^{:key (str "view-tab-" view-uuid)}
            (view-tab-button view-parent current-view-uuid view-uuid opts))
          view-uuids)
-    [(shui/button
+    (when-not references?
+     [(shui/button
       {:key "add-view"
        :variant :text
        :size :sm
@@ -3526,7 +3625,7 @@
        :on-click (fn []
                    (p/let [view (create-view! view-parent view-feature-type {:auto-triggered? false})]
                      (set-current-view-uuid! (:block/uuid view))))}
-      (ui/icon "plus" {:size 15}))])))
+      (ui/icon "plus" {:size 15}))]))))
 
 (hsx/defc view-head
   [view-parent view-entity table columns input sorting
@@ -3536,11 +3635,12 @@
   (let [[hover? set-hover?] (hooks/use-state nil)
         references? (contains? #{:linked-references :unlinked-references} view-feature-type)
         opacity (cond
-                  (and references? (not hover?)) "opacity-0"
+                  references? "opacity-100"
                   hover? "opacity-100"
                   :else "opacity-75")]
-    [:div.ls-view-head.flex.flex-1.flex-nowrap.items-center.justify-between.gap-1.overflow-hidden
-     {:on-mouse-over #(set-hover? true)
+    [:div.ls-view-head.flex.flex-1.items-center.justify-between.gap-1
+     {:class (if references? "flex-wrap gap-y-2" "flex-nowrap overflow-hidden")
+      :on-mouse-over #(set-hover? true)
       :on-mouse-out #(when-not (or (ui/popup-exists?)
                                    (ui/dropdown-exists?))
                        (set-hover? false))}
@@ -3554,7 +3654,7 @@
                           :hover? hover?
                           :opacity opacity
                           :references? references?)))]
-     [:div.view-actions.flex.items-center.gap-1.transition-opacity.ease-in.duration-300
+     [:div.view-actions.flex.shrink-0.items-center.gap-1.transition-opacity.ease-in.duration-300
       {:class opacity
        :on-mouse-down prevent-view-action-button-focus}
 
@@ -3565,7 +3665,7 @@
                  action))])
 
       (when (seq sorting)
-        (view-sorting table columns sorting))
+        (view-sorting table columns sorting references?))
 
       (filter-properties view-entity columns table option)
 
@@ -3694,7 +3794,7 @@
         {:keys [set-sorting! set-filters! set-visible-columns! set-ordered-columns! set-sized-columns!]}
         (db-set-table-state! view-entity {:set-sorting! set-sorting!
                                           :set-filters! set-filters!})
-        [selection-id] (hooks/use-state #(str (random-uuid)))
+        selection-id (hooks/use-memo #(str (random-uuid)) [(:block/uuid view-entity)])
         columns (sort-columns columns ordered-columns)
         select? (first (filter (fn [item] (= (:id item) :select)) columns))
         id? (first (filter (fn [item] (= (:id item) :id)) columns))
@@ -3838,7 +3938,9 @@
      * add-property!: `fn` to add a new property (or column)"
   [view-entity option]
   (let [*scroller-ref (hooks/use-memo #(atom nil) [])]
-    ^{:key (view-instance-key view-entity)}
+    ^{:key (if (contains? #{:linked-references :unlinked-references} (:view-feature-type option))
+             "reference-view"
+             (view-instance-key view-entity))}
     [view-inner view-entity
      (cond-> option
        (or config/publishing? (:logseq.property.view/group-by-property view-entity))
@@ -3976,9 +4078,11 @@
   (or view-data previous-view-data))
 
 (hsx/defc ^:large-vars/cleanup-todo loaded-view-aux
-  [view-entity {:keys [config view-feature-type query-row-uuids
-                       deactivate-deferred-view!] :as option}]
-  (let [[input set-input!] (hooks/use-state "")
+  [view-entity {:keys [config view-feature-type query-row-uuids] :as option}]
+  (let [view-uuid (:block/uuid view-entity)
+        [view-input set-view-input!] (hooks/use-state [view-uuid ""])
+        input (if (= view-uuid (first view-input)) (second view-input) "")
+        set-input! #(set-view-input! [view-uuid %])
         group-by-property (:logseq.property.view/group-by-property view-entity)
         display-type (view-display-type view-entity view-feature-type)
         list-view? (= display-type :logseq.property.view/type.list)
@@ -3987,7 +4091,10 @@
                                       :block/page))
         sorting (effective-view-sorting view-entity)
         filters (view-resource-filters view-feature-type (:logseq.property.table/filters view-entity))
-        debounced-input (hooks/use-debounced-value input 300)
+        debounced-view-input (hooks/use-debounced-value view-input 300)
+        debounced-input (if (= view-uuid (first debounced-view-input))
+                          (second debounced-view-input)
+                          "")
         viewport-height (measured-viewport-height
                          (some-> (get-scroll-parent config) .-clientHeight)
                          (.-innerHeight js/window))
@@ -4049,16 +4156,13 @@
                  query?
                  (assoc :columns (get-query-columns config view-entity properties))
 
-                 deactivate-deferred-view!
-                 (assoc :foldable-options
-                        {:default-collapsed? false
-                         :on-pointer-down
-                         (fn [collapsed?]
-                           (when collapsed?
-                             (deactivate-deferred-view!)))})
-
                  (seq row-previews)
                  (assoc :row-previews row-previews))]
+    (hooks/use-layout-effect!
+     (fn []
+       (set-view-input! [view-uuid ""])
+       js/undefined)
+     [view-uuid])
     (hooks/use-effect!
      (fn []
        (when window-or-full-data
@@ -4145,32 +4249,30 @@
                 :as option}
    activate!]
   (ui/foldable
-   (views-tab (:logseq.property/view-for view-entity)
-              (:block/uuid view-entity)
-              (assoc option
+   [:div.flex.flex-1.items-center.justify-between.gap-2
+    (views-tab (:logseq.property/view-for view-entity)
+               (:block/uuid view-entity)
+               (assoc option
                      :view-uuids view-uuids
                      :set-current-view-uuid! set-current-view-uuid!
                      :view-feature-type view-feature-type
                      :references? true
                      :data []
                      :items-count 0))
+    (reference-view-menu view-entity option)]
    (fn [] nil)
    {:title-trigger? false
     :default-collapsed? true
+    :collapsed-state (get-in option [:foldable-options :collapsed-state])
     :on-pointer-down (fn [collapsed?]
                        (when-not collapsed?
                          (activate!)))}))
 
 (hsx/defc view-aux
   [view-entity {:keys [defer-resource?] :as option}]
-  (let [[active? set-active!] (hooks/use-state (not defer-resource?))]
-    (if active?
-      (loaded-view-aux view-entity
-                       (cond-> option
-                         defer-resource?
-                         (assoc :deactivate-deferred-view!
-                                #(set-active! false))))
-      (deferred-view-placeholder view-entity option #(set-active! true)))))
+  (if (and defer-resource? (get-in option [:foldable-options :default-collapsed?]))
+    (deferred-view-placeholder view-entity option #((get-in option [:foldable-options :on-pointer-down]) false))
+    (loaded-view-aux view-entity option)))
 
 (hsx/defc sub-view
   [view-entity option]
@@ -4179,29 +4281,63 @@
 (hsx/defc selected-view-hydrate
   "use-block in selected-view re-rendered All Pages before the first
   lazy-item. Keep the subscription off the table render path."
-  [view-uuid first-paint-done? set-hydrated-entity!]
-  (let [entity (db-hooks/use-block view-uuid)]
+  [view-uuid first-paint-done? set-hydrated-entity! option]
+  (let [entity (db-hooks/use-block view-uuid)
+        feature-type (:view-feature-type option)
+        references? (contains? #{:linked-references :unlinked-references} feature-type)
+        expanded? (not (get-in option [:foldable-options :default-collapsed?]))
+        group-by-property (:logseq.property.view/group-by-property entity)
+        group-by-ident (or (:db/ident group-by-property)
+                           (when (and (= :logseq.property.view/type.list (view-display-type entity feature-type))
+                                      (nil? group-by-property))
+                             :block/page))
+        ;; Subscribe to the existing resource before selecting a reference view.
+        ;; The current list stays mounted until the replacement is ready.
+        reference-data (db-hooks/use-resource
+                        (when (and references? expanded? entity)
+                          (:resource-key
+                           (loaded-view-resource-plan
+                            view-uuid feature-type (effective-view-sorting entity)
+                            (view-resource-filters feature-type (:logseq.property.table/filters entity))
+                            "" group-by-ident nil 0))))
+        ready? (if references?
+                 (or (not expanded?) (some? reference-data))
+                 first-paint-done?)]
     (hooks/use-effect!
      (fn []
-       (when (and first-paint-done? entity)
+       (when (and ready? entity)
          (set-hydrated-entity! entity))
        js/undefined)
-     [first-paint-done? entity])
+     [ready? entity])
     nil))
 
 (hsx/defc selected-view
   [view-uuids option]
   (let [[requested-view-uuid set-requested-view-uuid!] (hooks/use-state nil)
+        references? (contains? #{:linked-references :unlinked-references} (:view-feature-type option))
+        collapsed-state (hooks/use-memo
+                         #(atom (boolean (or (:defer-resource? option)
+                                             (get-in option [:foldable-options :default-collapsed?])))) [])
+        [collapsed?] (hooks/use-atom collapsed-state)
+        set-collapsed! #(reset! collapsed-state %)
+        option (cond-> option
+                 references?
+                 (assoc :foldable-options (assoc (:foldable-options option)
+                                                :default-collapsed? collapsed?
+                                                :collapsed-state collapsed-state
+                                                :on-pointer-down set-collapsed!)))
         [first-paint-done? set-first-paint-done!] (hooks/use-state false)
         [hydrated-entity set-hydrated-entity!] (hooks/use-state nil)
         selected-view-uuid (if (some #{requested-view-uuid} view-uuids)
                              requested-view-uuid
                              (first view-uuids))
         pending-view {:block/uuid selected-view-uuid}
-        view-entity (first-paint-view-entity hydrated-entity pending-view first-paint-done?)]
+        view-entity (if references?
+                      (or hydrated-entity pending-view)
+                      (first-paint-view-entity hydrated-entity pending-view first-paint-done?))]
     [:<>
-     [selected-view-hydrate selected-view-uuid first-paint-done? set-hydrated-entity!]
-     ^{:key (str "view-" selected-view-uuid)}
+     [selected-view-hydrate selected-view-uuid first-paint-done? set-hydrated-entity! option]
+     ^{:key (if references? "reference-view" (str "view-" (:block/uuid view-entity)))}
      [sub-view view-entity
       (assoc option
              :view-uuids view-uuids
@@ -4252,7 +4388,10 @@
         selected-view-uuids (if query-result? [view-uuid] view-uuids)]
     (cond
       (seq selected-view-uuids)
-      (selected-view selected-view-uuids option)
+      (if (contains? #{:linked-references :unlinked-references} view-feature-type)
+        ^{:key (str view-parent-uuid view-feature-type)}
+        [selected-view selected-view-uuids option]
+        (selected-view selected-view-uuids option))
 
       (and (not query-result?) (some? view-uuids))
       (missing-view view-parent-uuid view-feature-type))))

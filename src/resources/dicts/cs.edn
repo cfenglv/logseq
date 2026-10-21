@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "upravit export.css"
  :settings.general/edit-global-config-edn "upravit globální config.edn"
  :settings.general/editor-font "Písmo editoru"
- :settings.general/editor-font-set-global "Nastavit jako globální rodinu písem"
  :settings.general/export-theme "Exportovat motiv"
  :settings.general/language "Jazyk"
  :settings.general/native-titlebar "Nativní záhlaví"

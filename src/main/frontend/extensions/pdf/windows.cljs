@@ -98,10 +98,13 @@
                   (resolve-classes! doc)
                   (resolve-styles! doc)
                   (.appendChild (.-body doc) main)
-                  (.render (rdc/createRoot main) (rfx/provider (pdf-playground pdf-current)))
+                  (let [root (rdc/createRoot main)]
+                    (.render root (rfx/provider (pdf-playground pdf-current)))
+                    (.addEventListener win "beforeunload"
+                                       #(do (.unmount root)
+                                            (close-pdf-in-new-window!))))
 
                   ;; events
-                  (.addEventListener win "beforeunload" #(close-pdf-in-new-window!))
                   (.addEventListener win "resize" #(storage/set :ls-pdf-system-win-layout
                                                                 {:height (.-clientHeight doc-el)
                                                                  :width  (.-clientWidth doc-el)

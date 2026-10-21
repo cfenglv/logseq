@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "Bewerk export.css"
  :settings.general/edit-global-config-edn "Globale config.edn bewerken"
  :settings.general/editor-font "Editorlettertype"
- :settings.general/editor-font-set-global "Instellen als globaal lettertype"
  :settings.general/export-theme "Exporteer thema"
  :settings.general/language "Taal"
  :settings.general/native-titlebar "Systeemeigen titelbalk"

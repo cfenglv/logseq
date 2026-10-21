@@ -1,5 +1,6 @@
 (ns frontend.worker.db-core-test
-  (:require ["fs" :as node-fs]
+  (:require [logseq.db.frontend.property :as db-property]
+            ["fs" :as node-fs]
             ["node:crypto" :as node-crypto]
             ["path" :as node-path]
             [cljs.test :refer [async deftest is]]
@@ -49,7 +50,10 @@
             [logseq.db.common.initial-data :as common-initial-data]
             [logseq.db.common.order :as db-order]
             [logseq.db.common.view :as db-view]
+            [logseq.db.frontend.literature :as literature]
             [logseq.db.frontend.schema :as db-schema]
+            [logseq.db.frontend.validate :as db-validate]
+            [logseq.db.sqlite.build :as sqlite-build]
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]
             [logseq.db.sqlite.export :as sqlite-export]
             [logseq.db.test.helper :as db-test]
@@ -1942,6 +1946,39 @@
         (p/catch (fn [error] (is false (str error))))
         (p/finally done))))
 
+(deftest remote-repair-retry-does-not-drain-itself-test
+  (async done
+    (let [repo "repair-retry-rpc"
+          operation-id (random-uuid)
+          wrapper* @#'thread-api/*invoke-wrapper-fn
+          previous-wrapper @wrapper*
+          entered? (atom false)]
+      (repair-commit-fence/reset-for-test!)
+      (-> (restoring-worker-state
+           (fn []
+             (p/let [_ ((@thread-api/*thread-apis :thread-api/init))]
+               (p/with-redefs
+                 [sync-download/<explicit-retry-repair!
+                  (fn [called-repo called-operation-id]
+                    (is (= repo called-repo))
+                    (is (= operation-id called-operation-id))
+                    (p/let [owner (repair-commit-fence/<enter! repo operation-id)]
+                      (reset! entered? true)
+                      (repair-commit-fence/release! repo owner)
+                      {:completed? true :operation-id operation-id}))]
+                 (-> (thread-api/remote-function
+                      "thread-api/db-sync-retry-repair"
+                      (ldb/write-transit-str [repo operation-id]))
+                     (p/timeout 1000)
+                     (p/then (fn [result]
+                               (is @entered? "The retry can enter its own commit fence.")
+                               (is (:completed? (ldb/read-transit-str result))))))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn []
+                       (repair-commit-fence/reset-for-test!)
+                       (reset! wrapper* previous-wrapper)
+                       (done)))))))
+
 (defn- repair-diagnostics
   [graph-id t checksum]
   {:t t :legacy-anchor checksum :server-recomputed-checksum checksum
@@ -2481,6 +2518,7 @@
         (let [upsert-blocks! (get @thread-api/*thread-apis :thread-api/search-upsert-blocks)
               sqlite-upserts (atom 0)
               vector-upserts (atom [])
+              vector-deletes (atom [])
               block-id (str (random-uuid))
               page-id (str (random-uuid))
               search-db #js {:transaction (fn [f]
@@ -2491,7 +2529,9 @@
                                     :embed-texts (fn [_texts]
                                                    (js/Promise. (fn [_resolve _reject])))}))
           (reset! worker-state/*sqlite-conns {test-repo {:search search-db}})
-          (reset! worker-state/*vector-indexes {test-repo {:upsert! (fn [docs]
+          (reset! worker-state/*vector-indexes {test-repo {:delete! (fn [ids]
+                                                                       (swap! vector-deletes conj (set ids)))
+                                                          :upsert! (fn [docs]
                                                                        (swap! vector-upserts conj docs))}})
           (p/let [result (js/Promise.race
                           #js [(upsert-blocks! test-repo [{:id block-id
@@ -2500,6 +2540,8 @@
                                (p/delay 20 ::timeout)])]
             (is (nil? result))
             (is (= 1 @sqlite-upserts))
+            (is (= [#{block-id}] @vector-deletes)
+                 "Changed vectors must be invalidated even while new embedding is pending")
             (is (empty? @vector-upserts))))))
      (p/catch (fn [error]
                 (is false (str "unexpected error: " error))))
@@ -3611,16 +3653,16 @@
 
 (deftest db-exists-returns-storage-result
   (async done
-    (restoring-worker-state
-     (fn []
-       (let [<db-exists? #'db-core/<db-exists?]
-         (platform/set-platform! (build-test-platform))
-         (-> (<db-exists? test-repo)
-             (p/then (fn [result]
-                       (is (false? result))))
-             (p/catch (fn [e]
-                        (is false (str "unexpected error: " e))))
-             (p/finally done)))))))
+    (-> (restoring-worker-state
+         (fn []
+           (let [<db-exists? #'db-core/<db-exists?]
+             (platform/set-platform! (build-test-platform))
+             (-> (<db-exists? test-repo)
+                 (p/then (fn [result]
+                           (is (false? result))))
+                 (p/catch (fn [e]
+                            (is false (str "unexpected error: " e))))))))
+        (p/finally done))))
 
 ;; ---- report-search-index-progress! tests ----
 
@@ -3692,6 +3734,202 @@
                                 nil)]
          ;; Should return nil (no transaction performed)
          (is (nil? result)))))))
+
+
+
+(deftest literature-registration-rechecks-and-transacts-in-one-worker-call
+  (restoring-worker-state
+   (fn []
+     (let [register! (get @thread-api/*thread-apis
+                          :thread-api/literature-register-pdf)
+           asset-uuid #uuid "72000000-0000-4000-8000-000000000021"
+           conn (db-test/create-conn-with-blocks
+                 [{:page {:block/title "Synthetic assets"}
+                   :blocks [{:block/uuid asset-uuid
+                             :block/title "candidate-paper"
+                             :build/keep-uuid? true
+                             :build/tags [:logseq.class/Asset]
+                             :build/properties
+                             {:logseq.property.asset/type "pdf"
+                              :logseq.property.asset/size 100
+                              :logseq.property.asset/checksum "candidate-checksum"}}]}])]
+       (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+       (reset! worker-state/*datascript-conns {test-repo conn})
+       (let [result (register! test-repo
+                               asset-uuid
+                               "Candidate Paper"
+                               {:doi "https://doi.org/10.5555/CANDIDATE"})
+             paper-uuid (:paper-uuid result)]
+         (is (= :created (:status result)))
+         (is (= :create (:action result)))
+         (is (uuid? paper-uuid))
+         (is (= paper-uuid
+                (get-in (literature/find-paper-by-asset @conn asset-uuid)
+                        [:papers 0 :block/uuid])))
+         (is (= paper-uuid
+                (get-in (literature/find-paper-by-identifiers
+                         @conn {:doi "10.5555/candidate"})
+                        [:papers 0 :block/uuid])))
+         (is (empty? (:errors (db-validate/validate-db @conn))))
+         (let [datom-count (count (d/datoms @conn :eavt))
+               repeat-result (register! test-repo
+                                        asset-uuid
+                                        "Ignored"
+                                        {})]
+           (is (= :already-linked (:status repeat-result)))
+           (is (= paper-uuid (get-in repeat-result [:paper :block/uuid])))
+           (is (= datom-count (count (d/datoms @conn :eavt))))))))))
+
+(deftest literature-source-registration-rechecks-and-transacts-in-one-worker-call
+  (restoring-worker-state
+   (fn []
+     (let [register! (get @thread-api/*thread-apis
+                          :thread-api/literature-register-source-record)
+           ensure-binding! (get @thread-api/*thread-apis
+                                :thread-api/literature-ensure-source-binding)
+           binding-uuid #uuid "73000000-0000-4000-8000-000000000021"
+           conn (db-test/create-conn)
+           source-record {:classification :bibliographic-item
+                          :source-key "zotero:local:synthetic:item:WORKER01"
+                          :title "Incomplete source paper"
+                          :doi "10.7300/worker-source"}]
+       (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+       (reset! worker-state/*datascript-conns {test-repo conn})
+       (let [connection (ensure-binding! test-repo binding-uuid
+                                        {:title "Synthetic shared bibliography"})
+             destination-page-uuid (:destination-page-uuid connection)
+             result (register! test-repo binding-uuid destination-page-uuid source-record)
+             paper-uuid (:paper-uuid result)]
+         (is (= :created (:status connection)) connection)
+         (is (uuid? destination-page-uuid))
+         (is (= :created (:status result)))
+         (is (= :create (:action result)))
+         (is (uuid? paper-uuid))
+         (is (= paper-uuid
+                (get-in (literature/find-paper-by-source-key
+                         @conn (:source-key source-record))
+                        [:papers 0 :block/uuid])))
+         (is (= "Incomplete source paper"
+                (:block/title (d/entity @conn [:block/uuid paper-uuid]))))
+         (is (= destination-page-uuid
+                (get-in (d/entity @conn [:block/uuid paper-uuid])
+                        [:block/parent :block/uuid])))
+         (is (empty? (:errors (db-validate/validate-db @conn))))
+         (let [datom-count (count (d/datoms @conn :eavt))
+               repeat-result (register! test-repo binding-uuid destination-page-uuid source-record)]
+           (is (= :already-imported (:status repeat-result)))
+           (is (= paper-uuid
+                  (get-in repeat-result [:paper :block/uuid])))
+           (is (= paper-uuid (:paper-uuid repeat-result))
+               "Repeated sources expose the same Paper UUID to import consumers")
+           (is (= datom-count (count (d/datoms @conn :eavt)))))
+         (is (= {:status :blocked :reason :not-top-level-bibliography}
+                (register! test-repo binding-uuid destination-page-uuid
+                           (assoc source-record :classification :child-item
+                                  :source-key "zotero:local:synthetic:item:CHILD001")))))))))
+
+(deftest literature-auto-link-rechecks-evidence-and-transacts-in-one-worker-call
+  (restoring-worker-state
+   (fn []
+     (let [auto-link! (get @thread-api/*thread-apis
+                           :thread-api/literature-auto-link-pdf)
+           asset-uuid #uuid "72000000-0000-4000-8000-000000000022"
+           paper-uuid #uuid "71000000-0000-4000-8000-000000000022"
+           conn (db-test/create-conn-with-blocks
+                 [{:page {:block/title "Synthetic assets"}
+                   :blocks [{:block/uuid asset-uuid
+                             :block/title "candidate-paper"
+                             :build/keep-uuid? true
+                             :build/tags [:logseq.class/Asset]
+                             :build/properties
+                             {:logseq.property.asset/type "pdf"
+                              :logseq.property.asset/size 101
+                              :logseq.property.asset/checksum "different-bytes"}}]}])]
+       (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+       (sqlite-build/create-blocks
+        conn
+        {:pages-and-blocks
+         [{:page {:block/title "Synthetic bibliography"}
+           :blocks [{:block/uuid paper-uuid
+                     :block/title "Existing Paper"
+                     :build/properties
+                     {:logseq.property/literature-item? true
+                      :logseq.property/literature-authors "Alice Example; Bob Researcher"
+                      :logseq.property/literature-type "journal-article"
+                      :logseq.property/literature-doi "10.5555/existing"
+                      :logseq.property/literature-arxiv "2401.12345"}}]}]})
+       (reset! worker-state/*datascript-conns {test-repo conn})
+       (let [evidence {:identifiers {:doi "10.5555/existing"
+                                     :arxiv "2401.12345v2"}
+                       :title "Existing Paper"
+                       :author-texts ["Alice Example and Bob Researcher"]
+                       :extraction-status :complete
+                       :usable? true
+                       :title-conflict? false
+                       :identifier-ambiguous? false}
+             result (auto-link! test-repo asset-uuid evidence)]
+         (is (= :linked (:status result)))
+         (is (= paper-uuid (:paper-uuid result)))
+         (is (= paper-uuid
+                (get-in (literature/find-paper-by-asset @conn asset-uuid)
+                        [:papers 0 :block/uuid])))
+         (is (empty? (:errors (db-validate/validate-db @conn))))
+         (let [datom-count (count (d/datoms @conn :eavt))]
+           (is (= :already-linked
+                  (:status (auto-link! test-repo asset-uuid evidence))))
+           (is (= datom-count (count (d/datoms @conn :eavt)))))
+         (is (= {:status :blocked :reason :title-mismatch}
+                (select-keys
+                 (auto-link! test-repo asset-uuid
+                             (assoc evidence :title "Wrong title"))
+                 [:status :reason]))))))))
+
+(deftest literature-duplicate-resolution-rechecks-and-transacts-in-one-worker-call
+  (restoring-worker-state
+   (fn []
+     (let [resolve! (get @thread-api/*thread-apis
+                         :thread-api/literature-resolve-duplicate-pdf)
+           keep-uuid #uuid "72000000-0000-4000-8000-000000000011"
+           duplicate-uuid #uuid "72000000-0000-4000-8000-000000000012"
+           conn (db-test/create-conn-with-blocks
+                 [{:page {:block/title "Synthetic assets"}
+                   :blocks [{:block/uuid keep-uuid
+                             :block/title "paper"
+                             :build/keep-uuid? true
+                             :build/tags [:logseq.class/Asset]
+                             :build/properties
+                             {:logseq.property.asset/type "pdf"
+                              :logseq.property.asset/size 100
+                              :logseq.property.asset/checksum "same-checksum"}}
+                            {:block/uuid duplicate-uuid
+                             :block/title "paper-copy"
+                             :build/keep-uuid? true
+                             :build/tags [:logseq.class/Asset]
+                             :build/properties
+                             {:logseq.property.asset/type "pdf"
+                              :logseq.property.asset/size 100
+                              :logseq.property.asset/checksum "same-checksum"}}]}])]
+       (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+       (reset! worker-state/*datascript-conns {test-repo conn})
+       (let [result (resolve! test-repo keep-uuid duplicate-uuid)
+             duplicate (d/entity @conn [:block/uuid duplicate-uuid])]
+         (is (= {:status :resolved
+                 :keep-uuid keep-uuid
+                 :duplicate-uuid duplicate-uuid}
+                result))
+         (is (= keep-uuid (:block/uuid (:block/link duplicate))))
+         (is (nil? (:logseq.property.asset/checksum duplicate))))
+       (is (= {:status :blocked
+               :reason :duplicate-asset-unavailable}
+              (resolve! test-repo keep-uuid duplicate-uuid)))))))
 
 (deftest get-latest-journals-returns-worker-maps
   (restoring-worker-state
@@ -5241,51 +5479,51 @@
 
 (deftest db-exists-returns-false-by-default
   (async done
-    (restoring-worker-state
-     (fn []
-       (let [db-exists! (get @thread-api/*thread-apis :thread-api/db-exists)]
-         (platform/set-platform! (build-test-platform))
-         (-> (db-exists! test-repo)
-             (p/then (fn [result]
-                       (is (false? result))))
-             (p/catch (fn [e]
-                        (is false (str "unexpected error: " e))))
-             (p/finally done)))))))
+    (-> (restoring-worker-state
+         (fn []
+           (let [db-exists! (get @thread-api/*thread-apis :thread-api/db-exists)]
+             (platform/set-platform! (build-test-platform))
+             (-> (db-exists! test-repo)
+                 (p/then (fn [result]
+                           (is (false? result))))
+                 (p/catch (fn [e]
+                            (is false (str "unexpected error: " e))))))))
+        (p/finally done))))
 
 ;; ---- export-db-binary thread-api test ----
 
 (deftest export-db-binary-returns-uint8array
   (async done
-    (restoring-worker-state
-     (fn []
-       (let [export-db! (get @thread-api/*thread-apis :thread-api/export-db-binary)
-             checkpoint-calls (atom [])]
-         (reset! worker-state/*sqlite-conns {test-repo {:db (fake-db)}})
-         (with-redefs [db-core/checkpoint-db! (fn [repo db]
-                                                (swap! checkpoint-calls conj [repo db]))]
-           (-> (export-db! test-repo)
-               (p/then (fn [result]
-                         (is (or (instance? js/Uint8Array result) (nil? result)))))
-               (p/catch (fn [e]
-                          (is false (str "unexpected error: " e))))
-               (p/finally done))))))))
+    (-> (restoring-worker-state
+         (fn []
+           (let [export-db! (get @thread-api/*thread-apis :thread-api/export-db-binary)
+                 checkpoint-calls (atom [])]
+             (reset! worker-state/*sqlite-conns {test-repo {:db (fake-db)}})
+             (with-redefs [db-core/checkpoint-db! (fn [repo db]
+                                                    (swap! checkpoint-calls conj [repo db]))]
+               (-> (export-db! test-repo)
+                   (p/then (fn [result]
+                             (is (or (instance? js/Uint8Array result) (nil? result)))))
+                   (p/catch (fn [e]
+                              (is false (str "unexpected error: " e)))))))))
+        (p/finally done))))
 
 ;; ---- list-db thread-api test ----
 
 (deftest list-db-returns-empty-list-by-default
   (async done
-    (restoring-worker-state
-     (fn []
-       (let [list-db! (get @thread-api/*thread-apis :thread-api/list-db)]
-         (platform/set-platform! (build-test-platform))
-         (-> (list-db!)
-             (p/then (fn [result]
-                       (is (vector? result))
-                       (is (empty? result))))
-             (p/catch (fn [e]
-                        ;; list-db may fail if platform not fully initialized, that's ok
-                        (is (some? e))))
-             (p/finally done)))))))
+    (-> (restoring-worker-state
+         (fn []
+           (let [list-db! (get @thread-api/*thread-apis :thread-api/list-db)]
+             (platform/set-platform! (build-test-platform))
+             (-> (list-db!)
+                 (p/then (fn [result]
+                           (is (vector? result))
+                           (is (empty? result))))
+                 (p/catch (fn [e]
+                            ;; list-db may fail if platform not fully initialized, that's ok
+                            (is (some? e))))))))
+        (p/finally done))))
 
 ;; ---- set-context thread-api test ----
 

@@ -1,5 +1,6 @@
 (ns frontend.worker.pipeline-test
-  (:require [cljs-time.coerce :as tc]
+  (:require [logseq.db.frontend.property :as db-property]
+            [cljs-time.coerce :as tc]
             [cljs-time.core :as t]
             [cljs.test :refer [deftest is testing]]
             [clojure.string :as string]
@@ -21,6 +22,7 @@
             [logseq.outliner.core :as outliner-core]
             [logseq.outliner.op :as outliner-op]
             [logseq.outliner.page :as outliner-page]
+            [logseq.outliner.pipeline :as outliner-pipeline]
             [logseq.outliner.property :as outliner-property]
             [logseq.outliner.recycle :as outliner-recycle]))
 
@@ -1585,3 +1587,37 @@
           (is (not (ldb/internal-page? converted)))
           (is (= (:db/id page) (:db/id converted)))
           (is (some? (:block/name converted))))))))
+
+(deftest private-literature-properties-keep-native-ref-exclusion-test
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "Reference fixture"}
+                :blocks [{:block/title "marker"}
+                         {:block/title "source key"}
+                         {:block/title "source target"}
+                         {:block/title "excluded PDF"}]}
+               {:page {:block/title "Paper fixture"} :blocks []}])
+        _ (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+        block-id (fn [title] (:db/id (db-test/find-block-by-content @conn title)))
+        paper-id (:db/id (db-test/find-page-by-title @conn "Paper fixture"))
+        cases [["marker" :logseq.property/literature-item? true]
+               ["source key" :logseq.property/literature-source-key [paper-id]]
+               ["source target" :logseq.property/literature-source-target paper-id]
+               ["excluded PDF" :logseq.property.asset/literature-auto-excluded? true]]
+        _ (d/transact! conn
+                       (conj (mapv (fn [[title ident value]]
+                                     {:db/id (block-id title) ident value})
+                                   cases)
+                             {:db/id (block-id "excluded PDF")
+                              :logseq.property.asset/type "pdf"}))
+        db @conn
+        bulk-refs (outliner-pipeline/db-rebuild-block-refs-fn db)]
+    (doseq [[title ident _] cases]
+      (let [property (d/entity db ident)
+            block (d/entity db (block-id title))
+            expected #{}]
+        (is (false? (:logseq.property/public? property)))
+        (is (true? (:logseq.property/hide? property)))
+        (is (= expected (set (outliner-pipeline/db-rebuild-block-refs db block))))
+        (is (= expected (set (bulk-refs block))))))))

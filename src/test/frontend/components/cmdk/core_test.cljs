@@ -2,6 +2,7 @@
   (:require
    [cljs.test :refer [async deftest is testing]]
    [frontend.components.block.breadcrumb :as block-breadcrumb]
+   [frontend.context.i18n :as i18n]
    [frontend.components.cmdk.core :as cmdk]
    [frontend.components.icon :as icon-component]
    [frontend.db.async :as db-async]
@@ -12,6 +13,7 @@
    [frontend.util :as util]
    [frontend.util.page :as page-util]
    [goog.object :as gobj]
+   [logseq.shui.hooks :as hooks]
    [logseq.shui.ui :as shui]
    [promesa.core :as p]))
 
@@ -72,6 +74,116 @@
           (when-let [creation-index (some #(when (:source-create %) (:item-index %)) items)]
             (cmdk/move-highlight state creation-index)
             (is (= :create (cmdk/state->action state)))))))))
+
+(deftest literature-filter-keeps-doi-and-excludes-page-creation-test
+  (let [query "10.5555/shared-paper"
+        paper {:source-block {:block/uuid #uuid "11111111-1111-1111-1111-111111111111"
+                              :logseq.property/literature-item? true}}
+        filter-state {::cmdk/input (atom query)
+                      ::cmdk/filter (atom {:group :literature})
+                      ::cmdk/results (atom {:literature {:items [paper]}
+                                           :nodes {:items [{:source-block {:block/title "unrelated note"}}]}})}
+        groups (cmdk/state->results-ordered filter-state)]
+    (is (= [:literature] (mapv second groups)))
+    (is (= [paper] (mapv #(dissoc % :group :item-index) (mapcat last groups))))
+    (is (not-any? :source-create (mapcat last groups))
+        "A DOI containing a slash stays in literature search without proposing a page.")))
+
+(deftest literature-filter-reuses-search-and-ignores-stale-query-test
+  (async done
+    (let [query (atom "old paper")
+          results (atom {})
+          filter-state {::cmdk/input query
+                        ::cmdk/filter (atom {:group :literature})
+                        ::cmdk/results results}
+          old-result (p/deferred)
+          new-result (p/deferred)
+          calls (atom [])
+          paper {:block/uuid #uuid "11111111-1111-1111-1111-111111111111"
+                 :block/title "Correct paper"
+                 :literature/detail "Example · 2026"}]
+      (-> (p/with-redefs [state/get-current-repo (constantly "graph-a")
+                          icon-component/get-node-icon-cp (constantly nil)
+                          db-async/<search-literature-papers
+                          (fn [repo input]
+                            (swap! calls conj [repo input])
+                            (if (= input "old paper") old-result new-result))]
+            (let [old-request (cmdk/load-results :literature filter-state)]
+              (reset! query "10.5555/shared-paper")
+              (let [new-request (cmdk/load-results :literature filter-state)]
+                (p/resolve! new-result {:status :ok :papers [paper]})
+                (p/let [_ new-request]
+                  (is (= [["graph-a" "old paper"] ["graph-a" "10.5555/shared-paper"]] @calls))
+                  (is (= (:block/uuid paper)
+                         (get-in @results [:literature :items 0 :source-block :block/uuid])))
+                  (is (= "Example · 2026" (get-in @results [:literature :items 0 :detail])))
+                  (p/resolve! old-result {:status :ok :papers []})
+                  (p/let [_ old-request]
+                    (is (= 1 (count (get-in @results [:literature :items])))
+                        "A late result for the previous input must not erase the current paper."))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
+(deftest literature-filter-distinguishes-unavailable-search-from-no-match
+  (async done
+    (let [response (atom nil)
+          results (atom {})
+          search-state {::cmdk/input (atom "existing paper")
+                        ::cmdk/filter (atom {:group :literature})
+                        ::cmdk/results results}]
+      (-> (p/with-redefs [state/get-current-repo (constantly "graph-a")
+                          db-async/<search-literature-papers (fn [& _] @response)]
+            (p/doseq [[result expected] [[{:status :unavailable :reason :index-rebuilding} :unavailable]
+                                        [{:status :disabled} :unavailable]
+                                        [:rejected :unavailable]
+                                        [{:status :ok :papers []} :success]]]
+              (reset! results {:literature {:items [{:text "Previous stale item"}]}})
+              (do
+                (reset! response (if (= :rejected result)
+                                   (p/rejected (js/Error. "Synthetic missing worker"))
+                                   (p/resolved result)))
+                nil)
+              (p/let [_ (cmdk/load-results :literature search-state)]
+                (is (= expected (get-in @results [:literature :status])))
+                (is (empty? (get-in @results [:literature :items]))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
+(deftest completed-index-refreshes-current-node-query
+  (let [search-state {::cmdk/input (atom "existing paper")
+                      ::cmdk/filter (atom nil)}
+        running {:repo "graph-a" :status :running :build-id "build-a"}
+        completed (assoc running :status :completed)
+        calls (atom [])]
+    (with-redefs [state/get-current-repo (constantly "graph-a")
+                  cmdk/load-results (fn [group value]
+                                      (swap! calls conj [group @(::cmdk/input value)]))]
+      (#'cmdk/refresh-after-index-build! search-state running completed)
+      (is (= [[:nodes "existing paper"]] @calls))
+      (reset! calls [])
+      (doseq [next-build [running (assoc running :progress 50)
+                         (assoc completed :visible? false)]]
+        (#'cmdk/refresh-after-index-build! search-state completed next-build))
+      (is (empty? @calls) "progress and visibility updates do not repeat a search")
+      (#'cmdk/refresh-after-index-build! search-state completed (assoc completed :build-id "build-b"))
+      (is (= 1 (count @calls)) "a new completed build refreshes even if intermediate progress was batched")
+      (reset! calls [])
+      (#'cmdk/refresh-after-index-build! search-state running (assoc completed :repo "graph-b"))
+      (#'cmdk/refresh-after-index-build! search-state completed completed)
+      (is (empty? @calls) "another graph and an already completed build do not refresh")
+      (doseq [input ["" "   "]]
+        (reset! (::cmdk/input search-state) input)
+        (#'cmdk/refresh-after-index-build! search-state running completed))
+      (is (empty? @calls) "blank input keeps the existing initial search behavior")
+      (reset! (::cmdk/input search-state) "existing paper")
+      (doseq [group [:commands :files :themes :filters]]
+        (reset! (::cmdk/filter search-state) {:group group})
+        (#'cmdk/refresh-after-index-build! search-state running completed))
+      (is (empty? @calls) "non-node filters are independent of the rebuilt index")
+      (doseq [group [:nodes :codes :current-page :literature]]
+        (reset! (::cmdk/filter search-state) {:group group})
+        (#'cmdk/refresh-after-index-build! search-state running completed))
+      (is (= [:nodes :codes :current-page :literature] (mapv first @calls))))))
 
 (deftest shift-open-page-uses-page-action-test
   (async done
@@ -150,8 +262,8 @@
 
 (deftest cmdk-search-debouncer-coalesces-continuous-typing-test
   (async done
-    (is (= 300 cmdk/search-debounce-ms)
-        "CMDK search waits 300ms after typing stops.")
+    (is (= 150 cmdk/search-debounce-ms)
+        "CMDK search waits 150ms after typing stops.")
     (let [calls (atom 0)
           [schedule! cancel!] (cmdk/make-search-debouncer #(swap! calls inc))
           keystroke-gap 80
@@ -161,8 +273,8 @@
       (js/setTimeout
        (fn []
          (is (zero? @calls)
-             "Search must not run at the old 150 ms per-character cadence."))
-       (+ last-keystroke 200))
+              "Search must wait for the final pause in continuous typing."))
+        (+ last-keystroke 100))
       (js/setTimeout
        (fn []
          (cancel!)
@@ -170,6 +282,53 @@
              "five keystrokes 80 ms apart should trigger one search after the pause")
          (done))
        (+ last-keystroke cmdk/search-debounce-ms 80)))))
+
+(deftest composition-start-cancels-a-queued-input-search-test
+  (async done
+    (let [search-state (assoc (cmdk-input-state)
+                             ::cmdk/filter (atom nil)
+                             ::cmdk/last-refresh-key (atom nil))
+          calls (atom [])
+          event (fn [value composing?]
+                  #js {:type "input"
+                       :target #js {:value value}
+                       :isComposing composing?})]
+      (-> (p/with-redefs [hooks/use-memo (fn [create _deps] (create))
+                          hooks/use-effect! (fn [& _args])
+                          hooks/use-atom (fn [a] [@a #(reset! a %)])
+                          i18n/t (constantly "")
+                          state/get-current-repo (constantly "repo-a")
+                          state/get-state (constantly nil)
+                          cmdk/persist-cmdk-query-state! (fn [_state])
+                          cmdk/load-results (fn [_group value]
+                                              (swap! calls conj @(::cmdk/input value)))]
+            (let [element (cmdk/input-row search-state [] {:sidebar? true})
+                  render (gobj/get (.-type element) "type")
+                  rendered (render (.-props element))
+                  input-element (some (fn [child]
+                                        (when (and child (= "input" (gobj/get child "type"))) child))
+                                      (array-seq (gobj/getValueByKeys rendered "props" "children")))
+                  props (gobj/get input-element "props")
+                  on-change (gobj/get props "onChange")
+                  composition-start (gobj/get props "onCompositionStart")
+                  composition-end (gobj/get props "onCompositionEnd")]
+              ;; Invoke the actual rendered input handlers with the real debounce.
+              (on-change (event "n" false))
+              (is (fn? composition-start))
+              (when composition-start
+                (composition-start #js {:type "compositionstart"}))
+              (on-change (event "ni" true))
+              (p/let [_ (p/delay (+ cmdk/search-debounce-ms 60))]
+                (is (empty? @calls)
+                    "A queued ordinary input must not query marked IME text.")
+                (is (= "ni" @(::cmdk/input search-state)))
+                (composition-end #js {:type "compositionend"
+                                     :target #js {:value "你"}})
+                (p/let [_ (p/delay (+ cmdk/search-debounce-ms 60))]
+                  (is (= ["你"] @calls)
+                      "Composition end still searches the committed text once.")))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
 
 (deftest refresh-results-skips-duplicate-search-key-test
   (let [calls (atom [])
@@ -279,4 +438,36 @@
           (p/catch
            (fn [error]
              (is false (str error))))
+          (p/finally done)))))
+
+(deftest late-initial-results-preserve-current-search
+  (async done
+    (let [recent (p/deferred)
+          queried {::cmdk/input (atom "")
+                   ::cmdk/filter (atom nil)
+                   ::cmdk/results (atom {})}
+          filtered {::cmdk/input (atom "")
+                    ::cmdk/filter (atom nil)
+                    ::cmdk/results (atom {})}
+          initial {::cmdk/input (atom "")
+                   ::cmdk/filter (atom nil)
+                   ::cmdk/results (atom {})}
+          search-results {:commands {:status :success :items [{:text "Current command"}]}}]
+      (-> (p/with-redefs [db-recent-handler/get-recent-pages (fn [] recent)]
+            (let [requests (mapv #(cmdk/load-results :initial %) [queried filtered initial])]
+              (reset! (::cmdk/input queried) "Current")
+              (reset! (::cmdk/filter filtered) {:group :commands})
+              (reset! (::cmdk/results queried) search-results)
+              (reset! (::cmdk/results filtered) search-results)
+              (p/resolve! recent [])
+              (p/all requests)))
+          (p/then
+           (fn [_]
+             (is (= search-results @(::cmdk/results queried)))
+             (is (= search-results @(::cmdk/results filtered)))
+             (is (= [] (vec (get-in @(::cmdk/results initial)
+                                   [:recently-updated-pages :items]))))
+             (is (= :success (get-in @(::cmdk/results initial)
+                                    [:recently-updated-pages :status])))))
+          (p/catch #(is false (str %)))
           (p/finally done)))))

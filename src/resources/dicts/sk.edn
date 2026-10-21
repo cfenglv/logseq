@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "Upraviť export.css"
  :settings.general/edit-global-config-edn "Upraviť globálny config.edn"
  :settings.general/editor-font "Písmo editora"
- :settings.general/editor-font-set-global "Nastaviť ako globálnu rodinu písma"
  :settings.general/export-theme "Exportovať motív"
  :settings.general/language "Jazyk"
  :settings.general/native-titlebar "Nativní záhlaví"

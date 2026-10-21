@@ -1229,6 +1229,41 @@
                         (is false (str e))
                         (done))))))
 
+(deftest literature-pdf-link-tx-uses-the-existing-e2ee-shape-test
+  (async done
+         (let [paper #uuid "93000000-0000-4000-8000-000000000001"
+               asset #uuid "93000000-0000-4000-8000-000000000002"
+               link #uuid "93000000-0000-4000-8000-000000000003"
+               doi-value #uuid "93000000-0000-4000-8000-000000000004"
+               source-value #uuid "93000000-0000-4000-8000-000000000005"
+               tx-data [[:db/add [:block/uuid paper] :block/title "Private paper title"]
+                        [:db/add [:block/uuid paper] :logseq.property/literature-doi
+                         [:block/uuid doi-value]]
+                        [:db/add [:block/uuid doi-value] :block/title "10.1234/private"]
+                        [:db/add [:block/uuid source-value] :block/title
+                         "zotero/users/synthetic/items/PRIVATE"]
+                        [:db/add [:block/uuid paper] :logseq.property/literature-assets
+                         [:block/uuid asset]]
+                        [:db/add [:block/uuid link] :block/title ""]
+                        [:db/add [:block/uuid link] :block/link [:block/uuid asset]]
+                        [:db/add [:block/uuid asset] :logseq.property.asset/checksum
+                         "synthetic-checksum"]]]
+           (-> (p/let [aes-key (crypt/<generate-aes-key)
+                       encrypted (sync-crypt/<encrypt-tx-data aes-key tx-data)
+                       decrypted (sync-crypt/<decrypt-tx-data aes-key encrypted)]
+                 (is (not= "Private paper title" (get-in encrypted [0 3])))
+                 (is (not= "10.1234/private" (get-in encrypted [2 3])))
+                 (is (not= "zotero/users/synthetic/items/PRIVATE"
+                           (get-in encrypted [3 3])))
+                 (is (= (nth tx-data 4) (nth encrypted 4))
+                     "The paper-to-Asset relation keeps the native ref shape")
+                 (is (= (nth tx-data 6) (nth encrypted 6))
+                     "The reusable PDF link keeps the native ref shape")
+                 (is (= tx-data decrypted)))
+               (p/catch (fn [e]
+                          (is false (str e))))
+               (p/finally done)))))
+
 (deftest ^:fix-me decrypt-snapshot-rows-test
   (async done
          (-> (p/let [aes-key (crypt/<generate-aes-key)

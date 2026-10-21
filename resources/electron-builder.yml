@@ -80,8 +80,13 @@ dmg:
 
 win:
   extraResources:
-    - from: node_modules/7zip-bin/win/x64/7za.exe
-      to: updater/7za.exe
+    - from: updater/windows/${arch}
+      to: updater
+      filter:
+        - 7za.exe
+        - 7z.dll
+        - 7zip-LICENSE.txt
+        - 7zip-NOTICE.txt
   icon: icons/logseq.ico
   target:
     - nsis

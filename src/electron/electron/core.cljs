@@ -467,12 +467,14 @@
                                                  (.hide win)))
                                            :else
                                            nil)))))
-                  (.on app' "before-quit" (fn [_e]
-                                            (reset! win/*quitting? true)
-                                            (-> (handler/stop-all-db-workers!)
-                                                (p/finally
-                                                  (fn []
-                                                    (embedding-server/stop!))))))
+                  (.on app' "before-quit"
+                       (lifecycle/quit-handler
+                        {:quitting? win/*quitting?
+                         :update-prepared? #(not @*quit-dirty?)
+                         :stop! #(-> (db-worker/<stop-for-quit! db-worker/manager)
+                                     (p/then (fn [_] (embedding-server/stop!))))
+                         :quit! #(.quit app')
+                         :on-error! #(logger/error :electron/quit-failed %)}))
 
                   (.on app' "activate" #(when @*win (.show win))))))
              (p/catch (fn [error]
@@ -499,7 +501,10 @@
                             {:scheme     FILE_LSP_SCHEME
                              :privileges (assoc privileges :codeCache true)}
                             {:scheme     FILE_ASSETS_SCHEME
-                             :privileges (assoc privileges :stream true)}]))
+                             ;; Absolute filesystem URLs have an empty host.
+                             ;; Chromium's standard custom schemes require a
+                             ;; host and turn assets:///Root into assets://root.
+                             :privileges (assoc privileges :standard false :stream true)}]))
 
       (register-default-protocol-client! app)
       (set-app-menu!)

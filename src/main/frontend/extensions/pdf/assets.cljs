@@ -62,7 +62,7 @@
       {:key           key
        :block         block
        :identity      (subs key (- (count key) 15))
-       :filename      filename
+       :filename      (or (:block/title block) filename)
        :url           url
        :hls-file      (str "assets/" key ".edn")
        :original-path original-path})))
@@ -124,11 +124,16 @@
   [{:keys [block]}]
   (p/let [ref-id (:db/id block)
           data (db-async/<q (state/get-current-repo) {:transact-db? false}
-                            '[:find (pull ?e [*])
+                            '[:find (pull ?e [* {:logseq.property.pdf/hl-color [:block/title]}])
                               :in $ ?ref-id
                               :where [?e :logseq.property/asset ?ref-id]]
                             ref-id)]
-    (let [highlights (some->> data (flatten) (map #(:logseq.property.pdf/hl-value %)) (vec))
+    (let [highlights (some->> data (flatten)
+                            (map (fn [annotation]
+                                   (let [color (get-in annotation [:logseq.property.pdf/hl-color :block/title])]
+                                     (cond-> (:logseq.property.pdf/hl-value annotation)
+                                       color (assoc-in [:properties :color] color)))))
+                            (vec))
           extra {:page (:logseq.property.asset/last-visit-page block)}]
       {:highlights highlights
        :extra (when (some #(not (nil? (% extra))) [:page]) extra)})))
@@ -185,9 +190,12 @@
     (p/let [block (db-async/<get-block repo (:id highlight) {:children? false})]
       (when-let [color (get-in highlight [:properties :color])]
         (p/let [color-id (<highlight-color-id repo color)]
-          (property-handler/set-block-property! (:block/uuid block)
-                                                :logseq.property.pdf/hl-color
-                                                color-id))))))
+          (property-handler/set-block-properties!
+           (:block/uuid block)
+           (cond-> {:logseq.property.pdf/hl-color color-id}
+             (area-highlight? highlight)
+             (assoc :logseq.property.pdf/hl-value highlight
+                    :logseq.property.pdf/hl-image (get-in highlight [:content :image])))))))))
 
 (defn unlink-hl-area-image$
   [^js _viewer current hl]
@@ -235,16 +243,18 @@
 (defn db-based-open-block-ref!
   [block]
   (let [hl-value (:logseq.property.pdf/hl-value block)
-        asset (:logseq.property/asset block)
-        external-url (:logseq.property.asset/external-url asset)
-        file-path (or external-url (str "../assets/" (:block/uuid asset) ".pdf"))
-        file-path (if (string/starts-with? file-path "zotero://")
-                    (get-zotero-local-pdf-path (:logseq.property.asset/external-file-name asset))
-                    file-path)]
-    (if asset
+        asset-ref (:logseq.property/asset block)]
+    (if asset-ref
       (->
-       (p/let [href (assets-handler/<make-asset-url file-path)]
-         (state/set-state! :pdf/ref-highlight hl-value)
+       (p/let [asset (db-async/<get-block (state/get-current-repo)
+                                       (:block/uuid asset-ref) {:children? false})
+               external-url (:logseq.property.asset/external-url asset)
+               file-path (or external-url (str "../assets/" (:block/uuid asset) ".pdf"))
+               file-path (if (string/starts-with? file-path "zotero://")
+                           (get-zotero-local-pdf-path (:logseq.property.asset/external-file-name asset))
+                           file-path)
+               href (assets-handler/<make-asset-url file-path)]
+         (state/set-state! :pdf/ref-highlight (assoc hl-value :request-id (random-uuid)))
          ;; open pdf viewer
          (state/set-current-pdf! (inflate-asset file-path {:href href :block asset})))
        (p/catch (fn [error]

@@ -188,7 +188,7 @@
 (defn open-finder
   []
   (try
-    (when-let [^js el (js/document.querySelector ".extensions__pdf-toolbar a[title=Search]")]
+    (when-let [^js el (js/document.querySelector ".extensions__pdf-toolbar [data-pdf-action=search]")]
       (.click el))
     (catch js/Error _e nil)))
 

@@ -2,6 +2,25 @@
     @apply flex flex-row items-center flex-nowrap gap-2 overflow-hidden;
 }
 
+.references .views,
+.unlinked-references .views {
+    flex-wrap: wrap;
+    overflow: visible;
+}
+
+.references .ls-view-head > div:first-child,
+.unlinked-references .ls-view-head > div:first-child {
+    min-width: 0;
+}
+
+.references .view-actions > button,
+.unlinked-references .view-actions > button {
+    width: auto;
+    flex-shrink: 0;
+    padding-left: 6px !important;
+    padding-right: 6px !important;
+}
+
 .ls-view-order-setting {
     button.order-button {
         width: 107px;

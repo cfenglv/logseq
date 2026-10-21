@@ -1,6 +1,7 @@
 (ns electron.utils
   (:require ["electron" :refer [BrowserWindow session]]
             ["fs-extra" :as fs]
+            ["node:crypto" :as node-crypto]
             ["node-fetch" :default node-fetch]
             ["open" :as open-module]
             ["path" :as node-path]
@@ -278,6 +279,25 @@
 (defn read-file-raw
   [path]
   (fs/readFileSync path))
+
+(defn <file-content-matches?
+  "Checks one local file without sending its contents to the renderer."
+  [path expected-size expected-checksum]
+  (-> (p/let [^js stat (fs/stat path)]
+        (if (not= expected-size (.-size stat))
+          false
+          (js/Promise.
+           (fn [resolve reject]
+             (let [hasher (.createHash node-crypto "sha256")
+                   stream (.createReadStream fs path)]
+               (.on stream "data" (fn [chunk] (.update hasher chunk)))
+               (.once stream "error" reject)
+               (.once stream "end"
+                      (fn [] (resolve (= expected-checksum (.digest hasher "hex"))))))))))
+      (p/catch (fn [^js error]
+                 (if (= "ENOENT" (.-code error))
+                   false
+                   (throw error))))))
 
 (defn read-file
   [path]

@@ -203,6 +203,8 @@
     (t :nav/all-files)
     :all-pages
     (t :nav.all-pages/title)
+    :literature
+    (t :nav/literature)
     :all-journals
     (t :nav/all-journals)
     :file

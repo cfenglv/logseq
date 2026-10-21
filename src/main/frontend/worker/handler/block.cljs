@@ -369,7 +369,7 @@
      (fail-render-read! "Invalid direct-children parent UUID"
                         {:parent-uuid root-uuid}))
    (let [root-id (resolve-parent-id db root-uuid)
-         remaining0 (or node-limit ##Inf)]
+         remaining0 (or node-limit js/Infinity)]
      (loop [pending [[root-id root-uuid (recycled-chain? db root-id)]]
             seen #{}
             remaining remaining0

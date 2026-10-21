@@ -1610,7 +1610,9 @@
   []
   (thread-api/register-invoke-wrapper-fn!
    (fn [qkw args invoke]
-     (if (= qkw :thread-api/db-sync-commit-repair)
+     ;; Both repair entry points enter and drain their own commit fence.
+     (if (or (= qkw :thread-api/db-sync-commit-repair)
+             (= qkw :thread-api/db-sync-retry-repair))
        (invoke)
        (repair-commit-fence/<with-repo-call! (first args) invoke))))
   (init-sqlite-module!))
@@ -1742,6 +1744,11 @@
   [repo operation-id verification]
   (let [result (complete-repair-operation! repo operation-id verification)]
     (p/let [cleanup (<cleanup-previous-artifact! repo)]
+      (shared-service/broadcast-to-clients!
+       :notification
+       [nil :success nil nil nil
+        {:i18n-key :sync/repair-complete-success
+         :i18n-args [(graph-dir/repo->graph-dir-key repo)]}])
       (assoc result :previous-cleanup cleanup))))
 
 (def-thread-api :thread-api/db-sync-retry-repair

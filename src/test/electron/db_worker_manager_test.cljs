@@ -281,6 +281,155 @@
                      (is false (str "unexpected error: " e))))
           (p/finally (fn [] (done)))))))
 
+(deftest normal-quit-waits-for-inflight-start-and-blocks-new-claims
+  (async done
+    (let [pending (p/deferred)
+          stops (atom [])
+          finished? (atom false)
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [_repo _opts] pending)
+                    :stop-daemon! (fn [value]
+                                    (swap! stops conj (:repo value))
+                                    (p/resolved true))})
+          claim (db-worker/ensure-started! manager "demo" 1)
+          stopping (-> (db-worker/<stop-for-quit! manager)
+                       (p/then #(reset! finished? %)))
+          claim-finished? (atom false)
+          blocked (-> (db-worker/ensure-started! manager "other" 2)
+                      (p/then (fn [_] :unexpected-success))
+                      (p/catch #(-> % ex-data :code))
+                      (p/then (fn [result] (reset! claim-finished? true) result)))
+          _ (is (db-worker/update-quiescing? manager) "Close the gate before returning to an updater claim.")
+          updating (-> (db-worker/begin-update-quiesce! manager)
+                       (p/then (fn [_] :unexpected-success))
+                       (p/catch (fn [error] (:code (ex-data error)))))]
+      (-> (p/let [_ (p/delay 0)
+                  _ (is (false? @finished?))
+                  update-code updating
+                  _ (is (= :updater-quiescing update-code))
+                  _ (is (false? @claim-finished?) "A new claim waits without joining the in-flight drain.")
+                  _ (is (= 1 (:inflight @(:claim-state manager))))
+                  _ (p/resolve! pending (runtime "demo"))
+                  _ claim
+                  _ stopping
+                  blocked-code blocked]
+            (is (= :updater-quiescing blocked-code))
+            (is (nil? (:quit-finished @(:claim-state manager))))
+            (is (= ["demo"] @stops))
+            (is (empty? (:repos @(:state manager)))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn [] (p/resolve! pending (runtime "demo")) (done)))))))
+
+(deftest normal-quit-joins-an-updater-gate-with-an-inflight-start
+  (async done
+    (let [pending (p/deferred)
+          stops (atom [])
+          finished? (atom false)
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [_repo _opts] pending)
+                    :stop-daemon! (fn [value]
+                                    (swap! stops conj (:repo value))
+                                    (p/resolved true))})
+          claim (db-worker/ensure-started! manager "demo" 1)
+          updating (-> (db-worker/begin-update-quiesce! manager)
+                       (p/then #(db-worker/stop-active-for-update! manager %)))
+          stopping (-> (db-worker/<stop-for-quit! manager)
+                       (p/then #(reset! finished? %)))]
+      (-> (p/let [_ (p/delay 0)
+                  _ (is (false? @finished?))
+                  _ (p/resolve! pending (runtime "demo"))
+                  _ claim
+                  _ updating
+                  _ stopping]
+            (is (= ["demo"] @stops))
+            (is (empty? (:repos @(:state manager)))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn [] (p/resolve! pending (runtime "demo")) (done)))))))
+
+(deftest failed-normal-quit-reopens-its-gate-and-allows-a-manual-retry
+  (async done
+    (let [stop-count (atom 0)
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo _opts] (p/resolved (runtime repo)))
+                    :stop-daemon! (fn [_] (p/resolved (> (swap! stop-count inc) 1)))})]
+      (-> (p/let [_ (db-worker/ensure-started! manager "demo" 1)
+                  error-code (-> (db-worker/<stop-for-quit! manager)
+                                 (p/then (fn [_] :unexpected-success))
+                                 (p/catch (fn [error] (:code (ex-data error)))))
+                  _ (is (= :server-stop-failed error-code))
+                  _ (is (false? (db-worker/update-quiescing? manager)))
+                  next-runtime (db-worker/ensure-started! manager "other" 2)
+                  _ (is (= "other" (:repo next-runtime)))
+                  _ (db-worker/<stop-for-quit! manager)]
+            (is (= 3 @stop-count))
+            (is (empty? (:repos @(:state manager)))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
+(deftest cancelled-partial-quit-resumes-waiting-runtime-claims
+  (async done
+    (let [pending-stop (p/deferred)
+          starts (atom [])
+          stops (atom [])
+          recovered? (atom false)
+          manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo _opts]
+                                     (swap! starts conj repo)
+                                     (p/resolved (runtime repo)))
+                    :stop-daemon! (fn [{:keys [repo]}]
+                                    (swap! stops conj repo)
+                                    (if (and (= repo "other") (= 2 (count @stops)))
+                                      pending-stop
+                                      (p/resolved true)))})]
+      (-> (p/let [_ (db-worker/ensure-started! manager "demo" 1)
+                  _ (db-worker/ensure-started! manager "other" 2)
+                  stopping (let [result (-> (db-worker/<stop-for-quit! manager)
+                                           (p/catch #(-> % ex-data :code)))]
+                             {:result result})
+                  _ (p/delay 0)
+                  _ (is (nil? (get-in @(:state manager) [:repos "demo"])))
+                  recovering (let [result (-> (db-worker/ensure-started! manager "demo" 1)
+                                              (p/then (fn [value]
+                                                        (reset! recovered? true)
+                                                        value)))]
+                               {:result result})
+                  _ (p/delay 0)
+                  _ (is (false? @recovered?))
+                  _ (is (zero? (:inflight @(:claim-state manager))))
+                  _ (p/resolve! pending-stop false)
+                  error-code (:result stopping)
+                  recovered (:result recovering)]
+            (is (= :server-stop-failed error-code))
+            (is (= "demo" (:repo recovered)))
+            (is (false? (db-worker/update-quiescing? manager)))
+            (is (nil? (:quit-finished @(:claim-state manager))))
+            (is (= ["demo" "other" "demo"] @starts))
+            (p/let [_ (db-worker/<stop-for-quit! manager)]
+              (is (empty? (:repos @(:state manager))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally (fn [] (p/resolve! pending-stop false) (done)))))))
+
+(deftest failed-normal-quit-does-not-reopen-the-updaters-gate
+  (async done
+    (let [manager (db-worker/create-manager
+                   {:start-daemon! (fn [repo _opts] (p/resolved (runtime repo)))
+                    :stop-daemon! (fn [_] (p/resolved false))})]
+      (-> (p/let [_ (db-worker/ensure-started! manager "demo" 1)
+                  token (db-worker/begin-update-quiesce! manager)
+                  error-code (-> (db-worker/<stop-for-quit! manager)
+                                 (p/then (fn [_] :unexpected-success))
+                                 (p/catch (fn [error] (:code (ex-data error)))))
+                  _ (is (= :server-stop-failed error-code))
+                  _ (is (db-worker/update-quiescing? manager))
+                  blocked-code (-> (db-worker/ensure-started! manager "other" 2)
+                                   (p/then (fn [_] :unexpected-success))
+                                   (p/catch (fn [error] (:code (ex-data error)))))]
+            (is (= :updater-quiescing blocked-code))
+            (is (= (:attempt-id token)
+                   (get-in @(:install-attempt manager) [:token :attempt-id]))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
 (deftest updater-quiesce-waits-for-inflight-claim-and-captures-identities-only
   (async done
     (let [start-resolve (atom nil)

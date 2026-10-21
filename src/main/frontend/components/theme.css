@@ -213,6 +213,10 @@ main.theme-container-inner {
   font-family: var(--ls-note-font-family, var(--ls-font-family)), sans-serif;
 }
 
+.left-sidebar-inner .page-title {
+  font-family: inherit;
+}
+
 .ls-block {
   font-size: var(--ls-note-font-size, var(--ls-page-text-size));
 }

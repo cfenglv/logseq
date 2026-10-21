@@ -3,6 +3,7 @@
             [frontend.components.block.drop :as block-drop]
             [frontend.handler.editor :as editor-handler]
             [frontend.handler.editor.assets :as editor-assets]
+            [frontend.handler.literature :as literature-handler]
             [frontend.state :as state]
             [promesa.core :as p]))
 
@@ -37,13 +38,32 @@
           {:keys [event prevent-default? stop-propagation?]}
           (drop-event ["Files"] [dropped-file] "")]
       (with-redefs [state/get-current-repo (constantly "test-repo")
+                    literature-handler/auto-identification-enabled? (constantly false)
                     editor-assets/db-based-save-assets! (fn [repo files & opts]
                                                            (swap! calls conj [repo files opts])
                                                            (p/resolved :saved))]
         (block-drop/handle-data-transfer-drop! event (:block/uuid target-block) target-block nil)
-        (is (= [["test-repo" [dropped-file] [:last-edit-block target-block]]] @calls))
+        (is (= [["test-repo" [dropped-file] [:last-edit-block target-block
+                                              :reuse-existing-pdf? true
+                                              :auto-identify-literature? false]]]
+               @calls))
         (is (true? @prevent-default?))
         (is (true? @stop-propagation?)))))
+
+  (testing "the same drop path admits identification when this graph enables it"
+    (let [calls (atom [])
+          target-block {:block/uuid (random-uuid) :block/title "Drop target"}
+          dropped-file (file "demo.pdf")
+          {:keys [event]} (drop-event ["Files"] [dropped-file] "")]
+      (with-redefs [state/get-current-repo (constantly "test-repo")
+                    literature-handler/auto-identification-enabled? (fn [repo]
+                                                                       (is (= "test-repo" repo))
+                                                                       true)
+                    editor-assets/db-based-save-assets! (fn [_repo _files & opts]
+                                                           (swap! calls conj (apply hash-map opts))
+                                                           (p/resolved :saved))]
+        (block-drop/handle-data-transfer-drop! event (:block/uuid target-block) target-block nil)
+        (is (= true (:auto-identify-literature? (first @calls)))))))
 
   (testing "file drop wins over text/plain from OS file drags"
     (let [asset-calls (atom 0)

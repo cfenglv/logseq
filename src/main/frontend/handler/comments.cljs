@@ -195,5 +195,6 @@
       (editor-assets/db-based-save-assets!
        (state/get-current-repo)
        (js->clj files)
-       :target-block target-block)
+       :target-block target-block
+       :reuse-existing-pdf? true)
       true)))

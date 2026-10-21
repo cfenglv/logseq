@@ -225,11 +225,11 @@
     ;; NOTE: URL type is not consistent across all protocols
     ;; Check file:// and assets://, pathname behavior is different
     (if-let [^js url (try
-                       (js/URL. (string/replace (safe-decode-uri-component original-url) "assets://" "file://"))
+                       (js/URL. (string/replace original-url "assets://" "file://"))
                        (catch :default e
                          (js/console.error "Failed to construct URL in url-to-path:" original-url e)
                          nil))]
-      (let [path (.-pathname url)
+      (let [path (safe-decode-uri-component (.-pathname url))
             host (.-host url)
             path (if (string/starts-with? path "///")
                    (subs path 2)

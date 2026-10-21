@@ -61,6 +61,8 @@
      [(when current-page
         {:filter {:group :current-page} :text (t :cmdk.filter/current-page) :info (t :cmdk.filter/add) :icon-theme :gray :icon "file"})
       {:filter {:group :nodes} :text (t :cmdk.filter/nodes) :info (t :cmdk.filter/add) :icon-theme :gray :icon "point-filled"}
+      (when (config/db-based-graph? (state/get-current-repo))
+        {:filter {:group :literature} :text (t :cmdk.filter/literature) :info (t :cmdk.filter/add) :icon-theme :gray :icon "books"})
       {:filter {:group :codes} :text (t :cmdk.filter/codes) :info (t :cmdk.filter/add) :icon-theme :gray :icon "code"}
       {:filter {:group :commands} :text (t :cmdk.filter/commands) :info (t :cmdk.filter/add) :icon-theme :gray :icon "command"}
       {:filter {:group :files} :text (t :cmdk.filter/files) :info (t :cmdk.filter/add) :icon-theme :gray :icon "file"}
@@ -73,6 +75,7 @@
     :filters (t :cmdk.group/filters)
     :current-page (t :cmdk.group/current-page)
     :nodes (t :cmdk.group/nodes)
+    :literature (t :cmdk.group/literature)
     :codes (t :cmdk.group/codes)
     :files (t :cmdk.group/files)
     :create (t :cmdk.group/create)
@@ -88,6 +91,7 @@
    :favorites      {:status :success :show :less :items nil}
    :current-page   {:status :success :show :less :items nil}
    :nodes          {:status :success :show :less :items nil}
+   :literature     {:status :success :show :less :items nil}
    :codes          {:status :success :show :less :items nil}
    :files          {:status :success :show :less :items nil}
    :themes         {:status :success :show :less :items nil}
@@ -165,6 +169,9 @@
         include-slash? (string/includes? input "/")
         start-with-slash? (string/starts-with? input "/")
         order* (cond
+                 (= filter-group :literature)
+                 [[(group-label :literature) :literature (visible-items :literature)]]
+
                  start-with-slash?
                  [[(group-label :filters)        :filters       (visible-items :filters)]
                   [(group-label :current-page)   :current-page  (visible-items :current-page)]
@@ -350,6 +357,14 @@
                  (recur e-cut new-result)
                  new-result)))]))
 
+(defn- search-item-presentation
+  [block]
+  (let [source (or (:alias block) block)
+        kind (list-item/result-kind source)]
+    (cond-> {:detail (:literature/detail block)}
+      (= :literature kind) (assoc :icon "books" :hide-inline-icon? true)
+      (= :pdf kind) (assoc :icon "file-type-pdf" :hide-inline-icon? true))))
+
 (defn page-item
   [repo page current-page-uuid input]
   (let [entity page
@@ -365,7 +380,7 @@
                                                        :alias (:block/title source-page)
                                                        :truncate? false)
         test-title (or (:block.temp/original-title page) plain-title)]
-    (hash-map :icon icon
+    (merge (hash-map :icon icon
               :icon-theme :gray
               :text [:span {"data-testid" test-title}
                      (if (string/includes? title "$pfts_2lqh>$") ; sqlite matched
@@ -380,25 +395,50 @@
               :result-type :page
               :current-page? current-page?
               :alias (:alias page)
-              :source-block (or source-page page))))
+              :source-block (or source-page page))
+           (search-item-presentation page))))
 
 (defn block-item
   [repo block current-page-uuid input]
   (let [id (:block/uuid block)
         text (:block.temp/unique-title block)
         icon (icon-component/get-node-icon-cp block {:ignore-current-icon? true})]
-    {:icon icon
+    (merge {:icon icon
      :icon-theme :gray
      :text (highlight-content-query text input)
-     :header (block-breadcrumb/breadcrumb {:disable-preview? true
+     :header (when-not (true? (:logseq.property/literature-item? block))
+               (block-breadcrumb/breadcrumb {:disable-preview? true
                                 :search? true} repo id
                                {:disabled? true
                                 :variant :search-result
-                                :block block})
+                                :block block}))
      :result-type :block
      :current-page? (when-let [page-id (:block/page block)]
                       (= page-id current-page-uuid))
-     :source-block block}))
+     :source-block block}
+           (search-item-presentation block))))
+
+(defmethod load-results :literature [group state]
+  (let [repo (state/get-current-repo)
+        input @(::input state)
+        query (string/trim input)
+        !results (::results state)]
+    (swap! !results assoc-in [group :status] :loading)
+    (p/let [{:keys [papers status]} (if (< (count query) 2)
+                              {:papers []}
+                              (p/catch (db-async/<search-literature-papers repo query)
+                                       (fn [_] {:status :unavailable})))]
+      (when (and (= repo (state/get-current-repo))
+                 (= input @(::input state))
+                 (= group (:group @(::filter state))))
+        (swap! !results update group merge
+               {:status (if (contains? #{:unavailable :disabled} status) :unavailable :success)
+                :items (mapv (fn [paper]
+                               (block-item repo
+                                           (assoc paper
+                                                  :block.temp/unique-title (:block/title paper)
+                                                  :logseq.property/literature-item? true)
+                                           nil input)) papers)})))))
 
 (defn- block-search-result->items
   [result]
@@ -656,6 +696,9 @@
             page-uuid (<block-parent-page-uuid repo block)]
       (when block
         (cond
+          (true? (:logseq.property/literature-item? block))
+          (route-handler/redirect-to-page! block-id)
+
           (some util/collapsed? parents)
           (route-handler/redirect-to-page! block-id)
 
@@ -705,6 +748,13 @@
         (:file-path item) (do
                             (open-file (:file-path item))
                             (shui/dialog-close! :ls-dialog-cmdk))
+        (and (= :pdf (list-item/result-kind (:source-block item)))
+             (not shift-or-sidebar?))
+        (p/let [repo (state/get-current-repo)
+                asset (db-async/<get-block repo (get-in item [:source-block :block/uuid]) {:children? false})]
+          (when (= repo (state/get-current-repo))
+            (shui/dialog-close! :ls-dialog-cmdk)
+            (state/pub-event! [:asset/show-preview asset])))
         (and shift-or-sidebar? page?) (handle-action :open-page-right state event)
         (and shift-or-sidebar? block?) (handle-action :open-block-right state event)
         page? (handle-action :open-page state event)
@@ -789,20 +839,22 @@
     (load-results :default state)
     (.focus @(::input-ref state))))
 
-(defmethod handle-action :filter [_ state _event]
-  (let [item (some-> state state->highlighted-item)
-        !input (::input state)
+(defn- set-filter-and-refresh!
+  [state group value]
+  (let [!input (::input state)
         input-ref @(::input-ref state)]
-    (let [value (get-filter-user-input @!input)]
-      (reset! !input value)
-      (set! (.-value input-ref) value))
-    (let [!filter (::filter state)
-          group (get-in item [:filter :group])]
-      (swap! !filter assoc :group group)
-      (reset! (::focus-source state) :keyboard)
-      (persist-cmdk-query-state! state)
-      (load-results group state)
-      (.focus input-ref))))
+    (reset! !input value)
+    (set! (.-value input-ref) value)
+    (swap! (::filter state) assoc :group group)
+    (reset! (::focus-source state) :keyboard)
+    (persist-cmdk-query-state! state)
+    (load-results group state)
+    (.focus input-ref)))
+
+(defmethod handle-action :filter [_ state _event]
+  (let [item (some-> state state->highlighted-item)]
+    (set-filter-and-refresh! state (get-in item [:filter :group])
+                            (get-filter-user-input @(::input state)))))
 
 (defmethod handle-action :theme [_ state _event]
   (when-let [item (some-> state state->highlighted-item)]
@@ -1063,7 +1115,7 @@
       (persist-cmdk-query-state! state)
       (load-results :default state))))
 
-(def search-debounce-ms 300)
+(def search-debounce-ms 150)
 
 (defn make-search-debouncer
   [refresh-fn]
@@ -1225,6 +1277,7 @@
 (hsx/defc input-row
   [state all-items opts]
   (let [highlighted-item @(::highlighted-item state)
+        [filter'] (hooks/use-atom (::filter state))
         input @(::input state)
         input-ref (::input-ref state)
         [debounced-refresh-results cancel-refresh-results]
@@ -1254,13 +1307,15 @@
              (js/clearTimeout timeout-id)))))
      [])
     (hooks/use-effect! (fn [] cancel-refresh-results) [])
-    [:div.cp__cmdk-input-row {:class "bg-gray-02 border-b border-1 border-gray-07"}
+    [:div.cp__cmdk-input-row {:class "flex items-center bg-gray-02 border-b border-1 border-gray-07"}
      [:input.cp__cmdk-search-input
-      {:class "text-xl bg-transparent !border-none w-full !outline-none !shadow-none px-3 py-3 focus:!border-none focus:!outline-none focus:!shadow-none focus-visible:!outline-none focus-visible:!shadow-none focus:ring-0 focus:ring-offset-0 focus-visible:ring-0 focus-visible:ring-offset-0"
+      {:class "text-xl bg-transparent !border-none w-full min-w-0 !outline-none !shadow-none px-3 py-3 focus:!border-none focus:!outline-none focus:!shadow-none focus-visible:!outline-none focus-visible:!shadow-none focus:ring-0 focus:ring-offset-0 focus-visible:ring-0 focus-visible:ring-offset-0"
        :auto-focus true
        :autoComplete "off"
        :autoCapitalize "off"
-       :placeholder (input-placeholder)
+       :placeholder (if (= :literature (:group filter'))
+                      (t :cmdk.input/literature-placeholder)
+                      (input-placeholder))
        :ref #(when-not @input-ref (reset! input-ref %))
        :on-change (fn [e]
                     (let [new-value (.-value (.-target e))
@@ -1273,10 +1328,23 @@
        :on-blur (fn [_e]
                   (when-let [on-blur (:on-input-blur opts)]
                     (on-blur input)))
+       :on-composition-start (fn [_e]
+                               (cancel-refresh-results))
        :on-composition-end (fn [e]
                              (handle-input-change state e (.. e -target -value) false)
                              (debounced-refresh-results))
-       :default-value input}]]))
+       :default-value input}]
+     (when (and (config/db-based-graph? (state/get-current-repo)) (nil? (get-action)))
+       (shui/button
+        {:variant (if (= :literature (:group filter')) :secondary :ghost)
+         :size :sm :class "shrink-0 mr-3"
+         :aria-pressed (= :literature (:group filter'))
+         :data-cmdk-literature-filter true
+         :on-click #(if (= :literature (:group filter'))
+                      (clear-filter-and-refresh! state)
+                      (set-filter-and-refresh! state :literature @(::input state)))}
+        (ui/icon "books" {:size 16})
+        (t :cmdk.filter/literature)))]))
 
 (defn- tip-with-shortcut
   [template shortcut & [shortcut-opts]]
@@ -1418,6 +1486,17 @@
   (state/set-state! :search/args nil)
   state)
 
+(defn- refresh-after-index-build!
+  [state previous-build build]
+  (let [filter-group (:group @(::filter state))]
+    (when (and (= :completed (:status build))
+               (not= [(:status previous-build) (:build-id previous-build)]
+                     [(:status build) (:build-id build)])
+               (= (:repo build) (state/get-current-repo))
+               (not (string/blank? @(::input state)))
+               (contains? #{nil :nodes :current-page :codes :literature} filter-group))
+      (load-results (or filter-group :nodes) state))))
+
 (hsx/defc cmdk
   [{:keys [sidebar?] :as opts}]
   (let [state (hooks/use-memo #(cmdk-init-state opts) [])
@@ -1425,8 +1504,11 @@
         search-mode (rfx/use-sub [:search/mode])
         search-args (rfx/use-sub [:search/args])
         navigation-snapshot (rfx/use-sub [:user-navigation/snapshot])
+        index-status (rfx/use-sub [:search/index-build :status])
+        index-build-id (rfx/use-sub [:search/index-build :build-id])
+        previous-index-build (hooks/use-ref (state/get-state :search/index-build))
         [filter'] (hooks/use-atom (::filter state))
-        [_results] (hooks/use-atom (::results state))
+        [results] (hooks/use-atom (::results state))
         [_highlighted-item] (hooks/use-atom (::highlighted-item state))
         [_focus-source] (hooks/use-atom (::focus-source state))
         group-filter (or (when (and (not= :global search-mode) (not (:sidebar? opts)))
@@ -1443,6 +1525,13 @@
                               (load-results :initial state)
                               (load-results :recently-updated-pages state))))
      [navigation-snapshot group-filter])
+    (hooks/use-effect!
+     (fn []
+       (let [previous-build (hooks/deref previous-index-build)
+             build (state/get-state :search/index-build)]
+         (set! (.-current previous-index-build) build)
+         (refresh-after-index-build! state previous-build build)))
+     [index-status index-build-id])
     (hooks/use-effect!
      (fn []
        (when (nil? search-mode)
@@ -1518,7 +1607,10 @@
                 [result-group state title group-key group-items first-item sidebar?]))
           [:div.flex.flex-col.p-4.opacity-50
            (when-not (string/blank? @*input)
-             (t :search/no-result))]))]
+             (t (if (and (= :literature group-filter)
+                         (= :unavailable (get-in results [:literature :status])))
+                  :asset.literature/search-unavailable
+                  :search/no-result)))]))]
      (when-not sidebar? (hints state first-item))]))
 
 (hsx/defc cmdk-modal [props]

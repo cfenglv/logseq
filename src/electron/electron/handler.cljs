@@ -74,11 +74,20 @@
     (logger/info ::open-file-in-folder full-path)
     (.showItemInFolder shell full-path)))
 
+(defmethod handle :literature/show-zotero-companion [_window _]
+  (let [source (node-path/join (.getAppPath app) "zotero-companion.xpi")
+        target (node-path/join (.getPath app "userData") "zotero-companion.xpi")]
+    (fs/copyFileSync source target)
+    (.showItemInFolder shell target)))
+
 (defmethod handle :readFile [_window [_ path]]
   (utils/read-file path))
 
 (defmethod handle :readFileRaw [_window [_ path]]
   (utils/read-file-raw path))
+
+(defmethod handle :fileContentMatches [_window [_ path size checksum]]
+  (utils/<file-content-matches? path size checksum))
 
 (defn writable?
   [path]
@@ -275,16 +284,20 @@
 (defmethod handle :db-worker-runtime [^js window [_ repo opts]]
   (if (string/blank? repo)
     (p/rejected (ex-info "repo is required" {:code :missing-repo}))
-    (p/let [embedding-endpoint (when (cfgs/semantic-search-enabled?)
+    (p/let [window-id (.-id window)
+            embedding-endpoint (when (cfgs/semantic-search-enabled?)
                                  (embedding-server/ensure-endpoint! app))]
       (p/let [runtime (db-worker/ensure-runtime! (canonical-repo repo)
-                                                 (.-id window)
+                                                 window-id
                                                  (cond-> {:generation (:generation opts)
                                                           :on-graph-lifecycle! notify-graph-lifecycle!}
                                                    embedding-endpoint
                                                    (assoc :embedding-endpoint embedding-endpoint
                                                           :embedding-model-id (.-LOGSEQ_EMBEDDING_MODEL js/process.env))))]
-        (select-keys runtime [:repo :root-dir :generation :base-url :auth-token :owned?])))))
+        (if (.isDestroyed window)
+          (p/let [_ (db-worker/release-runtime! (canonical-repo repo) window-id)]
+            (throw (ex-info "Runtime window was closed" {:code :window-closed})))
+          (select-keys runtime [:repo :root-dir :generation :base-url :auth-token :owned?]))))))
 
 (defmethod handle :releaseDbWorkerRuntime [^js window [_ repo]]
   (if (string/blank? repo)
@@ -295,8 +308,12 @@
   (if-not (and (= #{:service :user-id} (set (keys context)))
                (every? #(and (string? %) (not (string/blank? %))) [service user-id]))
     (p/rejected (ex-info "Invalid private navigation context" {:code :navigation-invalid-context}))
-    (p/let [runtime (db-worker/ensure-navigation-runtime! db-worker/manager (.-id window) service user-id)]
-      (select-keys runtime [:repo :root-dir :generation :base-url :auth-token :owned?]))))
+    (p/let [window-id (.-id window)
+            runtime (db-worker/ensure-navigation-runtime! db-worker/manager window-id service user-id)]
+      (if (.isDestroyed window)
+        (p/let [_ (db-worker/release-navigation-runtime! db-worker/manager window-id (:repo runtime))]
+          (throw (ex-info "Runtime window was closed" {:code :window-closed})))
+        (select-keys runtime [:repo :root-dir :generation :base-url :auth-token :owned?])))))
 
 (defmethod handle :release-user-navigation-runtime [^js window [_ repo]]
   (db-worker/release-navigation-runtime! db-worker/manager (.-id window) (canonical-repo repo)))
@@ -479,8 +496,29 @@
     (js/ArrayBuffer.isView payload) payload
     :else (js/JSON.stringify (bean/->js payload))))
 
+(defn- read-limited-text-response
+  [^js res max-bytes]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [^js body (.-body res)
+           chunks (atom [])
+           received (atom 0)]
+       (if-not body
+         (resolve "")
+         (do
+           (.on body "data"
+                (fn [^js chunk]
+                  (swap! received + (.-length chunk))
+                  (if (> @received max-bytes)
+                    (.destroy body (js/Error. "Response body exceeded byte limit"))
+                    (swap! chunks conj chunk))))
+           (.once body "end"
+                  #(resolve (.toString
+                             (js/Buffer.concat (to-array @chunks)) "utf8")))
+           (.once body "error" reject)))))))
+
 (defn- read-response-body
-  [^js res type method]
+  [^js res type method max-response-bytes]
   (if (or (= :HEAD method) (contains? #{204 205} (.-status res)))
     (p/resolved nil)
     (case type
@@ -496,10 +534,14 @@
                        (.toString "base64"))))
 
       :text
-      (.text res))))
+      (if (and (number? max-response-bytes)
+               (pos? max-response-bytes))
+        (read-limited-text-response res max-response-bytes)
+        (.text res)))))
 
 (defmethod handle :httpRequest [_ [_ req-id opts]]
-  (let [{:keys [url abortable method data body returnType headers timeout includeResponse]} opts]
+  (let [{:keys [url abortable method data body returnType headers timeout proxy
+                includeResponse maxResponseBytes]} opts]
     (when-let [[method type] (and (not (string/blank? url))
                                   [(keyword (string/upper-case (or method "GET")))
                                    (keyword (string/lower-case (or returnType "json")))])]
@@ -511,15 +553,17 @@
         (when controller
           (swap! *request-abort-signals assoc req-id controller))
         (-> (utils/fetch url
-                         (-> {:method  method
-                              :headers (and headers (bean/->js headers))}
+                         (-> (cond-> {:method method
+                                      :headers (and headers (bean/->js headers))}
+                               (contains? opts :proxy) (assoc :proxy proxy))
                              (merge (when (and (not (contains? #{:GET :HEAD} method)) (some? payload))
                                       {:body (request-body->js payload)})
 
                                     (when controller
                                       {:signal (.-signal controller)}))))
             (p/then (fn [^js res]
-                      (p/let [payload (read-response-body res type method)]
+                      (p/let [payload (read-response-body
+                                       res type method maxResponseBytes)]
                         (if includeResponse
                           {:status (.-status res)
                            :statusText (.-statusText res)

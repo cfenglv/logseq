@@ -1,8 +1,12 @@
 (ns frontend.components.settings-test
   (:require ["fs" :as fs]
-            [cljs.test :refer [deftest is testing]]
+            [cljs.test :refer [async deftest is testing]]
             [clojure.string :as string]
-            [frontend.components.settings :as settings]))
+            [frontend.components.settings :as settings]
+            [frontend.context.i18n :as i18n]
+            [frontend.handler.notification :as notification]
+            [frontend.util :as util]
+            [promesa.core :as p]))
 
 (defn- css-declares-no-drag?
   [css selector]
@@ -28,3 +32,30 @@
       (is (css-declares-no-drag? settings-css "\\.ls-app-no-drag"))
       (is (css-declares-no-drag? shui-css "\\.ui__select-content"))
       (is (css-declares-no-drag? shui-css "\\.ui__select-item")))))
+
+(deftest pat-copy-feedback-waits-for-confirmed-result
+  (async done
+         (let [pending (p/deferred)
+               response (atom pending)
+               notices (atom [])]
+           (-> (p/with-redefs [util/copy-to-clipboard! (fn [text]
+                                                      (is (= "synthetic-token" text))
+                                                      @response)
+                               i18n/t identity
+                               notification/show! (fn [message type]
+                                                    (swap! notices conj [message type]))]
+                 (let [request (settings/<copy-personal-access-token! "synthetic-token")]
+                   (is (empty? @notices))
+                   (p/resolve! pending true)
+                   (p/let [_ request
+                         _ (is (= [[:sync.personal-access-token/copied :success]] @notices))
+                         _ (reset! notices [])
+                         _ (do (reset! response (p/resolved false)) nil)
+                         _ (settings/<copy-personal-access-token! "synthetic-token")
+                         _ (is (= [[:sync.personal-access-token/copy-error :error]] @notices))
+                         _ (reset! notices [])
+                         _ (do (reset! response (p/rejected (js/Error. "synthetic clipboard rejection"))) nil)
+                         _ (settings/<copy-personal-access-token! "synthetic-token")]
+                     (is (= [[:sync.personal-access-token/copy-error :error]] @notices)))))
+               (p/catch (fn [error] (is false (str error))))
+               (p/finally done)))))

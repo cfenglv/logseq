@@ -1758,7 +1758,6 @@
  :settings.general/edit-export-css "Редагувати export.css"
  :settings.general/edit-global-config-edn "Редагувати глобальний config.edn"
  :settings.general/editor-font "Шрифт"
- :settings.general/editor-font-set-global "Встановити як глобальну гарнітуру шрифту"
  :settings.general/export-theme "Експортувати тему"
  :settings.general/language "Мова"
  :settings.general/native-titlebar "Системний заголовок вікна"

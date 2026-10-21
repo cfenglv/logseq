@@ -9,6 +9,7 @@
             [lambdaisland.glogi :as log]
             [logseq.common.util :as common-util]
             [logseq.db :as ldb]
+            [logseq.db.common.reference :as db-reference]
             [logseq.db.common.view :as db-view]
             [logseq.db.frontend.class :as db-class]))
 
@@ -232,13 +233,17 @@
       :linked-references
       (let [class-children (when (ldb/class? owner)
                              (db-class/get-structured-children db (:db/id owner)))
+            paper? (:logseq.property/literature-item? owner)
+            targets (if paper?
+                       (db-reference/literature-reference-target-ids db (:db/id owner))
+                       (cons (:db/id owner) (ldb/get-block-alias db (:db/id owner))))
             refs-scope (scope-uuids db
-                                    (concat [(:db/id owner)]
-                                            (ldb/get-block-alias db (:db/id owner))
-                                            class-children))]
-        (into (conj base [:ref-scope])
-              (map (fn [target-uuid]
-                     [:refs target-uuid]))
+                                    (concat targets class-children))]
+        (into (cond-> (conj base [:ref-scope])
+                paper? (conj [:property-membership :logseq.property/asset]))
+              (mapcat (fn [target-uuid]
+                        (cond-> [[:refs target-uuid]]
+                          paper? (conj [:entity target-uuid]))))
               refs-scope))
 
       :query-result

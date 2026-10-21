@@ -1,6 +1,5 @@
 (ns frontend.components.container
-  (:require [cljs-drag-n-drop.core :as dnd]
-            [clojure.string :as string]
+  (:require [clojure.string :as string]
             [dommy.core :as d]
             [frontend.components.block.selection :as block-selection]
             [frontend.components.content :as cp-content]
@@ -67,19 +66,11 @@
      (fn []
        (let [element (gdom/getElement "main-content-container")]
          (when element
-           (dnd/subscribe!
-            element
-            :upload-files
-            {:drop (fn [_e files]
-                     (when-let [id (state/get-edit-input-id)]
-                       (let [format (get (state/get-edit-block) :block/format :markdown)]
-                         (editor-assets/upload-asset! id files format editor-handler/*asset-uploading? true))))})
            (common-handler/listen-to-scroll! element)
            (when margin-less-pages? ;; makes sure full screen pages displaying without scrollbar
              (set! (.. element -scrollTop) 0)))
          (schedule-main-content-focus!)
-         (when element
-           #(dnd/unsubscribe! element :upload-files))))
+         nil))
      [margin-less-pages?])
     [:div#main-container.cp__sidebar-main-layout.flex-1.flex
      {:class (util/classnames [{:is-left-sidebar-open left-sidebar-open?}])}
@@ -92,12 +83,21 @@
      [:div#main-content-container.scrollbar-spacing.w-full.flex.justify-center.flex-row.outline-none.relative
 
       {:tabIndex "-1"
+       :on-drag-over (fn [^js event]
+                       (when (some #{"Files"} (js->clj (.. event -dataTransfer -types)))
+                         (.preventDefault event)))
+       :on-drop (fn [^js event]
+                  (when-let [files (some-> event .-dataTransfer .-files array-seq seq)]
+                    (util/stop event)
+                    (when-let [id (state/get-edit-input-id)]
+                      (let [format (get (state/get-edit-block) :block/format :markdown)]
+                        (editor-assets/upload-asset! id files format editor-handler/*asset-uploading? true)))))
        :data-is-margin-less-pages margin-less-pages?}
 
       [:div.cp__sidebar-main-content
        {:data-is-margin-less-pages margin-less-pages?
         :data-is-full-width (or margin-less-pages?
-                                (contains? #{:all-files :all-pages :my-publishing} route-name))}
+                                (contains? #{:all-files :all-pages :literature :my-publishing} route-name))}
 
        (footer/footer)
 

@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "تعديل CSS التصدير"
  :settings.general/edit-global-config-edn "تعديل config.edn العام"
  :settings.general/editor-font "خط المحرر"
- :settings.general/editor-font-set-global "تعيين كخط عام"
  :settings.general/export-theme "تصدير السمة"
  :settings.general/language "اللغة"
  :settings.general/native-titlebar "شريط عنوان النظام"

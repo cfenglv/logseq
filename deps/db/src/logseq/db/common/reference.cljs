@@ -260,6 +260,29 @@
        (map :db/id)
        set))
 
+(defn literature-reference-target-ids
+  "Read a Paper's existing PDF and annotation identities without rewriting refs."
+  [db id]
+  (let [paper (d/entity db id)]
+    (into (set (cons id (ldb/get-block-alias db id)))
+          (mapcat (fn [asset]
+                    (concat [(:db/id asset)]
+                            (ldb/get-block-alias db (:db/id asset))
+                            (map :db/id (:block/_link asset))
+                            (keep (fn [datom]
+                                  (let [annotation (d/entity db (:e datom))]
+                                    (when (and (= :annotation (:logseq.property/ls-type annotation))
+                                               (not (entity-util/hidden? annotation)))
+                                      (:e datom))))
+                                (d/datoms db :avet :logseq.property/asset (:db/id asset))))))
+          (remove entity-util/hidden? (:logseq.property/literature-assets paper)))))
+
+(defn literature-reference-block-ids
+  "Unfiltered reading references for a Paper and its existing attachments."
+  [db id]
+  (let [ids (literature-reference-target-ids db id)]
+    (set/difference (linked-reference-top-block-ids db ids nil) ids)))
+
 (defn- linked-reference-result
   [db id include-ref-pages-count? has-filters? ref-blocks children-ids]
   (cond->
@@ -274,7 +297,8 @@
   ([db id {:keys [include-ref-pages-count?]
            :or {include-ref-pages-count? true}}]
   (let [entity       (d/entity db id)
-        ids          (set (cons id (ldb/get-block-alias db id)))
+        ids          (when-not (:logseq.property/literature-item? entity)
+                       (set (cons id (ldb/get-block-alias db id))))
         page-filters (get-filters entity)
         excludes     (map :db/id (:excluded page-filters))
         includes     (map :db/id (:included page-filters))
@@ -284,7 +308,9 @@
                        (let [class-children (db-class/get-structured-children db id)]
                          (set (conj class-children id))))
         ;; Collect all top ref blocks that directly reference the page (or any alias).
-        full-ref-block-ids (linked-reference-top-block-ids db ids class-ids)
+        full-ref-block-ids (if (:logseq.property/literature-item? entity)
+                             (literature-reference-block-ids db id)
+                             (linked-reference-top-block-ids db ids class-ids))
         ;; matched can be top or child ids
         matched-ref-block-ids
         (when has-filters?

@@ -1,7 +1,12 @@
 (ns frontend.worker.undo-redo-test
-  (:require [cljs.test :refer [deftest is testing use-fixtures]]
+  (:require [logseq.db.frontend.property :as db-property]
+            [logseq.db.sqlite.create-graph :as sqlite-create-graph]
+            [cljs.test :refer [deftest is testing use-fixtures]]
             [datascript.core :as d]
+            [frontend.common.thread-api :as thread-api]
             [frontend.worker.a-test-env]
+            [frontend.worker.db-core :as db-core]
+            [frontend.worker.handler.transaction]
             [frontend.worker.pipeline :as worker-pipeline]
             [frontend.worker.sync.apply-txs :as sync-apply]
             [frontend.worker.state :as worker-state]
@@ -10,9 +15,12 @@
             [frontend.worker.undo-redo :as worker-undo-redo]
             [logseq.common.util.date-time :as date-time-util]
             [logseq.db :as ldb]
+            [logseq.db.frontend.literature :as literature]
+            [logseq.db.frontend.validate :as db-validate]
             [logseq.db.sqlite.build :as sqlite-build]
             [logseq.db.test.helper :as db-test]
-            [logseq.outliner.op :as outliner-op]))
+            [logseq.outliner.op :as outliner-op]
+            [logseq.outliner.property :as outliner-property]))
 
 (def ^:private test-repo "test-worker-undo-redo")
 
@@ -21,6 +29,7 @@
   (let [Database (js/require "better-sqlite3")
         db (new Database ":memory:")]
     (client-op/ensure-sqlite-schema! db)
+    (#'db-core/initialize-activation-record! db)
     db))
 
 (defn- delete-client-op-tx-row!
@@ -71,6 +80,88 @@
 
 (use-fixtures :each with-worker-conns)
 
+(deftest apply-outliner-ops-consumes-request-editor-context
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        apply! (get @thread-api/*thread-apis :thread-api/apply-outliner-ops)
+        block-uuid (:block/uuid (db-test/find-block-by-content @conn "task"))
+        stale {:block-uuid block-uuid :container-id :unknown-container
+               :start-pos 61 :end-pos 63}
+        cursor (assoc stale :start-pos 3 :end-pos 5)
+        selection {:selected-block-uuids [block-uuid] :selection-direction :down}]
+    (doseq [[label context expected]
+            [[:omitted {} nil]
+             [:nil {:pending-editor-info nil} nil]
+             [:cursor {:pending-editor-info cursor} cursor]
+             [:selection {:pending-editor-info selection} selection]]]
+      (testing (name label)
+        (worker-undo-redo/clear-history! test-repo)
+        (worker-undo-redo/set-pending-editor-info! test-repo stale)
+        (let [old-title (:block/title (d/entity @conn [:block/uuid block-uuid]))
+              new-title (str "saved " (name label))
+              save! (fn [title opts]
+                      (apply! test-repo
+                              [[:save-block [{:block/uuid block-uuid :block/title title} {}]]]
+                              (assoc opts :persist-op? true)))]
+          (save! new-title context)
+          (let [{:keys [undo-ops pending-editor-info]} (worker-undo-redo/get-debug-state test-repo)]
+            (is (nil? pending-editor-info))
+            (is (= 1 (count undo-ops)))
+            (is (not-any? #(contains? (:tx-meta (second %)) :pending-editor-info)
+                          (first undo-ops))
+                "Request context must not be copied into transaction metadata."))
+          (let [undo-result (worker-undo-redo/undo test-repo)]
+            (is (= (if expected [expected] []) (vec (:editor-cursors undo-result))))
+            (is (= old-title (:block/title (d/entity @conn [:block/uuid block-uuid])))))
+          (let [redo-result (worker-undo-redo/redo test-repo)]
+            (is (= (if expected [expected] []) (vec (:editor-cursors redo-result))))
+            (is (= new-title (:block/title (d/entity @conn [:block/uuid block-uuid])))))
+          (save! (str new-title " next") {})
+          (is (empty? (:editor-cursors (worker-undo-redo/undo test-repo)))
+              "A later caller without context must not inherit stale editor information."))))))
+
+(deftest apply-outliner-ops-empty-and-rejected-requests-use-explicit-context
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        apply! (get @thread-api/*thread-apis :thread-api/apply-outliner-ops)
+        block-uuid (:block/uuid (db-test/find-block-by-content @conn "task"))
+        page-uuid (:block/uuid (db-test/find-page-by-title @conn "page 1"))
+        cursor {:block-uuid block-uuid :container-id :unknown-container
+                :start-pos 3 :end-pos 5}
+        stale (assoc cursor :start-pos 61 :end-pos 63)
+        db-before @conn]
+    (worker-undo-redo/set-pending-editor-info! test-repo stale)
+    (apply! test-repo [] {:pending-editor-info cursor})
+    (is (= db-before @conn))
+    (is (= cursor (:pending-editor-info (worker-undo-redo/get-debug-state test-repo))))
+    (is (empty? (:undo-ops (worker-undo-redo/get-debug-state test-repo))))
+    (apply! test-repo [] {:pending-editor-info nil})
+    (is (nil? (:pending-editor-info (worker-undo-redo/get-debug-state test-repo))))
+    (worker-undo-redo/set-pending-editor-info! test-repo stale)
+    (is (thrown-with-msg? js/Error #"Page name shouldn't be blank"
+                         (apply! test-repo [[:rename-page [page-uuid ""]]]
+                                 {:pending-editor-info cursor})))
+    (is (= db-before @conn))
+    (is (= cursor (:pending-editor-info (worker-undo-redo/get-debug-state test-repo))))
+    (is (empty? (:undo-ops (worker-undo-redo/get-debug-state test-repo))))
+    (apply! test-repo [[:save-block [{:block/uuid block-uuid :block/title "after rejection"} {}]]]
+            {:persist-op? true :pending-editor-info cursor})
+    (is (= [cursor] (vec (:editor-cursors (worker-undo-redo/undo test-repo)))))))
+
+(deftest apply-outliner-ops-editor-context-is-scoped-to-requested-repo
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        apply! (get @thread-api/*thread-apis :thread-api/apply-outliner-ops)
+        other-repo "other-context-repo"
+        cursor {:selected-block-uuids [(random-uuid)] :selection-direction :up}]
+    (swap! worker-state/*datascript-conns assoc other-repo (d/conn-from-db @conn))
+    (try
+      (worker-undo-redo/set-pending-editor-info! test-repo cursor)
+      (worker-undo-redo/set-pending-editor-info! other-repo cursor)
+      (apply! other-repo [] {:pending-editor-info nil})
+      (is (nil? (:pending-editor-info (worker-undo-redo/get-debug-state other-repo))))
+      (is (= cursor (:pending-editor-info (worker-undo-redo/get-debug-state test-repo))))
+      (finally
+        (worker-undo-redo/clear-history! other-repo)
+        (swap! worker-state/*datascript-conns dissoc other-repo)))))
+
 (deftest worker-ui-state-roundtrip-test
   (let [ui-state-str "{:old-state {}, :new-state {:route-data {:to :page}}}"]
     (worker-undo-redo/record-ui-state! test-repo ui-state-str)
@@ -109,6 +200,183 @@
                   :outliner-op :save-block
                   :outliner-ops [[:save-block [{:block/uuid block-uuid
                                                 :block/title title} {}]]]}))))
+
+(defn- create-public-literature-page!
+  [conn]
+  (sqlite-build/create-blocks
+   conn {:pages-and-blocks [{:page {:block/title "Public bibliography"}}]})
+  (:block/uuid (db-test/find-page-by-title @conn "Public bibliography")))
+
+(deftest source-connection-is-one-native-undoable-transaction
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        connect! (get @thread-api/*thread-apis :thread-api/literature-ensure-source-binding)
+        binding-uuid (random-uuid)]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (let [result (connect! test-repo binding-uuid {:title "Public bibliography"})
+          destination (:destination-page-uuid result)]
+      (is (= :created (:status result)))
+      (is (not= binding-uuid destination))
+      (is (= 1 (count (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+      (worker-undo-redo/undo test-repo)
+      (is (ldb/recycled? (d/entity @conn [:block/uuid binding-uuid])))
+      (is (ldb/recycled? (d/entity @conn [:block/uuid destination])))
+      (worker-undo-redo/redo test-repo)
+      (is (not (ldb/recycled? (d/entity @conn [:block/uuid binding-uuid]))))
+      (is (not (ldb/recycled? (d/entity @conn [:block/uuid destination]))))
+      (is (empty? (:errors (db-validate/validate-db @conn)))))))
+
+(deftest background-literature-registration-preserves-user-undo-and-redo
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        ^js journal (worker-state/get-client-ops-conn test-repo)
+        register! (get @thread-api/*thread-apis
+                       :thread-api/literature-register-source-record)
+        task-uuid (:block/uuid (db-test/find-block-by-content @conn "task"))
+        binding-uuid (:block/uuid (db-test/find-page-by-title @conn "page 1"))
+        destination-page-uuid (create-public-literature-page! conn)
+        record {:classification :bibliographic-item
+                :source-key "zotero:user:synthetic:item:HISTORY1"
+                :doi "10.5555/history-one"}
+        paper-uuid (literature/source-record-paper-uuid record)
+        journal-count #(let [^js statement (.prepare journal
+                                                    "select count(*) as n from client_ops where kind = 'tx'")]
+                         (.-n (.get statement)))
+        title #(get (d/entity @conn [:block/uuid task-uuid]) :block/title)]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (save-block-title! conn task-uuid "user edit")
+    (let [before-journal (journal-count)]
+      (is (= :created (:status (register! test-repo binding-uuid destination-page-uuid record))))
+      (is (= :linked
+             (:status (register! test-repo binding-uuid destination-page-uuid
+                                 (assoc record :source-key "zotero:user:synthetic:item:HISTORY2")))))
+      (is (= (+ before-journal 2) (journal-count))))
+    (is (= 1 (count (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+    (worker-undo-redo/undo test-repo)
+    (is (= "task" (title)))
+    (is (some? (d/entity @conn [:block/uuid paper-uuid])))
+    (is (= 2 (count (:logseq.property/literature-source-key
+                    (d/entity @conn [:block/uuid paper-uuid])))))
+    (let [second-record (assoc record :source-key "zotero:user:synthetic:item:HISTORY3"
+                               :doi "10.5555/history-two")
+          second-paper-uuid (literature/source-record-paper-uuid second-record)]
+      (is (= :created (:status (register! test-repo binding-uuid destination-page-uuid second-record))))
+      (is (= 1 (count (:redo-ops (worker-undo-redo/get-debug-state test-repo)))))
+      (worker-undo-redo/redo test-repo)
+      (is (= "user edit" (title)))
+      (is (some? (d/entity @conn [:block/uuid second-paper-uuid])))
+      (is (some? (d/entity @conn [:block/uuid paper-uuid]))))))
+
+(deftest manual-literature-insert-restores-derived-refs-on-redo
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        apply! (get @thread-api/*thread-apis :thread-api/apply-outliner-ops)
+        page-uuid (:block/uuid (db-test/find-page-by-title @conn "page 1"))
+        previous-pipeline @ldb/*transact-pipeline-fn]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+    (try
+      (doseq [title ["Manual no-PDF paper" (str "Manual paper [[" page-uuid "]]")]]
+        (worker-undo-redo/clear-history! test-repo)
+        (let [paper-uuid (random-uuid)
+              snapshot (fn []
+                         (let [paper (d/entity @conn [:block/uuid paper-uuid])]
+                           {:title (:block/title paper)
+                            :marker (:logseq.property/literature-item? paper)
+                            :parent (some-> paper :block/parent :block/uuid)
+                            :page (some-> paper :block/page :block/uuid)
+                            :refs (set (map :block/uuid (:block/refs paper)))}))]
+          (apply! test-repo
+                  [[:insert-blocks [[{:block/uuid paper-uuid
+                                      :block/title title
+                                      :logseq.property/literature-item? true}]
+                                    page-uuid
+                                    {:keep-uuid? true :bottom? true :sibling? false}]]]
+                  {:persist-op? true})
+          (let [saved (snapshot)
+                marker-uuid (:block/uuid (d/entity @conn :logseq.property/literature-item?))]
+            (is (contains? (:refs saved) marker-uuid))
+            (is (= page-uuid (:parent saved) (:page saved)))
+            (worker-undo-redo/undo test-repo)
+            (is (nil? (d/entity @conn [:block/uuid paper-uuid])))
+            (worker-undo-redo/redo test-repo)
+            (is (= saved (snapshot))
+                "Redo preserves the saved paper and its derived property/content references."))))
+      (finally
+        (reset! ldb/*transact-pipeline-fn previous-pipeline)))))
+
+(deftest manual-literature-pdf-registration-remains-undoable
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        asset-uuid (random-uuid)
+        register! (get @thread-api/*thread-apis
+                       :thread-api/literature-register-pdf)]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (sqlite-build/create-blocks
+     conn
+     {:pages-and-blocks
+      [{:page {:block/title "Manual PDF assets"}
+        :blocks [{:block/uuid asset-uuid
+                  :build/keep-uuid? true
+                  :block/title "Synthetic PDF"
+                  :build/tags [:logseq.class/Asset]
+                  :build/properties
+                  {:logseq.property.asset/type "pdf"
+                   :logseq.property.asset/checksum "synthetic-manual-pdf"}}]}]})
+    (worker-undo-redo/clear-history! test-repo)
+    (let [result (register! test-repo asset-uuid "Manual paper"
+                            {:doi "10.5555/manual-pdf"})
+          paper-uuid (:paper-uuid result)]
+      (is (= :created (:status result)))
+      (is (= 1 (count (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+      (worker-undo-redo/undo test-repo)
+      (is (nil? (d/entity @conn [:block/uuid paper-uuid])))
+      (is (some? (d/entity @conn [:block/uuid asset-uuid])))
+      (worker-undo-redo/redo test-repo)
+      (is (= paper-uuid
+             (get-in (literature/find-paper-by-asset @conn asset-uuid)
+                     [:papers 0 :block/uuid])))
+      (is (= paper-uuid
+             (get-in (literature/find-paper-by-identifiers
+                      @conn {:doi "10.5555/manual-pdf"})
+                     [:papers 0 :block/uuid]))))))
+
+(deftest manual-pdf-without-identifier-remains-undoable
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        asset-uuid (random-uuid)
+        register! (get @thread-api/*thread-apis
+                       :thread-api/literature-register-pdf)]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (sqlite-build/create-blocks
+     conn
+     {:pages-and-blocks
+      [{:page {:block/title "Unidentified PDF assets"}
+        :blocks [{:block/uuid asset-uuid
+                  :build/keep-uuid? true
+                  :block/title "Unknown research PDF"
+                  :build/tags [:logseq.class/Asset]
+                  :build/properties
+                  {:logseq.property.asset/type "pdf"
+                   :logseq.property.asset/checksum "synthetic-unknown-pdf"}}]}]})
+    (worker-undo-redo/clear-history! test-repo)
+    (let [result (register! test-repo asset-uuid "User supplied title" {})
+          paper-uuid (:paper-uuid result)]
+      (is (= :created (:status result)))
+      (is (uuid? paper-uuid))
+      (is (= 1 (count (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+      (worker-undo-redo/undo test-repo)
+      (is (nil? (d/entity @conn [:block/uuid paper-uuid])))
+      (is (some? (d/entity @conn [:block/uuid asset-uuid])))
+      (worker-undo-redo/redo test-repo)
+      (is (= paper-uuid
+             (get-in (literature/find-paper-by-asset @conn asset-uuid)
+                     [:papers 0 :block/uuid]))))))
 
 (defn- block-id->uuid
   [db block-id]
@@ -275,6 +543,290 @@
     (some #(when (= ::worker-undo-redo/db-transact (first %))
              (second %))
           redo-op)))
+
+(defn- property-subtree-snapshot
+  [db uuids]
+  (let [pattern (cond-> '[:block/uuid :block/title :block/order
+                         {:block/parent [:block/uuid]}
+                         {:block/page [:block/uuid]}
+                         {:logseq.property/created-from-property [:db/ident]}
+                         {:logseq.property/description [:block/uuid]}]
+                  (literature/available? db)
+                  (into '[{:logseq.property/literature-doi [:block/uuid]}
+                          {:logseq.property/literature-source-key [:block/uuid]}
+                          {:logseq.property/literature-source-target [:block/uuid]}]))]
+    (mapv (fn [uuid]
+          (some-> (d/pull db
+                         pattern
+                         [:block/uuid uuid])
+                  (update :logseq.property/literature-source-key set)))
+          uuids)))
+
+(defn- seed-no-id-source-correction!
+  [conn]
+  (let [binding-uuid (:block/uuid (db-test/find-page-by-title @conn "page 1"))
+        paper-a (random-uuid)
+        paper-b (random-uuid)
+        paper-c (random-uuid)
+        source-key (str "zotero:synthetic:item:" paper-a)]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (sqlite-build/create-blocks
+     conn {:pages-and-blocks
+           [{:page {:block/title (str "Synthetic source history " paper-a)}
+             :blocks [{:block/uuid paper-a :block/title "History source Paper without identifier"
+                       :build/properties {:logseq.property/literature-item? true
+                                          :logseq.property/literature-source-key #{source-key}}}
+                      {:block/uuid paper-b :block/title "History selected Paper without identifier"
+                       :build/properties {:logseq.property/literature-item? true}}
+                      {:block/uuid paper-c :block/title "History remote Paper without identifier"
+                       :build/properties {:logseq.property/literature-item? true}}]}]})
+    (let [key-node (first (:logseq.property/literature-source-key
+                          (d/entity @conn [:block/uuid paper-a])))
+          key-uuid (:block/uuid key-node)]
+      (outliner-property/set-block-property!
+       conn (:db/id key-node) :logseq.property/literature-source-target
+       (:db/id (d/entity @conn [:block/uuid binding-uuid])))
+      (worker-undo-redo/clear-history! test-repo)
+      {:paper-a paper-a :paper-b paper-b :paper-c paper-c :key-uuid key-uuid
+       :source {:key-uuid key-uuid :source-key source-key
+                :binding-uuid binding-uuid :active? true}})))
+
+(deftest explicit-source-corrections-use-original-journal-and-undo-redo
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        ^js journal (worker-state/get-client-ops-conn test-repo)
+        binding-uuid (:block/uuid (db-test/find-page-by-title @conn "page 1"))
+        destination (create-public-literature-page! conn)
+        register! (get @thread-api/*thread-apis :thread-api/literature-register-source-record)
+        correct! (get @thread-api/*thread-apis :thread-api/literature-correct-source-record)
+        record {:classification :bibliographic-item
+                :source-key "zotero:user:synthetic:item:CORRECT01"
+                :doi "10.5555/source-correction-a"}
+        other-record (assoc record :source-key "zotero:user:synthetic:item:CORRECT02")
+        target-record (assoc record :source-key "zotero:user:synthetic:item:CORRECT03"
+                             :doi "10.5555/source-correction-b")
+        paper-uuid (literature/source-record-paper-uuid record)
+        target-uuid (literature/source-record-paper-uuid target-record)
+        journal-count #(let [^js stmt (.prepare journal
+                                               "select count(*) as n from client_ops where kind = 'tx'")]
+                         (.-n (.get stmt)))]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (register! test-repo binding-uuid destination record)
+    (register! test-repo binding-uuid destination other-record)
+    (register! test-repo binding-uuid destination target-record)
+    (let [source-node (first (filter #(= (:source-key record) (:block/title %))
+                                    (:logseq.property/literature-source-key
+                                     (d/entity @conn [:block/uuid paper-uuid]))))
+          source {:key-uuid (:block/uuid source-node)
+                  :source-key (:source-key record)
+                  :binding-uuid binding-uuid :active? true}
+          source-uuids (mapv :block/uuid
+                            (concat (:logseq.property/literature-source-key
+                                     (d/entity @conn [:block/uuid paper-uuid]))
+                                    (:logseq.property/literature-source-key
+                                     (d/entity @conn [:block/uuid target-uuid]))))
+          uuids (into [paper-uuid target-uuid] source-uuids)
+          baseline (property-subtree-snapshot @conn uuids)]
+      (doseq [action [:unlink :reassign]]
+        (worker-undo-redo/clear-history! test-repo)
+        (let [before-count (journal-count)
+              result (correct! test-repo paper-uuid source action
+                               (when (= action :reassign) target-uuid))
+              changed (property-subtree-snapshot @conn uuids)]
+          (is (= :updated (:status result)))
+          (is (= (inc before-count) (journal-count)) "One user action persists one native transaction.")
+          (is (= 1 (count (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+          (let [history (latest-undo-history-data)
+                entry (client-op/get-local-tx-entry test-repo (:db-sync/tx-id history))
+                forward (:db-sync/forward-outliner-ops history)
+                inverse (:db-sync/inverse-outliner-ops history)
+                context {:paper-uuid paper-uuid :source source :action action
+                         :target-paper-uuid (when (= action :reassign) target-uuid)
+                         :inverse? false}]
+            (is (= :transact (ffirst forward)))
+            (is (= :transact (ffirst inverse)))
+            (is (= context (get-in forward [0 1 1 :literature/correct-source-record])))
+            (is (= (assoc context :inverse? true)
+                   (get-in inverse [0 1 1 :literature/correct-source-record])))
+            (is (= forward (:forward-outliner-ops entry)))
+            (is (= inverse (:inverse-outliner-ops entry))))
+          (is (not= baseline changed))
+          (dotimes [_ 2]
+            (is (map? (worker-undo-redo/undo test-repo)))
+            (is (= baseline (property-subtree-snapshot @conn uuids)))
+            (is (empty? (:errors (db-validate/validate-db @conn))))
+            (is (map? (worker-undo-redo/redo test-repo)))
+            (is (= changed (property-subtree-snapshot @conn uuids)))
+            (is (empty? (:errors (db-validate/validate-db @conn)))))
+          (worker-undo-redo/undo test-repo)
+          (is (= baseline (property-subtree-snapshot @conn uuids))))))))
+
+(deftest stale-source-correction-undo-consumes-only-current-action
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        journal (worker-state/get-client-ops-conn test-repo)
+        correct! (get @thread-api/*thread-apis :thread-api/literature-correct-source-record)
+        task-uuid (:block/uuid (db-test/find-block-by-content @conn "task"))]
+    (doseq [action [:reassign :unlink]]
+      (testing (name action)
+        (let [{:keys [paper-a paper-b paper-c key-uuid source]}
+              (seed-no-id-source-correction! conn)]
+          (save-block-title! conn task-uuid "Earlier user edit")
+          (is (= :updated (:status (correct! test-repo paper-a source action
+                                             (when (= action :reassign) paper-b)))))
+          (let [history (latest-undo-history-data)
+                tx-id (:db-sync/tx-id history)]
+            (is (= 2 (count (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+            (d/transact! conn
+                         [[:db/retract [:block/uuid paper-a] :logseq.property/literature-source-key
+                           [:block/uuid key-uuid]]
+                          [:db/retract [:block/uuid paper-b] :logseq.property/literature-source-key
+                           [:block/uuid key-uuid]]
+                          [:db/add [:block/uuid paper-c] :logseq.property/literature-source-key
+                           [:block/uuid key-uuid]]
+                          [:db/add [:block/uuid key-uuid] :logseq.property/literature-source-target
+                           [:block/uuid (:binding-uuid source)]]]
+                         {:rtc-tx? true})
+            (when (= action :unlink)
+              (delete-client-op-tx-row! journal tx-id)
+              (is (not (client-op-tx-row-exists? journal tx-id)))
+              (let [before @conn
+                    pending (sync-apply/pending-txs test-repo)]
+                (is (= {:applied? false :reason :source-correction-blocked}
+                       (sync-apply/apply-history-action!
+                        test-repo tx-id true
+                        (merge (:tx-meta history)
+                               (select-keys history [:db-sync/forward-outliner-ops
+                                                     :db-sync/inverse-outliner-ops])))))
+                (is (identical? before @conn))
+                (is (= pending (sync-apply/pending-txs test-repo)))))
+            (let [before @conn
+                  pending (sync-apply/pending-txs test-repo)]
+              (is (= {:undo? true :applied? false :reason :source-correction-blocked}
+                     (worker-undo-redo/undo test-repo)))
+              (is (identical? before @conn))
+              (is (= pending (sync-apply/pending-txs test-repo)))
+              (is (= "Earlier user edit" (:block/title (d/entity @conn [:block/uuid task-uuid]))))
+              (is (= 1 (count (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+              (is (empty? (:redo-ops (worker-undo-redo/get-debug-state test-repo)))))
+            (worker-undo-redo/undo test-repo)
+            (is (= "task" (:block/title (d/entity @conn [:block/uuid task-uuid]))))
+            (is (= [paper-c]
+                   (mapv :block/uuid (:papers (literature/find-paper-by-source-key
+                                              @conn (:source-key source))))))
+            (is (= (:binding-uuid source)
+                   (:block/uuid (:logseq.property/literature-source-target
+                                 (d/entity @conn [:block/uuid key-uuid])))))
+            (is (nil? (:logseq.property/literature-doi (d/entity @conn [:block/uuid paper-c]))))
+            (is (nil? (:logseq.property/literature-arxiv (d/entity @conn [:block/uuid paper-c]))))))))))
+
+(deftest stale-source-correction-redo-preserves-earlier-redo-action
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        correct! (get @thread-api/*thread-apis :thread-api/literature-correct-source-record)
+        task-uuid (:block/uuid (db-test/find-block-by-content @conn "task"))
+        {:keys [paper-a paper-b paper-c key-uuid source]} (seed-no-id-source-correction! conn)]
+    (is (= :updated (:status (correct! test-repo paper-a source :reassign paper-b))))
+    (save-block-title! conn task-uuid "Later user edit")
+    (worker-undo-redo/undo test-repo)
+    (worker-undo-redo/undo test-repo)
+    (is (= [paper-a]
+           (mapv :block/uuid (:papers (literature/find-paper-by-source-key @conn (:source-key source))))))
+    (is (= 2 (count (:redo-ops (worker-undo-redo/get-debug-state test-repo)))))
+    (d/transact! conn
+                 [[:db/retract [:block/uuid paper-a] :logseq.property/literature-source-key
+                   [:block/uuid key-uuid]]
+                  [:db/add [:block/uuid paper-c] :logseq.property/literature-source-key
+                   [:block/uuid key-uuid]]]
+                 {:rtc-tx? true})
+    (let [before @conn
+          pending (sync-apply/pending-txs test-repo)]
+      (is (= {:undo? false :applied? false :reason :source-correction-blocked}
+             (worker-undo-redo/redo test-repo)))
+      (is (identical? before @conn))
+      (is (= pending (sync-apply/pending-txs test-repo)))
+      (is (= "task" (:block/title (d/entity @conn [:block/uuid task-uuid]))))
+      (is (= 1 (count (:redo-ops (worker-undo-redo/get-debug-state test-repo)))))
+      (is (empty? (:undo-ops (worker-undo-redo/get-debug-state test-repo)))))
+    (worker-undo-redo/redo test-repo)
+    (is (= "Later user edit" (:block/title (d/entity @conn [:block/uuid task-uuid]))))
+    (is (= [paper-c]
+           (mapv :block/uuid (:papers (literature/find-paper-by-source-key @conn (:source-key source))))))
+    (is (empty? (:redo-ops (worker-undo-redo/get-debug-state test-repo))))))
+
+(deftest delete-undo-restores-nested-default-property-values
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        {:keys [parent-uuid child-uuid]} (seed-page-parent-child!)
+        task-uuid (:block/uuid (db-test/find-block-by-content @conn "task"))]
+    (apply-ops! conn [[:set-block-property [parent-uuid :logseq.property/description "Parent description"]]]
+                (local-tx-meta {}))
+    (let [description (:logseq.property/description (d/entity @conn [:block/uuid parent-uuid]))
+          description-uuid (:block/uuid description)
+          note-uuid (random-uuid)]
+      (apply-ops! conn
+                  [[:insert-blocks [[{:block/uuid note-uuid :block/title "Description child"}]
+                                    (:db/id description) {:sibling? false :keep-uuid? true}]]]
+                  (local-tx-meta {}))
+      (apply-ops! conn [[:set-block-property [note-uuid :logseq.property/description "Nested description"]]]
+                  (local-tx-meta {}))
+      (let [nested-uuid (:block/uuid (:logseq.property/description
+                                    (d/entity @conn [:block/uuid note-uuid])))
+            uuids [parent-uuid child-uuid description-uuid note-uuid nested-uuid]
+            before (property-subtree-snapshot @conn uuids)
+            neighbor (property-subtree-snapshot @conn [task-uuid])]
+        (worker-undo-redo/clear-history! test-repo)
+        (apply-ops! conn [[:delete-blocks [[parent-uuid] {}]]] (local-tx-meta {}))
+        (is (every? nil? (property-subtree-snapshot @conn uuids)))
+        (dotimes [_ 2]
+          (worker-undo-redo/undo test-repo)
+          (is (= before (property-subtree-snapshot @conn uuids)))
+          (is (= neighbor (property-subtree-snapshot @conn [task-uuid])))
+          (is (empty? (:errors (db-validate/validate-db @conn))))
+          (worker-undo-redo/redo test-repo)
+          (is (every? nil? (property-subtree-snapshot @conn uuids))))))))
+
+(deftest delete-undo-restores-paper-links-to-retained-sources
+  (let [conn (worker-state/get-datascript-conn test-repo)
+        binding-uuid (:block/uuid (db-test/find-page-by-title @conn "page 1"))
+        destination-page-uuid (create-public-literature-page! conn)
+        record {:classification :bibliographic-item
+                :source-key "zotero:user:synthetic:item:DELETE01"
+                :doi "10.5555/delete-undo"}
+        register! (get @thread-api/*thread-apis :thread-api/literature-register-source-record)
+        paper-uuid (literature/source-record-paper-uuid record)]
+    (d/transact! conn (sqlite-create-graph/build-properties
+                                 (select-keys db-property/built-in-properties
+                                              db-property/literature-property-idents)))
+    (register! test-repo binding-uuid destination-page-uuid record)
+    (register! test-repo binding-uuid destination-page-uuid (assoc record :source-key "zotero:user:synthetic:item:DELETE02"))
+    (let [paper (d/entity @conn [:block/uuid paper-uuid])
+          source-uuids (mapv :block/uuid (:logseq.property/literature-source-key paper))
+          owned-uuids [paper-uuid (:block/uuid (:logseq.property/literature-doi paper))]
+          uuids (into owned-uuids source-uuids)
+          before (property-subtree-snapshot @conn uuids)
+          sources (property-subtree-snapshot @conn source-uuids)
+          binding (property-subtree-snapshot @conn [binding-uuid])]
+      (worker-undo-redo/clear-history! test-repo)
+      (apply-ops! conn [[:delete-blocks [[paper-uuid] {}]]] (local-tx-meta {}))
+      (is (every? nil? (property-subtree-snapshot @conn owned-uuids)))
+      (is (= sources (property-subtree-snapshot @conn source-uuids)))
+      (dotimes [_ 2]
+        (let [db-before @conn
+              undo-before @worker-undo-redo/*undo-ops
+              redo-before @worker-undo-redo/*redo-ops]
+          (is (= {:status :blocked :reason :source-link-unavailable}
+                 (register! test-repo binding-uuid destination-page-uuid record)))
+          (is (identical? db-before @conn))
+          (is (= undo-before @worker-undo-redo/*undo-ops))
+          (is (= redo-before @worker-undo-redo/*redo-ops)))
+        (worker-undo-redo/undo test-repo)
+        (is (= before (property-subtree-snapshot @conn uuids)))
+        (is (= binding (property-subtree-snapshot @conn [binding-uuid])))
+        (is (empty? (:errors (db-validate/validate-db @conn))))
+        (worker-undo-redo/redo test-repo)
+        (is (every? nil? (property-subtree-snapshot @conn owned-uuids)))
+        (is (= sources (property-subtree-snapshot @conn source-uuids)))))))
 
 (defn- move-retract-entity-ops-to-front
   [tx-data]

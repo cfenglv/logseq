@@ -495,6 +495,126 @@
                      checksum)]
     (first result)))
 
+(defn <find-reusable-pdf-by-checksum
+  [graph checksum]
+  (<invoke-db-worker :thread-api/literature-find-reusable-pdf-by-checksum
+                     graph
+                     checksum))
+
+(defn <resolve-duplicate-pdf
+  [graph keep-uuid duplicate-uuid & [comparison]]
+  (apply <invoke-db-worker :thread-api/literature-resolve-duplicate-pdf
+         (cond-> [graph keep-uuid duplicate-uuid] comparison (conj comparison))))
+
+(defn <duplicate-pdf-plans
+  [graph asset-uuids]
+  (<invoke-db-worker :thread-api/literature-duplicate-pdf-plans graph asset-uuids))
+
+
+
+(defn <add-literature-pdf-filenames
+  [graph pdf-filenames]
+  (<invoke-db-worker :thread-api/literature-add-pdf-filenames graph pdf-filenames))
+
+(defn <ensure-literature-source-binding
+  [graph binding-uuid destination]
+  (<invoke-db-worker :thread-api/literature-ensure-source-binding
+                     graph
+                     binding-uuid
+                     destination))
+
+(defn <register-pdf-as-literature
+  [graph asset-uuid title identifiers & [metadata]]
+  (apply <invoke-db-worker :thread-api/literature-register-pdf
+         (cond-> [graph asset-uuid title identifiers] (seq metadata) (conj metadata))))
+
+(defn <plan-literature-doi-metadata
+  [graph paper-uuid record asset-uuid]
+  (<invoke-db-worker :thread-api/literature-plan-doi-metadata graph paper-uuid record asset-uuid))
+
+(defn <apply-literature-doi-metadata
+  [graph paper-uuid record accepted-changes asset-uuid]
+  (<invoke-db-worker :thread-api/literature-apply-doi-metadata
+                     graph paper-uuid record accepted-changes asset-uuid))
+
+(defn <register-literature-source-record
+  [graph binding-uuid destination-page-uuid source-record]
+  (<invoke-db-worker :thread-api/literature-register-source-record
+                     graph
+                     binding-uuid
+                     destination-page-uuid
+                     source-record))
+
+(defn <add-literature-doi-paper
+  [graph destination-page-uuid record]
+  (<invoke-db-worker :thread-api/literature-add-doi-paper graph destination-page-uuid record))
+
+(defn <paper-literature-sources
+  [graph paper-uuid]
+  (<invoke-db-worker :thread-api/literature-paper-sources graph paper-uuid))
+
+(defn <correct-literature-source-record
+  [graph paper-uuid source action target-paper-uuid]
+  (<invoke-db-worker :thread-api/literature-correct-source-record
+                     graph paper-uuid source action target-paper-uuid))
+
+(defn <find-literature-source-record-link
+  [graph binding-uuid paper-uuid]
+  (<invoke-db-worker :thread-api/literature-find-source-record-link
+                     graph
+                     binding-uuid
+                     paper-uuid))
+
+(defn <plan-linked-literature-source-record-metadata
+  [graph binding-uuid paper-uuid source-record]
+  (<invoke-db-worker :thread-api/literature-plan-linked-source-record-metadata
+                     graph
+                     binding-uuid
+                     paper-uuid
+                     source-record))
+
+(defn <apply-literature-source-record-metadata
+  [graph binding-uuid paper-uuid source-record accepted-changes]
+  (<invoke-db-worker :thread-api/literature-apply-source-record-metadata
+                     graph
+                     binding-uuid
+                     paper-uuid
+                     source-record
+                     accepted-changes))
+
+(defn <search-literature-papers
+  [graph query]
+  (<invoke-db-worker :thread-api/literature-search-papers graph query))
+
+(defn <keep-pdf-as-ordinary
+  [graph asset-uuid]
+  (<invoke-db-worker :thread-api/literature-keep-pdf graph asset-uuid))
+
+(defn <link-pdf-to-literature
+  ([graph asset-uuid target-paper-uuid]
+   (<invoke-db-worker :thread-api/literature-link-pdf
+                      graph
+                      asset-uuid
+                      target-paper-uuid))
+  ([graph asset-uuid target-paper-uuid options]
+   (<invoke-db-worker :thread-api/literature-link-pdf
+                      graph
+                      asset-uuid
+                      target-paper-uuid
+                      options)))
+
+(defn <auto-link-pdf-to-literature
+  [graph asset-uuid evidence]
+  (<invoke-db-worker :thread-api/literature-auto-link-pdf
+                     graph
+                     asset-uuid
+                     evidence))
+
+(defn <register-verified-pdf-as-literature
+  [graph asset-uuid evidence metadata]
+  (<invoke-db-worker :thread-api/literature-register-verified-pdf
+                     graph asset-uuid evidence metadata))
+
 (defn <get-block-properties-history
   [graph block-id]
   (p/let [result (<q graph {:transact-db? false}

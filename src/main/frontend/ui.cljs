@@ -598,8 +598,8 @@
 
 (hsx/defc foldable
   [header content {:keys [title-trigger? on-pointer-down class
-                          default-collapsed? init-collapsed]}]
-  (let [collapsed? (hooks/use-memo #(atom (true? default-collapsed?)) [])
+                          default-collapsed? init-collapsed collapsed-state]}]
+  (let [collapsed? (hooks/use-memo #(or collapsed-state (atom (true? default-collapsed?))) [])
            render-content? (hooks/use-memo #(atom (not (true? default-collapsed?))) [])
            collapse-timeout (hooks/use-ref nil)
            [collapsed-value] (hooks/use-atom collapsed?)
@@ -611,8 +611,7 @@
                                (when-let [timeout-id (hooks/deref collapse-timeout)]
                                  (js/clearTimeout timeout-id)
                                  (hooks/set-ref! collapse-timeout nil))
-                               (when (false? next-collapsed?)
-                                 (reset! render-content? true))
+                               (reset! render-content? true)
                                (reset! collapsed? next-collapsed?)
                                (when (true? next-collapsed?)
                                  (hooks/set-ref!
@@ -644,7 +643,7 @@
           :aria-hidden (boolean collapsed-value)}
          [:div.ls-foldable-content-inner
           (if (fn? content)
-            (when render-content-value (content))
+            (when (or render-content-value (not collapsed-value)) (content))
             content)]]]))
 
 (hsx/defc admonition

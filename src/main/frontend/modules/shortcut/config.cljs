@@ -401,6 +401,9 @@
    :go/all-graphs                           {:binding "g shift+g"
                                              :fn      route-handler/redirect-to-all-graphs}
 
+   :go/shared-literature                    {:binding []
+                                             :fn :frontend.components.literature/open-library-current!}
+
    :go/keyboard-shortcuts                   {:binding "g s"
                                              :fn      #(state/pub-event! [:modal/keymap])}
 
@@ -525,6 +528,9 @@
                        :desc "(Dev) Validate current graph"
                        :inactive (not (state/developer-mode?))
                        :fn :frontend.handler.common.developer/validate-db}
+   :graph/repair-local-copy {:binding []
+                             :inactive (not (util/electron?))
+                             :fn :frontend.handler.db-based.sync/request-repair!}
    :dev/recompute-checksum {:binding []
                             :desc "(Dev) Recompute graph checksum"
                             :inactive (not (state/developer-mode?))
@@ -693,6 +699,7 @@
           :go/forward
           :search/re-index
           :graph/db-save
+          :graph/repair-local-copy
           :sidebar/open-today-page
           :ui/toggle-contents
           :sidebar/clear
@@ -711,6 +718,7 @@
           :go/flashcards
           :go/graph-view
           :go/all-graphs
+          :go/shared-literature
           :go/keyboard-shortcuts
           :go/tomorrow
           :go/next-journal
@@ -810,6 +818,7 @@
      :go/all-pages
      :go/graph-view
      :go/all-graphs
+     :go/shared-literature
      :go/flashcards
      :go/tomorrow
      :go/next-journal
@@ -892,6 +901,7 @@
      :graph/export-as-html
      :graph/open
      :graph/remove
+     :graph/repair-local-copy
      :graph/add
      :sidebar/close-top
      :sidebar/clear

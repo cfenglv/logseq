@@ -49,6 +49,10 @@
   }
 }
 
+#main-container:has(.ls-literature) {
+  transition: none;
+}
+
 #main-content {
   position: relative;
   height: calc(100vh - var(--ls-headbar-height));

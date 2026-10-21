@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "Rediger export.css"
  :settings.general/edit-global-config-edn "Rediger global config.edn"
  :settings.general/editor-font "Redigeringsskrifttype"
- :settings.general/editor-font-set-global "Sett som global skriftfamilie"
  :settings.general/export-theme "Eksporter tema"
  :settings.general/language "Språk"
  :settings.general/native-titlebar "Systemtittellinje"

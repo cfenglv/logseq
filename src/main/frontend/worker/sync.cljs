@@ -1,6 +1,7 @@
 (ns frontend.worker.sync
   "Sync client"
   (:require
+   [frontend.common.thread-api :as thread-api]
    [frontend.worker.platform :as platform]
    [frontend.worker.repair-commit-fence :as repair-commit-fence]
    [frontend.worker.shared-service :as shared-service]
@@ -60,6 +61,71 @@
   `:logseq.kv/graph-remote?`, and nothing unsets it."
   [db]
   (true? (some-> db (ldb/get-key-value :logseq.kv/graph-remote?))))
+(defn- repair-client-current?
+  [repo client socket graph-id]
+  (and client socket
+       (identical? client (current-client repo))
+       (identical? socket (:ws client))
+       (= graph-id (sync-util/get-graph-id repo))
+       (sync-transport/ws-open? socket)))
+
+(defn- request-repair-pull!
+  [repo graph-id result]
+  (when (= 1 (:rename-count result))
+    ;; A reconnect may have delivered hello before the replacement was ready.
+    (let [client (current-client repo)]
+      (when (and (= graph-id (:graph-id client))
+                 (repair-client-current? repo client (:ws client) graph-id))
+        (sync-apply/enqueue-flush-pending! repo client)
+        (sync-handle-message/request-pull! client (client-op/get-local-tx repo))))))
+
+(defn <request-repair!
+  "Explicitly rebuild a settled local projection using the existing repair owner."
+  [repo]
+  (let [conn (worker-state/get-datascript-conn repo)
+        client (current-client repo)
+        socket (:ws client)
+        graph-id (:graph-id client)]
+    (if-not (and conn (repair-client-current? repo client socket graph-id))
+      (p/resolved {:claimed? false :reason :inactive-context})
+      (let [before (client-op/read-repair-local-observation repo)]
+        (p/let [local-checksum (sync-checksum/<recompute-checksum @conn)
+                diagnostics (sync-util/fetch-json
+                             (str (sync-auth/http-base-url @worker-state/*db-sync-config)
+                                  "/sync/" graph-id "/checksum/diagnostics?proof-only=true")
+                             {:method "GET"} {:response-schema :sync/checksum-diagnostics})]
+          (if-not (and (identical? conn (worker-state/get-datascript-conn repo))
+                       (repair-client-current? repo client socket graph-id))
+            {:claimed? false :reason :context-changed}
+            (let [after (client-op/read-repair-local-observation repo)]
+              (cond
+                (not (and (= before after)
+                          (= (:t diagnostics) (:remote-t after)
+                             (get @*repo->latest-remote-tx repo))
+                          (zero? (:pending-count after))
+                          (empty? @(:inflight client))))
+                {:claimed? false :reason :not-converged}
+
+                (not= (:legacy-anchor diagnostics) (:server-recomputed-checksum diagnostics))
+                (fail-fast :db-sync/server-checksum-drift {:repo repo})
+
+                :else
+                (let [basis {:remote-t (:t diagnostics)
+                             :server-checkpoint-identity (:server-checkpoint-identity diagnostics)
+                             :journal-high-water (:journal-high-water after)
+                             :checksum-basis {:version 1 :legacy-checksum local-checksum
+                                              :server-recomputed-checksum (:server-recomputed-checksum diagnostics)
+                                              :server-t (:t diagnostics) :legacy-anchor (:legacy-anchor diagnostics)
+                                              :metadata-proof (:metadata-proof diagnostics)}}
+                      claim-f (get @thread-api/*thread-apis :thread-api/db-sync-claim-repair)
+                      claim (claim-f repo graph-id basis)]
+                  ;; Release the request fence before the runner commits its replacement.
+                  (when (:claimed? claim)
+                    (-> (sync-download/<run-repair-operation! repo (:operation claim))
+                        (p/then #(request-repair-pull! repo graph-id %))
+                        (p/catch (fn [error]
+                                   (log/error :db-sync/repair-run-failed {:repo repo :error error})))))
+                  claim)))))))))
 
 (defn update-local-sync-checksum!
   "Keeps the stored checksum current on a graph that syncs. A graph that does
@@ -455,12 +521,14 @@
   [repo]
   ;; db-sync-start itself is a fenced thread-api call. Resume on the next turn
   ;; so that call can release before a repair commit enters the same fence.
-  (-> (p/delay 0)
-      (p/then #(sync-download/<resume-repair-operation! repo))
-      (p/catch
-       (fn [error]
-         (log/error :db-sync/repair-resume-failed
-                    {:repo repo :error error}))))
+  (let [graph-id (sync-util/get-graph-id repo)]
+    (-> (p/delay 0)
+        (p/then #(sync-download/<resume-repair-operation! repo))
+        (p/then #(request-repair-pull! repo graph-id %))
+        (p/catch
+         (fn [error]
+           (log/error :db-sync/repair-resume-failed
+                      {:repo repo :error error})))))
   nil)
 
 (defn- catch-up-pull-due?
@@ -574,8 +642,8 @@
   (sync-apply/handle-local-tx! repo tx-report))
 
 (defn request-asset-download!
-  [repo asset-uuid]
-  (sync-apply/request-asset-download! repo asset-uuid))
+  [repo asset-uuid & options]
+  (apply sync-apply/request-asset-download! repo asset-uuid options))
 
 (defn download-missing-assets!
   [repo graph-id]

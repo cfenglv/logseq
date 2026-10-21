@@ -229,6 +229,9 @@
                               op
                               (rebind-op-db-sync-tx-id op (:history-tx-id worker-result))))
 
+          (= :source-correction-blocked (:reason worker-result))
+          {:undo? undo? :applied? false :reason :source-correction-blocked}
+
           (skippable-worker-result? undo? worker-result)
           (skip-op-and-recur repo undo?)
 

@@ -2,7 +2,7 @@
   "Transaction, outliner operation, and worker-state synchronization operations."
   (:require
    [datascript.core :as d]
-   [frontend.common.thread-api :refer [def-thread-api]]
+   [frontend.common.thread-api :as thread-api :refer [def-thread-api]]
    [frontend.worker-common.util :as worker-util]
    [frontend.worker.db-listener :as db-listener]
    [frontend.worker.handler.block :as block-handler]
@@ -14,6 +14,7 @@
    [logseq.common.util :as common-util]
    [logseq.db :as ldb]
    [logseq.db.common.order :as db-order]
+   [logseq.db.frontend.literature :as literature]
    [logseq.outliner.op :as outliner-op]
    [logseq.outliner.recycle :as outliner-recycle]))
 
@@ -46,7 +47,7 @@
   (when context (worker-state/update-context! context))
   nil)
 
-(def-thread-api :thread-api/transact
+(defn- transact!
   [repo tx-data tx-meta context]
   (assert (some? repo))
   (worker-state/set-db-latest-tx-time! repo)
@@ -74,6 +75,274 @@
                                              :tx-count (count tx-data)
                                              :error error})
         (throw error)))))
+
+(def-thread-api :thread-api/transact
+  [repo tx-data tx-meta context]
+  (transact! repo tx-data tx-meta context))
+
+
+
+(def-thread-api :thread-api/literature-add-pdf-filenames
+  [repo pdf-filenames]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection :repo repo})))
+        tx-data (literature/build-add-pdf-filenames-tx @conn pdf-filenames)]
+    (when (seq tx-data)
+      (transact! repo tx-data
+                 {:outliner-op :transact :local-tx? true :persist-op? true
+                  :gen-undo-ops? false
+                  :data {:literature/pdf-filenames true}}
+                 nil))
+    nil))
+
+(def-thread-api :thread-api/literature-ensure-source-binding
+  [repo binding-uuid destination]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection
+                                  :repo repo})))
+        plan (literature/build-source-connection-plan @conn binding-uuid destination)]
+    (if (= :ready (:status plan))
+      (do
+        (transact! repo
+                   (:tx-data plan)
+                   (assoc (:tx-meta plan)
+                          :local-tx? true
+                          :data {:literature/ensure-source-binding true})
+                   nil)
+        (-> plan
+            (dissoc :tx-data :tx-meta)
+            (assoc :status (case (:action plan)
+                             :restore :restored
+                             :created))))
+      (dissoc plan :tx-data :tx-meta))))
+
+(def-thread-api :thread-api/literature-register-pdf
+  [repo asset-uuid title identifiers & [metadata]]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection
+                                  :repo repo})))
+        paper-uuid (literature/source-record-paper-uuid identifiers)]
+    (if paper-uuid
+      (let [repair-status (get @thread-api/*thread-apis
+                               :thread-api/db-sync-repair-status)]
+        (if (:operation (repair-status repo))
+          {:status :deferred :reason :repair-active}
+          (outliner-op/apply-ops!
+           conn
+           [[:literature-register-identified-pdf
+             (cond-> [asset-uuid title identifiers] (seq metadata) (conj metadata))]]
+           {:persist-op? true
+            :data {:literature/register-pdf true}})))
+      (let [plan (literature/build-register-pdf-plan
+                  @conn asset-uuid title identifiers (random-uuid) metadata)]
+        (if (= :ready (:status plan))
+          (do
+            ;; Identifier-free explicit creation preserves its original path.
+            (transact! repo
+                       (:tx-data plan)
+                       {:outliner-op :transact
+                        :local-tx? true
+                        :persist-op? true
+                        :data {:literature/register-pdf true}}
+                       nil)
+            (-> plan
+                (dissoc :tx-data)
+                (assoc :status (case (:action plan)
+                                 :create :created
+                                 :link :linked))))
+          (dissoc plan :tx-data))))))
+
+(def-thread-api :thread-api/literature-register-verified-pdf
+  [repo asset-uuid evidence metadata]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection
+                                  :repo repo})))
+        repair-status (get @thread-api/*thread-apis
+                           :thread-api/db-sync-repair-status)]
+    (if (:operation (repair-status repo))
+      {:status :deferred :reason :repair-active}
+      (outliner-op/apply-ops!
+       conn
+       [[:literature-register-verified-pdf [asset-uuid evidence metadata]]]
+       {:persist-op? true
+        :gen-undo-ops? false
+        :data {:literature/register-verified-pdf true}}))))
+
+(def-thread-api :thread-api/literature-register-source-record
+  [repo binding-uuid destination-page-uuid source-record]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection
+                                  :repo repo})))
+        repair-status (get @thread-api/*thread-apis
+                           :thread-api/db-sync-repair-status)]
+    ;; Repair claims require a settled queue. Check its existing receipt in the
+    ;; same worker turn as the write, so an import cannot enter after a claim.
+    (if (:operation (repair-status repo))
+      {:status :deferred :reason :repair-active}
+      (outliner-op/apply-ops!
+       conn
+       [[:literature-register-source-record
+         [binding-uuid destination-page-uuid source-record]]]
+       {:persist-op? true
+        :gen-undo-ops? false
+        :data {:literature/register-source-record true}}))))
+
+(def-thread-api :thread-api/literature-paper-sources
+  [repo paper-uuid]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection :repo repo})))]
+    (literature/paper-sources @conn paper-uuid)))
+
+(def-thread-api :thread-api/literature-correct-source-record
+  [repo paper-uuid source action target-paper-uuid]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection :repo repo})))
+        repair-status (get @thread-api/*thread-apis :thread-api/db-sync-repair-status)]
+    (if (:operation (repair-status repo))
+      {:status :deferred :reason :repair-active}
+      (let [plan (literature/build-correct-source-record-plan
+                  @conn paper-uuid source action target-paper-uuid)]
+        (if (= :ready (:status plan))
+          (do
+            (outliner-op/apply-ops!
+             conn (:ops plan)
+             {:persist-op? true :gen-undo-ops? true
+              :db-sync/forward-outliner-ops (:ops plan)
+              :db-sync/inverse-outliner-ops (:inverse-ops plan)
+              :data {:literature/correct-source-record true}})
+            (-> plan (dissoc :ops :inverse-ops) (assoc :status :updated)))
+          (dissoc plan :ops :inverse-ops))))))
+
+(def-thread-api :thread-api/literature-apply-source-record-metadata
+  [repo binding-uuid paper-uuid source-record accepted-changes]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection
+                                  :repo repo})))
+        plan (literature/build-apply-source-record-metadata-plan
+              @conn binding-uuid paper-uuid source-record accepted-changes)]
+    (if (= :ready (:status plan))
+      (do
+        ;; Revalidation and all native writes stay in this worker request.
+        (outliner-op/apply-ops!
+         conn
+         (:ops plan)
+         {:data {:literature/apply-source-record-metadata true}})
+        (-> plan
+            (dissoc :ops)
+            (assoc :status :updated
+                   :updated-fields (mapv :field (:changes plan)))))
+      (dissoc plan :ops))))
+
+
+(def-thread-api :thread-api/literature-apply-doi-metadata
+  [repo paper-uuid record accepted-changes asset-uuid]
+  (let [conn (worker-state/get-datascript-conn repo)
+        repair-status (get @thread-api/*thread-apis :thread-api/db-sync-repair-status)]
+    (if (:operation (repair-status repo))
+      {:status :deferred :reason :repair-active}
+      (let [plan (literature/build-apply-doi-metadata-plan
+                  @conn paper-uuid record accepted-changes asset-uuid)]
+        (if (= :ready (:status plan))
+          (do
+            (outliner-op/apply-ops! conn (:ops plan)
+                                  {:persist-op? true :gen-undo-ops? true})
+            (-> plan (dissoc :ops) (assoc :status :updated)))
+          (dissoc plan :ops))))))
+
+(def-thread-api :thread-api/literature-add-doi-paper
+  [repo destination-page-uuid record]
+  (let [conn (worker-state/get-datascript-conn repo)
+        repair-status (get @thread-api/*thread-apis :thread-api/db-sync-repair-status)]
+    (if (:operation (repair-status repo))
+      {:status :deferred :reason :repair-active}
+      (let [plan (literature/build-add-doi-paper-plan @conn destination-page-uuid record)]
+        (if (= :ready (:status plan))
+          (do
+            (outliner-op/apply-ops! conn (:ops plan)
+                                  {:persist-op? true :gen-undo-ops? true})
+            (-> plan (dissoc :ops) (assoc :status :created)))
+          (dissoc plan :ops))))))
+
+(def-thread-api :thread-api/literature-keep-pdf
+  [repo asset-uuid]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection :repo repo})))
+        repair-status (get @thread-api/*thread-apis :thread-api/db-sync-repair-status)]
+    (if (:operation (repair-status repo))
+      {:status :deferred :reason :repair-active}
+      (let [plan (literature/build-keep-pdf-plan @conn asset-uuid)]
+        (if (= :ready (:status plan))
+          (do
+            (transact! repo (:tx-data plan)
+                       {:outliner-op :transact :local-tx? true :persist-op? true
+                        :data {:literature/keep-pdf true}}
+                       nil)
+            (-> plan (dissoc :tx-data) (assoc :status :kept)))
+          (dissoc plan :tx-data))))))
+
+(def-thread-api :thread-api/literature-link-pdf
+  [repo asset-uuid target-paper-uuid & [options]]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection
+                                  :repo repo})))]
+    (if (:automatic? options)
+      (let [repair-status (get @thread-api/*thread-apis :thread-api/db-sync-repair-status)]
+        (if (:operation (repair-status repo))
+          {:status :deferred :reason :repair-active}
+          (outliner-op/apply-ops!
+           conn [[:literature-auto-link-pdf [asset-uuid target-paper-uuid (:source-context options)]]]
+           {:persist-op? true :gen-undo-ops? false
+            :data {:literature/auto-link-pdf true}})))
+      (let [plan (literature/build-link-pdf-plan @conn asset-uuid target-paper-uuid)]
+        (if (= :ready (:status plan))
+          (do
+            (transact! repo (:tx-data plan)
+                       {:outliner-op :transact :local-tx? true :persist-op? true
+                        :data {:literature/link-pdf true}}
+                       nil)
+            (-> plan (dissoc :tx-data) (assoc :status :linked)))
+          (dissoc plan :tx-data))))))
+
+(def-thread-api :thread-api/literature-rename-pdf-titles
+  [repo paper-uuid]
+  (let [conn (worker-state/get-datascript-conn repo)
+        plan (literature/build-rename-paper-pdfs-plan @conn paper-uuid)]
+    (if (= :ready (:status plan))
+      (do
+        (when (seq (:tx-data plan))
+          (transact! repo (:tx-data plan)
+                     {:outliner-op :transact :local-tx? true :persist-op? true
+                      :data {:literature/rename-pdf-titles true}} nil))
+        (-> plan (dissoc :tx-data) (assoc :status :complete)))
+      (dissoc plan :tx-data))))
+
+(def-thread-api :thread-api/literature-auto-link-pdf
+  [repo asset-uuid evidence]
+  ;; Empty metadata preserves the link-only path, including identifier-not-found
+  ;; for the renderer's optional metadata lookup, and rechecks Keep on replay.
+  ((get @thread-api/*thread-apis :thread-api/literature-register-verified-pdf)
+   repo asset-uuid evidence {}))
+
+(def-thread-api :thread-api/literature-resolve-duplicate-pdf
+  [repo keep-uuid duplicate-uuid & [comparison]]
+  (let [conn (or (worker-state/get-datascript-conn repo)
+                 (throw (ex-info "Missing worker graph connection"
+                                 {:type :db/missing-connection :repo repo})))]
+    (outliner-op/apply-ops!
+     conn [[:literature-merge-duplicate-pdf
+            (cond-> [keep-uuid duplicate-uuid] comparison (conj comparison))]]
+     {:persist-op? true :gen-undo-ops? true})))
+
 
 (defn- perf-time-ms []
   (if (and (exists? js/performance)

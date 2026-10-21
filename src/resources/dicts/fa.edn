@@ -1603,7 +1603,6 @@
  :settings.general/edit-export-css "ویرایش CSS صادرات"
  :settings.general/edit-global-config-edn "ویرایش config.edn سراسری"
  :settings.general/editor-font "فونت ویرایشگر"
- :settings.general/editor-font-set-global "تنظیم به عنوان فونت سراسری"
  :settings.general/export-theme "صادر کردن پوسته"
  :settings.general/language "زبان"
  :settings.general/native-titlebar "نوار عنوان سیستم"

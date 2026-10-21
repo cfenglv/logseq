@@ -118,15 +118,18 @@
             (:reset-conn! tx-meta)
             (:initial-db? tx-meta)
             (:skip-validate-db? tx-meta false)
-            ;; used by `batch-transact-with-temp-conn!`
-            (:skip-validate-db? @conn)
+            ;; Replayed pending ops need their derived datoms in the journal.
+            ;; The outer temporary batch still validates the completed graph.
+            (and (:skip-validate-db? @conn)
+                 (not (:db-sync/rebased-local? tx-meta)))
             (:logseq.graph-parser.exporter/new-graph? tx-meta)
             ;; Finalize already wrote :block/refs; skip pipeline rebuild.
             (:transact-new-graph-refs? tx-meta)))))
 
 (defn- should-validate-pipeline-result?
-  [tx-meta]
-  (not (:fix-db? tx-meta)))
+  [conn tx-meta]
+  (not (or (:fix-db? tx-meta)
+           (:skip-validate-db? @conn))))
 
 (defn- transact-failed-log-data
   [tx-meta tx-data error]
@@ -162,7 +165,7 @@
                 pipeline-f @*transact-pipeline-fn
                 tx-report (if pipeline-f (pipeline-f tx-report*) tx-report*)
                 _ (throw-if-page-has-block-parent! (:db-after tx-report) (:tx-data tx-report))
-                [validate-result errors] (if (should-validate-pipeline-result? tx-meta)
+                [validate-result errors] (if (should-validate-pipeline-result? conn tx-meta)
                                            (db-validate/validate-tx-report tx-report nil)
                                            [true nil])]
             (cond

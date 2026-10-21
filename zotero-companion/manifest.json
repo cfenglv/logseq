@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "Logseq Literature Notifier",
+  "version": "0.0.2",
+  "description": "Exposes bounded Zotero change hints to the local Logseq literature bridge.",
+  "applications": {
+    "zotero": {
+      "id": "logseq-literature-notifier@example.com",
+      "strict_min_version": "7.0",
+      "strict_max_version": "9.0.*",
+      "update_url": "https://example.invalid/logseq-literature-notifier-updates.json"
+    }
+  }
+}

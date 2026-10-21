@@ -174,6 +174,7 @@
 (def ^:private repair-retry-backoff-ms [1000 5000 30000])
 (def ^:private transient-repair-error-types
   #{:db-sync/repair-snapshot-download-failed
+    :db-sync/repair-remote-tail-moved
     :db-sync/repair-staging-remote-advanced
     :db-sync/repair-active-graph-changed
     :db-sync/repair-staging-cancelled})
@@ -196,7 +197,7 @@
        (zero? (:pending-count after))))
 
 (defn- <claim-repair-after-checksum-mismatch*
-  [repo client remote-t remote-checksum]
+  [repo client remote-t remote-checksum on-committed]
   (let [graph-id (some-> (:graph-id client) str)
         conn (worker-state/get-datascript-conn repo)
         base (sync-auth/http-base-url @worker-state/*db-sync-config)]
@@ -254,6 +255,9 @@
                   result (claim-f repo graph-id start-basis)]
               (when (:claimed? result)
                 (-> (<run-repair-operation! repo (:operation result))
+                    (p/then (fn [commit-result]
+                              (when on-committed
+                                (on-committed commit-result))))
                     (p/catch
                      (fn [error]
                        (log/error :db-sync/repair-run-failed
@@ -266,9 +270,12 @@
 (defn <claim-repair-after-checksum-mismatch!
   "Recheck one mismatch suspect. DB-core's durable CAS is the only operation
   claim and makes overlapping requests idempotent without a second scheduler."
-  [repo client remote-t remote-checksum]
-  (<claim-repair-after-checksum-mismatch*
-   repo client remote-t remote-checksum))
+  ([repo client remote-t remote-checksum]
+   (<claim-repair-after-checksum-mismatch*
+    repo client remote-t remote-checksum nil))
+  ([repo client remote-t remote-checksum on-committed]
+   (<claim-repair-after-checksum-mismatch*
+    repo client remote-t remote-checksum on-committed)))
 
 (defn complete-datoms-import!
   [repo graph-id remote-tx]

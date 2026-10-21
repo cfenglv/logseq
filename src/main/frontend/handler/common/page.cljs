@@ -105,7 +105,7 @@
 (defn <create!
   ([title]
    (<create! title {}))
-  ([title {:keys [redirect? today-journal? class? edit?]
+  ([title {:keys [redirect? today-journal? class? edit? expected-repo]
            :or   {redirect? true
                   edit? true}
            :as options}]
@@ -139,14 +139,15 @@
            ;; With explicit tags, the worker finds an existing page by title and tags
            (p/let [existing-page (when-not (or class? (seq (:tags options)))
                                    (<page-for-create title'))]
-             (if (and existing-page (not (ldb/recycled? existing-page)))
+             (when (or (nil? expected-repo) (= expected-repo (state/get-current-repo)))
+              (if (and existing-page (not (ldb/recycled? existing-page)))
                (do
                  (when redirect?
                    (route-handler/redirect-to-page! (:block/uuid existing-page))
                  (when (and edit? (not today-journal?))
                      (js/setTimeout #(edit-page! existing-page) 100)))
                  existing-page)
-               (p/let [options' (cond-> (update options :tags concat (:block/tags parsed-result))
+               (p/let [options' (cond-> (update (dissoc options :expected-repo) :tags concat (:block/tags parsed-result))
                                   (nil? (:split-namespace? options))
                                   (assoc :split-namespace? true))
                        [_page-name page-uuid] (ui-outliner-tx/transact!
@@ -157,7 +158,7 @@
                    (route-handler/redirect-to-page! page-uuid)
                    (when (and edit? (not today-journal?))
                      (js/setTimeout #(some-> page edit-page!) 100)))
-                 page)))))))))
+                 page))))))))))
 
 ;; favorite fns
 ;; ============

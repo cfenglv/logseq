@@ -132,6 +132,15 @@
                (send! (:ws client) {:type "pull" :since since})))
            (send! (:ws client) {:type "pull" :since since})))))))
 
+(defn- request-repair-pull-after-commit!
+  [repo client result]
+  (when (and (= 1 (:rename-count result))
+             (identical? client (current-client repo))
+             (= (:graph-id client) (sync-util/get-graph-id repo))
+             (ws-open? (:ws client)))
+    (sync-apply/enqueue-flush-pending! repo client)
+    (request-pull! client (client-op/get-local-tx repo))))
+
 (defn- clear-pending-pull!
   [client]
   (when-let [*pending (:pending-pull-since client)]
@@ -182,7 +191,9 @@
           (log/warn :db-sync/checksum-mismatch mismatch-data)
           (p/catch
            (sync-download/<claim-repair-after-checksum-mismatch!
-            repo client remote-tx remote-checksum)
+            repo client remote-tx remote-checksum
+            (fn [result]
+              (request-repair-pull-after-commit! repo client result)))
            (fn [error]
              (log/error :db-sync/repair-claim-failed
                         {:repo repo
@@ -394,6 +405,17 @@
 (defn- handle-pull-ok!
   [repo client local-tx remote-tx remote-checksum message]
   (clear-pending-pull! client)
+  ;; Equal-head pulls can finish a committed repair without starting a new one.
+  (when (= local-tx remote-tx (get @sync-apply/*repo->latest-remote-tx repo))
+    (when-let [{:keys [local-checksum reserved-value]}
+               (ready-sync-metadata repo client local-tx remote-tx)]
+      (when (= local-checksum remote-checksum)
+        (p/catch
+         (sync-download/<complete-repair-if-converged!
+          repo client remote-tx remote-checksum reserved-value)
+         (fn [error]
+           (log/error :db-sync/repair-completion-failed
+                      {:repo repo :remote-tx remote-tx :error error}))))))
   ;; (log/info ::handle-pull-ok! {:repo repo
   ;;                              :remote-tx remote-tx
   ;;                              :local-tx local-tx})

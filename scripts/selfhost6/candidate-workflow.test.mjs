@@ -54,6 +54,16 @@ const releasePolicy = readReleasePolicy(
 );
 
 const releaseLineId = "selfhost-official-architecture-v1";
+test("Windows updater packages the full pinned reader for the target architecture", () => {
+  const config = fs.readFileSync(path.join(repoRoot, "resources/electron-builder.yml"), "utf8");
+  assert.match(config, /from: updater\/windows\/\$\{arch\}/);
+  for (const name of ["7za.exe", "7z.dll", "7zip-LICENSE.txt", "7zip-NOTICE.txt"])
+    assert.ok(config.includes("- " + name));
+  assert.doesNotMatch(config, /from: node_modules\/7zip-bin\/win\//);
+  const prepare = fs.readFileSync(path.join(repoRoot, "resources/updater/prepare-target-build-manifest.mjs"), "utf8");
+  assert.match(prepare, /if \(platform === "win32"\)[\s\S]*await prepareWindowsArchiveReader\(\{ arch,/);
+});
+
 const pointerNames = [
   `${releaseLineId}.yml`,
   `${releaseLineId}-mac.yml`,
@@ -220,8 +230,8 @@ test("the mature desktop action stages one complete traditional draft and stops"
   assert.match(selfhostReleaseJobs, /selfhost-operation == 'stage-draft'/);
   assert.match(selfhostReleaseJobs, /github\.ref_name == 'release\/2\.0\.2-selfhost\.1'/);
   const bridgeJob = legacyWorkflow.split('\n  selfhost-release-bridge:')[1];
-  assert.match(bridgeJob, /test "\$\{SELFHOST6_TARGET_VERSION\}" = '2\.0\.1-selfhost\.7'/);
-  assert.match(bridgeJob, /github\.ref_name == 'release\/2\.0\.1-selfhost\.7'/);
+  assert.match(bridgeJob, /test "\$\{SELFHOST6_TARGET_VERSION\}" = '2\.0\.2-selfhost\.1'/);
+  assert.match(bridgeJob, /github\.ref_name == 'release\/2\.0\.2-selfhost\.1'/);
   assert.match(
     legacyWorkflow,
     /run-name: Desktop release · \$\{\{ github\.event\.inputs\.build-target \}\} · \$\{\{ github\.event\.inputs\.selfhost-operation \}\} · \$\{\{ github\.event\.inputs\.git-ref \}\}/,
@@ -347,7 +357,7 @@ test("the mature desktop action stages one complete traditional draft and stops"
   assert.doesNotMatch(builtReleaseVerifier, /docs\/selfhost6-phase/);
 });
 
-test("the same desktop action bridges published .7 with only five assets and four pointers", () => {
+test("the same desktop action binds the published final to a separate .7 bridge", () => {
   const bridgeJob = legacyWorkflow.match(
     /  selfhost-release-bridge:[\s\S]*?\n  nightly-release:/,
   )[0];
@@ -356,13 +366,23 @@ test("the same desktop action bridges published .7 with only five assets and fou
   assert.match(bridgeJob, /group: selfhost-release-selfhost-official-architecture-v1/);
   assert.match(
     bridgeJob,
-    /Download and verify the published latest release[\s\S]*--phase published[\s\S]*Stage the one-time \.6 bridge pointers[\s\S]*Promote exactly five updater assets and four pointers/,
+    /Download and verify the published final latest release[\s\S]*--phase published[\s\S]*Verify both sources and the exact embedded final bytes[\s\S]*Stage the one-time \.6 bridge pointers[\s\S]*Promote exactly five updater assets and four pointers/,
   );
   assert.match(bridgeJob, /repos\/\$\{GITHUB_REPOSITORY\}\/releases\/latest/);
   assert.match(bridgeJob, /gh release download "\$\{SELFHOST6_TARGET_VERSION\}"/);
   assert.equal((bridgeJob.match(/\.selfhost6\.json/g) ?? []).length, 5);
   assert.equal((bridgeJob.match(/promote-update-feed\.mjs/g) ?? []).length, 1);
   assert.equal((bridgeJob.match(/promote-existing-release\.mjs/g) ?? []).length, 1);
+  assert.match(bridgeJob, /--source-full-sha "\$\{FINAL_SOURCE_FULL_SHA\}"/);
+  assert.match(bridgeJob, /--expected-source-full-sha "\$\{BRIDGE_SOURCE_FULL_SHA\}"/);
+  assert.doesNotMatch(bridgeJob, /--(?:source-full-sha|expected-source-full-sha) "\$\{GITHUB_SHA\}"/);
+  assert.match(bridgeJob, /ref: \$\{\{ env\.BRIDGE_SOURCE_FULL_SHA \}\}[\s\S]*path: bridge-source/);
+  assert.match(bridgeJob, /node bridge-source\/scripts\/selfhost6\/promote-update-feed\.mjs/);
+  assert.match(bridgeJob, /node bridge-source\/scripts\/selfhost6\/promote-existing-release\.mjs/);
+  assert.match(bridgeJob, /--expected-target-version '2\.0\.1-selfhost\.7'/);
+  assert.match(bridgeJob, /Validate explicit bridge build inputs[\s\S]*verify-offline-bridge\.mjs inputs[\s\S]*Download and verify the exact bridge build artifact[\s\S]*verify-offline-bridge\.mjs download[\s\S]*unzip -q -n -j[\s\S]*verify-offline-bridge\.mjs payloads/);
+  for (const name of ["BRIDGE_SOURCE_FULL_SHA", "FINAL_SOURCE_FULL_SHA", "BRIDGE_BUILD_RUN_ID",
+    "BRIDGE_BUILD_ARTIFACT_ID", "BRIDGE_BUILD_ARTIFACT_SHA256"]) assert.match(bridgeJob, new RegExp(name));
   for (const name of [
     "SELFHOST_EXISTING_RELEASE_ID",
     "SELFHOST_EXISTING_RELEASE_TARGET_FULL_SHA",
@@ -374,6 +394,98 @@ test("the same desktop action bridges published .7 with only five assets and fou
     legacyWorkflow.match(/on:[\s\S]*?\nenv:/)[0],
     /release:\s*\n\s+types:\s*\[published\]/,
   );
+});
+
+test("the Windows probe is private, non-release and independent of real package signing", () => {
+  const probe = legacyWorkflow.match(/  selfhost-windows-bridge-probe:[\s\S]*?\n  selfhost-bridge-build-inputs:/)[0];
+  assert.match(probe, /selfhost-operation == 'build-offline-bridge'/);
+  assert.match(probe, /build-target == 'non-release'/);
+  assert.match(probe, /is-draft == 'true'/);
+  assert.match(probe, /github\.event\.inputs\.git-ref == github\.ref_name/);
+  assert.match(probe, /permissions:\n\s+contents: read/);
+  assert.match(probe, /Require a private test context[\s\S]*private-windows-test-context-required[\s\S]*Check out exact Windows probe tools/);
+  assert.deepEqual([...probe.matchAll(/runner: (windows-\S+)\n\s+arch: (\S+)/g)].map(match => match.slice(1)), [
+    ["windows-2022", "x64"], ["windows-11-arm", "arm64"],
+  ]);
+  assert.match(probe, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(probe, /persist-credentials: false/);
+  assert.match(probe, /npm exec --yes --package=pnpm@10\.33\.0 -- pnpm --dir static install/);
+  assert.ok([...probe.matchAll(/uses: (\S+)/g)].every(match => match[1].startsWith("actions/")));
+  assert.match(probe, /pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts/);
+  assert.match(probe, /run: node --test scripts\/selfhost6\/windows-nsis-probe\.test\.mjs/);
+  assert.match(probe, /run: node scripts\/selfhost6\/windows-nsis-probe\.mjs/);
+  assert.match(probe, /if: \$\{\{ always\(\) && github\.event\.repository\.private \}\}/);
+  assert.match(probe, /retention-days: 3/);
+  assert.doesNotMatch(probe, /needs:|environment:|secrets\.|contents: write|gh release|promote-|prepare-update-artifact|--publish/);
+});
+
+test("the desktop action builds native bridge inputs without promoting a partial set", () => {
+  for (const name of ["upstream-compile-cljs", "build-android"]) {
+    const root = legacyWorkflow.split(`\n  ${name}:`)[1].split(/\n  [a-z][a-z0-9-]+:/)[0];
+    assert.match(root, /if: .*selfhost-operation != 'build-offline-bridge'/);
+  }
+  const jobs = legacyWorkflow.match(
+    /  selfhost-bridge-build-inputs:[\s\S]*?\n  compile-cljs:/,
+  )[0];
+  const inputs = jobs.split("\n  selfhost-bridge-build-macos:")[0];
+  assert.match(inputs, /selfhost-operation == 'build-offline-bridge'/);
+  assert.match(inputs, /build-target == 'stable'/);
+  assert.match(inputs, /is-draft == 'true'/);
+  assert.match(inputs, /github\.ref_name == 'release\/2\.0\.2-selfhost\.1'/);
+  assert.match(inputs, /git-ref == 'release\/2\.0\.2-selfhost\.1'/);
+  assert.match(inputs, /environment: selfhost-production/);
+  assert.match(inputs, /permissions:\n\s+contents: read/);
+  assert.match(inputs, /build-offline-bridge\.mjs inputs[\s\S]*Download and verify the existing final Draft[\s\S]*verify-draft-release\.mjs[\s\S]*--phase after[\s\S]*Retain exact final macOS arm64 input/);
+  assert.match(inputs, /--source-full-sha "\$\{FINAL_SOURCE_FULL_SHA\}"/);
+  assert.doesNotMatch(inputs, /--source-full-sha "\$\{GITHUB_SHA\}"/);
+  assert.equal((inputs.match(/uses: actions\/upload-artifact@v4/g) ?? []).length, 5);
+  for (const [id, filename] of [
+    ["darwin-arm64", "Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip"],
+    ["darwin-x64", "Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip"],
+    ["linux-arm64", "Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage"],
+    ["linux-x64", "Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage"],
+    ["win32-x64", "Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe"],
+  ]) {
+    const name = `name: selfhost-offline-final-${id}-` + "${{ env.FINAL_SOURCE_FULL_SHA }}";
+    const upload = inputs.split(name)[1]?.split("if-no-files-found:")[0];
+    assert.ok(upload?.includes(`path: |\n            final-release-assets/${filename}\n            final-release-assets/${filename}.selfhost6.json\n`), id);
+  }
+  assert.deepEqual([...jobs.matchAll(/^\s+- id: (\S+)$/gm)].map(match => match[1]), [
+    "darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64",
+  ]);
+  const mac = jobs.match(/  selfhost-bridge-build-macos:[\s\S]*?\n  selfhost-bridge-build-linux:/)[0];
+  const linux = jobs.split("\n  selfhost-bridge-build-linux:")[1].split("\n  selfhost-bridge-build-windows:")[0];
+  for (const job of [mac, linux]) {
+    assert.match(job, /needs: \[ selfhost-bridge-build-inputs \]/);
+    assert.match(job, /ref: \$\{\{ github\.sha \}\}/);
+    assert.match(job, /ref: \$\{\{ env\.BRIDGE_SOURCE_FULL_SHA \}\}[\s\S]*path: bridge-source/);
+    assert.match(job, /name: selfhost-offline-final-\$\{\{ matrix\.id \}\}-\$\{\{ env\.FINAL_SOURCE_FULL_SHA \}\}[\s\S]*path: final-release-assets/);
+    assert.match(job, /pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts/);
+    assert.match(job, /uses: actions\/setup-java@v4\n\s+with:\n\s+distribution: zulu\n\s+java-version: \$\{\{ env\.JAVA_VERSION \}\}[\s\S]*Export existing native update strings/);
+    assert.match(job, /working-directory: bridge-source\n\s+run: bb lang:export-native-update-strings "\$RUNNER_TEMP\/offline-bridge-native-strings\.json"/);
+    assert.match(job, /run: node scripts\/selfhost6\/build-offline-bridge\.mjs build/);
+    assert.match(job, /name: selfhost-offline-bridge-input-\$\{\{ matrix\.id \}\}-\$\{\{ env\.BRIDGE_SOURCE_FULL_SHA \}\}-\$\{\{ env\.FINAL_SOURCE_FULL_SHA \}\}/);
+    assert.match(job, /path: bridge-build-input/);
+    assert.match(job, /if-no-files-found: error/);
+  }
+  assert.match(linux, /container: debian:bullseye-slim/);
+  assert.match(linux, /Prepare the native compiler baseline[\s\S]*curl git unzip build-essential pkg-config libglib2\.0-dev libgtk-3-dev[\s\S]*Check out exact bridge workflow tools/);
+  const windows = jobs.split("\n  selfhost-bridge-build-windows:")[1];
+  assert.match(windows, /needs: \[ selfhost-bridge-build-inputs \]/);
+  assert.match(windows, /runs-on: windows-2022[\s\S]*shell: pwsh/);
+  assert.match(windows, /ref: \$\{\{ github\.sha \}\}/);
+  assert.match(windows, /ref: \$\{\{ env\.BRIDGE_SOURCE_FULL_SHA \}\}[\s\S]*path: bridge-source/);
+  assert.match(windows, /name: selfhost-offline-final-win32-x64-\$\{\{ env\.FINAL_SOURCE_FULL_SHA \}\}[\s\S]*path: final-release-assets/);
+  assert.match(windows, /architecture: x64/);
+  assert.match(windows, /Copy-Item -LiteralPath resources\/package\.json,resources\/pnpm-lock\.yaml,resources\/pnpm-workspace\.yaml -Destination static/);
+  assert.match(windows, /pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts[\s\S]*if \(\$LASTEXITCODE -ne 0\)/);
+  assert.match(windows, /working-directory: bridge-source\n\s+run: bb lang:export-native-update-strings "\$env:RUNNER_TEMP\/offline-bridge-native-strings\.json"/);
+  assert.match(windows, /run: node scripts\/selfhost6\/build-offline-bridge\.mjs build/);
+  assert.match(windows, /name: selfhost-offline-bridge-input-win32-x64-\$\{\{ env\.BRIDGE_SOURCE_FULL_SHA \}\}-\$\{\{ env\.FINAL_SOURCE_FULL_SHA \}\}[\s\S]*path: bridge-build-input[\s\S]*if-no-files-found: error/);
+  assert.doesNotMatch(windows, /arm64|matrix|strategy/);
+  assert.doesNotMatch(jobs, /contents: write|--publish always|action-gh-release|promote-update-feed|promote-existing-release/);
+  assert.doesNotMatch(jobs, /LOGSEQ_PROJECT_UPDATE_SIGNING_KEY|prepare-update-artifact|cljs:release|rtc:prepush/);
+  assert.doesNotMatch(jobs, /name: selfhost-offline-bridge-\$\{\{/);
 });
 
 test("existing release promotion keeps one bounded transaction owner", () => {

@@ -1,6 +1,6 @@
 (ns frontend.components.block.drop-boundary-test
   (:require [cljs.test :refer [async deftest is]]
-            [frontend.components.block :as block]
+            [frontend.components.block]
             [frontend.db.async :as db-async]
             [frontend.handler.dnd :as dnd]
             [frontend.state :as state]
@@ -20,7 +20,6 @@
           event #js {:stopPropagation (fn [])}]
       (is (fn? block-drop))
       (-> (p/with-redefs [state/get-selection-block-ids (constantly [first-uuid second-uuid])
-                          block/block-drag-end (fn [& _] nil)
                           state/get-current-repo (constantly "test-repo")
                           db-async/<get-blocks (fn [& _] (p/resolved selected))
                           dnd/move-blocks (fn [_event blocks _target _original _move-to]
@@ -52,7 +51,6 @@
           moved (atom nil)
           move-complete (p/deferred)]
       (-> (p/with-redefs [state/get-selection-blocks (constantly [child ancestor])
-                          block/block-drag-end (fn [& _] nil)
                           state/get-current-repo (constantly "test-repo")
                           db-async/<get-blocks (fn [_repo ids _opts]
                                                 (reset! requested (vec ids))

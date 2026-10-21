@@ -34,7 +34,7 @@
       height: 1.45rem;
       line-height: 1.45rem;
       white-space: pre;
-      font-family: Fira Code, Monaco, Menlo, Consolas, 'COURIER NEW', monospace;
+      font-family: var(--ls-code-font-family, Fira Code, Monaco, Menlo, Consolas, 'COURIER NEW', monospace);
     }
   }
 }
@@ -67,7 +67,7 @@
   height: auto;
   max-height: 1024px;
   width: 100%;
-  font-family: Fira Code, Monaco, Menlo, Consolas, 'COURIER NEW', monospace;
+  font-family: var(--ls-code-font-family, Fira Code, Monaco, Menlo, Consolas, 'COURIER NEW', monospace);
   border-radius: 2px;
   line-height: 1.45em;
 

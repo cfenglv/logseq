@@ -137,6 +137,11 @@
       (:path route-match)
       (get-in route-match [:data :name])))
 
+(defn- painted-page-title-key
+  [{:keys [status page]}]
+  (when (and (= :ready status) page (not (:block/page page)))
+    [(:block/uuid page) (:block/title page)]))
+
 (hsx/defc route-view
   "A route switch unmounts the previous view at once. Keep it on screen until
    the next route can paint in a single commit instead of flashing an empty
@@ -144,10 +149,17 @@
   [route-match]
   (let [paint (routes/use-route-paint route-match)
         ready? (not= :loading (:status paint))
+        [page-uuid page-title] (painted-page-title-key paint)
         [held set-held!] (hooks/use-state nil)
         current (when ready?
                   {:route-match route-match
                    :key (route-view-key route-match paint)})]
+    (hooks/use-effect!
+     (fn []
+       (when page-title
+         (route-handler/update-page-title! route-match))
+       js/undefined)
+     [page-uuid page-title])
     (when (and current (not= current held))
       (set-held! current))
     (when-let [painted (or current held)]

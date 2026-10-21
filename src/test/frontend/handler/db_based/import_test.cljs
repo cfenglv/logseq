@@ -1,12 +1,65 @@
 (ns frontend.handler.db-based.import-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require ["jszip" :as JSZip]
+            [cljs.test :refer [async deftest is]]
             [frontend.config :as config]
             [frontend.db :as db]
+            [frontend.fs :as fs]
             [frontend.handler.db-based.import :as import-handler]
+            [frontend.handler.notification :as notification]
             [frontend.handler.repo :as repo-handler]
             [frontend.persist-db :as persist-db]
             [frontend.state :as state]
+            [logseq.shui.ui :as shui]
             [promesa.core :as p]))
+
+(deftest sqlite-zip-builds-search-after-assets-finish-test
+  (async done
+    (let [check-import
+          (fn [with-assets?]
+            (let [zip (JSZip.)
+                  graph (str config/db-version-prefix "zip-imported")
+                  calls (atom [])]
+              (.file zip "db.sqlite" "synthetic db")
+              (when with-assets?
+                (.file zip "assets/synthetic.png" "synthetic asset"))
+              (-> (p/let [buffer (.generateAsync zip #js {:type "arraybuffer"})]
+                    (p/with-redefs [import-handler/import-from-sqlite-db!
+                                   (fn [_ _ finished] (p/resolved (finished)))
+                                   state/get-current-repo (constantly graph)
+                                   config/get-repo-dir (constantly "/synthetic-import")
+                                   state/set-state! (fn [key value] (swap! calls conj [key value]))
+                                   fs/mkdir-if-not-exists (fn [_] (p/resolved nil))
+                                   fs/write-asset-file!
+                                   (fn [repo name _]
+                                     (swap! calls conj [:asset repo name])
+                                     (p/resolved nil))
+                                   notification/show! (fn [& _])
+                                   shui/dialog-close! (fn [& _])
+                                   state/<invoke-db-worker
+                                   (fn [& args]
+                                     (swap! calls conj (vec args))
+                                     (p/resolved :started))]
+                      (import-handler/import-from-sqlite-zip!
+                       #js {:arrayBuffer #(p/resolved buffer)} "zip-imported"
+                       #(swap! calls conj [:finished]))))
+                  (p/then
+                   (fn []
+                     (is (= (if with-assets?
+                              [[:asset graph "synthetic.png"]
+                               [:graph/importing nil]
+                               [:graph/importing-state nil]
+                               [:finished]
+                               [:thread-api/search-build-blocks-indice-in-worker graph]]
+                              [[:graph/importing nil]
+                               [:graph/importing-state nil]
+                               [:finished]])
+                            (vec (remove #(or (= [:graph/importing :sqlite-zip] %)
+                                              (and (= :graph/importing-state (first %))
+                                                   (map? (second %))))
+                                         @calls)))))))))]
+      (-> (p/do! (check-import true) (check-import false))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
 
 (deftest import-from-sqlite-db-persists-import-marker-through-worker-test
   (async done

@@ -152,3 +152,25 @@
     (profile/on-rtc-state! {:user-profile/context ["https://another-service.example" "owner"] :user-profile/repo "graph-a"
                            :online-users [{:user/uuid "member" :display-name "Wrong service" :has-avatar? false :profile-revision 99}]})
     (is (= 2 (get-in (state/get-state :user-profile/state) [:profiles "member" :profile-revision])))))
+
+(deftest automatic-refresh-failure-retains-cache-without-toast-test
+  (async done
+    (let [network-error (js/Error. "Connection unavailable")
+          notifications (atom [])]
+      (-> (p/with-redefs [profile/current-context (constantly context)
+                         user-handler/<ensure-id&access-token! #(p/resolved nil)
+                         rtc-handler/fetch-json (fn [& _] (p/rejected network-error))
+                         rtc-handler/<rtc-get-users-info (fn [& _] (p/resolved []))
+                         notification/show! (fn [& args] (swap! notifications conj args))]
+            (profile/ingest-metadata! context "graph-a" [(saved-profile "owner" 1 nil)])
+            (p/let [_ (profile/refresh-on-focus!)]
+              (is (empty? @notifications) "An automatic read failure is not a failed user action")
+              (is (= 1 (get-in (state/get-state :user-profile/state) [:profiles "owner" :profile-revision])))
+              (-> (profile/<get-own!)
+                  (p/then (fn [_] (is false "Explicit reads must still reject")))
+                  (p/catch (fn [error] (is (identical? network-error error)))))
+              (-> (profile/<save! {:display-name "Display Name" :avatar-png-base64 nil :expected-revision 1})
+                  (p/then (fn [_] (is false "A failed save must not become success")))
+                  (p/catch (fn [error] (is (identical? network-error error)))))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))

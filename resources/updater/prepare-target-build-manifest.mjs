@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { prepareWindowsArchiveReader } from "../../scripts/lib/windows-archive-reader.mjs";
 
 const updaterDirectory = path.dirname(fileURLToPath(import.meta.url));
 const releasePolicy = JSON.parse(
@@ -62,5 +63,7 @@ const manifest = {
   "client-ops-write-format": releasePolicy.clientOpsWriteFormat,
 };
 const output = path.join(updaterDirectory, "TARGET_BUILD_MANIFEST.json");
+if (platform === "win32")
+  await prepareWindowsArchiveReader({ arch, outputDirectory: path.join(updaterDirectory, "windows", arch) });
 fs.writeFileSync(output, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
 process.stdout.write(`${JSON.stringify({ status: "prepared", output, manifest })}\n`);

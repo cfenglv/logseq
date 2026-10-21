@@ -556,6 +556,9 @@
                                            :hide? true
                                            :public? false}
                                   :queryable? true}
+     :logseq.property.asset/literature-auto-excluded?
+     {:title "Keep as ordinary PDF"
+      :schema {:type :checkbox :hide? true :public? false}}
      :logseq.property.asset/external-url {:title "External URL"
                                           :schema {:type :string
                                                    :hide? false
@@ -699,10 +702,83 @@
                                                     :cardinality :many
                                                     :public? true}
                                            :queryable? true}
+     :logseq.property/literature-item? {:title "Literature item"
+                                        :schema {:type :checkbox
+                                                 :public? false
+                                                 :hide? true}}
+     :logseq.property/literature-authors {:title "Authors"
+                                          :schema {:type :default
+                                                   :public? true}
+                                          :queryable? true}
+     :logseq.property/literature-date {:title "Publication date"
+                                       :schema {:type :default
+                                                :public? true}
+                                       :queryable? true}
+     :logseq.property/literature-publication {:title "Publication"
+                                              :schema {:type :default
+                                                       :public? true}
+                                              :queryable? true}
+     :logseq.property/literature-type {:title "Item type"
+                                       :schema {:type :default
+                                                :public? true}
+                                       :queryable? true}
+     :logseq.property/literature-doi {:title "DOI"
+                                      :schema {:type :default
+                                               :public? true}
+                                      :queryable? true}
+     :logseq.property/literature-arxiv {:title "arXiv"
+                                        :schema {:type :default
+                                                 :public? true}
+                                        :queryable? true}
+     :logseq.property/literature-url {:title "URL"
+                                      :schema {:type :default
+                                               :public? true}
+                                      :queryable? true}
+     :logseq.property/literature-citekey {:title "Citation key"
+                                          :schema {:type :default
+                                                   :public? true}
+                                          :queryable? true}
+     :logseq.property/literature-aliases {:title "Filename history"
+                                          :schema {:type :default
+                                                   :cardinality :many
+                                                   :public? true}
+                                          :queryable? true}
+     :logseq.property/literature-source-key {:title "Literature source key"
+                                             :schema {:type :default
+                                                      :cardinality :many
+                                                      :public? false
+                                                      :hide? true}}
+     :logseq.property/literature-source-target {:title "Literature source target"
+                                                :schema {:type :node
+                                                         :public? false
+                                                         :hide? true}}
+     :logseq.property/literature-assets {:title "PDF files"
+                                         :schema {:type :node
+                                                  :cardinality :many
+                                                  :public? true}
+                                         :queryable? true}
      :logseq.property.sync/large-title-object {:title "Reference to large block title stored in remote object storage"
                                                :schema {:type :map
                                                         :public? false
                                                         :hide? true}})))
+
+(def literature-property-idents
+  [:logseq.property/literature-item?
+   :logseq.property/literature-authors
+   :logseq.property/literature-date
+   :logseq.property/literature-publication
+   :logseq.property/literature-type
+   :logseq.property/literature-doi
+   :logseq.property/literature-arxiv
+   :logseq.property/literature-url
+   :logseq.property/literature-citekey
+   :logseq.property/literature-source-key
+   :logseq.property/literature-source-target
+   :logseq.property/literature-assets
+   :logseq.property/literature-aliases
+   :logseq.property.asset/literature-auto-excluded?])
+
+
 
 (def public-built-in-properties
   (->> built-in-properties

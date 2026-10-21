@@ -1522,6 +1522,30 @@
                                 []
                                 response))))
 
+(deftest literature-ref-count-watches-associated-pdf-and-annotation-refs-test
+  (let [{:keys [conn resource-block reference-block journal-child-a journal-child-b journal-grandchild]}
+        (render-resource-fixture)
+        lookup (fn [id] [:block/uuid id])
+        paper (lookup resource-block)
+        pdf (lookup journal-child-b)
+        annotation (lookup journal-grandchild)
+        key [:block-ref-count resource-block]]
+    (d/transact! conn [[:db/add paper :logseq.property/literature-item? true]
+                       [:db/add paper :logseq.property/literature-assets pdf]
+                       [:db/retract (lookup reference-block) :block/refs paper]
+                       [:db/add (lookup reference-block) :block/refs pdf]
+                       [:db/add annotation :logseq.property/ls-type :annotation]
+                       [:db/add annotation :logseq.property/asset pdf]
+                       [:db/add (lookup journal-child-a) :block/refs annotation]])
+    (let [response (call-resource render-one-resource conn key)]
+      (is (= 2 (:value response)))
+      (is (every? (:watch-keys response)
+                  [[:entity resource-block] [:entity journal-child-b]
+                   [:refs resource-block] [:refs journal-child-b] [:refs journal-grandchild]
+                   [:property-membership :logseq.property/asset]])))
+    (d/transact! conn [[:db/retract paper :logseq.property/literature-assets pdf]])
+    (is (zero? (:value (call-resource render-one-resource conn key))))))
+
 (deftest block-ref-count-resource-uses-the-target-reference-key-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn resource-block]} (render-resource-fixture)
