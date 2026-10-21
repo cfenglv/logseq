@@ -184,7 +184,6 @@
      2
      #(w/with-page %
         (settings/developer-mode)
-        (settings/refresh-test-env!)
         (util/login-test-account))
      [@*page1 @*page2])
     (w/with-page @*page1
