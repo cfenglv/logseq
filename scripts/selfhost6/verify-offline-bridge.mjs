@@ -39,7 +39,6 @@ export function readBridgeInputs(env) {
 
 export async function verifyBridgeArtifactDownload({ run, artifact, archivePath, repository, ...input }) {
   assert.equal(run.id, input.runId, "bridge build run changed");
-  assert.equal(run.name, "Build-Desktop-Release", "bridge build must use the desktop release owner");
   assert.equal(run.path, ".github/workflows/build-desktop-release.yml");
   assert.equal(run.repository.full_name, repository, "bridge run repository changed");
   assert.equal(run.event, "workflow_dispatch");

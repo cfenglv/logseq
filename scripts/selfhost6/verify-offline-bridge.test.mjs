@@ -165,7 +165,8 @@ test("bridge build transport binds explicit run, artifact, both sources and dige
   };
   const input = readBridgeInputs(env);
   const run = {
-    id: 73, name: "Build-Desktop-Release", path: ".github/workflows/build-desktop-release.yml",
+    id: 73, name: "Desktop release · stable · build-offline-bridge · release/2.0.2-selfhost.1",
+    path: ".github/workflows/build-desktop-release.yml",
     repository: { full_name: "example/project" }, event: "workflow_dispatch",
     status: "completed", conclusion: "success", head_sha: "c".repeat(40),
   };
@@ -175,6 +176,9 @@ test("bridge build transport binds explicit run, artifact, both sources and dige
   };
   const options = { ...input, run, artifact, archivePath, repository: "example/project" };
   await verifyBridgeArtifactDownload(options);
+  await assert.rejects(verifyBridgeArtifactDownload({
+    ...options, run: { ...run, path: ".github/workflows/unrelated.yml" },
+  }));
   assert.throws(() => readBridgeInputs({ ...env, BRIDGE_BUILD_RUN_ID: "" }), /positive integer/);
   await assert.rejects(verifyBridgeArtifactDownload({
     ...options, artifact: { ...artifact, workflow_run: { ...artifact.workflow_run, id: 75 } },
