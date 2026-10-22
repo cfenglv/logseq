@@ -4,7 +4,7 @@
   "sourceVersion": "2.0.2-selfhost.1",
   "syntheticForwardTargetVersion": "2.0.2-selfhost.2",
   "bundleIdentity": "com.logseq.logseq",
-  "forwardUpdateChannel": "selfhost-official-architecture-v1",
+  "forwardUpdateChannel": "latest",
   "provider": {
     "kind": "github",
     "owner": "cfenglv",

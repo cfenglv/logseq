@@ -97,7 +97,9 @@ test("the trust anchor, validators, and bounded ZIP reader ship in the desktop r
     assert.match(builder, new RegExp(`from: ${resource.replaceAll("/", "\\/")}`));
   }
   assert.match(builder, /mac:\n(?:.|\n)*?extraResources:\n\s+- from: updater\/ProjectUpdater\n\s+to: updater\/ProjectUpdater/);
-  assert.match(builder, /win:\n(?:.|\n)*?from: node_modules\/7zip-bin\/win\/x64\/7za\.exe\n\s+to: updater\/7za\.exe/);
+  assert.match(builder, /win:\n(?:.|\n)*?from: updater\/windows\/\$\{arch\}\n\s+to: updater\n\s+filter:/);
+  for (const name of ["7za.exe", "7z.dll", "7zip-LICENSE.txt", "7zip-NOTICE.txt"])
+    assert.ok(builder.includes(`- ${name}`));
   assert.match(builder, /nsis:\n(?:.|\n)*?include: windows\/selfhost6-updater\.nsh/);
   assert.match(builder, /publish:\n\s+- provider: github\n\s+owner: cfenglv\n\s+repo: logseq/);
   assert.doesNotMatch(builder, /provider: generic|releases\/download\/selfhost-official-architecture-v1/);

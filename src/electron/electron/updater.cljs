@@ -62,7 +62,7 @@
   (let [platform (.-platform js/process)
         arch (.-arch js/process)
         {:keys [feed-url channel allow-prerelease? allow-downgrade?] :as options}
-        (updater-config/updater-options electron-version platform arch)]
+        (updater-config/updater-options platform arch)]
     (when-not options
       (throw (ex-info "this build has no qualified update provider"
                       {:code :unsupported-updater-build

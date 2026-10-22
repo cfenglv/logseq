@@ -20,7 +20,7 @@ export function readReleasePolicy(policyPath) {
   assert.equal(policy.sourceVersion, "2.0.2-selfhost.1");
   assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.2");
   assert.equal(policy.bundleIdentity, "com.logseq.logseq");
-  assert.equal(policy.forwardUpdateChannel, policy.releaseLineId);
+  assert.equal(policy.forwardUpdateChannel, "latest");
   assert.deepEqual(policy.provider, {
     kind: "github",
     owner: "cfenglv",

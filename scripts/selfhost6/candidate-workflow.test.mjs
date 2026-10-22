@@ -345,12 +345,12 @@ test("the mature desktop action stages one complete traditional draft and stops"
   assert.match(builtReleaseVerifier, /formal release set must contain exactly thirty-five assets/);
   assert.match(builtReleaseVerifier, /traditionalReleaseAssetNames/);
   for (const channelFile of [
-    "selfhost-official-architecture-v1-x64.yml",
-    "selfhost-official-architecture-v1-arm64.yml",
-    "selfhost-official-architecture-v1-x64-mac.yml",
-    "selfhost-official-architecture-v1-arm64-mac.yml",
-    "selfhost-official-architecture-v1-linux.yml",
-    "selfhost-official-architecture-v1-linux-arm64.yml",
+    "latest-x64.yml",
+    "latest-arm64.yml",
+    "latest-x64-mac.yml",
+    "latest-arm64-mac.yml",
+    "latest-linux.yml",
+    "latest-linux-arm64.yml",
   ]) assert.match(selfhostReleaseJobs, new RegExp(channelFile.replaceAll(".", "\\.")));
   assert.doesNotMatch(builtReleaseVerifier, /endsWith\("\.yml"\)\), false/);
   assert.match(builtReleaseVerifier, /built-assets-verified-awaiting-product-qualification/);

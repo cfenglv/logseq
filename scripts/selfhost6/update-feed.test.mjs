@@ -58,10 +58,13 @@ const signingPolicy = Object.freeze({
 const privateKeyPem = privateKey.export({ format: "pem", type: "pkcs8" });
 const sourceFullSha = "a".repeat(40);
 
-function fixture(targetVersion = releasePolicy.syntheticForwardTargetVersion) {
+function fixture(targetVersion = releasePolicy.syntheticForwardTargetVersion, platform = "darwin", arch = "arm64") {
   const inputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "selfhost6-feed-"));
   const directory = path.join(inputDirectory, "staged");
-  const archivePath = path.join(inputDirectory, `Logseq-darwin-arm64-${targetVersion}.zip`);
+  const label = platform === "linux" && arch === "x64" ? "x86_64" : arch;
+  const archiveName = platform === "win32" ? `Logseq-win-${arch}-${targetVersion}-nsis.exe`
+    : `Logseq-${platform}-${label}-${targetVersion}.${platform === "linux" ? "AppImage" : "zip"}`;
+  const archivePath = path.join(inputDirectory, archiveName);
   const targetManifestPath = path.join(inputDirectory, "TARGET_BUILD_MANIFEST.json");
   fs.writeFileSync(archivePath, "physical candidate bytes");
   fs.writeFileSync(targetManifestPath, `${JSON.stringify({
@@ -69,8 +72,8 @@ function fixture(targetVersion = releasePolicy.syntheticForwardTargetVersion) {
     "target-source-full-sha": sourceFullSha,
     "target-version": targetVersion,
     "release-line-id": releasePolicy.releaseLineId,
-    platform: "darwin",
-    arch: "arm64",
+    platform,
+    arch,
     "bundle-identity": releasePolicy.bundleIdentity,
     "signing-key-identity": signingPolicy.keyId,
     "readable-activation-formats": releasePolicy.readableActivationFormats,
@@ -83,8 +86,8 @@ function fixture(targetVersion = releasePolicy.syntheticForwardTargetVersion) {
     targetManifestPath,
     sourceFullSha,
     targetVersion,
-    platform: "darwin",
-    arch: "arm64",
+    platform,
+    arch,
     releasePolicy,
     signingPolicy,
     privateKeyPem,
@@ -135,27 +138,29 @@ test("a content-addressed source target binds metadata to immutable bytes", () =
 test("win32 arm64 uses the same shared Windows update channel as win32 x64", () => {
   assert.equal(
     channelFileName(releasePolicy, "win32", "x64"),
-    "selfhost-official-architecture-v1.yml",
+    "latest.yml",
   );
   assert.equal(
     channelFileName(releasePolicy, "win32", "arm64"),
-    "selfhost-official-architecture-v1.yml",
+    "latest.yml",
   );
 });
 
-test("traditional GitHub metadata uses isolated release-local channel names", () => {
+test("traditional GitHub metadata uses standard latest architecture channels", () => {
+  assert.equal(releasePolicy.forwardUpdateChannel, "latest");
+  assert.notEqual(releasePolicy.forwardUpdateChannel, releasePolicy.releaseLineId);
   assert.equal(traditionalChannelFileName(releasePolicy, "win32", "x64"),
-    "selfhost-official-architecture-v1-x64.yml");
+    "latest-x64.yml");
   assert.equal(traditionalChannelFileName(releasePolicy, "win32", "arm64"),
-    "selfhost-official-architecture-v1-arm64.yml");
+    "latest-arm64.yml");
   assert.equal(traditionalChannelFileName(releasePolicy, "darwin", "x64"),
-    "selfhost-official-architecture-v1-x64-mac.yml");
+    "latest-x64-mac.yml");
   assert.equal(traditionalChannelFileName(releasePolicy, "darwin", "arm64"),
-    "selfhost-official-architecture-v1-arm64-mac.yml");
+    "latest-arm64-mac.yml");
   assert.equal(traditionalChannelFileName(releasePolicy, "linux", "x64"),
-    "selfhost-official-architecture-v1-linux.yml");
+    "latest-linux.yml");
   assert.equal(traditionalChannelFileName(releasePolicy, "linux", "arm64"),
-    "selfhost-official-architecture-v1-linux-arm64.yml");
+    "latest-linux-arm64.yml");
 });
 
 test("native electron-builder metadata keeps its fields and gains the existing signature", () => {
@@ -233,70 +238,68 @@ test("bridge rejects synthetic .8 and post-signing artifact replacement", () => 
   );
 });
 
-test("electron-updater GitHubProvider resolves latest Release metadata and immutable bytes", async () => {
-  const item = fixture();
-  const verified = verifyArtifactDescriptor({
-    descriptor: item.descriptor,
-    artifactPath: item.artifactPath,
-    releasePolicy,
-    signingPolicy,
-  });
-  const native = [
-    `version: ${releasePolicy.syntheticForwardTargetVersion}`,
-    "files:",
-    `  - url: ${item.descriptor.assetName}`,
-    `    sha512: ${Buffer.from(verified["archive-sha512"], "hex").toString("base64")}`,
-    `    size: ${verified["archive-size"]}`,
-    `path: ${item.descriptor.assetName}`,
-    `sha512: ${Buffer.from(verified["archive-sha512"], "hex").toString("base64")}`,
-    "releaseDate: '2026-08-31T00:00:00.000Z'",
-    "",
-  ].join("\n");
-  const metadata = finalizeTraditionalMetadata({
-    metadataText: native,
-    artifactDirectory: item.directory,
-    descriptors: [item.descriptor],
-    expectedTargetVersion: item.descriptor.targetVersion,
-    platform: "darwin",
-    arch: "arm64",
-    releasePolicy,
-    signingPolicy,
-  });
-  const tag = releasePolicy.syntheticForwardTargetVersion;
-  const channelFile = traditionalChannelFileName(releasePolicy, "darwin", "arm64");
-  const feed = `<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>${tag}</title><link href="https://github.com/cfenglv/logseq/releases/tag/${tag}"/><content>fixture</content></entry></feed>`;
-  const executor = {
-    async request(options) {
-      const requestPath = options.path;
-      if (requestPath.endsWith("/releases.atom")) return feed;
-      if (requestPath.endsWith("/releases/latest")) return JSON.stringify({ tag_name: tag });
-      if (requestPath.endsWith(`/${channelFile}`)) return metadata;
-      if (requestPath.endsWith(`/${item.descriptor.assetName}`)) {
-        return fs.readFileSync(item.artifactPath).toString("utf8");
-      }
-      throw new Error(`unexpected GitHubProvider request path: ${requestPath}`);
-    },
-  };
-  const provider = new GitHubProvider(
-    { provider: "github", owner: "cfenglv", repo: "logseq" },
-    {
-      channel: `${releasePolicy.forwardUpdateChannel}-arm64`,
-      allowPrerelease: false,
-      currentVersion: "2.0.1-selfhost.7",
-      fullChangelog: false,
-    },
-    { executor, platform: "darwin", isUseMultipleRangeRequest: false },
-  );
-  const info = await provider.getLatestVersion();
-  assert.equal(info.version, releasePolicy.syntheticForwardTargetVersion);
-  assert.equal(info.tag, releasePolicy.syntheticForwardTargetVersion);
-  assert.deepEqual(Object.keys(info.selfhostUpdateSignatures), ["arm64"]);
-  const resolved = provider.resolveFiles(info);
-  assert.equal(resolved.length, 1);
-  assert.equal(path.basename(resolved[0].url.pathname), item.descriptor.assetName);
-  const archiveBytes = Buffer.from(await executor.request({ path: resolved[0].url.pathname }));
-  assert.deepEqual(archiveBytes, fs.readFileSync(item.artifactPath));
+test("electron-updater GitHubProvider resolves six latest channels and exact signed bytes", async (context) => {
+  const previousArch = process.env.TEST_UPDATER_ARCH;
+  try {
+    for (const [platform, arch, channelFile] of [
+      ["darwin", "arm64", "latest-arm64-mac.yml"], ["darwin", "x64", "latest-x64-mac.yml"],
+      ["win32", "arm64", "latest-arm64.yml"], ["win32", "x64", "latest-x64.yml"],
+      ["linux", "arm64", "latest-linux-arm64.yml"], ["linux", "x64", "latest-linux.yml"],
+    ]) {
+      process.env.TEST_UPDATER_ARCH = arch;
+      const item = fixture(releasePolicy.syntheticForwardTargetVersion, platform, arch);
+      context.after(() => fs.rmSync(item.inputDirectory, { recursive: true, force: true }));
+      const verified = verifyArtifactDescriptor({ descriptor: item.descriptor,
+        artifactPath: item.artifactPath, releasePolicy, signingPolicy });
+      const tag = item.descriptor.targetVersion;
+      const native = [
+        `version: ${tag}`, "files:", `  - url: ${item.descriptor.assetName}`,
+        `    sha512: ${Buffer.from(verified["archive-sha512"], "hex").toString("base64")}`,
+        `    size: ${verified["archive-size"]}`, `path: ${item.descriptor.assetName}`,
+        `sha512: ${Buffer.from(verified["archive-sha512"], "hex").toString("base64")}`,
+        "releaseDate: '2026-08-31T00:00:00.000Z'", "",
+      ].join("\n");
+      const metadata = finalizeTraditionalMetadata({ metadataText: native,
+        artifactDirectory: item.directory, descriptors: [item.descriptor],
+        expectedTargetVersion: tag, platform, arch, releasePolicy, signingPolicy });
+      assert.equal(traditionalChannelFileName(releasePolicy, platform, arch), channelFile);
+      const requests = [];
+      const feed = `<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>${tag}</title><link href="https://github.com/example/release-fixture/releases/tag/${tag}"/><content>fixture</content></entry></feed>`;
+      const executor = {
+        async request(options) {
+          const requestPath = options.path;
+          requests.push(requestPath);
+          if (requestPath.endsWith("/releases.atom")) return feed;
+          if (requestPath.endsWith("/releases/latest")) return JSON.stringify({ tag_name: tag });
+          if (requestPath.endsWith(`/${channelFile}`)) return metadata;
+          if (requestPath.endsWith(`/${item.descriptor.assetName}`))
+            return fs.readFileSync(item.artifactPath).toString("utf8");
+          throw new Error(`unexpected GitHubProvider request path: ${requestPath}`);
+        },
+      };
+      const provider = new GitHubProvider(
+        { provider: "github", owner: "example", repo: "release-fixture" },
+        { channel: platform === "linux" ? "latest" : `latest-${arch}`,
+          allowPrerelease: false, currentVersion: releasePolicy.sourceVersion, fullChangelog: false },
+        { executor, platform, isUseMultipleRangeRequest: false },
+      );
+      const info = await provider.getLatestVersion();
+      assert.equal(info.version, tag);
+      assert.equal(info.tag, tag);
+      assert.deepEqual(Object.keys(info.selfhostUpdateSignatures), [arch]);
+      assert.deepEqual(info.selfhostUpdateSignatures[arch], item.descriptor.signedMetadata);
+      assert.ok(requests.some(requestPath => requestPath.endsWith(`/${channelFile}`)));
+      const resolved = provider.resolveFiles(info);
+      assert.equal(resolved.length, 1);
+      assert.equal(path.basename(resolved[0].url.pathname), item.descriptor.assetName);
+      assert.deepEqual(Buffer.from(await executor.request({ path: resolved[0].url.pathname })),
+        fs.readFileSync(item.artifactPath));
+    }
+  } finally {
+    if (previousArch === undefined) delete process.env.TEST_UPDATER_ARCH;
+    else process.env.TEST_UPDATER_ARCH = previousArch;
+  }
 });
 
 test("native AppUpdater accepts newer versions and rejects invalid versions or downgrades", async () => {
@@ -313,6 +316,8 @@ test("native AppUpdater accepts newer versions and rejects invalid versions or d
   assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
     version: releasePolicy.syntheticForwardTargetVersion,
   }), true);
+  for (const version of ["2.0.3-selfhost.1", "2.1.0-selfhost.1"])
+    assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, { version }), true);
   assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
     version: "2.0.1-selfhost.7",
   }), false);

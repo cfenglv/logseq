@@ -106,24 +106,6 @@ function normalizedRemoteAssets(assets) {
   return normalized;
 }
 
-function normalizedExpectedAssets(assets, targetVersion) {
-  const normalized = normalizedRemoteAssets(assets);
-  if (normalized.length === 0) return normalized;
-  if (normalized.length === 16) {
-    assert.ok(normalized.every(({ name }) => name.startsWith("Logseq-")),
-      "legacy Draft contains a non-formal asset");
-    assert.equal(normalized.filter(({ name }) => name.endsWith(".selfhost6.json")).length, 8,
-      "legacy Draft must contain eight artifact descriptors");
-  } else {
-    assert.deepEqual(
-      new Set(normalized.map(({ name }) => name)),
-      new Set(traditionalReleaseAssetNames(releasePolicy, targetVersion)),
-      "frozen Draft differs from the traditional release inventory",
-    );
-  }
-  return normalized;
-}
-
 function normalizedTraditionalRemoteAssets(assets, targetVersion) {
   const normalized = normalizedRemoteAssets(assets);
   assert.deepEqual(
@@ -179,7 +161,7 @@ function verifyReleaseIdentity(options) {
 }
 
 export function draftInventorySha256(assets) {
-  const normalized = normalizedExpectedAssets(assets, releasePolicy.sourceVersion);
+  const normalized = normalizedRemoteAssets(assets);
   return sha256Bytes(Buffer.from(`${JSON.stringify(normalized)}\n`));
 }
 
@@ -224,7 +206,7 @@ export function verifyDraftBeforeReplacement(options) {
   assert.equal(draftInventorySha256(options.expectedAssets), options.expectedInventorySha256,
     "frozen Draft asset inventory secret is inconsistent");
 
-  const frozen = normalizedExpectedAssets(options.expectedAssets, options.targetVersion);
+  const frozen = normalizedRemoteAssets(options.expectedAssets);
   const replacement = normalizedLocalAssets(options.artifactDirectory, options.targetVersion);
   const frozenByName = new Map(frozen.map((asset) => [asset.name, asset]));
   const replacementByName = new Map(replacement.map((asset) => [asset.name, asset]));

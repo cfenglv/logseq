@@ -108,7 +108,10 @@ function fixture(context, mode) {
   const legacyNames = ["darwin-arm64.dmg", "darwin-arm64.zip", "darwin-x64.dmg", "darwin-x64.zip",
     "linux-arm64.AppImage", "linux-x64.AppImage", "win32-arm64.exe", "win32-x64.exe"]
     .flatMap((name) => [`Logseq-${name}`, `Logseq-${name}.selfhost6.json`]);
-  const legacyAssets = legacyNames.map((name, index) => {
+  const frozenNames = mode === "channel-replace"
+    ? traditionalReleaseAssetNames({ ...policy, forwardUpdateChannel: policy.releaseLineId }, version)
+    : legacyNames;
+  const legacyAssets = frozenNames.map((name, index) => {
     const bytes = Buffer.from(`frozen:${name}`);
     return { id: 1000 + index, name, size: bytes.length, digest: sha256(bytes) };
   });
@@ -128,7 +131,9 @@ function fixture(context, mode) {
   if (mode !== "create") Object.assign(secrets, {
     SELFHOST_DRAFT_RELEASE_ID: String(mode === "wrong" ? oldReleaseId : releaseId),
     SELFHOST_DRAFT_TARGET_FULL_SHA: oldSource,
-    SELFHOST_DRAFT_ASSET_INVENTORY_SHA256: draftInventorySha256(legacyAssets),
+    SELFHOST_DRAFT_ASSET_INVENTORY_SHA256: mode === "channel-replace"
+      ? sha256(Buffer.from(`${JSON.stringify([...legacyAssets].sort((a, b) => a.name.localeCompare(b.name)))}\n`))
+      : draftInventorySha256(legacyAssets),
     SELFHOST_DRAFT_ASSET_INVENTORY_JSON: JSON.stringify(legacyAssets),
   });
   const statePath = path.join(root, "state.json");
@@ -245,6 +250,23 @@ test("actual Draft workflow: frozen ID pointing at old .7 stops before any mutat
   assert.equal(fs.existsSync(path.join(input.root, "temp/selfhost-draft-obsolete-asset-ids.txt")), false);
   assert.equal(input.state().calls.every(({ method }) => method === "GET"), true);
   assert.deepEqual(input.state().releases, initial);
+});
+
+test("actual Draft workflow: frozen old-channel inventory becomes exactly thirty-five latest-channel assets", (context) => {
+  const input = fixture(context, "channel-replace");
+  assert.equal(input.legacyAssets.length, 35);
+  success(input.run(before));
+  const obsolete = input.legacyAssets.filter(({ name }) => name.endsWith(".yml"));
+  assert.equal(obsolete.length, 6);
+  assert.deepEqual(input.deletionList().trim().split("\n").map(Number),
+    obsolete.map(({ id }) => id).sort((a, b) => a - b));
+  success(input.run(remove));
+  input.action();
+  verifyCompleted(input);
+  assert.deepEqual(input.state().releases.find(({ id }) => id === releaseId).assets
+    .filter(({ name }) => name.endsWith(".yml")).map(({ name }) => name).sort(),
+  ["latest-arm64-mac.yml", "latest-arm64.yml", "latest-linux-arm64.yml",
+    "latest-linux.yml", "latest-x64-mac.yml", "latest-x64.yml"]);
 });
 
 test("actual Draft workflow: an incorrect action output cannot retag old .7", (context) => {
