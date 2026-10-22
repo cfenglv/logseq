@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { bridgeBuildNames, buildOfflineBridge, readOfflineBridgeBuildInputs } from "./build-offline-bridge.mjs";
+import { bridgeBuildNames, buildOfflineBridge, readOfflineBridgeBuildInputs, verifyOfflineBridgeSource } from "./build-offline-bridge.mjs";
 
 test("native build inputs keep bridge and final sources independent", () => {
   const env = { BRIDGE_SOURCE_FULL_SHA: "a".repeat(40), FINAL_SOURCE_FULL_SHA: "b".repeat(40) };
@@ -26,7 +26,7 @@ test("native build inputs keep bridge and final sources independent", () => {
   assert.throws(() => bridgeBuildNames("win32", "arm64", "2.0.2-selfhost.1"), /entry is x64/);
 });
 
-test("a wrong or dirty bridge source rejects before compilation or output writes", async context => {
+test("source validation rejects changed native inputs without checking unrelated Android files", async context => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "offline-bridge-source-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   execFileSync("git", ["init", "--quiet", root]);
@@ -42,9 +42,17 @@ test("a wrong or dirty bridge source rejects before compilation or output writes
     const bridgeSourceFullSha = execFileSync("git", ["rev-parse", "HEAD"], {
       cwd: root, encoding: "utf8",
     }).trim();
-    fs.writeFileSync(path.join(root, "untracked.txt"), "synthetic unsaved source\n");
+    fs.mkdirSync(path.join(root, "android"));
+    fs.writeFileSync(path.join(root, "android/gradlew.bat"), "synthetic Android launcher\r\n");
+    assert.doesNotThrow(() => verifyOfflineBridgeSource(root, bridgeSourceFullSha));
+    fs.mkdirSync(path.join(root, "resources"));
+    fs.writeFileSync(path.join(root, "resources/untracked.txt"), "synthetic unsaved native source\n");
     await assert.rejects(buildOfflineBridge({ bridgeRoot: root, outputDirectory, bridgeSourceFullSha }),
       /bridge checkout must be clean/);
+    fs.unlinkSync(path.join(root, "resources/untracked.txt"));
+    fs.mkdirSync(path.join(root, "scripts"));
+    fs.writeFileSync(path.join(root, "scripts/untracked.mjs"), "// synthetic unsaved build source\n");
+    assert.throws(() => verifyOfflineBridgeSource(root, bridgeSourceFullSha), /bridge checkout must be clean/);
   }
   assert.equal(fs.existsSync(outputDirectory), false);
 });

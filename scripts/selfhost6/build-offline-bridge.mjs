@@ -47,16 +47,20 @@ function run(command, args, options = {}) {
   return result.stdout;
 }
 
+export function verifyOfflineBridgeSource(bridgeRoot, bridgeSourceFullSha) {
+  assert.equal(run("git", ["rev-parse", "HEAD"], { cwd: bridgeRoot }).trim(), bridgeSourceFullSha,
+    "bridge checkout differs from its exact source");
+  assert.equal(run("git", ["status", "--porcelain", "--", "resources", "scripts"], { cwd: bridgeRoot }), "",
+    "bridge checkout must be clean");
+}
+
 export async function buildOfflineBridge({
   bridgeRoot, finalDirectory, outputDirectory, nativeStrings,
   bridgeSourceFullSha, finalSourceFullSha,
 }) {
   const names = bridgeBuildNames(process.platform, process.arch, "2.0.2-selfhost.1");
   assert.equal(fs.existsSync(outputDirectory), false, "bridge output directory already exists");
-  assert.equal(run("git", ["rev-parse", "HEAD"], { cwd: bridgeRoot }).trim(), bridgeSourceFullSha,
-    "bridge checkout differs from its exact source");
-  assert.equal(run("git", ["status", "--porcelain"], { cwd: bridgeRoot }), "",
-    "bridge checkout must be clean");
+  verifyOfflineBridgeSource(bridgeRoot, bridgeSourceFullSha);
   const owner = await import(pathToFileURL(
     path.join(bridgeRoot, "scripts/lib/selfhost6-release-identity.mjs")));
   const bridgePolicy = owner.readReleasePolicy(
