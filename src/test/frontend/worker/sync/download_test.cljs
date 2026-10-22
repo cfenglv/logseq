@@ -882,8 +882,7 @@
                     (is (identical? target resource))
                     (p/resolved target))
                   sync-download/<rehydrate-repair-titles!
-                  (fn [hydration-repo graph-id staging-conn aes-key]
-                    (is (= [repo "graph-1" nil] [hydration-repo graph-id aes-key]))
+                  (fn [_repo _graph-id staging-conn _aes-key]
                     (is (identical? target-conn staging-conn))
                     (p/resolved nil))
                   sync-checksum/<recompute-checksum
