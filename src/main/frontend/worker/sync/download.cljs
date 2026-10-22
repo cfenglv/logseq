@@ -12,6 +12,7 @@
    [frontend.worker.sync.apply-txs :as sync-apply]
    [frontend.worker.sync.client-op :as client-op]
    [frontend.worker.sync.crypt :as sync-crypt]
+   [frontend.worker.sync.large-title :as sync-large-title]
    [frontend.worker.sync.log-and-state :as rtc-log-and-state]
    [frontend.worker.sync.temp-sqlite :as sync-temp-sqlite]
    [frontend.worker.sync.transport :as sync-transport]
@@ -800,6 +801,18 @@
             _ (<add-snapshot-local-revisions! conn)]
       (assoc resource :conn conn))))
 
+(defn- <rehydrate-repair-titles!
+  [repo graph-id conn aes-key]
+  ;; Restore snapshot/tail placeholders in staging, before local edits replay.
+  ;; A short edit can retain an old marker and must not be replaced by its blob.
+  (let [tx-data (->> (d/datoms @conn :aevt sync-large-title/large-title-object-attr)
+                     (filter #(= "" (:block/title (d/entity @conn (:e %)))))
+                     (mapv (fn [datom]
+                             [:db/add (:e datom) sync-large-title/large-title-object-attr (:v datom)])))]
+    (when (seq tx-data)
+      (sync-apply/rehydrate-large-titles!
+       repo {:conn conn :graph-id graph-id :aes-key aes-key :tx-data tx-data}))))
+
 (defn- repair-staging-key
   [repo graph-id]
   [repo graph-id])
@@ -1002,6 +1015,7 @@
                   _ (ensure-repair-build-active! repo active-conn owner-token)
                   remote-result (sync-apply/<apply-repair-staging-tails!
                                  (:conn target) remote-txs [] @active-conn)
+                  _ (<rehydrate-repair-titles! repo graph-id (:conn target) aes-key)
                   remote-checksum (sync-checksum/<recompute-checksum @(:conn target))
                   _ (when-not (= remote-checksum
                                   (:server-recomputed-checksum tail-proof))

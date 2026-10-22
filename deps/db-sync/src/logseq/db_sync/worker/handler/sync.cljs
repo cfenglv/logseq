@@ -1029,7 +1029,14 @@
          :graph-id graph-id
          :captured-t captured-t
          :current-t current-t})))
-    (storage/set-checksum! (.-sql self) recomputed)))
+    (storage/set-checksum! (.-sql self) recomputed)
+    ;; Diagnostics can replace a legacy derived anchor without a new tx.
+    ;; Refresh peers through the existing metadata boundary so they do not
+    ;; retain the old checksum until another edit or reconnect.
+    (ws/broadcast! self nil {:type "hello"
+                            :t current-t
+                            :checksum recomputed
+                            :capabilities server-capabilities})))
 
 (defn- <checksum-diagnostics-response
   [^js self graph-id include-blocks?]

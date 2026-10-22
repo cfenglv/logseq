@@ -820,6 +820,30 @@
     :legacy-anchor "server-6"
     :metadata-proof "authenticated-diagnostics-v1:graph-1:6:server-6:server-6"}})
 
+(deftest repair-snapshot-rehydrates-placeholders-without-overwriting-short-edits-test
+  (async done
+         (let [conn (d/create-conn db-schema/schema)
+               marker {:asset-uuid "60000000-0000-4000-8000-000000000001" :asset-type "txt"}
+               _ (d/transact! conn [{:db/id 1 :block/title ""
+                                    :logseq.property.sync/large-title-object marker}
+                                   {:db/id 2 :block/title "A short newer edit"
+                                    :logseq.property.sync/large-title-object marker}])
+               calls (atom [])]
+           (-> (p/with-redefs
+                 [sync-apply/rehydrate-large-titles!
+                  (fn [repo opts]
+                    (swap! calls conj [repo opts])
+                    (p/resolved nil))]
+                 (p/let [_ (#'sync-download/<rehydrate-repair-titles!
+                            "synthetic-repo" "synthetic-graph" conn nil)]
+                   (is (= [["synthetic-repo"
+                            {:conn conn :graph-id "synthetic-graph" :aes-key nil
+                             :tx-data [[:db/add 1 :logseq.property.sync/large-title-object marker]]}]]
+                          @calls))
+                   (is (= "A short newer edit" (:block/title (d/entity @conn 2))))))
+               (p/catch #(is false (str %)))
+               (p/finally done)))))
+
 (deftest repair-staging-builder-uses-one-snapshot-resource-and-captures-watermarks-test
   (async done
          (let [repo "repair-staging-repo"
@@ -857,6 +881,11 @@
                   (fn [resource _aes-key _graph-e2ee?]
                     (is (identical? target resource))
                     (p/resolved target))
+                  sync-download/<rehydrate-repair-titles!
+                  (fn [hydration-repo graph-id staging-conn aes-key]
+                    (is (= [repo "graph-1" nil] [hydration-repo graph-id aes-key]))
+                    (is (identical? target-conn staging-conn))
+                    (p/resolved nil))
                   sync-checksum/<recompute-checksum
                   (fn [_]
                     (let [checksum (first @checksums)]
@@ -1044,6 +1073,7 @@
                   sync-download/<materialize-repair-target!
                   (fn [resource _aes-key _graph-e2ee?]
                     (p/resolved resource))
+                  sync-download/<rehydrate-repair-titles! (fn [& _] (p/resolved nil))
                   sync-checksum/<recompute-checksum (fn [_] (p/resolved "stale-snapshot"))
                   sync-download/<fetch-repair-diagnostics
                   (fn [& _]

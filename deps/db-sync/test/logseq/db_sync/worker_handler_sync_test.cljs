@@ -161,6 +161,42 @@
                               (is false (str error))
                               (done)))))))))
 
+(deftest checksum-diagnostics-refreshes-connected-peers-only-when-anchor-changes-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   sent (atom [])
+                   peer #js {:readyState 1
+                             :send (fn [raw]
+                                     (swap! sent conj (protocol/parse-message raw)))}
+                   self #js {:sql sql :conn conn :schema-ready true
+                             :state #js {:getWebSockets (fn [] #js [peer])}}
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                        :block/name "rollout checksum page"
+                                        :block/title "Rollout checksum page"}])
+                   expected (sync-checksum/recompute-checksum @conn)
+                   before-t (storage/get-t sql)
+                   _ (is (not= "0000000000000000" expected))
+                   _ (storage/set-checksum! sql "0000000000000000")]
+               (-> (p/let [_ (#'sync-handler/<checksum-diagnostics-response
+                              self "synthetic-rollout" false)
+                           _ (is (= [{:type "hello" :t before-t
+                                      :checksum expected
+                                      :capabilities sync-handler/server-capabilities}]
+                                    @sent))
+                           _ (is (= before-t (storage/get-t sql))
+                                 "Refreshing a derived anchor must not append a graph transaction")
+                           _ (#'sync-handler/<checksum-diagnostics-response
+                              self "synthetic-rollout" false)]
+                     (is (= 1 (count @sent))
+                         "A current anchor must not trigger another refresh"))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
 (deftest checksum-diagnostics-does-not-overwrite-a-newer-anchor-test
   (with-memory-sql
     (fn [sql]
