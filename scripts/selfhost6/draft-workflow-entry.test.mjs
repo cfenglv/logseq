@@ -26,6 +26,7 @@ const oldSource = "a".repeat(40);
 const newSource = "b".repeat(40);
 const releaseId = 424242;
 const oldReleaseId = 777777;
+const releaseNotes = "## Changes\n\nUser-maintained release notes and installation instructions.\n";
 const sha256 = (bytes) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
 
 // Only the external GitHub API/action boundary is synthetic. Run the checked-in
@@ -113,7 +114,7 @@ function fixture(context, mode) {
   });
   const release = {
     id: releaseId, tag_name: version, target_commitish: oldSource,
-    name: `Logseq ${version}`, body: `Source commit ${oldSource}.`,
+    name: `Logseq ${version}`, body: releaseNotes,
     draft: true, prerelease: false, published_at: null, assets: legacyAssets,
   };
   const oldRelease = {
@@ -165,6 +166,8 @@ function fixture(context, mode) {
   const deletionList = () => fs.readFileSync(path.join(root, "temp/selfhost-draft-obsolete-asset-ids.txt"), "utf8");
   const action = () => {
     assert.equal(publish.uses, "softprops/action-gh-release@v2");
+    assert.equal(publish.with.body, undefined, "the action must preserve edited release notes");
+    assert.equal(publish.with.body_path, undefined, "the action must not replace edited release notes");
     for (const [key, value] of Object.entries({ draft: true, prerelease: false, make_latest: false,
       fail_on_unmatched_files: true, overwrite_files: true })) assert.equal(publish.with[key], value);
     const names = expand(publish.with.files).trim().split(/\s+/).map((name) => path.basename(name));
@@ -174,10 +177,11 @@ function fixture(context, mode) {
     const current = state();
     let target = current.releases.find(({ tag_name: tagName }) => tagName === version);
     if (!target) {
-      target = { ...release, target_commitish: newSource };
+      target = { ...release, target_commitish: newSource, body: null };
       current.releases.push(target);
     }
-    Object.assign(target, { assets, name: expand(publish.with.name), body: expand(publish.with.body) });
+    Object.assign(target, { assets, name: expand(publish.with.name),
+      target_commitish: expand(publish.with.target_commitish) });
     save(current);
     if (publish.id) expressions[`steps.${publish.id}.outputs.id`] = String(target.id);
   };
@@ -188,7 +192,7 @@ function success(result) {
   assert.equal(result.status, 0, `workflow shell failed: ${result.error?.code ?? ""}\n${result.stdout}${result.stderr}`);
 }
 
-function verifyCompleted(input) {
+function verifyCompleted(input, expectedBody = releaseNotes) {
   const result = input.run(after);
   success(result);
   assert.match(result.stdout, /draft-staging-verified/);
@@ -197,6 +201,7 @@ function verifyCompleted(input) {
   assert.equal(staged.target_commitish, newSource);
   assert.equal(staged.draft, true);
   assert.equal(staged.published_at, null);
+  assert.equal(staged.body, expectedBody, "binding must preserve the release notes");
   assert.deepEqual(input.json("selfhost-draft-assets-after.json"), input.assets);
   assert.deepEqual(input.json("selfhost-draft-tag-refs-after.json"), []);
   assert.equal(input.json("selfhost-releases-after.json").length, 2);
@@ -213,7 +218,7 @@ test("actual Draft workflow: absent target creates a new Draft and passes its ID
   success(input.run(remove));
   assert.equal(input.state().calls.every(({ method }) => method === "GET"), true);
   input.action();
-  verifyCompleted(input);
+  verifyCompleted(input, null);
 });
 
 test("actual Draft workflow: frozen target replaces only obsolete assets and remains a Draft", (context) => {
@@ -272,7 +277,7 @@ test("actual Draft workflow: absent or partial binding cannot adopt an existing 
 });
 
 test("actual bridge input workflow: protected Draft access downloads and verifies all thirty-five files", (context) => {
-  const input = fixture(context, "create");
+  const input = fixture(context, "replace");
   for (const name of ["scripts", "resources"]) fs.cpSync(
     path.join(input.root, "release-source", name), path.join(input.root, name), { recursive: true });
   input.action();

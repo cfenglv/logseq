@@ -319,7 +319,7 @@ test("the mature desktop action stages one complete traditional draft and stops"
   assert.match(selfhostReleaseJobs, /verify-draft-release\.mjs[\s\S]*--phase after/);
   assert.match(selfhostReleaseJobs, /-f tag_name="\$\{SELFHOST6_TARGET_VERSION\}"/);
   assert.match(selfhostReleaseJobs, /-f name="Logseq \$\{SELFHOST6_TARGET_VERSION\}"/);
-  assert.match(selfhostReleaseJobs, /-f body="Source commit \$\{EXPECTED_SOURCE_FULL_SHA\}\."/);
+  assert.doesNotMatch(selfhostReleaseJobs, /^\s+body(?:_path)?:|-f body=/m);
   for (const name of [
     "SELFHOST_DRAFT_RELEASE_ID",
     "SELFHOST_DRAFT_TARGET_FULL_SHA",

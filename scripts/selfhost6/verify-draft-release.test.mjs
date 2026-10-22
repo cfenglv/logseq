@@ -266,24 +266,15 @@ test("a partial official Draft replacement remains safely resumable", (context) 
   }), { status: "draft-prewrite-verified" });
 });
 
-test("staged Draft must exactly match all local verified assets", (context) => {
+test("staged Draft allows release notes while exactly matching source and assets", (context) => {
   const input = fixture();
   context.after(() => fs.rmSync(input.directory, { recursive: true, force: true }));
-  assert.throws(() => verifyDraftAfterStaging({
-    ...input,
-    release: { ...input.release, target_commitish: replacementSourceFullSha },
-    assets: input.replacementAssets,
-    releaseId: String(releaseId),
-    sourceFullSha: replacementSourceFullSha,
-    targetVersion,
-    artifactDirectory: input.directory,
-  }), /Draft body changed/);
   assert.deepEqual(verifyDraftAfterStaging({
     ...input,
     release: {
       ...input.release,
       target_commitish: replacementSourceFullSha,
-      body: `Source commit ${replacementSourceFullSha}.`,
+      body: "## Changes\n\nUpdate details and installation instructions.\n",
     },
     assets: input.replacementAssets,
     releaseId: String(releaseId),
@@ -291,6 +282,18 @@ test("staged Draft must exactly match all local verified assets", (context) => {
     targetVersion,
     artifactDirectory: input.directory,
   }), { status: "draft-staging-verified" });
+  assert.throws(() => verifyDraftAfterStaging({
+    ...input,
+    release: {
+      ...input.release,
+      body: "## Changes\n\nUpdate details and installation instructions.\n",
+    },
+    assets: input.replacementAssets,
+    releaseId: String(releaseId),
+    sourceFullSha: replacementSourceFullSha,
+    targetVersion,
+    artifactDirectory: input.directory,
+  }), /Draft target source changed/);
   assert.throws(() => verifyDraftAfterStaging({
     ...input,
     release: {
@@ -314,7 +317,7 @@ test("staged Draft rejects every published-envelope drift", (context) => {
   const exactRelease = {
     ...input.release,
     target_commitish: replacementSourceFullSha,
-    body: `Source commit ${replacementSourceFullSha}.`,
+    body: "## Changes\n\nRelease notes may be edited before or after publication.\n",
   };
   const cases = [
     [{ ...exactRelease, id: releaseId + 1 }, /Draft release id changed/],
@@ -341,7 +344,7 @@ test("published release must be latest, exact, and byte-identical before bridgin
   const published = {
     ...input.release,
     target_commitish: replacementSourceFullSha,
-    body: `Source commit ${replacementSourceFullSha}.`,
+    body: "## Changes\n\nRelease notes may be edited before or after publication.\n",
     draft: false,
     published_at: "2026-08-31T00:00:00Z",
   };
@@ -361,6 +364,10 @@ test("published release must be latest, exact, and byte-identical before bridgin
     artifactDirectory: input.directory,
   };
   assert.deepEqual(verifyPublishedRelease(options), { status: "published-release-verified" });
+  assert.throws(() => verifyPublishedRelease({
+    ...options,
+    release: { ...published, target_commitish: sourceFullSha },
+  }), /published target source changed/);
   assert.throws(() => verifyPublishedRelease({
     ...options,
     latestRelease: { ...published, id: releaseId + 1 },

@@ -176,7 +176,6 @@ function verifyReleaseIdentity(options) {
   assert.equal(options.release.target_commitish, options.sourceFullSha,
     "Draft target source changed");
   assert.equal(options.release.name, `Logseq ${options.targetVersion}`, "Draft name changed");
-  assert.equal(options.release.body, `Source commit ${options.sourceFullSha}.`, "Draft body changed");
 }
 
 export function draftInventorySha256(assets) {
@@ -271,8 +270,6 @@ export function verifyPublishedRelease(options) {
   assert.equal(options.release.target_commitish, options.sourceFullSha,
     "published target source changed");
   assert.equal(options.release.name, `Logseq ${options.targetVersion}`, "published name changed");
-  assert.equal(options.release.body, `Source commit ${options.sourceFullSha}.`,
-    "published body changed");
   assert.equal(options.release.draft, false, "version Release is still a Draft");
   assert.equal(options.release.prerelease, false, "version Release is a prerelease");
   assert.match(options.release.published_at ?? "", /^\d{4}-\d{2}-\d{2}T/,
