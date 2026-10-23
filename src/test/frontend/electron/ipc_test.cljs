@@ -44,3 +44,48 @@
                        (set! util/electron? original-electron?)
                        (set! (.-apis js/window) original-apis)
                        (done)))))))
+
+(deftest invoke-sends-an-empty-array-without-arguments
+  (async done
+    (let [received (atom nil)
+          original-electron? util/electron?
+          original-apis (.-apis js/window)]
+      (set! util/electron? (constantly true))
+      (set! (.-apis js/window)
+            #js {:invoke (fn [channel args]
+                           (reset! received {:channel channel :args args})
+                           (js/Promise.resolve "downloaded"))})
+      (-> (p/let [result (ipc/invoke "get-downloaded-update")]
+            (is (= "downloaded" result))
+            (is (= "get-downloaded-update" (:channel @received)))
+            (is (array? (:args @received)))
+            (is (= [] (js->clj (:args @received)))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn []
+                       (set! util/electron? original-electron?)
+                       (set! (.-apis js/window) original-apis)
+                       (done)))))))
+
+(deftest invoke-preserves-argument-order-and-conversion
+  (async done
+    (let [received (atom nil)
+          original-electron? util/electron?
+          original-apis (.-apis js/window)]
+      (set! util/electron? (constantly true))
+      (set! (.-apis js/window)
+            #js {:invoke (fn [channel args]
+                           (reset! received {:channel channel :args args})
+                           (js/Promise.resolve true))})
+      (-> (p/let [result (ipc/invoke "synthetic-argument-check" "first" {:enabled true} #js {:count 2})]
+            (is (true? result))
+            (is (= "synthetic-argument-check" (:channel @received)))
+            (is (array? (:args @received)))
+            (is (= ["first" {"enabled" true} {"count" 2}]
+                   (js->clj (:args @received)))))
+          (p/catch (fn [e]
+                     (is false (str "unexpected error: " e))))
+          (p/finally (fn []
+                       (set! util/electron? original-electron?)
+                       (set! (.-apis js/window) original-apis)
+                       (done)))))))

@@ -38,5 +38,5 @@
 (defn invoke
   [channel & args]
   (when (util/electron?)
-    (p/let [result (js/window.apis.invoke channel (bean/->js args))]
+    (p/let [result (js/window.apis.invoke channel (bean/->js (vec args)))]
       result)))
