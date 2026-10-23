@@ -368,7 +368,7 @@ test("the same desktop action binds the published final to a separate .7 bridge"
   assert.match(bridgeJob, /group: selfhost-release-selfhost-official-architecture-v1/);
   assert.match(
     bridgeJob,
-    /Download and verify the published final latest release[\s\S]*--phase published[\s\S]*Verify both sources and the exact embedded final bytes[\s\S]*Stage the one-time \.6 bridge pointers[\s\S]*Promote exactly five updater assets and four pointers/,
+    /Download and verify the published final latest release[\s\S]*--phase published[\s\S]*Verify both sources and the Mac targets or embedded final bytes[\s\S]*Stage the one-time \.6 bridge pointers[\s\S]*Promote exactly five updater assets and four pointers/,
   );
   assert.match(bridgeJob, /repos\/\$\{GITHUB_REPOSITORY\}\/releases\/latest/);
   assert.match(bridgeJob, /gh release download "\$\{SELFHOST6_TARGET_VERSION\}"/);

@@ -1331,7 +1331,7 @@ jobs:
             finalReleasePolicy: readReleasePolicy('resources/updater/selfhost-release-policy.json'),
             signingPolicy, reader: await getBridgeArchiveReader(),
           });
-          console.log(JSON.stringify({ status: 'offline-bridge-set-verified' }));
+          console.log(JSON.stringify({ status: 'bridge-set-verified', mac: 'network', windowsLinux: 'offline' }));
           NODE
 
       - name: Archive the signed and paired bridge set
@@ -2017,7 +2017,7 @@ jobs:
           cp resources/package.json resources/pnpm-lock.yaml resources/pnpm-workspace.yaml static/
           pnpm --dir static install --frozen-lockfile --ignore-workspace --ignore-scripts
 
-      - name: Verify both sources and the exact embedded final bytes
+      - name: Verify both sources and the Mac targets or embedded final bytes
         run: node scripts/selfhost6/verify-offline-bridge.mjs payloads
 
       - name: Stage the one-time .6 bridge pointers

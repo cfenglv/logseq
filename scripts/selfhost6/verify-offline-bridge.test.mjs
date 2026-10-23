@@ -35,7 +35,7 @@ const privateKeyPem = privateKey.export({ format: "pem", type: "pkcs8" });
 const bridgeSourceFullSha = "a".repeat(40), finalSourceFullSha = "b".repeat(40);
 const digest = content => `sha256:${createHash("sha256").update(content).digest("hex")}`;
 
-function fixture(context, { corrupt = false, duplicate = false } = {}) {
+function fixture(context, { corrupt = false, duplicate = false, embedMac = false, wrongURL = false, missingOffline = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "offline-bridge-input-"));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const reader = path.join(root, process.platform === "win32" ? "7za.exe" : "7za");
@@ -72,14 +72,20 @@ function fixture(context, { corrupt = false, duplicate = false } = {}) {
     }
     sign(finalPath, finalReleasePolicy, finalSourceFullSha);
     const payload = Buffer.from(finalBytes);
-    if (corrupt && index === 0) payload[0] ^= 1;
-    fs.writeFileSync(path.join(source, "payload", finalName), payload);
-    if (duplicate && index === 0) {
+    if (corrupt && platform === "linux" && arch === "arm64") payload[0] ^= 1;
+    if ((platform !== "darwin" && !missingOffline) || embedMac)
+      fs.writeFileSync(path.join(source, "payload", finalName), payload);
+    if (duplicate && platform === "linux" && arch === "arm64") {
       fs.mkdirSync(path.join(source, "duplicate"));
       fs.writeFileSync(path.join(source, "duplicate", finalName), payload);
     }
     fs.copyFileSync(`${finalPath}.selfhost6.json`,
       path.join(source, "payload", `${finalName}.selfhost6.json`));
+    if (platform === "darwin") {
+      const { owner, repo } = finalReleasePolicy.provider;
+      const url = `https://github.com/${owner}/${repo}/releases/download/${finalReleasePolicy.sourceVersion}/${finalName}\n`;
+      fs.writeFileSync(path.join(source, "payload/download-url"), wrongURL ? url.replace(arch, "other") : url);
+    }
     fs.writeFileSync(manifestPath, `${JSON.stringify(buildTargetManifest({
       policy: bridgeReleasePolicy, sourceFullSha: bridgeSourceFullSha,
       targetVersion: bridgeReleasePolicy.sourceVersion, platform, arch,
@@ -151,6 +157,14 @@ test("ambiguous embedded final names are rejected before pointer writes", async 
     stagePointers(input);
   }, /bridge must contain exactly one Logseq-/);
   assert.equal(fs.existsSync(path.join(input.root, "pointers")), false);
+});
+
+test("both Mac bridges must be light and pin the exact public target; other platforms remain offline", async context => {
+  for (const options of [{ embedMac: true }, { wrongURL: true }, { missingOffline: true }]) {
+    const input = fixture(context, options);
+    await assert.rejects(verifyOfflineBridgeSet(input), /Mac bridge must not embed|fixed Mac download URL differs|exactly one Logseq-/);
+    assert.equal(fs.existsSync(path.join(input.root, "pointers")), false);
+  }
 });
 
 test("bridge build transport binds explicit run, artifact, both sources and digest", async context => {

@@ -188,11 +188,16 @@ test('the bridge finishing job signs real CLI outputs and verifies the exact fiv
       payload + '.selfhost6.json'
     )
     fs.mkdirSync(path.join(contents, 'payload'))
-    for (const suffix of ['', '.selfhost6.json'])
+    for (const suffix of platform === 'darwin' ? ['.selfhost6.json'] : ['', '.selfhost6.json'])
       fs.copyFileSync(
         payload + suffix,
         path.join(contents, 'payload', finalName + suffix)
       )
+    if (platform === 'darwin') {
+      const { owner, repo } = policy.provider
+      write(path.join(contents, 'payload/download-url'),
+        `https://github.com/${owner}/${repo}/releases/download/${policy.sourceVersion}/${finalName}\n`)
+    }
     json(
       manifest,
       identity.buildTargetManifest({
@@ -245,7 +250,7 @@ test('the bridge finishing job signs real CLI outputs and verifies the exact fiv
   const verified = run('Verify exact bridge and final payload pairs')
   assert.equal(verified.status, 0, verified.stderr)
   assert.deepEqual(JSON.parse(verified.stdout), {
-    status: 'offline-bridge-set-verified',
+    status: 'bridge-set-verified', mac: 'network', windowsLinux: 'offline',
   })
   const upload = step('Archive the signed and paired bridge set')
   assert.equal(upload.uses, 'actions/upload-artifact@v4')

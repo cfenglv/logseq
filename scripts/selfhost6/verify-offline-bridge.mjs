@@ -150,6 +150,15 @@ export async function verifyOfflineBridgePair({
   const descriptorBytes = readMember(reader, bridgeArchivePath,
     uniqueMember(names, `${path.basename(finalArchivePath)}.selfhost6.json`), typeArgs);
   assert.ok(descriptorBytes.equals(finalDescriptorBytes), "embedded final descriptor differs");
+  if (bridgeDescriptor.platform === "darwin") {
+    assert.equal(names.some(name => name.endsWith(".zip")), false, "Mac bridge must not embed a final ZIP");
+    const { owner, repo } = finalReleasePolicy.provider;
+    const url = `https://github.com/${owner}/${repo}/releases/download/${finalReleasePolicy.sourceVersion}/${path.basename(finalArchivePath)}\n`;
+    assert.equal(readMember(reader, bridgeArchivePath,
+      uniqueMember(names, "download-url"), typeArgs).toString("utf8"), url,
+    "fixed Mac download URL differs from its exact final");
+    return;
+  }
   const payload = await hashMember(reader, bridgeArchivePath,
     uniqueMember(names, path.basename(finalArchivePath)), typeArgs);
   assert.equal(payload.size, finalMetadata["archive-size"], "embedded final size differs");
@@ -211,7 +220,9 @@ async function main() {
       signingPolicy,
     });
   }
-  process.stdout.write(`${JSON.stringify({ status: `offline-bridge-${phase}-verified` })}\n`);
+  process.stdout.write(`${JSON.stringify(phase === "payloads"
+    ? { status: "bridge-payloads-verified", mac: "network", windowsLinux: "offline" }
+    : { status: `offline-bridge-${phase}-verified` })}\n`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href)

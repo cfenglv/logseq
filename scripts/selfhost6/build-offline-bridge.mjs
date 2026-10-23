@@ -142,7 +142,8 @@ export async function buildOfflineBridge({
     fs.copyFileSync(archive, path.join(outputDirectory, names.bridge), fs.constants.COPYFILE_EXCL);
     fs.writeFileSync(path.join(outputDirectory, "TARGET_BUILD_MANIFEST.json"), bridgeManifest,
       { flag: "wx" });
-    return { status: "offline-bridge-prepared-awaiting-project-signature",
+    return { status: process.platform === "darwin"
+      ? "light-bridge-prepared-awaiting-project-signature" : "offline-bridge-prepared-awaiting-project-signature",
       platform: process.platform, arch: process.arch };
   } catch (error) {
     if (createdOutput) fs.rmSync(outputDirectory, { recursive: true, force: true });
