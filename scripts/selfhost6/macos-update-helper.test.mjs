@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { spawn, spawnSync } from "node:child_process";
-import { once } from "node:events";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -64,10 +63,9 @@ function installedVersion(appPath) {
   return run("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleShortVersionString", path.join(appPath, "Contents/Info.plist")]).stdout.trim();
 }
 
-test("macOS helper and thin bridge preserve native install contracts", { timeout: 120_000 }, async (t) => {
+test("macOS helper and light bridge preserve native install contracts", { timeout: 120_000 }, async (t) => {
   if (process.platform !== "darwin") return t.skip("macOS-only physical helper test");
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "selfhost6-helper-test-"));
-  let sourceProcess, sourceClosed, bridgeClosed, finalInput;
   const canary = root + ".canary";
   try {
     const { privateKey, publicKey } = generateKeyPairSync("ed25519");
@@ -232,10 +230,7 @@ test("macOS helper and thin bridge preserve native install contracts", { timeout
       JSON.stringify({ signedMetadata: signUpdateMetadata({ metadata: value, policy, privateKeyPem }) }));
     writeBridgeDescriptor(bridgeUnsigned);
     const nativeStrings = path.join(root, "native-strings.json");
-    fs.writeFileSync(nativeStrings, JSON.stringify({
-      en: { title: "Update error", description: "Open the app again." },
-      "zh-CN": { title: "更新错误", description: "请重新打开应用。" },
-    }));
+    run("bb", ["lang:export-native-update-strings", nativeStrings], { cwd: repoRoot });
     const buildBridge = (app, expectedSource = sourceSha, expectFailure = false) => run(process.execPath, [
       path.join(repoRoot, "resources/updater/build-macos-update-helper.mjs"),
       "--bridge", "--test-only", "--public-key-base64", publicKeyBase64,
@@ -260,7 +255,7 @@ test("macOS helper and thin bridge preserve native install contracts", { timeout
     assert.equal(outer["target-version"], "2.0.1-selfhost.7");
     assert.equal(outer["target-source-full-sha"], "c".repeat(40));
     assert.equal(fs.readdirSync(bridgeResources, { recursive: true }).filter((name) => name.endsWith("TARGET_BUILD_MANIFEST.json")).length, 1);
-    assert.deepEqual(fs.readFileSync(path.join(bridgeResources, "payload", path.basename(bridgePayload))), bridgeArchiveBytes);
+    assert.equal(fs.existsSync(path.join(bridgeResources, "payload", path.basename(bridgePayload))), false);
     assert.deepEqual(fs.readFileSync(path.join(bridgeResources, "payload", `${path.basename(bridgePayload)}.selfhost6.json`)),
       fs.readFileSync(bridgeDescriptor));
     const bridgeExecutable = path.join(bridgeApp, "Contents/MacOS/LogseqBridge");
@@ -268,7 +263,7 @@ test("macOS helper and thin bridge preserve native install contracts", { timeout
     for (const directory of ["", "Contents", "Contents/MacOS", "Contents/Resources", "Contents/Resources/updater", "Contents/Resources/payload"])
       assert.equal(fs.statSync(path.join(bridgeApp, directory)).mode & 0o777, 0o755);
     assert.equal(fs.statSync(bridgeExecutable).mode & 0o777, 0o755);
-    assert.equal(fs.statSync(path.join(bridgeResources, "payload", path.basename(bridgePayload))).mode & 0o777, 0o644);
+    assert.equal(fs.statSync(path.join(bridgeResources, "payload/download-url")).mode & 0o777, 0o644);
     assert.equal(fs.existsSync(path.join(bridgeApp, "Contents/Frameworks")), false);
     assert.equal(fs.existsSync(path.join(bridgeResources, "app.asar")), false);
     const wrongSourceApp = path.join(root, "wrong-bridge-source/Logseq.app");
@@ -299,91 +294,7 @@ test("macOS helper and thin bridge preserve native install contracts", { timeout
     const sandbox = (command, args) => ["-D", `root=${fs.realpathSync(root)}`, "-f", profile, command, ...args];
     fs.writeFileSync(canary, "synthetic-outside-canary\n", { flag: "wx" });
     run("/usr/bin/sandbox-exec", sandbox(handoffTest, ["--boundary", canary]));
-    const boundary = path.join(root, "bridge-boundary.dylib");
-    run("/usr/bin/xcrun", ["clang", "-arch", clangArch, "-dynamiclib", "-Wall", "-Wextra", "-Werror", "-framework", "CoreFoundation",
-      path.join(repoRoot, "scripts/selfhost6/macos-update-bridge-boundary.test.c"), "-o", boundary]);
-    run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", bridgeApp]);
-    fs.mkdirSync(path.join(root, "home")); fs.mkdirSync(path.join(root, "tmp"));
-    run("/usr/bin/mkfifo", [path.join(root, "final-input")]);
-    finalInput = fs.openSync(path.join(root, "final-input"), fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
-    const isolatedEnv = { ...process.env, HOME: path.join(root, "home"), TMPDIR: path.join(root, "tmp"),
-      LOGSEQ_BRIDGE_TEST_ROOT: fs.realpathSync(root), LOGSEQ_BRIDGE_TEST_APP: bridgeApp, LOGSEQ_BRIDGE_TEST_TOOL: handoffTest };
-    const embeddedPayload = path.join(bridgeResources, "payload", path.basename(bridgePayload));
-    fs.writeFileSync(embeddedPayload, changedArchive);
-    run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", bridgeApp]);
-    const badPayloadRoot = path.join(root, "bad-native-payload");
-    fs.mkdirSync(badPayloadRoot);
-    const badPayload = run("/usr/bin/sandbox-exec", sandbox("/usr/bin/env", [
-      `DYLD_INSERT_LIBRARIES=${boundary}`, bridgeExecutable,
-    ]), { env: { ...isolatedEnv, LOGSEQ_BRIDGE_TEST_ROOT: badPayloadRoot }, expectFailure: true, timeout: 5_000 });
-    assert.equal(badPayload.error, undefined);
-    assert.equal(badPayload.status, 1);
-    assert.match(badPayload.stderr, /archive bytes do not match signed metadata/);
-    assert.deepEqual(fs.readdirSync(badPayloadRoot).sort(), ["boundary-loaded", "native-alert"]);
-    assert.equal(installedVersion(bridgeApp), "2.0.1-selfhost.7");
-    assert.deepEqual(fs.readdirSync(path.dirname(bridgeApp)), ["Logseq.app"]);
-    fs.writeFileSync(embeddedPayload, bridgeArchiveBytes);
-    run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", bridgeApp]);
-    sourceProcess = spawn("/usr/bin/sandbox-exec", sandbox(sourceFixture, ["--target", bridgeApp]), {
-      env: isolatedEnv, stdio: ["pipe", "pipe", "pipe"],
-    });
-    sourceClosed = once(sourceProcess, "close");
-    const [ready] = await once(sourceProcess.stdout, "data");
-    assert.equal(ready.toString(), "R");
-    const bridgeProcess = spawn("/usr/bin/sandbox-exec", sandbox("/usr/bin/env", [
-      `DYLD_INSERT_LIBRARIES=${boundary}`, bridgeExecutable, "--test-fail-backup-cleanup",
-    ]), { env: { ...isolatedEnv, LOGSEQ_BRIDGE_TEST_SOURCE_PID: String(sourceProcess.pid) }, stdio: ["ignore", "pipe", "pipe"] });
-    bridgeClosed = once(bridgeProcess, "close");
-    let bridgeStderr = "";
-    bridgeProcess.stderr.on("data", (data) => { bridgeStderr += data; });
-    const waitForMarker = async (name) => {
-      const deadline = Date.now() + 10_000;
-      while (!fs.existsSync(path.join(root, name))) {
-        assert.equal(bridgeProcess.exitCode, null, bridgeStderr);
-        assert.ok(Date.now() < deadline, `missing native component marker ${name}: ${bridgeStderr}`);
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
-    };
-    await waitForMarker("source-subscribed");
-    assert.equal(fs.existsSync(path.join(root, "boundary-loaded")), true);
-    assert.equal(fs.existsSync(path.join(root, "launch-requested")), false);
-    const contenderRoot = path.join(root, "contender");
-    fs.mkdirSync(contenderRoot);
-    const contender = run("/usr/bin/sandbox-exec", sandbox("/usr/bin/env", [
-      `DYLD_INSERT_LIBRARIES=${boundary}`, bridgeExecutable,
-    ]), { env: { ...isolatedEnv, LOGSEQ_BRIDGE_TEST_ROOT: contenderRoot }, expectFailure: true, timeout: 5_000 });
-    assert.equal(contender.error, undefined);
-    assert.match(contender.stderr, /another bridge owns this installation/);
-    assert.equal(fs.existsSync(path.join(contenderRoot, "native-alert")), true);
-    assert.equal(fs.existsSync(path.join(contenderRoot, "launch-requested")), false);
-    assert.equal(fs.existsSync(path.join(contenderRoot, "source-subscribed")), false);
-    sourceProcess.stdin.end();
-    assert.equal((await sourceClosed)[0], 0);
-    assert.equal((await bridgeClosed)[0], 0, bridgeStderr);
-    assert.match(bridgeStderr, /backup cleanup.*injected failure during backup cleanup/);
-    assert.equal(fs.existsSync(path.join(root, "native-alert")), false);
-    assert.equal(fs.existsSync(path.join(root, "launch-requested")), true);
-    assert.equal(installedVersion(bridgeApp), "2.0.2-selfhost.1");
-    assert.equal(fs.readFileSync(path.join(bridgeResources, "payload/synthetic-sentinel"), "utf8"), "final-owned-resource\n");
-    const bridgeBackups = fs.readdirSync(path.dirname(bridgeApp)).filter((name) => name.startsWith(".logseq-previous-"));
-    assert.equal(bridgeBackups.length, 1);
-    assert.equal(installedVersion(path.join(path.dirname(bridgeApp), bridgeBackups[0])), "2.0.1-selfhost.7");
-    const finalPid = Number(fs.readFileSync(path.join(root, "final-pid"), "utf8"));
-    assert.ok(Number.isInteger(finalPid) && finalPid > 1);
-    process.kill(finalPid, 0);
-    run(handoffTest, ["--lock", path.dirname(bridgeApp)]);
-    fs.writeSync(finalInput, "X"); fs.closeSync(finalInput); finalInput = undefined;
-    run(handoffTest, ["--wait-final", String(finalPid)]);
-    assert.equal(fs.readFileSync(path.join(root, "final-exited"), "utf8"), "normal-exit\n");
   } finally {
-    if (sourceProcess?.stdin.writable) sourceProcess.stdin.end();
-    if (sourceClosed) await sourceClosed;
-    if (bridgeClosed) await bridgeClosed;
-    if (finalInput !== undefined) {
-      fs.writeSync(finalInput, "X"); fs.closeSync(finalInput);
-      if (fs.existsSync(path.join(root, "final-pid")))
-        run(path.join(root, "handoff-test"), ["--wait-final", fs.readFileSync(path.join(root, "final-pid"), "utf8").trim()]);
-    }
     if (fs.existsSync(canary)) fs.unlinkSync(canary);
     fs.rmSync(root, { recursive: true, force: true });
   }

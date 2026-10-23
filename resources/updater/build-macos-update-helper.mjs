@@ -138,13 +138,20 @@ if (isBridge) {
   replacements.set("__LOGSEQ_BRIDGE_PAYLOAD_SIZE__", String(metadata["archive-size"]));
   const nativeText = JSON.parse(fs.readFileSync(required("--native-strings")));
   for (const [locale, suffix] of [["en", "EN"], ["zh-CN", "ZH"]]) {
-    for (const [field, marker] of [["title", "TITLE"], ["description", "DESC"]]) {
+    for (const [field, marker] of [
+      ["title", "ERROR_TITLE"], ["retry-description", "ERROR_DESC"],
+      ["version", "VERSION"], ["preparing", "PREPARING"], ["downloading", "DOWNLOADING"],
+      ["progress", "PROGRESS"], ["verifying", "VERIFYING"], ["installing", "INSTALLING"],
+      ["retry", "RETRY"], ["close", "CLOSE"],
+    ]) {
       const text = nativeText[locale]?.[field];
       assert.ok(typeof text === "string" && text.length > 0, `missing native update ${locale}/${field}`);
-      replacements.set(`__LOGSEQ_BRIDGE_ERROR_${marker}_${suffix}__`, JSON.stringify(text).slice(1, -1));
+      replacements.set(`__LOGSEQ_BRIDGE_${marker}_${suffix}__`, JSON.stringify(text).slice(1, -1));
     }
   }
-  bridgeInputs = { payload, descriptor, name, manifest: bridgeBytes, version: bridgePolicy.sourceVersion };
+  const { owner, repo } = bridgePolicy.provider;
+  const downloadURL = `https://github.com/${owner}/${repo}/releases/download/${metadata["target-version"]}/${name}`;
+  bridgeInputs = { descriptor, name, downloadURL, manifest: bridgeBytes, version: bridgePolicy.sourceVersion };
 }
 for (const [marker, value] of replacements) {
   assert.equal(source.split(marker).length, 2, `Swift helper must contain exactly one ${marker}`);
@@ -172,7 +179,7 @@ try {
     const object = path.join(temporaryRoot, "BridgeHandoff.o");
     const native = spawnSync("xcrun", ["clang", "-target", target, "-O2", "-Wall", "-Wextra", "-Werror", "-c", `${handoff}.c`, "-o", object], { encoding: "utf8" });
     assert.equal(native.status, 0, native.stderr || native.error?.message);
-    bridgeCompileArguments.push("-DSELFHOST6_OFFLINE_BRIDGE", "-import-objc-header", `${handoff}.h`, object);
+    bridgeCompileArguments.push("-DSELFHOST6_OFFLINE_BRIDGE", "-framework", "AppKit", "-import-objc-header", `${handoff}.h`, object);
   }
   const compile = spawnSync("xcrun", [
     "swiftc",
@@ -213,13 +220,13 @@ try {
     });
     assert.equal(plist.status, 0, plist.stderr || plist.stdout);
     fs.writeFileSync(path.join(resources, "updater/TARGET_BUILD_MANIFEST.json"), bridgeInputs.manifest);
-    fs.copyFileSync(bridgeInputs.payload, path.join(resources, "payload", bridgeInputs.name));
     fs.copyFileSync(bridgeInputs.descriptor, path.join(resources, "payload", `${bridgeInputs.name}.selfhost6.json`));
+    fs.writeFileSync(path.join(resources, "payload/download-url"), bridgeInputs.downloadURL + "\n");
     fs.copyFileSync(path.join(resourceRoot, "icons/logseq.icns"), path.join(resources, "icon.icns"));
     for (const directory of ["", "Contents", "Contents/MacOS", "Contents/Resources", "Contents/Resources/updater", "Contents/Resources/payload"])
       fs.chmodSync(path.join(output, directory), 0o755);
     for (const file of ["Contents/Info.plist", "Contents/Resources/icon.icns", "Contents/Resources/updater/TARGET_BUILD_MANIFEST.json",
-      `Contents/Resources/payload/${bridgeInputs.name}`, `Contents/Resources/payload/${bridgeInputs.name}.selfhost6.json`])
+      "Contents/Resources/payload/download-url", `Contents/Resources/payload/${bridgeInputs.name}.selfhost6.json`])
       fs.chmodSync(path.join(output, file), 0o644);
   }
   process.stdout.write(`${JSON.stringify(isBridge ? { status: "bridge-app-prepared-unsigned", arch } : { status: "ok", arch, keyId, output })}\n`);

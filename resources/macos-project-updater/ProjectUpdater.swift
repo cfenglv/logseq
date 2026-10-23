@@ -2,7 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 #if SELFHOST6_OFFLINE_BRIDGE
-import CoreFoundation
+import AppKit
 
 private let bridgePayloadName = "__LOGSEQ_BRIDGE_PAYLOAD_NAME__"
 private let bridgeFinalVersion = "__LOGSEQ_BRIDGE_FINAL_VERSION__"
@@ -14,6 +14,12 @@ private let bridgeErrorTitleEN = "__LOGSEQ_BRIDGE_ERROR_TITLE_EN__"
 private let bridgeErrorDescEN = "__LOGSEQ_BRIDGE_ERROR_DESC_EN__"
 private let bridgeErrorTitleZH = "__LOGSEQ_BRIDGE_ERROR_TITLE_ZH__"
 private let bridgeErrorDescZH = "__LOGSEQ_BRIDGE_ERROR_DESC_ZH__"
+private let bridgeTextEN = ["__LOGSEQ_BRIDGE_VERSION_EN__", "__LOGSEQ_BRIDGE_PREPARING_EN__",
+    "__LOGSEQ_BRIDGE_DOWNLOADING_EN__", "__LOGSEQ_BRIDGE_PROGRESS_EN__", "__LOGSEQ_BRIDGE_VERIFYING_EN__",
+    "__LOGSEQ_BRIDGE_INSTALLING_EN__", "__LOGSEQ_BRIDGE_RETRY_EN__", "__LOGSEQ_BRIDGE_CLOSE_EN__"]
+private let bridgeTextZH = ["__LOGSEQ_BRIDGE_VERSION_ZH__", "__LOGSEQ_BRIDGE_PREPARING_ZH__",
+    "__LOGSEQ_BRIDGE_DOWNLOADING_ZH__", "__LOGSEQ_BRIDGE_PROGRESS_ZH__", "__LOGSEQ_BRIDGE_VERIFYING_ZH__",
+    "__LOGSEQ_BRIDGE_INSTALLING_ZH__", "__LOGSEQ_BRIDGE_RETRY_ZH__", "__LOGSEQ_BRIDGE_CLOSE_ZH__"]
 #endif
 
 private let algorithm = "ed25519-selfhost-release-v1"
@@ -47,10 +53,10 @@ private struct Arguments {
 #endif
 
 #if SELFHOST6_OFFLINE_BRIDGE
-    init() {
+    init(archive: URL) {
         target = Bundle.main.bundleURL.standardizedFileURL
         let payload = target.appendingPathComponent("Contents/Resources/payload")
-        archive = payload.appendingPathComponent(bridgePayloadName)
+        self.archive = archive
         metadata = payload.appendingPathComponent(bridgePayloadName + ".selfhost6.json")
         relaunch = true
         verifyOnly = false
@@ -358,7 +364,7 @@ private func launch(_ app: URL) throws {
     _ = try run("/usr/bin/open", ["-n", app.path])
 }
 
-private func install(_ arguments: Arguments) throws {
+private func install(_ arguments: Arguments, beforeSwap: () throws -> Void = {}) throws {
     let manager = FileManager.default
     let metadataData = try Data(contentsOf: arguments.metadata)
 #if SELFHOST6_OFFLINE_BRIDGE
@@ -391,6 +397,7 @@ private func install(_ arguments: Arguments) throws {
     let candidate = staging.appendingPathComponent("Logseq.app")
     guard manager.fileExists(atPath: candidate.path) else { try fail("archive does not contain Logseq.app") }
     try validateExtractedApp(candidate, metadata: metadata)
+    try beforeSwap()
     var previousMoved = false
     var candidateMoved = false
     do {
@@ -422,35 +429,307 @@ private func install(_ arguments: Arguments) throws {
 }
 
 #if SELFHOST6_OFFLINE_BRIDGE
-private func bridgeMain() throws {
-    let arguments = Arguments()
+private func prepareBridge(_ arguments: Arguments) throws -> Int32 {
     guard arguments.target.pathExtension == "app" else { try fail("bridge must run from its App bundle") }
     let parent = arguments.target.deletingLastPathComponent()
     let directory = open(parent.path, O_RDONLY | O_CLOEXEC)
     guard directory >= 0 else { try fail("cannot open bridge installation directory") }
-    defer { close(directory) }
-    guard flock(directory, LOCK_EX | LOCK_NB) == 0 else { try fail("another bridge owns this installation") }
-    let sourceResult = arguments.target.path.withCString { logseq_bridge_wait_for_source_helper($0) }
-    guard sourceResult == 0 else { try fail("cannot finish source helper handoff: \(String(cString: strerror(sourceResult)))") }
-    let manifest = arguments.target.appendingPathComponent("Contents/Resources/updater/TARGET_BUILD_MANIFEST.json")
-    guard hex(SHA256.hash(data: try Data(contentsOf: manifest))) == bridgeManifestSha256 else {
-        try fail("installed App is no longer this bridge")
+    do {
+        guard flock(directory, LOCK_EX | LOCK_NB) == 0 else { try fail("another bridge owns this installation") }
+        let sourceResult = arguments.target.path.withCString { logseq_bridge_wait_for_source_helper($0) }
+        guard sourceResult == 0 else { try fail("cannot finish source helper handoff") }
+        let manifest = arguments.target.appendingPathComponent("Contents/Resources/updater/TARGET_BUILD_MANIFEST.json")
+        guard hex(SHA256.hash(data: try Data(contentsOf: manifest))) == bridgeManifestSha256 else {
+            try fail("installed App is no longer this bridge")
+        }
+        return directory
+    } catch {
+        close(directory)
+        throw error
     }
-    try install(arguments)
 }
 
-do {
-    try bridgeMain()
-    exit(EXIT_SUCCESS)
-} catch {
-    FileHandle.standardError.write(Data("selfhost6 bridge: \(error)\n".utf8))
-    let chinese = Locale.preferredLanguages.first?.hasPrefix("zh") == true
-    var response: CFOptionFlags = 0
-    CFUserNotificationDisplayAlert(0, CFOptionFlags(kCFUserNotificationStopAlertLevel), nil, nil, nil,
-        (chinese ? bridgeErrorTitleZH : bridgeErrorTitleEN) as CFString,
-        (chinese ? bridgeErrorDescZH : bridgeErrorDescEN) as CFString, nil, nil, nil, &response)
-    exit(EXIT_FAILURE)
+private struct BridgeCancelled: Error {}
+
+// Only a running attempt lives in memory. Reopening reads the fixed descriptor and
+// complete cache again; no task journal, background downloader or retry queue.
+private final class BridgeWindow: NSObject, NSApplicationDelegate, NSWindowDelegate, URLSessionDownloadDelegate {
+    private let chinese = Locale.preferredLanguages.first?.hasPrefix("zh") == true
+    private var text: [String] { chinese ? bridgeTextZH : bridgeTextEN }
+    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 216),
+        styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    private let version = NSTextField(labelWithString: "")
+    private let stage = NSTextField(wrappingLabelWithString: "")
+    private let detail = NSTextField(labelWithString: "")
+    private let progress = NSProgressIndicator()
+    private let retry = NSButton()
+    private let closeButton = NSButton()
+    private var session: URLSession?
+    private var task: URLSessionDownloadTask?
+    private var arguments: Arguments?
+    private var lockDirectory: Int32 = -1
+    private var busy = false
+    private var closing = false
+    private var swapping = false
+#if SELFHOST6_UPDATER_TESTING
+    private var testSignals: [DispatchSourceSignal] = []
+    private func testValue(_ name: String) -> String? {
+        guard let index = CommandLine.arguments.firstIndex(of: name), index + 1 < CommandLine.arguments.count else { return nil }
+        return CommandLine.arguments[index + 1]
+    }
+    private func record(_ event: String) {
+        guard let path = testValue("--test-events"), let handle = FileHandle(forWritingAtPath: path) else { return }
+        defer { try? handle.close() }
+        handle.seekToEndOfFile()
+        handle.write(Data("\(event)\n".utf8))
+    }
+#endif
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        window.title = "Logseq"
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        version.stringValue = text[0].replacingOccurrences(of: "{1}", with: bridgeFinalVersion)
+        version.font = .systemFont(ofSize: 15, weight: .semibold)
+        stage.font = .systemFont(ofSize: 13)
+        detail.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        detail.textColor = .secondaryLabelColor
+        progress.style = .bar
+        retry.title = text[6]
+        retry.bezelStyle = .rounded
+        retry.target = self
+        retry.action = #selector(retryUpdate)
+        closeButton.title = text[7]
+        closeButton.bezelStyle = .rounded
+        closeButton.target = self
+        closeButton.action = #selector(closeUpdate)
+        let buttons = NSStackView(views: [closeButton, retry])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        let stack = NSStackView(views: [version, stage, progress, detail, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView!.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor, constant: -24),
+            stack.topAnchor.constraint(equalTo: window.contentView!.topAnchor, constant: 24),
+            progress.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            stage.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            buttons.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
+        ])
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+#if SELFHOST6_UPDATER_TESTING
+        // Native control actions are test-only; production has no control socket or URL override.
+        for (signalNumber, action) in [(SIGUSR1, #selector(retryUpdate)), (SIGUSR2, #selector(closeUpdate))] {
+            signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
+            source.setEventHandler { [weak self] in self?.perform(action) }
+            source.resume()
+            testSignals.append(source)
+        }
+        record("pid=\(getpid())")
+        record("window-ready")
+#endif
+        begin()
+    }
+
+    @objc private func retryUpdate() { if !busy && !closing { begin() } }
+    @objc private func closeUpdate() { NSApp.terminate(nil) }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { closeUpdate(); return false }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        closing = true
+        retry.isEnabled = false
+        if swapping || busy && task == nil { return .terminateLater }
+        session?.invalidateAndCancel()
+        if lockDirectory >= 0 { close(lockDirectory); lockDirectory = -1 }
+        return .terminateNow
+    }
+
+    private func finishClose() {
+        if lockDirectory >= 0 { close(lockDirectory); lockDirectory = -1 }
+        NSApp.reply(toApplicationShouldTerminate: true)
+    }
+
+    private func showStage(_ value: String) {
+        stage.stringValue = value
+        detail.stringValue = ""
+        progress.isHidden = false
+        progress.isIndeterminate = true
+        progress.startAnimation(nil)
+    }
+
+    private func showFailure() {
+        busy = false
+        task = nil
+        session?.finishTasksAndInvalidate()
+        session = nil
+        swapping = false
+        if closing { finishClose(); return }
+        progress.stopAnimation(nil)
+        progress.isHidden = true
+        stage.stringValue = chinese ? bridgeErrorTitleZH : bridgeErrorTitleEN
+        detail.stringValue = chinese ? bridgeErrorDescZH : bridgeErrorDescEN
+        retry.isHidden = false
+        retry.isEnabled = true
+#if SELFHOST6_UPDATER_TESTING
+        record("failed")
+#endif
+    }
+
+    private func cacheRoot() throws -> URL {
+#if SELFHOST6_UPDATER_TESTING
+        if let root = testValue("--test-cache-root") { return URL(fileURLWithPath: root) }
+#endif
+        return try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask,
+            appropriateFor: nil, create: true).appendingPathComponent("Logseq/UpdateBridge")
+    }
+
+    private func begin() {
+        busy = true
+        retry.isHidden = true
+        showStage(text[1])
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                var cache = try self.cacheRoot()
+                cache.appendPathComponent(bridgePayloadSha256)
+                let arguments = Arguments(archive: cache.appendingPathComponent(bridgePayloadName))
+                if self.lockDirectory < 0 { self.lockDirectory = try prepareBridge(arguments) }
+                try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700])
+                DispatchQueue.main.async {
+                    self.arguments = arguments
+                    if self.closing { self.finishClose(); return }
+                    if FileManager.default.fileExists(atPath: arguments.archive.path) {
+                        self.installCached()
+                    } else { self.download() }
+                }
+            } catch {
+                FileHandle.standardError.write(Data("selfhost6 bridge: preparation rejected\n".utf8))
+                DispatchQueue.main.async { self.showFailure() }
+            }
+        }
+    }
+
+    private func download() {
+        do {
+            let location = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/payload/download-url")
+            var address = try String(contentsOf: location, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+#if SELFHOST6_UPDATER_TESTING
+            if let value = testValue("--test-download-url") { address = value }
+#else
+            guard URL(string: address)?.scheme == "https" else { try fail("bridge download must use HTTPS") }
+#endif
+            guard let url = URL(string: address) else { try fail("invalid fixed download URL") }
+            showStage(text[2])
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.urlCredentialStorage = nil
+            let session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
+            self.session = session
+            let task = session.downloadTask(with: url)
+            self.task = task
+            task.resume()
+#if SELFHOST6_UPDATER_TESTING
+            record("downloading")
+#endif
+        } catch { showFailure() }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        guard !closing else { return }
+        progress.isIndeterminate = false
+        progress.maxValue = Double(bridgePayloadSize)
+        progress.doubleValue = Double(totalBytesWritten)
+        detail.stringValue = text[3]
+            .replacingOccurrences(of: "{1}", with: ByteCountFormatter.string(fromByteCount: totalBytesWritten, countStyle: .file))
+            .replacingOccurrences(of: "{2}", with: ByteCountFormatter.string(fromByteCount: Int64(bridgePayloadSize), countStyle: .file))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard !closing else { return }
+        do {
+            guard let response = downloadTask.response as? HTTPURLResponse, response.statusCode == 200,
+                  let arguments = arguments else { try fail("download response rejected") }
+            let attributes = try FileManager.default.attributesOfItem(atPath: location.path)
+            guard (attributes[.size] as? NSNumber)?.uint64Value == bridgePayloadSize else { try fail("download size differs") }
+            try FileManager.default.moveItem(at: location, to: arguments.archive)
+            task = nil
+            session.finishTasksAndInvalidate()
+            self.session = nil
+#if SELFHOST6_UPDATER_TESTING
+            record("download-complete")
+            if CommandLine.arguments.contains("--test-pause-before-install") {
+                busy = false
+                showStage(text[4])
+                return
+            }
+#endif
+            installCached()
+        } catch { showFailure() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if error != nil, self.task != nil {
+            FileHandle.standardError.write(Data("selfhost6 bridge: download rejected\n".utf8))
+            showFailure()
+        }
+    }
+
+    private func installCached() {
+        guard !closing, let arguments = arguments else { return }
+        showStage(text[4])
+#if SELFHOST6_UPDATER_TESTING
+        record("verifying")
+#endif
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try install(arguments, beforeSwap: {
+                    try DispatchQueue.main.sync {
+                        guard !self.closing else { throw BridgeCancelled() }
+                        self.swapping = true
+                        self.showStage(self.text[5])
+                        self.closeButton.isEnabled = false
+#if SELFHOST6_UPDATER_TESTING
+                        self.record("installing")
+#endif
+                    }
+                })
+                try? FileManager.default.removeItem(at: arguments.archive.deletingLastPathComponent())
+                DispatchQueue.main.async {
+#if SELFHOST6_UPDATER_TESTING
+                    self.record("installed")
+#endif
+                    self.busy = false
+                    self.swapping = false
+                    if self.closing { self.finishClose() } else { NSApp.terminate(nil) }
+                }
+            } catch {
+                // A bad complete cache must not trap every later retry. Keep valid
+                // bytes for extraction/swap failures; only discard failed byte validation.
+                if let failure = error as? Failure, failure.description == "archive bytes do not match signed metadata" {
+                    try? FileManager.default.removeItem(at: arguments.archive)
+                }
+                FileHandle.standardError.write(Data("selfhost6 bridge: install rejected\n".utf8))
+                DispatchQueue.main.async {
+                    self.closeButton.isEnabled = true
+                    self.showFailure()
+                }
+            }
+        }
+    }
 }
+
+let bridgeApplication = NSApplication.shared
+private let bridgeWindow = BridgeWindow()
+bridgeApplication.delegate = bridgeWindow
+bridgeApplication.setActivationPolicy(.accessory)
+bridgeApplication.run()
 #else
 do {
     let arguments = try Arguments(Array(CommandLine.arguments.dropFirst()))
