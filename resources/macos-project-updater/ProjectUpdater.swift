@@ -610,7 +610,7 @@ private final class BridgeWindow: NSObject, NSApplicationDelegate, NSWindowDeleg
                     } else { self.download() }
                 }
             } catch {
-                FileHandle.standardError.write(Data("selfhost6 bridge: preparation rejected\n".utf8))
+                NSLog("selfhost6 bridge: preparation rejected: %@", String(describing: error))
                 DispatchQueue.main.async { self.showFailure() }
             }
         }
@@ -715,7 +715,7 @@ private final class BridgeWindow: NSObject, NSApplicationDelegate, NSWindowDeleg
                 if let failure = error as? Failure, failure.description == "archive bytes do not match signed metadata" {
                     try? FileManager.default.removeItem(at: arguments.archive)
                 }
-                FileHandle.standardError.write(Data("selfhost6 bridge: install rejected\n".utf8))
+                NSLog("selfhost6 bridge: install rejected: %@", String(describing: error))
                 DispatchQueue.main.async {
                     self.closeButton.isEnabled = true
                     self.showFailure()
