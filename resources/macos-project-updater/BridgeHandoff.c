@@ -9,10 +9,9 @@
 #include <unistd.h>
 #include "BridgeHandoff.h"
 
-static int has_target(pid_t pid, const char *target) {
+static int has_target(pid_t pid, const char *target, char *buffer) {
     int mib[] = {CTL_KERN, KERN_PROCARGS2, pid};
-    char buffer[ARG_MAX];
-    size_t length = sizeof(buffer);
+    size_t length = ARG_MAX;
     if (sysctl(mib, 3, buffer, &length, NULL, 0) != 0) return errno == ESRCH ? 0 : -1;
     if (length <= sizeof(int)) { errno = EPROTO; return -1; }
     int argc;
@@ -39,6 +38,7 @@ int logseq_bridge_wait_for_source_helper(const char *target) {
     pid_t source = 0;
     int matches = 0;
     pid_t *pids = NULL;
+    char *arguments = NULL;
     if (fcntl(queue, F_SETFD, FD_CLOEXEC) != 0) { result = errno; goto done; }
     int capacity = proc_listpids(PROC_UID_ONLY, getuid(), NULL, 0);
     if (capacity <= 0) { result = errno ? errno : EIO; goto done; }
@@ -62,7 +62,11 @@ int logseq_bridge_wait_for_source_helper(const char *target) {
         }
         const char *base = strrchr(executable, '/');
         if (base == NULL || strcmp(base + 1, "ProjectUpdater") != 0) continue;
-        const int exact = has_target(pids[index], target);
+        if (arguments == NULL) {
+            arguments = malloc(ARG_MAX);
+            if (arguments == NULL) { result = ENOMEM; goto done; }
+        }
+        const int exact = has_target(pids[index], target, arguments);
         if (exact < 0) { result = errno; goto done; }
         if (!exact) continue;
         if (++matches > 1) { result = EBUSY; goto done; }
@@ -85,6 +89,7 @@ int logseq_bridge_wait_for_source_helper(const char *target) {
         else if ((pid_t)event.ident != source || !(event.fflags & NOTE_EXIT)) result = EPROTO;
     }
 done:
+    free(arguments);
     free(pids);
     close(queue);
     return result;

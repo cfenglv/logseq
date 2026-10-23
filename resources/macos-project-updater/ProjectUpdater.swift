@@ -437,7 +437,7 @@ private func prepareBridge(_ arguments: Arguments) throws -> Int32 {
     do {
         guard flock(directory, LOCK_EX | LOCK_NB) == 0 else { try fail("another bridge owns this installation") }
         let sourceResult = arguments.target.path.withCString { logseq_bridge_wait_for_source_helper($0) }
-        guard sourceResult == 0 else { try fail("cannot finish source helper handoff") }
+        guard sourceResult == 0 else { try fail("cannot finish source helper handoff: \(String(cString: strerror(sourceResult)))") }
         let manifest = arguments.target.appendingPathComponent("Contents/Resources/updater/TARGET_BUILD_MANIFEST.json")
         guard hex(SHA256.hash(data: try Data(contentsOf: manifest))) == bridgeManifestSha256 else {
             try fail("installed App is no longer this bridge")
