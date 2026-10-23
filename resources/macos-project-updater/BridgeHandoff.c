@@ -17,7 +17,12 @@ static int has_target(pid_t pid, const char *target, char *buffer) {
     int argc;
     memcpy(&argc, buffer, sizeof(argc));
     char *cursor = buffer + sizeof(argc), *end = buffer + length;
-    cursor += strnlen(cursor, (size_t)(end - cursor));
+    const size_t executable_length = strnlen(cursor, (size_t)(end - cursor));
+    if (cursor + executable_length == end) { errno = EPROTO; return -1; }
+    /* Kernel argument metadata survives replacement of the old App's executable. */
+    const char *base = strrchr(cursor, '/');
+    if (base == NULL || strcmp(base + 1, "ProjectUpdater") != 0) return 0;
+    cursor += executable_length;
     while (cursor < end && *cursor == 0) ++cursor;
     int target_value = 0;
     for (int index = 0; index < argc && cursor < end; ++index) {
@@ -55,13 +60,6 @@ int logseq_bridge_wait_for_source_helper(const char *target) {
             result = errno ? errno : EIO; goto done;
         }
         if (strcmp(name, "ProjectUpdater") != 0) continue;
-        char executable[PROC_PIDPATHINFO_MAXSIZE];
-        if (proc_pidpath(pids[index], executable, sizeof(executable)) <= 0) {
-            if (errno == ESRCH) continue;
-            result = errno ? errno : EIO; goto done;
-        }
-        const char *base = strrchr(executable, '/');
-        if (base == NULL || strcmp(base + 1, "ProjectUpdater") != 0) continue;
         if (arguments == NULL) {
             arguments = malloc(ARG_MAX);
             if (arguments == NULL) { result = ENOMEM; goto done; }
