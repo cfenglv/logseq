@@ -259,6 +259,7 @@ jobs:
       - name: Cache Static File
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: static
           path: |
             static
@@ -323,6 +324,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: logseq-linux-x64-builds
           path: builds
 
@@ -384,6 +386,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: logseq-linux-arm64-builds
           path: builds
 
@@ -462,6 +465,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: logseq-win-x64-builds
           path: builds
 
@@ -540,6 +544,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: logseq-win-arm64-builds
           path: builds
 
@@ -626,6 +631,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: logseq-darwin-x64-builds
           path: builds
 
@@ -713,6 +719,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: logseq-darwin-arm64-builds
           path: builds
 
@@ -947,7 +954,7 @@ jobs:
             final-release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
             final-release-assets/Logseq-darwin-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
       - name: Retain exact final macOS x64 input
         uses: actions/upload-artifact@v4
@@ -957,7 +964,7 @@ jobs:
             final-release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip
             final-release-assets/Logseq-darwin-x64-${{ env.SELFHOST6_TARGET_VERSION }}.zip.selfhost6.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
       - name: Retain exact final Linux arm64 input
         uses: actions/upload-artifact@v4
@@ -967,7 +974,7 @@ jobs:
             final-release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
             final-release-assets/Logseq-linux-arm64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
       - name: Retain exact final Linux x64 input
         uses: actions/upload-artifact@v4
@@ -977,7 +984,7 @@ jobs:
             final-release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage
             final-release-assets/Logseq-linux-x86_64-${{ env.SELFHOST6_TARGET_VERSION }}.AppImage.selfhost6.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
       - name: Retain exact final Windows x64 input
         uses: actions/upload-artifact@v4
@@ -987,7 +994,7 @@ jobs:
             final-release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe
             final-release-assets/Logseq-win-x64-${{ env.SELFHOST6_TARGET_VERSION }}-nsis.exe.selfhost6.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   selfhost-bridge-build-macos:
     needs: [ selfhost-bridge-build-inputs ]
@@ -1067,7 +1074,7 @@ jobs:
           name: selfhost-offline-bridge-input-${{ matrix.id }}-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
           path: bridge-build-input
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   selfhost-bridge-build-linux:
     needs: [ selfhost-bridge-build-inputs ]
@@ -1159,7 +1166,7 @@ jobs:
           name: selfhost-offline-bridge-input-${{ matrix.id }}-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
           path: bridge-build-input
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   selfhost-bridge-build-windows:
     needs: [ selfhost-bridge-build-inputs ]
@@ -1233,7 +1240,7 @@ jobs:
           name: selfhost-offline-bridge-input-win32-x64-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
           path: bridge-build-input
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   selfhost-bridge-signing:
     needs: [ selfhost-bridge-build-inputs, selfhost-bridge-build-macos, selfhost-bridge-build-linux, selfhost-bridge-build-windows ]
@@ -1340,7 +1347,7 @@ jobs:
           name: selfhost-offline-bridge-${{ env.BRIDGE_SOURCE_FULL_SHA }}-${{ env.FINAL_SOURCE_FULL_SHA }}
           path: bridge-release-assets
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   compile-cljs:
     needs: [ release-source-gate, rtc-browser-e2e ]
@@ -1411,6 +1418,7 @@ jobs:
       - name: Upload compiled desktop tree
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: selfhost6-static-${{ env.SELFHOST6_TARGET_VERSION }}-${{ needs.release-source-gate.outputs.source-sha }}
           path: static
           include-hidden-files: true
@@ -1569,6 +1577,7 @@ jobs:
       - name: Upload unsigned release input
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: selfhost6-unsigned-${{ matrix.id }}-${{ env.SELFHOST6_TARGET_VERSION }}-${{ needs.release-source-gate.outputs.source-sha }}
           path: release-input
           if-no-files-found: error
@@ -1659,7 +1668,7 @@ jobs:
           name: selfhost-finalized-release-assets
           path: signed
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 3
 
   selfhost-release-verifier:
     needs: [ selfhost-release-signing, release-source-gate ]
@@ -1705,6 +1714,7 @@ jobs:
       - name: Upload independent verifier receipt
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: selfhost-release-verifier-${{ github.run_id }}
           path: release-verification/receipt.json
           if-no-files-found: error
