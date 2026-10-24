@@ -34,7 +34,7 @@
            (-> (p/with-redefs [auth/auth-claims
                                (fn [_request _env]
                                  (p/rejected (ex-info "jwks" {})))]
-                 (p/let [{:keys [base-url stop!]} (node-server/start! {:port 0
+                 (p/let [{:keys [base-url stop!]} (node-server/start! {:port 0 :host "127.0.0.1"
                                                                        :data-dir (str "tmp/db-sync-node-server-test/" (random-uuid))})
                          _ (reset! stop-server! stop!)
                          _ (reset! test-url (str base-url "/graphs"))
@@ -78,7 +78,7 @@
                                (fn [req opts]
                                  (swap! request-opts conj opts)
                                  (original-request-from-node req opts))]
-                 (p/let [{:keys [port stop!]} (node-server/start! {:port 0
+                 (p/let [{:keys [port stop!]} (node-server/start! {:port 0 :host "127.0.0.1"
                                                                    :base-url "https://sync.example.test:9443"
                                                                    :data-dir (str "tmp/db-sync-node-server-base-url-test/" (random-uuid))})
                          _ (reset! stop-server! stop!)
@@ -124,7 +124,7 @@
            (-> (p/with-redefs [auth/auth-claims
                                (fn [_request _env]
                                  (p/rejected (ex-info "jwks" {})))]
-                 (p/let [{:keys [base-url stop!]} (node-server/start! {:port 0
+                 (p/let [{:keys [base-url stop!]} (node-server/start! {:port 0 :host "127.0.0.1"
                                                                        :data-dir (str "tmp/db-sync-node-server-log-test/" (random-uuid))})
                          _ (reset! stop-server! stop!)
                          _ (reset! logged-errors [])

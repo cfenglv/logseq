@@ -5,8 +5,12 @@
             [frontend.worker.platform :as platform]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
+            [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.assets :as sync-assets]
+            [frontend.worker.sync.client-op :as client-op]
+            [frontend.worker.sync.presence :as sync-presence]
             [logseq.db :as ldb]
+            [logseq.db.frontend.asset :as db-asset]
             [logseq.db.frontend.schema :as db-schema]
             [promesa.core :as p]))
 
@@ -59,7 +63,25 @@
                          (is (= [[repo (str asset-uuid ".png")]] @asset-stat-calls))
                          (is (fn? @enqueued-task))
                          (is (= [] @download-calls))
-                         (is (= [] @broadcast-calls))))
+                         (is (= [] @broadcast-calls))
+                         (p/with-redefs [worker-state/get-datascript-conn (fn [_repo] conn)
+                                          platform/current (fn [] {})
+                                          platform/asset-stat (fn [& _args] (p/resolved {:size 10}))
+                                          sync-assets/download-remote-asset!
+                                          (fn [& args]
+                                            (swap! download-calls conj args)
+                                            (p/resolved nil))]
+                           (sync-assets/request-asset-download!
+                            repo asset-uuid
+                            {:replace-existing? true
+                             :current-client-f (fn [_repo] {:graph-id graph-id})
+                             :enqueue-asset-task-f (fn [_client task]
+                                                    (execute-enqueued-asset-task! task))
+                             :broadcast-rtc-state!-f (fn [& args]
+                                                       (swap! broadcast-calls conj args))}))))
+               (p/then (fn [_]
+                         (is (= [[repo graph-id asset-uuid "png"]] @download-calls))
+                         (is (= 1 (count @broadcast-calls)))))
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
                (p/finally done)))))
@@ -130,6 +152,49 @@
                (p/catch (fn [error]
                           (is (= download-error error))
                           (is (= [[repo asset-uuid download-error]] @log-calls))))
+               (p/finally done)))))
+
+(deftest request-asset-download-failure-does-not-block-later-downloads-test
+  (async done
+         (let [repo "asset-download-repo"
+               graph-id "graph-1"
+               missing-uuid (random-uuid)
+               ok-uuid (random-uuid)
+               conn (asset-conn missing-uuid)
+               _ (ldb/transact! conn [{:block/uuid ok-uuid
+                                       :logseq.property.asset/type "png"
+                                       :logseq.property.asset/remote-metadata {:type "png"}}])
+               client {:repo repo
+                       :graph-id graph-id
+                       :asset-queue (atom (p/resolved nil))}
+               download-calls (atom [])]
+           (-> (p/with-redefs [worker-state/*db-sync-client (atom client)
+                               worker-state/get-datascript-conn (fn [_repo] conn)
+                               platform/current (fn [] {})
+                               platform/asset-stat (fn [& _args] (p/resolved nil))
+                               client-op/remove-asset-op (fn [& _args] nil)
+                               shared-service/broadcast-to-clients! (fn [& _args] nil)
+                               sync-presence/rtc-state-payload (fn [& _args] {})
+                               sync-assets/log-request-asset-download-failed! (fn [& _args] nil)
+                               sync-assets/download-remote-asset!
+                               (fn [_repo _graph-id asset-uuid _asset-type]
+                                 (swap! download-calls conj asset-uuid)
+                                 (if (= missing-uuid asset-uuid)
+                                   (p/rejected (ex-info "download asset failed"
+                                                        {:type :rtc.exception/download-asset-failed
+                                                         :data {:status 404}}))
+                                   (p/resolved nil)))]
+                 (p/let [first-result (-> (db-sync/request-asset-download! repo missing-uuid)
+                                          (p/then (fn [_] {:error nil}))
+                                          (p/catch (fn [e] {:error e})))
+                         _ (-> (db-sync/request-asset-download! repo ok-uuid)
+                               (p/catch (fn [_] nil)))]
+                   (is (= 404 (-> first-result :error ex-data :data :status))
+                       "the failing download must still reject for its own caller")
+                   (is (= [missing-uuid ok-uuid] @download-calls)
+                       "a 404 on one asset must not stop later queued downloads")))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
                (p/finally done)))))
 
 (deftest upload-remote-asset-serializes-resolved-encrypted-payload-test
@@ -288,7 +353,8 @@
                (p/then (fn [result]
                          (is (= {:total 2
                                  :downloaded 1
-                                 :skipped-existing 1}
+                                 :skipped-existing 1
+                                 :failed 0}
                                 result))
                          (is (= #{[repo (str existing-uuid ".pdf")]
                                   [repo (str missing-uuid ".png")]}
@@ -298,6 +364,78 @@
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
                (p/finally done)))))
+
+(deftest download-remote-assets-if-missing-continues-past-failures-test
+  (async done
+         (let [repo "asset-prefetch-repo"
+               graph-id "graph-1"
+               failed-uuid (random-uuid)
+               ok-uuid (random-uuid)
+               candidates [{:asset-uuid failed-uuid
+                            :asset-type "png"}
+                           {:asset-uuid ok-uuid
+                            :asset-type "png"}]
+               download-calls (atom [])
+               log-calls (atom [])]
+           (-> (p/with-redefs [platform/current (fn [] {})
+                               platform/asset-stat
+                               (fn [& _args]
+                                 (p/resolved nil))
+                               sync-assets/log-request-asset-download-failed!
+                               (fn [repo' asset-uuid' error']
+                                 (swap! log-calls conj [repo' asset-uuid' error']))
+                               sync-assets/download-remote-asset!
+                               (fn [_repo _graph-id asset-uuid _asset-type]
+                                 (swap! download-calls conj asset-uuid)
+                                 (if (= failed-uuid asset-uuid)
+                                   (p/rejected (ex-info "download asset failed"
+                                                        {:type :rtc.exception/download-asset-failed
+                                                         :data {:status 404}}))
+                                   (p/resolved nil)))]
+                 (sync-assets/download-remote-assets-if-missing!
+                  repo graph-id candidates))
+               (p/then (fn [result]
+                         (is (= #{failed-uuid ok-uuid} (set @download-calls))
+                             "a failed download must not stop the remaining assets")
+                         (is (= {:total 2
+                                 :downloaded 1
+                                 :skipped-existing 0
+                                 :failed 1}
+                                result))
+                         (is (= 1 (count @log-calls)))
+                         (is (= repo (first (first @log-calls))))
+                         (is (= failed-uuid (second (first @log-calls))))))
+               (p/catch (fn [error]
+                          (is false (str "unexpected error: " error))))
+               (p/finally done)))))
+
+(deftest download-remote-assets-preserves-access-and-local-failures-test
+  (async done
+    (let [access-uuid (random-uuid)
+          local-uuid (random-uuid)
+          cause (js/Error. "asset write failed")
+          access-error (ex-info "download asset failed" {:type :rtc.exception/download-asset-failed
+                                                        :data {:status 403}})
+          local-error (ex-info "download asset failed" {:type :rtc.exception/download-asset-failed} cause)
+          errors {access-uuid access-error local-uuid local-error}]
+      (-> (p/with-redefs [platform/current (constantly {})
+                         platform/asset-stat (fn [& _] (p/resolved nil))
+                         sync-assets/log-request-asset-download-failed! (fn [& _] nil)
+                         sync-assets/download-remote-asset!
+                         (fn [_repo _graph-id asset-uuid _asset-type]
+                           (p/rejected (get errors asset-uuid)))]
+            (p/all
+             (mapv (fn [[asset-uuid expected]]
+                     (-> (sync-assets/download-remote-assets-if-missing!
+                          "asset-failure-repo" "graph-1" [{:asset-uuid asset-uuid :asset-type "png"}])
+                         (p/then (fn [_] (is false "Only a missing object may continue")))
+                         (p/catch (fn [error]
+                                    (is (identical? expected error))
+                                    (when (= asset-uuid local-uuid)
+                                      (is (identical? cause (ex-cause error))))))))
+                   errors)))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
 
 (deftest download-remote-assets-if-missing-bounds-download-concurrency-test
   (async done
@@ -327,10 +465,50 @@
                (p/then (fn [result]
                          (is (= {:total 12
                                  :downloaded 12
-                                 :skipped-existing 0}
+                                 :skipped-existing 0
+                                 :failed 0}
                                 result))
                          (is (= 12 (count @download-calls)))
                          (is (= 10 @max-active-downloads))))
                (p/catch (fn [error]
                           (is false (str "unexpected error: " error))))
+               (p/finally done)))))
+
+
+(deftest replacement-pdf-content-is-checked-before-writing-test
+  (async done
+         (let [repo "synthetic-content-check"
+               asset-uuid (random-uuid)
+               conn (asset-conn asset-uuid)
+               healthy (.-buffer (js/Uint8Array. #js [37 80 68 70]))
+               changed (.-buffer (js/Uint8Array. #js [37 80 68 71]))
+               response (atom changed)
+               writes (atom [])]
+           (-> (p/let [checksum (db-asset/<get-file-array-buffer-checksum healthy)]
+                 (ldb/transact! conn [{:block/uuid asset-uuid
+                                      :logseq.property.asset/type "pdf"
+                                      :logseq.property.asset/checksum checksum}])
+                 (p/with-redefs [worker-state/*db-sync-config (atom {:http-base "http://127.0.0.1:1"})
+                                 worker-state/get-datascript-conn (constantly conn)
+                                 worker-state/get-id-token (constantly nil)
+                                 sync-assets/graph-aes-key (fn [& _] (p/resolved nil))
+                                 js/fetch (fn [& _]
+                                            (p/resolved #js {:ok true :status 200
+                                                             :headers #js {:get (fn [_] "4")}
+                                                             :arrayBuffer (fn [] (p/resolved @response))}))
+                                 platform/current (constantly :synthetic-platform)
+                                 platform/asset-write-bytes! (fn [_platform _repo _name payload]
+                                                              (swap! writes conj payload)
+                                                              (p/resolved nil))
+                                 shared-service/broadcast-to-clients! (fn [& _] nil)]
+                   (p/let [error (-> (sync-assets/download-remote-asset! repo "synthetic-graph" asset-uuid "pdf" true)
+                                    (p/catch ex-data))]
+                     (is (= :rtc.exception/download-asset-failed (:type error)))
+                     (is (= :content-mismatch (get-in error [:data :reason])))
+                     (is (empty? @writes))
+                     (reset! response healthy)
+                     (p/let [_ (sync-assets/download-remote-asset! repo "synthetic-graph" asset-uuid "pdf" true)]
+                       (is (= 1 (count @writes)))
+                       (is (identical? healthy (first @writes)))))))
+               (p/catch (fn [error] (is false (str error))))
                (p/finally done)))))

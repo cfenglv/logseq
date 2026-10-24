@@ -225,15 +225,20 @@
     ;; NOTE: URL type is not consistent across all protocols
     ;; Check file:// and assets://, pathname behavior is different
     (if-let [^js url (try
-                       (js/URL. (string/replace (safe-decode-uri-component original-url) "assets://" "file://"))
+                       (js/URL. (string/replace original-url "assets://" "file://"))
                        (catch :default e
                          (js/console.error "Failed to construct URL in url-to-path:" original-url e)
                          nil))]
-      (let [path (.-pathname url)
+      (let [path (safe-decode-uri-component (.-pathname url))
             host (.-host url)
             path (if (string/starts-with? path "///")
                    (subs path 2)
                    path)
+            ;; assets:// URLs protect a Windows drive colon as
+            ;; /logseq__colon/ (see electron.utils/
+            ;; decode-protected-assets-schema-path); restore it before the
+            ;; drive-letter rule below so it resolves to a native C:/ path
+            path (string/replace path "/logseq__colon/" ":/")
             path (if (re-find #"(?i)^/[a-zA-Z]:" path) ;; Win path fix
                    (subs path 1)
                    path)]

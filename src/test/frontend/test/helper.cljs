@@ -18,22 +18,40 @@
 
 (def test-db "logseq_db_test-db")
 
+(defonce ^:private *initial-dbs (atom {}))
+(defonce ^:private *previous-transact-pipeline (atom nil))
+
+(defn- initial-db
+  "The DB value a test starts from, built once per schema and reused:
+  building it recomputes datascript's reverse schema for every built-in
+  property, which took most of the time of a small test."
+  [schema build-init-data?]
+  (let [k [schema build-init-data?]]
+    (or (get @*initial-dbs k)
+        (let [db-conn (d/create-conn (merge db-schema/schema schema))]
+          (when build-init-data?
+            (d/transact! db-conn (sqlite-create-graph/build-db-initial-data config/config-default-content)))
+          (swap! *initial-dbs assoc k @db-conn)
+          @db-conn))))
+
 (defn start-test-db!
   [& {:keys [build-init-data? schema] :or {build-init-data? true}}]
   (state/set-current-repo! test-db)
   (let [db-name (conn/get-repo-path test-db)
-        db-conn (d/create-conn (merge db-schema/schema schema))]
+        db-conn (d/conn-from-db (initial-db schema build-init-data?))]
     (conn/destroy-all!)
     (swap! conn/conns assoc db-name db-conn)
+    (reset! *previous-transact-pipeline @ldb/*transact-pipeline-fn)
     (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
-    (when build-init-data? (d/transact! db-conn (sqlite-create-graph/build-db-initial-data config/config-default-content)))
     (d/listen! db-conn ::listen-db-changes!
                (fn [tx-report]
                  (worker-pipeline/invoke-hooks db-conn tx-report {})))))
 
 (defn destroy-test-db!
   []
-  (conn/destroy-all!))
+  (conn/destroy-all!)
+  (reset! ldb/*transact-pipeline-fn @*previous-transact-pipeline)
+  (reset! *previous-transact-pipeline nil))
 
 (def file-to-db-statuses
   {"TODO" :logseq.property/status.todo
@@ -102,3 +120,6 @@
 
 (defn find-block-by-content [block-title]
   (db-test/find-block-by-content (conn/get-db) block-title))
+
+(defn find-page-by-title [title]
+  (db-test/find-page-by-title (conn/get-db) title))

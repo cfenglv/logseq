@@ -39,6 +39,9 @@
   [repo graph-id]
   (when-let [storage (session-storage)]
     (when-not (string/blank? repo)
+      (when (and (not= repo (.getItem storage repo-key))
+                 (string/blank? graph-id))
+        (.removeItem storage graph-id-key))
       (.setItem storage repo-key repo))
     (when-not (string/blank? graph-id)
       (.setItem storage graph-id-key graph-id))))

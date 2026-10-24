@@ -71,13 +71,104 @@
                :block/title "linked block"}
         original {:db/id 2
                   :block/uuid #uuid "22222222-2222-2222-2222-222222222222"
-                  :block/title "original block"}]
+                  :block/title "original block"}
+        selected-node-without-original
+        #js {:getAttribute #({"blockid" (str block-id)} %)}
+        selected-node #js {:getAttribute
+                           #({"blockid" (str block-id)
+                              "originalblockid" (str (:block/uuid original))} %)}
+        later-selected-node #js {:getAttribute
+                                 #({"blockid" (str block-id)
+                                    "originalblockid" (str (random-uuid))} %)}]
     (with-redefs [outliner-core/blocks-with-level (fn [_] [(assoc block :block/level 1)])
-                  block-handler/get-original-block (fn [b]
-                                                     (when (= (:block/uuid b) block-id)
-                                                       original))]
-      (is (= [original]
+                  state/get-edit-block (constantly nil)
+                  state/get-input (constantly nil)
+                  state/get-selection-blocks (constantly [selected-node-without-original
+                                                          selected-node
+                                                          later-selected-node])]
+      (is (= [(select-keys original [:block/uuid])]
              (block-handler/get-top-level-blocks [block]))))))
+
+(deftest copy-summaries-exclude-covered-descendants
+  (async done
+    (let [conn (db-test/create-conn-with-blocks
+                [{:page {:block/title "outline"}
+                  :blocks [{:block/title "ancestor"
+                            :build/children [{:block/title "middle"
+                                              :build/children [{:block/title "leaf"}]}]}]}])
+          db @conn
+          ancestor-id (:block/uuid (db-test/find-block-by-content db "ancestor"))
+          leaf-id (:block/uuid (db-test/find-block-by-content db "leaf"))]
+      (p/with-redefs [db-async/<q (fn [_graph _opts query & inputs]
+                                  (p/resolved (apply d/q query db inputs)))
+                     state/get-edit-block (constantly nil)
+                     state/get-input (constantly nil)
+                     state/get-selection-blocks (constantly [])]
+        (-> (p/let [summaries (db-async/<get-block-summaries "graph" [leaf-id ancestor-id])]
+              (is (= [ancestor-id]
+                     (mapv :block/uuid (block-handler/get-top-level-blocks summaries)))))
+            (p/catch #(is false (str %)))
+            (p/finally done))))))
+
+(deftest selected-node-embed-resolves-the-placeholder-from-rendered-identity-test
+  (let [target-uuid #uuid "11111111-1111-1111-1111-111111111111"
+        placeholder-uuid #uuid "22222222-2222-2222-2222-222222222222"
+        target {:db/id 1
+                :block/uuid target-uuid
+                :block/title "canonical target"}
+        embed-wrapper #js {:getAttribute
+                           (fn [attribute]
+                             (when (= attribute "originalblockid")
+                               (str placeholder-uuid)))}
+        selected-node #js {:getAttribute
+                           (fn [attribute]
+                             (when (= attribute "blockid")
+                               (str target-uuid)))
+                           :closest
+                           (fn [selector]
+                             (when (= selector ".ls-block")
+                               embed-wrapper))}]
+    (with-redefs [outliner-core/blocks-with-level
+                  (fn [_] [(assoc target :block/level 1)])
+                  state/get-edit-block (constantly nil)
+                  state/get-input (constantly nil)
+                  state/get-selection-blocks (constantly [selected-node])]
+      (is (= [{:block/uuid placeholder-uuid}]
+             (vec (block-handler/get-top-level-blocks [target])))
+          "A selected linked-render row must resolve to its placeholder, not its canonical target."))))
+
+(deftest selected-node-embed-child-does-not-resolve-to-ancestor-placeholder-test
+  (let [child-uuid #uuid "11111111-1111-1111-1111-111111111111"
+        placeholder-uuid #uuid "22222222-2222-2222-2222-222222222222"
+        child {:db/id 1
+               :block/uuid child-uuid
+               :block/title "ordinary embedded child"}
+        child-row #js {:getAttribute
+                       (fn [attribute]
+                         (when (= attribute "blockid")
+                           (str child-uuid)))}
+        ancestor-placeholder #js {:getAttribute
+                                  (fn [attribute]
+                                    (when (= attribute "originalblockid")
+                                      (str placeholder-uuid)))}
+        selected-node #js {:getAttribute
+                           (fn [attribute]
+                             (when (= attribute "blockid")
+                               (str child-uuid)))
+                           :closest
+                           (fn [selector]
+                             (case selector
+                               ".ls-block" child-row
+                               ".ls-block[originalblockid]" ancestor-placeholder
+                               nil))}]
+    (with-redefs [outliner-core/blocks-with-level
+                  (fn [_] [(assoc child :block/level 1)])
+                  state/get-edit-block (constantly nil)
+                  state/get-input (constantly nil)
+                  state/get-selection-blocks (constantly [selected-node])]
+      (is (= [child-uuid]
+             (mapv :block/uuid (block-handler/get-top-level-blocks [child])))
+          "An ordinary child row must not inherit an embed ancestor's placeholder identity."))))
 
 (deftest edit-block-loads-target-through-worker-test
   (async done
@@ -117,6 +208,7 @@
              (fn []
                (is (= [[:get-block "test" block-id {:children? false}]
                        [:event [:editor/save-code-editor]]
+                       [:event [:editor/save-current-block]]
                        [:clear-edit {:clear-editing-block? false}]
                        [:clear-selection]
                        [:set-editing

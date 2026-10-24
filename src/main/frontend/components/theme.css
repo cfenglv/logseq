@@ -201,18 +201,38 @@ main.theme-container-inner {
   --left-sidebar-bg-color: var(--lx-gray-02, var(--ls-secondary-background-color, hsl(var(--secondary, var(--rx-gray-03-hsl)))));
 }
 
-html[data-font='serif'] .ls-block, .ls-font-serif {
+.ls-font-serif {
   font-family: Lyon-Text, Georgia, ui-serif, serif;
 }
 
-html[data-font='serif'][data-font-global='true'] {
-  --ls-font-family: Lyon-Text, Georgia, ui-serif, serif;
-}
-
-html[data-font='mono'] .ls-block, .ls-font-mono {
+.ls-font-mono {
   font-family: iawriter-mono, Nitti, Menlo, Courier, monospace;
 }
 
-html[data-font='mono'][data-font-global='true'] {
-  --ls-font-family: iawriter-mono, Nitti, Menlo, Courier, monospace;
+.ls-block, .page-title, .journal-title {
+  font-family: var(--ls-note-font-family, var(--ls-font-family)), sans-serif;
+}
+
+.left-sidebar-inner .page-title {
+  font-family: inherit;
+}
+
+.ls-block {
+  font-size: var(--ls-note-font-size, var(--ls-page-text-size));
+}
+
+.ls-block .editor-inner textarea {
+  font-family: inherit;
+}
+
+:is(.left-sidebar-inner, .cp__header, .cp__cmdk, .cp__settings-main,
+    .cp__settings-appearance-dialog-inner, .ui__dialog-content, .ui__alert-dialog-content,
+    .ui__dropdown-menu-content, .ui__select-content, .ui__popover-content) {
+  --text-sm: calc(var(--ls-interface-font-size, 16px) * 0.875);
+
+  &.text-xs, .text-xs { font-size: calc(var(--ls-interface-font-size, 16px) * 0.75); }
+  &.text-sm, .text-sm { font-size: calc(var(--ls-interface-font-size, 16px) * 0.875); }
+  &.text-base, .text-base { font-size: var(--ls-interface-font-size, 16px); }
+  &.text-lg, .text-lg { font-size: calc(var(--ls-interface-font-size, 16px) * 1.125); }
+  &.text-xl, .text-xl { font-size: calc(var(--ls-interface-font-size, 16px) * 1.25); }
 }

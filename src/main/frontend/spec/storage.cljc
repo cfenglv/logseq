@@ -7,6 +7,7 @@
 (s/def ::ls-right-sidebar-width string?)
 (s/def ::ls-left-sidebar-open? boolean?)
 (s/def ::ls-cmdk-last-search map?)
+(s/def ::ls-literature-settings map?)
 (s/def :ui/theme string?)
 (s/def :ui/system-theme? boolean?)
 (s/def ::lsp-core-enabled boolean?)
@@ -50,6 +51,7 @@
             ::ls-right-sidebar-width
             ::ls-left-sidebar-open?
             ::ls-cmdk-last-search
+            ::ls-literature-settings
             :ui/theme
             :ui/system-theme?
             :ui/recent-pages

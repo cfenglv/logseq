@@ -9,6 +9,8 @@
             [frontend.handler.config :as config-handler]
             [frontend.handler.comments :as comments-handler]
             [frontend.handler.editor :as editor-handler]
+            [frontend.handler.editor.format :as editor-format]
+            [frontend.handler.editor.quick-add :as editor-quick-add]
             [frontend.handler.export :as export-handler]
             [frontend.handler.history :as history]
             [frontend.handler.journal :as journal-handler]
@@ -117,16 +119,16 @@
                                              :fn      editor-handler/open-link-in-sidebar!}
 
    :editor/bold                             {:binding "mod+b"
-                                             :fn      editor-handler/bold-format!}
+                                             :fn      editor-format/bold-format!}
 
    :editor/italics                          {:binding "mod+i"
-                                             :fn      editor-handler/italics-format!}
+                                             :fn      editor-format/italics-format!}
 
    :editor/highlight                        {:binding "mod+shift+h"
-                                             :fn      editor-handler/highlight-format!}
+                                             :fn      editor-format/highlight-format!}
 
    :editor/strike-through                   {:binding "mod+shift+s"
-                                             :fn      editor-handler/strike-through-format!}
+                                             :fn      editor-format/strike-through-format!}
 
    :editor/clear-block                      {:binding (if mac? "ctrl+l" "alt+l")
                                              :fn      editor-handler/clear-block-content!}
@@ -239,7 +241,7 @@
                                              :fn      history/redo!}
 
    :editor/insert-link                      {:binding "mod+l"
-                                             :fn      #(editor-handler/html-link-format!)}
+                                             :fn      #(editor-format/html-link-format!)}
 
    :editor/select-all-blocks                {:binding "mod+shift+a"
                                              :fn      editor-handler/select-all-blocks!}
@@ -274,12 +276,12 @@
    :editor/add-property-status              {:binding "p s"
                                              :selection? true
                                              :fn      (fn []
-                                                        (state/pub-event! [:editor/new-property {:property-key "Status"}]))}
+                                                        (state/pub-event! [:editor/new-property {:property-key :logseq.property/status}]))}
 
    :editor/add-property-priority            {:binding "p p"
                                              :selection? true
                                              :fn      (fn []
-                                                        (state/pub-event! [:editor/new-property {:property-key "Priority"}]))}
+                                                        (state/pub-event! [:editor/new-property {:property-key :logseq.property/priority}]))}
 
    :editor/add-property-icon                {:binding "p i"
                                              :selection? true
@@ -399,6 +401,9 @@
    :go/all-graphs                           {:binding "g shift+g"
                                              :fn      route-handler/redirect-to-all-graphs}
 
+   :go/shared-literature                    {:binding []
+                                             :fn :frontend.components.literature/open-library-current!}
+
    :go/keyboard-shortcuts                   {:binding "g s"
                                              :fn      #(state/pub-event! [:modal/keymap])}
 
@@ -443,7 +448,7 @@
 
    :editor/quick-add                        {:binding (if mac? "mod+e" "mod+alt+e")
                                              :inactive config/publishing?
-                                             :fn      editor-handler/quick-add}
+                                             :fn      editor-quick-add/quick-add}
    :editor/jump                             {:binding "mod+j"
                                              :fn      jump-handler/jump-to}
 
@@ -523,6 +528,9 @@
                        :desc "(Dev) Validate current graph"
                        :inactive (not (state/developer-mode?))
                        :fn :frontend.handler.common.developer/validate-db}
+   :graph/repair-local-copy {:binding []
+                             :inactive (not (util/electron?))
+                             :fn :frontend.handler.db-based.sync/request-repair!}
    :dev/recompute-checksum {:binding []
                             :desc "(Dev) Recompute graph checksum"
                             :inactive (not (state/developer-mode?))
@@ -691,7 +699,9 @@
           :go/forward
           :search/re-index
           :graph/db-save
+          :graph/repair-local-copy
           :sidebar/open-today-page
+          :ui/toggle-contents
           :sidebar/clear
           :shell/run
           :publish/open-dialog
@@ -708,6 +718,7 @@
           :go/flashcards
           :go/graph-view
           :go/all-graphs
+          :go/shared-literature
           :go/keyboard-shortcuts
           :go/tomorrow
           :go/next-journal
@@ -719,7 +730,6 @@
           :ui/toggle-left-sidebar
           :ui/toggle-help
           :ui/toggle-theme
-          :ui/toggle-contents
           :editor/copy-page-url
           :editor/set-tags
           :editor/add-property-deadline
@@ -808,6 +818,7 @@
      :go/all-pages
      :go/graph-view
      :go/all-graphs
+     :go/shared-literature
      :go/flashcards
      :go/tomorrow
      :go/next-journal
@@ -890,6 +901,7 @@
      :graph/export-as-html
      :graph/open
      :graph/remove
+     :graph/repair-local-copy
      :graph/add
      :sidebar/close-top
      :sidebar/clear

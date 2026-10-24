@@ -61,12 +61,13 @@
 (defn normalize-online-users
   [users]
   (->> users
-       (keep (fn [{:keys [user-id email username name]}]
+       (keep (fn [{:keys [user-id email username name editing-block-uuid] :as user}]
                (when (string? user-id)
                  (let [display-name (or username name user-id)]
-                   (cond-> {:user/uuid user-id
-                            :user/name display-name}
-                     (string? email) (assoc :user/email email))))))
+                   (cond-> (merge {:user/uuid user-id :user/name display-name}
+                                  (select-keys user [:display-name :has-avatar? :profile-revision]))
+                     (string? email) (assoc :user/email email)
+                     (string? editing-block-uuid) (assoc :user/editing-block-uuid editing-block-uuid))))))
        (common-util/distinct-by :user/uuid)
        (vec)))
 
@@ -79,6 +80,8 @@
                 local-tx remote-tx local-checksum remote-checksum graph-id]}
         (sync-counts-f repo)]
     {:rtc-state {:ws-state ws-state}
+     :user-profile/context (:user-profile/context client)
+     :user-profile/repo repo
      :rtc-lock (= :open ws-state)
      :online-users (or online-users [])
      :unpushed-block-update-count (or pending-local 0)
@@ -101,20 +104,43 @@
 (defn update-online-users!
   [broadcast-f client users]
   (when-let [*online-users (:online-users client)]
-    (let [users' (normalize-online-users users)]
+    (let [known (into {} (map (juxt :user/uuid identity)) @*online-users)
+          users' (mapv (fn [user]
+                         (let [previous (get known (:user/uuid user))]
+                           (if (> (get previous :profile-revision -1) (get user :profile-revision -1))
+                             (merge user (select-keys previous [:display-name :has-avatar? :profile-revision]))
+                             user)))
+                       (normalize-online-users users))]
       (when (not= users' @*online-users)
         (reset! *online-users users')
         (broadcast-f client)))))
 
 (defn update-user-presence!
   [broadcast-f client user-id* editing-block-uuid]
-  (when (and user-id* editing-block-uuid)
+  ;; a null editing-block-uuid means the user stopped editing (the server
+  ;; clears it the same way): drop their editing block
+  (when user-id*
     (when-let [*online-users (:online-users client)]
       (swap! *online-users
              (fn [users]
                (mapv (fn [user]
                        (if (= user-id* (:user/uuid user))
-                         (assoc user :user/editing-block-uuid editing-block-uuid)
+                         (if editing-block-uuid
+                           (assoc user :user/editing-block-uuid editing-block-uuid)
+                           (dissoc user :user/editing-block-uuid))
                          user))
                      users)))
       (broadcast-f client))))
+
+(defn update-user-profile!
+  [broadcast-f client {:keys [user-id profile-revision] :as profile}]
+  (when-let [*users (:online-users client)]
+    (let [before @*users
+          after (mapv (fn [user]
+                        (if (and (= user-id (:user/uuid user))
+                                 (>= profile-revision (get user :profile-revision -1)))
+                          (merge user (select-keys profile [:display-name :has-avatar? :profile-revision]))
+                          user)) before)]
+      (when (not= before after)
+        (reset! *users after)
+        (broadcast-f client)))))

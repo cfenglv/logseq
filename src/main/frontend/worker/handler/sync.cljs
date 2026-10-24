@@ -21,6 +21,10 @@
   [repo]
   (db-sync/status repo))
 
+(def-thread-api :thread-api/db-sync-request-repair
+  [repo]
+  (db-sync/<request-repair! repo))
+
 (def-thread-api :thread-api/db-sync-stop
   []
   (db-sync/stop!))
@@ -29,9 +33,13 @@
   [editing-block-uuid]
   (db-sync/update-presence! editing-block-uuid))
 
+(def-thread-api :thread-api/db-sync-refresh-profile
+  [context repo]
+  (db-sync/refresh-profile! context repo))
+
 (def-thread-api :thread-api/db-sync-request-asset-download
-  [repo asset-uuid]
-  (db-sync/request-asset-download! repo asset-uuid))
+  [repo asset-uuid & options]
+  (apply db-sync/request-asset-download! repo asset-uuid options))
 
 (def-thread-api :thread-api/db-sync-download-missing-assets
   [repo graph-id]

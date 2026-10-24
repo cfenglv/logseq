@@ -32,6 +32,18 @@ const staticCleanKeep = new Set([
 ])
 const staticInstallCommand = 'pnpm install --ignore-workspace --frozen-lockfile'
 
+const buildZoteroCompanion = async () => {
+  const JSZip = require('jszip')
+  const zip = new JSZip()
+  for (const name of ['manifest.json', 'bootstrap.js']) {
+    zip.file(name, fs.readFileSync(path.join(__dirname, 'zotero-companion', name)),
+      { date: new Date('1980-01-01T00:00:00Z') })
+  }
+  fs.mkdirSync(outputPath, { recursive: true })
+  fs.writeFileSync(path.join(outputPath, 'zotero-companion.xpi'),
+    await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }))
+}
+
 const css = {
   watchCSS () {
     return cp.spawn(`pnpm css:watch`, {
@@ -325,14 +337,16 @@ exports.electronMakerUnsigned = async () => {
 
 exports.cap = common.runCapWithLocalDevServerEntry
 exports.clean = common.clean
+exports.zoteroCompanion = buildZoteroCompanion
 exports.watch = gulp.series(
   common.syncResourceFile,
+  buildZoteroCompanion,
   common.syncAssetFiles,
   gulp.parallel(common.keepSyncResourceFile, css.watchCSS))
 exports.watchMobile = gulp.series(
   common.syncResourceFile, common.syncAssetFiles,
   gulp.parallel(common.keepSyncResourceFile, common.keepSyncWorkersToMobile, css.watchMobileCSS))
 exports.build = gulp.series(common.clean, common.syncResourceFile,
-  common.syncAssetFiles, css.buildCSS)
+  common.syncAssetFiles, buildZoteroCompanion, css.buildCSS)
 exports.buildMobile = gulp.series(common.clean, common.syncResourceFile,
   common.syncAssetFiles, css.buildMobileCSS)

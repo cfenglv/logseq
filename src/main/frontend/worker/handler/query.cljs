@@ -13,6 +13,8 @@
             [logseq.db.common.initial-data :as common-initial-data]
             [logseq.db.frontend.datalog :as datalog-util]
             [logseq.db.frontend.inputs :as db-inputs]
+            [logseq.db.frontend.literature :as literature]
+            [logseq.db.frontend.literature-source :as literature-source]
             [logseq.db.frontend.rules :as rules]))
 
 (def-thread-api :thread-api/q
@@ -45,6 +47,41 @@
       (some->> eid
                (d/pull @conn selector)
                (common-initial-data/with-parent @conn)))))
+
+(def-thread-api :thread-api/literature-find-reusable-pdf-by-checksum
+  [repo checksum]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (literature/find-reusable-pdf-by-checksum @conn checksum)))
+
+(def-thread-api :thread-api/literature-duplicate-pdf-plans
+  [repo asset-uuids]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (let [db @conn]
+      (into {} (map (fn [asset-uuid]
+                      [asset-uuid
+                       (merge (literature/duplicate-pdf-usage db asset-uuid)
+                              (dissoc (literature/build-duplicate-pdf-demotion-plan
+                                       db (first (remove #{asset-uuid} asset-uuids)) asset-uuid
+                                       {:preview? true})
+                                      :tx-data))])
+                    asset-uuids)))))
+
+(def-thread-api :thread-api/literature-find-source-record-link
+  [repo binding-uuid paper-uuid]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (literature-source/find-source-record-link @conn binding-uuid paper-uuid)))
+
+(def-thread-api :thread-api/literature-plan-linked-source-record-metadata
+  [repo binding-uuid paper-uuid source-record]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (literature/build-linked-source-record-metadata-plan
+     @conn binding-uuid paper-uuid source-record)))
+
+
+(def-thread-api :thread-api/literature-plan-doi-metadata
+  [repo paper-uuid record asset-uuid]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (dissoc (literature/build-doi-metadata-plan @conn paper-uuid record asset-uuid) :ops)))
 
 (defn- block-status-history
   [db block-id]
@@ -98,13 +135,23 @@
   (when-let [conn (worker-state/get-datascript-conn repo)]
     (task-spent-time @conn block-id (common-util/time-ms))))
 
+(defn- reader-character-literal?
+  "cljs.reader treats \\\\X as a character, which is a 1-char string in CLJS."
+  [input value]
+  (and (string? input)
+       (string/starts-with? input "\\")
+       (char? value)))
+
 (defn- query-input-value
+  "Parse stringified EDN query inputs from plugin/JSON callers (e.g. \":today\").
+  Keep the original string when cljs.reader reads a symbol or character literal, so regex
+  patterns such as \"\\\\(uuid\\\\)\" are not reduced to \"(\"."
   [input]
   (if (and (string? input)
            (not (page-ref/page-ref? input)))
     (try
       (let [value (cljs.reader/read-string input)]
-        (if (symbol? value)
+        (if (or (symbol? value) (reader-character-literal? input value))
           input
           value))
       (catch :default _

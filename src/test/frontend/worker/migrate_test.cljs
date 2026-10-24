@@ -5,6 +5,8 @@
             [frontend.worker.db.migrate :as db-migrate]
             [frontend.worker.pipeline :as worker-pipeline]
             [logseq.db :as ldb]
+            [logseq.db.common.order :as db-order]
+            [logseq.db.frontend.property :as db-property]
             [logseq.db.frontend.schema :as db-schema]
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]))
 
@@ -17,6 +19,43 @@
           [?e ?attr]]
         db
         attr)))
+
+(deftest literature-migration-preserves-existing-data-and-stable-identities
+  (let [conn (d/create-conn db-schema/schema)
+        asset-uuid #uuid "76000000-0000-4000-8000-000000000001"
+        note-uuid #uuid "76000000-0000-4000-8000-000000000002"]
+    (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+    (d/transact! conn
+                 (mapv (fn [ident] [:db/retractEntity ident])
+                       db-property/literature-property-idents))
+    (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                        :kv/value {:major 65 :minor 33}}
+                       {:block/uuid asset-uuid
+                        :block/title "Existing PDF"
+                        :block/tags :logseq.class/Asset
+                        :logseq.property.asset/type "pdf"
+                        :logseq.property.asset/size 120
+                        :logseq.property.asset/checksum "synthetic-existing-content"}
+                       {:block/uuid note-uuid
+                        :block/title "Existing citation and annotation text"
+                        :block/link [:block/uuid asset-uuid]}])
+    (let [before @conn
+          other (d/conn-from-db before)
+          asset-before (d/pull before '[*] [:block/uuid asset-uuid])
+          note-before (d/pull before '[*] [:block/uuid note-uuid])]
+      (db-migrate/migrate conn :target-version {:major 65 :minor 35})
+      (db-migrate/migrate other :target-version {:major 65 :minor 35})
+      (is (= {:major 65 :minor 35}
+             (:kv/value (d/entity @conn :logseq.kv/schema-version))))
+      (is (= asset-before (d/pull @conn '[*] [:block/uuid asset-uuid])))
+      (is (= note-before (d/pull @conn '[*] [:block/uuid note-uuid])))
+      (doseq [ident db-property/literature-property-idents]
+        (is (true? (:logseq.property/built-in? (d/entity @conn ident))))
+        (is (= (:block/uuid (d/entity @conn ident))
+               (:block/uuid (d/entity @other ident)))))
+      (let [after @conn]
+        (is (nil? (db-migrate/migrate conn :target-version {:major 65 :minor 35})))
+        (is (= after @conn))))))
 
 (defn- extends-idents
   [db entity]
@@ -108,7 +147,10 @@
         graph-created-at (:kv/value (d/entity @conn :logseq.kv/graph-created-at))
         _ (assert (= {:major 64 :minor 8} initial-version))
         _ (assert (some? graph-created-at))
-        _ (db-migrate/ensure-built-in-data-exists! conn)]
+        ;; This old-format fixture tests built-in metadata repair, independently
+        ;; of a current worker pipeline registered by another test namespace.
+        _ (with-redefs [ldb/*transact-pipeline-fn (atom nil)]
+            (db-migrate/ensure-built-in-data-exists! conn))]
     (is (= initial-version
            (:kv/value (d/entity @conn :logseq.kv/graph-initial-schema-version)))
         "Initial version not changed by fn")
@@ -372,6 +414,39 @@
       (is (= #{(:db/id (d/entity migration-db [:block/uuid target-uuid]))}
              (ref-ids (:logseq.property.comments/blocks
                        (d/entity migration-db [:block/uuid comments-area-uuid]))))))))
+
+(deftest migrate-65-34-advances-repaired-page-order-allocator
+  (let [conn (d/create-conn db-schema/schema)
+        child-uuid (random-uuid)]
+    (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+    (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                        :kv/value {:major 65 :minor 33}}
+                       {:db/id "parent"
+                        :block/uuid (random-uuid)
+                        :block/title "Country"
+                        :block/name "country"
+                        :block/tags :logseq.class/Page}
+                       {:block/uuid (random-uuid)
+                        :block/title "Overview"
+                        :block/parent "parent"
+                        :block/page "parent"
+                        :block/order "bzz"}
+                       {:block/uuid child-uuid
+                        :block/title "Australia"
+                        :block/name "australia"
+                        :block/tags :logseq.class/Page
+                        :block/parent "parent"}])
+    (with-redefs [db-order/*max-key (atom "a0")]
+      (let [result (db-migrate/migrate conn :target-version {:major 65 :minor 34})
+            migration-report (first (:upgrade-result-coll result))
+            repaired-order (:block/order (d/entity @conn [:block/uuid child-uuid]))]
+        (is (= {:major 65 :minor 34}
+               (:kv/value (d/entity @conn :logseq.kv/schema-version))))
+        (is (= {:fix db-order/missing-internal-page-parent-order-tx}
+               (:migrate-updates migration-report)))
+        (is (pos? (compare repaired-order "bzz")))
+        (is (pos? (compare (db-order/gen-key) repaired-order)))
+        (is (nil? (db-migrate/migrate conn :target-version {:major 65 :minor 34})))))))
 
 (deftest migrate-65-33-adds-gallery-view-properties
   (let [conn (d/create-conn db-schema/schema)

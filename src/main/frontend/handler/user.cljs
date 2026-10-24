@@ -85,6 +85,17 @@
    parse-jwt
    :sub))
 
+(defn sync-app-state-payload
+  "The original worker auth payload, shared by notes and the private RTC runtime."
+  []
+  (let [payload (select-keys (state/get-state) [:git/current-repo :config
+                                              :auth/id-token :auth/access-token :auth/refresh-token
+                                              :auth/oauth-token-url :auth/oauth-domain :auth/oauth-client-id
+                                              :user/info])]
+    (cond-> (if (nil? (:git/current-repo payload)) (dissoc payload :git/current-repo) payload)
+      (seq config/OAUTH-DOMAIN) (assoc :auth/oauth-domain config/OAUTH-DOMAIN)
+      (seq config/COGNITO-CLIENT-ID) (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID))))
+
 (defn logged-in? []
   (let [token (state/get-auth-refresh-token)]
     (when (string? token)

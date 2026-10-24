@@ -273,6 +273,7 @@ export const getCopiedBlocksFromMemory = (text) => {
   return copiedBlocksMemoryCache.blocks
 }
 
+// Resolves true only after the clipboard write completes; false for denied/failed writes.
 export const writeClipboard = ({text, html, blocks}, ownerWindow) => {
   const navigator = (ownerWindow || window).navigator
   const textBlob = new Blob([text], {
@@ -285,8 +286,8 @@ export const writeClipboard = ({text, html, blocks}, ownerWindow) => {
     name: "clipboard-write"
   }).then((result) => {
     if (result.state != "granted" && result.state != "prompt"){
-      console.debug("Copy without `clipboard-write` permission:", text)
-      return
+      console.debug("Copy without `clipboard-write` permission")
+      return false
     }
     let promise_written = null
     if (typeof ClipboardItem !== "undefined") {
@@ -319,13 +320,14 @@ export const writeClipboard = ({text, html, blocks}, ownerWindow) => {
       }
       promise_written = navigator.clipboard.write(data)
     } else {
-      console.debug("Degraded copy without `ClipboardItem` support:", text)
+      console.debug("Degraded copy without `ClipboardItem` support")
       promise_written = navigator.clipboard.writeText(text)
     }
     return promise_written.then(() => {
-      /* success */
+      return true
     }).catch(e => {
-      console.log(e, "fail")
+      console.warn("Clipboard write failed", e.name)
+      return false
     })
   })
 }

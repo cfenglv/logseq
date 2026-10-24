@@ -61,18 +61,19 @@
   []
   (let [platform (.-platform js/process)
         arch (.-arch js/process)
-        {:keys [provider feed-url channel allow-prerelease? allow-downgrade?] :as options}
-        (updater-config/updater-options electron-version platform arch)]
+        {:keys [feed-url channel allow-prerelease? allow-downgrade?] :as options}
+        (updater-config/updater-options platform arch)]
     (when-not options
       (throw (ex-info "this build has no qualified update provider"
                       {:code :unsupported-updater-build
                        :version electron-version
                        :platform platform
                        :arch arch})))
-    (.setFeedURL autoUpdater
-                 (bean/->js {:provider provider
-                             :url feed-url
-                             :channel channel}))
+    (when feed-url
+      (.setFeedURL autoUpdater
+                   (bean/->js {:provider "generic"
+                               :url feed-url
+                               :channel channel})))
     (when channel
       (set! (.-channel autoUpdater) channel)
       (set! (.-allowPrerelease autoUpdater) allow-prerelease?)
@@ -112,6 +113,7 @@
             (reset! *downloaded-update payload)
             (reset! *downloaded-target
                     {:downloaded-file (.-downloadedFile ^js info)
+                     :version (.-version ^js info)
                      :signed-metadata signed-metadata
                      :verified-archive-sha512 (downloaded-file-sha512 info)
                      ;; electron-updater emits update-downloaded only after its

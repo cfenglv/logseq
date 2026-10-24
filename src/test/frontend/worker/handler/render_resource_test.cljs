@@ -4,6 +4,7 @@
             [frontend.common.thread-api :as thread-api]
             [frontend.db.subs-loader :as subs-loader]
             [frontend.worker.handler.block :as block-handler]
+            [frontend.worker.handler.block-breadcrumb :as block-breadcrumb]
             [frontend.worker.handler.render-resource.engine :as render-engine]
             [frontend.worker.handler.query :as query-handler]
             [frontend.worker.handler.search :as search-handler]
@@ -12,7 +13,9 @@
             [frontend.worker.state :as worker-state]
             [logseq.common.config :as common-config]
             [logseq.common.util :as common-util]
+            [logseq.common.user-navigation :as navigation]
             [logseq.db :as ldb]
+            [logseq.db.common.reference :as db-reference]
             [logseq.db.common.view :as db-view]
             [logseq.db.test.helper :as db-test]))
 
@@ -498,7 +501,11 @@
 (defn- assert-resource-envelope
   [db resource-key watch-keys value response]
   (let [watch-all? (contains? watch-keys [:graph])
-        watch-keys (disj watch-keys [:graph])]
+        watch-keys (cond-> (disj watch-keys [:graph])
+                     (and (= :query (first resource-key)) (not watch-all?))
+                     (into #{[:attr :logseq.property/hide?]
+                             [:attr :logseq.property/deleted-at]
+                             [:attr :block/parent]}))]
     (is (= #{:basis-rev :key :watch-keys :watch-all? :value :slots}
            (set (keys response))))
     (is (= (:max-tx db) (:basis-rev response)))
@@ -519,9 +526,10 @@
   (is (not (contains? block :block/properties)))
   (is (not (contains? block :block/properties-text-values)))
   (is (every? #{:block.temp/positioned-properties
-                :block.temp/breadcrumb
                 :block.temp/refs-count
-                :block.temp/order-list-index}
+                :block.temp/order-list-index
+                :block.temp/class-property-idents
+                :block.temp/has-children?}
               (filter #(= "block.temp" (namespace %)) (keys block))))
   (doseq [reference (concat (keep block [:block/page :block/parent])
                             (:block/refs block)
@@ -694,11 +702,10 @@
             (is (= #{:value}
                    (set (keys (get slots [:block reference-block]))))
                 "A block wire slot has one canonical transaction ID in its value.")
-            (is (= resource-block
-                   (get-in slots [[:block resource-block]
-                                  :value :block/uuid])))
-            (is (contains? (get (:groups response) [:block reference-block])
-                           [:block resource-block]))
+            (is (not (contains? slots [:block resource-block]))
+                "Unrequested :block/refs targets stay out of the snapshot batch.")
+            (is (= #{[:block reference-block]}
+                   (get (:groups response) [:block reference-block])))
             (is (vector? (get-in slots [[:children journal-a] :items])))
             (is (= {:keys #{[:page-lookup "page identity"]}
                     :all? false}
@@ -720,16 +727,18 @@
     (is (= (reference-dependencies [reference-block resource-block])
            (reference-dependencies [resource-block reference-block]))
         "Each requested root must own the same hydration slots in every batch order.")
-    (is (contains? (reference-dependencies [resource-block reference-block])
-                   [:block resource-block])
-        "A root must own its referenced block even when it is not first in the batch.")
+    (is (= #{[:block reference-block]}
+           (reference-dependencies [resource-block reference-block]))
+        "A root does not pull unrequested :block/refs targets into its group.")
     (let [response (request [resource-block reference-block])
           patch (#'subs-loader/entry-response
                  response {:slot-key [:block reference-block]})]
-      (is (= resource-block
-             (get-in patch [:slots [:block resource-block]
+      (is (= reference-block
+             (get-in patch [:slots [:block reference-block]
                             :value :block/uuid]))
-          "The real loader partition must retain a later root's hydrated dependency."))))
+          "The loader partition for a root is that root's own snapshot.")
+      (is (nil? (get-in patch [:slots [:block resource-block]]))
+          "A later requested root is its own group, not a dependency of this one."))))
 
 (deftest render-snapshots-thread-api-fails-fast-without-a-database-test
   (when-let [api (get @thread-api/*thread-apis
@@ -752,6 +761,70 @@
                                 #{[:page-lookup "page identity"]}
                                 page
                                 response))))
+
+(deftest page-identity-seeds-one-canonical-page-slot-test
+  (let [{:keys [conn page]} (render-resource-fixture)
+        db @conn
+        resource-keys [[:page-identity "page identity"]
+                       [:page-identity page]]
+        block-key [:block page]
+        canonical-page (get-in (block-handler/canonical-blocks db [page])
+                               [:blocks page])
+        render (fn [blocks resources]
+                 (render-engine/render-snapshots
+                  db {:blocks blocks :children [] :resources resources} {}))]
+    (doseq [resource-key resource-keys]
+      (let [slot-key [:resource resource-key]
+            response (render [] [resource-key])]
+        (is (= (:max-tx db) (:basis-rev response)))
+        (is (= #{slot-key block-key} (set (keys (:slots response)))))
+        (is (= {slot-key #{slot-key block-key}} (:groups response)))
+        (is (= {:watch {:keys #{[:page-lookup (second resource-key)]}
+                       :all? false}
+                :value page}
+               (get-in response [:slots slot-key])))
+        (is (= {:value canonical-page}
+               (get-in response [:slots block-key])))
+        (is (= response (-> response ldb/write-transit-str ldb/read-transit-str)))))
+    (let [response (render [page] resource-keys)
+          resource-slot-keys (mapv #(vector :resource %) resource-keys)]
+      (is (= (conj (set resource-slot-keys) block-key)
+             (set (keys (:slots response)))))
+      (is (= (assoc (into {} (map (fn [slot-key]
+                                   [slot-key #{slot-key block-key}]))
+                         resource-slot-keys)
+                    block-key #{block-key})
+             (:groups response)))
+      (is (= {:value canonical-page} (get-in response [:slots block-key])))
+      (is (= response (-> response ldb/write-transit-str ldb/read-transit-str))))))
+
+(deftest personal-navigation-resources-watch-hidden-missing-and-ancestor-targets-test
+  (let [conn (db-test/create-conn)
+        parent (random-uuid)
+        child (random-uuid)
+        missing (random-uuid)
+        scope (str (random-uuid))
+        snapshot {:scope scope :token ["test-runtime" 1] :favorites [(str child) (str missing)] :recents [(str parent)]}
+        favorites-key (navigation/resource-key snapshot [:favorites])
+        _ (d/transact! conn [{:db/id -1 :block/uuid parent :block/title "Parent" :block/name "parent"
+                             :block/tags :logseq.class/Page :logseq.property/deleted-at 100}
+                            {:block/uuid child :block/title "Child" :block/parent -1 :block/page -1}])
+        hidden (render-one-resource @conn favorites-key)]
+    (is (= 4 (count favorites-key)))
+    (is (empty? (:value hidden)))
+    (is (= #{[:entity child] [:entity parent] [:entity missing]} (:watch-keys hidden)))
+    (d/transact! conn [[:db/retract [:block/uuid parent] :logseq.property/deleted-at 100]])
+    (let [shown (render-one-resource @conn favorites-key)
+          status-key (navigation/resource-key snapshot [:favorite-status child])
+          recent-key (navigation/resource-key snapshot [:recent-pages []])]
+      (is (= [child] (mapv :block/uuid (:value shown))))
+      (is (= 5 (count status-key)))
+      (is (true? (:value (render-one-resource @conn status-key))))
+      (is (= [parent] (mapv :block/uuid (:value (render-one-resource @conn recent-key))))))
+    (d/transact! conn [{:block/uuid missing :block/title "Arrived" :block/name "arrived" :block/tags :logseq.class/Page}])
+    (is (= [child missing] (mapv :block/uuid (:value (render-one-resource @conn favorites-key)))))
+    (is (= [:favorites] (navigation/resource-key nil [:favorites])))
+    (is (nil? (navigation/resource-key {:loading? true} [:favorites])))))
 
 (deftest sidebar-page-resources-track-favorites-status-and-recent-page-content-test
   (when-let [api (render-resource-api)]
@@ -803,6 +876,7 @@
        @conn
        [:favorites]
        #{[:children favorite-page-uuid]
+         [:attr :block/link]
          [:entity first-page-uuid]}
        [{:db/id first-page-id
          :block/uuid first-page-uuid
@@ -814,7 +888,8 @@
       (assert-resource-envelope
        @conn
        [:favorite-status first-page-uuid]
-       #{[:children favorite-page-uuid]}
+       #{[:children favorite-page-uuid]
+         [:attr :block/link]}
        true
        status-response)
       (assert-resource-envelope
@@ -836,6 +911,33 @@
          :block/tags [page-tag]}]
        recent-response))))
 
+(deftest page-identity-resource-resolves-names-containing-uuid-refs-test
+  (when-let [api (render-resource-api)]
+    (let [conn (db-test/create-conn)
+          leaf-uuid (random-uuid)
+          inner-uuid (random-uuid)]
+      ;; Nested page-ref names keep their inner ref uuid-substituted:
+      ;; "[[foo]] bar" is stored as "[[<leaf-uuid>]] bar".
+      (d/transact! conn
+                   [{:db/id -1
+                     :block/uuid leaf-uuid
+                     :block/tx-id 1
+                     :block/title "foo"
+                     :block/name "foo"}
+                    {:db/id -2
+                     :block/uuid inner-uuid
+                     :block/tx-id 1
+                     :block/title (str "[[" leaf-uuid "]] bar")
+                     :block/name (str "[[" leaf-uuid "]] bar")
+                     :block/refs -1}])
+      (let [response (call-resource api conn
+                                    [:page-identity (str "[[" leaf-uuid "]] bar")])]
+        (assert-resource-envelope @conn
+                                  [:page-identity (str "[[" leaf-uuid "]] bar")]
+                                  #{[:page-lookup (str "[[" leaf-uuid "]] bar")]}
+                                  inner-uuid
+                                  response)))))
+
 (deftest missing-page-identity-keeps-a-creation-watch-key-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn]} (render-resource-fixture)
@@ -845,7 +947,8 @@
                                 resource-key
                                 #{[:page-lookup "missing page"]}
                                 nil
-                                response))))
+                                response)
+      (is (empty? (:slots response))))))
 
 (deftest page-preview-source-resource-resolves-aliases-to-one-uuid-test
   (when-let [api (render-resource-api)]
@@ -911,10 +1014,16 @@
                      :logseq.property/created-from-property
                      [:block/uuid positioned-property]}])
       (let [resource-key [:block-breadcrumb target 16]
+            target-block (d/entity @conn [:block/uuid target])
+            breadcrumb-ancestors (block-breadcrumb/block-breadcrumb @conn target-block 16)
             response (call-resource api conn resource-key)
             expected {:target-uuid target
                       :ancestor-uuids [page parent-a parent-b positioned-property]
+                      :ancestors breadcrumb-ancestors
                       :ref-titles {}}]
+        (is (= ["Page Identity" "Parent A" "Parent B"]
+               (mapv :block/title (take 3 breadcrumb-ancestors)))
+            "Shallow breadcrumb identities keep ancestor titles for CMDK and [[ search.")
         (assert-resource-envelope @conn
                                   resource-key
                                   #{[:entity target]
@@ -924,7 +1033,9 @@
                                     [:entity positioned-property]}
                                   expected
                                   response)
-        (is (every? uuid? (:ancestor-uuids (:value response))))))))
+        (is (every? uuid? (:ancestor-uuids (:value response))))
+        (is (= ["Page Identity" "Parent A" "Parent B" "Positioned"]
+               (mapv :block/title (:ancestors (:value response)))))))))
 
 (deftest block-breadcrumb-resource-honors-the-requested-depth-test
   (when-let [api (render-resource-api)]
@@ -955,6 +1066,8 @@
                      :block/parent -105
                      :block/order "y2"}])
       (let [resource-key [:block-breadcrumb target 1]
+            target-block (d/entity @conn [:block/uuid target])
+            breadcrumb-ancestors (block-breadcrumb/block-breadcrumb @conn target-block 1)
             response (call-resource api conn resource-key)]
         (assert-resource-envelope @conn
                                   resource-key
@@ -963,6 +1076,7 @@
                                     [:entity parent-b]}
                                   {:target-uuid target
                                    :ancestor-uuids [page parent-b]
+                                   :ancestors breadcrumb-ancestors
                                    :ref-titles {}}
                                   response)))))
 
@@ -993,6 +1107,8 @@
                      :block/parent -108
                      :block/order "z1"}])
       (let [resource-key [:block-breadcrumb target-uuid 1]
+            target-block (d/entity @conn [:block/uuid target-uuid])
+            breadcrumb-ancestors (block-breadcrumb/block-breadcrumb @conn target-block 1)
             response (call-resource api conn resource-key)]
         (assert-resource-envelope @conn
                                   resource-key
@@ -1002,6 +1118,7 @@
                                     [:entity ref-uuid]}
                                   {:target-uuid target-uuid
                                    :ancestor-uuids [page parent-uuid]
+                                   :ancestors breadcrumb-ancestors
                                    :ref-titles {ref-uuid "Referenced title"}}
                                   response)
         (d/transact! conn
@@ -1011,6 +1128,213 @@
         (is (= {ref-uuid "Updated title"}
                (get-in (call-resource api conn resource-key)
                        [:value :ref-titles])))))))
+
+(deftest block-breadcrumb-resource-resolves-title-only-uuid-refs-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn page]} (render-resource-fixture)
+          leaf-uuid (random-uuid)
+          inner-uuid (random-uuid)
+          parent-uuid (random-uuid)
+          nested-parent-uuid (random-uuid)
+          target-uuid (random-uuid)]
+      (d/transact! conn
+                   [{:db/id -110
+                     :block/uuid leaf-uuid
+                     :block/tx-id 21
+                     :block/title "foo"}
+                    {:db/id -111
+                     :block/uuid inner-uuid
+                     :block/tx-id 21
+                     :block/title (str "[[" leaf-uuid "]] bar")
+                     :block/refs -110}
+                    ;; "[[[[foo]] bar]] nested" stored form: the inner [[foo]]
+                    ;; is uuid-substituted inside the outer page ref.
+                    {:db/id -112
+                     :block/uuid parent-uuid
+                     :block/tx-id 21
+                     :block/title (str "[[[[" leaf-uuid "]] bar]] nested")
+                     :block/page [:block/uuid page]
+                     :block/parent [:block/uuid page]
+                     :block/order "n0"
+                     :block/refs -111}
+                    ;; A [[uuid]] whose target title itself references a uuid.
+                    {:db/id -113
+                     :block/uuid nested-parent-uuid
+                     :block/tx-id 21
+                     :block/title (str "[[" inner-uuid "]] deeper")
+                     :block/page [:block/uuid page]
+                     :block/parent -112
+                     :block/order "n1"
+                     :block/refs -111}
+                    {:db/id -114
+                     :block/uuid target-uuid
+                     :block/tx-id 21
+                     :block/title "Target"
+                     :block/page [:block/uuid page]
+                     :block/parent -113
+                     :block/order "n2"}])
+      (let [resource-key [:block-breadcrumb target-uuid 16]
+            target-block (d/entity @conn [:block/uuid target-uuid])
+            breadcrumb-ancestors (block-breadcrumb/block-breadcrumb @conn target-block 16)
+            response (call-resource api conn resource-key)]
+        (assert-resource-envelope @conn
+                                  resource-key
+                                  #{[:entity target-uuid]
+                                    [:entity page]
+                                    [:entity parent-uuid]
+                                    [:entity nested-parent-uuid]
+                                    [:entity leaf-uuid]
+                                    [:entity inner-uuid]}
+                                  {:target-uuid target-uuid
+                                   :ancestor-uuids [page parent-uuid nested-parent-uuid]
+                                   :ancestors breadcrumb-ancestors
+                                   :ref-titles {leaf-uuid "foo"
+                                                inner-uuid (str "[[" leaf-uuid "]] bar")}}
+                                  response)))))
+
+(deftest block-breadcrumb-resource-resolves-uuids-inside-ref-titles-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn page]} (render-resource-fixture)
+          leaf-uuid (random-uuid)
+          ref-uuid (random-uuid)
+          ancestor-uuid (random-uuid)
+          target-uuid (random-uuid)]
+      (d/transact! conn
+                   [{:db/id -110
+                     :block/uuid leaf-uuid
+                     :block/tx-id 21
+                     :block/title "foo"}
+                    {:db/id -111
+                     :block/uuid ref-uuid
+                     :block/tx-id 21
+                     :block/title (str "[[" leaf-uuid "]] bar")
+                     :block/refs -110}
+                    ;; Block-ref shape: the ancestor title references a block
+                    ;; whose own title is an id ref, so the leaf uuid is only
+                    ;; reachable through the ref's title.
+                    {:db/id -112
+                     :block/uuid ancestor-uuid
+                     :block/tx-id 21
+                     :block/title (str "[[" ref-uuid "]] nested")
+                     :block/page [:block/uuid page]
+                     :block/parent [:block/uuid page]
+                     :block/order "n0"
+                     :block/refs -111}
+                    {:db/id -113
+                     :block/uuid target-uuid
+                     :block/tx-id 21
+                     :block/title "Target"
+                     :block/page [:block/uuid page]
+                     :block/parent -112
+                     :block/order "n1"}])
+      (let [resource-key [:block-breadcrumb target-uuid 16]
+            target-block (d/entity @conn [:block/uuid target-uuid])
+            breadcrumb-ancestors (block-breadcrumb/block-breadcrumb @conn target-block 16)
+            response (call-resource api conn resource-key)]
+        (assert-resource-envelope @conn
+                                  resource-key
+                                  #{[:entity target-uuid]
+                                    [:entity page]
+                                    [:entity ancestor-uuid]
+                                    [:entity leaf-uuid]
+                                    [:entity ref-uuid]}
+                                  {:target-uuid target-uuid
+                                   :ancestor-uuids [page ancestor-uuid]
+                                   :ancestors breadcrumb-ancestors
+                                   :ref-titles {leaf-uuid "foo"
+                                                ref-uuid (str "[[" leaf-uuid "]] bar")}}
+                                  response)))))
+
+(deftest block-breadcrumb-resource-returns-empty-payload-for-missing-blocks-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn]} (render-resource-fixture)
+          missing (random-uuid)
+          resource-key [:block-breadcrumb missing 16]
+          response (call-resource api conn resource-key)]
+      (assert-resource-envelope @conn
+                                  resource-key
+                                  #{[:entity missing]}
+                                  {:target-uuid missing
+                                   :ancestor-uuids []
+                                   :ancestors []
+                                   :ref-titles {}}
+                                  response))))
+
+(deftest block-breadcrumb-keeps-root-first-order-when-zoomed-into-nested-page-block-test
+  (let [conn (db-test/create-conn)
+        library (ldb/get-built-in-page @conn common-config/library-page-name)
+        some-page (random-uuid)
+        test-a (random-uuid)
+        test-b (random-uuid)
+        test-c (random-uuid)
+        inner (random-uuid)]
+    (is (some? library) "Built-in Library page is required for nested page breadcrumbs.")
+    (d/transact! conn
+                 [{:db/id -1
+                   :block/uuid some-page
+                   :block/tx-id 21
+                   :block/title "some page"
+                   :block/name "some page"
+                   :block/tags :logseq.class/Page
+                   :block/parent (:db/id library)}
+                  {:db/id -2
+                   :block/uuid test-a
+                   :block/tx-id 21
+                   :block/title "test a"
+                   :block/name "test a"
+                   :block/tags :logseq.class/Page
+                   :block/parent -1}
+                  {:db/id -3
+                   :block/uuid test-b
+                   :block/tx-id 21
+                   :block/title "test b"
+                   :block/name "test b"
+                   :block/tags :logseq.class/Page
+                   :block/parent -2}
+                  {:db/id -4
+                   :block/uuid test-c
+                   :block/tx-id 21
+                   :block/title "test c"
+                   :block/page -3
+                   :block/parent -3
+                   :block/order "a0"}
+                  {:db/id -5
+                   :block/uuid inner
+                   :block/tx-id 21
+                   :block/title "inner"
+                   :block/page -3
+                   :block/parent -4
+                   :block/order "a1"}])
+    (let [page-block (d/entity @conn [:block/uuid test-b])
+          zoomed-block (d/entity @conn [:block/uuid test-c])
+          inner-block (d/entity @conn [:block/uuid inner])
+          page-ancestors (block-breadcrumb/block-breadcrumb @conn page-block)
+          zoomed-ancestors (block-breadcrumb/block-breadcrumb @conn zoomed-block)
+          depth-limited-ancestors (block-breadcrumb/block-breadcrumb @conn inner-block 1)]
+      (is (= ["Library" "some page" "test a"]
+             (mapv :block/title page-ancestors))
+          "Page breadcrumb stays root-first and omits the current page.")
+      (is (= ["Library" "some page" "test a" "test b"]
+             (mapv :block/title zoomed-ancestors))
+          "Zoomed block breadcrumb stays root-first and includes the parent page.")
+      (is (= ["test b" "test c"]
+             (mapv :block/title depth-limited-ancestors))
+          "Truncated walks still prepend :block/page when it is not already an ancestor.")
+      (when-let [api (render-resource-api)]
+        (let [resource-key [:block-breadcrumb test-c 16]
+              response (call-resource api conn resource-key)]
+          (assert-resource-envelope @conn
+                                    resource-key
+                                    #{[:entity test-c]
+                                      [:entity (:block/uuid library)]
+                                      [:entity some-page]
+                                      [:entity test-a]
+                                      [:entity test-b]}
+                                    {:target-uuid test-c
+                                     :ancestor-uuids [(:block/uuid library) some-page test-a test-b]
+                                     :ancestors zoomed-ancestors
+                                     :ref-titles {}}
+                                    response))))))
 
 (deftest journals-resource-returns-only-ordered-uuids-test
   (when-let [api (render-resource-api)]
@@ -1063,19 +1387,23 @@
                             #"Unknown renderer resource key"
                             (call-resource-raw api conn resource-key))))))
 
-(deftest canonical-visible-blocks-include-ready-properties-and-breadcrumbs-test
-  (let [{:keys [conn page resource-block positioned-property]}
+(deftest canonical-visible-blocks-keep-properties-without-preloading-breadcrumbs-test
+  (let [{:keys [conn resource-block positioned-property]}
         (render-resource-fixture)
         positioned-property-id (:db/id (d/entity @conn
                                                   [:block/uuid positioned-property]))
         _ (d/transact! conn [[:db/add positioned-property-id :block/tx-id 20]])
         response (block-handler/canonical-blocks @conn [resource-block])
         target (get-in response [:blocks resource-block])]
-    (is (contains? (:blocks response) positioned-property)
-        "A positioned property row is ready in the same visible block load.")
-    (is (= [page]
-           (mapv :block/uuid (:block.temp/breadcrumb target)))
-        "The primary breadcrumb is ready with its owning block.")
+    (is (not (contains? (:blocks response) positioned-property))
+        "Inlined property definitions do not become sibling canonical snapshots.")
+    (is (= [positioned-property]
+           (mapv :block/uuid (get-in target [:block.temp/positioned-properties :block-right])))
+        "Positioned chips arrive in the same snapshot as the row.")
+    (is (= "right" (:user.property/positioned target))
+        "The written property value stays on the row.")
+    (is (not (contains? target :block.temp/breadcrumb))
+        "Ancestor data loads only when a breadcrumb is displayed.")
     (is (= response
            (-> response ldb/write-transit-str ldb/read-transit-str)))))
 
@@ -1111,7 +1439,8 @@
           expected {:full-properties
                     [{:property-uuid display-property
                       :property-ident :user.property/display
-                      :value property-value}]
+                      :value property-value
+                      :closed-value-uuids [closed-value]}]
                     :hidden-properties
                     [{:property-uuid hidden-property
                       :property-ident :user.property/hidden
@@ -1168,23 +1497,6 @@
         (is (some #(= property-uuid (:property-uuid %)) rows)
             "A class-configured property is rendered even when the block has no own value.")))))
 
-(deftest block-positioned-properties-resource-watches-every-candidate-definition-test
-  (when-let [api (render-resource-api)]
-    (let [{:keys [conn resource-block display-property positioned-property hidden-property]}
-          (render-resource-fixture)
-          resource-key [:block-positioned-properties resource-block :block-right]
-          response (call-resource api conn resource-key)]
-      (assert-resource-envelope
-       @conn
-       resource-key
-       #{[:entity resource-block]
-         [:property-config]
-         [:entity display-property]
-         [:entity positioned-property]
-         [:entity hidden-property]}
-       [positioned-property]
-       response))))
-
 (deftest block-bidirectional-properties-resource-returns-uuid-groups-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn resource-block bidirectional-class bidirectional-entity]}
@@ -1210,6 +1522,30 @@
                                 []
                                 response))))
 
+(deftest literature-ref-count-watches-associated-pdf-and-annotation-refs-test
+  (let [{:keys [conn resource-block reference-block journal-child-a journal-child-b journal-grandchild]}
+        (render-resource-fixture)
+        lookup (fn [id] [:block/uuid id])
+        paper (lookup resource-block)
+        pdf (lookup journal-child-b)
+        annotation (lookup journal-grandchild)
+        key [:block-ref-count resource-block]]
+    (d/transact! conn [[:db/add paper :logseq.property/literature-item? true]
+                       [:db/add paper :logseq.property/literature-assets pdf]
+                       [:db/retract (lookup reference-block) :block/refs paper]
+                       [:db/add (lookup reference-block) :block/refs pdf]
+                       [:db/add annotation :logseq.property/ls-type :annotation]
+                       [:db/add annotation :logseq.property/asset pdf]
+                       [:db/add (lookup journal-child-a) :block/refs annotation]])
+    (let [response (call-resource render-one-resource conn key)]
+      (is (= 2 (:value response)))
+      (is (every? (:watch-keys response)
+                  [[:entity resource-block] [:entity journal-child-b]
+                   [:refs resource-block] [:refs journal-child-b] [:refs journal-grandchild]
+                   [:property-membership :logseq.property/asset]])))
+    (d/transact! conn [[:db/retract paper :logseq.property/literature-assets pdf]])
+    (is (zero? (:value (call-resource render-one-resource conn key))))))
+
 (deftest block-ref-count-resource-uses-the-target-reference-key-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn resource-block]} (render-resource-fixture)
@@ -1232,6 +1568,86 @@
                                 0
                                 response))))
 
+(deftest block-ref-count-resource-counts-class-page-link-refs-test
+  ;; db-test#1292: a tag page with [[tag]] page-link refs must expose a
+  ;; positive :block-ref-count so Linked References can mount. #tag instances
+  ;; stay in the objects table and must not inflate that count.
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn page class-page resource-block]}
+          (render-resource-fixture)
+          class-id (entity-id @conn class-page)
+          page-id (entity-id @conn page)
+          page-link-id (entity-id @conn resource-block)
+          tagged-uuid (random-uuid)
+          resource-key [:block-ref-count class-page]
+          _ (d/transact! conn
+                         [{:block/uuid tagged-uuid
+                           :block/tx-id 20
+                           :block/title "Rumba #dance"
+                           :block/page page-id
+                           :block/parent page-id
+                           :block/order "z0"
+                           :block/tags class-id
+                           :block/refs class-id}
+                          [:db/add page-link-id :block/refs class-id]])
+          linked-view (add-view! conn :linked-references class-page)
+          response (call-resource api conn resource-key)
+          view-response (call-resource api conn
+                                       [:view-data linked-view
+                                        {:feature-type :linked-references
+                                         :sorting [{:id :block/title :asc? true}]}])
+          linked (db-reference/get-linked-references @conn class-id)
+          linked-titles (set (map :block/title (:ref-blocks linked)))]
+      (assert-resource-envelope @conn
+                                resource-key
+                                #{[:refs class-page]}
+                                1
+                                response)
+      (is (pos? (:value response))
+          "Class/tag pages with a [[tag]] page-link ref must report a positive count.")
+      (is (contains? (set (get-in view-response [:value :rows])) resource-block)
+          "Linked References view-data must include the page-link ref.")
+      (is (not (contains? (set (get-in view-response [:value :rows])) tagged-uuid))
+          "Tagged #tag instances belong in the objects table, not Linked References.")
+      (is (contains? linked-titles "Resource block"))
+      (is (not (contains? linked-titles "Rumba #dance"))))))
+
+(deftest block-ref-count-resource-excludes-class-tagged-instances-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn page class-page]} (render-resource-fixture)
+          class-id (entity-id @conn class-page)
+          page-id (entity-id @conn page)
+          resource-key [:block-ref-count class-page]
+          _ (d/transact! conn
+                         [{:block/uuid (random-uuid)
+                           :block/tx-id 20
+                           :block/title "Rumba #dance"
+                           :block/page page-id
+                           :block/parent page-id
+                           :block/order "z0"
+                           :block/tags class-id
+                           :block/refs class-id}])
+          response (call-resource api conn resource-key)]
+      (assert-resource-envelope @conn
+                                resource-key
+                                #{[:refs class-page]}
+                                0
+                                response))))
+
+(deftest block-ref-count-resource-skips-property-incoming-refs-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn property-page resource-block]} (render-resource-fixture)
+          property-id (entity-id @conn property-page)
+          page-link-id (entity-id @conn resource-block)
+          resource-key [:block-ref-count property-page]
+          _ (d/transact! conn [[:db/add page-link-id :block/refs property-id]])
+          response (call-resource api conn resource-key)]
+      (assert-resource-envelope @conn
+                                resource-key
+                                #{[:refs property-page]}
+                                0
+                                response))))
+
 (deftest block-unlinked-ref-exists-resource-gates-empty-reference-views-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn page view-row]} (render-resource-fixture)
@@ -1248,6 +1664,23 @@
                                     true
                                     response)))
       (with-redefs [search-handler/search-blocks (fn [& _] [])]
+        (let [response (call-resource-with-runtime api conn resource-key {:repo test-repo})]
+          (assert-resource-envelope @conn resource-key
+                                    #{}
+                                    false
+                                    response))))))
+
+(deftest block-unlinked-ref-exists-resource-ignores-own-page-mentions-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn page view-row]} (render-resource-fixture)
+          page-id (entity-id @conn page)
+          row-id (entity-id @conn view-row)
+          resource-key [:block-unlinked-ref-exists page]
+          _ (d/transact! conn [[:db/add page-id :block/title "Reference target"]
+                               [:db/add row-id :block/title "Mentions reference target"]
+                               [:db/add row-id :block/page page-id]])]
+      (with-redefs [search-handler/search-blocks
+                    (fn [_repo _query _opts] [{:db/id row-id}])]
         (let [response (call-resource-with-runtime api conn resource-key {:repo test-repo})]
           (assert-resource-envelope @conn resource-key
                                     #{}
@@ -1597,12 +2030,17 @@
     (let [{:keys [conn view-owner view-a view-b]}
           (render-resource-fixture)
           resource-key [:views view-owner :class-objects]
-          response (call-resource api conn resource-key)]
+          response (call-resource api conn resource-key)
+          by-name (call-resource api conn [:views "projects" :class-objects])]
       (assert-resource-envelope @conn
                                 resource-key
                                 #{resource-key}
                                 [view-a view-b]
-                                response))))
+                                response)
+      (is (= #{resource-key} (:watch-keys by-name))
+          "String owner lookups must watch the canonical UUID key used by invalidation.")
+      (is (= [view-a view-b] (:value by-name))
+          "All Pages can resolve $$$views by page name and skip page-identity."))))
 
 (deftest view-data-resource-supports-every-feature-with-flat-uuid-rows-test
   (when-let [api (render-resource-api)]
@@ -1669,7 +2107,76 @@
           (is (contains? (set (get-in response [:value :rows])) row))
           (is (every? uuid? (get-in response [:value :rows]))))))))
 
-(deftest all-pages-view-data-includes-the-height-derived-initial-block-window-test
+(deftest query-view-data-resource-returns-property-maps-for-columns-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn view-row]} (render-resource-fixture)
+          query-view (add-view! conn :query-result)
+          _ (d/transact! conn
+                         [[:db/add (entity-id @conn view-row)
+                           :logseq.property/status
+                           :logseq.property/status.doing]])
+          resource-key [:view-data query-view
+                        {:feature-type :query-result
+                         :sorting []
+                         :query-row-uuids [view-row]}]
+          properties (get-in (call-resource api conn resource-key)
+                             [:value :properties])
+          status (some #(when (= :logseq.property/status (:db/ident %)) %)
+                       properties)]
+      (is (seq properties))
+      (is (every? #(keyword? (:db/ident %)) properties)
+          "Query columns are built from property maps, not bare idents.")
+      (is (= "Status" (:block/title status)))
+      (is (= :default (:logseq.property/type status)))
+      (is (= #{"Backlog" "Todo" "Doing" "In Review" "Done" "Canceled"}
+             (set (map :block/title (:property/closed-values status))))))))
+
+(deftest query-view-data-keeps-projected-columns-even-without-values-test
+  (let [{:keys [conn view-row]} (render-resource-fixture)
+        query-uuid (random-uuid)
+        query-view (add-view! conn :query-result)
+        resource-key [:view-data query-view
+                      {:feature-type :query-result :query-row-uuids [view-row]}]]
+    (d/transact! conn [{:block/uuid query-uuid
+                        :block/title "{:query [:find (pull ?b [:logseq.property/priority]) :where [?b :block/title]]}"
+                        :logseq.property.node/display-type :code}
+                       {:block/uuid query-view
+                        :logseq.property/query [:block/uuid query-uuid]}])
+    (let [response (call-resource (render-resource-api) conn resource-key)]
+      (is (= [:logseq.property/priority]
+             (mapv :db/ident (get-in response [:value :properties]))))
+      (is (contains? (:watch-keys response) [:entity query-uuid])))))
+
+(deftest view-data-resource-returns-empty-rows-after-the-view-is-deleted-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn view-owner view-a view-b]}
+          (render-resource-fixture)
+          resource-key [:view-data view-a
+                        {:feature-type :class-objects
+                         :sorting [{:id :block/title :asc? true}]}]
+          views-key [:views view-owner :class-objects]
+          live (call-resource api conn resource-key)
+          _ (is (seq (get-in live [:value :rows]))
+                "The live view must return rows before delete.")
+          _ (d/transact! conn [[:db/retractEntity [:block/uuid view-a]]])
+          response (call-resource api conn resource-key)
+          batch (render-engine/render-snapshots
+                 @conn
+                 {:blocks []
+                  :children []
+                  :resources [resource-key views-key]}
+                 {})]
+      (assert-resource-envelope @conn
+                                resource-key
+                                #{[:entity view-a]}
+                                {:partition :flat :count 0 :rows []}
+                                response)
+      (is (= [view-b] (get-in batch [:slots [:resource views-key] :value]))
+          "A deleted view-data snapshot must not fail sibling :views in the same batch.")
+      (is (= {:partition :flat :count 0 :rows []}
+             (get-in batch [:slots [:resource resource-key] :value]))))))
+
+(deftest all-pages-view-data-returns-the-first-window-ids-without-row-snapshots-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn]} (render-resource-fixture)
           view-uuid (add-view! conn :all-pages)
@@ -1679,15 +2186,103 @@
                          :initial-row-count 2}]
           response (call-resource api conn resource-key)
           value (:value response)
-          initial-rows (take 2 (:rows value))]
+          initial-rows (take 2 (:rows value))
+          previews (:row-previews value)]
       (is (not (contains? value :initial-blocks)))
-      (is (every? #(contains? (:slots response) [:block %])
-                  (take 2 (:rows value))))
-      (is (every? #(contains? % :block.temp/positioned-properties)
-                  (map #(get-in response [:slots [:block %] :value])
-                       initial-rows)))
+      (is (= 2 (count initial-rows)))
+      (is (every? uuid? initial-rows))
+      (is (not-any? #(contains? (:slots response) [:block %])
+                    initial-rows)
+          "The first window stays an ID list. Full row snapshots still load through use-block.")
+      (is (contains? (:watch-keys response) [:attr :block/title])
+          "The first-window previews include titles, so title edits must refresh the view-data resource.")
+      (is (= (count initial-rows) (count previews)))
+      (is (every? (fn [row]
+                    (let [preview (get previews row)]
+                      (and (= row (:block/uuid preview))
+                           (string? (:block/title preview))
+                           (integer? (:db/id preview))
+                           (true? (:block.temp/first-window-preview? preview)))))
+                  initial-rows)
+          "First-window titles travel with the IDs so the table can paint without use-block.")
       (is (= response
              (-> response ldb/write-transit-str ldb/read-transit-str))))))
+
+(deftest class-objects-view-data-returns-the-first-window-ids-without-row-snapshots-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn view-a view-row]} (render-resource-fixture)
+          resource-key [:view-data view-a
+                        {:feature-type :class-objects
+                         :sorting [{:id :block/title :asc? true}]
+                         :initial-row-count 1}]
+          response (call-resource api conn resource-key)
+          value (:value response)
+          preview (get (:row-previews value) view-row)]
+      (is (= 1 (count (:rows value))))
+      (is (contains? (set (:rows value)) view-row))
+      (is (not (contains? (:slots response) [:block view-row]))
+          "Class-object first windows stay ID lists so open is not blocked on snapshots.")
+      (is (= view-row (:block/uuid preview)))
+      (is (= "Object row" (:block/title preview))
+          "The first window includes the name so Tags/Movies can paint before use-block.")
+      (is (true? (:block.temp/first-window-preview? preview)))
+      (is (integer? (:db/id preview)))
+      (is (= response
+             (-> response ldb/write-transit-str ldb/read-transit-str))))))
+
+(deftest all-pages-view-data-row-offset-returns-the-scrolled-window-without-remaining-ids-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn]} (render-resource-fixture)
+          view-uuid (add-view! conn :all-pages)
+          first-key [:view-data view-uuid
+                     {:feature-type :all-pages
+                      :sorting [{:id :block/title :asc? true}]
+                      :initial-row-count 2}]
+          offset-key [:view-data view-uuid
+                      {:feature-type :all-pages
+                       :sorting [{:id :block/title :asc? true}]
+                       :initial-row-count 2
+                       :row-offset 1}]
+          first-value (:value (call-resource api conn first-key))
+          offset-value (:value (call-resource api conn offset-key))
+          first-rows (:rows first-value)
+          offset-rows (:rows offset-value)
+          preview (get (:row-previews offset-value) (first offset-rows))]
+      (is (= 2 (count first-rows)))
+      (is (= 2 (count offset-rows)))
+      (is (= (second first-rows) (first offset-rows))
+          "The offset window starts after the first row, not after collecting every page id.")
+      (is (not= first-rows offset-rows))
+      (is (= (count offset-rows) (count (:row-previews offset-value))))
+      (is (true? (:block.temp/first-window-preview? preview)))
+      (is (string? (:block/title preview)))
+      (is (not-any? #(contains? (:slots (call-resource api conn offset-key)) [:block %])
+                    offset-rows)))))
+
+(deftest all-pages-snapshot-skips-named-entities-without-uuid-test
+  (let [api (get @thread-api/*thread-apis :thread-api/get-render-snapshots)]
+    (if-not api
+      (is false "Missing thread API: get-render-snapshots")
+      (let [{:keys [conn page]} (render-resource-fixture)
+            view-uuid (add-view! conn :all-pages)
+            resource-key [:view-data view-uuid
+                          {:feature-type :all-pages
+                           :sorting [{:id :block/updated-at :asc? false}]}]
+            request {:blocks []
+                     :children []
+                     :resources [resource-key]}
+            snapshot (fn []
+                       (with-redefs [worker-state/get-datascript-conn (constantly conn)]
+                         (api test-repo request)))
+            before (get-in (snapshot) [:slots [:resource resource-key] :value :rows])
+            _ (d/transact! conn [{:block/name "external url"
+                                  :block/title "External URL"}])
+            after (get-in (snapshot) [:slots [:resource resource-key] :value :rows])]
+        (is (seq before))
+        (is (contains? (set before) page))
+        (is (every? uuid? before))
+        (is (= before after)
+            "A leftover :block/name entity without :block/uuid must not fail All Pages.")))))
 
 (deftest opaque-query-resource-declares-watch-all-test
   (when-let [api (render-resource-api)]
@@ -1797,6 +2392,24 @@
                       (mapcat :rows (:partitions group)))
             "Nested view rows cross the boundary only as UUIDs.")))))
 
+(deftest unlinked-reference-gate-excludes-links-to-page-alias-test
+  (let [conn (db-test/create-conn)
+        topic (random-uuid)
+        alias (random-uuid)
+        outside (random-uuid)
+        candidate (random-uuid)]
+    (d/transact! conn [{:db/id -1 :block/uuid topic :block/title "Topic" :block/name "topic"
+                       :block/alias [-2]}
+                      {:db/id -2 :block/uuid alias :block/title "Alias" :block/name "alias"}
+                      {:db/id -3 :block/uuid outside :block/title "Outside" :block/name "outside"}
+                      {:block/uuid candidate :block/title "Topic is already linked via Alias"
+                       :block/page -3 :block/refs [-2]}])
+    (let [db @conn
+          topic-id (:db/id (d/entity db [:block/uuid topic]))
+          candidate-id (:db/id (d/entity db [:block/uuid candidate]))]
+      (with-redefs [search-handler/search-blocks (fn [& _] [{:db/id candidate-id}])]
+        (is (false? (block-handler/unlinked-reference-exists? db "synthetic" topic-id)))))))
+
 (deftest unlinked-references-resource-normalizes-list-partitions-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn view-owner view-a view-row]} (render-resource-fixture)
@@ -1874,6 +2487,7 @@
           (is (not (contains? (:watch-keys response)
                               [:attr :block/page]))))))))
 
+
 (deftest query-resource-executes-dsl-with-only-serialized-context-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn view-row]} (render-resource-fixture)
@@ -1948,6 +2562,86 @@
                                 {:rows [journal-grandchild]}
                                 response))))
 
+(deftest query-resource-keeps-escaped-paren-regex-inputs-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn]} (render-resource-fixture)
+          matcher "\\([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\)"
+          resource-key
+          [:query {:kind :datalog
+                   :query '[:find ?regex
+                            :in $ ?matcher
+                            :where [(re-pattern ?matcher) ?regex]]
+                   :inputs [matcher]}]
+          response (call-resource api conn resource-key)]
+      (is (regexp? (first (:rows (:value response))))
+          "Broken-reference regex inputs must not be read as a character literal."))))
+
+(deftest render-snapshots-isolates-failing-query-resources-test
+  (let [{:keys [conn]} (render-resource-fixture)
+        journals-key [:journals]
+        failing-query
+        [:query {:kind :datalog
+                 :query '[:find ?regex
+                          :in $ ?matcher
+                          :where [(re-pattern ?matcher) ?regex]]
+                 :inputs ["("]}]
+        response (render-engine/render-snapshots
+                  @conn
+                  {:blocks []
+                   :children []
+                   :resources [failing-query journals-key]}
+                  {})]
+    (is (nil? (get-in response [:slots [:resource journals-key] :error]))
+        "A failing query must not fail sibling resources in the same snapshot.")
+    (is (vector? (get-in response [:slots [:resource journals-key] :value])))
+    (is (re-find #"Invalid regular expression"
+                 (get-in response [:slots [:resource failing-query] :value :error :message])))
+    (is (= [] (get-in response [:slots [:resource failing-query] :value :rows])))
+    (is (= response
+           (-> response ldb/write-transit-str ldb/read-transit-str)))))
+
+(deftest render-snapshots-isolates-incomplete-dsl-query-resources-test
+  (let [{:keys [conn]} (render-resource-fixture)
+        journals-key [:journals]
+        ;; Incomplete syntax while editing a /query block: cljs.reader throws
+        ;; a plain js/Error, not a js/SyntaxError.
+        failing-query [:query {:kind :dsl :query "((and)"}]
+        response (render-engine/render-snapshots
+                  @conn
+                  {:blocks []
+                   :children []
+                   :resources [failing-query journals-key]}
+                  {})]
+    (is (nil? (get-in response [:slots [:resource journals-key] :error]))
+        "An unreadable DSL query must not fail sibling resources in the same snapshot.")
+    (is (vector? (get-in response [:slots [:resource journals-key] :value])))
+    (is (string? (get-in response [:slots [:resource failing-query] :value :error :message])))
+    (is (= [] (get-in response [:slots [:resource failing-query] :value :rows])))
+    (is (= response
+           (-> response ldb/write-transit-str ldb/read-transit-str)))))
+
+(deftest render-snapshots-keeps-query-error-data-transit-safe-test
+  (let [{:keys [conn]} (render-resource-fixture)
+        journals-key [:journals]
+        ;; A readable but invalid DSL query: datascript's parser reports
+        ;; unknown vars with ex-data containing deftyped AST nodes that
+        ;; transit cannot encode.
+        failing-query [:query {:kind :dsl :query "((and))"}]
+        response (render-engine/render-snapshots
+                  @conn
+                  {:blocks []
+                   :children []
+                   :resources [failing-query journals-key]}
+                  {})]
+    (is (nil? (get-in response [:slots [:resource journals-key] :error]))
+        "An invalid DSL query must not fail sibling resources in the same snapshot.")
+    (is (vector? (get-in response [:slots [:resource journals-key] :value])))
+    (is (string? (get-in response [:slots [:resource failing-query] :value :error :message])))
+    (is (= [] (get-in response [:slots [:resource failing-query] :value :rows])))
+    (is (= response
+           (-> response ldb/write-transit-str ldb/read-transit-str))
+        "Query error payloads must stay transit-encodable.")))
+
 (deftest query-resource-injects-built-in-rules-and-merges-user-rules-test
   (when-let [api (render-resource-api)]
     (let [{:keys [conn resource-block reference-block]}
@@ -2000,6 +2694,66 @@
                                 (datalog-query-watch-keys resource-key)
                                 {:rows [["Jan 1st, 2020" 20200101]]}
                                 response))))
+
+(deftest query-resource-renders-partial-block-pulls-as-blocks-test
+  (let [{:keys [conn journal-a journal-b]} (render-resource-fixture)]
+    (doseq [query ['[:find (pull ?p [:block/journal-day])
+                    :in $ ?start ?end
+                    :where [?p :block/journal-day ?day]
+                    [(>= ?day ?start)] [(<= ?day ?end)]]
+                   '[:find (pull $ ?p [:block/journal-day])
+                     :in $ ?start ?end
+                     :where [?p :block/journal-day ?day]
+                     [(>= ?day ?start)] [(<= ?day ?end)]]]]
+      (let [resource-key [:query {:kind :datalog :query query
+                                  :inputs [20200101 20200102]}]
+            response (call-resource (render-resource-api) conn resource-key)]
+        (is (= #{journal-a journal-b} (set (get-in response [:value :rows]))))
+        (testing "transforms can still read the requested properties"
+          (let [transformed-key
+                (update resource-key 1 assoc :result-transform-edn
+                        "(fn [rows] (filter #(= 20200101 (:block/journal-day %)) rows))")]
+            (is (= [journal-a]
+                   (get-in (call-resource (render-resource-api) conn transformed-key)
+                           [:value :rows])))))))))
+
+(deftest partial-block-pull-filters-hidden-and-deleted-results-test
+  (let [{:keys [conn journal-a journal-b]} (render-resource-fixture)
+        resource-key [:query {:kind :datalog
+                              :query '[:find (pull ?p [:block/journal-day])
+                                       :where [?p :block/journal-day]]}]]
+    (d/transact! conn [{:block/uuid journal-a :logseq.property/hide? true}
+                       {:block/uuid journal-b :logseq.property/deleted-at 1000}])
+    (let [response (call-resource (render-resource-api) conn resource-key)]
+      (is (empty? (get-in response [:value :rows])))
+      (is (contains? (:watch-keys response) [:attr :logseq.property/hide?]))
+      (is (contains? (:watch-keys response) [:attr :logseq.property/deleted-at])))))
+
+(deftest query-resource-keeps-pull-maps-without-uuid-test
+  (when-let [api (render-resource-api)]
+    (let [{:keys [conn journal-a]} (render-resource-fixture)
+          doing-uuid (random-uuid)]
+      (d/transact! conn [{:block/uuid doing-uuid
+                          :block/tx-id 20
+                          :block/title "Doing task"
+                          :block/page [:block/uuid journal-a]
+                          :block/parent [:block/uuid journal-a]
+                          :block/order "z0"
+                          :logseq.property/status :logseq.property/status.doing}])
+      (let [resource-key
+            [:query {:kind :datalog
+                     :query '[:find (pull ?h [*]) (pull ?p [:block/title :block/journal-day])
+                              :where
+                              (task ?h #{"Doing"})
+                              [?h :block/page ?p]]}]
+            response (call-resource api conn resource-key)]
+        (assert-resource-envelope @conn
+                                  resource-key
+                                  (datalog-query-watch-keys resource-key)
+                                  {:rows [[doing-uuid
+                                           {:block/title "Jan 1st, 2020"
+                                            :block/journal-day 20200101}]]}
+                                  response)))))
 
 (deftest query-resource-applies-serialized-transform-and-top-level-filter-test
   (when-let [api (render-resource-api)]
@@ -2055,6 +2809,9 @@
           [:query {:kind :dsl
                    :query "\"needle\""
                    :current-block-uuid view-row}]]
+      (d/transact! conn [{:block/uuid hidden-uuid
+                         :block/title "needle hidden"
+                         :logseq.property/hide? true}])
       (with-redefs [search-handler/search-blocks
                     (fn [repo query-text options]
                       (swap! calls conj [repo query-text options])
@@ -2125,15 +2882,7 @@
         (is (thrown? js/Error
                      (call-resource-raw api conn
                                         [:query {:kind :dsl
-                                                 :query "\"needle\""}]))))
-      (testing "query result maps without UUIDs never cross the boundary"
-        (with-redefs [query-dsl/execute-query
-                      (fn [_query _db _opts]
-                        [[{:db/id 1 :block/title "No UUID"}]])]
-          (is (thrown? js/Error
-                       (call-resource-raw api conn
-                                          [:query {:kind :dsl
-                                                   :query "(task TODO)"}]))))))))
+                                                 :query "\"needle\""}])))))))
 
 (deftest block-sync-conflicts-resource-is-owned-by-the-sync-state-provider-test
   (when-let [api (render-resource-api)]

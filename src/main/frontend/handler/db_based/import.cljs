@@ -169,7 +169,9 @@
                       :warning false))
                    (state/set-state! :graph/importing nil)
                    (state/set-state! :graph/importing-state nil)
-                   (finished-ok-handler))))))))
+                   (finished-ok-handler)
+                   (when (pos? asset-total)
+                     (state/<invoke-db-worker :thread-api/search-build-blocks-indice-in-worker repo)))))))))
       (p/catch
        (fn [e]
          (js/console.error e)

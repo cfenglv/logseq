@@ -9,9 +9,12 @@
 
 (defn coerce-ws-client-message [message]
   (when message
-    (let [coerced (coerce/coerce db-sync-schema/ws-client-message-coercer message {:schema :ws/client})]
-      (when-not (= coerced coerce/invalid-coerce)
-        coerced))))
+    (if (= "profile/refresh" (:type message))
+      (try (db-sync-schema/profile-refresh-message-coercer message)
+           (catch :default _ nil))
+      (let [coerced (coerce/coerce db-sync-schema/ws-client-message-coercer message {:schema :ws/client})]
+        (when-not (= coerced coerce/invalid-coerce)
+          coerced)))))
 
 (defn coerce-ws-server-message [message]
   (when message

@@ -14,6 +14,7 @@
    [logseq.common.config :as common-config]
    [logseq.common.util :as common-util]
    [logseq.db :as ldb]
+   [logseq.db.frontend.asset :as db-asset]
    [promesa.core :as p]))
 
 (def max-asset-size (* 100 1024 1024))
@@ -331,6 +332,16 @@
                      (range (min parallelism (count asset-ops))))))
       (p/resolved nil))))
 
+(defn enqueue-asset-task!
+  [client task]
+  (when-let [queue (:asset-queue client)]
+    (swap! queue
+           (fn [prev]
+             (-> (or prev (p/resolved nil))
+                 ;; Keep queue alive even if one asset task fails.
+                 (p/catch (fn [_] nil))
+                 (p/then (fn [_] (task))))))))
+
 (defn enqueue-asset-sync!
   [repo client {:keys [enqueue-asset-task-f current-client-f broadcast-rtc-state!-f fail-fast-f]}]
   (enqueue-asset-task-f
@@ -349,7 +360,7 @@
         length))))
 
 (defn download-remote-asset!
-  [repo graph-id asset-uuid asset-type]
+  [repo graph-id asset-uuid asset-type & [verify-content?]]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
     (if (and (seq base) (seq graph-id) (seq asset-type))
       (-> (p/let [aes-key (graph-aes-key
@@ -378,7 +389,18 @@
                   (if (not aes-key)
                     body
                     (let [asset-file-untransited (ldb/read-transit-str (.decode (js/TextDecoder.) body))]
-                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))]
+                      (crypt/<decrypt-uint8array aes-key asset-file-untransited)))
+                  ent (when verify-content?
+                        (let [conn (worker-state/get-datascript-conn repo)]
+                          (d/entity @conn [:block/uuid asset-uuid])))
+                  checksum (:logseq.property.asset/checksum ent)
+                  file-checksum (when (and verify-content? checksum)
+                                  (db-asset/<get-file-array-buffer-checksum asset-file))
+                  _ (when (and verify-content? checksum (not= checksum file-checksum))
+                      (throw (ex-info "downloaded asset content mismatch"
+                                      {:type :rtc.exception/download-asset-failed
+                                       :data {:reason :content-mismatch
+                                              :asset-uuid asset-uuid}})))]
             (<write-asset-bytes! repo asset-id asset-type asset-file))
           (p/catch
            (fn [e]
@@ -402,7 +424,7 @@
               :error error}))
 
 (defn request-asset-download!
-  [repo asset-uuid {:keys [current-client-f enqueue-asset-task-f broadcast-rtc-state!-f]}]
+  [repo asset-uuid {:keys [replace-existing? current-client-f enqueue-asset-task-f broadcast-rtc-state!-f]}]
   (when-let [client (current-client-f repo)]
     (when-let [graph-id (:graph-id client)]
       (enqueue-asset-task-f
@@ -417,12 +439,14 @@
                                  (platform/asset-stat (platform/current)
                                                       repo
                                                       (asset-file-name asset-id asset-type)))
-                          missing-local? (and should-download? (nil? meta))
-                          _ (when missing-local?
-                              (download-remote-asset! repo graph-id asset-uuid asset-type))
-                          _ (when missing-local?
+                          download? (and should-download? (or replace-existing? (nil? meta)))
+                          _ (when download?
+                              (if (and replace-existing? (= "pdf" asset-type))
+                                (download-remote-asset! repo graph-id asset-uuid asset-type true)
+                                (download-remote-asset! repo graph-id asset-uuid asset-type)))
+                          _ (when download?
                               (client-op/remove-asset-op repo asset-uuid))
-                          _ (when missing-local?
+                          _ (when download?
                               (broadcast-rtc-state!-f client))]
                     nil)
                   (p/catch (fn [e]
@@ -457,7 +481,8 @@
         queue (atom (vec candidates))
         result (atom {:total (count candidates)
                       :downloaded 0
-                      :skipped-existing 0})
+                      :skipped-existing 0
+                      :failed 0})
         pop-queue! (fn []
                      (let [selected (atom nil)]
                        (swap! queue
@@ -471,16 +496,25 @@
         worker (fn worker []
                  (if-let [{:keys [asset-uuid asset-type]} (pop-queue!)]
                    (let [asset-id (str asset-uuid)]
-                     (p/let [meta (platform/asset-stat current-platform
-                                                       repo
-                                                       (asset-file-name asset-id asset-type))
-                             _ (if meta
-                                 (do
-                                   (swap! result update :skipped-existing inc)
-                                   nil)
-                                 (p/let [_ (download-remote-asset! repo graph-id asset-uuid asset-type)]
-                                   (swap! result update :downloaded inc)))]
-                       (worker)))
+                     (-> (p/let [meta (platform/asset-stat current-platform
+                                                           repo
+                                                           (asset-file-name asset-id asset-type))
+                                 _ (if meta
+                                     (do
+                                       (swap! result update :skipped-existing inc)
+                                       nil)
+                                     (p/let [_ (download-remote-asset! repo graph-id asset-uuid asset-type)]
+                                       (swap! result update :downloaded inc)))]
+                           nil)
+                         (p/catch (fn [e]
+                                    (log-request-asset-download-failed! repo asset-uuid e)
+                                    ;; The asset endpoint returns 404 for a missing
+                                    ;; object. Access, decryption and write errors
+                                    ;; must retain their original failure/cause.
+                                    (if (= 404 (get-in (ex-data e) [:data :status]))
+                                      (swap! result update :failed inc)
+                                      (throw e))))
+                         (p/then (fn [_] (worker)))))
                    (p/resolved nil)))]
     (p/let [_ (p/all (mapv (fn [_] (worker))
                            (range (min remote-asset-download-parallelism

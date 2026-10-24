@@ -1,5 +1,7 @@
 (ns frontend.handler.route-test
   (:require [cljs.test :refer [async deftest is testing use-fixtures]]
+            [electron.ipc :as ipc]
+            [frontend.db.async :as db-async]
             [frontend.db.conn :as conn]
             [frontend.db.utils :as db-utils]
             [frontend.date :as date]
@@ -9,14 +11,116 @@
             [frontend.state :as state]
             [frontend.test.helper :as test-helper :refer [load-test-files]]
             [promesa.core :as p]
+            [reitit.frontend :as rf]
             [reitit.frontend.easy :as rfe]))
 
 (use-fixtures :each {:before test-helper/start-test-db!
                      :after test-helper/destroy-test-db!})
 
+(deftest route-change-clears-only-detached-selection-test
+  (doseq [[path cleared?] [["/page/other" true] ["/page/current" false]]]
+    (let [cleared (atom false)
+          route {:path path}]
+      (with-redefs [state/get-route-match (constantly {:path "/page/current"})
+                    state/clear-selection! #(reset! cleared true)
+                    state/swap-state! (fn [& _])
+                    route-handler/update-page-title! (fn [_])
+                    route-handler/update-page-label! (fn [_])]
+        (route-handler/set-route-match! route)
+        (is (= cleared? @cleared))))))
+
 (defn- test-db
   []
   (conn/get-db test-helper/test-db))
+
+(defn- deletion-test-window
+  [previous-url calls]
+  #js {:location (js/URL. "https://example.test/#/page/current?graph-id=graph")
+       :navigation #js {:canGoBack (some? previous-url)
+                        :currentEntry #js {:id "current-entry" :index 1}
+                        :entries (fn [] #js [#js {:url previous-url} #js {}])}
+       :history #js {:back #(swap! calls conj :back)}})
+
+(defn- deletion-test-router
+  []
+  (rf/router [["/" {:name :home}]
+              ["/all-pages" {:name :all-pages}]
+              ["/page/:name" {:name :page}]
+              ["/page/:name/block/:block-route-name" {:name :page-block}]]))
+
+(deftest deletion-navigation-uses-only-live-same-graph-targets-test
+  (async done
+    (let [original-window (.-window js/global)
+          original-history @rfe/history
+          live {:db/id 1 :block/title "Previous"}
+          cases [{:label "live page" :url "https://example.test/#/page/previous?graph-id=graph" :block live :expected :back}
+                 {:label "live heading" :url "https://example.test/#/page/previous/block/heading?graph-id=graph" :block live :expected :back}
+                 {:label "non-page view" :url "https://example.test/#/all-pages" :expected :back}
+                 {:label "no previous entry"}
+                 {:label "only forward entries" :url "https://example.test/#/all-pages" :forward-only? true}
+                 {:label "native history unavailable" :no-navigation? true}
+                 {:label "missing page" :url "https://example.test/#/page/missing?graph-id=graph"}
+                 {:label "recycled page" :url "https://example.test/#/page/previous?graph-id=graph"
+                  :block (assoc live :logseq.property/deleted-at 1)}
+                 {:label "other graph" :url "https://example.test/#/page/previous?graph-id=other" :block live}
+                 {:label "unbound page" :url "https://example.test/#/page/previous" :block live}
+                 {:label "other origin" :url "https://other.example/#/all-pages"}
+                 {:label "other application" :url "https://example.test/other/#/all-pages"}
+                 {:label "unknown route" :url "https://example.test/#/missing-route"}]]
+      (reset! rfe/history {:router (deletion-test-router)})
+      (-> (p/loop [remaining cases]
+            (when-let [{:keys [label url block expected forward-only? no-navigation?]} (first remaining)]
+              (let [calls (atom [])
+                    window (deletion-test-window url calls)]
+                (when forward-only? (aset window "navigation" "canGoBack" false))
+                (when no-navigation? (set! (.-navigation window) nil))
+                (set! (.-window js/global) window)
+                (p/let [_ (p/with-redefs [state/get-current-repo (constantly "repo")
+                                         graph-handler/current-graph-id (constantly "graph")
+                                         db-async/<get-block (fn [& _] (p/resolved block))
+                                         route-handler/redirect! #(swap! calls conj %)]
+                            (route-handler/<redirect-after-page-deletion!))]
+                  (is (= [(or expected {:to :home :push false})] @calls) label)
+                  (p/recur (next remaining))))))
+          (p/catch #(is false (str %)))
+          (p/finally (fn []
+                       (set! (.-window js/global) original-window)
+                       (reset! rfe/history original-history)
+                       (done)))))))
+
+(deftest deletion-navigation-does-not-overwrite-newer-user-navigation-test
+  (async done
+    (let [original-window (.-window js/global)
+          original-history @rfe/history]
+      (reset! rfe/history {:router (deletion-test-router)})
+      (-> (p/loop [changes [:route :graph :entry]]
+            (when-let [change (first changes)]
+              (let [calls (atom [])
+                    repo (atom "repo")
+                    block (p/deferred)
+                    queried (p/deferred)
+                    window (deletion-test-window "https://example.test/#/page/previous?graph-id=graph" calls)]
+                (set! (.-window js/global) window)
+                (p/let [_ (p/with-redefs [state/get-current-repo #(deref repo)
+                                         graph-handler/current-graph-id (constantly "graph")
+                                         db-async/<get-block (fn [& _] (p/resolve! queried true) block)
+                                         route-handler/redirect! #(swap! calls conj %)]
+                            (let [result (route-handler/<redirect-after-page-deletion!)]
+                              (p/do!
+                               queried
+                               (case change
+                                 :route (set! (.. window -location -hash) "#/all-pages")
+                                 :graph (reset! repo "other-repo")
+                                 :entry (aset window "navigation" "currentEntry" "id" "new-entry"))
+                               (p/resolve! block {:db/id 1 :block/title "Previous"})
+                               result)))]
+                  (is (empty? @calls) (name change))
+                  (p/recur (next changes))))))
+          (p/catch #(is false (str %)))
+          (p/finally (fn []
+                       (set! (.-window js/global) original-window)
+                       (reset! rfe/history original-history)
+                       (done)))))))
 
 (deftest default-page-route
   (let [journal-uuid (random-uuid)]
@@ -181,10 +285,91 @@
              (is (= [[:thread-api/get-route-title "test" "Page"]
                      [:thread-api/get-route-title "test" "Page"]
                      [:thread-api/get-route-title "test" (str block-id)]]
-                    @calls))
+                    (filterv #(= :thread-api/get-route-title (first %)) @calls)))
              (is (= "Page" (.-page (.-dataset (.-body document)))))
              (is (= (str (subs block-title 0 48) "...")
                     (.-title document)))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally
+           (fn []
+             (state/replace-state! previous-state)
+             (reset! state/*db-worker previous-worker)
+             (set! (.-document js/global) previous-document)
+             (done)))))))
+
+(defn- page-route
+  [page-name]
+  {:data {:name :page}
+   :path-params {:name page-name}})
+
+(deftest stale-route-title-resolve-does-not-overwrite-current-page-test
+  (async done
+    (let [left-route (page-route "Left")
+          current-route (page-route "Current")
+          left-title (p/deferred)
+          document #js {:title "stale"
+                        :body #js {:dataset #js {:page ""}}}
+          previous-document (.-document js/global)
+          previous-state (state/get-state)
+          previous-worker @state/*db-worker
+          window-titles (atom [])]
+      (set! (.-document js/global) document)
+      (state/swap-state! assoc :git/current-repo "test")
+      (reset! state/*db-worker
+              (fn [_api _repo route-name]
+                (case route-name
+                  "Left" left-title
+                  "Current" (p/resolved {:page-title "Current"})
+                  (p/resolved nil))))
+      (-> (p/with-redefs [ipc/ipc (fn [channel title]
+                                    (when (= :set-window-title channel)
+                                      (swap! window-titles conj title)))]
+            (p/do!
+             (do (route-handler/update-page-title! left-route) nil)
+             (route-handler/update-page-title! current-route)
+             (is (= "Current" (.-title document)))
+             (p/resolve! left-title {:page-title "Left"})
+             (p/delay 10)
+             (is (= "Current" (.-title document))
+                 "A stale Back/forward title resolve must not overwrite the current page.")
+             (is (= ["Current"] (vec (distinct @window-titles))))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally
+           (fn []
+             (state/replace-state! previous-state)
+             (reset! state/*db-worker previous-worker)
+             (set! (.-document js/global) previous-document)
+             (done)))))))
+
+(deftest set-route-match-updates-title-after-back-navigation-test
+  (async done
+    (let [left-route (page-route "Left")
+          previous-route (page-route "Previous")
+          document #js {:title ""
+                        :body #js {:dataset #js {:page ""}}}
+          previous-document (.-document js/global)
+          previous-state (state/get-state)
+          previous-worker @state/*db-worker]
+      (set! (.-document js/global) document)
+      (state/swap-state! assoc :git/current-repo "test")
+      (reset! state/*db-worker
+              (fn [_api _repo route-name]
+                (p/resolved {:page-title route-name})))
+      (-> (p/do!
+           (route-handler/set-route-match! left-route)
+           (p/delay 0)
+           (is (= "Left" (.-title document)))
+           ;; popstate / history.back uses the same on-navigate -> set-route-match! path
+           (route-handler/set-route-match! previous-route)
+           (p/delay 0)
+           (is (= "Previous" (.-title document)))
+           (route-handler/set-route-match! left-route)
+           (p/delay 0)
+           (is (= "Left" (.-title document))))
           (p/catch
            (fn [error]
              (is false (str error))))

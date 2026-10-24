@@ -2,8 +2,12 @@
   (:require [clojure.string :as string]
             [electron.ipc :as ipc]
             [frontend.colors :as colors]
+            [frontend.common.crypt :as crypt]
             [frontend.components.assets :as assets]
+            [frontend.components.e2ee :as e2ee]
             [frontend.components.email :as email-component]
+            [frontend.components.user-profile :as user-profile]
+            [frontend.components.literature :as literature-component]
             [frontend.components.shortcut :as shortcut]
             [frontend.components.svg :as svg]
             [frontend.config :as config]
@@ -18,6 +22,7 @@
             [frontend.handler.property :as property-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-profile :as profile-handler]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.core :as instrument]
             [frontend.modules.shortcut.data-helper :as shortcut-helper]
@@ -27,10 +32,12 @@
             [frontend.storage :as storage]
             [frontend.ui :as ui]
             [frontend.util :refer [classnames web-platform?] :as util]
+            [frontend.util.typography :as typography]
             [frontend.version :as fv]
             [goog.string :as gstring]
             [lambdaisland.glogi :as log]
             [logseq.common.version :as build-version]
+            [logseq.db :as ldb]
             [logseq.shui.hooks :as hooks]
             [logseq.shui.ui :as shui]
             [promesa.core :as p]
@@ -260,31 +267,130 @@
       (ui/render-keyboard-shortcut (shortcut-helper/gen-shortcut-seq :ui/toggle-wide-mode)
                                    :shortcut-id :ui/toggle-wide-mode)])])
 
-(defn editor-font-family-row [t {:keys [type global]}]
-  [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4
-   [:label.block.text-sm.font-medium.leading-5.opacity-70
-    {:for "font_family"}
-    (t :settings.general/editor-font)]
-   [:div.flex.flex-col.col-span-2
-    [:div.flex.gap-2
-     (for [t [:default :serif :mono]
-           :let [t (name t)
-                 tt (string/capitalize t)
-                 active? (= (or type "default") t)]]
-       (shui/button
-        {:key t
-         :variant :secondary
-         :class (str "cursor-pointer" (when active? " !border-primary border-[2px]"))
-         :on-click #(state/set-editor-font! {:type t})}
-        [:span.flex.flex-col
-         {:class (str "ls-font-" t)}
-         [:strong "Ag"]
-         [:small tt]]))]
-    [:div.pt-3
-     [:label.w-full.flex.items-center.cursor-pointer
-      (shui/checkbox {:checked (boolean global)
-                      :on-checked-change #(state/set-editor-font! {:global %})})
-      [:span.pl-1.text-sm.opacity-70 (t :settings.general/editor-font-set-global)]]]]])
+(defn- custom-font-controls
+  [t region family field-id choose! close-custom! font-error chooser query set-query!]
+  [:div.font-custom-controls
+   {:on-key-down #(when (= "Escape" (.-key %)) (.stopPropagation %) (close-custom!))}
+   [:input.form-input.is-small.min-w-0
+    {:key [region family] :id (str field-id "-name") :type "text" :auto-focus true
+     :default-value (if (string? family) family "") :aria-label (t :settings.general/font-custom)
+     :placeholder (t :settings.general/font-name-placeholder)
+     :on-blur #(let [value (string/trim (.. % -target -value))]
+                 (when (not= value (if (string? family) family ""))
+                   (state/set-editor-font! region :family (when (seq value) value))))
+     :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
+   [:div.flex.flex-wrap.gap-1
+    (shui/button {:variant :outline :size :sm :on-click choose!} (t :settings.general/font-installed))
+    (shui/button {:variant :ghost :size :sm :on-click close-custom!} (t :ui/close))]
+   (when (= region (:region font-error)) [:p.text-xs {:role "status"} (t (:i18n-key font-error))])
+   (when (= region (:region chooser))
+     [:div.font-installed-list
+      [:input.form-input.is-small {:type "search" :value query :auto-focus true
+                                  :aria-label (t :settings.general/font-search) :placeholder (t :settings.general/font-search)
+                                  :on-change #(set-query! (.. % -target -value))}]
+      [:div.flex.flex-col.max-h-48.overflow-y-auto
+       (for [font (:families chooser) :when (string/includes? (string/lower-case font) (string/lower-case query))]
+         (shui/button {:key font :variant :ghost :size :sm
+                       :on-click #(do (state/set-editor-font! region :family font) (close-custom!))} font))]])])
+
+(hsx/defc editor-font-family-row [t settings]
+  (let [_preferred-language (rfx/use-sub [:preferred-language])
+        [region set-region!] (hooks/use-state :editor)
+        [custom-region set-custom-region!] (hooks/use-state nil)
+        [chooser set-chooser!] (hooks/use-state nil)
+        [query set-query!] (hooks/use-state "")
+        [font-error set-font-error!] (hooks/use-state nil)
+        family-select (hooks/use-ref nil)
+        {:keys [family size]} (get settings region)
+        code? (= region :code)
+        field-id (str "font-" (name region))
+        regions [[:editor (t :settings.general/font-notes)]
+                 [:interface (t :settings.general/font-interface)]
+                 [:code (t :settings.general/font-code)]]
+        description (case region
+                      :editor (t :settings.general/font-notes-description)
+                      :interface (t :settings.general/font-interface-description)
+                      :code (t :settings.general/font-code-desc))
+        switch! (fn [next-region]
+                  (set-region! next-region)
+                  (set-custom-region! nil)
+                  (set-chooser! nil)
+                  (set-query! "")
+                  (set-font-error! nil))
+        close-custom! (fn []
+                        (set-custom-region! nil)
+                        (set-chooser! nil)
+                        (set-font-error! nil)
+                        (.focus (.-current family-select)))
+        choose! (fn []
+                  (set-font-error! nil)
+                  (if-not (fn? (.-queryLocalFonts js/window))
+                    (set-font-error! {:region region :i18n-key :settings.general/font-list-unavailable})
+                    (-> (p/let [fonts (js/window.queryLocalFonts)]
+                          (set-query! "")
+                          (set-chooser! {:region region :families (->> (array-seq fonts) (map #(.-family %)) distinct sort vec)}))
+                        (p/catch (fn [_] (set-font-error! {:region region :i18n-key :settings.general/font-list-denied}))))))]
+    [:div.it.font-settings.flex.flex-col.gap-3.sm:grid.sm:grid-cols-3.sm:gap-6
+     {:on-key-down #(when (and (contains? #{"BUTTON" "SELECT"} (.. % -target -tagName))
+                              (contains? #{"Enter" "ArrowUp" "ArrowDown" "ArrowLeft" "ArrowRight"} (.-key %)))
+                      ;; Keep native control activation ahead of the outliner shortcuts.
+                      (.stopPropagation %))}
+     [:h3.text-sm.font-medium.leading-5.opacity-70 (t :settings.general/editor-font)]
+     [:div.font-settings-content.sm:col-span-2.min-w-0
+      [:section.font-settings-layout.font-region-editor.min-w-0 {:data-font-region (name region)}
+       [:p.sr-only {:id (str field-id "-description")} description]
+       [:div.font-region-controls
+        [:label.sr-only {:for "font-region"} (t :settings.general/font-region-label)]
+        [:select#font-region.form-select.is-small {:value (name region) :on-change #(switch! (keyword (.. % -target -value)))}
+         (for [[item label] regions] [:option {:key item :value (name item)} label])]]
+       [:div.font-family-controls
+        [:label.sr-only {:for (str field-id "-preset")} (t :settings.general/font-family)]
+        [:select.form-select.is-small.min-w-0
+         {:ref family-select :id (str field-id "-preset")
+          :aria-describedby (str field-id "-description")
+          :value (if (keyword? family) (name family) (if (string? family) "custom" "default"))
+          :on-change #(let [value (.. % -target -value)]
+                        (if (= value "other")
+                          (set-custom-region! region)
+                          (do (set-custom-region! nil)
+                              (state/set-editor-font! region :family (when-not (= value "default") (keyword value))))))}
+         [:option {:value "default"} (if code? (t :settings.general/font-code-default) (t :settings.general/font-default))]
+         (when-not code? [:option {:value "serif"} (t :settings.general/font-serif)])
+         [:option {:value "mono"} (t :settings.general/font-mono)]
+         (when (string? family) [:option {:value "custom" :disabled true} family])
+         [:option {:value "other"} (t :settings.general/font-other-action)]]
+        (shui/button {:variant :ghost :size :icon :class "font-reset"
+                      :title (t :settings.general/font-reset-family)
+                      :aria-label (t :settings.general/font-reset-family)
+                      :on-click #(state/set-editor-font! region :family nil)}
+                     (ui/icon "rotate-clockwise" {:size 14}))]
+       (when-not code?
+         [:form.font-size-controls {:on-submit #(.preventDefault %)
+                                    :on-reset #(state/set-editor-font! region :size nil)}
+          [:label.sr-only {:for (str field-id "-size")} (t :settings.general/font-size)]
+          [:input.form-input.is-small
+           {:key [region size] :id (str field-id "-size") :type "number" :min 8 :max 48 :step 1
+            :style {:width "5rem" :flex "none"}
+            :default-value (or size "") :placeholder (t :settings.general/font-size-placeholder)
+            :on-blur #(let [input (.-target %)]
+                        (if (.checkValidity input)
+                          (state/set-editor-font! region :size (when (seq (.-value input)) (.-valueAsNumber input)))
+                          (.reportValidity input)))
+            :on-key-down #(when (= "Enter" (.-key %)) (.blur (.-target %)))}]
+          [:span.whitespace-nowrap (t :settings.general/font-size-unit)]
+          (shui/button {:type "reset" :variant :ghost :size :icon :class "font-reset"
+                        :title (t :settings.general/font-reset-size)
+                        :aria-label (t :settings.general/font-reset-size)}
+                       (ui/icon "rotate-clockwise" {:size 14}))])
+        (when (= region custom-region)
+          (custom-font-controls t region family field-id choose! close-custom!
+                                font-error chooser query set-query!))
+        [:p.font-preview.text-sm
+         {:style (cond-> {:font-family (if code?
+                                        (or (typography/family-css family "monospace") "var(--ls-code-font-family, monospace)")
+                                        (or (typography/family-css family) "var(--ls-font-family)"))}
+                   size (assoc :font-size (str size "px")))}
+         (t :settings.general/font-preview)]]]]))
 
 (hsx/defc switch-spell-check-row
   [t]
@@ -312,6 +418,20 @@
             #((state/set-state! [:electron/user-cfgs :auto-update] (not enabled?))
               (ipc/ipc :userAppCfgs :auto-update (not enabled?))))))
 
+(defn language-select-content-props
+  "Keep the language popup clickable over Electron's custom title-bar drag region."
+  ([]
+   (language-select-content-props nil))
+  ([container]
+   (let [no-drag-style {:app-region "no-drag"
+                        :-webkit-app-region "no-drag"}]
+     (cond-> {:class "z-[99999] ls-app-no-drag"
+              :style no-drag-style
+              :positioner-props {:className "ls-app-no-drag"
+                                 :style (assoc no-drag-style :z-index 99999)}}
+       (some? container)
+       (assoc :container container)))))
+
 (defn language-row [t preferred-language]
   (let [selected-language (some-> preferred-language name)
         language-items (mapv (fn [language]
@@ -334,9 +454,7 @@
                   (fn [value]
                     (get language-labels value value))))
                 (shui/select-content
-                 {:container (.-body js/document)
-                  :class "z-[99999]"
-                  :positioner-props {:style {:z-index 99999}}}
+                 (language-select-content-props (.-body js/document))
                  (shui/select-group
                   (for [{:keys [value label]} language-items]
                     (shui/select-item {:key value :value value} label)))))]
@@ -346,7 +464,8 @@
 
 (hsx/defc theme-modes-row
   [t]
-  (let [theme (rfx/use-sub [:ui/theme])
+  (let [_preferred-language (rfx/use-sub [:preferred-language])
+        theme (rfx/use-sub [:ui/theme])
         dark? (= "dark" theme)
         system-theme? (rfx/use-sub [:ui/system-theme?])
         switch-theme (if dark? "light" "dark")
@@ -371,7 +490,8 @@
 
 (hsx/defc accent-color-row
   [_in-modal?]
-  (let [color-accent (rfx/use-sub [:ui/radix-color])
+  (let [_preferred-language (rfx/use-sub [:preferred-language])
+        color-accent (rfx/use-sub [:ui/radix-color])
         color-label (fn [color]
                       (case color
                         :none [:p {:style {:max-width "300px"}}
@@ -637,6 +757,7 @@
   "Push the current sync URL config to the db worker so changes take effect
    without restarting the app."
   []
+  (profile-handler/refresh-on-focus!)
   (state/<invoke-db-worker :thread-api/set-db-sync-config
                            {:enabled? true
                             :ws-url (config/db-sync-ws-url)
@@ -1154,6 +1275,13 @@
        (http-server-switcher-row))
      (when (util/electron?)
        (markdown-mirror-row t))
+     (when current-repo
+       [:div.it.sm:grid.sm:grid-cols-3.sm:gap-4
+        [:label.text-sm.font-medium (t :settings.literature/title)]
+        [:div.sm:col-span-2
+         (shui/button {:variant :outline :size :sm
+                       :on-click #(literature-component/open-library! current-repo)}
+                      (t :settings.literature/browse))]])
      (flashcards-switcher-row enable-flashcards?)
      (when (semantic-search-setting-supported? app-base-info)
        (semantic-search-row t semantic-search-enabled?))
@@ -1207,7 +1335,7 @@
     (hooks/use-effect!
      #(do
         (p/let [graph-uuid (state/<invoke-db-worker :thread-api/get-rtc-graph-uuid current-repo)
-                _ (rtc-handler/<rtc-get-users-info)]
+                _ (profile-handler/<refresh-members!)]
           (set-graph-uuid! graph-uuid)
           (set-loading! false))
         nil)
@@ -1225,12 +1353,13 @@
         (for [{user-name :user/name
                user-email :user/email
                user-uuid :user/uuid
-               graph<->user-user-type :graph<->user/user-type} users]
+               graph<->user-user-type :graph<->user/user-type :as user} users]
           (let [member? (= :member graph<->user-user-type)
                 can-remove? (and manager? member?)]
             [:div.flex.flex-row.items-center.gap-2
              {:key (str "user-" (or user-uuid user-name))}
-             [:div user-name]
+             (user-profile/user-avatar user {:class "w-6 h-6" :tooltip? false})
+             [:div (user-profile/name-label user)]
              (when user-email
                (email-component/email-address {:email user-email
                                                :class "opacity-50 text-sm"}))
@@ -1253,7 +1382,7 @@
 	                                 (when (and graph-uuid member-id)
                                    (-> (rtc-handler/<rtc-remove-member! graph-uuid member-id)
                                        (p/then (fn []
-                                                 (rtc-handler/<rtc-get-users-info true)))
+                                                 (profile-handler/<refresh-members!)))
                                        (p/catch (fn [e]
                                                   (notification/show! (t :collaboration/remove-access-error) :error)
                                                   (log/error :db-sync/remove-member-failed {:error e
@@ -1273,6 +1402,233 @@
   []
   [:div.panel-wrap.is-collaboration.mb-8
    (settings-rtc-members)])
+
+(def ^:private pat-one-year-ms (* 365 24 60 60 1000))
+
+(defn- local-date-str
+  [^js date]
+  (let [pad (fn [n] (.padStart (str n) 2 "0"))]
+    (str (.getFullYear date) "-"
+         (pad (inc (.getMonth date))) "-"
+         (pad (.getDate date)))))
+
+(defn- default-pat-expiration-date
+  []
+  (local-date-str (js/Date. (+ (.now js/Date) pat-one-year-ms))))
+
+(defn- pat-expiration-ms
+  [date]
+  (when (and (string? date) (not (string/blank? date)))
+    (let [timestamp (js/Date.parse (str date "T23:59:59.999"))]
+      (when-not (js/isNaN timestamp)
+        timestamp))))
+
+(defn- pat-permission-label
+  [permission]
+  (case permission
+    "read" (t :sync.personal-access-token.permission/read)
+    "write" (t :sync.personal-access-token.permission/write)
+    "both" (t :sync.personal-access-token.permission/both)
+    permission))
+
+(hsx/defc personal-access-token-select
+  [label value items on-value-change]
+  (let [labels (into {} (map (juxt :value :label)) items)]
+    [:div.flex.flex-col.gap-1
+     [:label.text-sm.opacity-70 label]
+     (shui/select
+      {:value value
+       :items items
+       :on-value-change on-value-change}
+      (shui/select-trigger
+       {:class "h-9 w-full" :aria-label label}
+       (shui/select-value (fn [selected] (get labels selected selected))))
+      (shui/select-content
+       {:container (.-body js/document)}
+       (shui/select-group
+        (for [{:keys [value label]} items]
+          (shui/select-item {:key value :value value} label)))))]))
+
+(hsx/defc personal-access-token-create-form
+  [graph-items pending? set-pending! on-created!]
+  (let [[selected-graph set-selected-graph!] (hooks/use-state nil)
+        [permission set-permission!] (hooks/use-state "both")
+        [expiration set-expiration!] (hooks/use-state (default-pat-expiration-date))
+        permission-items [{:value "read" :label (pat-permission-label "read")}
+                          {:value "write" :label (pat-permission-label "write")}
+                          {:value "both" :label (pat-permission-label "both")}]
+        expires-at (pat-expiration-ms expiration)
+        form-valid? (and (some? selected-graph)
+                         expires-at
+                         (> expires-at (.now js/Date)))
+        create! (fn []
+                  (when form-valid?
+                    (set-pending! true)
+                    (-> (rtc-handler/<create-personal-access-token!
+                         {:graph-id selected-graph
+                          :permission permission
+                          :expires-at expires-at})
+                        (p/then on-created!)
+                        (p/catch (fn [error]
+                                   (notification/show!
+                                    (t :sync.personal-access-token/request-error)
+                                    :error)
+                                   (log/error :db-sync/pat-create-failed {:status (:status (ex-data error))})))
+                        (p/finally #(set-pending! false)))))]
+    (hooks/use-effect!
+     (fn []
+       (when (and (nil? selected-graph) (seq graph-items))
+         (set-selected-graph! (:value (first graph-items))))
+       nil)
+     [graph-items selected-graph])
+    [:section.flex.flex-col.gap-3
+     [:h2.text-base.font-semibold (t :sync.personal-access-token/create-title)]
+     (if (seq graph-items)
+       [:div.grid.gap-3.md:grid-cols-3
+        (personal-access-token-select
+         (t :sync.personal-access-token/graph)
+         selected-graph graph-items set-selected-graph!)
+        (personal-access-token-select
+         (t :sync.personal-access-token/permission)
+         permission permission-items set-permission!)
+        [:div.flex.flex-col.gap-1
+         [:label.text-sm.opacity-70 (t :sync.personal-access-token/expiration)]
+         (shui/input
+          {:type "date"
+           :aria-label (t :sync.personal-access-token/expiration)
+           :value expiration
+           :min (local-date-str (js/Date.))
+           :max (local-date-str (js/Date. (+ (.now js/Date) pat-one-year-ms)))
+           :on-change #(set-expiration! (util/evalue %))})]]
+       [:p.text-sm.opacity-70 (t :sync.personal-access-token/no-graphs)])
+     (shui/button
+      {:class "self-start"
+       :disabled (or pending? (empty? graph-items) (not form-valid?))
+       :on-click create!}
+      (ui/icon "key" {:size 16})
+      (t :sync.personal-access-token/create))]))
+
+(defn <copy-personal-access-token!
+  [token]
+  (-> (util/copy-to-clipboard! token)
+      (p/then (fn [copied?]
+                (notification/show!
+                 (t (if copied?
+                      :sync.personal-access-token/copied
+                      :sync.personal-access-token/copy-error))
+                 (if copied? :success :error))))
+      (p/catch (fn [_]
+                 (notification/show! (t :sync.personal-access-token/copy-error) :error)))))
+
+(hsx/defc personal-access-token-created
+  [created-token]
+  (when-let [token (:token created-token)]
+    [:section.flex.flex-col.gap-2.border.p-3.rounded
+     [:h2.text-base.font-semibold (t :sync.personal-access-token/created-title)]
+     [:p.text-sm.opacity-70 (t :sync.personal-access-token/created-warning)]
+     [:div.flex.items-center.gap-2
+      [:code.flex-1.break-all.select-all token]
+      (shui/button
+       {:variant "outline"
+        :size :sm
+        :title (t :ui/copy)
+        :on-click #(<copy-personal-access-token! token)}
+       (ui/icon "copy" {:size 16}))]]))
+
+(hsx/defc personal-access-token-list
+  [tokens load-error? pending? revoke!]
+  [:section.flex.flex-col.gap-2
+   [:h2.text-base.font-semibold (t :sync.personal-access-token/existing-title)]
+   (cond
+     load-error?
+     [:p.text-sm.text-red-500 (t :sync.personal-access-token/request-error)]
+
+     (nil? tokens)
+     (ui/loading (t :ui/loading))
+
+     (empty? tokens)
+     [:p.text-sm.opacity-70 (t :sync.personal-access-token/empty)]
+
+     :else
+     [:div.divide-y
+      (for [{:keys [id graph-name token-prefix permission created-at expires-at]} tokens]
+        [:div.flex.items-center.justify-between.gap-4.py-3
+         {:key id}
+         [:div.min-w-0.flex.flex-col.gap-1
+          [:div.flex.items-center.gap-2.flex-wrap
+           [:code (str token-prefix "...")]
+           [:span.text-sm.font-medium (or graph-name (t :sync.personal-access-token/deleted-graph))]
+           [:span.text-xs.opacity-60 (pat-permission-label permission)]]
+          [:div.text-xs.opacity-60
+           (t :sync.personal-access-token/date-summary
+              (locale-format-date (js/Date. created-at))
+              (locale-format-date (js/Date. expires-at)))]]
+         (shui/button
+          {:variant "ghost"
+           :size :sm
+           :disabled pending?
+           :on-click #(revoke! id)}
+          (ui/icon "trash" {:size 16})
+          (t :sync.personal-access-token/revoke))])])])
+
+(hsx/defc settings-personal-access-tokens
+  []
+  (let [graphs (rfx/use-sub [:rtc/graphs])
+        [tokens set-tokens!] (hooks/use-state nil)
+        [created-token set-created-token!] (hooks/use-state nil)
+        [pending? set-pending!] (hooks/use-state false)
+        [load-error? set-load-error!] (hooks/use-state false)
+        graph-items (->> graphs
+                         (filter (fn [{:keys [graph-ready-for-use?]}]
+                                   (not= false graph-ready-for-use?)))
+                         (mapv (fn [{:keys [GraphName GraphUUID graph-e2ee?]}]
+                                 {:value (str GraphUUID)
+                                  :label (if graph-e2ee?
+                                           (t :sync.personal-access-token/encrypted-graph-label GraphName)
+                                           GraphName)})))
+        load-tokens! (fn []
+                       (set-load-error! false)
+                       (-> (rtc-handler/<personal-access-tokens)
+                           (p/then (fn [result]
+                                     (set-tokens! (:tokens result))))
+                           (p/catch (fn [error]
+                                      (set-load-error! true)
+                                      (log/error :db-sync/pat-list-failed {:status (:status (ex-data error))})))))
+        on-created! (fn [result]
+                      (set-created-token! result)
+                      (load-tokens!))
+        revoke! (fn [token-id]
+                  (when (js/confirm (t :sync.personal-access-token/revoke-confirm))
+                    (set-pending! true)
+                    (-> (rtc-handler/<revoke-personal-access-token! token-id)
+                        (p/then (fn []
+                                  (set-tokens! (filterv #(not= token-id (:id %)) tokens))))
+                        (p/catch (fn [error]
+                                   (notification/show!
+                                    (t :sync.personal-access-token/request-error)
+                                    :error)
+                                   (log/error :db-sync/pat-revoke-failed {:status (:status (ex-data error))})))
+                        (p/finally #(set-pending! false)))))]
+    (hooks/use-effect!
+     (fn []
+       (load-tokens!)
+       (when (empty? graphs)
+         (rtc-handler/<get-remote-graphs))
+       nil)
+     [])
+    [:div.panel-wrap.is-personal-access-tokens.mb-8.flex.flex-col.gap-6
+     [:p.text-sm.opacity-70
+      (t :sync.personal-access-token/description)
+      " "
+      [:a.external-link
+       {:href (str (rtc-handler/http-base) "/api-docs")
+        :target "_blank"
+        :rel "noreferrer"}
+       (t :sync.personal-access-token/api-docs)]]
+     (personal-access-token-create-form
+      graph-items pending? set-pending! on-created!)
+     (personal-access-token-created created-token)
+     (personal-access-token-list tokens load-error? pending? revoke!)]))
 
 (hsx/defc forgot-password
   [token refresh-token user-uuid]
@@ -1335,11 +1691,67 @@
       [:a.opacity-70.hover:opacity-100 {:on-click #(set-reset! true)}
        (t :encryption/reset-password)])))
 
+(defn- exported-key->base64 [^js u8]
+  (when (instance? js/Uint8Array u8)
+    (js/btoa (.join (js/Array.from u8 (fn [b] (js/String.fromCharCode b))) ""))))
+
+(defn- transit->exported-key-base64 [value]
+  (when (string? value)
+    (try (exported-key->base64 (ldb/read-transit-str value))
+         (catch :default _ nil))))
+
+(hsx/defc encryption-key-display
+  [rsa-key-pair]
+  (let [public-key-base64 (transit->exported-key-base64 (:public-key rsa-key-pair))
+        [private-key set-private-key!] (hooks/use-state nil)
+        reveal-private-key!
+        (fn []
+          (let [private-key-promise (p/deferred)
+                encrypted-private-key (ldb/read-transit-str (:encrypted-private-key rsa-key-pair))]
+            (shui/dialog-open!
+             #(e2ee/e2ee-password-to-decrypt-private-key
+               encrypted-private-key private-key-promise)
+             {:auto-width? true
+              :on-close (fn []
+                          (p/reject! private-key-promise (ex-info "cancelled" {}))
+                          (shui/dialog-close!))})
+            (-> (p/let [private-key' private-key-promise
+                        exported (crypt/<export-private-key private-key')]
+                  (set-private-key! (exported-key->base64 exported)))
+                (p/catch (fn [_] nil)))))]
+    [:div.flex.flex-col.gap-3
+     [:div.flex.flex-col.gap-1
+      [:p.text-sm.opacity-70 (t :encryption/public-key)]
+      (if (string? public-key-base64)
+        [:div.flex.items-start.gap-2
+         [:code.text-xs.break-all.flex-1.select-all public-key-base64]
+         (shui/button
+          {:variant "outline"
+           :size :sm
+           :on-click #(util/copy-to-clipboard! public-key-base64)}
+          (t :encryption/copy-key))]
+        [:p.text-sm.opacity-70 (t :encryption/key-unavailable)])]
+     [:div.flex.flex-col.gap-1
+      [:p.text-sm.opacity-70 (t :encryption/private-key)]
+      (if (string? private-key)
+        [:div.flex.items-start.gap-2
+         [:code.text-xs.break-all.flex-1.select-all private-key]
+         (shui/button
+          {:variant "outline"
+           :size :sm
+           :on-click #(util/copy-to-clipboard! private-key)}
+          (t :encryption/copy-key))]
+        (shui/button
+         {:variant "outline"
+          :size :sm
+          :on-click reveal-private-key!}
+         (t :encryption/show-private-key)))]]))
+
 (hsx/defc encryption
   []
   (let [user-uuid (user-handler/user-uuid)
-        token (state/get-auth-id-token)
-        refresh-token (str (state/get-auth-refresh-token))
+        token (rfx/use-sub [:auth/id-token])
+        refresh-token (str (rfx/use-sub [:auth/refresh-token]))
         [rsa-key-pair set-rsa-key-pair!] (hooks/use-state :not-inited)
         [init-key-err set-init-key-err!] (hooks/use-state nil)
         [get-key-err set-get-key-err!] (hooks/use-state nil)
@@ -1391,6 +1803,8 @@
                                            (set-reset-password-status! (t :encryption/failed-to-update-password))))))]
             [:div.flex.flex-col.gap-4
              ;; [:p "E2EE key-pair already generated!"]
+             ^{:key (str (:public-key rsa-key-pair) (:encrypted-private-key rsa-key-pair))}
+             [encryption-key-display rsa-key-pair]
              (when-not forgot?
                [:div.flex.flex-col
                 [:p (t :encryption/remember-password-rich)]
@@ -1445,11 +1859,14 @@
 (hsx/defc ^:large-vars/cleanup-todo settings
   [_active-tab]
   (let [current-repo (rfx/use-sub [:git/current-repo])
+        _auth-token (rfx/use-sub [:auth/id-token])
+        _preferred-language (rfx/use-sub [:preferred-language])
         _installed-plugins (rfx/use-sub [:plugin/installed-plugins])
         plugins-of-settings (and config/lsp-enabled? (seq (plugin-handler/get-enabled-plugins-if-setting-schema)))
         *active (hooks/use-memo #(atom DEFAULT-ACTIVE-TAB-STATE) [])
         [active] (hooks/use-atom *active)
-        logged-in? (user-handler/logged-in?)]
+        logged-in? (user-handler/logged-in?)
+        identity-key (str [(rtc-handler/http-base) (user-handler/user-uuid)])]
     (hooks/use-effect!
      (fn []
        (state/load-app-user-cfgs)
@@ -1482,6 +1899,9 @@
                [:features (t :settings/features) (ui/icon "app-feature")]
                (when logged-in?
                  [:collaboration (t :settings/collaboration) (ui/icon "users")])
+
+               (when (and logged-in? (user-handler/rtc-group?))
+                 [:personal-access-tokens (t :settings/personal-access-tokens) (ui/icon "key")])
 
                (when logged-in?
                  [:encryption (t :settings/encryption) (ui/icon "lock")])
@@ -1540,8 +1960,13 @@
         :collaboration
         (settings-collaboration)
 
+        :personal-access-tokens
+        ^{:key identity-key}
+        [settings-personal-access-tokens]
+
         :encryption
-        (encryption)
+        ^{:key identity-key}
+        [encryption]
 
          :ai
          (if (util/electron?)

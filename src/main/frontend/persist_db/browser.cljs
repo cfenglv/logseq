@@ -48,6 +48,11 @@
     (state/set-state! [:search/index-build-notify-repos repo] false)
     (notification/show! (t :search/indices-rebuilt-success) :success)))
 
+(def-thread-api :thread-api/set-ui-state
+  [path value]
+  (state/set-state! path value)
+  nil)
+
 (def-thread-api :thread-api/search-index-build-progress
   [repo {:keys [build-id status progress processed total]
          input-stage :stage}]
@@ -145,6 +150,7 @@
                  :mobile? (util/mobile?)
                  :validate-db-options (:dev/validate-db-options (state/get-config))
                  :importing? (:graph/importing (state/get-state))
+                 :web-platform? util/web-platform?
                  :date-formatter (state/get-date-formatter)
                  :export-bullet-indentation (state/get-export-bullet-indentation)
                  :preferred-format (state/get-preferred-format)}]
@@ -186,39 +192,49 @@
   (reset! state/*db-worker-thread nil)
   (reset! state/*db-worker nil))
 
-(defn start-db-worker!
-  []
-  (when-not util/node-test?
-    (p/do!
-     (reload-app-if-old-db-worker-exists)
-     (stop-db-worker!)
-     (let [worker-url (if config/publishing? "static/js/db-worker.js" "js/db-worker.js")
+(defn create-worker-client!
+  "Reuse the original Comlink/Transit wrapper without installing the notes driver."
+  [private-navigation?]
+  (let [worker-url (if config/publishing? "static/js/db-worker.js" "js/db-worker.js")
            worker (js/Worker.
                    (str worker-url
                         "?electron=" (util/electron?)
                         "&capacitor=" (util/capacitor?)
-                        "&publishing=" config/publishing?))
-           _ (set-worker-fs worker)
+                        "&publishing=" config/publishing?
+                        (when private-navigation? "&userNavigation=true")))
            wrapped-worker* (Comlink/wrap worker)
            wrapped-worker (fn [qkw & args]
-                            (if (contains? #{:thread-api/export-db-binary
-                                             :thread-api/export-client-ops-db-binary
-                                             :thread-api/import-db-binary}
-                                           qkw)
+                            (cond
+                              (contains? #{:thread-api/export-db-binary
+                                           :thread-api/export-client-ops-db-binary
+                                           :thread-api/import-db-binary}
+                                         qkw)
                               (let [method (str (namespace qkw) "/" (name qkw))]
                                 (if (= :thread-api/import-db-binary qkw)
                                   (.remoteInvokeBinary ^js wrapped-worker* method (first args) (second args))
                                   (.remoteInvokeBinary ^js wrapped-worker* method (first args))))
+
+                              :else
                               (-> (p/let [result (.remoteInvoke ^js wrapped-worker*
                                                                  (str (namespace qkw) "/" (name qkw))
                                                                  (ldb/write-transit-str args))]
                                     (ldb/read-transit-str result))
                                   (p/catch (fn [error]
                                              (js/console.error "DB worker API failed:" (str qkw) error)
-                                             (throw error))))))
+                                             (throw error))))))]
+    (Comlink/expose #js{"remoteInvoke" thread-api/remote-function} worker)
+    {:worker worker :wrapped-worker wrapped-worker}))
+
+(defn start-db-worker!
+  []
+  (when-not util/node-test?
+    (p/do!
+     (reload-app-if-old-db-worker-exists)
+     (stop-db-worker!)
+     (let [{:keys [worker wrapped-worker]} (create-worker-client! false)
+           _ (set-worker-fs worker)
            t1 (util/time-ms)]
        (reset! state/*db-worker-thread worker)
-       (Comlink/expose #js{"remoteInvoke" thread-api/remote-function} worker)
        (worker-handler/handle-message! worker wrapped-worker)
        (reset! state/*db-worker wrapped-worker)
        (-> (p/let [_ (state/<invoke-db-worker :thread-api/init)

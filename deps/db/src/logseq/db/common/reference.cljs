@@ -251,12 +251,37 @@
        (mapcat (fn [pid] (:block/_refs (d/entity db pid))))
        (remove (fn [ref]
                  (or
+                  ;; Exclude blocks that live on this page or one of its aliases.
+                  (contains? ids (:db/id (:block/page ref)))
                   (when class-ids
                     (some class-ids (map :db/id (:block/tags ref))))
                   (entity-util/hidden? ref)
                   (entity-util/hidden? (:block/page ref)))))
        (map :db/id)
        set))
+
+(defn literature-reference-target-ids
+  "Read a Paper's existing PDF and annotation identities without rewriting refs."
+  [db id]
+  (let [paper (d/entity db id)]
+    (into (set (cons id (ldb/get-block-alias db id)))
+          (mapcat (fn [asset]
+                    (concat [(:db/id asset)]
+                            (ldb/get-block-alias db (:db/id asset))
+                            (map :db/id (:block/_link asset))
+                            (keep (fn [datom]
+                                  (let [annotation (d/entity db (:e datom))]
+                                    (when (and (= :annotation (:logseq.property/ls-type annotation))
+                                               (not (entity-util/hidden? annotation)))
+                                      (:e datom))))
+                                (d/datoms db :avet :logseq.property/asset (:db/id asset))))))
+          (remove entity-util/hidden? (:logseq.property/literature-assets paper)))))
+
+(defn literature-reference-block-ids
+  "Unfiltered reading references for a Paper and its existing attachments."
+  [db id]
+  (let [ids (literature-reference-target-ids db id)]
+    (set/difference (linked-reference-top-block-ids db ids nil) ids)))
 
 (defn- linked-reference-result
   [db id include-ref-pages-count? has-filters? ref-blocks children-ids]
@@ -272,7 +297,8 @@
   ([db id {:keys [include-ref-pages-count?]
            :or {include-ref-pages-count? true}}]
   (let [entity       (d/entity db id)
-        ids          (set (cons id (ldb/get-block-alias db id)))
+        ids          (when-not (:logseq.property/literature-item? entity)
+                       (set (cons id (ldb/get-block-alias db id))))
         page-filters (get-filters entity)
         excludes     (map :db/id (:excluded page-filters))
         includes     (map :db/id (:included page-filters))
@@ -282,7 +308,9 @@
                        (let [class-children (db-class/get-structured-children db id)]
                          (set (conj class-children id))))
         ;; Collect all top ref blocks that directly reference the page (or any alias).
-        full-ref-block-ids (linked-reference-top-block-ids db ids class-ids)
+        full-ref-block-ids (if (:logseq.property/literature-item? entity)
+                             (literature-reference-block-ids db id)
+                             (linked-reference-top-block-ids db ids class-ids))
         ;; matched can be top or child ids
         matched-ref-block-ids
         (when has-filters?
@@ -309,17 +337,19 @@
 (defn get-unlinked-references
   [db id]
   (let [entity (d/entity db id)
-        title (string/lower-case (:block/title entity))]
+        title (string/lower-case (:block/title entity))
+        page-ids (ldb/page-alias-set db id)]
     (when-not (string/blank? title)
       (let [ids (->> (d/datoms db :avet :block/title)
                      (keep (fn [d]
-                             (when (and (not= id (:e d))
+                             (when (and (not (contains? page-ids (:e d)))
                                         (string/includes? (string/lower-case (:v d)) title))
                                (:e d)))))]
         (keep
          (fn [eid]
            (let [e (d/entity db eid)]
-             (when-not (or (some #(= id %) (map :db/id (:block/refs e)))
+             (when-not (or (contains? page-ids (:db/id (:block/page e)))
+                           (some #(contains? page-ids %) (map :db/id (:block/refs e)))
                            (:block/link e)
                            (ldb/built-in? e))
                e)))

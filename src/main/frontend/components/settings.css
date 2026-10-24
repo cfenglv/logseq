@@ -249,6 +249,107 @@
   }
 }
 
+.font-settings {
+  .font-settings-content {
+    container-type: inline-size;
+  }
+
+  .font-settings-layout,
+  .font-custom-controls,
+  .font-installed-list {
+    display: grid;
+    gap: 0.5rem;
+    min-width: 0;
+    align-content: start;
+  }
+
+  .font-settings-layout {
+    grid-template-columns: 9rem minmax(0, 1fr);
+    grid-template-areas: "region family" "size preview";
+    align-items: center;
+    column-gap: 0.75rem;
+  }
+
+  .font-region-controls,
+  .font-family-controls,
+  .font-size-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .font-region-controls {
+    grid-area: region;
+  }
+
+  .font-family-controls {
+    grid-area: family;
+    max-width: 14.5rem;
+    gap: 0.25rem;
+  }
+
+  .font-family-controls > select {
+    flex: 1 1 12.5rem;
+    width: 12.5rem;
+    min-width: 5rem;
+  }
+
+  .font-region-controls > select {
+    flex: 0 1 9rem;
+    width: 9rem;
+    min-width: 5rem;
+  }
+
+  .font-reset {
+    flex: none;
+    box-sizing: border-box;
+    width: 1.75rem;
+    height: 1.75rem;
+    padding: 0;
+  }
+
+  .font-size-controls {
+    grid-area: size;
+    gap: 0.25rem;
+    font-size: 0.75rem;
+  }
+
+  .font-size-controls > input {
+    flex: none;
+    width: 5rem;
+  }
+
+  .form-input,
+  .form-select {
+    margin-top: 0;
+    max-width: 100%;
+  }
+
+  .font-preview {
+    grid-area: preview;
+    margin: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .font-custom-controls {
+    grid-column: 1 / -1;
+  }
+
+  @container (max-width: 20rem) {
+    .font-settings-layout {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-areas: none;
+    }
+
+    .font-settings-layout > * {
+      grid-area: auto;
+    }
+  }
+}
+
 .cp__theme-modes-options {
   @apply flex items-center m-0 list-none gap-3;
 
@@ -489,4 +590,10 @@ body[data-settings-tab=keymap] {
       @apply grid-cols-8 pb-1 ml-1 max-w-[320px];
     }
   }
+}
+
+/* Electron custom title bar captures clicks unless overlays set no-drag. */
+.ls-app-no-drag,
+.ls-app-no-drag * {
+  -webkit-app-region: no-drag;
 }

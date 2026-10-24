@@ -63,13 +63,6 @@
   [ws]
   (sync-transport/ws-open? ws))
 
-(defn- enqueue-asset-task!
-  [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue
-           (fn [prev]
-             (p/then prev (fn [_] (task)))))))
-
 (defn- enqueue-send-task!
   [client task]
   (if-let [queue (:send-queue client)]
@@ -139,6 +132,15 @@
                (send! (:ws client) {:type "pull" :since since})))
            (send! (:ws client) {:type "pull" :since since})))))))
 
+(defn- request-repair-pull-after-commit!
+  [repo client result]
+  (when (and (= 1 (:rename-count result))
+             (identical? client (current-client repo))
+             (= (:graph-id client) (sync-util/get-graph-id repo))
+             (ws-open? (:ws client)))
+    (sync-apply/enqueue-flush-pending! repo client)
+    (request-pull! client (client-op/get-local-tx repo))))
+
 (defn- clear-pending-pull!
   [client]
   (when-let [*pending (:pending-pull-since client)]
@@ -189,7 +191,9 @@
           (log/warn :db-sync/checksum-mismatch mismatch-data)
           (p/catch
            (sync-download/<claim-repair-after-checksum-mismatch!
-            repo client remote-tx remote-checksum)
+            repo client remote-tx remote-checksum
+            (fn [result]
+              (request-repair-pull-after-commit! repo client result)))
            (fn [error]
              (log/error :db-sync/repair-claim-failed
                         {:repo repo
@@ -256,15 +260,15 @@
                                    :message-type "tx/reject"
                                    :reason reason}
                             (contains? message :t) (assoc :t remote-tx)
-                            (string? (:error-detail message))
-                            (assoc :error-detail (:error-detail message))
                             (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
                             (some? failed-tx-id) (assoc :failed-tx-id failed-tx-id)
                             (seq missing-block-uuids) (assoc :missing-block-uuids (vec missing-block-uuids))
+                            (contains? message :error-detail) (assoc :error-detail (:error-detail message))
                             (some? data) (assoc :data data))]
         (if (or (contains? message :success-tx-ids)
                 (contains? message :failed-tx-id))
           (do
+            (sync-apply/commit-large-title-markers! repo request (or success-tx-ids []))
             (sync-apply/mark-pending-txs-false! repo successful-tx-ids)
             (when failed-tx-id
               (sync-apply/rollback-and-mark-failed-txs! repo [failed-tx-id])))
@@ -287,7 +291,7 @@
     (request-pull! client local-tx))
   (sync-assets/enqueue-asset-sync!
    repo client
-   {:enqueue-asset-task-f enqueue-asset-task!
+   {:enqueue-asset-task-f sync-assets/enqueue-asset-task!
     :current-client-f current-client
     :broadcast-rtc-state!-f broadcast-rtc-state!
     :fail-fast-f fail-fast})
@@ -383,6 +387,12 @@
         "hello" (handle-hello! repo client local-tx remote-tx remote-checksum
                                (:capabilities message))
         "online-users" (handle-online-users! repo client message)
+        "profile/updated" (sync-presence/update-user-profile! broadcast-rtc-state! client message)
+        "error" (if (= "profile-refresh-failed" (:message message))
+                  (shared-service/broadcast-to-clients!
+                   :rtc-sync-state
+                   (assoc (sync-presence/rtc-state-payload sync-counts client) :user-profile/error true))
+                  (fail-fast :db-sync/invalid-field {:repo repo :type (:type message)}))
         "presence" (handle-presence! client message)
         "tx/batch/ok" (handle-tx-batch-ok! repo client remote-tx remote-checksum)
         "pull/ok" (handle-pull-ok! repo client local-tx remote-tx remote-checksum message)
@@ -395,6 +405,17 @@
 (defn- handle-pull-ok!
   [repo client local-tx remote-tx remote-checksum message]
   (clear-pending-pull! client)
+  ;; Equal-head pulls can finish a committed repair without starting a new one.
+  (when (= local-tx remote-tx (get @sync-apply/*repo->latest-remote-tx repo))
+    (when-let [{:keys [local-checksum reserved-value]}
+               (ready-sync-metadata repo client local-tx remote-tx)]
+      (when (= local-checksum remote-checksum)
+        (p/catch
+         (sync-download/<complete-repair-if-converged!
+          repo client remote-tx remote-checksum reserved-value)
+         (fn [error]
+           (log/error :db-sync/repair-completion-failed
+                      {:repo repo :remote-tx remote-tx :error error}))))))
   ;; (log/info ::handle-pull-ok! {:repo repo
   ;;                              :remote-tx remote-tx
   ;;                              :local-tx local-tx})

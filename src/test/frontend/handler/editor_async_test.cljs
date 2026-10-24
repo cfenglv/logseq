@@ -1,28 +1,42 @@
 (ns frontend.handler.editor-async-test
   (:require [cljs.test :refer [is testing async use-fixtures]]
+            [electron.ipc :as ipc]
             [datascript.core :as d]
+            [dommy.core :as dom]
             [frontend.components.block.comments-model :as comments-model]
             [frontend.db.async :as db-async]
             [frontend.db.conn :as conn]
+            [frontend.db.subs :as db-subs]
             [frontend.db.transact :as db-transact]
             [frontend.db.utils :as db-utils]
+            [frontend.fs :as fs]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.block :as block-handler]
             [frontend.handler.comments :as comments-handler]
+            [frontend.handler.common :as common-handler]
             [frontend.handler.db-based.property :as db-property-handler]
             [frontend.handler.editor :as editor]
+            [frontend.handler.editor.assets :as editor-assets]
+            [frontend.handler.editor.quick-add :as editor-quick-add]
+            [frontend.handler.export.html :as export-html]
+            [frontend.handler.literature :as literature-handler]
+            [frontend.handler.notification :as notification]
             [frontend.handler.user :as user-handler]
             [frontend.modules.outliner.op :as frontend-outliner-op]
             [frontend.state :as state]
             [frontend.test.helper :as test-helper :include-macros true :refer [deftest-async load-test-files]]
             [frontend.util :as util]
+            [frontend.worker.handler.block :as worker-block-handler]
             [frontend.worker.handler.comments :as worker-comments]
             [goog.dom :as gdom]
             [logseq.db :as ldb]
+            [logseq.db.frontend.asset :as db-asset]
             [logseq.outliner.op :as outliner-op]
+            [logseq.shui.ui :as shui]
             [promesa.core :as p]))
 
 (defonce ^:private *previous-state (atom nil))
+(defonce ^:private *previous-db-worker (atom nil))
 
 (def ^:private test-worker-block-pull
   '[* {:block/page [*]
@@ -100,13 +114,37 @@
              (reset! *previous-state (state/get-state))
              (async done
                     (test-helper/start-test-db!)
+                    (reset! *previous-db-worker state/<invoke-db-worker)
+                    (set! state/<invoke-db-worker
+                          (fn [api & args]
+                            (if (and (= :thread-api/pull api)
+                                     (= :logseq.class/Asset (last args)))
+                              (p/resolved
+                               (d/pull (conn/get-db test-helper/test-db)
+                                       [:block/uuid] :logseq.class/Asset))
+                              (apply @*previous-db-worker api args))))
                     (done)))
    :after (fn []
             (let [previous-state @*previous-state]
               (test-helper/destroy-test-db!)
+              (set! state/<invoke-db-worker @*previous-db-worker)
+              (reset! *previous-db-worker nil)
               (state/set-current-repo! (:git/current-repo previous-state))
               (state/replace-state! previous-state)
               (reset! *previous-state nil)))})
+
+(defn- synthetic-pdf-file
+  [filename]
+  #js {:name filename :type "application/pdf" :size 100
+       :arrayBuffer #(p/resolved (.-buffer (js/Uint8Array. 100)))})
+
+(defn- <with-enabled-pdf-save
+  [f]
+  (p/with-redefs [state/get-current-repo (constantly "repo")
+                 db-subs/projection-context (constantly {:graph-id "repo" :projection-epoch 1})
+                 literature-handler/load-settings (constantly {:enabled? true})
+                 db-asset/<get-file-array-buffer-checksum (constantly (p/resolved "checksum"))]
+    (f)))
 
 (defn- delete-block
   [db block {:keys [embed? on-delete edit-content on-edit schedule-immediately?]}]
@@ -163,6 +201,7 @@
             (state/set-state! :git/current-repo previous-repo))))))
 
 (deftest-async delete-block-async!
+  (p/do!
   (testing "backspace deletes empty block"
     (load-test-files
      [{:page {:block/title "page1"}
@@ -205,6 +244,7 @@
                                                    :tail-len 0
                                                    :container-id nil
                                                    :save-code-editor? false
+                                                   :save-current-block? false
                                                    :skip-load? true}}
                                            (some-> (last @edit-calls)
                                                    (update :block :block/title)))
@@ -237,7 +277,7 @@
                                                                  @conn)
                                                             (map first))]
                                      (is (= ["b1" "b2"] updated-blocks) "Visible page blocks stay on the page")
-                                     (is (empty? deleted-blocks) "Deleted block is removed from page db")))}))))
+                                     (is (empty? deleted-blocks) "Deleted block is removed from page db")))})))))
 
 (deftest-async backspace-between-empty-blocks-focuses-current-block-like-master
   (load-test-files
@@ -377,10 +417,77 @@
                           :tail-len 0
                           :container-id nil
                           :save-code-editor? false
+                          :save-current-block? false
                           :skip-load? true}]
                         @edit-call)
                      "Deletion should restore focus from the renderer callback")))))
         (p/finally (fn [] nil)))))
+
+(defn- selection-block-dom
+  [block]
+  #js {:closest (constantly nil)
+       :getAttribute (fn [attr]
+                       (when (= attr "blockid")
+                         (str (:block/uuid block))))})
+
+(defn- <delete-selected-blocks!
+  [blocks]
+  (p/with-redefs [state/<invoke-db-worker <test-db-worker
+                  db-transact/apply-outliner-ops apply-test-outliner-ops!
+                  editor/get-selected-blocks (fn [] (mapv selection-block-dom blocks))
+                  dom/has-class? (constantly false)
+                  dom/attr (fn [node attr]
+                             (when node
+                               (.getAttribute node attr)))
+                  util/get-prev-block-non-collapsed-non-embed (constantly nil)
+                  editor/edit-block! (constantly nil)]
+    (editor/cut-selection-blocks false)))
+
+(deftest-async delete-selected-child-page-unlinks-namespace-and-keeps-content
+  (load-test-files
+   [{:page {:block/title "Parent page"}
+     :blocks [{:block/title "sibling"}]}
+    {:page {:block/title "Child page"}
+     :blocks [{:block/title "keep this content"}
+              {:block/title "and this too"}]}])
+  (let [conn (conn/get-db test-helper/test-db false)
+        parent (ldb/get-page @conn "parent page")
+        child (ldb/get-page @conn "child page")]
+    (d/transact! conn [{:db/id (:db/id child)
+                        :block/parent (:db/id parent)
+                        :block/order "a1"}])
+    (p/let [_ (<delete-selected-blocks! [(d/entity @conn (:db/id child))])
+            child' (ldb/get-page @conn "child page")
+            parent' (ldb/get-page @conn "parent page")
+            child-titles (->> (d/q '[:find [?title ...]
+                                     :in $ ?page
+                                     :where
+                                     [?b :block/page ?page]
+                                     [?b :block/title ?title]
+                                     [(missing? $ ?b :logseq.property/deleted-at)]]
+                                   @conn
+                                   (:db/id child'))
+                              set)
+            parent-children (map :block/title (ldb/sort-by-order (:block/_parent parent')))]
+      (is (some? child')
+          "The child page entity must remain after selection delete")
+      (is (nil? (:block/parent child'))
+          "Selection delete must only remove the namespace relationship")
+      (is (= #{"keep this content" "and this too"} child-titles)
+          "Child page content must stay intact")
+      (is (= ["sibling"] parent-children)
+          "The parent page must keep its own blocks and lose the child page"))))
+
+(deftest-async delete-selected-block-still-removes-its-children
+  (load-test-files
+   [{:page {:block/title "page1"}
+     :blocks [{:block/title "parent"
+               :build/children [{:block/title "nested child"}]}]}])
+  (p/let [parent (test-helper/find-block-by-content "parent")
+          _ (<delete-selected-blocks! [parent])]
+    (is (nil? (test-helper/find-block-by-content "parent")))
+    (is (nil? (test-helper/find-block-by-content "nested child"))
+        "Selection delete of a regular block must still retract its subtree")))
 
 (deftest-async backspace-before-block-merges-into-previous-blank-asset-block
   (load-test-files
@@ -595,17 +702,18 @@
         (is (not= (:db/id comments-area') (:db/id (:block/parent target')))
             "The target block must not become a child of the comments area")))))
 
-(deftest-async db-based-save-assets-appends-to-today-page-without-editor
-  (let [today-page {:block/uuid (random-uuid)
-                    :block/title "today"}
+(deftest-async db-based-save-assets-appends-to-asset-page-without-editor
+  (let [asset-page {:block/uuid (random-uuid)
+                    :block/title "Asset"}
         inserted (atom nil)]
     (-> (p/with-redefs [assets-handler/ensure-assets-dir! (fn [_repo]
                                                             (p/resolved ["/repo" "assets"]))
                         assets-handler/get-file-checksum (constantly "checksum")
                         db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
-                        db-async/<get-today-journal-title (fn [& _] (p/resolved "today"))
-                        db-async/<get-journal-page-by-day (fn [& _] (p/resolved today-page))
-                        state/<invoke-db-worker (fn [& _] (p/resolved nil))
+                        state/<invoke-db-worker (fn [api & _]
+                                                  (p/resolved
+                                                   (when (= api :thread-api/pull)
+                                                     asset-page)))
                         state/get-edit-block (constantly nil)
                         state/get-edit-content (constantly "")
                         frontend-outliner-op/insert-blocks! (fn [blocks target opts]
@@ -618,11 +726,11 @@
                                                 (mapv (fn [block-id]
                                                         {:block/uuid block-id})
                                                       block-ids)))]
-          (editor/db-based-save-assets! "repo" [{:src "image.png"
+          (editor-assets/db-based-save-assets! "repo" [{:src "image.png"
                                                  :title "image"}]))
         (p/then
          (fn [_]
-           (is (= today-page (:target @inserted)))
+           (is (= asset-page (:target @inserted)))
            (is (= {:keep-uuid? true
                    :bottom? true
                    :sibling? false
@@ -654,7 +762,7 @@
                                                 (mapv (fn [block-id]
                                                         {:block/uuid block-id})
                                                       block-ids)))]
-          (editor/db-based-save-assets! "repo"
+          (editor-assets/db-based-save-assets! "repo"
                                         [{:src "image.png"
                                           :title "image"}]
                                         :last-edit-block last-edit-block))
@@ -696,7 +804,7 @@
                                                 (mapv (fn [block-id]
                                                         {:block/uuid block-id})
                                                       block-ids)))]
-          (editor/db-based-save-assets! "repo"
+          (editor-assets/db-based-save-assets! "repo"
                                         [{:src "image.png"
                                           :title "image"}]
                                         :target-block target-block
@@ -713,6 +821,516 @@
                    :replace-empty-target? false}
                   (:opts @inserted))
                "Explicit target asset insertion should append as children, not replace the temp edit block"))))))
+
+(deftest-async db-based-save-assets-reuses-and-repairs-an-existing-literature-pdf
+  (let [target {:block/uuid (random-uuid) :block/title "target"}
+        existing-uuid #uuid "32d917fc-4599-476f-ae84-c0d3fbf9439c"
+        inserted (atom nil)
+        writes (atom [])
+        filenames (atom nil)
+        file (synthetic-pdf-file "paper.pdf")]
+    (-> (p/with-redefs [assets-handler/ensure-assets-dir! (fn [_repo]
+                                                            (p/resolved ["/repo" "assets"]))
+                        assets-handler/get-file-checksum (constantly "checksum")
+                        db-async/<get-asset-with-checksum (fn [& _]
+                                                            (p/resolved {:block/uuid existing-uuid}))
+                        db-async/<find-reusable-pdf-by-checksum
+                        (fn [_repo checksum]
+                          (is (= "checksum" checksum))
+                          (p/resolved {:status :found
+                                       :assets [{:block/uuid existing-uuid}]}))
+                        db-async/<add-literature-pdf-filenames
+                        (fn [_repo names]
+                          (reset! filenames names)
+                          (p/resolved nil))
+                        db-async/<get-today-journal-title (fn [& _] (p/resolved "today"))
+                        db-async/<get-journal-page-by-day (fn [& _]
+                                                            (p/resolved {:block/uuid (random-uuid)}))
+                        fs/file-exists? (fn [repo-dir path]
+                                          (is (= "/repo" repo-dir))
+                                          (is (= (str "assets/" existing-uuid ".pdf") path))
+                                          (p/resolved false))
+                        fs/write-asset-file! (fn [_repo file-path content]
+                                                       (swap! writes conj [file-path (.-byteLength content)])
+                                                       (p/resolved nil))
+                        state/get-edit-block (constantly nil)
+                        frontend-outliner-op/insert-blocks! (fn [blocks target' _opts]
+                                                             (reset! inserted {:blocks blocks
+                                                                               :target target'})
+                                                             [:insert-blocks])
+                        db-async/<get-blocks (fn [_repo block-ids _opts]
+                                               (p/resolved
+                                                (mapv (fn [block-id] {:block/uuid block-id})
+                                                      block-ids)))]
+          (<with-enabled-pdf-save
+           (fn [] (editor-assets/db-based-save-assets! "repo" [file]
+                                        :reuse-existing-pdf? true
+                                        :target-block target))))
+        (p/then
+         (fn [_]
+           (is (= target (:target @inserted)))
+           (is (= {existing-uuid #{"paper.pdf"}} @filenames))
+           (is (= [:block/uuid existing-uuid]
+                  (get-in @inserted [:blocks 0 :block/link])))
+           (is (= [[(str existing-uuid ".pdf") 100]] @writes)
+               "A missing local file is restored at the existing Asset UUID"))))))
+
+(deftest-async literature-pdf-reuse-restores-only-missing-or-damaged-files
+  (let [writes (atom [])
+        matches? (atom true)
+        checks (atom [])
+        file #js {:name "paper.pdf" :size 3}
+        content (.-buffer (js/Uint8Array. #js [1 2 3]))
+        write {:file file :file-path "existing.pdf" :checksum "expected-checksum"}]
+    (-> (p/with-redefs [util/electron? (constantly true)
+                        ipc/ipc (fn [& args]
+                                  (swap! checks conj args)
+                                  (p/resolved @matches?))
+                        fs/read-file-raw (fn [& _]
+                                           (throw (js/Error. "Native verification does not send local PDF bytes")))
+                        assets-handler/db-based-write-asset! (fn [repo file-path file' content']
+                                                               (swap! writes conj [repo file-path file' content'])
+                                                               (p/resolved nil))]
+          (p/let [_ (assets-handler/<restore-reused-asset-file! "repo" "/repo" "assets" write content)
+                  _ (is (empty? @writes) "Healthy duplicate files are never rewritten")
+                  _ (reset! matches? false)
+                  _ (assets-handler/<restore-reused-asset-file! "repo" "/repo" "assets" write content)
+                  _ (assets-handler/<restore-reused-asset-file! "repo" "/repo" "assets" write content)]
+            nil))
+        (p/then (fn [_]
+                  (is (= (repeat 2 ["repo" "existing.pdf" file content]) @writes)
+                      "Missing or damaged files use the supplied correct bytes at the original path")
+                  (is (= (repeat 3 ["fileContentMatches" "/repo/assets/existing.pdf" 3 "expected-checksum"])
+                         @checks)))))))
+
+(deftest-async literature-pdf-reuse-read-failure-does-not-overwrite
+  (let [writes (atom [])]
+    (-> (p/with-redefs [util/electron? (constantly true)
+                        ipc/ipc (fn [& _] (p/rejected (js/Error. "File cannot be read")))
+                        assets-handler/db-based-write-asset! (fn [& args]
+                                                               (swap! writes conj args)
+                                                               (p/resolved nil))]
+          (-> (assets-handler/<restore-reused-asset-file!
+               "repo" "/repo" "assets"
+               {:file #js {:name "paper.pdf" :size 3}
+                :file-path "existing.pdf" :checksum "expected-checksum"}
+               (.-buffer (js/Uint8Array. #js [1 2 3])))
+              (p/then (fn [_] (is false "An unreadable file cannot be reported restored")))
+              (p/catch (fn [error] (is (= "File cannot be read" (.-message error)))))))
+        (p/then (fn [_] (is (empty? @writes)))))))
+
+(deftest-async literature-pdf-reuse-checks-browser-bytes
+  (let [stored-bytes (js/Uint8Array. #js [0 1 2 3 0])
+        expected (.subarray stored-bytes 1 4)]
+    (p/with-redefs [util/electron? (constantly false)
+                    fs/file-exists? (fn [& _] (p/resolved true))
+                    fs/read-file-raw (fn [& _] (p/resolved expected))]
+      (p/let [checksum (db-asset/<get-file-array-buffer-checksum expected)
+              matches? (assets-handler/<asset-file-content-matches? "/repo" "assets/existing.pdf" 3 checksum)
+              _ (is matches? "The browser checks only the returned byte view")
+              _ (aset stored-bytes 2 4)
+              matches? (assets-handler/<asset-file-content-matches? "/repo" "assets/existing.pdf" 3 checksum)]
+        (is (not matches?) "Same-size damage is detected in the browser path")))))
+
+(deftest-async db-based-save-assets-collapses-same-batch-identical-pdfs
+  (let [target {:block/uuid (random-uuid) :block/title "target"}
+        inserted (atom nil)
+        writes (atom [])
+        filenames (atom nil)
+        lookups (atom 0)
+        files [(synthetic-pdf-file "first.pdf")
+               (synthetic-pdf-file "second.pdf")]]
+    (-> (p/with-redefs [fs/file-exists? (fn [& _] (p/resolved false))
+                        assets-handler/ensure-assets-dir! (fn [_repo]
+                                                            (p/resolved ["/repo" "assets"]))
+                        assets-handler/get-file-checksum (constantly "checksum")
+                        db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                        db-async/<find-reusable-pdf-by-checksum
+                        (fn [_repo checksum]
+                          (swap! lookups inc)
+                          (is (= "checksum" checksum))
+                          (p/resolved {:status :missing :assets []}))
+                        db-async/<add-literature-pdf-filenames
+                        (fn [_repo names]
+                          (reset! filenames names)
+                          (p/resolved nil))
+                        db-async/<get-today-journal-title (fn [& _] (p/resolved "today"))
+                        db-async/<get-journal-page-by-day (fn [& _]
+                                                            (p/resolved {:block/uuid (random-uuid)}))
+                        fs/write-asset-file! (fn [_repo file-path file]
+                                                       (swap! writes conj [file-path file])
+                                                       (p/resolved nil))
+                        state/get-edit-block (constantly nil)
+                        frontend-outliner-op/insert-blocks! (fn [blocks target' _opts]
+                                                             (reset! inserted {:blocks blocks
+                                                                               :target target'})
+                                                             [:insert-blocks])
+                        db-async/<get-blocks (fn [_repo block-ids _opts]
+                                               (p/resolved
+                                                (mapv (fn [block-id] {:block/uuid block-id})
+                                                      block-ids)))]
+          (<with-enabled-pdf-save
+           (fn [] (editor-assets/db-based-save-assets! "repo" files
+                                        :reuse-existing-pdf? true
+                                        :target-block target))))
+        (p/then
+         (fn [_]
+           (let [[asset link] (:blocks @inserted)]
+             (is (= 1 @lookups))
+             (is (= 1 (count @writes)))
+             (is (= {(:block/uuid asset) #{"first.pdf" "second.pdf"}} @filenames))
+             (is (= (str (:block/uuid asset) ".pdf")
+                    (ffirst @writes)))
+             (is (= [:block/uuid (:block/uuid asset)] (:block/link link)))))))))
+
+(defn- check-overlapping-pdf-saves
+  [empty-edit?]
+  (let [reads (atom {})
+        hashes (atom [])
+        writes (atom [])
+        saved (atom nil)
+        inserted (atom [])
+        first-write (p/deferred)
+        finish-write (p/deferred)
+        make-file (fn [filename]
+                    #js {:name filename :size 1 :type "application/pdf"
+                         :arrayBuffer
+                         (fn []
+                           (let [n (get (swap! reads update filename (fnil inc 0)) filename)]
+                             (p/resolved (.-buffer (js/Uint8Array. #js [n])))))})
+        files [(make-file "paper.pdf") (make-file "renamed-paper.pdf")]
+        blank {:block/uuid (random-uuid) :block/title ""}
+        targets (if empty-edit? [blank blank]
+                    [{:block/uuid (random-uuid)} {:block/uuid (random-uuid)}])]
+    (-> (p/with-redefs [literature-handler/load-settings (constantly {:enabled? true})
+                        state/get-current-repo (constantly "repo")
+                        db-subs/projection-context (constantly {:repo "repo" :epoch 1})
+                        state/get-edit-block (constantly (when empty-edit? blank))
+                        state/get-edit-content (constantly "")
+                        editor/edit-block! (fn [& _] nil)
+                        db-async/<get-block (fn [& _] (p/resolved (or @saved blank)))
+                        assets-handler/ensure-assets-dir! (fn [_] (p/resolved ["/repo" "assets"]))
+                        db-asset/<get-file-array-buffer-checksum
+                        (fn [content]
+                          (let [value (aget (js/Uint8Array. content) 0)]
+                            (swap! hashes conj value)
+                            (p/resolved (str "checksum-" value))))
+                        db-async/<get-asset-with-checksum (fn [& _] (p/resolved @saved))
+                        db-async/<find-reusable-pdf-by-checksum
+                        (fn [& _]
+                          (p/resolved (if @saved
+                                        {:status :found :assets [@saved]}
+                                        {:status :missing :assets []})))
+                        db-async/<get-today-journal-title (fn [& _] (p/resolved "today"))
+                        db-async/<get-journal-page-by-day (fn [& _] (p/resolved (first targets)))
+                        fs/file-exists? (fn [& _] (p/resolved true))
+                        assets-handler/<asset-file-content-matches? (fn [& _] (p/resolved true))
+                        fs/write-asset-file!
+                        (fn [_repo path content]
+                          (swap! writes conj [path (aget (js/Uint8Array. content) 0)])
+                          (p/resolve! first-write nil)
+                          finish-write)
+                        db-async/<add-literature-pdf-filenames (fn [& _] (p/resolved nil))
+                        frontend-outliner-op/insert-blocks!
+                        (fn [blocks target _opts]
+                          (swap! inserted conj {:blocks blocks :target target})
+                          (when-let [asset (first (filter :logseq.property.asset/checksum blocks))]
+                            (reset! saved asset))
+                          [:insert-blocks])
+                        db-async/<get-blocks
+                        (fn [_ ids _] (p/resolved (mapv #(hash-map :block/uuid %) ids)))]
+          (let [saves (mapv (fn [file target]
+                              (if empty-edit?
+                                (editor-assets/db-based-save-assets!
+                                 "repo" [file] :reuse-existing-pdf? true)
+                                (editor-assets/db-based-save-assets!
+                                 "repo" [file] :reuse-existing-pdf? true :target-block target)))
+                            files targets)]
+            (p/let [_ first-write
+                    _ (p/delay 0)]
+              (p/resolve! finish-write nil)
+              (p/all saves))))
+        (p/then
+         (fn [_]
+           (is (= {"paper.pdf" 1 "renamed-paper.pdf" 1} @reads))
+           (is (= [1 1] @hashes))
+           (is (= 1 (count @writes))
+               "A healthy Asset is written only on the first paste")
+           (is (= 1 (second (first @writes))) "Saved bytes must be the bytes that were hashed")
+           (is (= targets (mapv :target @inserted)))
+           (let [assets (filter :logseq.property.asset/checksum (mapcat :blocks @inserted))]
+             (is (= 1 (count assets)))
+             (when empty-edit?
+               (is (= (:block/uuid blank) (:block/uuid (first assets))))))
+           (let [link (first (filter :block/link (mapcat :blocks @inserted)))]
+             (is (= [:block/uuid (:block/uuid @saved)] (:block/link link)))
+             (is (not= (:block/uuid link) (second (:block/link link)))
+                 "A second paste into the former empty node must not self-link")))))))
+
+(deftest-async overlapping-pdf-saves-share-one-asset-and-read-each-file-once
+  (p/do! (check-overlapping-pdf-saves false)
+         (check-overlapping-pdf-saves true)))
+
+(deftest-async reused-unregistered-pdf-is-identified-once-after-paste
+  (let [asset-uuid #uuid "72000000-0000-4000-8000-000000000010"
+        checksum "reused-checksum"
+        files [#js {:name "paper.pdf" :type "application/pdf" :size 100}
+               #js {:name "renamed-paper.pdf" :type "application/pdf" :size 100}]
+        candidates (mapv (fn [file]
+                           {:file file
+                            :file-name (.-name file)
+                            :ext "pdf"
+                            :checksum checksum
+                            :asset-block {:block/uuid (random-uuid)}})
+                         files)
+        reuse {:status :found
+               :literature-status :missing
+               :assets [{:block/uuid asset-uuid}]}
+        plan (#'editor-assets/build-asset-insert-plan candidates {checksum reuse})]
+    (is (= {asset-uuid #{"paper.pdf" "renamed-paper.pdf"}} (:pdf-filenames plan)))
+    (is (= [{:asset-uuid asset-uuid
+             :file-path (str asset-uuid ".pdf")
+             :checksum checksum
+             :byte-size 100}]
+           (:new-pdf-identifications plan))
+        "Same-batch aliases of an unregistered PDF identify its original Asset once")
+    (is (= [[:block/uuid asset-uuid] [:block/uuid asset-uuid]]
+           (mapv :block/link (:blocks plan))))
+    (is (empty? (:new-writes plan)))
+    (is (= [(str asset-uuid ".pdf")]
+           (mapv :file-path (:repair-writes plan))))
+    (doseq [status [:found :conflict]]
+      (is (empty? (:new-pdf-identifications
+                   (#'editor-assets/build-asset-insert-plan
+                    candidates {checksum (assoc reuse :literature-status status)})))
+          "Registered or ambiguously associated PDFs are not parsed again"))
+    (is (empty? (:new-pdf-identifications
+                 (#'editor-assets/build-asset-insert-plan
+                  [(assoc (first candidates) :file nil)] {checksum reuse}))))
+    (is (empty? (:new-pdf-identifications
+                 (#'editor-assets/build-asset-insert-plan
+                  [(assoc (first candidates)
+                          :file #js {:name "image.pdf" :type "image/png" :size 100})]
+                  {checksum reuse})))
+        "An explicit non-PDF MIME type never starts PDF identification")
+    (p/resolved nil)))
+
+(deftest-async literature-identification-entry-is-default-off
+  (let [target {:block/uuid (random-uuid) :block/title "target"}
+        lookups (atom 0)
+        schedules (atom 0)
+        file #js {:name "paper.pdf" :size 100}]
+    (-> (p/with-redefs [assets-handler/ensure-assets-dir! (fn [_]
+                                                            (p/resolved ["/repo" "assets"]))
+                        assets-handler/get-file-checksum (constantly "checksum")
+                        db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                        db-async/<find-reusable-pdf-by-checksum (fn [& _]
+                                                                  (swap! lookups inc)
+                                                                  (p/resolved {:status :missing}))
+                        db-async/<get-today-journal-title (fn [& _] (p/resolved "today"))
+                        db-async/<get-journal-page-by-day (fn [& _]
+                                                            (p/resolved {:block/uuid (random-uuid)}))
+                        assets-handler/db-based-write-asset! (fn [& _] (p/resolved nil))
+                        state/get-edit-block (constantly nil)
+                        frontend-outliner-op/insert-blocks! (fn [& _] [:insert-blocks])
+                        db-async/<get-blocks (fn [_ block-ids _]
+                                               (p/resolved (mapv #(hash-map :block/uuid %) block-ids)))
+                        literature-handler/schedule-new-pdf-identification!
+                        (fn [& _]
+                          (swap! schedules inc)
+                          (p/resolved {:status :complete}))]
+          (editor-assets/db-based-save-assets! "repo" [file]
+                                        :reuse-existing-pdf? true
+                                        :target-block target))
+        (p/then
+         (fn [_]
+           (is (zero? @lookups)
+               "A single new PDF keeps the existing save path when identification is off")
+           (is (zero? @schedules)))))))
+
+(deftest-async literature-identification-starts-after-a-new-pdf-is-saved-and-inserted
+  (let [target {:block/uuid (random-uuid) :block/title "target"}
+        events (atom [])
+        scheduled (atom nil)
+        callback (fn [_])
+        file (synthetic-pdf-file "paper.pdf")]
+    (-> (p/with-redefs [fs/file-exists? (fn [& _] (p/resolved false))
+                        assets-handler/ensure-assets-dir! (fn [_]
+                                                            (p/resolved ["/repo" "assets"]))
+                        assets-handler/get-file-checksum (constantly "checksum")
+                        db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                        db-async/<find-reusable-pdf-by-checksum
+                        (fn [_ checksum]
+                          (is (= "checksum" checksum))
+                          (p/resolved {:status :missing :assets []}))
+                        db-async/<add-literature-pdf-filenames
+                        (fn [_ names]
+                          (is (= #{"paper.pdf"} (first (vals names))))
+                          (swap! events conj [:filenames])
+                          (p/resolved nil))
+                        db-async/<get-today-journal-title (fn [& _] (p/resolved "today"))
+                        db-async/<get-journal-page-by-day (fn [& _]
+                                                            (p/resolved {:block/uuid (random-uuid)}))
+                        fs/write-asset-file!
+                        (fn [_ file-path file']
+                          (swap! events conj [:write file-path file'])
+                          (p/resolved nil))
+                        state/get-edit-block (constantly nil)
+                        frontend-outliner-op/insert-blocks!
+                        (fn [blocks _target _opts]
+                          (swap! events conj [:insert (mapv :block/uuid blocks)])
+                          [:insert-blocks])
+                        db-async/<get-blocks
+                        (fn [_ block-ids _]
+                          (swap! events conj [:read-back (vec block-ids)])
+                          (p/resolved (mapv #(hash-map :block/uuid %) block-ids)))
+                        literature-handler/schedule-new-pdf-identification!
+                        (fn [repo repo-dir asset-dir entries & {:keys [on-result]}]
+                          (swap! events conj [:schedule])
+                          (reset! scheduled {:repo repo
+                                             :repo-dir repo-dir
+                                             :asset-dir asset-dir
+                                             :entries entries
+                                             :on-result on-result})
+                          (p/resolved {:status :complete}))]
+          (<with-enabled-pdf-save
+           (fn [] (editor-assets/db-based-save-assets! "repo" [file]
+                                        :reuse-existing-pdf? true
+                                        :auto-identify-literature? true
+                                        :on-literature-identification callback
+                                        :target-block target))))
+        (p/then
+         (fn [_]
+           (let [entry (first (:entries @scheduled))]
+             (is (= [:write :insert :filenames :read-back :schedule]
+                    (mapv first @events)))
+             (is (= "repo" (:repo @scheduled)))
+             (is (= "/repo" (:repo-dir @scheduled)))
+             (is (= "assets" (:asset-dir @scheduled)))
+             (is (= "checksum" (:checksum entry)))
+             (is (= 100 (:byte-size entry)))
+             (is (= (str (:asset-uuid entry) ".pdf") (:file-path entry)))
+             (is (identical? callback (:on-result @scheduled)))))))))
+
+(deftest-async literature-identification-keeps-a-lightweight-manual-review-entry
+  (let [target {:block/uuid (random-uuid) :block/title "target"}
+        stored (atom [])
+        scheduled (atom nil)
+        file (synthetic-pdf-file "paper.pdf")]
+    (-> (p/with-redefs [fs/file-exists? (fn [& _] (p/resolved false))
+                        assets-handler/ensure-assets-dir! (fn [_]
+                                                            (p/resolved ["/repo" "assets"]))
+                        assets-handler/get-file-checksum (constantly "checksum")
+                        db-async/<get-asset-with-checksum (fn [& _] (p/resolved nil))
+                        db-async/<find-reusable-pdf-by-checksum
+                        (fn [& _] (p/resolved {:status :missing :assets []}))
+                        db-async/<add-literature-pdf-filenames
+                        (fn [& _] (p/resolved nil))
+                        db-async/<get-today-journal-title (fn [& _] (p/resolved "today"))
+                        db-async/<get-journal-page-by-day (fn [& _]
+                                                            (p/resolved {:block/uuid (random-uuid)}))
+                        fs/write-asset-file! (fn [& _] (p/resolved nil))
+                        state/get-edit-block (constantly nil)
+                        frontend-outliner-op/insert-blocks! (fn [& _] [:insert-blocks])
+                        db-async/<get-blocks
+                        (fn [_ block-ids _]
+                          (p/resolved (mapv #(hash-map :block/uuid %) block-ids)))
+                        literature-handler/store-review-result!
+                        (fn [repo repo-dir asset-dir-rpath result]
+                          (swap! stored conj [repo repo-dir asset-dir-rpath result]))
+                        literature-handler/schedule-new-pdf-identification!
+                        (fn [_repo _repo-dir _asset-dir-rpath entries
+                             & {:keys [on-result]}]
+                          (reset! scheduled {:entries entries :on-result on-result})
+                          (p/resolved {:status :busy}))]
+          (<with-enabled-pdf-save
+           (fn [] (editor-assets/db-based-save-assets! "repo" [file]
+                                        :reuse-existing-pdf? true
+                                        :auto-identify-literature? true
+                                        :target-block target))))
+        (p/then
+         (fn [_]
+           (let [[repo repo-dir asset-dir-rpath pending] (first @stored)
+                 entry (first (:entries @scheduled))]
+             (is (= ["repo" "/repo" "assets"]
+                    [repo repo-dir asset-dir-rpath]))
+             (is (= :pending (get-in pending [:extraction :status])))
+             (is (= (:asset-uuid entry) (:asset-uuid pending)))
+             (is (= "checksum" (:checksum pending)))
+             (is (= 100 (:byte-size pending)))
+             (is (= 1 (count @stored)))
+             (is (fn? (:on-result @scheduled)))))))))
+
+(deftest-async db-upload-assets-enables-literature-identification-only-for-local-graph-settings
+  (let [calls (atom [])
+        uploading? (atom true)]
+    (-> (p/with-redefs [editor/insert-command! (fn [& _])
+                        literature-handler/auto-identification-enabled?
+                        #(= % "enabled-repo")
+                        editor-assets/db-based-save-assets!
+                        (fn [repo _files & opts]
+                          (swap! calls conj [repo (apply hash-map opts)])
+                          (p/resolved []))]
+          (p/let [_ (editor-assets/db-upload-assets! "default-repo" "id" #js [] :markdown uploading? true)
+                  _ (editor-assets/db-upload-assets! "enabled-repo" "id" #js [] :markdown uploading? true)]
+            (is (= [["default-repo"
+                     {:reuse-existing-pdf? true
+                      :auto-identify-literature? false}]
+                    ["enabled-repo"
+                     {:reuse-existing-pdf? true
+                      :auto-identify-literature? true}]]
+                   @calls))))
+        (p/then (fn [_]
+                  (is (false? @uploading?)))))))
+
+(deftest-async db-based-save-assets-stops-checksum-conflicts-before-writes
+  (let [side-effects (atom [])
+        dialog (atom nil)
+        first-uuid #uuid "21271957-3e09-4ca7-9ca9-2425af7a5702"
+        second-uuid #uuid "c1e8dd1b-acbb-4dc4-8b77-09d597406ee6"
+        file (synthetic-pdf-file "paper.pdf")]
+    (-> (p/with-redefs [assets-handler/get-file-checksum (constantly "checksum")
+                        db-async/<get-asset-with-checksum (fn [& _]
+                                                            (p/resolved {:block/uuid first-uuid}))
+                        db-async/<find-reusable-pdf-by-checksum
+                        (fn [& _]
+                          (p/resolved {:status :conflict
+                                       :assets [{:block/uuid first-uuid}
+                                                {:block/uuid second-uuid}]}))
+                        literature-handler/<history-conflict-group!
+                        (fn [_ kind entry]
+                          (is (= :checksum kind))
+                          (is (= "checksum" (:checksum entry)))
+                          (p/resolved {:status :ok
+                                       :members [{:block/uuid first-uuid}
+                                                 {:block/uuid second-uuid}]}))
+                        assets-handler/ensure-assets-dir! (fn [& _]
+                                                            (swap! side-effects conj :ensure-assets-dir)
+                                                            (p/resolved ["/repo" "assets"]))
+                        db-async/<get-today-journal-title (fn [& _]
+                                                           (swap! side-effects conj :journal-title)
+                                                           (p/resolved "today"))
+                        assets-handler/db-based-write-asset! (fn [& _]
+                                                       (swap! side-effects conj :file-write)
+                                                       (p/resolved nil))
+                        frontend-outliner-op/insert-blocks! (fn [& _]
+                                                             (swap! side-effects conj :outliner-write)
+                                                             [:insert-blocks])
+                        shui/dialog-open! (fn [content opts]
+                                            (reset! dialog {:content content
+                                                            :opts opts}))
+                        state/get-edit-block (constantly nil)]
+          (<with-enabled-pdf-save
+           (fn [] (editor-assets/db-based-save-assets! "repo" [file]
+                                        :reuse-existing-pdf? true
+                                        :target-block {:block/uuid (random-uuid)}))))
+        (p/then
+         (fn [_]
+           (is (fn? (:content @dialog)))
+           (is (= :literature-pdf-reference-choice
+                  (get-in @dialog [:opts :id])))
+           (is (= [:ensure-assets-dir] @side-effects)
+               "Conflict opens the reference choice before any file or outliner writes"))))))
 
 (deftest-async ensure-comments-area-for-selected-blocks
   (let [first-uuid (random-uuid)
@@ -779,7 +1397,7 @@
                     (fn [content opts]
                       (swap! inserts conj [content opts])
                       (p/resolved nil))]
-      (p/let [_ (editor/quick-add-ensure-new-block-exists!)]
+      (p/let [_ (editor-quick-add/quick-add-ensure-new-block-exists!)]
         (is (= [["" {:page quick-add-page-id
                       :container-id :unknown-container
                       :replace-empty-target? false}]]
@@ -1000,3 +1618,526 @@
         (p/then
          (fn []
            (is (= (:block/uuid comment-block) @resolved-block-ref)))))))
+
+;; Collapsed copy/cut/paste coverage for https://github.com/logseq/db-test/issues/1216
+(defn- <complete-tree-worker
+  [_api repo' requests]
+  (let [db' (conn/get-db repo')]
+    (p/resolved
+     (mapv (fn [{:keys [id opts]}]
+             (let [id' (if (string? id) (uuid id) id)]
+               (assoc (worker-block-handler/get-block-and-children db' id' opts)
+                      :id id)))
+           requests))))
+
+(defn- load-collapsed-clipboard-fixture!
+  [& {:keys [parent-collapsed? child-collapsed?]
+      :or {parent-collapsed? true
+           child-collapsed? false}}]
+  (load-test-files
+   [{:page {:block/title "Source"}
+     :blocks [{:block/title "Parent"
+               :block/collapsed? parent-collapsed?
+               :build/children
+               [{:block/title "Child"
+                 :block/collapsed? child-collapsed?
+                 :build/children [{:block/title "Grandchild"}]}
+                {:block/title "Sibling child"}]}]}
+    {:page {:block/title "Dest"}
+     :blocks [{:block/title "Target"}]}])
+  {:parent (test-helper/find-block-by-content "Parent")
+   :target (test-helper/find-block-by-content "Target")
+   :expected-titles ["Parent" "Child" "Grandchild" "Sibling child"]})
+
+(defn- page-block-by-title
+  [page-name title]
+  (d/q '[:find (pull ?b [:block/uuid :block/title]) .
+         :in $ ?page-name ?title
+         :where
+         [?p :block/name ?page-name]
+         [?b :block/page ?p]
+         [?b :block/title ?title]
+         [(missing? $ ?b :logseq.property/deleted-at)]]
+       (conn/get-db test-helper/test-db)
+       page-name
+       title))
+
+(defn- subtree-titles
+  [block-uuid]
+  (mapv :block/title
+        (ldb/get-block-and-children (conn/get-db test-helper/test-db) block-uuid)))
+
+(defn- <structured-clipboard-blocks
+  [block-uuid]
+  (p/let [blocks (#'editor/<get-all-blocks-by-ids test-helper/test-db [block-uuid])]
+    (#'editor/blocks-for-clipboard blocks)))
+
+(defn- <cut-collapsed-parent!
+  [parent]
+  (let [clipboard (atom nil)]
+    (p/with-redefs [state/<invoke-db-worker <complete-tree-worker
+                    editor/compose-copied-blocks-contents
+                    (fn [_repo ids & _]
+                      (p/resolved [ids (:block/title parent) [parent]]))
+                    export-html/export-blocks-as-html (fn [& _] (p/resolved ""))
+                    common-handler/copy-to-clipboard-without-id-property!
+                    (fn [_repo _text _html blocks & _opts]
+                      (reset! clipboard blocks))
+                    db-transact/apply-outliner-ops apply-test-outliner-ops!]
+      (p/let [_ (editor/cut-block! (:block/uuid parent))]
+        @clipboard))))
+
+(deftest-async ^:large-vars/cleanup-todo copied-selection-loads-the-complete-structured-tree
+  (let [repo test-helper/test-db
+        page-uuid (random-uuid)
+        property-uuid (random-uuid)
+        root-uuid (random-uuid)
+        collapsed-uuid (random-uuid)
+        collapsed-child-uuid (random-uuid)
+        query-uuid (random-uuid)
+        property-value-uuid (random-uuid)
+        independent-uuid (random-uuid)
+        chain-uuids (vec (repeatedly 101 random-uuid))
+        chain-blocks
+        (mapv (fn [index block-uuid]
+                {:db/id (- (+ 100 index))
+                 :block/uuid block-uuid
+                 :block/tx-id 1
+                 :block/title (str "Chain " index)
+                 :block/page -1
+                 :block/parent (if (zero? index) -3 (- (+ 99 index)))
+                 :block/order "a0"})
+              (range (count chain-uuids))
+              chain-uuids)]
+    (d/transact!
+     (conn/get-db repo false)
+     (concat
+      [{:db/id -1
+        :block/uuid page-uuid
+        :block/tx-id 1
+        :block/title "Page"
+        :block/name "page"
+        :block/tags :logseq.class/Page}
+       {:db/id -2
+        :db/ident :user.property/Text
+        :db/valueType :db.type/ref
+        :db/cardinality :db.cardinality/one
+        :block/uuid property-uuid
+        :block/tx-id 1
+        :block/title "Text"
+        :block/tags :logseq.class/Property}
+       {:db/id -3
+        :block/uuid root-uuid
+        :block/tx-id 1
+        :block/title "Root"
+        :block/page -1
+        :block/parent -1
+        :block/order "a0"}
+       {:db/id -4
+        :block/uuid collapsed-uuid
+        :block/tx-id 1
+        :block/title "Collapsed"
+        :block/page -1
+        :block/parent -3
+        :block/order "a1"
+        :block/collapsed? true}
+       {:db/id -5
+        :block/uuid collapsed-child-uuid
+        :block/tx-id 1
+        :block/title "Collapsed child"
+        :block/page -1
+        :block/parent -4
+        :block/order "a0"}
+       {:db/id -6
+        :block/uuid query-uuid
+        :block/tx-id 1
+        :block/title "Query"
+        :block/page -1
+        :block/order "a3"}
+       {:db/id -7
+        :block/uuid independent-uuid
+        :block/tx-id 1
+        :block/title "Independent"
+        :block/page -1
+        :block/parent -1
+        :block/order "a1"}
+       {:db/id -8
+        :block/uuid property-value-uuid
+        :block/tx-id 1
+        :block/title "Property value"
+        :block/page -1
+        :block/parent -3
+        :block/order "a2"
+        :logseq.property/created-from-property -2
+        :logseq.property/query -6}]
+      chain-blocks))
+    (let [db (conn/get-db repo)
+          expected-uuids
+          (conj (mapv :block/uuid
+                      (ldb/get-block-and-children
+                       db root-uuid {:include-property-block? true}))
+                independent-uuid)]
+      (p/with-redefs [state/<invoke-db-worker <complete-tree-worker]
+        (p/let [blocks (#'editor/<get-all-blocks-by-ids
+                         repo [root-uuid (nth chain-uuids 50) independent-uuid])]
+          (is (= expected-uuids (mapv :block/uuid blocks))))))))
+
+(deftest-async copied-collapsed-parent-includes-nested-children
+  (let [{:keys [parent expected-titles]} (load-collapsed-clipboard-fixture!)]
+    (p/with-redefs [state/<invoke-db-worker <complete-tree-worker]
+      (p/let [blocks (#'editor/<get-all-blocks-by-ids
+                       test-helper/test-db [(:block/uuid parent)])]
+        (is (= expected-titles (mapv :block/title blocks)))
+        (is (= (:block/uuid parent) (:block/uuid (first blocks))))))))
+
+(deftest-async copied-expanded-parent-includes-nested-children
+  (testing "Non-collapsed control still copies the full subtree"
+    (let [{:keys [parent expected-titles]} (load-collapsed-clipboard-fixture!
+                                            :parent-collapsed? false)]
+      (p/with-redefs [state/<invoke-db-worker <complete-tree-worker]
+        (p/let [blocks (#'editor/<get-all-blocks-by-ids
+                         test-helper/test-db [(:block/uuid parent)])]
+          (is (= expected-titles (mapv :block/title blocks))))))))
+
+(deftest-async copied-partially-collapsed-nested-levels-include-hidden-descendants
+  (testing "A collapsed nested child still contributes hidden descendants to the copy"
+    (let [{:keys [parent expected-titles]} (load-collapsed-clipboard-fixture!
+                                            :parent-collapsed? false
+                                            :child-collapsed? true)]
+      (p/with-redefs [state/<invoke-db-worker <complete-tree-worker]
+        (p/let [blocks (#'editor/<get-all-blocks-by-ids
+                         test-helper/test-db [(:block/uuid parent)])]
+          (is (= expected-titles (mapv :block/title blocks)))
+          (is (some #(= "Grandchild" (:block/title %)) blocks)))))))
+
+(deftest-async cut-collapsed-parent-includes-nested-children-and-removes-source
+  (let [{:keys [parent expected-titles]} (load-collapsed-clipboard-fixture!)]
+    (p/let [clipboard (<cut-collapsed-parent! parent)]
+      (is (= expected-titles (mapv :block/title clipboard)))
+      (is (nil? (page-block-by-title "source" "Parent")))
+      (is (nil? (page-block-by-title "source" "Child")))
+      (is (nil? (page-block-by-title "source" "Grandchild"))))))
+
+(deftest-async paste-after-copy-of-collapsed-parent-restores-full-tree
+  (let [{:keys [parent target expected-titles]} (load-collapsed-clipboard-fixture!)]
+    (p/with-redefs [state/<invoke-db-worker <complete-tree-worker
+                    db-transact/apply-outliner-ops apply-test-outliner-ops!]
+      (p/let [clipboard (<structured-clipboard-blocks (:block/uuid parent))
+              _ (editor/paste-blocks clipboard {:target-block target
+                                                :sibling? true
+                                                :keep-uuid? false
+                                                :ops-only? true})
+              pasted (page-block-by-title "dest" "Parent")
+              source (page-block-by-title "source" "Parent")]
+        (is (some? pasted) "Copy+paste must insert the collapsed parent on the destination page")
+        (is (not= (:block/uuid parent) (:block/uuid pasted))
+            "Copy must mint a new parent uuid")
+        (is (= expected-titles (subtree-titles (:block/uuid pasted))))
+        (is (= expected-titles (subtree-titles (:block/uuid source)))
+            "The original collapsed tree must remain after copy")))))
+
+(deftest-async paste-after-cut-of-collapsed-parent-restores-full-tree
+  (let [{:keys [parent target expected-titles]} (load-collapsed-clipboard-fixture!)
+        parent-uuid (:block/uuid parent)]
+    (p/let [clipboard (<cut-collapsed-parent! parent)
+            _ (p/with-redefs [db-transact/apply-outliner-ops apply-test-outliner-ops!]
+                (editor/paste-blocks clipboard {:target-block target
+                                                :sibling? true
+                                                :keep-uuid? true
+                                                :ops-only? true}))
+            pasted (page-block-by-title "dest" "Parent")]
+      (is (= parent-uuid (:block/uuid pasted))
+          "Cut+paste keeps the original parent uuid")
+      (is (= expected-titles (subtree-titles parent-uuid)))
+      (is (nil? (page-block-by-title "source" "Parent"))
+          "The source page must stay empty after cut+paste"))))
+
+(deftest-async expand-block-skip-db-keeps-parent-container-collapse
+  (testing "Display-only expand must not mark the parent editor container as open"
+    (let [block-id (random-uuid)
+          parent-container 1
+          zoom-container 2
+          repo test-helper/test-db
+          previous-repo (state/get-current-repo)
+          previous-args (state/get-editor-args)
+          previous-editor-container (state/get-current-editor-container-id)
+          previous-collapsed (state/get-state :ui/collapsed-blocks)]
+      (state/set-current-repo! repo)
+      (state/set-state! :editor/args [nil nil {:container-id parent-container}])
+      (state/set-state! :editor/container-id parent-container)
+      (state/set-state! :ui/collapsed-blocks {})
+      (-> (p/with-redefs [db-async/<get-block
+                          (fn [_repo id opts]
+                            (is (= block-id id))
+                            (is (true? (:include-collapsed-children? opts)))
+                            (p/resolved {:block/uuid id}))]
+            (p/do!
+             ;; Zoom/root load path used to omit :container-id, which wrote false
+             ;; onto the current editor/parent container via resolve-container-id.
+             (editor/expand-block! block-id {:skip-db-collpsing? true})
+             (is (nil? (state/get-block-collapsed block-id parent-container))
+                 "skip-db expand without a container must not write the editor container")
+             (editor/expand-block! block-id {:skip-db-collpsing? true
+                                             :container-id zoom-container})
+             (state/set-collapsed-block! block-id false zoom-container)
+             (is (false? (state/get-block-collapsed block-id zoom-container)))
+             (is (nil? (state/get-block-collapsed block-id parent-container))
+                 "Zoom expand must stay on the zoom container")
+             ;; Navigate-back cleanup only clears the zoom container.
+             (state/set-collapsed-block! block-id nil zoom-container)))
+          (p/then
+           (fn [_]
+             (is (nil? (state/get-block-collapsed block-id parent-container))
+                 "Parent view can fall back to DB :block/collapsed? after back")
+             (is (nil? (state/get-block-collapsed block-id zoom-container)))))
+          (p/finally
+           (fn []
+             (state/set-state! :editor/args previous-args)
+             (state/set-state! :editor/container-id previous-editor-container)
+             (state/set-state! :ui/collapsed-blocks previous-collapsed)
+             (state/set-current-repo! previous-repo)))))))
+(deftest-async duplicate-pdf-resolution-stops-after-the-first-current-blocker
+  (let [keep-uuid #uuid "72000000-0000-4000-8000-000000000021"
+        first-duplicate #uuid "72000000-0000-4000-8000-000000000022"
+        blocked-duplicate #uuid "72000000-0000-4000-8000-000000000023"
+        untouched-duplicate #uuid "72000000-0000-4000-8000-000000000024"
+        calls (atom [])]
+    (-> (p/with-redefs
+          [db-async/<resolve-duplicate-pdf
+           (fn [repo kept-uuid duplicate]
+             (swap! calls conj [repo kept-uuid duplicate])
+             (p/resolved
+              (if (= duplicate blocked-duplicate)
+                {:status :blocked :reason :duplicate-in-use}
+                {:status :resolved
+                 :keep-uuid kept-uuid
+                 :duplicate-uuid duplicate})))]
+          (#'editor-assets/<resolve-duplicate-pdfs!
+           "test-repo"
+           keep-uuid
+           [first-duplicate blocked-duplicate untouched-duplicate]
+           (constantly true)))
+        (p/then
+         (fn [results]
+           (is (= [["test-repo" keep-uuid first-duplicate]
+                   ["test-repo" keep-uuid blocked-duplicate]]
+                  @calls))
+           (is (= [:resolved :blocked] (mapv :status results)))
+           (is (= :duplicate-in-use (:reason (last results)))))))))
+
+(deftest-async duplicate-pdf-blocker-closes-the-stale-choice-dialog
+  (let [keep-uuid #uuid "72000000-0000-4000-8000-000000000031"
+        duplicate-uuid #uuid "72000000-0000-4000-8000-000000000032"
+        close-count (atom 0)
+        notification-type (atom nil)]
+    (-> (p/with-redefs
+          [db-async/<resolve-duplicate-pdf
+           (fn [& _]
+             (p/resolved {:status :blocked :reason :duplicate-in-use}))
+           shui/dialog-close! (fn [id]
+                                (is (= :literature-duplicate-pdf id))
+                                (swap! close-count inc))
+           notification/show! (fn [_message type & _]
+                                (reset! notification-type type))]
+          (#'editor-assets/resolve-duplicate-pdf-choice!
+           "test-repo"
+           [{:block/uuid keep-uuid} {:block/uuid duplicate-uuid}]
+           keep-uuid
+           #(is false "A blocked choice must not resume the import")
+           (constantly true)
+           (constantly true)))
+        (p/then
+         (fn []
+           (is (= 1 @close-count))
+           (is (= :warning @notification-type)))))))
+
+(defn- capture-duplicate-pdf-dialog!
+  [dialog content opts]
+  (let [config (assoc opts :open? true :close (fn []))]
+    (reset! dialog config)
+    (dorun (tree-seq coll? seq (content config)))))
+
+(deftest-async duplicate-pdf-chooser-reuses-the-existing-paste-callback
+  (let [keep-uuid #uuid "72000000-0000-4000-8000-000000000041"
+        duplicate-uuid #uuid "72000000-0000-4000-8000-000000000042"
+        files [:synthetic-pdf]
+        opts {:target-block #uuid "72000000-0000-4000-8000-000000000043"}
+        assets [{:block/uuid keep-uuid :block/title "Keep"}
+                {:block/uuid duplicate-uuid :block/title "Duplicate"}]
+        dialog (atom nil)
+        choice (atom nil)
+        calls (atom [])
+        resumed (atom [])
+        history-completions (atom 0)
+        notifications (atom [])]
+    (state/set-state! :db/restoring? false)
+    (p/with-redefs
+      [state/get-current-repo (constantly "test-repo")
+       db-subs/projection-context (constantly {:graph-id "test-repo" :projection-epoch 1})
+       shui/dialog-open! #(capture-duplicate-pdf-dialog! dialog %1 %2)
+       shui/dialog-get (fn [_] [0 @dialog])
+       shui/button (fn [button-opts & _]
+                     (when-not @choice (reset! choice (:on-click button-opts))))
+       shui/dialog-close! (fn [id]
+                            (is (contains? #{:literature-duplicate-pdf :literature-pdf-reference-choice} id))
+                            (swap! dialog assoc :open? false))
+       notification/show! (fn [_ type & _] (swap! notifications conj type))
+       literature-handler/<history-conflict-group!
+       (fn [& _] (p/resolved {:status :ok :members assets}))
+       db-async/<resolve-duplicate-pdf
+       (fn [repo kept duplicate]
+         (swap! calls conj [repo kept duplicate])
+         (p/resolved {:status :resolved}))
+       editor-assets/<db-based-save-assets!
+       (fn [repo incoming incoming-opts]
+         (swap! resumed conj [repo incoming incoming-opts])
+         (p/resolved []))]
+      (p/let [_ (editor-assets/show-duplicate-pdf-conflict!
+                "test-repo" files opts {:assets assets :checksum "synthetic-checksum"})
+              _ (@choice)]
+        (is (empty? @calls) "Choosing an existing PDF reference does not merge Assets.")
+        (is (= [["test-repo" files
+                 (assoc opts :pdf-choices {"synthetic-checksum" keep-uuid})]] @resumed))
+        (is (empty? @notifications))
+        (is (false? (:open? @dialog)))
+        (reset! choice nil)
+        (editor-assets/show-duplicate-pdf-conflict!
+         "test-repo" assets #(swap! history-completions inc))
+        (p/let [_ (@choice)]
+          (is (= 1 @history-completions))
+          (is (= 1 (count @resumed))
+              "A history choice must call its callback without repasting files")
+          (is (= [["test-repo" keep-uuid duplicate-uuid]] @calls))
+          (is (= [:success] @notifications)))))))
+
+(deftest-async duplicate-pdf-chooser-discards-replies-after-close-reopen-or-cutover
+  (let [keep-uuid #uuid "72000000-0000-4000-8000-000000000051"
+        first-duplicate #uuid "72000000-0000-4000-8000-000000000052"
+        untouched-duplicate #uuid "72000000-0000-4000-8000-000000000053"
+        assets [{:block/uuid keep-uuid :block/title "Keep"}
+                {:block/uuid first-duplicate :block/title "First"}
+                {:block/uuid untouched-duplicate :block/title "Second"}]]
+    (p/loop [remaining (seq [:closed :reopened :graph-switched :cutover :restoring])]
+      (when-let [scenario (first remaining)]
+        (let [dialog (atom nil)
+              choice (atom nil)
+              current-repo (atom "test-repo")
+              context (atom {:graph-id "test-repo" :projection-epoch 1})
+              started (p/deferred)
+              deferred (p/deferred)
+              calls (atom [])
+              resumed (atom 0)
+              closes (atom 0)
+              notifications (atom [])]
+          (state/set-state! :db/restoring? false)
+          (p/let [_ (p/with-redefs
+                      [state/get-current-repo #(deref current-repo)
+                       db-subs/projection-context #(deref context)
+                       shui/dialog-open! #(capture-duplicate-pdf-dialog! dialog %1 %2)
+                       shui/dialog-get (fn [_] [0 @dialog])
+                       shui/button (fn [button-opts & _]
+                                     (when-not @choice
+                                       (reset! choice (:on-click button-opts))))
+                       shui/dialog-close! (fn [_] (swap! closes inc))
+                       notification/show! (fn [_ type & _]
+                                            (swap! notifications conj type))
+                       db-async/<resolve-duplicate-pdf
+                       (fn [repo kept duplicate]
+                         (swap! calls conj [repo kept duplicate])
+                         (p/resolve! started true)
+                         deferred)]
+                      (editor-assets/show-duplicate-pdf-conflict!
+                       "test-repo" assets #(swap! resumed inc))
+                      (let [pending (@choice)]
+                        (p/let [_ started]
+                          (is (= [["test-repo" keep-uuid first-duplicate]] @calls))
+                          (case scenario
+                            :closed (swap! dialog assoc :open? false)
+                            :reopened (swap! dialog assoc :close (fn []))
+                            :graph-switched (reset! current-repo "other-test-repo")
+                            :cutover (swap! context update :projection-epoch inc)
+                            :restoring (state/set-state! :db/restoring? true))
+                          (p/resolve! deferred {:status :resolved})
+                          (p/let [_ pending]
+                            (testing (name scenario)
+                              (is (= [["test-repo" keep-uuid first-duplicate]] @calls)
+                                  "A stale selection must not resolve another duplicate")
+                              (is (zero? @resumed))
+                              (is (zero? @closes)
+                                  "An old reply must not close a new dialog")
+                              (is (empty? @notifications)))))))]
+            (p/recur (next remaining))))))))
+
+(deftest-async duplicate-pdf-chooser-does-not-start-a-closed-selection
+  (let [assets [{:block/uuid #uuid "72000000-0000-4000-8000-000000000061"
+                 :block/title "Keep"}
+                {:block/uuid #uuid "72000000-0000-4000-8000-000000000062"
+                 :block/title "Duplicate"}]
+        dialog (atom nil)
+        choice (atom nil)
+        calls (atom 0)
+        resumed (atom 0)]
+    (state/set-state! :db/restoring? false)
+    (p/with-redefs
+      [state/get-current-repo (constantly "test-repo")
+       db-subs/projection-context (constantly {:graph-id "test-repo" :projection-epoch 1})
+       shui/dialog-open! #(capture-duplicate-pdf-dialog! dialog %1 %2)
+       shui/dialog-get (fn [_] [0 @dialog])
+       shui/button (fn [button-opts & _]
+                     (when-not @choice (reset! choice (:on-click button-opts))))
+       db-async/<resolve-duplicate-pdf
+       (fn [& _] (swap! calls inc) (p/resolved {:status :resolved}))
+       shui/dialog-close! (fn [& _] (is false "A closed choice must not close another dialog"))
+       notification/show! (fn [& _] (is false "A closed choice must not show result feedback"))]
+      (editor-assets/show-duplicate-pdf-conflict! "test-repo" assets #(swap! resumed inc))
+      (swap! dialog assoc :open? false)
+      (p/let [_ (@choice)]
+        (is (zero? @calls))
+        (is (zero? @resumed))))))
+
+(deftest-async duplicate-pdf-resume-rejection-reports-error-without-closing-a-new-dialog
+  (let [assets [{:block/uuid #uuid "72000000-0000-4000-8000-000000000071"
+                 :block/title "Keep"}
+                {:block/uuid #uuid "72000000-0000-4000-8000-000000000072"
+                 :block/title "Duplicate"}]
+        dialog (atom nil)
+        choice (atom nil)
+        resume-started (p/deferred)
+        resume-result (p/deferred)
+        calls (atom 0)
+        resumed (atom 0)
+        closes (atom [])
+        notifications (atom [])]
+    (state/set-state! :db/restoring? false)
+    (p/with-redefs
+      [state/get-current-repo (constantly "test-repo")
+       db-subs/projection-context (constantly {:graph-id "test-repo" :projection-epoch 1})
+       shui/dialog-open! #(capture-duplicate-pdf-dialog! dialog %1 %2)
+       shui/dialog-get (fn [_] [0 @dialog])
+       shui/button (fn [button-opts & _]
+                     (when-not @choice (reset! choice (:on-click button-opts))))
+       db-async/<resolve-duplicate-pdf
+       (fn [& _] (swap! calls inc) (p/resolved {:status :resolved}))
+       shui/dialog-close! (fn [id]
+                            (swap! closes conj id)
+                            (swap! dialog assoc :open? false))
+       notification/show! (fn [_ type & _] (swap! notifications conj type))]
+      (editor-assets/show-duplicate-pdf-conflict!
+       "test-repo" assets
+       (fn []
+         (swap! resumed inc)
+         (p/resolve! resume-started true)
+         resume-result))
+      (let [pending (@choice)]
+        (p/let [_ resume-started]
+          (is (= [:literature-duplicate-pdf] @closes))
+          (is (= [:success] @notifications))
+          (reset! dialog {:id :literature-library :open? true :close (fn [])})
+          (p/reject! resume-result (ex-info "Synthetic resume failure" {}))
+          (p/let [_ pending]
+            (is (= 1 @calls))
+            (is (= 1 @resumed))
+            (is (= [:success :error] @notifications))
+            (is (= [:literature-duplicate-pdf] @closes))
+            (is (= :literature-library (:id @dialog)))
+            (is (true? (:open? @dialog)))))))))

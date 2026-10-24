@@ -279,7 +279,7 @@
                                       :keywordize-keys true)]
               (is (= 200 (.-status post-response) (.-status get-response)))
               (is (= {:encrypted-aes-key encrypted-key}
-                     post-body get-body))
+                     post-body (select-keys get-body [:encrypted-aes-key])))
               (is (= encrypted-key (get @stored [graph-id user-id])))))
           (p/then (fn [] (done)))
           (p/catch (fn [error]

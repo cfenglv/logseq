@@ -10,12 +10,19 @@
    [frontend.worker.state :as worker-state]
    [lambdaisland.glogi :as log]
    [logseq.common.util :as common-util]
+   [logseq.db.frontend.literature :as literature]
    [promesa.core :as p]))
 
 (def search-db-version
   "Current search index version, stored in PRAGMA user_version.
   Bump to force a rebuild when the index format changes."
-  2)
+  6)
+
+(def ^:private fts-id-keyed-search-db-version
+  "The last version whose blocks_fts rows have rowids unrelated to their
+  blocks rows. Move it to rowid keys before rebuilding graph-derived titles
+  (`<migrate-fts-to-rowid!`)."
+  4)
 
 (def ^:private search-index-build-batch-size 200)
 (def ^:private vector-embedding-batch-size 32)
@@ -295,9 +302,44 @@
     (p/resolved nil)
     (<search-blocks repo q option)))
 
+(def ^:private literature-search-candidate-limit 200)
+(def ^:private literature-search-result-limit 10)
+
+(def-thread-api :thread-api/literature-search-papers
+  [repo q]
+  (let [conn (worker-state/get-datascript-conn repo)
+        search-db (get-search-db repo)]
+    (cond
+      (or (nil? conn) (nil? search-db))
+      {:status :unavailable :reason :missing-index}
+
+      (search-index-build-active? repo)
+      {:status :unavailable :reason :index-rebuilding}
+
+      (not (literature/available? @conn))
+      {:status :disabled :papers [] :truncated? false}
+
+      :else
+      (let [{:keys [candidates truncated?]}
+            (search/search-title-candidates
+             search-db q literature-search-candidate-limit)
+            papers (->> candidates
+                        (mapcat (fn [{:keys [id]}]
+                                  (when (common-util/uuid-string? id)
+                                    (map search/literature-paper-result
+                                         (literature/search-papers-for-candidate
+                                          @conn (uuid id))))))
+                        distinct
+                        (take literature-search-result-limit)
+                        vec)]
+        {:status :ok
+         :papers papers
+         :truncated? truncated?}))))
+
 (def-thread-api :thread-api/search-upsert-blocks
   [repo blocks]
   (when-let [db (get-search-db repo)]
+    (search/delete-vector-blocks! (worker-state/get-vector-index repo) (map :id blocks))
     (search/upsert-blocks! db (bean/->js blocks))
     (schedule-vector-index-upsert! repo blocks)
     nil))
@@ -402,7 +444,7 @@
                                                            search-index-build-time-budget-ms)
                processed' (+ processed (count batch))
                indexed (vec (keep #(search/block->index % index-opts) batch))
-               indexed-blocks' (into indexed-blocks indexed)
+               indexed-blocks' (cond-> indexed-blocks vector-index (into indexed))
                progress (progress-for-fts processed')
                should-report? (> progress last-progress)]
            (p/let [_ (when (seq indexed)
@@ -424,14 +466,73 @@
                                                             :total total}))]
              nil)))))))
 
+(def ^:private fts-rowid-migration-pause-ratio
+  "The move waits this many times as long as its last batch took before the
+  next one, so it takes at most a third of the worker's time."
+  2)
+
+(declare <rebuild-blocks-indice!)
+
+(defn- <migrate-fts-to-rowid!
+  "Moves an index of `fts-id-keyed-search-db-version` to rowid-keyed FTS rows,
+  copied from its own blocks table in paced batches. Queries keep reading the
+  old blocks_fts, which its triggers keep complete, until the last step swaps
+  the tables in 1 transaction. Stops when another build takes over or the
+  index is truncated."
+  [repo search-db build-id]
+  (let [started-at (common-util/time-ms)]
+    (p/let [_ (js/Promise. (fn [resolve] (js/setTimeout resolve 0)))]
+      (ensure-active-search-index-build! repo build-id)
+      (when (= fts-id-keyed-search-db-version (search-index-version search-db))
+        (search/start-fts-rowid-migration! search-db)
+        (p/loop [after 0
+                 pause-ms 0]
+          (p/let [_ (js/Promise. (fn [resolve] (js/setTimeout resolve pause-ms)))
+                  _ (<wait-for-search-index-idle! repo build-id)]
+            (when (= fts-id-keyed-search-db-version (search-index-version search-db))
+              (let [batch-started-at (common-util/time-ms)]
+                (if-let [after' (search/copy-fts-rowid-batch! search-db after search-index-build-batch-size)]
+                  (p/recur after' (* fts-rowid-migration-pause-ratio
+                                     (- (common-util/time-ms) batch-started-at)))
+                  (do
+                    (search/finish-fts-rowid-migration! search-db 5)
+                    (log/info :search/fts-rowid-migration-done
+                              {:repo repo
+                               :ms (- (common-util/time-ms) started-at)})
+                    ;; The v4 cache still contains UUID-based titles. Only a
+                    ;; completed rowid move hands off to the existing v6 rebuild.
+                    (<rebuild-blocks-indice! repo false)))))))))))
+
+(defn- schedule-fts-rowid-migration!
+  [repo search-db]
+  (when-not (get @*search-index-build-ids repo)
+    (let [build-id (start-search-index-build! repo)]
+      (-> (<migrate-fts-to-rowid! repo search-db build-id)
+          (p/catch (fn [error]
+                     (when-not (= :search/stale-index-build (:type (ex-data error)))
+                       (log/error :search/fts-rowid-migration-failed {:repo repo
+                                                                      :error error}))))
+          (p/finally (fn []
+                       (clear-search-index-build! repo build-id)))))))
+
 (defn <rebuild-blocks-indice!
   [repo force?]
   (p/let [search-db (get-search-db repo)]
     (when search-db
       (let [version (search-index-version search-db)]
-        (if (and (= version search-db-version)
-                 (not force?))
+        (cond
+          (and (= version search-db-version)
+               (not force?))
           version
+
+          ;; The index is complete, so search keeps working while it moves
+          (and (= version fts-id-keyed-search-db-version)
+               (not force?))
+          (do
+            (schedule-fts-rowid-migration! repo search-db)
+            version)
+
+          :else
           (when-let [conn (worker-state/get-datascript-conn repo)]
             (let [build-id (start-search-index-build! repo)]
               (-> (report-search-index-progress! repo {:build-id build-id

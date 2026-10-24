@@ -2,6 +2,7 @@
   (:require
    ["remove-accents" :as remove-accents]
    [clojure.string :as string]
+   [frontend.context.i18n :refer [t]]
    [frontend.components.icon :as icon-component]
    [frontend.handler.block :as block-handler]
    [goog.string :as gstring]
@@ -59,6 +60,14 @@
 
 (def current-page-badge-label "Current Page")
 
+(defn result-kind
+  [block]
+  (when block
+    (cond
+      (true? (:logseq.property/literature-item? block)) :literature
+      (= "pdf" (:logseq.property.asset/type block)) :pdf
+      :else :note)))
+
 (defn current-page-badge-placement
   [{:keys [current-page? result-type]}]
   (when current-page?
@@ -72,11 +81,12 @@
   (when-not (string/blank? label)
     [:span.cp__cmdk-current-page-badge label]))
 
-(hsx/defc root [{:keys [icon icon-theme query text info shortcut value-label value title highlighted header hoverable
+(hsx/defc root [{:keys [icon icon-theme query text info detail shortcut value-label value title highlighted header hoverable
                         compact rounded on-mounted on-click on-mouse-move source-block hide-inline-icon?] :as props
                  :or {hoverable true rounded true}}
                 {:keys [app-config]}]
   (let [highlight-query (partial highlight-query* app-config query)
+        kind (result-kind source-block)
         badge-placement (current-page-badge-placement props)
         text-badge (current-page-badge-node (:text-badge badge-placement))
         header-badge (current-page-badge-node (:header-badge badge-placement))
@@ -84,6 +94,7 @@
     [:div (merge
            {:style {:opacity 1}
             :data-cmdk-item true
+            :data-cmdk-result-kind (some-> kind name)
             :data-hoverable (when hoverable true)
             :data-highlighted (when highlighted true)
             :data-kb-highlighted (when keyboard-highlighted? true)
@@ -117,7 +128,7 @@
        (if (string? icon)
          (shui/tabler-icon icon {:size "14" :class ""})
          icon)]
-      [:div.flex.flex-1.flex-col
+      [:div.flex.flex-1.min-w-0.flex-col
        (when title
          [:div.text-sm.pb-2.font-bold.text-gray-11 (highlight-query title)])
        [:div {:class "cp__cmdk-item-main-text text-sm font-medium text-gray-12 flex items-center gap-2 flex-wrap"}
@@ -128,7 +139,15 @@
                                                icon-component/icon))
         text-badge
         (when info
-          [:span.text-xs.text-gray-11 " — " (highlight-query info)])]]
+          [:span.text-xs.text-gray-11 " — " (highlight-query info)])]
+       (when detail
+         [:div.text-xs.text-gray-11.truncate {:title detail} (highlight-query detail)])]
+      (when kind
+        [:span.cp__cmdk-current-page-badge.shrink-0
+         (case kind
+           :literature (t :cmdk.result/literature)
+           :pdf (t :cmdk.result/pdf)
+           :note (t :cmdk.result/note))])
       (when (or value-label value)
         [:div {:class "text-xs"}
          (when (and value-label value)

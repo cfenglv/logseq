@@ -1,6 +1,7 @@
 (ns frontend.worker.sync
   "Sync client"
   (:require
+   [frontend.common.thread-api :as thread-api]
    [frontend.worker.platform :as platform]
    [frontend.worker.repair-commit-fence :as repair-commit-fence]
    [frontend.worker.shared-service :as shared-service]
@@ -14,9 +15,11 @@
    [frontend.worker.sync.presence :as sync-presence]
    [frontend.worker.sync.transport :as sync-transport]
    [frontend.worker.sync.upload :as sync-upload]
+   [frontend.worker.sync.user-navigation :as navigation-sync]
    [frontend.worker.sync.util :as sync-util]
    [lambdaisland.glogi :as log]
    [logseq.common.util :as common-util]
+   [logseq.db :as ldb]
    [logseq.db-sync.checksum :as sync-checksum]
    [promesa.core :as p]
    [logseq.common.config :as common-config]))
@@ -53,10 +56,88 @@
     :latest-remote-checksum @*repo->latest-remote-checksum}
    repo))
 
+(defn- graph-remote?
+  "True when the graph syncs: upload and download set
+  `:logseq.kv/graph-remote?`, and nothing unsets it."
+  [db]
+  (true? (some-> db (ldb/get-key-value :logseq.kv/graph-remote?))))
+(defn- repair-client-current?
+  [repo client socket graph-id]
+  (and client socket
+       (identical? client (current-client repo))
+       (identical? socket (:ws client))
+       (= graph-id (sync-util/get-graph-id repo))
+       (sync-transport/ws-open? socket)))
+
+(defn- request-repair-pull!
+  [repo graph-id result]
+  (when (= 1 (:rename-count result))
+    ;; A reconnect may have delivered hello before the replacement was ready.
+    (let [client (current-client repo)]
+      (when (and (= graph-id (:graph-id client))
+                 (repair-client-current? repo client (:ws client) graph-id))
+        (sync-apply/enqueue-flush-pending! repo client)
+        (sync-handle-message/request-pull! client (client-op/get-local-tx repo))))))
+
+(defn <request-repair!
+  "Explicitly rebuild a settled local projection using the existing repair owner."
+  [repo]
+  (let [conn (worker-state/get-datascript-conn repo)
+        client (current-client repo)
+        socket (:ws client)
+        graph-id (:graph-id client)]
+    (if-not (and conn (repair-client-current? repo client socket graph-id))
+      (p/resolved {:claimed? false :reason :inactive-context})
+      (let [before (client-op/read-repair-local-observation repo)]
+        (p/let [local-checksum (sync-checksum/<recompute-checksum @conn)
+                diagnostics (sync-util/fetch-json
+                             (str (sync-auth/http-base-url @worker-state/*db-sync-config)
+                                  "/sync/" graph-id "/checksum/diagnostics?proof-only=true")
+                             {:method "GET"} {:response-schema :sync/checksum-diagnostics})]
+          (if-not (and (identical? conn (worker-state/get-datascript-conn repo))
+                       (repair-client-current? repo client socket graph-id))
+            {:claimed? false :reason :context-changed}
+            (let [after (client-op/read-repair-local-observation repo)]
+              (cond
+                (not (and (= before after)
+                          (= (:t diagnostics) (:remote-t after)
+                             (get @*repo->latest-remote-tx repo))
+                          (zero? (:pending-count after))
+                          (empty? @(:inflight client))))
+                {:claimed? false :reason :not-converged}
+
+                (not= (:legacy-anchor diagnostics) (:server-recomputed-checksum diagnostics))
+                (fail-fast :db-sync/server-checksum-drift {:repo repo})
+
+                :else
+                (let [basis {:remote-t (:t diagnostics)
+                             :server-checkpoint-identity (:server-checkpoint-identity diagnostics)
+                             :journal-high-water (:journal-high-water after)
+                             :checksum-basis {:version 1 :legacy-checksum local-checksum
+                                              :server-recomputed-checksum (:server-recomputed-checksum diagnostics)
+                                              :server-t (:t diagnostics) :legacy-anchor (:legacy-anchor diagnostics)
+                                              :metadata-proof (:metadata-proof diagnostics)}}
+                      claim-f (get @thread-api/*thread-apis :thread-api/db-sync-claim-repair)
+                      claim (claim-f repo graph-id basis)]
+                  ;; Release the request fence before the runner commits its replacement.
+                  (when (:claimed? claim)
+                    (-> (sync-download/<run-repair-operation! repo (:operation claim))
+                        (p/then #(request-repair-pull! repo graph-id %))
+                        (p/catch (fn [error]
+                                   (log/error :db-sync/repair-run-failed {:repo repo :error error})))))
+                  claim)))))))))
+
 (defn update-local-sync-checksum!
-  [repo tx-report]
-  (when (worker-state/get-client-ops-conn repo)
-    (let [current-checksum (client-op/get-local-checksum repo)
+  "Keeps the stored checksum current on a graph that syncs. A graph that does
+  not sync keeps none: the checksum is only compared with the sync server's,
+  and the upload recomputes it before it sends the snapshot. The transaction
+  that makes a graph remote starts from a full recompute, since the stored
+  value may predate edits made while the graph was local."
+  [repo {:keys [db-before db-after] :as tx-report}]
+  (when (and (worker-state/get-client-ops-conn repo)
+             (graph-remote? db-after))
+    (let [current-checksum (when (graph-remote? db-before)
+                             (client-op/get-local-checksum repo))
           new-checksum (sync-checksum/update-checksum current-checksum tx-report)]
       (when (and (exists? js/process)
                  (= "1" (aget (.-env js/process) "LOGSEQ_CHECKSUM_ASSERT")))
@@ -78,7 +159,30 @@
                                :recomputed-checksum recomputed-checksum
                                :tx-meta tx-meta
                                :tx-count (count tx-data)}))))))
-      (client-op/update-local-checksum repo new-checksum))))
+      (client-op/update-local-checksum repo new-checksum (:max-tx (:db-after tx-report))))))
+
+(defn reconcile-local-checksum!
+  "Heals a checksum left stale when a commit's checksum write never landed: the
+  checksum is stored post-commit in the client-ops sqlite file, separate from
+  the graph store, so process death between the two writes drops it. The stored
+  covered commit is compared with the reopened db's :max-tx; a mismatch means
+  commits were missed and the checksum is recomputed. A graph that does not
+  sync keeps no checksum, so nothing is healed on it."
+  [repo conn]
+  (when (and (worker-state/get-client-ops-conn repo)
+             (graph-remote? @conn))
+    (let [checksum (client-op/get-local-checksum repo)
+          covered-tx (client-op/get-local-checksum-covered-tx repo)
+          current-tx (:max-tx @conn)]
+      (when (and checksum (not= covered-tx current-tx))
+        (let [recomputed (sync-checksum/recompute-checksum @conn)]
+          (when-not (= checksum recomputed)
+            (log/info :db-sync/checksum-healed-on-open {:repo repo
+                                                      :stored-checksum checksum
+                                                      :recomputed-checksum recomputed
+                                                      :covered-tx covered-tx
+                                                      :current-tx current-tx}))
+          (client-op/update-local-checksum repo recomputed current-tx))))))
 
 (defn- broadcast-rtc-state!
   [client]
@@ -189,12 +293,15 @@
       (send! ws {:type "presence"
                  :editing-block-uuid editing-block-uuid}))))
 
-(defn- enqueue-asset-task!
-  [client task]
-  (when-let [queue (:asset-queue client)]
-    (swap! queue
-           (fn [prev]
-             (p/then prev (fn [_] (task)))))))
+(defn refresh-profile!
+  [context repo]
+  (let [client @worker-state/*db-sync-client
+        ws (:ws client)]
+    (boolean
+     (when (and (= context (:user-profile/context client)) (= repo (:repo client))
+                ws (sync-transport/ws-open? ws))
+       (send! ws {:type "profile/refresh"})
+       true))))
 
 (defn- ensure-client-state!
   [repo]
@@ -213,7 +320,16 @@
    :server-capabilities (atom #{})
    :ws-state (atom :closed)})
 
-(declare connect!)
+(declare connect! <connect-attempt! schedule-reconnect!)
+
+(defn- handle-private-connect-error! [repo client url error]
+  (when (navigation-sync/active-client? client)
+    (sync-util/set-last-sync-error! client error)
+    (if (navigation-sync/retryable-error? error)
+      (schedule-reconnect! repo client url :connect-failed)
+      (shared-service/broadcast-to-clients! :notification
+                                            [nil :warning true "user-navigation-online" 0
+                                             {:i18n-key :sync.navigation/online-error}]))))
 
 (defn- schedule-reconnect!
   [repo client url reason]
@@ -229,12 +345,13 @@
                             (when-let [current @worker-state/*db-sync-client]
                               (when (and (= (:repo current) repo)
                                          (= (:graph-id current) (:graph-id client)))
-                                (-> (p/let [token (<resolve-ws-token)
-                                            updated (connect! repo current url token)]
-                                      (reset! worker-state/*db-sync-client updated))
+                                (-> (<connect-attempt! repo current url)
                                     (p/catch (fn [error]
-                                               (log/error :db-sync/ws-reconnect-failed {:repo repo :error error})
-                                               (schedule-reconnect! repo current url :connect-failed)))))))
+                                               (if (navigation-sync/private-client? current)
+                                                 (handle-private-connect-error! repo current url error)
+                                                 (do
+                                                   (log/error :db-sync/ws-reconnect-failed {:repo repo :error error})
+                                                   (schedule-reconnect! repo current url :connect-failed)))))))))
                           delay)]
           (swap! reconnect assoc :timer timeout-id :attempt (inc attempt))
           (log/info :db-sync/ws-reconnect-scheduled
@@ -325,7 +442,9 @@
                                :token-exists? (some? (or token (auth-token)))})
   (when-let [token' (or token (auth-token))]
     (let [ws (platform/websocket-connect (platform/current) (sync-transport/append-token url token'))
-          updated (assoc client :ws ws)]
+          updated (assoc client :ws ws
+                                :user-profile/context [(sync-auth/http-base-url @worker-state/*db-sync-config)
+                                                       (sync-auth/get-user-uuid token')])]
       (attach-ws-handlers! repo updated ws url)
       (set! (.-onopen ws)
             (fn [_]
@@ -336,13 +455,41 @@
               (send! ws {:type "hello" :client repo})
               (sync-assets/enqueue-asset-sync!
                repo updated
-               {:enqueue-asset-task-f enqueue-asset-task!
+               {:enqueue-asset-task-f sync-assets/enqueue-asset-task!
                 :current-client-f current-client
                 :broadcast-rtc-state!-f broadcast-rtc-state!
                 :fail-fast-f fail-fast})))
       (close-stale-ws-loop updated ws url))))
 
 (declare clear-catch-up-pull-timer!)
+
+(defn- <connect-attempt!
+  [repo client url]
+  (p/let [token (<resolve-ws-token)
+          private? (navigation-sync/private-client? client)
+          _ (when private? (navigation-sync/assert-active! client))
+          _ (when private? (navigation-sync/<initialize! client token))
+          _ (when private? (navigation-sync/assert-active! client))
+          connected (connect! repo client url token)]
+    (reset! worker-state/*db-sync-client connected)
+    connected))
+
+(defn initialize-private-navigation!
+  "A new live scope uses the same init promise; offline recovery owns no new timer."
+  [repo]
+  (when-let [client (current-client repo)]
+    (when (and (navigation-sync/private-client? client) (ws-open? (:ws client)))
+      (-> (p/let [token (<resolve-ws-token)]
+            (navigation-sync/assert-active! client)
+            (navigation-sync/<initialize! client token))
+          (p/catch (fn [error]
+                     (when (navigation-sync/active-client? client)
+                       (detach-ws-handlers! (:ws client))
+                       (.close (:ws client))
+                       (set-ws-state! client :closed)
+                       (clear-inflight! client)
+                       (handle-private-connect-error! repo client
+                                                      (sync-transport/format-ws-url (ws-base-url) (:graph-id client)) error))))))))
 
 (defn stop!
   []
@@ -374,12 +521,14 @@
   [repo]
   ;; db-sync-start itself is a fenced thread-api call. Resume on the next turn
   ;; so that call can release before a repair commit enters the same fence.
-  (-> (p/delay 0)
-      (p/then #(sync-download/<resume-repair-operation! repo))
-      (p/catch
-       (fn [error]
-         (log/error :db-sync/repair-resume-failed
-                    {:repo repo :error error}))))
+  (let [graph-id (sync-util/get-graph-id repo)]
+    (-> (p/delay 0)
+        (p/then #(sync-download/<resume-repair-operation! repo))
+        (p/then #(request-repair-pull! repo graph-id %))
+        (p/catch
+         (fn [error]
+           (log/error :db-sync/repair-resume-failed
+                      {:repo repo :error error})))))
   nil)
 
 (defn- catch-up-pull-due?
@@ -463,12 +612,21 @@
               (p/let [client (ensure-client-state! repo)
                       url (sync-transport/format-ws-url base graph-id)
                       _ (ensure-client-graph-uuid! repo graph-id)
-                      connected (assoc client :graph-id graph-id)
-                      token (<resolve-ws-token)
-                      connected (connect! repo connected url token)]
-                (reset! worker-state/*db-sync-client connected)
-                (ensure-catch-up-pull-timer!)
-                (defer-repair-resume! repo)
+                      navigation-context @worker-state/*user-navigation-context
+                      private? (= repo (:repo navigation-context))
+                      connected (cond-> (assoc client :graph-id graph-id)
+                                  private? (assoc :user-navigation/context (:identity navigation-context)))
+                      _ (when private? (reset! worker-state/*db-sync-client connected))
+                      _ (-> (<connect-attempt! repo connected url)
+                            (p/catch (fn [error]
+                                       (if private?
+                                         (handle-private-connect-error! repo connected url error)
+                                         (throw error)))))]
+                (when (or (not private?)
+                          (and (navigation-sync/active-client? connected)
+                               (:ws @worker-state/*db-sync-client)))
+                  (ensure-catch-up-pull-timer!))
+                (when-not private? (defer-repair-resume! repo))
                 nil))
              (p/finally
                (fn []
@@ -484,8 +642,8 @@
   (sync-apply/handle-local-tx! repo tx-report))
 
 (defn request-asset-download!
-  [repo asset-uuid]
-  (sync-apply/request-asset-download! repo asset-uuid))
+  [repo asset-uuid & options]
+  (apply sync-apply/request-asset-download! repo asset-uuid options))
 
 (defn download-missing-assets!
   [repo graph-id]
@@ -496,7 +654,7 @@
   (when-let [client (current-client repo)]
     (sync-assets/enqueue-asset-sync!
      repo client
-     {:enqueue-asset-task-f enqueue-asset-task!
+     {:enqueue-asset-task-f sync-assets/enqueue-asset-task!
       :current-client-f current-client
       :broadcast-rtc-state!-f broadcast-rtc-state!
       :fail-fast-f fail-fast}))

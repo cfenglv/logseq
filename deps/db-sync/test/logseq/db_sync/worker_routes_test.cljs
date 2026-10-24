@@ -43,6 +43,14 @@
       (is (= :e2ee/grant-access (:handler match)))
       (is (= "graph-9" (get-in match [:path-params :graph-id]))))))
 
+(deftest match-route-user-profile-test
+  (is (= :user-profile/get (:handler (routes/match-route "GET" "/user/profile"))))
+  (is (= :user-profile/save (:handler (routes/match-route "PUT" "/user/profile"))))
+  (let [match (routes/match-route "GET" "/graphs/graph-1/members/user-2/avatar")]
+    (is (= :graph-members/avatar (:handler match)))
+    (is (= {:graph-id "graph-1" :member-id "user-2"} (:path-params match))))
+  (is (nil? (routes/match-route "POST" "/user/profile"))))
+
 (deftest match-route-method-mismatch-test
   (testing "method mismatch returns nil"
     (is (nil? (routes/match-route "GET" "/graphs/graph-1/members/user-9")))

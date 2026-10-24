@@ -9,7 +9,10 @@
    [logseq.e2e.locator :as loc]
    [logseq.e2e.page :as page]
    [logseq.e2e.util :as util]
-   [wally.main :as w]))
+   [wally.main :as w])
+  (:import
+   (com.microsoft.playwright Locator$ClickOptions)
+   (com.microsoft.playwright.options KeyboardModifier)))
 
 (use-fixtures :once fixtures/open-page)
 (use-fixtures :each fixtures/new-logseq-page fixtures/validate-graph)
@@ -90,6 +93,109 @@
         (page/goto-page target-page)
         (assert/assert-is-visible
          (loc/filter ".references" :has-text source-page))))))
+
+(defn- create-node-embed-fixture!
+  [suffix]
+  (let [target-page (str "node embed target " suffix)
+        source-page (str "node embed source " suffix)]
+    (page/new-page target-page)
+    (let [target (ls-api-call! :editor.appendBlockInPage
+                               target-page
+                               "node embed target parent")
+          target-uuid (get target "uuid")]
+      (let [child (ls-api-call! :editor.insertBlock
+                                target-uuid
+                                "node embed target child"
+                                {:sibling false})]
+        (page/new-page source-page)
+        (b/new-block "")
+        (util/input-command "Node embed")
+        (util/press-seq target-page)
+        (assert/assert-is-visible
+         (loc/filter ".ui__popover-content a.menu-link.chosen"
+                     :has-text target-page))
+        (k/enter)
+        (let [embed-row (.first
+                         (w/-query
+                          ".ls-page-blocks .ls-block.embed-block[originalblockid]"))]
+          (assert/assert-is-visible embed-row)
+          {:child-uuid (get child "uuid")
+           :embed-row embed-row
+           :target-uuid target-uuid})))))
+
+(defn- assert-node-embed-target-intact!
+  [{:keys [child-uuid target-uuid]}]
+  (let [target (ls-api-call! :editor.getBlock target-uuid)
+        child (ls-api-call! :editor.getBlock child-uuid)]
+    (is (= "node embed target parent" (get target "content")) (pr-str target))
+    (is (= "node embed target child" (get child "content")) (pr-str child))))
+
+(deftest node-embed-selection-delete-keeps-the-canonical-target-test
+  (testing "selection Delete removes only the rendered placeholder"
+    (let [{:keys [embed-row target-uuid] :as fixture}
+          (create-node-embed-fixture! "selection delete")]
+      (assert-node-embed-target-intact! fixture)
+      (w/click (.first (.locator embed-row
+                                 (format "#block-content-%s" target-uuid)))
+               (doto (Locator$ClickOptions.)
+                 (.setModifiers [(if util/mac?
+                                   KeyboardModifier/META
+                                   KeyboardModifier/CONTROL)])))
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (b/delete-blocks)
+      (assert-node-embed-target-intact! fixture)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (b/undo)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       1)
+      (assert-node-embed-target-intact! fixture)
+      (b/redo)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (assert-node-embed-target-intact! fixture)
+      (util/refresh-until-graph-loaded)
+      (assert-node-embed-target-intact! fixture))))
+
+(deftest node-embed-keyboard-cut-keeps-the-canonical-target-test
+  (testing "keyboard Cut removes only the rendered placeholder"
+    (let [{:keys [embed-row target-uuid] :as fixture}
+          (create-node-embed-fixture! "keyboard cut")]
+      (w/click (.first (.locator embed-row
+                                 (format "#block-content-%s" target-uuid)))
+               (doto (Locator$ClickOptions.)
+                 (.setModifiers [(if util/mac?
+                                   KeyboardModifier/META
+                                   KeyboardModifier/CONTROL)])))
+      (assert/assert-have-count ".ls-page-blocks .ls-block.selected" 1)
+      (k/press "ControlOrMeta+x")
+      (assert-node-embed-target-intact! fixture)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (util/refresh-until-graph-loaded)
+      (assert-node-embed-target-intact! fixture))))
+
+(deftest node-embed-context-menu-cut-keeps-the-canonical-target-test
+  (testing "context-menu Cut removes only the rendered placeholder"
+    (let [{:keys [embed-row target-uuid] :as fixture}
+          (create-node-embed-fixture! "context menu cut")]
+      (util/double-esc)
+      (util/right-click
+       (.first (.locator embed-row
+                         (format ".bullet-container[blockid='%s']"
+                                 target-uuid))))
+      (assert/assert-is-visible ".ls-context-menu-content")
+      (w/click (loc/filter "[role='menuitem']" :has-text "Cut"))
+      (assert-node-embed-target-intact! fixture)
+      (assert/assert-have-count
+       ".ls-page-blocks .ls-block.embed-block[originalblockid]"
+       0)
+      (util/refresh-until-graph-loaded)
+      (assert-node-embed-target-intact! fixture))))
 
 (deftest unlinked-reference-filter-and-breadcrumb-test
   (testing "unlinked-reference search updates results and breadcrumbs track renames"
@@ -443,6 +549,87 @@
         (is (= "kept"
                (block-value (get object "uuid")
                             inherited-property)))))))
+
+(deftest mounted-tag-view-refreshes-class-properties-test
+  (let [tag-name (str "LiveSchema" (random-uuid))
+        property-name (str "live-property-" (random-uuid))
+        tag (ls-api-call! :editor.createTag tag-name)
+        property (ls-api-call! :editor.upsertProperty property-name {})]
+    (page/goto-page tag-name)
+    (assert/assert-is-visible ".ls-view-body")
+    (let [route (w/eval-js "location.href")
+          column (loc/filter ".ls-table-header-cell" :has-text property-name)]
+      (ls-api-call! :editor.upsertBlockProperty
+                   (get tag "uuid") ":logseq.property.class/properties" [(get property "id")])
+      (assert/assert-is-visible column)
+      (is (= route (w/eval-js "location.href")))
+      (ls-api-call! :editor.removeBlockProperty
+                   (get tag "uuid") ":logseq.property.class/properties")
+      (assert/assert-have-count column 0)
+      (is (= route (w/eval-js "location.href"))))))
+
+(deftest inherited-class-properties-refresh-mounted-collapse-test
+  (let [parent (ls-api-call! :editor.createTag "CollapseParent")
+        child (ls-api-call! :editor.createTag "CollapseChild")
+        property (ls-api-call! :editor.upsertProperty "collapse-property" {})
+        object (ls-api-call! :editor.appendBlockInPage (current-page-name) "childless object")
+        uuid (get object "uuid")
+        assert-collapsable! (fn [expected]
+                             (.waitForFunction
+                              (w/get-page)
+                              "([id, expected]) => document.querySelector('.ls-block[blockid=\"'+id+'\"]')?.getAttribute('data-db-collapsable') === String(expected)"
+                              [uuid expected])
+                             (is (= (str expected)
+                                    (.getAttribute (w/-query (str ".ls-block[blockid='" uuid "']"))
+                                                   "data-db-collapsable"))))]
+    (ls-api-call! :editor.addTagExtends (get child "id") (get parent "id"))
+    (ls-api-call! :editor.upsertBlockProperty uuid "block/tags" (get child "id"))
+    (util/exit-edit)
+    (assert-collapsable! false)
+    (ls-api-call! :editor.upsertBlockProperty
+                 (get parent "uuid") "logseq.property.class/properties" [(get property "id")])
+    (assert-collapsable! true)
+    (ls-api-call! :editor.removeBlockProperty
+                 (get parent "uuid") "logseq.property.class/properties")
+    (assert-collapsable! false)
+    (util/refresh-until-graph-loaded)
+    (assert-collapsable! false)))
+
+(deftest query-input-error-isolation-and-recovery-test
+  (let [page-name (current-page-name)
+        anchor (ls-api-call! :editor.appendBlockInPage page-name "QueryRecoveryAnchor")
+        tag (ls-api-call! :editor.getTag "logseq.class/Query")
+        owners (mapv #(ls-api-call! :editor.appendBlockInPage page-name %
+                                    {:properties {"block/tags" (get tag "id")}})
+                     ["Valid query" "Invalid query"])
+        query-ids (mapv #(get % ":logseq.property/query") owners)
+        query-text (fn [matcher]
+                     (pr-str {:query '[:find (pull ?b [*]) :in $ ?matcher
+                                       :where [?b :block/title ?title]
+                                       [(re-pattern ?matcher) ?regex]
+                                       [(re-find ?regex ?title)]]
+                              :inputs [matcher]}))
+        result-selector (fn [owner]
+                          (str "#ls-block-" (get owner "uuid") " .custom-query-results"))
+        error-selector ".block-content-fallback-ui:has-text('Query error:')"]
+    (doseq [[id matcher] (map vector query-ids ["^QueryRecoveryAnchor$" "("])]
+      (ls-api-call! :editor.updateBlock id (query-text matcher))
+      (w/eval-js "id => frontend.handler.db_based.property.set_block_property_BANG_(id,cljs.core.keyword('logseq.property.node/display-type'),cljs.core.keyword('code'))" id))
+    (util/exit-edit)
+    (assert/assert-is-visible error-selector)
+    (assert/assert-have-count error-selector 1)
+    (assert/assert-is-visible (result-selector (first owners)))
+    (w/click (str "#block-content-" (get anchor "uuid")))
+    (util/move-cursor-to-end)
+    (k/press "Space")
+    (util/exit-edit)
+    (ls-api-call! :editor.updateBlock (second query-ids) (query-text "^QueryRecoveryAnchor"))
+    (w/wait-for-not-visible error-selector)
+    (assert/assert-is-visible (result-selector (second owners)))
+    (util/refresh-until-graph-loaded)
+    (assert/assert-have-count error-selector 0)
+    (doseq [owner owners]
+      (assert/assert-is-visible (result-selector owner)))))
 
 (deftest tag-template-dynamic-values-test
   (testing "a tag template is applied once and resolves dynamic date references"

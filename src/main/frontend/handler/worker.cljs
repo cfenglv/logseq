@@ -6,6 +6,7 @@
             [frontend.common.crypt :as crypt]
             [frontend.context.i18n :as i18n]
             [frontend.handler.e2ee :as e2ee-handler]
+            [frontend.handler.file-graph-import :as file-graph-import]
             [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [lambdaisland.glogi :as log]
@@ -57,6 +58,10 @@
      :assets/asset-file-write-finish
      (fn [m] (assoc-in m [repo asset-id] (or ts (.now js/Date)))))))
 
+(defmethod handle :thread-api/set-ui-state [_ _worker args]
+  (when-let [f (get @thread-api/*thread-apis :thread-api/set-ui-state)]
+    (apply f args)))
+
 (defmethod handle :thread-api/search-index-build-progress [_ _worker args]
   (when-let [f (get @thread-api/*thread-apis :thread-api/search-index-build-progress)]
     (apply f args)))
@@ -80,6 +85,10 @@
 (defmethod handle :record-worker-client-id [_ _worker data]
   (when-let [client-id (:client-id data)]
     (state/set-db-worker-client-id! client-id)))
+
+(defmethod handle :user-navigation/source-changed [_ _worker {:keys [repo graph-id]}]
+  (when (= repo (state/get-current-repo))
+    (state/set-state! :user-navigation/source-identity [repo graph-id])))
 
 (defmethod handle :capture-error [_ _worker data]
   (state/pub-event! [:capture-error data]))
@@ -156,6 +165,15 @@
           (p/let [_ (e2ee-handler/<native-delete-secret! key)]
             {:supported? true}))))
 
+    :read-import-file
+    (let [path (:path payload)]
+      (if-not (string? path)
+        (p/rejected (ex-info "invalid read-import-file payload"
+                             {:code :invalid-ui-action-payload
+                              :action action
+                              :payload payload}))
+        (file-graph-import/<read-file-graph-import-file path)))
+
     (p/rejected (ex-info "unsupported db-worker ui action"
                          {:code :unsupported-ui-action
                           :action action
@@ -214,17 +232,21 @@
          (get error-value "message"))))
 
 (defn handle-message!
-  [^js worker wrapped-worker]
+  ([worker wrapped-worker] (handle-message! worker wrapped-worker handle))
+  ([^js worker wrapped-worker dispatch]
   (assert worker "worker doesn't exists")
   (let [handle-worker-failure!
         (fn [event]
-          (when (identical? worker @state/*db-worker-thread)
+          (if (identical? worker @state/*db-worker-thread)
+            (do
             (log/error :db-worker/stopped-unexpectedly {:event event})
             (set! (.-onmessage worker) nil)
             (set! (.-onerror worker) nil)
             (set! (.-onmessageerror worker) nil)
             (reset! state/*db-worker-thread nil)
-            (reset! state/*db-worker nil)))]
+            (reset! state/*db-worker nil))
+            (dispatch :capture-error wrapped-worker
+                      {:error (ex-info "Database worker stopped" {:code :db-worker-unavailable})})))]
     (set! (.-onerror worker) handle-worker-failure!)
     (set! (.-onmessageerror worker) handle-worker-failure!))
   (set! (.-onmessage worker)
@@ -246,6 +268,6 @@
                     (js/console.error "Unexpected webworker error :" data))
                   (if (string? data)
                     (let [[e payload] (ldb/read-transit-str data)]
-                      (handle (keyword e) wrapped-worker payload))
+                      (dispatch (keyword e) wrapped-worker payload))
                     (when-not (string/starts-with? (.-type data) "MP_")
-                      (js/console.error "Worker received invalid data from worker: " data))))))))))
+                      (js/console.error "Worker received invalid data from worker: " data)))))))))))

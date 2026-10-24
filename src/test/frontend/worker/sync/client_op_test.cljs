@@ -6,7 +6,9 @@
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync.client-op :as client-op]
             [logseq.db.common.sqlite :as common-sqlite]
-            [logseq.db.sqlite.gc :as sqlite-gc]))
+            [logseq.db.sqlite.gc :as sqlite-gc]
+            [logseq.db.sqlite.util :as sqlite-util]
+            [logseq.db-sync.protocol :as protocol]))
 
 (defn- new-memory-db
   []
@@ -135,6 +137,33 @@
                                  "select count(*) as c from client_tx_upload_state where logical_tx_id = ?"
                                  (str malformed-id)))))))))
 
+(deftest frozen-upload-state-optional-outliner-op-test
+  (doseq [kind [:single-wire-v1 :staged-large-upload-v1]
+          outliner-op [nil :save-block "save-block" 42 false]]
+    (with-client-ops-db
+      "optional-outliner-op-repo"
+      (fn [db]
+        (let [repo "optional-outliner-op-repo"
+              tx-id (random-uuid)
+              state (merge {:format-version 1 :kind kind
+                            :source-digest "synthetic-source-digest"
+                            :outliner-op outliner-op}
+                           (if (= kind :single-wire-v1)
+                             {:wire-entry {:tx-id (str tx-id) :tx "synthetic-wire"}}
+                             {:session-id "synthetic-session" :boundaries [1]
+                              :source-next-index 0 :chunk-seq 0}))]
+          (client-op/put-client-tx-upload-state! repo tx-id state)
+          (if (or (nil? outliner-op) (keyword? outliner-op))
+            (do
+              (is (= state (client-op/get-client-tx-upload-state repo tx-id)))
+              (is (= {tx-id state} (client-op/get-client-tx-upload-states repo [tx-id]))))
+            (do
+              (is (thrown-with-msg? js/Error #"Invalid client transaction upload state"
+                                   (client-op/get-client-tx-upload-state repo tx-id)))
+              (is (thrown-with-msg? js/Error #"Invalid client transaction upload state"
+                                   (client-op/get-client-tx-upload-states repo [tx-id])))))
+          (is (= 1 (sqlite-count db "select count(*) as c from client_tx_upload_state"))))))))
+
 (deftest sqlite-sync-meta-roundtrip-test
   (let [repo "repo-1"]
     (with-client-ops-db
@@ -142,22 +171,33 @@
       (fn [_db]
         (client-op/update-graph-uuid repo "graph-1")
         (client-op/update-local-tx repo 9)
-        (client-op/update-local-checksum repo "checksum-1")
+        (client-op/update-local-checksum repo "checksum-1" 9)
 
         (client-op/update-graph-uuid repo "graph-2")
         (client-op/update-local-tx repo 12)
-        (client-op/update-local-checksum repo "checksum-2")
+        (client-op/update-local-checksum repo "checksum-2" 12)
 
         (is (= "graph-2" (client-op/get-graph-uuid repo)))
         (is (= 12 (client-op/get-local-tx repo)))
-        (is (= "checksum-2" (client-op/get-local-checksum repo)))))))
+        (is (= "checksum-2" (client-op/get-local-checksum repo)))
+        (is (= 12 (client-op/get-local-checksum-covered-tx repo)))))))
+
+(deftest checksum-covered-tx-roundtrip-test
+  (let [repo "repo-checksum-covered-tx"]
+    (with-client-ops-db
+      repo
+      (fn [_db]
+        (is (nil? (client-op/get-local-checksum-covered-tx repo)))
+        (client-op/update-local-checksum repo "checksum-1" 41)
+        (is (= "checksum-1" (client-op/get-local-checksum repo)))
+        (is (= 41 (client-op/get-local-checksum-covered-tx repo)))))))
 
 (deftest legacy-client-tx-upload-state-table-is-migrated-test
   (testing "legacy .5 client_tx_upload_state (session_data) must migrate to the current upload-state schema"
     (let [repo "legacy-upload-state-repo"]
       (with-client-ops-db
        repo
-       (fn [db]
+       (fn [^js db]
          (.exec db (str "create table client_tx_upload_state ("
                         "logical_tx_id text primary key,"
                         "session_data text not null,"
@@ -183,6 +223,77 @@
              (is (contains? (set columns) "source_digest"))
              (is (contains? (set columns) "state")))))))))
 
+(deftest legacy-frozen-upload-state-keeps-wire-and-original-source-test
+  (doseq [one-group? [false true]]
+    (with-client-ops-db
+      "legacy-frozen-upload-repo"
+      (fn [^js db]
+        (let [repo "legacy-frozen-upload-repo"
+              tx-id (random-uuid)
+              source [[:db/add [:block/uuid tx-id] :block/title "original"]
+                      [:db/add [:block/uuid tx-id] :block/title "final"]]
+              frozen (if one-group? [] [(second source)])
+              session-id "synthetic-replacement-session"
+              session {:session-version 2 :session-id session-id
+                       :source-digest (protocol/tx-upload-session-id tx-id :save-block source)
+                       :outliner-op :save-block :tx-data source
+                       :boundaries (if one-group? [[0 2]] [[0 1] [1 2]])
+                       :source-next-index (if one-group? 2 1) :chunk-seq 1
+                       :wire-cache {1 {:tx-data frozen}} :final-wire-frozen? true}]
+          (client-op/upsert-local-tx-entry!
+           repo {:tx-id tx-id :pending? true :created-at 1 :failed? false
+                 :outliner-op :insert-blocks :normalized-tx-data [] :reversed-tx-data []})
+          (.exec db "drop table client_tx_upload_state")
+          (.exec db "create table client_tx_upload_state (logical_tx_id text primary key, session_data text not null, updated_at integer not null)")
+          (.run (.prepare db "insert into client_tx_upload_state values (?, ?, ?)")
+                (str tx-id) (sqlite-util/write-transit-str session) 17)
+          (aset db "__logseq_client_ops_schema_ready_v3" false)
+          (client-op/ensure-sqlite-schema! db)
+          (let [state (client-op/get-client-tx-upload-state repo tx-id)
+                pending (first (client-op/get-pending-local-txs repo))]
+            (is (= (if one-group? [2 2] [1 2]) (:boundaries state)))
+            (is (= session-id (:session-id state)))
+            (is (= {:tx (sqlite-util/write-transit-str frozen)
+                    :tx-id (str (protocol/tx-chunk-id tx-id session-id 1 true))
+                    :logical-tx-id (str tx-id) :upload-session-id session-id
+                    :chunk-index 1 :chunk-final? true :outliner-op :save-block}
+                   (:wire-cache state)))
+            (is (= :save-block (:outliner-op pending)))
+            (is (= source (:tx pending)))
+            (client-op/ensure-sqlite-schema! db)
+            (is (= state (client-op/get-client-tx-upload-state repo tx-id)))))))))
+
+(deftest legacy-nonfinal-upload-rebase-preserves-pending-and-replaces-generation-test
+  (doseq [acked? [false true]]
+    (with-client-ops-db
+      "legacy-nonfinal-rebase-repo"
+      (fn [^js db]
+        (let [repo "legacy-nonfinal-rebase-repo"
+              tx-id (random-uuid)
+              source [[:db/add [:block/uuid tx-id] :block/title "original"]
+                      [:db/add [:block/uuid tx-id] :block/title "final"]]
+              rebased (assoc source 1 [:db/add [:block/uuid tx-id] :block/title "rebased"])
+              session {:session-version 2
+                       :session-id (protocol/tx-upload-session-id tx-id :save-block source)
+                       :outliner-op :save-block :tx-data source
+                       :boundaries [[0 1] [1 2]]
+                       :source-next-index (if acked? 1 0) :chunk-seq (if acked? 1 0)
+                       :wire-cache {0 {:tx-data [(first source)]}}}]
+          (client-op/upsert-local-tx-entry!
+           repo {:tx-id tx-id :pending? true :created-at 1 :failed? false
+                 :outliner-op :save-block :normalized-tx-data rebased :reversed-tx-data []})
+          (.exec db "drop table client_tx_upload_state")
+          (.exec db "create table client_tx_upload_state (logical_tx_id text primary key, session_data text not null, updated_at integer not null)")
+          (.run (.prepare db "insert into client_tx_upload_state values (?, ?, ?)")
+                (str tx-id) (sqlite-util/write-transit-str session) 17)
+          (aset db "__logseq_client_ops_schema_ready_v3" false)
+          (client-op/ensure-sqlite-schema! db)
+          (is (nil? (client-op/get-client-tx-upload-state repo tx-id)))
+          (let [pending (first (client-op/get-pending-local-txs repo))]
+            (is (= tx-id (:tx-id pending)))
+            (is (= :save-block (:outliner-op pending)))
+            (is (= rebased (:tx pending)))))))))
+
 (deftest repair-local-observation-is-one-journal-read-transaction-test
   (let [repo "repo-repair-observation"
         tx-id (random-uuid)]
@@ -190,7 +301,7 @@
       repo
       (fn [_db]
         (client-op/update-local-tx repo 7)
-        (client-op/update-local-checksum repo "legacy-7")
+        (client-op/update-local-checksum repo "legacy-7" 41)
         (client-op/upsert-local-tx-entry!
          repo {:tx-id tx-id
                :created-at 10
@@ -211,7 +322,7 @@
       repo
       (fn [db]
         (client-op/update-local-tx repo 12)
-        (client-op/update-local-checksum repo "legacy-12")
+        (client-op/update-local-checksum repo "legacy-12" 42)
         (client-op/insert-sync-meta-value-if-absent!
          db "selfhost.activation-record.v1" "activation-raw")
         (client-op/upsert-local-tx-entry!

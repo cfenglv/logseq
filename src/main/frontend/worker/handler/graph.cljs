@@ -8,7 +8,10 @@
             [frontend.worker.graph-view :as graph-view]
             [frontend.worker.plain-value :as worker-plain]
             [frontend.worker.state :as worker-state]
+            [frontend.worker.sync.client-op :as client-op]
             [logseq.common.config :as common-config]
+            [logseq.common.user-navigation :as navigation]
+            [logseq.common.util :as common-util]
             [logseq.common.uuid :as common-uuid]
             [logseq.db :as ldb]
             [logseq.outliner.op :as outliner-op]))
@@ -175,3 +178,86 @@
                        [(ldb/kv :logseq.kv/local-graph-uuid local-graph-uuid)]
                        {:graph-open/ensure-local-graph-uuid? true})
           local-graph-uuid))))
+
+(defn- navigation-domain-key [service user-id scope]
+  (str "user-navigation-local/" service "/" (or user-id "anonymous") "/" scope))
+
+(defn- resolved-recents [db page-ids]
+  (->> page-ids (keep #(some-> (d/entity db %) :block/uuid str)) distinct
+       (take navigation/recents-limit) vec))
+
+(defn- navigation-source [repo service user-id legacy-recents]
+  (when-not (and (string? service) (not (string/blank? service))
+                 (or (nil? user-id) (and (string? user-id) (not (string/blank? user-id))))
+                 (vector? legacy-recents) (every? integer? legacy-recents))
+    (throw (ex-info "Invalid navigation source" {:code :navigation-invalid-context})))
+  (let [conn (worker-state/get-datascript-conn repo)
+        local-scope (str ((get @frontend.common.thread-api/*thread-apis :thread-api/ensure-local-graph-uuid) repo))
+        db @conn
+        ops-db (worker-state/get-client-ops-conn repo)
+        binding (when user-id
+                  (-> (client-op/insert-sync-meta-value-if-absent!
+                       ops-db "user-navigation-legacy-recents-owner"
+                       (ldb/write-transit-str [local-scope service user-id (resolved-recents db legacy-recents)]))
+                      :value ldb/read-transit-str))
+        recents (if user-id
+                  (if (= [local-scope service user-id] (vec (take 3 binding))) (nth binding 3) [])
+                  (resolved-recents db legacy-recents))
+        key (navigation-domain-key service user-id local-scope)
+        device (str (random-uuid))
+        favorites (->> ((get @frontend.common.thread-api/*thread-apis :thread-api/get-favorite-pages) repo)
+                       (mapv #(str (:block/uuid %))))
+        initial {:device-id device :transfer-id (str (random-uuid))
+                 :values {(navigation/ident :favorites-seed local-scope nil) favorites
+                          (navigation/ident :recents-seed local-scope device) recents}}
+        encoded (:value (client-op/insert-sync-meta-value-if-absent! ops-db key (ldb/write-transit-str initial)))
+        domain (ldb/read-transit-str encoded)]
+    {:local-scope local-scope :remote-scope (some-> (ldb/get-graph-rtc-uuid db) str)
+     :key key :encoded encoded :domain domain}))
+
+(def-thread-api :thread-api/user-navigation-source
+  [repo service user-id legacy-recents]
+  (let [{:keys [local-scope remote-scope domain]} (navigation-source repo service user-id legacy-recents)]
+    {:local-scope local-scope :remote-scope remote-scope :domain domain
+     :snapshot (navigation/snapshot (:values domain) local-scope [(:transfer-id domain)])}))
+
+(def-thread-api :thread-api/user-navigation-local
+  [repo service user-id legacy-recents operation args]
+  (let [{:keys [local-scope key encoded domain]} (navigation-source repo service user-id legacy-recents)
+        {:keys [device-id values]} domain
+        [target selected?] args
+        visits-key (navigation/ident :visits local-scope device-id)
+        seed-key (navigation/ident :recents-seed local-scope device-id)
+        values (case operation
+                 :favorite (let [ident (navigation/ident :favorite local-scope target)]
+                             (when-not (and (common-util/uuid-string? target) (boolean? selected?))
+                               (throw (ex-info "Invalid favorite" {:code :navigation-invalid-value})))
+                             (assoc values ident (navigation/favorite-value (get values ident) selected? (str (random-uuid)) (common-util/time-ms))))
+                 :visit (do
+                          (when-not (common-util/uuid-string? target)
+                            (throw (ex-info "Invalid recent page" {:code :navigation-invalid-value})))
+                          (assoc values visits-key (navigation/visit-value (get values visits-key) target (common-util/time-ms))))
+                 :reorder (do
+                            (when-not (and (vector? target) (every? common-util/uuid-string? target))
+                              (throw (ex-info "Invalid favorite order" {:code :navigation-invalid-value})))
+                            (assoc values (navigation/ident :order local-scope nil) (navigation/order-value values local-scope target)))
+                 :remove-recents (let [targets (set target)]
+                                   (when-not (and (vector? target) (every? common-util/uuid-string? target))
+                                     (throw (ex-info "Invalid recent pages" {:code :navigation-invalid-value})))
+                                   (assoc values visits-key (vec (remove #(targets (first %)) (get values visits-key)))
+                                          seed-key (vec (remove targets (get values seed-key)))))
+                 (throw (ex-info "Unknown navigation operation" {:code :navigation-invalid-operation})))]
+    (when-not (client-op/compare-and-set-sync-meta-value! (worker-state/get-client-ops-conn repo)
+                                                        key encoded (ldb/write-transit-str (assoc domain :values values)))
+      (throw (ex-info "Navigation source changed" {:code :navigation-save-failed})))
+    (navigation/snapshot values local-scope [(:transfer-id domain)])))
+
+(def-thread-api :thread-api/user-navigation-nodes
+  [repo targets recent?]
+  (when-not (and (vector? targets) (every? common-util/uuid-string? targets) (boolean? recent?))
+    (throw (ex-info "Invalid navigation targets" {:code :navigation-invalid-value})))
+  (let [db @(worker-state/get-datascript-conn repo)]
+    (->> targets (keep #(d/entity db [:block/uuid (uuid %)]))
+         (remove ldb/hidden?)
+         (filter #(or (not recent?) (and (ldb/page? %) (not (string/blank? (:block/title %))))))
+         (mapv #(entity->plain-map db %)))))

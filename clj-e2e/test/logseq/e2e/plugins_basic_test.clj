@@ -345,6 +345,29 @@
             tag1 (ls-api-call! :editor.getTag id1)]
         (is (= (get tag1 ":logseq.property.class/extends") [id2 id3]) "tag1 extends tag2,tag3 with db ids")))))
 
+(deftest create-tag-keeps-custom-uuid-test
+  (let [title (str "custom-uuid-" (random-uuid))
+        requested (str (random-uuid))
+        tag (ls-api-call! :editor.createTag title {:uuid requested})
+        existing (ls-api-call! :editor.createTag title)]
+    (is (= requested (get tag "uuid")))
+    (is (= requested (get existing "uuid")))
+    (is (= title (get (ls-api-call! :editor.getTag requested) "title")))))
+
+(deftest permanently-delete-only-recycled-pages-test
+  (let [title (str "plugin-recycle-" (random-uuid))
+        page (ls-api-call! :editor.createPage title {} {:redirect false})
+        id (get page "uuid")
+        child (ls-api-call! :editor.appendBlockInPage title "recycled child")]
+    (ls-api-call! :editor.deleteRecycledPagePermanently id)
+    (is (= id (get (ls-api-call! :editor.getPage id) "uuid")))
+    (is (some? (ls-api-call! :editor.getBlock (get child "uuid"))))
+    (is (nil? (ls-api-call! :editor.deleteRecycledPagePermanently (str (random-uuid)))))
+    (ls-api-call! :editor.deletePage title)
+    (ls-api-call! :editor.deleteRecycledPagePermanently id)
+    (is (nil? (ls-api-call! :editor.getPage id)))
+    (is (nil? (ls-api-call! :editor.getBlock (get child "uuid"))))))
+
 (deftest get-tags-by-name-test
   (testing "get tags by exact name"
     (let [tag-name "product"

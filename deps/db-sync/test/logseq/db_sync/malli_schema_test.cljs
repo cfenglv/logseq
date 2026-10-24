@@ -1,6 +1,7 @@
 (ns logseq.db-sync.malli-schema-test
   (:require [cljs.test :refer [deftest is testing]]
-            [logseq.db-sync.malli-schema :as db-sync-schema]))
+            [logseq.db-sync.malli-schema :as db-sync-schema]
+            [malli.core :as ma]))
 
 (def ^:private request-samples
   {:graphs/create {:graph-name "Demo"}
@@ -53,3 +54,40 @@
                :outliner-op :save-block}
         body {:t-before 0 :txs [entry]}]
     (is (= body (coerce-request :sync/tx-batch body)))))
+
+(deftest user-profile-contract-test
+  (let [body {:display-name "测试 😀" :avatar-png-base64 nil :expected-revision 0}
+        response {:user-id "profile-user" :display-name nil :has-avatar? false
+                  :profile-revision 2 :avatar-png-base64 nil}]
+    (is (= body (coerce-request :user-profile/save body)))
+    (is (= (assoc body :display-name nil)
+           (coerce-request :user-profile/save (assoc body :display-name nil))))
+    (is (= response ((get db-sync-schema/http-response-coercers :user-profile/get) response)))
+    (is (ma/validate db-sync-schema/user-profile-save-request-schema
+                     (assoc body :display-name (apply str (repeat 64 "😀")))))
+    (doseq [invalid [(dissoc body :avatar-png-base64)
+                     (assoc body :user-id "another-user")
+                     (assoc body :display-name "  ")
+                     (assoc body :display-name 42)
+                     (assoc body :display-name (apply str (repeat 65 "😀")))
+                     (assoc body :expected-revision -1)
+                     (assoc body :expected-revision "1")
+                     (assoc body :avatar-png-base64 (apply str (repeat (inc db-sync-schema/avatar-base64-max-length) "a")))]]
+      (is (not (ma/validate db-sync-schema/user-profile-save-request-schema invalid))))
+    (try
+      (coerce-request :user-profile/save (assoc body :user-id "another-user" :avatar-png-base64 "private-image-data"))
+      (is false "Invalid request must fail")
+      (catch :default error
+        (is (not (contains? (ex-data error) :value)))
+        (is (not (.includes (str error) "private-image-data")))))))
+
+(deftest profile-websocket-contract-test
+  (let [refresh {:type "profile/refresh"}
+        updated {:type "profile/updated" :user-id "user-1" :display-name nil
+                 :has-avatar? false :profile-revision 3}]
+    (is (= refresh (db-sync-schema/ws-client-message-coercer refresh)))
+    (is (= updated (db-sync-schema/ws-server-message-coercer updated)))
+    (is (not (ma/validate db-sync-schema/ws-client-message-schema (assoc refresh :user-id "another-user"))))
+    (is (not (ma/validate db-sync-schema/ws-server-message-schema (assoc updated :avatar-png-base64 "image"))))
+    (is (= (assoc updated :display-name "Display Name")
+           (db-sync-schema/ws-server-message-coercer (assoc updated :display-name "Display Name"))))))

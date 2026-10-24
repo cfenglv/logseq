@@ -2,8 +2,7 @@
   "Common fns for file and db based page handlers, including create!, delete!
   and favorite fns. This ns should be agnostic of file or db concerns but there
   is still some file-specific tech debt to remove from create!"
-  (:require [clojure.set :as set]
-            [clojure.string :as string]
+  (:require [clojure.string :as string]
             [dommy.core :as dom]
             [frontend.context.i18n :as i18n :refer [t]]
             [frontend.handler.config :as config-handler]
@@ -13,6 +12,7 @@
             [frontend.handler.route :as route-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-navigation :as navigation]
             [frontend.modules.outliner.op :as outliner-op]
             [frontend.modules.outliner.ui :as ui-outliner-tx]
             [frontend.state :as state]
@@ -105,7 +105,7 @@
 (defn <create!
   ([title]
    (<create! title {}))
-  ([title {:keys [redirect? today-journal? class? edit?]
+  ([title {:keys [redirect? today-journal? class? edit? expected-repo]
            :or   {redirect? true
                   edit? true}
            :as options}]
@@ -125,26 +125,29 @@
          (notification/show! (t :page.validation/name-no-hash) :error)
 
          (and has-tags?
-              (seq (set/intersection ldb/private-tags (set (map :db/ident (:block/tags parsed-result))))))
+              (seq (filter ldb/private-create-page-tag? (:block/tags parsed-result))))
          (notification/show! (i18n/interpolate-rich-text-node
                               (t :page.validation/cant-set-built-in-tags)
                               [(i18n/locale-join-rich-text-node
-                                (keep #(when (ldb/private-tags (:db/ident %))
+                                (keep #(when (ldb/private-create-page-tag? %)
                                          (pr-str (:block/title %)))
                                       (:block/tags parsed-result)))])
                              :error)
 
          :else
          (when-not (string/blank? title')
-           (p/let [existing-page (when-not class? (<page-for-create title'))]
-             (if (and existing-page (not (ldb/recycled? existing-page)))
+           ;; With explicit tags, the worker finds an existing page by title and tags
+           (p/let [existing-page (when-not (or class? (seq (:tags options)))
+                                   (<page-for-create title'))]
+             (when (or (nil? expected-repo) (= expected-repo (state/get-current-repo)))
+              (if (and existing-page (not (ldb/recycled? existing-page)))
                (do
                  (when redirect?
                    (route-handler/redirect-to-page! (:block/uuid existing-page))
                  (when (and edit? (not today-journal?))
                      (js/setTimeout #(edit-page! existing-page) 100)))
                  existing-page)
-               (p/let [options' (cond-> (update options :tags concat (:block/tags parsed-result))
+               (p/let [options' (cond-> (update (dissoc options :expected-repo) :tags concat (:block/tags parsed-result))
                                   (nil? (:split-namespace? options))
                                   (assoc :split-namespace? true))
                        [_page-name page-uuid] (ui-outliner-tx/transact!
@@ -155,7 +158,7 @@
                    (route-handler/redirect-to-page! page-uuid)
                    (when (and edit? (not today-journal?))
                      (js/setTimeout #(some-> page edit-page!) 100)))
-                 page)))))))))
+                 page))))))))))
 
 ;; favorite fns
 ;; ============
@@ -163,21 +166,25 @@
   [page-block-uuid]
   {:pre [(uuid? page-block-uuid)]}
   (when-let [repo (state/get-current-repo)]
-    (state/<invoke-db-worker :thread-api/favorited-page?
-                             repo
-                             page-block-uuid)))
+    (if (navigation/enabled?)
+      (navigation/<favorited? page-block-uuid)
+      (state/<invoke-db-worker :thread-api/favorited-page? repo page-block-uuid))))
 
 (defn <db-favorite-page!
   [page-block-uuid]
   {:pre [(uuid? page-block-uuid)]}
   (when-let [repo (state/get-current-repo)]
-    (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid true)))
+    (if (navigation/enabled?)
+      (navigation/<set-favorite! page-block-uuid true)
+      (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid true))))
 
 (defn <db-unfavorite-page!
   [page-block-uuid]
   {:pre [(uuid? page-block-uuid)]}
   (when-let [repo (state/get-current-repo)]
-    (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid false)))
+    (if (navigation/enabled?)
+      (navigation/<set-favorite! page-block-uuid false)
+      (state/<invoke-db-worker :thread-api/set-page-favorite repo page-block-uuid false))))
 
 ;; favorites fns end ================
 
@@ -189,8 +196,8 @@
 
 (defn <delete!
   "Deletes a page. If delete is successful calls ok-handler. Otherwise calls error-handler
-   if given. Note that error-handler is being called in addition to error messages that worker
-   already provides"
+   with the error or nil if given. Note that error-handler is being called in addition to error
+   messages that worker already provides"
   [page-uuid-or-name ok-handler & {:keys [error-handler]}]
   (when page-uuid-or-name
     (assert (or (uuid? page-uuid-or-name) (string? page-uuid-or-name)))
@@ -201,7 +208,7 @@
                       repo
                       [:block/uuid :block/title]
                       (page-lookup-ref page-uuid-or-name))]
-          (when-let [page-uuid (:block/uuid page)]
+          (if-let [page-uuid (:block/uuid page)]
             (let [default-home (state/get-default-home)
                   home-page? (= (:block/title page) (:page default-home))]
               (p/do!
@@ -216,9 +223,13 @@
                                  nil)]
                      (if res
                        (when ok-handler (ok-handler))
-                       (when error-handler (error-handler))))
+                       (when error-handler (error-handler nil))))
                    (p/catch (fn [error]
-                              (js/console.error error))))))))))))
+                              (js/console.error error)
+                              (when error-handler
+                                (error-handler error)))))))
+            (when error-handler
+              (error-handler nil))))))))
 
 ;; other fns
 ;; =========
@@ -228,7 +239,8 @@
   (when-let [repo (state/get-current-repo)]
     (p/let [page (state/<invoke-db-worker :thread-api/pull repo [:block/uuid] (page-lookup-ref page-name))]
       (when-let [page-block-uuid (:block/uuid page)]
-        (<db-unfavorite-page! page-block-uuid)))))
+        (p/do! (<db-unfavorite-page! page-block-uuid)
+               (when (navigation/enabled?) (navigation/<remove-recents! [page-block-uuid])))))))
 
 (defn after-page-renamed!
   [repo {:keys [page-id old-name new-name]}]

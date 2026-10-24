@@ -28,6 +28,7 @@
         env (doto (js-obj)
               (aset "DB" index-db)
               (aset "LOGSEQ_SYNC_ASSETS" assets-bucket)
+              (aset "ASSET_LINK_SECRET" (:asset-link-secret cfg))
               ;; Node adapter serves snapshot transit stream without gzip to avoid
               ;; browser/adapter content-encoding mismatches during graph download.
               (aset "DB_SYNC_SNAPSHOT_STREAM_GZIP" "false")
@@ -82,19 +83,25 @@
 
 (defn- handle-ws-connection
   [ctx env request ^js socket]
-  (p/let [claims (auth/auth-claims request env)
-          user (presence/claims->user claims)]
-    (when user
-      (presence/add-presence! ctx socket user))
-    (presence/broadcast-online-users! ctx))
-  (.on socket "message"
+  (let [ready (-> (p/let [claims (auth/auth-claims request env)
+                          user (presence/<connection-user (aget env "DB") claims)]
+                    (when (and user (= 1 (.-readyState socket)))
+                      (presence/add-presence! ctx socket user)
+                      (presence/broadcast-online-users! ctx)
+                      user))
+                  (p/catch (fn [error]
+                             (log/error :db-sync/ws-error error)
+                             (.close socket 1011 "server error")
+                             nil)))]
+   (.on socket "message"
        (fn [data]
          (let [text (if (string? data) data (.toString data))]
-           (try
-             (ws-handler/handle-ws-message! ctx socket text)
-             (catch :default e
+           (-> (p/let [user ready]
+                 (when user (ws-handler/handle-ws-message! ctx socket text)))
+               (p/catch (fn [e]
                (log/error :db-sync/ws-error e)
-               (.send socket (js/JSON.stringify #js {:type "error" :message "server error"})))))))
+               (.send socket (js/JSON.stringify #js {:type "error" :message (if (= "profile-refresh-failed" (ex-message e))
+                                                                            "profile-refresh-failed" "server error")})))))))))
   (.on socket "close"
        (fn []
          (presence/remove-presence! ctx socket)
@@ -106,6 +113,21 @@
          (presence/broadcast-online-users! ctx)
          (detach-ws! ctx socket)
          (log/error :db-sync/ws-error error))))
+
+(defn- local-do-namespace
+  "Durable Object namespace stand-in that forwards to the local graph context."
+  [registry deps]
+  #js {:idFromName (fn [graph-id] graph-id)
+       :get (fn [_do-id]
+              #js {:fetch (fn [request]
+                            (let [url (platform/request-url request)
+                                  graph-id (.get (.-searchParams url) "graph-id")]
+                              (sync-handler/handle-http
+                               (graph/get-or-create-graph registry deps graph-id)
+                               request)))})})
+
+(defn- unlimited-limiter []
+  #js {:limit (fn [_opts] (p/resolved #js {:success true}))})
 
 (defn start!
   [overrides]
@@ -120,7 +142,10 @@
         env (doto (make-env cfg index-db assets-bucket)
               (aset "DB_SYNC_DELETE_GRAPH"
                     (fn [graph-id]
-                      (graph/delete-graph! registry deps graph-id))))
+                      (graph/delete-graph! registry deps graph-id)))
+              (aset "LOGSEQ_SYNC_DO" (local-do-namespace registry deps))
+              (aset "SEMANTIC_READ_RATE_LIMITER" (unlimited-limiter))
+              (aset "SEMANTIC_WRITE_RATE_LIMITER" (unlimited-limiter)))
         server (.createServer http
                               (fn [req res]
                                 (-> (p/let [request (platform-node/request-from-node req request-origin)
@@ -161,8 +186,9 @@
                  (.destroy socket)))))
       (p/let [_ (js/Promise.
                  (fn [resolve]
-                   (.listen server (:port cfg)
-                            (fn [] (resolve nil)))))
+                   (if-let [host (:host overrides)]
+                     (.listen server (:port cfg) host (fn [] (resolve nil)))
+                     (.listen server (:port cfg) (fn [] (resolve nil))))))
               address (.address server)
               port (if (number? address) address (.-port address))
               base-url (or (:base-url cfg) (str "http://localhost:" port))]

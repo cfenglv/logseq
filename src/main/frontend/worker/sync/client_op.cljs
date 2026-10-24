@@ -6,9 +6,14 @@
             [frontend.worker.state :as worker-state]
             [goog.object :as gobj]
             [lambdaisland.glogi :as log]
+            [logseq.common.defkeywords :refer [defkeywords]]
             [logseq.db.sqlite.util :as sqlite-util]
+            [logseq.db-sync.protocol :as sync-protocol]
             [malli.core :as ma]
             [malli.transform :as mt]))
+
+(defkeywords
+  :db-sync/checksum-covered-tx {:doc "Immutable graph commit covered by the stored sync checksum."})
 
 (def op-schema
   [:multi {:dispatch first}
@@ -254,14 +259,69 @@
          (sqlite-run! tx client-ops-table-sql [])
          (sqlite-run! tx sync-conflicts-table-sql [])
          (sqlite-run! tx client-tx-upload-state-table-sql [])
-         ;; Graphs created by the legacy selfhost line (.1-.5) carry the old
-         ;; client_tx_upload_state(logical_tx_id, session_data, updated_at)
-         ;; shape. Upload state is only a resume cache, so migrate by
-         ;; rebuilding the table with the current schema; pending journal rows
-         ;; remain authoritative and re-upload stays exact-once.
          (when (legacy-client-tx-upload-state? tx)
-           (sqlite-run! tx "drop table client_tx_upload_state" [])
-           (sqlite-run! tx client-tx-upload-state-table-sql []))
+           ;; A lost ACK can leave ciphertext staged under these identities.
+           ;; Convert the existing generation atomically; never re-encrypt it.
+           (let [rows (sqlite-rows tx "select logical_tx_id, session_data, updated_at from client_tx_upload_state" [])
+                 converted (mapv
+                            (fn [row]
+                              (let [logical-tx-id (aget row "logical_tx_id")
+                                    session (sqlite-util/read-transit-str (aget row "session_data"))
+                                    {:keys [session-id tx-data outliner-op chunk-seq source-next-index]} session
+                                    _ (when-not (= 2 (:session-version session))
+                                        (throw (ex-info "Unsupported legacy upload session"
+                                                        {:type :db-sync/invalid-client-tx-upload-state
+                                                         :logical-tx-id logical-tx-id})))
+                                    boundaries (mapv second (:boundaries session))
+                                    ;; The old one-group upload stages ordinal zero,
+                                    ;; then sends an explicit empty final ordinal one.
+                                    boundaries (cond-> boundaries
+                                                 (= 1 (count boundaries)) (conj (count tx-data)))
+                                    final? (= chunk-seq (dec (count boundaries)))
+                                    wire-entry (get (:wire-cache session) chunk-seq)
+                                    source-digest (sync-protocol/tx-payload-digest outliner-op tx-data)
+                                    pending (sqlite-row tx
+                                                        "select normalized_tx_data, outliner_op from client_ops where tx_id = ? and pending = 1"
+                                                        [logical-tx-id])
+                                    superseded? (and pending
+                                                     (not (:final-wire-frozen? session))
+                                                     (not= source-digest
+                                                           (sync-protocol/tx-payload-digest
+                                                            (str->kw (aget pending "outliner_op"))
+                                                            (sqlite-util/read-transit-str (aget pending "normalized_tx_data")))))
+                                    state {:format-version 1 :kind :staged-large-upload-v1
+                                           :session-id session-id :source-digest source-digest
+                                           :outliner-op outliner-op :boundaries boundaries
+                                           :source-next-index source-next-index :chunk-seq chunk-seq
+                                           :wire-cache (when wire-entry
+                                                         {:tx (sqlite-util/write-transit-str (:tx-data wire-entry))
+                                                          :tx-id (str (sync-protocol/tx-chunk-id
+                                                                       (uuid logical-tx-id) session-id chunk-seq final?))
+                                                          :logical-tx-id logical-tx-id
+                                                          :upload-session-id session-id :chunk-index chunk-seq
+                                                          :chunk-final? final? :outliner-op outliner-op})}]
+                                {:logical-tx-id logical-tx-id :state state
+                                 :superseded? superseded?
+                                 :updated-at (aget row "updated_at")
+                                 :session session})) rows)]
+             (sqlite-run! tx "drop table client_tx_upload_state" [])
+             (sqlite-run! tx client-tx-upload-state-table-sql [])
+             ;; .6 replaced a nonfinal generation after a rebase changed its
+             ;; source. Leave that pending row intact for the existing uploader
+             ;; to start the new generation; only final-frozen wire is immutable.
+             (doseq [{:keys [logical-tx-id state updated-at session superseded?]} converted
+                     :when (not superseded?)]
+               (sqlite-run! tx
+                            "insert into client_tx_upload_state values (?, ?, ?, ?, ?, ?)"
+                            [logical-tx-id 1 "staged-large-upload-v1" (:source-digest state)
+                             (sqlite-util/write-transit-str state) updated-at])
+               ;; A pull after a lost final ACK may have rewritten the pending
+               ;; source. The already frozen generation keeps its original op.
+               (when (:final-wire-frozen? session)
+                 (sqlite-run! tx
+                              "update client_ops set normalized_tx_data = ?, outliner_op = ? where tx_id = ? and pending = 1"
+                              [(sqlite-util/write-transit-str (:tx-data session))
+                               (kw->str (:outliner-op session)) logical-tx-id])))))
          (sqlite-run! tx pending-index-sql [])
          (sqlite-run! tx asset-index-sql [])
          (sqlite-run! tx sync-conflicts-block-index-sql [])))
@@ -466,11 +526,16 @@
     (sqlite-set-meta! store :local-tx 0)))
 
 (defn update-local-checksum
-  [repo checksum]
-  {:pre [(some? checksum)]}
+  "Stores the checksum together with the graph commit (:max-tx) it covers. The
+  checksum is written post-commit to the client-ops sqlite file, separate from
+  the graph store, so process death between the two writes leaves it stale; the
+  covered commit lets graph open detect that and recompute."
+  [repo checksum covered-tx]
+  {:pre [(some? checksum) (integer? covered-tx)]}
   (let [store (sqlite-store-or-throw repo)]
     (assert (some? store) repo)
-    (sqlite-set-meta! store :db-sync/checksum checksum)))
+    (sqlite-set-meta! store :db-sync/checksum checksum)
+    (sqlite-set-meta! store :db-sync/checksum-covered-tx covered-tx)))
 
 (defn get-pending-local-tx-count
   [repo]
@@ -516,6 +581,14 @@
                        rows)]
       {:local-checksum (get values "checksum")
        :reserved-value (get values key)})))
+
+(defn get-local-checksum-covered-tx
+  "The graph commit the stored checksum covers, nil when never recorded."
+  [repo]
+  (let [store (sqlite-store-or-throw repo)]
+    (assert (some? store) repo)
+    (some-> (sqlite-get-meta store :db-sync/checksum-covered-tx)
+            (js/parseInt 10))))
 
 (defn rtc-db-graph?
   "Is RTC enabled"
@@ -589,6 +662,21 @@
       {:tx-id tx-id
        :created-at created-at'
        :should-inc-pending? should-inc-pending?})))
+
+(defn replace-rebased-local-tx-entry!
+  "Replace a frozen literature transaction with its semantic replay, keeping
+  the same pending row and ordering key. The new datoms need a new wire ID."
+  [repo previous-tx-id {:keys [tx-id] :as entry}]
+  (sqlite-with-tx!
+   (sqlite-store-or-throw repo)
+   (fn [store]
+     (sqlite-run! store
+                  "update client_ops set tx_id = ? where kind = 'tx' and tx_id = ?"
+                  [(str tx-id) (str previous-tx-id)])
+     (sqlite-run! store
+                  "delete from client_tx_upload_state where logical_tx_id = ?"
+                  [(str previous-tx-id)])
+     (upsert-local-tx-entry! repo entry))))
 
 (defn get-local-tx-entry
   [repo tx-id]
@@ -748,14 +836,14 @@
        (= format-version (:format-version state))
        (= kind (:kind state))
        (= source-digest (:source-digest state))
+       (or (nil? (:outliner-op state))
+           (keyword? (:outliner-op state)))
        (case kind
          :single-wire-v1
-         (and (keyword? (:outliner-op state))
-              (map? (:wire-entry state)))
+         (map? (:wire-entry state))
 
          :staged-large-upload-v1
-         (and (keyword? (:outliner-op state))
-              (string? (:session-id state))
+         (and (string? (:session-id state))
               (vector? (:boundaries state))
               (integer? (:source-next-index state))
               (integer? (:chunk-seq state)))

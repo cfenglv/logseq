@@ -1,14 +1,15 @@
 {
   "schemaVersion": 1,
   "releaseLineId": "selfhost-official-architecture-v1",
-  "sourceVersion": "2.0.1-selfhost.6",
-  "syntheticForwardTargetVersion": "2.0.1-selfhost.7",
+  "sourceVersion": "2.0.2-selfhost.2",
+  "syntheticForwardTargetVersion": "2.0.2-selfhost.3",
   "bundleIdentity": "com.logseq.logseq",
-  "forwardUpdateChannel": "selfhost-official-architecture-v1",
+  "forwardUpdateChannel": "latest",
   "provider": {
-    "kind": "generic",
-    "baseUrl": "https://github.com/cfenglv/logseq/releases/download/selfhost-official-architecture-v1",
-    "remoteMutation": "promotion-only"
+    "kind": "github",
+    "owner": "cfenglv",
+    "repo": "logseq",
+    "remoteMutation": "version-release-only"
   },
   "firstInstall": "controlled-manual-artifact",
   "allowDowngrade": false,

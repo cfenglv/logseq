@@ -1,14 +1,51 @@
 (ns frontend.handler.assets-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require [cljs.test :refer [async deftest is testing]]
             [frontend.config :as config]
             [frontend.fs :as fs]
             [frontend.handler.assets :as assets]
+            [frontend.state :as state]
             [frontend.util :as util]
             [promesa.core :as p]))
 
 (defn- uint8->vec
   [^js payload]
   (js->clj (js/Array.from payload)))
+
+(deftest damaged-asset-recovery-must-restore-registered-content-test
+  (async done
+    (let [repo "content-recovery-repo"
+          asset-uuid (random-uuid)
+          asset {:block/uuid asset-uuid
+                 :logseq.property.asset/type "pdf"
+                 :logseq.property.asset/size 1983
+                 :logseq.property.asset/checksum "registered-checksum"
+                 :logseq.property.asset/remote-metadata {:type "pdf"}}
+          checks (atom [false true false false])
+          requests (atom [])]
+      (-> (p/with-redefs
+            [config/get-repo-dir (constantly "/tmp/content-recovery-graph")
+             assets/<asset-file-content-matches?
+             (fn [repo-dir file-rpath size checksum]
+               (is (= ["/tmp/content-recovery-graph" (str "assets/" asset-uuid ".pdf")
+                       1983 "registered-checksum"]
+                      [repo-dir file-rpath size checksum]))
+               (let [result (first @checks)]
+                 (swap! checks subvec 1)
+                 (p/resolved result)))
+             state/<invoke-db-worker
+             (fn [& args]
+               (swap! requests conj args)
+               (p/resolved nil))]
+            (p/let [_ (assets/<ensure-asset-file-content! repo asset)
+                    failed-name (-> (assets/<ensure-asset-file-content! repo asset)
+                                    (p/then (fn [_] nil))
+                                    (p/catch (fn [error] (.-name error))))]
+              (is (= "AssetContentMismatchError" failed-name))
+              (is (= (repeat 2 [:thread-api/db-sync-request-asset-download repo asset-uuid true])
+                     @requests))
+              (is (empty? @checks))))
+          (p/catch (fn [error] (is false (str "unexpected error: " error))))
+          (p/finally done)))))
 
 (deftest coerce-array-buffer-to-uint8-test
   (let [source (js/Uint8Array. #js [1 2 3])
@@ -131,3 +168,26 @@
     (let [url "assets:///C/logseq__colon/Users/charlie/graph/assets/test.mp3"]
       (is (= url
              (assets/asset-protocol-url->media-url url))))))
+
+(deftest local-file-iframe-src->assets-url-test
+  (with-redefs [state/get-current-repo (constantly "example")
+                config/get-repo-dir (constantly "C:/graph")]
+    (doseq [[src expected]
+            [["file:///C:/docs/example.html?mode=dark#section"
+              "assets:///C/logseq__colon/docs/example.html?mode=dark#section"]
+             ["FILE:///tmp/a%23b%3Fc.html" "assets:///tmp/a%23b%3Fc.html"]
+             ["file:///tmp/a&b.html" "assets:///tmp/a%26b.html"]
+             ["file:///tmp/a%2523b.html" "assets:///tmp/a%2523b.html"]
+             ["file://server/share/example.html" "assets://server/share/example.html"]
+             ["../assets/100%20done%.html?mode=dark#section"
+              "assets:///C/logseq__colon/graph/assets/100%20done%25.html?mode=dark#section"]
+             ["assets/%FF.html" "assets:///C/logseq__colon/graph/assets/%25FF.html"]
+             ["./assets/example.html" "assets:///C/logseq__colon/graph/assets/example.html"]
+             ["https://example.com/example.html" nil]
+             ["//example.com/example.html" nil]
+             ["javascript:alert(1)" nil]
+             ["assets:///tmp/example.html" nil]
+             ["assets-other/example.html" nil]
+             ["file://[invalid" nil]]]
+      (testing src
+        (is (= expected (assets/local-file-iframe-src->assets-url src)))))))

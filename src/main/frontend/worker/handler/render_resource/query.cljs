@@ -1,13 +1,16 @@
 (ns frontend.worker.handler.render-resource.query
   "DSL and Datalog query execution and result normalization."
   (:require [clojure.string :as string]
+            [datascript.core :as d]
             [datascript.impl.entity :as de]
             [frontend.worker.handler.query :as query-handler]
             [frontend.worker.handler.render-resource.common :as common]
             [frontend.worker.handler.search :as search-handler]
             [frontend.worker.query-dsl :as query-dsl]
+            [lambdaisland.glogi :as log]
             [logseq.common.util :as common-util]
             [logseq.db :as ldb]
+            [logseq.db.frontend.datalog :as datalog-util]
             [logseq.outliner.tree :as otree]
             [sci.core :as sci]))
 
@@ -18,8 +21,15 @@
          (uuid? (:block/uuid cell)))
     (:block/uuid cell)
 
-    (or (map? cell) (de/entity? cell))
-    (common/fail! "Renderer query result map has no UUID" {:value cell})
+    ;; Partial pull maps are valid query cells. Keep them transit-safe
+    ;; instead of failing the whole get-render-snapshots batch.
+    (de/entity? cell)
+    (cond-> {:db/id (:db/id cell)}
+      (keyword? (:db/ident cell))
+      (assoc :db/ident (:db/ident cell)))
+
+    (map? cell)
+    (update-vals cell normalize-query-cell)
 
     (fn? cell)
     (common/fail! "Renderer query result contains a function" {})
@@ -114,6 +124,23 @@
       (when (and (string? value) (not (string/blank? value)))
         (string/trim value)))))
 
+(defn- with-block-pull-identity
+  [query-spec]
+  (let [{find-expressions :find} (datalog-util/query-vec->map (:query query-spec))
+        expression (first find-expressions)
+        pattern (when (seq? expression) (last expression))]
+    (if (and (= 1 (count find-expressions))
+             (seq? expression)
+             (= 'pull (first expression))
+             (vector? pattern)
+             (not-any? #{'* :block/uuid} pattern))
+      ;; A single pull renders as block views even when its visible columns
+      ;; omit the UUID. Keep the original query for column selection.
+      (assoc-in query-spec [:query 1]
+                (apply list (concat (butlast expression)
+                                    [(conj pattern :block/uuid)])))
+      query-spec)))
+
 (defn- execute-query-spec
   [db query-spec {:keys [repo]}]
   (case (:kind query-spec)
@@ -125,8 +152,6 @@
 
         (quoted-query-text query-string)
         (let [query-text (quoted-query-text query-string)]
-          (when-not repo
-            (common/fail! "Full-text query resource requires repository" {}))
           (mapv vector
                 (search-handler/search-blocks
                  repo query-text
@@ -145,7 +170,8 @@
 
     :datalog
     (query-handler/execute-custom-query
-     db query-spec (assoc query-spec :require-today-day? true))))
+     db (with-block-pull-identity query-spec)
+     (assoc query-spec :require-today-day? true))))
 
 (defn- query-tuples
   [result]
@@ -168,9 +194,9 @@
                tuples)))
 
 (defn- filter-block-query-result
-  [blocks {:keys [current-block-uuid remove-block-children?]}]
+  [db blocks {:keys [current-block-uuid remove-block-children?]}]
   (let [blocks (->> blocks
-                    (remove ldb/hidden?)
+                    (remove #(ldb/hidden? (d/entity db [:block/uuid (:block/uuid %)])))
                     (remove #(= current-block-uuid (:block/uuid %))))]
     (if (or (false? remove-block-children?)
             (not-every? #(integer? (:db/id %)) blocks))
@@ -192,10 +218,10 @@
     rows))
 
 (defn- query-result-rows
-  [result query-spec]
+  [db result query-spec]
   (let [tuples (query-tuples result)
         rows (if (block-query-result? tuples)
-               (filter-block-query-result (map first tuples) query-spec)
+               (filter-block-query-result db (map first tuples) query-spec)
                tuples)
         rows (apply-result-transform rows (:result-transform-edn query-spec))]
     (mapv normalize-query-row rows)))
@@ -213,17 +239,72 @@
 
 (defn- query-watch-keys
   [db query-spec]
-  (dependency-watch
-   (if (= :datalog (:kind query-spec))
-     (query-handler/custom-query-watch-dependencies query-spec)
-     (query-dsl/query-watch-dependencies (:query query-spec) db query-spec))))
+  (let [watch (dependency-watch
+               (if (= :datalog (:kind query-spec))
+                 (query-handler/custom-query-watch-dependencies query-spec)
+                 (query-dsl/query-watch-dependencies (:query query-spec) db query-spec)))]
+    (if (= common/watch-all watch)
+      watch
+      (into watch #{[:attr :logseq.property/hide?]
+                    [:attr :logseq.property/deleted-at]
+                    [:attr :block/parent]}))))
+
+(defn- transit-safe-value
+  "Convert values transit cannot encode (parser deftypes, functions, atoms)
+   into their printed form so renderer payloads always serialize."
+  [value]
+  (cond
+    (map? value)
+    (into {} (map (fn [[k v]]
+                    [(transit-safe-value k) (transit-safe-value v)]))
+          value)
+
+    (set? value)
+    (into #{} (map transit-safe-value) value)
+
+    (and (sequential? value) (not (string? value)))
+    (mapv transit-safe-value value)
+
+    (or (nil? value)
+        (string? value)
+        (number? value)
+        (boolean? value)
+        (keyword? value)
+        (symbol? value)
+        (uuid? value)
+        (inst? value)
+        (de/entity? value)
+        (instance? ExceptionInfo value)
+        (instance? js/Error value))
+    value
+
+    :else
+    (pr-str value)))
+
+(defn- query-error-value
+  [error]
+  (cond-> {:rows []
+           :error {:message (or (ex-message error) (str error))}}
+    (ex-data error) (assoc-in [:error :data] (transit-safe-value (ex-data error)))))
 
 (defn- query
   [db resource-key runtime]
   (let [query-spec (require-query-spec! (second resource-key))]
-    [(query-watch-keys db query-spec)
-     {:rows (query-result-rows (execute-query-spec db query-spec runtime)
-                               query-spec)}]))
+    (when (and (= :dsl (:kind query-spec))
+               (quoted-query-text (:query query-spec))
+               (not (:repo runtime)))
+      (common/fail! "Full-text query resource requires repository" {}))
+    (try
+      [(query-watch-keys db query-spec)
+       {:rows (query-result-rows db (execute-query-spec db query-spec runtime)
+                                 query-spec)}]
+      ;; A user-supplied query can fail in many ways: cljs.reader errors on
+      ;; incomplete syntax while editing, invalid regex, malformed datalog,
+      ;; a bad result-transform. Isolating the failure keeps sibling snapshot
+      ;; resources alive; watch-all re-evaluates once the query is fixed.
+      (catch :default error
+        (log/error :renderer-query-failed {:kind (:kind query-spec) :error error})
+        [common/watch-all (query-error-value error)]))))
 
 (def resource-renderers
   {:query (common/renderer 2 query)})

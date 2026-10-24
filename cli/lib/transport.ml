@@ -10,6 +10,13 @@ type event_type = Cli_primitive.keyword
 type event_payload = Melange_edn_melange.any
 type event_subscription = { close : unit -> unit Cli_effect.t }
 
+exception Http_error of { status : int; code : string; message : string }
+
+let () =
+  Printexc.register_printer (function
+    | Http_error { message; _ } -> Some (Printexc.to_string (Failure message))
+    | _ -> None)
+
 let thread_api_method name = Edn_util.keyword_t ("thread-api/" ^ name)
 
 module T = Transit_melange.Transit.Json
@@ -58,7 +65,7 @@ let find_substring_from ~needle haystack start =
   in
   if needle_len = 0 then Some start else loop start
 
-let http_error_message status body =
+let http_error status body =
   let fallback =
     if String.trim body = "" then
       "http request failed (" ^ string_of_int status ^ ")"
@@ -69,13 +76,19 @@ let http_error_message status body =
   try
     match Json_util.object_of_json_string body with
     | Some object_ ->
-        Option.value
-          (match Json_util.nested_string_field object_ "error" "message" with
-          | Some _ as message -> message
-          | None -> Json_util.string_field object_ "message")
-          ~default:fallback
-    | None -> fallback
-  with _ -> fallback
+        let message =
+          Option.value
+            (match Json_util.nested_string_field object_ "error" "message" with
+            | Some _ as message -> message
+            | None -> Json_util.string_field object_ "message")
+            ~default:fallback
+        in
+        let code = Json_util.nested_string_field object_ "error" "code" in
+        (match code with
+        | Some code -> Http_error { status; code; message }
+        | None -> Failure message)
+    | None -> Failure fallback
+  with _ -> Failure fallback
 
 let response_status response = Fetch.Response.status response
 let success_status status = status >= 200 && status <= 299
@@ -85,7 +98,7 @@ let request ?timeout_span method_ uri ~headers ~body =
   >>= fun (response, body) ->
   let status = response_status response in
   if success_status status then Cli_effect.pure (response, body)
-  else Cli_effect.error (Failure (http_error_message status body))
+  else Cli_effect.error (http_error status body)
 
 let method_name method_ = Edn_util.keyword_to_string method_ |> String.trim
 

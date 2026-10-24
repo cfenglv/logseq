@@ -52,10 +52,10 @@
       (vec graph-names))))
 
 (defn- db-exists?
-  [graph]
+  [graph private-navigation?]
   (->
    (p/let [^js root (.getDirectory js/navigator.storage)
-           _dir-handle (.getDirectoryHandle root (str "." (worker-util/get-pool-name graph)))]
+           _dir-handle (.getDirectoryHandle root (str "." (worker-util/get-pool-name graph private-navigation?)))]
      true)
     (p/catch
     (fn [_e]                         ; not found
@@ -231,12 +231,14 @@
 
 (defn browser-platform
   []
+  (let [private-navigation? (search-param-true? "userNavigation")]
   {:env {:publishing? (string/includes? (.. js/location -href) "publishing=true")
+         :user-navigation? private-navigation?
          :runtime :browser
          :owner-source (owner-source)}
    :storage {:install-opfs-pool install-opfs-pool
              :list-graphs list-graphs
-             :db-exists? db-exists?
+             :db-exists? #(db-exists? % private-navigation?)
              :resolve-db-path (fn [_repo _pool path] path)
              :export-file export-file
              :inspect-db-artifact-set <inspect-db-artifact-set
@@ -265,4 +267,4 @@
    :crypto {:save-secret-text! save-secret-text!
             :read-secret-text read-secret-text
             :delete-secret-text! delete-secret-text!}
-   :timers {:set-interval! (fn [f ms] (js/setInterval f ms))}})
+   :timers {:set-interval! (fn [f ms] (js/setInterval f ms))}}))

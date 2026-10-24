@@ -45,13 +45,15 @@
        (common-graph-dir/decode-graph-dir-name dir-name))
 
      (defn get-pool-name
-       [graph-name]
-       (str "logseq-pool-"
+       ([graph-name] (get-pool-name graph-name false))
+       ([graph-name private-navigation?]
+       (str (if private-navigation? "logseq-user-navigation-pool-" "logseq-pool-")
             (-> graph-name
                 (string/replace sqlite-util/db-version-prefix "")
+                string/trim
                 (string/replace "/" "_")
                 (string/replace "\\" "_")
-                (string/replace ":" "_"))))
+                (string/replace ":" "_")))))
 
      (defn- decode-username
        [username]

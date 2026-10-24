@@ -1,8 +1,12 @@
 (ns logseq.db-sync.index-test
-  (:require [cljs.test :refer [async deftest is]]
+  (:require ["fs" :as fs]
+            ["os" :as os]
+            ["path" :as node-path]
+            [cljs.test :refer [async deftest is]]
             [clojure.string :as string]
             [logseq.db-sync.common :as common]
             [logseq.db-sync.index :as index]
+            [logseq.db-sync.node.storage :as node-storage]
             [promesa.core :as p]))
 
 (def ^:private graph-e2ee-migration-sql
@@ -51,15 +55,15 @@
                           (is false (str error))
                           (done)))))))
 
-(deftest semantic-graphs-list-is-bounded-and-excludes-e2ee-test
+(deftest semantic-graphs-list-is-bounded-and-includes-e2ee-test
   (async done
          (let [call (atom nil)
                rows #js [#js {"graph_id" "graph-1" "graph_name" "test-mcp"
                               "updated_at" 20 "created_at" 10 "schema_version" "65"
-                              "graph_ready_for_use" 1 "role" "manager" "invited_by" nil}
+                              "graph_e2ee" 0 "graph_ready_for_use" 1 "role" "manager" "invited_by" nil}
                          #js {"graph_id" "graph-2" "graph_name" "test-mcp-2"
                               "updated_at" 19 "created_at" 11 "schema_version" "65"
-                              "graph_ready_for_use" 1 "role" "member" "invited_by" "u2"}]]
+                              "graph_e2ee" 1 "graph_ready_for_use" 1 "role" "member" "invited_by" "u2"}]]
            (-> (p/with-redefs [common/<d1-all
                                (fn [_db sql & args]
                                  (reset! call {:sql sql :args args})
@@ -69,7 +73,8 @@
                (p/then (fn [{:keys [graphs next-cursor]}]
                          (is (= 1 (count graphs)))
                          (is (string? next-cursor))
-                         (is (string/includes? (:sql @call) "g.graph_e2ee = 0"))
+                         (is (not (string/includes? (:sql @call) "g.graph_e2ee = 0")))
+                         (is (string/includes? (:sql @call) "g.graph_e2ee"))
                          (is (string/includes? (:sql @call) "limit ?"))
                          (is (= 2 (last (:args @call))))
                          (done)))
@@ -211,3 +216,120 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (done)))))))
+
+(deftest full-migration-filenames-preserve-profile-and-add-pat-test
+  ;; The db-sync test entry runs from this package, as do its other fixtures.
+  (let [migration-dir "worker/migrations"
+        filenames (sort (filter #(string/ends-with? % ".sql") (.readdirSync fs migration-dir)))
+        base (filter #(not (string/starts-with? % "0007_")) filenames)
+        profile "0007_add_user_profile.sql"
+        pat "0007_add_personal_access_tokens.sql"]
+    (doseq [old-profile? [false true]]
+      (let [sql (new node-storage/sqlite ":memory:")
+            apply-migration! (fn [filename]
+                               (.exec sql (.readFileSync fs (node-path/join migration-dir filename) "utf8"))
+                               (let [^js stmt (.prepare sql "insert into d1_migrations(name) values (?)")]
+                                 (.run stmt filename)))
+            pending (fn []
+                      (let [applied (set (map #(aget % "name")
+                                             (.all (.prepare sql "select name from d1_migrations"))))]
+                        (remove applied filenames)))]
+        (try
+          (.exec sql "create table d1_migrations(name text primary key)")
+          (run! apply-migration! base)
+          (when old-profile?
+            (apply-migration! profile)
+            (.exec sql "insert into users(id,display_name,avatar_png_base64,profile_revision) values ('synthetic-user','Original','cG5n',3)"))
+          (run! apply-migration! (pending))
+          (is (empty? (pending)))
+          (is (= 2 (aget (.get (.prepare sql "select count(*) as n from d1_migrations where name in (?,?)") profile pat) "n")))
+          (is (some? (.get (.prepare sql "select name from sqlite_master where name='personal_access_tokens'"))))
+          (when old-profile?
+            (let [saved (.get (.prepare sql "select display_name,avatar_png_base64,profile_revision from users where id='synthetic-user'"))]
+              (is (= "Original" (aget saved "display_name")))
+              (is (= "cG5n" (aget saved "avatar_png_base64")))
+              (is (= 3 (aget saved "profile_revision")))))
+          (finally (.close sql)))))))
+
+(deftest user-profile-real-sqlite-storage-test
+  (async done
+         (let [dir (.mkdtempSync fs (node-path/join (.tmpdir os) "db-sync-profile-test-"))
+               new-db (node-storage/open-index-db (node-path/join dir "new"))
+               old-db (node-storage/open-index-db (node-path/join dir "old"))
+               new-id (str "profile-new-" (random-uuid))
+               old-id (str "profile-old-" (random-uuid))]
+           (-> (p/let [_ (common/<d1-run old-db
+                                        (str "create table users (id TEXT primary key, email TEXT, "
+                                             "email_verified INTEGER, username TEXT, created_at INTEGER)"))
+                       _ (common/<d1-run old-db "insert into users (id, username) values (?, ?)"
+                                        old-id "Original")
+                       _ (index/<index-init! new-db)
+                       _ (index/<index-init! old-db)
+                       _ (index/<index-init! old-db)
+                       old-profile (index/<user-profile old-db old-id)
+                       _ (is (= {:display-name nil :avatar-png-base64 nil
+                                 :has-avatar? false :profile-revision 0 :username "Original"}
+                                (select-keys old-profile [:display-name :avatar-png-base64
+                                                          :has-avatar? :profile-revision :username])))
+                       _ (index/<user-upsert! new-db #js {:sub new-id :email "user@example.com"
+                                                        "cognito:username" "Account"})
+                       saved (index/<user-profile-save! new-db new-id
+                                                        {:display-name "测试 User" :avatar-png-base64 "cG5n"
+                                                         :expected-revision 0})
+                       _ (is (= 1 (:profile-revision saved)))
+                       _ (is (true? (:has-avatar? saved)))
+                       _ (index/<user-upsert! new-db #js {:sub new-id :email "changed@example.com"
+                                                        "cognito:username" "New account name"})
+                       after-login (index/<user-profile new-db new-id)
+                       _ (is (= (select-keys saved [:display-name :avatar-png-base64 :profile-revision])
+                                (select-keys after-login [:display-name :avatar-png-base64 :profile-revision])))
+                       _ (is (= "New account name" (:username after-login)))
+                       conflict (index/<user-profile-save! new-db new-id
+                                                           {:display-name "Stale" :avatar-png-base64 nil
+                                                            :expected-revision 0})
+                       _ (is (nil? conflict))
+                       after-conflict (index/<user-profile new-db new-id)
+                       _ (is (= after-login after-conflict))
+                       _ (index/<graph-member-upsert! new-db "profile-graph" new-id "member" nil)
+                       members (index/<graph-members-list new-db "profile-graph")
+                       _ (is (= "测试 User" (:display-name (first members))))
+                       _ (is (true? (:has-avatar? (first members))))
+                       _ (is (not (contains? (first members) :avatar-png-base64)))
+                       metadata (index/<user-profile-metadata new-db new-id)
+                       _ (is (= (select-keys saved [:user-id :display-name :has-avatar? :profile-revision]) metadata))
+                       removed (index/<user-profile-save! new-db new-id
+                                                          {:display-name nil :avatar-png-base64 nil
+                                                           :expected-revision 1})]
+                 (is (= {:display-name nil :avatar-png-base64 nil :has-avatar? false :profile-revision 2}
+                        (select-keys removed [:display-name :avatar-png-base64 :has-avatar? :profile-revision]))))
+               (p/catch (fn [error] (is false (str error))))
+               (p/finally (fn []
+                            (.close new-db)
+                            (.close old-db)
+                            (.rmSync fs dir #js {:recursive true})
+                            (done)))))))
+
+(deftest user-profile-d1-update-result-test
+  (async done
+         (-> (p/with-redefs [common/<d1-run (fn [_db _sql & _args]
+                                            (p/resolved #js {:success true :meta #js {:changes 1}}))
+                             index/<user-profile (fn [_db user-id]
+                                                   (p/resolved {:user-id user-id :profile-revision 1}))]
+               (p/let [saved (index/<user-profile-save! :db "profile-user"
+                                                      {:display-name "User" :avatar-png-base64 nil
+                                                       :expected-revision 0})]
+                 (is (= {:user-id "profile-user" :profile-revision 1} saved))))
+             (p/then (fn [_]
+                       (p/with-redefs [common/<d1-run (fn [& _]
+                                                      (p/resolved #js {:success true :meta #js {:changes 0}}))]
+                         (p/let [conflict (index/<user-profile-save! :db "profile-user" {})]
+                           (is (nil? conflict))))))
+             (p/then (fn [_]
+                       (p/doseq [result [#js {} #js {:meta #js {}} #js {:changes 2}]]
+                         (p/with-redefs [common/<d1-run (fn [& _] (p/resolved result))]
+                           (-> (index/<user-profile-save! :db "profile-user" {})
+                               (p/then (fn [_] (is false "Invalid database result must fail")))
+                               (p/catch (fn [error]
+                                          (is (= "invalid user profile update result" (ex-message error))))))))))
+             (p/catch (fn [error] (is false (str error))))
+             (p/finally done))))

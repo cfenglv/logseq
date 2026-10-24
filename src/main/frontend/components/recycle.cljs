@@ -1,6 +1,6 @@
 (ns frontend.components.recycle
   "Recycle page UI"
-  (:require [frontend.components.avatar :as avatar]
+  (:require [frontend.components.user-profile :as user-profile]
             [frontend.components.block :as component-block]
             [frontend.context.i18n :as i18n :refer [t]]
             [frontend.db.hooks :as db-hooks]
@@ -25,12 +25,13 @@
 
 (defn- deleted-by-avatar
   [user]
-  (avatar/user-avatar
-   {:class "w-4 h-4"
-    :name (or (:logseq.property.user/name user)
+  (user-profile/user-avatar
+   {:user/uuid (some-> (:block/uuid user) str)
+    :user/name (or (:logseq.property.user/name user)
               (:block/title user)
               "U")
-    :avatar-src (:logseq.property.user/avatar user)}))
+    :avatar-src (:logseq.property.user/avatar user)}
+   {:class "w-4 h-4"}))
 
 (defn- deleted-root-header
   [root]

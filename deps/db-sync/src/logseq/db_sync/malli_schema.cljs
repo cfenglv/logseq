@@ -1,6 +1,93 @@
 (ns logseq.db-sync.malli-schema
-  (:require [malli.core :as ma]
+  (:require [clojure.string :as string]
+            [logseq.common.defkeywords :refer [defkeyword]]
+            [logseq.common.user-navigation :as navigation]
+            [malli.core :as ma]
             [malli.transform :as mt]))
+
+(defkeyword :display-name "Optional user-selected display name, separate from the login identity.")
+(defkeyword :avatar-png-base64 "Optional Base64-encoded 128 by 128 PNG user avatar.")
+(defkeyword :has-avatar? "Whether the current user profile contains an avatar, without its image data.")
+(defkeyword :profile-revision "Version of a user's saved display name and avatar.")
+(defkeyword :expected-revision "Profile version the user read before editing.")
+(defkeyword :user-profile/get "Read the authenticated user's profile.")
+(defkeyword :user-profile/save "Save the authenticated user's profile at an expected revision.")
+(defkeyword :graph-members/avatar "Read a current graph member's avatar and profile metadata.")
+
+(def avatar-base64-max-length 174764)
+
+(defkeyword :user-navigation/init "Provision and conditionally initialize the authenticated user's private navigation graph.")
+(defkeyword :favorites-seed "Ordered UUID strings from legacy shared favorites, including an initialized empty vector.")
+(defkeyword :recents-seed "Ordered legacy recent UUID strings for one physical device, without invented times.")
+(defkeyword :transfer-id "Persistent UUID string binding one conditional local-to-RTC navigation transfer.")
+
+(def navigation-uuid-schema [:re #"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"])
+(def navigation-seed-schema [:vector navigation-uuid-schema])
+(def navigation-stamp-schema [:or [:tuple [:= :seed] navigation-uuid-schema]
+                             [:tuple [:= :selection] navigation-uuid-schema]])
+(def navigation-visits-schema [:vector {:max navigation/recents-limit}
+                              [:tuple navigation-uuid-schema [:int {:min 0}]]])
+(def navigation-value-validators
+  (update-vals
+   {:favorite [:or [:map {:closed true} [:selected? [:= false]]]
+               [:map {:closed true} [:selected? [:= true]]
+                [:membership-id navigation-uuid-schema] [:added-at [:int {:min 0}]]]]
+    :order [:vector [:tuple navigation-uuid-schema navigation-stamp-schema]]
+    :visits navigation-visits-schema
+    :favorites-seed navigation-seed-schema
+    :recents-seed navigation-seed-schema
+    :transfer-once [:= true]}
+   ma/validator))
+
+(defn navigation-transfer-values-valid?
+  [values scope device-id]
+  (and (map? values)
+       (every? (fn [[key value]]
+                 (let [[family key-scope discriminator] (navigation/ident-parts key)
+                       validator (get navigation-value-validators family)]
+                   (and validator (= scope key-scope) (not= :transfer-once family)
+                        (= key (navigation/ident family key-scope discriminator))
+                        (case family
+                          :favorite (ma/validate navigation-uuid-schema discriminator)
+                          (:visits :recents-seed) (= device-id discriminator)
+                          (:order :favorites-seed) (nil? discriminator))
+                        (validator value)))) values)))
+
+(def user-navigation-init-request-schema
+  [:map {:closed true}
+   [:scopes [:vector [:map {:closed true}
+                     [:scope navigation-uuid-schema]
+                     [:device-id navigation-uuid-schema]
+                     [:favorites-seed navigation-seed-schema]
+                     [:recents-seed navigation-seed-schema]
+                     [:transfer-id {:optional true} navigation-uuid-schema]
+                     [:values {:optional true} :string]]]]])
+
+(def display-name-schema
+  [:maybe [:and :string
+           [:fn (fn [value]
+                  (<= 1 (.-length (js/Array.from (string/trim value))) 64))]]])
+
+(def profile-revision-schema [:int {:min 0}])
+
+(def user-profile-save-request-schema
+  [:map {:closed true}
+   [:display-name display-name-schema]
+   [:avatar-png-base64 [:maybe [:string {:max avatar-base64-max-length}]]]
+   [:expected-revision profile-revision-schema]])
+
+(def user-profile-metadata-schema
+  [:map
+   [:user-id :string]
+   [:display-name display-name-schema]
+   [:has-avatar? :boolean]
+   [:profile-revision profile-revision-schema]])
+
+(def user-profile-response-schema
+  (into user-profile-metadata-schema
+        [[:email {:optional true} [:maybe :string]]
+         [:username {:optional true} [:maybe :string]]
+         [:avatar-png-base64 [:maybe [:string {:max avatar-base64-max-length}]]]]))
 
 (def tx-entry-schema
   [:map
@@ -21,6 +108,9 @@
 (def client-revision-entry
   [:client-revision {:optional true} :string])
 
+(def profile-refresh-message-schema
+  [:map {:closed true} [:type [:= "profile/refresh"]]])
+
 (def ws-client-message-schema
   [:multi {:dispatch :type}
    ["hello"
@@ -31,6 +121,8 @@
     [:map
      [:type [:= "presence"]]
      [:editing-block-uuid {:optional true} [:maybe :string]]]]
+   ["profile/refresh"
+    profile-refresh-message-schema]
    ["pull"
     [:map
      [:type [:= "pull"]]
@@ -69,7 +161,11 @@
    [:user-id :string]
    [:email {:optional true} [:maybe :string]]
    [:username {:optional true} [:maybe :string]]
-   [:name {:optional true} [:maybe :string]]])
+   [:name {:optional true} [:maybe :string]]
+   [:editing-block-uuid {:optional true} :string]
+   [:display-name {:optional true} display-name-schema]
+   [:has-avatar? {:optional true} :boolean]
+   [:profile-revision {:optional true} profile-revision-schema]])
 
 (def online-users-schema
   [:map
@@ -98,6 +194,8 @@
      [:capabilities {:optional true} [:sequential :string]]
      [:checksum {:optional true} :string]]]
    ["online-users" online-users-schema]
+   ["profile/updated"
+    (into [:map {:closed true}] (concat (rest user-profile-metadata-schema) [[:type [:= "profile/updated"]]]))]
    ["presence"
     [:map
      [:type [:= "presence"]]
@@ -149,7 +247,10 @@
    [:invited-by {:optional true} [:maybe :string]]
    [:created-at :int]
    [:email {:optional true} [:maybe :string]]
-   [:username {:optional true} [:maybe :string]]])
+   [:username {:optional true} [:maybe :string]]
+   [:display-name {:optional true} display-name-schema]
+   [:has-avatar? {:optional true} :boolean]
+   [:profile-revision {:optional true} profile-revision-schema]])
 
 (def graph-members-list-response-schema
   [:map
@@ -220,7 +321,10 @@
 
 (def e2ee-graph-aes-key-response-schema
   [:map
-   [:encrypted-aes-key {:optional true} [:maybe :string]]])
+   [:encrypted-aes-key {:optional true} [:maybe :string]]
+   ;; base64 of the raw RSA-OAEP wrapped AES key, for agents that unwrap
+   ;; client-side with their RSA private key (no transit parsing needed)
+   [:encrypted-aes-key-base64 {:optional true} [:maybe :string]]])
 
 (def e2ee-grant-access-entry-schema
   [:map
@@ -263,7 +367,8 @@
    [:metadata-proof :string]])
 
 (def http-request-schemas
-  {:graphs/create graph-create-request-schema
+  {:user-profile/save user-profile-save-request-schema
+   :graphs/create graph-create-request-schema
    :graph-members/create graph-member-create-request-schema
    :graph-members/update graph-member-update-request-schema
    :sync/tx-batch tx-batch-request-schema
@@ -272,7 +377,10 @@
    :e2ee/grant-access e2ee-grant-access-request-schema})
 
 (def http-response-schemas
-  {:graphs/list graphs-list-response-schema
+  {:user-profile/get user-profile-response-schema
+   :user-profile/save user-profile-response-schema
+   :graph-members/avatar user-profile-response-schema
+   :graphs/list graphs-list-response-schema
    :graphs/create graph-create-response-schema
    :graphs/access graph-access-response-schema
    :graphs/delete graph-delete-response-schema
@@ -302,20 +410,24 @@
    {:name :db-sync/json}
    mt/json-transformer))
 
-(defn- ->coercer [schema]
-  (ma/coercer schema json-transformer nil
-              #(ma/-fail! ::db-sync-malli-coerce
-                          (select-keys % [:value]))))
+(defn- ->coercer
+  ([schema] (->coercer schema false))
+  ([schema private-profile?]
+   (ma/coercer schema json-transformer nil
+               #(ma/-fail! ::db-sync-malli-coerce
+                           (if private-profile? {} (select-keys % [:value]))))))
 
 (def ws-client-message-coercer (->coercer ws-client-message-schema))
+(def profile-refresh-message-coercer (->coercer profile-refresh-message-schema true))
 (def ws-server-message-coercer (->coercer ws-server-message-schema))
 
 (def http-request-coercers
   (into {}
-        (map (fn [[k schema]] [k (->coercer schema)]))
+        (map (fn [[k schema]] [k (->coercer schema (= k :user-profile/save))]))
         http-request-schemas))
 
 (def http-response-coercers
   (into {}
-        (map (fn [[k schema]] [k (->coercer schema)]))
+        (map (fn [[k schema]]
+               [k (->coercer schema (contains? #{:user-profile/get :user-profile/save :graph-members/avatar} k))]))
         http-response-schemas))

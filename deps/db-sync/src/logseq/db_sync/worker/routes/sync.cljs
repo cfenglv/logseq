@@ -3,6 +3,7 @@
 
 (def ^:private route-data
   [["/health" {:methods {"GET" :sync/health}}]
+   ["/user-navigation/init" {:methods {"POST" :sync/user-navigation-init}}]
    ["/pull" {:methods {"GET" :sync/pull}}]
    ["/checksum/diagnostics" {:methods {"GET" :sync/checksum-diagnostics}}]
    ["/snapshot/download" {:methods {"GET" :sync/snapshot-download}}]

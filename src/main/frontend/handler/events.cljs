@@ -26,6 +26,7 @@
             [frontend.handler.events.rtc-error :as rtc-error]
             [frontend.handler.export :as export]
             [frontend.handler.graph :as graph-handler]
+            [frontend.handler.literature :as literature-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.page :as page-handler]
             [frontend.handler.plugin :as plugin-handler]
@@ -35,6 +36,7 @@
             [frontend.handler.shell :as shell-handler]
             [frontend.handler.ui :as ui-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-profile :as user-profile]
             [frontend.mobile.util :as mobile-util]
             [frontend.modules.instrumentation.posthog :as posthog]
             [frontend.modules.outliner.pipeline :as pipeline]
@@ -124,6 +126,7 @@
 
 (defn- graph-switch
   [graph]
+  (literature-handler/stop-zotero-sync! :graph-switch)
   (state/set-current-repo! graph)
   (page-handler/init-commands!)
   ;; load config
@@ -144,8 +147,7 @@
    (state/set-state! :sync-graph/init? false)
    (when (:rtc-download? opts)
      (repo-handler/refresh-repos!)
-     (p/do!
-      (p/delay 5000)
+      (p/do!
       (p/let [repo (state/get-current-repo)
               _ (<build-search-index! repo)]
         (when state/lsp-enabled?
@@ -186,6 +188,7 @@
                  :mobile? (util/mobile?)
                  :validate-db-options (:dev/validate-db-options (state/get-config))
                  :importing? (:graph/importing (state/get-state))
+                 :web-platform? util/web-platform?
                  :date-formatter (state/get-date-formatter)
                  :export-bullet-indentation (state/get-export-bullet-indentation)
                  :preferred-format (state/get-preferred-format)}]
@@ -197,7 +200,9 @@
 (defevent! :graph/ready
   [[_ repo]]
   ;; FIXME: an ugly implementation for redirecting to page on new window is restored
-  (repo-handler/graph-ready! repo))
+  (let [result (repo-handler/graph-ready! repo)]
+    (literature-handler/reconcile-zotero-lifecycle! repo)
+    result))
 
 (defevent! :instrument [[_ {:keys [type payload] :as opts}]]
   (when-not (empty? (dissoc opts :type :payload))
@@ -280,7 +285,7 @@
 (defevent! :graph/restored [[_ graph]]
   (when graph (assets-handler/ensure-assets-dir! graph))
   (state/pub-event! [:graph/sync-context])
-  (when graph
+  (when (and graph (not (:graph/importing (state/get-state))))
     (schedule-search-index-build! graph))
   (export/auto-db-backup! graph)
   (rtc-flows/trigger-rtc-start graph)
@@ -380,6 +385,14 @@
     (p/resolved lang)
     (state/<invoke-db-worker :thread-api/get-key-value repo :logseq.kv/latest-code-lang)))
 
+(defn- refocus-upsert-type-block!
+  [source-block converted-block update-current-block?]
+  (when (or (not update-current-block?)
+            (and (nil? (state/get-state :editor/pending-new-block))
+                 (= (:block/uuid source-block)
+                    (:block/uuid (state/get-edit-block)))))
+    (editor-handler/edit-block! converted-block :max)))
+
 (defevent! :editor/upsert-type-block [[_ {:keys [block type lang update-current-block?]}]]
   (p/let [_ (when-not update-current-block?
               (editor-handler/save-current-block!))
@@ -415,7 +428,7 @@
                                 (p/let [_ (apply-requested-title! db-block)
                                         _ (turn-type! db-block)]
                                   (<get-upsert-type-block repo (:block/uuid db-block))))]
-        (js/setTimeout #(editor-handler/edit-block! converted-block :max) 100)))))
+        (js/setTimeout #(refocus-upsert-type-block! db-block converted-block update-current-block?) 100)))))
 
 (defn- editing-users-by-block
   [online-users current-user-uuid]
@@ -442,9 +455,10 @@
       (state/set-state! :rtc/editing-users-by-block new-user :nested-path block-id))))
 
 (defevent! :rtc/sync-state [[_ state]]
+  (user-profile/on-rtc-state! state)
   (when (contains? state :online-users)
     (sync-editing-users-by-block! (:online-users state)))
-  (doseq [[k value] state]
+  (doseq [[k value] (dissoc state :user-profile/context :user-profile/repo :user-profile/error)]
     (state/set-state! :rtc/state value :nested-path k)))
 
 (defevent! :rtc/presence-update [[_ {:keys [editing-block-uuid]}]]

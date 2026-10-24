@@ -52,84 +52,142 @@ input::-webkit-inner-spin-button {
 
   &-loader {
     position: relative;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+
+  &-viewer-cnt {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    position: relative;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
   }
 
   &-header {
-    display: flex;
-    justify-content: flex-end;
-    position: absolute;
-    top: 0;
-    right: 10px; /* Allows clicking on the scrollbar */
-    width: calc(100% - 10px);
-    padding: 8px 20px;
+    grid-area: 1 / 1;
+    position: relative;
+    width: 100%;
+    min-width: 0;
+    padding: 6px 8px;
+    background-color: var(--ls-primary-background-color);
+    border-bottom: 1px solid var(--ls-border-color);
     z-index: 5;
     -webkit-app-region: drag;
   }
 
   &-toolbar {
-    -webkit-app-region: no-drag;
+    width: 100%;
+    min-width: 0;
+
+    .button, .pager {
+      -webkit-app-region: no-drag;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 28px;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      margin: 0;
+      border: 0;
+      border-radius: 5px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      transition: none;
+
+      &:hover, &.is-active {
+        background-color: var(--ls-secondary-background-color);
+      }
+
+      &.is-active {
+        color: var(--ls-link-text-color);
+      }
+
+      &:focus-visible {
+        outline: 2px solid var(--ls-link-text-color);
+        outline-offset: -2px;
+      }
+
+      &:disabled {
+        opacity: .3;
+        cursor: default;
+      }
+    }
+
+    .pdf-titlebar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+      margin-bottom: 3px;
+    }
+
+    .pdf-title {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 500;
+    }
 
     > .inner {
       display: flex;
       align-items: center;
-      justify-content: flex-end;
+      gap: 6px;
+      min-width: 0;
 
       > .r {
-        a.button {
-          @apply select-none flex items-center mx-2 py-1 px-0.5 bg-transparent
-          transition-none break-normal hover:opacity-80;
-
-          &.is-active {
-            @apply opacity-100 rounded-none;
-
-            border-bottom: 2px solid #969494;
-          }
-
-          &:active {
-            @apply opacity-60;
-          }
-        }
+        display: flex;
+        flex: 1;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 1px;
+        min-width: 0;
       }
 
       .pager {
+        flex-shrink: 0;
         white-space: nowrap;
+        font-size: 12px;
 
         > .nu {
-          padding-right: 4px;
+          gap: 3px;
+          padding-right: 3px;
 
           input {
             user-select: inherit;
-            width: 35px;
+            width: 30px;
             text-align: right;
-            padding-right: 4px;
-            padding-left: 2px;
-            height: 18px;
+            padding: 2px;
+            height: 24px;
             border: none;
-            background: transparent;
-            font-size: 15px;
+            border-radius: 3px;
+            background: var(--ls-secondary-background-color);
+            font-size: 12px;
 
-            &.is-long {
-              font-size: 12px;
-            }
+            &.is-long { font-size: 10px; }
           }
         }
 
-        > .ct {
-          .button {
-            margin: 0;
-
-            &:last-child {
-              padding-right: 3px;
-            }
-          }
+        .ct .button {
+          width: 24px;
+          flex-basis: 24px;
         }
       }
     }
   }
 
   &-outline {
-    position: absolute;
-    right: 15px;
+    position: relative;
 
     > section {
       white-space: pre-wrap;
@@ -255,19 +313,31 @@ input::-webkit-inner-spin-button {
     }
 
     &-wrap.hls-popup-overlay {
-      right: -6px;
-      left: unset;
-      bottom: unset;
+      position: absolute;
+      top: 100%;
+      right: 8px;
+      left: 8px;
+      bottom: auto;
       height: auto;
       width: auto;
     }
   }
 
   &-settings {
-    &-inner.hls-popup-box {
+    &.hls-popup-overlay {
       position: absolute;
-      right: 375px;
+      top: 36px;
+      right: 8px;
+      left: auto;
+      bottom: auto;
       width: 235px;
+      max-width: calc(100% - 16px);
+      height: auto;
+    }
+
+    &-inner.hls-popup-box {
+      position: relative;
+      width: 100%;
       padding: 15px 10px;
     }
 
@@ -328,16 +398,18 @@ input::-webkit-inner-spin-button {
 
   &-finder {
     &-wrap.hls-popup-overlay {
-      right: -6px;
-      left: unset;
-      bottom: unset;
+      position: absolute;
+      top: 100%;
+      right: 8px;
+      left: 8px;
+      bottom: auto;
       height: auto;
       width: auto;
     }
 
     &.hls-popup-box {
-      min-width: 360px;
-      width: auto;
+      min-width: 0;
+      width: 100%;
 
       > .input-inner {
         @apply p-2 relative;
@@ -345,6 +417,8 @@ input::-webkit-inner-spin-button {
         .input-wrap {
           @apply mr-1.5 border border-gray-300;
           border-radius: 4px;
+          flex: 1;
+          min-width: 0;
 
           &:active, &:focus-within {
             border-color: transparent;
@@ -358,6 +432,8 @@ input::-webkit-inner-spin-button {
           border-radius: 4px;
           color: black;
           outline: none;
+          width: 100%;
+          min-width: 0;
           border: 2px solid transparent;
 
           &:focus {
@@ -398,6 +474,8 @@ input::-webkit-inner-spin-button {
   }
 
   &-viewer {
+    grid-area: 2 / 1;
+    inset: 0;
     position: absolute;
     overflow: auto;
     width: 100%;
@@ -419,6 +497,8 @@ input::-webkit-inner-spin-button {
   &-resizer {
     @apply absolute w-[3px] h-screen overflow-hidden;
     @apply z-10 right-0 cursor-col-resize;
+    top: 0;
+    height: 100%;
 
     transition: background-color 300ms;
     transition-delay: 300ms;
@@ -715,10 +795,6 @@ input::-webkit-inner-spin-button {
 
   background-color: transparent;
 
-  .extensions__pdf-toolbar .buttons {
-    background-color: var(--ls-primary-background-color);
-  }
-
   &[data-theme=light] {
     @apply bg-white;
   }
@@ -741,10 +817,6 @@ input::-webkit-inner-spin-button {
       filter: invert(100%);
     }
 
-    .extensions__pdf-toolbar {
-      background: linear-gradient(0deg, rgba(255, 255, 255, 0) 10%, rgb(15 31 37) 100%)
-    }
-
     .extensions__pdf-hls-area-region {
       mix-blend-mode: revert;
       opacity: .4;
@@ -758,23 +830,9 @@ input::-webkit-inner-spin-button {
       background-color: #f8eeda;
     }
 
-    .extensions__pdf-toolbar {
-      .buttons {
-        @apply bg-[#f6efdf];
-      }
-    }
   }
 }
 
-html[data-theme=dark] {
-  .extensions__pdf-container[data-theme=warm] {
-    .extensions__pdf-toolbar {
-      .buttons {
-        @apply bg-background;
-      }
-    }
-  }
-}
 
 .block-ref-wrap {
   &[data-hl-type=area] {
@@ -897,7 +955,7 @@ body[data-page] {
   }
 
   .extensions__pdf-viewer-cnt {
-    @apply flex overflow-x-hidden;
+    @apply overflow-x-hidden;
   }
 
   .extensions__pdf-highlights {
@@ -941,6 +999,13 @@ body.is-pdf-active {
   }
 }
 
+html.is-electron.is-mac:not(.is-fullscreen) body[data-page] {
+  .extensions__pdf-container {
+    top: calc(var(--ls-headbar-height) + var(--ls-headbar-inner-top-padding));
+    height: calc(100vh - var(--ls-headbar-height) - var(--ls-headbar-inner-top-padding));
+  }
+}
+
 html.is-system-window {
   .extensions__pdf-container {
     width: 100vw;
@@ -981,24 +1046,6 @@ html.is-system-window {
   &.selected {
     background-color: rgb(206 255 162);
     border: 2px dashed #ff3434;
-  }
-}
-
-.hl-flash {
-  animation-name: hl-flash;
-  animation-duration: 0.3s;
-  animation-timing-function: ease;
-  animation-iteration-count: 1;
-  animation-direction: alternate;
-  animation-play-state: running;
-}
-
-@keyframes hl-flash {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
   }
 }
 

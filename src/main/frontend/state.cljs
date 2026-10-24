@@ -16,6 +16,7 @@
             [frontend.util :as util]
             [frontend.util.cursor :as cursor]
             [frontend.util.entity :as entity]
+            [frontend.util.typography :as typography]
             [goog.dom :as gdom]
             [goog.object :as gobj]
             [logseq.common.config :as common-config]
@@ -32,6 +33,12 @@
 (defonce *db-worker-client-id (atom (storage/get :db-worker-client-id)))
 (defonce *editor-info (atom nil))
 (defonce app-ready-promise (p/deferred))
+
+(defn- load-editor-font! []
+  (let [stored (storage/get :ui/editor-font)
+        current (typography/normalize stored)]
+    (when (not= stored current) (storage/set :ui/editor-font current))
+    current))
 
 (def ^:private supported-locale-tags
   (into {}
@@ -75,6 +82,14 @@
               (instance? js/Error result))
         (p/rejected result)
         result))))
+
+(defn <invoke-db-worker-when-ready
+  "Skip the thread-api request when db-worker is not initialized.
+  Returns nil in that case. UI effects that need the result should
+  depend on `db-worker-ready?` so they re-run after the worker starts."
+  [qkw & args]
+  (when @db-worker-ready?
+    (apply <invoke-db-worker qkw args)))
 
 (def ^:private export-block-text-indent-styles #{"dashes" "spaces" "no-indent"})
 
@@ -120,6 +135,9 @@
                                               :progress 0
                                               :processed 0
                                               :total 0}
+      :literature/review-candidates          {}
+      :literature/import-state               {}
+      :literature/organization               {}
 
       ;; modals
       :modal/dropdowns                       {}
@@ -147,7 +165,7 @@
       :ui/custom-theme                       (or (storage/get :ui/custom-theme) {:light {:mode "light"} :dark {:mode "dark"}})
       :ui/wide-mode?                         (storage/get :ui/wide-mode)
       :ui/radix-color                        (storage/get :ui/radix-color)
-      :ui/editor-font                        (storage/get :ui/editor-font)
+      :ui/editor-font                        (load-editor-font!)
 
       ;; ui/collapsed-blocks is to separate the collapse/expand state from db for:
       ;; 1. right sidebar
@@ -157,6 +175,9 @@
       ;; graph => {container-id {:block-id bool}}
       :ui/collapsed-blocks                   {}
       :ui/sidebar-collapsed-blocks           {}
+      ;; block uuids whose lazy children must mount regardless of viewport
+      ;; distance (set while scrolling to an anchor target inside them)
+      :ui/anchor-mount                       {}
       :ui/file-component                     nil
       :ui/developer-mode?                    (or (= (storage/get "developer-mode") "true")
                                                  false)
@@ -315,6 +336,9 @@
       :auth/oauth-domain                     nil
       :auth/oauth-client-id                  nil
       :auth/current-login-user               nil
+      :user-profile/state                    {:context nil :repo nil :profiles {} :avatars {}}
+      :user-navigation/snapshot              nil
+      :user-navigation/source-identity       nil
 
       ;; graph-uuid -> ...
       :rtc/state                             {}
@@ -688,8 +712,7 @@ should be done through this fn in order to get global config and config defaults
   [blocks]
   (->> blocks
        (remove nil?)
-       (keep #(when-let [id (dom/attr % "blockid")]
-                (uuid id)))
+       (keep util/selection-node-block-id)
        (distinct)))
 
 (defn block-content-max-length
@@ -1048,6 +1071,15 @@ should be done through this fn in order to get global config and config defaults
 (defn clear-editor-action!
   []
   (set-state! :editor/action nil))
+
+(defn clear-editor-action-if-switching-block!
+  "Slash commands and other editor popups belong to the current edit block.
+   Entering edit on a different block closes them. Re-editing the same block
+   keeps the current action."
+  [new-block]
+  (when (not= (:block/uuid new-block)
+              (:block/uuid (get-edit-block)))
+    (clear-editor-action!)))
 
 (defn get-edit-pos
   []
@@ -1817,6 +1849,9 @@ should be done through this fn in order to get global config and config defaults
 (defn set-editing!
   [edit-input-id content block cursor-range & {:keys [move-cursor? container-id property-block direction event pos]
                                                :or {move-cursor? true}}]
+  ;; Click-to-edit uses pointerdown -> set-editing!, not editor-on-hide.
+  ;; Close slash/commands when the edit target changes; same-block re-edit keeps them.
+  (clear-editor-action-if-switching-block! block)
   (when-not (exists? js/process)
     (when (and edit-input-id block
                (or
@@ -1868,10 +1903,6 @@ should be done through this fn in order to get global config and config defaults
 (defn set-last-key-code!
   [key-code]
   (set-state! :editor/last-key-code key-code))
-
-(defn get-last-key-code
-  []
-  (get-state :editor/last-key-code))
 
 (defn set-ui-last-key-code!
   [key-code]
@@ -2057,9 +2088,8 @@ should be done through this fn in order to get global config and config defaults
   (swap-state! assoc :ui/radix-color color)
   (storage/set :ui/radix-color color))
 
-(defn set-editor-font! [config]
-  (let [config' (:ui/editor-font (rfx/snapshot))
-        config (if (map? config') (merge config' config) {})]
+(defn set-editor-font! [region field value]
+  (let [config (typography/set-value (:ui/editor-font (rfx/snapshot)) region field value)]
     (swap-state! assoc :ui/editor-font config)
     (storage/set :ui/editor-font config)))
 

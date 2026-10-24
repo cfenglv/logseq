@@ -1,6 +1,7 @@
 (ns electron.utils
   (:require ["electron" :refer [BrowserWindow session]]
             ["fs-extra" :as fs]
+            ["node:crypto" :as node-crypto]
             ["node-fetch" :default node-fetch]
             ["open" :as open-module]
             ["path" :as node-path]
@@ -279,6 +280,25 @@
   [path]
   (fs/readFileSync path))
 
+(defn <file-content-matches?
+  "Checks one local file without sending its contents to the renderer."
+  [path expected-size expected-checksum]
+  (-> (p/let [^js stat (fs/stat path)]
+        (if (not= expected-size (.-size stat))
+          false
+          (js/Promise.
+           (fn [resolve reject]
+             (let [hasher (.createHash node-crypto "sha256")
+                   stream (.createReadStream fs path)]
+               (.on stream "data" (fn [chunk] (.update hasher chunk)))
+               (.once stream "error" reject)
+               (.once stream "end"
+                      (fn [] (resolve (= expected-checksum (.digest hasher "hex"))))))))))
+      (p/catch (fn [^js error]
+                 (if (= "ENOENT" (.-code error))
+                   false
+                   (throw error))))))
+
 (defn read-file
   [path]
   (try
@@ -317,13 +337,14 @@
      (send-to-renderer win kind payload))))
 
 (defn get-graph-dir
-  "required by all internal state in the electron section"
+  "Resolve a trimmed DB graph name to its directory for Electron state."
   [graph-name]
-  (when (and (string? graph-name)
-             (string/starts-with? graph-name common-config/db-version-prefix))
-    (let [repo (common-config/canonicalize-db-version-repo graph-name)]
-      (node-path/join (common-graph/get-db-graphs-dir)
-                      (graph-dir/repo->encoded-graph-dir-name repo)))))
+  (when (string? graph-name)
+    (let [trimmed (string/trim graph-name)]
+      (when (string/starts-with? trimmed common-config/db-version-prefix)
+        (when-let [repo (common-config/canonicalize-db-version-repo trimmed)]
+          (node-path/join (common-graph/get-db-graphs-dir)
+                          (graph-dir/repo->encoded-graph-dir-name repo)))))))
 
 (comment
   (defn get-graph-name

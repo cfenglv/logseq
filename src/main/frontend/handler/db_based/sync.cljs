@@ -12,7 +12,53 @@
             [frontend.util :as util]
             [lambdaisland.glogi :as log]
             [logseq.db-sync.malli-schema :as db-sync-schema]
+            [logseq.shui.ui :as shui]
             [promesa.core :as p]))
+
+(defn ^:export request-repair!
+  []
+  (if-let [repo (when (util/electron?) (state/get-current-repo))]
+    (-> (shui/dialog-confirm!
+         (t :sync/repair-confirm-desc)
+         {:id :sync-repair
+          :title (t :sync/repair-confirm-title)
+          :cancel-label (t :ui/cancel)
+          :ok-label (t :ui/confirm)})
+        (p/then
+         (fn [_]
+           (if-not (= repo (state/get-current-repo))
+             (notification/show! (t :sync/repair-context-changed-warning) :warning)
+             (p/let [{local-operation :operation} (state/<invoke-db-worker :thread-api/db-sync-repair-status repo)]
+               (if-not (= repo (state/get-current-repo))
+                 (notification/show! (t :sync/repair-context-changed-warning) :warning)
+                 (if (= :local-only (:disposition local-operation))
+                   (do
+                     (notification/show! (t :sync/repair-start-feedback) :info)
+                     (state/<invoke-db-worker :thread-api/db-sync-retry-repair repo (:operation-id local-operation)))
+                   (p/let [{:keys [claimed? operation reason]}
+                           (state/<invoke-db-worker :thread-api/db-sync-request-repair repo)]
+                     (when (= repo (state/get-current-repo))
+                       (cond
+                         claimed?
+                         (notification/show! (t :sync/repair-start-feedback) :info)
+
+                         (= :local-only (:disposition operation))
+                         (notification/show! (t :sync/repair-local-only-warning) :warning false)
+
+                         operation
+                         (notification/show! (t :sync/repair-busy-feedback) :info)
+
+                         (= :context-changed reason)
+                         (notification/show! (t :sync/repair-context-changed-warning) :warning)
+
+                         :else
+                         (notification/show! (t :sync/repair-unavailable-warning) :warning))))))))))
+        (p/catch (fn [error]
+                   ;; The existing confirmation dialog rejects with false/nil on cancel.
+                   (when error
+                     (log/error :db-sync/repair-request-failed error)
+                     (notification/show! (t :sync/repair-request-error) :error)))))
+    (notification/show! (t :sync/repair-unavailable-warning) :warning)))
 
 (defn- ws->http-base [ws-url]
   (when (string? ws-url)
@@ -223,25 +269,10 @@
       (log/info :db-sync/stop-skipped {:reason :db-worker-not-ready})
       (p/resolved nil))))
 
-(defn- sync-app-state-payload
-  []
-  (let [payload (select-keys (state/get-state) [:git/current-repo :config
-                                                 :auth/id-token :auth/access-token :auth/refresh-token
-                                                 :auth/oauth-token-url :auth/oauth-domain :auth/oauth-client-id
-                                                 :user/info])]
-    (cond-> (if (nil? (:git/current-repo payload))
-              (dissoc payload :git/current-repo)
-              payload)
-      (seq config/OAUTH-DOMAIN)
-      (assoc :auth/oauth-domain config/OAUTH-DOMAIN)
-
-      (seq config/COGNITO-CLIENT-ID)
-      (assoc :auth/oauth-client-id config/COGNITO-CLIENT-ID))))
-
 (defn- <sync-auth-state-to-db-worker!
   []
   (p/let [_ (user-handler/<ensure-id&access-token!)
-          payload (sync-app-state-payload)]
+          payload (user-handler/sync-app-state-payload)]
     (state/<invoke-db-worker :thread-api/sync-app-state payload)))
 
 (defn <rtc-start!
@@ -274,6 +305,7 @@
      (p/let [graph-uuid (<get-rtc-graph-uuid repo)]
        (when graph-uuid
          (let [base (http-base)
+               account-id (user-handler/user-uuid)
                users-info (state/get-state :rtc/users-info)
                cached-users (get users-info repo)]
            (cond
@@ -286,15 +318,19 @@
                                       {:method "GET"}
                                       {:response-schema :graph-members/list})
                      members (:members resp)
-                     users (mapv (fn [{:keys [user-id role email username]}]
+                     users (mapv (fn [{:keys [user-id role email username] :as member}]
                                    (let [name (or username email user-id)
                                          user-type (some-> role keyword)]
-                                     (cond-> {:user/uuid user-id
+                                     (cond-> (merge {:user/uuid user-id
                                               :user/name name
                                               :graph<->user/user-type user-type}
+                                                    (select-keys member [:display-name :has-avatar? :profile-revision]))
                                        (string? email) (assoc :user/email email))))
                                  members)]
-               (state/set-state! :rtc/users-info users :nested-path repo)
+               (when (and (= repo (state/get-current-repo))
+                          (= base (http-base))
+                          (= account-id (user-handler/user-uuid)))
+                 (state/set-state! :rtc/users-info users :nested-path repo))
                users)
 
              :else
@@ -343,9 +379,13 @@
                        _ (<ensure-download-runtime-bound! graph)
                        _ (state/<invoke-db-worker :thread-api/db-sync-download-graph-by-id
                                                  graph graph-uuid graph-e2ee?)
-                       _ (when (util/electron?)
-                           (state/<invoke-db-worker :thread-api/db-sync-download-missing-assets
-                                                   graph graph-uuid))]
+                       assets-result (when (util/electron?)
+                                       (state/<invoke-db-worker :thread-api/db-sync-download-missing-assets
+                                                               graph graph-uuid))
+                       _ (when (pos? (:failed assets-result))
+                           (notification/show!
+                            (t :sync/assets-download-partial (:downloaded assets-result) (:failed assets-result))
+                            :warning false))]
                  true)
                (p/rejected (ex-info "db-sync missing graph info"
                                     {:type :db-sync/invalid-graph
@@ -393,6 +433,31 @@
           (p/finally
             (fn []
               (state/set-state! :rtc/loading-graphs? false)))))))
+
+(def ^:private personal-access-tokens-path "/api/v1/personal-access-tokens")
+
+(defn <personal-access-tokens
+  []
+  (p/let [_ (user-handler/<ensure-id&access-token!)]
+    (fetch-json (str (http-base) personal-access-tokens-path)
+                {:method "GET"}
+                {})))
+
+(defn <create-personal-access-token!
+  [request]
+  (p/let [_ (user-handler/<ensure-id&access-token!)]
+    (fetch-json (str (http-base) personal-access-tokens-path)
+                {:method "POST"
+                 :headers {"content-type" "application/json"}
+                 :body (js/JSON.stringify (clj->js request))}
+                {})))
+
+(defn <revoke-personal-access-token!
+  [token-id]
+  (p/let [_ (user-handler/<ensure-id&access-token!)]
+    (fetch-json (str (http-base) personal-access-tokens-path "/" token-id)
+                {:method "DELETE"}
+                {})))
 
 (defn <rtc-invite-email
   [graph-uuid email]

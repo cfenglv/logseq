@@ -1,12 +1,20 @@
 (ns ^:no-doc frontend.handler.assets
-  (:require [clojure.string :as string]
+  (:require ["path" :as node-path]
+            [clojure.string :as string]
+            [electron.ipc :as ipc]
             [frontend.config :as config]
+            [frontend.context.i18n :refer [t]]
+            [frontend.date :as date]
+            [frontend.db.async :as db-async]
             [frontend.fs :as fs]
+            [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [frontend.util :as util]
+            [lambdaisland.glogi :as log]
             [logseq.common.config :as common-config]
             [logseq.common.path :as path]
             [logseq.common.util :as common-util]
+            [logseq.db :as ldb]
             [logseq.db.frontend.asset :as db-asset]
             [medley.core :as medley]
             [promesa.core :as p]))
@@ -124,6 +132,37 @@
       (some-> (resolve-asset-real-path-url (state/get-current-repo) path)
               (common-util/safe-decode-uri-component)))))
 
+(defn- encode-iframe-path-segment
+  [segment]
+  (let [escaped (string/replace segment #"%(?![0-9a-fA-F]{2})" "%25")
+        decoded (try
+                  (js/decodeURIComponent escaped)
+                  ;; Invalid escapes represent literal filename characters.
+                  (catch :default _ segment))]
+    (js/encodeURIComponent decoded)))
+
+(defn local-file-iframe-src->assets-url
+  "Return an assets URL for a file or graph-relative asset `src`, or nil.
+
+  Preserve URL parameters and fragments, and encode filesystem path segments
+  once for the Electron assets protocol."
+  [src]
+  (when (string? src)
+    (when-let [url (try
+                     (cond
+                       (re-find #"(?i)^file:" src)
+                       (js/URL. src)
+
+                       (re-find #"^(?:\./|\.\./)*assets/" src)
+                       (when-let [repo-dir (some-> (state/get-current-repo) config/get-repo-dir)]
+                         (js/URL. (string/replace-first src #"^[./]+" "")
+                                  (str (path/prepend-protocol "file:" repo-dir) "/"))))
+                     (catch :default _ nil))]
+      (let [pathname (string/replace-first (.-pathname url)
+                                           #"^/([A-Za-z]):/" "/$1/logseq__colon/")
+            encoded-path (string/replace pathname #"[^/]+" encode-iframe-path-segment)]
+        (str "assets://" (.-host url) encoded-path (.-search url) (.-hash url))))))
+
 (defn <make-data-url
   [path]
   (let [repo-dir (config/get-repo-dir (state/get-current-repo))]
@@ -145,6 +184,35 @@
               css
               (map vector rel-paths blob-urls)))))
 
+(defn- local-file-path->absolute-path
+  "Resolve a filesystem path to an absolute native path.
+
+  `~` expands to the user home, `file://`/`assets://` URLs unwrap to their
+  native path, absolute paths pass through, and `./`/`../`/bare relative
+  paths resolve against the graph dir."
+  [file-path repo-dir]
+  (cond
+    (string/starts-with? file-path "~")
+    (path/path-join (get-in (state/get-state) [:system/info :home-dir])
+                    (string/replace-first file-path #"^~[/\\]*" ""))
+
+    (path/absolute? file-path)
+    (path/file-url-or-path->path file-path)
+
+    :else
+    (path/path-join repo-dir file-path)))
+
+(defn file-path->assets-url
+  "Resolve a local filesystem path to an Electron assets:// URL.
+
+  `~/`, `file://`, absolute paths are used as-is; `./`/`../`/bare relative
+  paths resolve against the current graph dir."
+  [file-path]
+  (path/prepend-protocol "assets:"
+                         (protect-windows-drive-in-assets-path
+                          (local-file-path->absolute-path file-path
+                                                          (config/get-repo-dir (state/get-current-repo))))))
+
 (defn <make-asset-url
   "Make accessible asset url from path.
    If path is absolute url, return it directly.
@@ -159,26 +227,27 @@
      (let [repo (state/get-current-repo)
            repo-dir (config/get-repo-dir repo)
            local-asset? (common-config/local-relative-asset? path)
-           ;; Hack for path calculation
-           path (string/replace path #"^(\.\.)?/" "./")
+           ;; Hack for "../assets" path calculation
+           rpath (string/replace path #"^(\.\.)?/" "./")
            js-url? (not (nil? js-url))]
        (cond
          js-url?
          path                                               ;; just return the original
 
          (and (alias-enabled?)
-              (check-alias-path? path))
-         (resolve-asset-real-path-url (state/get-current-repo) path)
+              (check-alias-path? rpath))
+         (resolve-asset-real-path-url (state/get-current-repo) rpath)
 
           (util/electron?)
           (let [full-path (if local-asset?
-                            (path/path-join repo-dir path) path)]
+                            (path/path-join repo-dir rpath)
+                            (local-file-path->absolute-path path repo-dir))]
             ;; fullpath will be encoded
             (path/prepend-protocol "assets:" (protect-windows-drive-in-assets-path full-path)))
 
          :else
-         (p/let [binary (fs/read-file-raw repo-dir path {})
-                 svg? (string/ends-with? path ".svg")
+         (p/let [binary (fs/read-file-raw repo-dir rpath {})
+                 svg? (string/ends-with? rpath ".svg")
                  type (if svg? "image/svg+xml" "image")
                  blob (js/Blob. (array binary) (clj->js {:type type}))]
            (when blob (js/URL.createObjectURL blob))))))))
@@ -187,6 +256,97 @@
   [^js file]
   (-> (if (string? file) file (.arrayBuffer file))
       (p/then db-asset/<get-file-array-buffer-checksum)))
+
+(defn db-based-write-asset!
+  ([repo file-path file]
+   (p/let [content (.arrayBuffer file)]
+     (db-based-write-asset! repo file-path file content)))
+  ([repo file-path _file content]
+   (fs/write-asset-file! repo file-path content)))
+
+(defn prepare-asset-block
+  [repo ^js file {:keys [external-url] :as opts}]
+  ;; WARN file name maybe fully qualified path when paste file
+  (p/let [[file title] (if (map? file) [(:src file) (:title file)] [file nil])
+          [file external-url] (if (string? file) [nil file] [file external-url])
+          file-name (node-path/basename (or (some-> file (.-name)) (str external-url)))
+          file-name-without-ext* (db-asset/asset-name->title file-name)
+          file-name-without-ext (if (= file-name-without-ext* "image")
+                                  (date/get-date-time-string-2)
+                                  file-name-without-ext*)
+          checksum (or (:checksum opts)
+                       (some-> (or file external-url) (get-file-checksum)))
+          size (or (some-> file (.-size)) 0)
+          existing-asset (some->> checksum (db-async/<get-asset-with-checksum repo))
+          block-id (or (:block/uuid opts) (ldb/new-block-id))
+          ext (when file-name (db-asset/asset-path->type file-name))]
+    {:file file
+     :file-name file-name
+     :ext ext
+     :checksum checksum
+     :existing-asset existing-asset
+     :asset-block
+     {:block/title (or title file-name-without-ext)
+      :block/uuid block-id
+      :logseq.property.asset/type ext
+      :logseq.property.asset/external-url external-url
+      :logseq.property.asset/size size
+      :logseq.property.asset/checksum checksum
+      ;; Use stable class ident in tx payload to avoid leaking numeric eids
+      ;; into outliner history ops shared with the worker sync pipeline.
+      :block/tags #{:logseq.class/Asset}}}))
+
+(declare ->uint8)
+
+(defn <asset-file-content-matches?
+  [repo-dir file-rpath size checksum]
+  (if (util/electron?)
+    (ipc/ipc "fileContentMatches" (path/path-join repo-dir file-rpath) size checksum)
+    (p/let [exists? (fs/file-exists? repo-dir file-rpath)
+            local-checksum (when exists?
+                             (p/let [local-bytes (fs/read-file-raw repo-dir file-rpath {})]
+                               (db-asset/<get-file-array-buffer-checksum (->uint8 local-bytes))))]
+      (= checksum local-checksum))))
+
+(defn <ensure-asset-file-content!
+  "Checks one local asset and restores its registered bytes when available."
+  [repo asset-block]
+  (if (and (:block/uuid asset-block)
+           (:logseq.property.asset/checksum asset-block)
+           (string/blank? (:logseq.property.asset/external-url asset-block)))
+    (let [repo-dir (config/get-repo-dir repo)
+          file-rpath (path/path-join common-config/local-assets-dir
+                                    (str (:block/uuid asset-block) "."
+                                         (:logseq.property.asset/type asset-block)))
+          matches? #(<asset-file-content-matches?
+                     repo-dir file-rpath (:logseq.property.asset/size asset-block)
+                     (:logseq.property.asset/checksum asset-block))]
+      (p/let [local-matches? (matches?)]
+        (when-not local-matches?
+          (p/let [restored? (when (:logseq.property.asset/remote-metadata asset-block)
+                             (-> (p/let [_ (state/<invoke-db-worker
+                                            :thread-api/db-sync-request-asset-download
+                                            repo (:block/uuid asset-block) true)]
+                                   (matches?))
+                                 (p/catch (fn [error]
+                                            (log/error :db-sync/request-asset-download-failed error)
+                                            false))))]
+            (when-not restored?
+              (throw (doto (js/Error. file-rpath)
+                       (aset "name" "AssetContentMismatchError"))))))))
+    (p/resolved nil)))
+
+(defn <restore-reused-asset-file!
+  "Restores a missing or damaged file while leaving matching bytes untouched."
+  ([repo repo-dir asset-dir-rpath write]
+   (<restore-reused-asset-file! repo repo-dir asset-dir-rpath write nil))
+  ([repo repo-dir asset-dir-rpath {:keys [file file-path checksum]} content]
+   (p/let [matches? (<asset-file-content-matches?
+                    repo-dir (path/path-join asset-dir-rpath file-path) (.-size file) checksum)]
+     (when-not matches?
+       (if content
+         (db-based-write-asset! repo file-path file content)
+         (db-based-write-asset! repo file-path file))))))
 
 (defn- field-value
   [payload field-name]
@@ -317,8 +477,18 @@
   [repo asset-block file-ready?]
   (let [progress (get (or (state/get-state :rtc/asset-upload-download-progress) {}) repo)]
     (when (should-request-remote-asset-download? repo asset-block file-ready? progress)
-      (state/<invoke-db-worker
-       :thread-api/db-sync-request-asset-download
-       repo
-       (:block/uuid asset-block))
+      (-> (state/<invoke-db-worker
+           :thread-api/db-sync-request-asset-download
+           repo
+           (:block/uuid asset-block))
+          (p/catch
+           (fn [error]
+             (log/error :db-sync/request-asset-download-failed error)
+             (when (= repo (state/get-current-repo))
+               (notification/show!
+                (t :asset/missing-file
+                   (path/path-join common-config/local-assets-dir
+                                   (str (:block/uuid asset-block) "."
+                                        (:logseq.property.asset/type asset-block))))
+                :error)))))
       true)))

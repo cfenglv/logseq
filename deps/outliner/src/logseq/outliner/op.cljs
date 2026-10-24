@@ -2,22 +2,156 @@
   "Transact outliner ops"
   (:require [clojure.string :as string]
             [datascript.core :as d]
-            [logseq.common.defkeywords :refer [defkeywords]]
+            [logseq.common.defkeywords :refer [defkeyword defkeywords]]
             [logseq.common.util :as common-util]
             [logseq.common.util.date-time :as date-time-util]
             [logseq.db :as ldb]
+            [logseq.db.frontend.literature :as literature]
+            [logseq.db.frontend.literature-source :as literature-source]
             [logseq.db.sqlite.export :as sqlite-export]
             [logseq.outliner.core :as outliner-core]
             [logseq.outliner.template :as outliner-template]
             [logseq.outliner.page :as outliner-page]
             [logseq.outliner.property :as outliner-property]
             [logseq.outliner.recycle :as outliner-recycle]
-            [logseq.outliner.transaction :as outliner-tx]
             [malli.core :as m]
             [logseq.outliner.op.construct :as op-construct]))
 
 (defkeywords
   ::missing-parent-original {:doc "The linked-reference parent supplied to an outdent no longer exists."})
+
+(defkeyword :literature-register-source-record
+  "Replan one literature source registration against the graph on replay.")
+
+(defkeyword :literature-register-identified-pdf
+  "Replan one DOI/arXiv PDF registration against the graph on replay.")
+
+(defkeyword :literature-register-verified-pdf
+  "Replan one metadata-verified PDF registration against the graph on replay.")
+
+(defkeyword :literature-auto-link-pdf
+  "Recheck an automatic source attachment association against the current graph.")
+
+(defkeyword :literature-merge-duplicate-pdf
+  "Replan an exact PDF merge against the current graph during native replay.")
+
+(defn merge-duplicate-pdf!
+  [conn keep-uuid duplicate-uuid & [comparison]]
+  (let [plan (literature/build-duplicate-pdf-demotion-plan
+              @conn keep-uuid duplicate-uuid {:comparison comparison})]
+    (if (= :ready (:status plan))
+      (do
+        (ldb/transact! conn (:tx-data plan) {:outliner-op :literature-merge-duplicate-pdf})
+        (-> plan (dissoc :tx-data) (assoc :status :resolved)))
+      (dissoc plan :tx-data))))
+
+(defkeyword :source-context
+  "The exact source identity and prepared native Asset used for an attachment commit.")
+
+(defkeyword :reference-uuid
+  "The stable UUID reserved for an attachment's native linked reference.")
+
+(defn auto-link-literature-pdf!
+  [conn asset-uuid paper-uuid {:keys [binding-uuid source-key asset-block reference-uuid]}]
+  (let [owner (literature-source/find-source-record-owner @conn binding-uuid source-key)]
+    (if-not (and (= :found (:status owner)) (= paper-uuid (:paper-uuid owner)))
+      {:status :blocked :reason :source-link-unavailable}
+      (let [paper (d/entity @conn [:block/uuid paper-uuid])
+            new-asset? (and asset-block (nil? (d/entity @conn [:block/uuid asset-uuid])))
+            _ (when asset-block (assert (= asset-uuid (:block/uuid asset-block))))
+            ;; Plan before any native write so a blocked association cannot leave
+            ;; an inserted Asset behind. The final writes share the original batch.
+            plan-db (if new-asset?
+                      (d/db-with @conn [(assoc asset-block :block/tags #{[:db/ident :logseq.class/Asset]})])
+                      @conn)
+            plan (literature/build-auto-associate-pdf-plan
+                  plan-db asset-uuid paper-uuid (:block/title asset-block))]
+        (if (contains? #{:ready :already-linked} (:status plan))
+          (do
+            (when new-asset?
+              (outliner-core/insert-blocks! conn [asset-block] paper
+                                            {:keep-uuid? true :bottom? true :sibling? false}))
+            (when (= :ready (:status plan))
+              (ldb/transact! conn (:tx-data plan) {:outliner-op :literature-auto-link-pdf}))
+            (let [asset (d/entity @conn [:block/uuid asset-uuid])
+                  outside? (not= paper-uuid (:block/uuid (:block/parent asset)))
+                  position (when outside?
+                             (d/q '[:find ?u . :in $ ?asset-uuid ?paper-uuid
+                                  :where
+                                  [?a :block/uuid ?asset-uuid]
+                                  [?p :block/link ?a]
+                                  [?t :block/uuid ?paper-uuid]
+                                  [?p :block/parent ?t]
+                                  [?p :block/uuid ?u]
+                                  (not [?p :logseq.property/deleted-at])]
+                                  @conn asset-uuid paper-uuid))]
+              (when (and outside? (nil? position))
+                (outliner-core/insert-blocks!
+                 conn [{:block/uuid reference-uuid :block/title "" :block/link [:block/uuid asset-uuid]}]
+                 paper {:keep-uuid? true :bottom? true :sibling? false})))
+            (cond-> (dissoc plan :tx-data)
+              (= :ready (:status plan)) (assoc :status :linked)))
+          (dissoc plan :tx-data))))))
+
+(defn register-literature-verified-pdf!
+  [conn asset-uuid evidence metadata]
+  (let [plan (if (empty? metadata)
+               (literature/build-auto-link-pdf-plan @conn asset-uuid evidence)
+               (literature/build-auto-register-pdf-plan
+                @conn asset-uuid evidence metadata))]
+    (if (= :ready (:status plan))
+      (do
+        (ldb/transact! conn (:tx-data plan)
+                       {:outliner-op :literature-register-verified-pdf})
+        (-> plan
+            (dissoc :tx-data)
+            (assoc :status (case (:action plan)
+                             :create :created
+                             :link :linked))))
+      (dissoc plan :tx-data))))
+
+(defn register-literature-identified-pdf!
+  [conn asset-uuid title identifiers & [metadata]]
+  (let [paper-uuid (literature/source-record-paper-uuid identifiers)
+        plan (literature/build-register-pdf-plan
+              @conn asset-uuid title identifiers paper-uuid metadata)]
+    (if (= :ready (:status plan))
+      (do
+        (ldb/transact! conn (:tx-data plan)
+                       {:outliner-op :literature-register-identified-pdf})
+        (-> plan
+            (dissoc :tx-data)
+            (assoc :status (case (:action plan)
+                             :create :created
+                             :link :linked))))
+      (dissoc plan :tx-data))))
+
+(defn register-literature-source-record!
+  [conn binding-uuid destination-page-uuid source-record & [rebase-db-before]]
+  (let [plan (literature/build-register-source-record-plan
+              @conn binding-uuid destination-page-uuid source-record)]
+    (if (= :ready (:status plan))
+      (do
+        (ldb/transact! conn
+                       (if rebase-db-before
+                         ;; The pending datoms already own these value orders.
+                         ;; Regenerating them makes repair disagree with its ACK.
+                         (mapv (fn [item]
+                                 (if-let [order (when (:logseq.property/created-from-property item)
+                                                  (:block/order
+                                                   (d/entity rebase-db-before
+                                                             [:block/uuid (:block/uuid item)])))]
+                                   (assoc item :block/order order)
+                                   item))
+                               (:tx-data plan))
+                         (:tx-data plan))
+                       {:outliner-op :literature-register-source-record})
+        (-> plan
+            (dissoc :tx-data)
+            (assoc :status (case (:action plan)
+                             :create :created
+                             :link :linked))))
+      (dissoc plan :tx-data))))
 
 (def ^:private ^:large-vars/data-var op-schema
   [:multi {:dispatch first}
@@ -124,6 +258,33 @@
      [:op :keyword]
      [:args [:tuple ::tx-data ::tx-meta]]]]
 
+   [:literature-register-source-record
+    [:catn
+     [:op :keyword]
+     [:args [:tuple ::block-id ::block-id map?]]]]
+
+   [:literature-register-identified-pdf
+    [:catn
+     [:op :keyword]
+     [:args [:or [:tuple ::block-id ::title map?]
+                 [:tuple ::block-id ::title map? map?]]]]]
+
+   [:literature-register-verified-pdf
+    [:catn
+     [:op :keyword]
+     [:args [:tuple ::block-id map? map?]]]]
+
+   [:literature-auto-link-pdf
+    [:catn
+     [:op :keyword]
+     [:args [:tuple ::block-id ::block-id
+             [:map [:binding-uuid uuid?] [:source-key :string]
+              [:reference-uuid uuid?] [:asset-block {:optional true} map?]]]]]]
+
+   [:literature-merge-duplicate-pdf
+    [:catn [:op :keyword] [:args [:or [:tuple ::block-id ::block-id]
+                                    [:tuple ::block-id ::block-id map?]]]]]
+
    ;; page ops
    [:create-page
     [:catn
@@ -212,14 +373,18 @@
           true)))))
 
 (defn- import-edn-data
-  [conn *result export-map {:keys [tx-meta] :as import-options}]
+  [conn *result export-map {:keys [tx-meta validate-scope] :as import-options}]
   (let [{:keys [error] :as txs}
-        (try (sqlite-export/build-import export-map @conn (dissoc import-options :tx-meta))
+        (try (sqlite-export/build-import export-map @conn (dissoc import-options :tx-meta :validate-scope))
              (catch :default e
                (js/console.error "Import EDN error: " e)
                {:error "An unexpected error occurred building the import. See the javascript console for details."}))
         validation (when-not error
-                     (sqlite-export/validate-import-txs txs @conn))]
+                     (sqlite-export/validate-import-txs
+                      txs
+                      @conn
+                      (cond-> {:edn-label "Imported EDN"}
+                        validate-scope (assoc :validate-scope validate-scope))))]
     ;; (cljs.pprint/pprint txs)
     (if (or error (:error validation))
       (reset! *result {:error (or error (:error validation))})
@@ -300,6 +465,21 @@
 (defn- ^:large-vars/cleanup-todo apply-op!
   [conn opts' *result [op args]]
   (case op
+    :literature-merge-duplicate-pdf
+    (reset! *result (apply merge-duplicate-pdf! conn args))
+
+    :literature-register-source-record
+    (reset! *result (apply register-literature-source-record! conn args))
+
+    :literature-register-identified-pdf
+    (reset! *result (apply register-literature-identified-pdf! conn args))
+
+    :literature-register-verified-pdf
+    (reset! *result (apply register-literature-verified-pdf! conn args))
+
+    :literature-auto-link-pdf
+    (reset! *result (apply auto-link-literature-pdf! conn args))
+
     ;; blocks
     :save-block
     (apply outliner-core/save-block! conn args)
@@ -426,25 +606,44 @@
 (defn apply-ops!
   [conn ops opts]
   (assert (ops-validator ops) ops)
-  (let [semantic-ops (filter (fn [op] (get op-construct/semantic-outliner-ops (first op))) ops)
+  (let [semantic-ops (atom [])
         single-op-outliner-op (when (= 1 (count ops))
                                 (first (first ops)))
         opts' (cond-> (assoc opts
                              :transact-opts {:conn conn}
                              :local-tx? true
-                             :outliner-ops semantic-ops
                              :db-sync/tx-id (or (:db-sync/tx-id opts) (random-uuid)))
                 (and single-op-outliner-op
                      (nil? (:outliner-op opts)))
                 (assoc :outliner-op single-op-outliner-op)
 
+                (= :rename-page single-op-outliner-op)
+                (assoc :data (let [[page-uuid new-title] (second (first ops))
+                                   page (d/entity @conn [:block/uuid page-uuid])]
+                               {:page-id (:db/id page)
+                                :old-name (:block/title page)
+                                :new-name new-title}))
+
                 (some import-edn-op? ops)
                 (assoc ::sqlite-export/imported-data? true))
         *result (atom nil)]
 
-    (outliner-tx/transact!
-     opts'
-     (doseq [op-entry ops]
-       (apply-op! conn opts' *result op-entry)))
+    (ldb/batch-transact-with-temp-conn!
+     conn (dissoc opts' :additional-tx :transact-opts :current-block)
+     (fn [temp-conn _tx-data]
+       (doseq [[op args :as op-entry] ops]
+         (let [result (apply-op! temp-conn opts' *result op-entry)
+               [_ [blocks target-id insert-opts]] (first (get-in result [:tx-meta :outliner-ops]))
+               op-entry (case op
+                          :save-block (first (get-in result [:tx-meta :outliner-ops]))
+                          :insert-blocks (when result [:insert-blocks [blocks target-id insert-opts]])
+                          :apply-template (when result [:apply-template [(first args) target-id
+                                                                         (assoc insert-opts :template-blocks blocks)]])
+                          op-entry)]
+           (when (and op-entry (contains? op-construct/semantic-outliner-ops op))
+             (swap! semantic-ops conj op-entry))))
+       (when (seq (:additional-tx opts'))
+         (ldb/transact! temp-conn (:additional-tx opts') {})))
+     :transform-tx-meta #(assoc % :outliner-ops @semantic-ops))
 
     @*result))

@@ -2,8 +2,7 @@
   "Block code needed by app but not graph-parser. This should be the only frontend
    namespace that has references to legacy file attributes like :block/pre-block?
    as they are being removed from graph-parser output"
-  (:require [cljs.cache :as cache]
-            [clojure.string :as string]
+  (:require [clojure.string :as string]
             [frontend.common.cache :as common.cache]
             [frontend.context.i18n :refer [t]]
             [frontend.format :as format]
@@ -57,13 +56,16 @@ and handles unexpected failure."
                                            :page-name page-name
                                            :db-graph-mode? true})]
       (map (fn [block]
-             (let [block (standalone-display-block block)]
+             (let [block (standalone-display-block block)
+                   ;; Only a heading is saved from the parsed properties. Others (e.g. an
+                   ;; Org :PROPERTIES: drawer typed in a block) stay in the block's text.
+                   ;; Markdown headings go up to 6; mldoc reports `####### x` as size 7.
+                   heading (get-in block [:block/properties :heading])
+                   heading (when (or (true? heading) (and (integer? heading) (<= 1 heading 6)))
+                             heading)]
                (cond-> (dissoc block :block/format :block/properties :block/macros :block/properties-order)
-                 (:block/properties block)
-                 (merge (update-keys (:block/properties block)
-                                     (fn [k]
-                                       (or ({:heading :logseq.property/heading} k)
-                                           (throw (ex-info (str "Don't know how to save graph-parser property " (pr-str k)) {})))))))))
+                 heading
+                 (assoc :logseq.property/heading heading))))
            blocks))
     (catch :default e
       (log/error :exception e)
@@ -91,7 +93,7 @@ and handles unexpected failure."
           block (dissoc block :block.temp/ast-body :block/level)]
       (if uuid (assoc block :block/uuid uuid) block))))
 
-(defonce *blocks-ast-cache (volatile! (cache/lru-cache-factory {} :threshold 5000)))
+(defonce *blocks-ast-cache (volatile! (common.cache/empty-lru 5000)))
 
 (defn- markdown-heading-level
   [content]

@@ -11,9 +11,17 @@
             [frontend.state :as state]
             [frontend.ui :as ui]
             [frontend.util :as util]
+            [frontend.util.typography :as typography]
             [io.factorhouse.hsx.core :as hsx]
             [logseq.shui.hooks :as hooks]
             [logseq.shui.ui :as shui]))
+
+(defn apply-current-graph-changed!
+  "Load graph-dependent CSS and notify plugins only after db-worker is ready."
+  [db-worker-ready?]
+  (when db-worker-ready?
+    (ui-handler/reset-custom-css!)
+    (plugin-handler/hook-plugin-app :current-graph-changed {})))
 
 (hsx/defc scrollbar-measure
   []
@@ -35,7 +43,8 @@
   [{:keys [route theme accent-color editor-font on-click current-repo db-restoring?
            settings-open? sidebar-open? system-theme? sidebar-blocks-len preferred-language]} child]
   (let [mounted-fn (hooks/use-mounted)
-        [restored-sidebar? set-restored-sidebar?] (hooks/use-state false)]
+        [restored-sidebar? set-restored-sidebar?] (hooks/use-state false)
+        db-worker-ready? (hooks/use-atom-value state/db-worker-ready?)]
 
     (hooks/use-effect!
      #(let [^js doc js/document.documentElement
@@ -59,10 +68,7 @@
 
     (hooks/use-effect!
      (fn []
-       (when-let [{:keys [type global]} editor-font]
-         (doto js/document.documentElement
-           (.setAttribute "data-font" (or type "default"))
-           (.setAttribute "data-font-global" (boolean global)))))
+       (typography/apply! js/document editor-font))
      [editor-font])
 
     (hooks/use-effect!
@@ -92,10 +98,15 @@
 
     (hooks/use-effect!
      (fn []
-       (ui-handler/reset-custom-css!)
        (pdf/reset-current-pdf!)
-       (plugin-handler/hook-plugin-app :current-graph-changed {}))
+       nil)
      [current-repo])
+
+    (hooks/use-effect!
+     (fn []
+       (apply-current-graph-changed! db-worker-ready?)
+       nil)
+     [current-repo db-worker-ready?])
 
     (hooks/use-effect!
      #(let [db-restored? (false? db-restoring?)]

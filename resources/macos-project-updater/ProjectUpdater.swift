@@ -237,7 +237,7 @@ private func validateMetadata(_ value: SignedMetadata, archive: URL) throws {
           value.algorithm == algorithm,
           value.keyId == keyId,
           value.releaseLineId == releaseLine,
-          value.targetVersion == "2.0.1-selfhost.7",
+          !value.targetVersion.isEmpty,
           value.platform == "darwin",
           value.arch == helperArch(),
           value.bundleIdentity == bundleIdentity,
@@ -294,7 +294,10 @@ private func validateExtractedApp(_ app: URL, metadata: SignedMetadata) throws {
           bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String == metadata.targetVersion else {
         try fail("extracted App bundle identity does not match target metadata")
     }
+    // Intel packages preserve the unsigned runtime used by existing Keychain items.
+#if arch(arm64)
     _ = try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+#endif
 }
 
 private func waitForParent(_ pid: pid_t) throws {

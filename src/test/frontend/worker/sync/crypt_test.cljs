@@ -10,6 +10,7 @@
             [frontend.worker.sync.util :as sync-util]
             [frontend.worker.ui-request :as ui-request]
             [logseq.db :as ldb]
+            [logseq.db-sync.worker.handler.e2ee :as e2ee-handler]
             [promesa.core :as p]))
 
 (def ^:private decrypt-snapshot-datoms-batch-orig sync-crypt/<decrypt-snapshot-datoms-batch)
@@ -677,10 +678,13 @@
                                                           (p/resolved :exported-public-key))
                                ldb/write-transit-str pr-str]
                  (let [task-1 (sync-crypt/ensure-user-rsa-keys!)
-                       task-2 (sync-crypt/ensure-user-rsa-keys!)]
-                   (p/all [task-1 task-2])))
+                       task-2 (sync-crypt/ensure-user-rsa-keys!)
+                       task-3 (sync-crypt/ensure-user-rsa-keys! {:ensure-server? true})
+                       task-4 (sync-crypt/ensure-user-rsa-keys! {:ensure-server? true
+                                                             :server-rsa-keys-exists? false})]
+                   (p/all [task-1 task-2 task-3 task-4])))
                (p/then (fn [results]
-                         (is (= 2 (count results)))
+                         (is (= 4 (count results)))
                          (is (= 1 @ui-calls))
                          (is (= 1 (count @upload-calls)))
                          (is (= ["new-password"] @save-calls))))
@@ -1225,6 +1229,41 @@
                         (is false (str e))
                         (done))))))
 
+(deftest literature-pdf-link-tx-uses-the-existing-e2ee-shape-test
+  (async done
+         (let [paper #uuid "93000000-0000-4000-8000-000000000001"
+               asset #uuid "93000000-0000-4000-8000-000000000002"
+               link #uuid "93000000-0000-4000-8000-000000000003"
+               doi-value #uuid "93000000-0000-4000-8000-000000000004"
+               source-value #uuid "93000000-0000-4000-8000-000000000005"
+               tx-data [[:db/add [:block/uuid paper] :block/title "Private paper title"]
+                        [:db/add [:block/uuid paper] :logseq.property/literature-doi
+                         [:block/uuid doi-value]]
+                        [:db/add [:block/uuid doi-value] :block/title "10.1234/private"]
+                        [:db/add [:block/uuid source-value] :block/title
+                         "zotero/users/synthetic/items/PRIVATE"]
+                        [:db/add [:block/uuid paper] :logseq.property/literature-assets
+                         [:block/uuid asset]]
+                        [:db/add [:block/uuid link] :block/title ""]
+                        [:db/add [:block/uuid link] :block/link [:block/uuid asset]]
+                        [:db/add [:block/uuid asset] :logseq.property.asset/checksum
+                         "synthetic-checksum"]]]
+           (-> (p/let [aes-key (crypt/<generate-aes-key)
+                       encrypted (sync-crypt/<encrypt-tx-data aes-key tx-data)
+                       decrypted (sync-crypt/<decrypt-tx-data aes-key encrypted)]
+                 (is (not= "Private paper title" (get-in encrypted [0 3])))
+                 (is (not= "10.1234/private" (get-in encrypted [2 3])))
+                 (is (not= "zotero/users/synthetic/items/PRIVATE"
+                           (get-in encrypted [3 3])))
+                 (is (= (nth tx-data 4) (nth encrypted 4))
+                     "The paper-to-Asset relation keeps the native ref shape")
+                 (is (= (nth tx-data 6) (nth encrypted 6))
+                     "The reusable PDF link keeps the native ref shape")
+                 (is (= tx-data decrypted)))
+               (p/catch (fn [e]
+                          (is false (str e))))
+               (p/finally done)))))
+
 (deftest ^:fix-me decrypt-snapshot-rows-test
   (async done
          (-> (p/let [aes-key (crypt/<generate-aes-key)
@@ -1353,3 +1392,42 @@
              (p/catch (fn [e]
                         (is false (str e))
                         (done))))))
+
+(deftest semantic-ciphertext-decrypts-after-download-for-each-graph-member-test
+  (async done
+         (-> (p/let [aes-key (crypt/<generate-aes-key)
+                     exported-key (crypt/<export-aes-key aes-key)
+                     key-base64 (js/btoa (.join (js/Array.from exported-key #(js/String.fromCharCode %)) ""))
+                     request (js/Request. "https://sync.example.test/api/v1/graphs/graph-1/e2ee/encrypt"
+                                          #js {:method "POST"
+                                               :headers #js {"content-type" "application/json"}
+                                               :body (js/JSON.stringify #js {:key key-base64
+                                                                             :texts #js ["Shared 名称" "shared 名称"]})})
+                     response (e2ee-handler/handle {:request request :env #js {}
+                                                    :graph-id "graph-1" :handler :semantic/e2ee-encrypt})
+                     body (.json response)
+                     texts (aget body "texts")]
+               (is (= 200 (.-status response)))
+               (p/loop [members ["original-member" "later-member"]]
+                 (when-let [member (first members)]
+                   (p/let [pair (crypt/<generate-rsa-key-pair)
+                           wrapped (crypt/<encrypt-aes-key (:publicKey pair) aes-key)
+                           downloaded-key
+                           (p/with-redefs [sync-crypt/e2ee-base (constantly "https://sync.example.test")
+                                           sync-crypt/<clear-item! (fn [_] (p/resolved nil))
+                                           sync-crypt/<set-item! (fn [_ _] (p/resolved nil))
+                                           sync-crypt/<get-user-rsa-key-pair-raw
+                                           (fn [_] (p/resolved {:public-key "synthetic-public-key"
+                                                                :encrypted-private-key "synthetic-encrypted-private-key"}))
+                                           sync-crypt/<decrypt-private-key (fn [_] (p/resolved (:privateKey pair)))
+                                           sync-crypt/<fetch-graph-encrypted-aes-key-raw
+                                           (fn [_ _] (p/resolved {:encrypted-aes-key (ldb/write-transit-str wrapped)}))]
+                             (sync-crypt/<fetch-graph-aes-key-for-download (str (random-uuid))))
+                           decrypted (decrypt-snapshot-datoms-batch-orig
+                                      downloaded-key
+                                      [{:a :block/title :v (aget texts 0)}
+                                       {:a :block/name :v (aget texts 1)}])]
+                     (is (= ["Shared 名称" "shared 名称"] (mapv :v decrypted)) member)
+                     (p/recur (next members))))))
+             (p/catch #(is false (str %)))
+             (p/finally done))))

@@ -34,11 +34,37 @@
 
 (deftest file-url-or-path->path
   (testing "file URL paths"
+    (testing "encoded delimiters belong to the filename"
+      (is (= "/synthetic/paper#draft?part%.pdf"
+             (path/file-url-or-path->path "file:///synthetic/paper%23draft%3Fpart%25.pdf")))
+      (is (= "/synthetic/paper#draft?part%.pdf"
+             (path/file-url-or-path->path "assets:///synthetic/paper%23draft%3Fpart%25.pdf"))))
+    (testing "Chinese and spaces decode after URL parsing"
+      (is (= "/synthetic/中文 paper.pdf"
+             (path/file-url-or-path->path "file:///synthetic/%E4%B8%AD%E6%96%87%20paper.pdf")))
+      (is (= "/synthetic/中文 paper.pdf"
+             (path/file-url-or-path->path "assets:///synthetic/%E4%B8%AD%E6%96%87%20paper.pdf"))))
+    (testing "literal percent escapes decode once"
+      (is (= "/synthetic/literal%23.pdf"
+             (path/file-url-or-path->path "file:///synthetic/literal%2523.pdf")))
+      (is (= "/synthetic/literal%23.pdf"
+             (path/file-url-or-path->path "assets:///synthetic/literal%2523.pdf"))))
+    (testing "Windows drive and UNC paths preserve encoded filename characters"
+      (is (= "D:/中文 paper#draft?part%.pdf"
+             (path/file-url-or-path->path "file:///D%3A/%E4%B8%AD%E6%96%87%20paper%23draft%3Fpart%25.pdf")))
+      (is (= "D:/中文 paper#draft?part%.pdf"
+             (path/file-url-or-path->path "assets:///D%3A/%E4%B8%AD%E6%96%87%20paper%23draft%3Fpart%25.pdf")))
+      (is (= "//nas/share/中文 paper#draft?part%.pdf"
+             (path/file-url-or-path->path "file://NAS/share/%E4%B8%AD%E6%96%87%20paper%23draft%3Fpart%25.pdf")))
+      (is (= "//nas/share/中文 paper#draft?part%.pdf"
+             (path/file-url-or-path->path "assets://NAS/share/%E4%B8%AD%E6%96%87%20paper%23draft%3Fpart%25.pdf"))))
     (is (= "D:/a.txt" (path/file-url-or-path->path "file:///D:/a.txt")))
     (is (= "c:/x" (path/file-url-or-path->path "file:///c:/x")))
     (is (= "//nas/share/x" (path/file-url-or-path->path "file://NAS/share/x")))
     (is (= "D:/a.txt" (path/file-url-or-path->path "file:///D%3A/a.txt")))
     (is (= "/home/admin/a.txt" (path/file-url-or-path->path "file:///home/admin/a.txt")))
+    ;; Electron assets:// URLs protect a Windows drive colon as /logseq__colon/
+    (is (= "C:/graph/assets/a.txt" (path/file-url-or-path->path "assets:///C/logseq__colon/graph/assets/a.txt")))
     (is (= "/D:/a.txt" (path/file-url-or-path->path "/D:/a.txt")))
     (is (= "/D:\\a.txt" (path/file-url-or-path->path "/D:\\a.txt")))
     (is (= "/home/admin/a.txt" (path/file-url-or-path->path "/home/admin/a.txt")))))

@@ -15,6 +15,51 @@
                     (is (= result value))))
           (p/finally done)))))
 
+(deftest queued-outliner-request-captures-editor-context-in-one-worker-call
+  (async done
+    (let [repo (atom "captured-context-repo")
+          editor (atom {:selected-block-uuids [(random-uuid)] :selection-direction :up})
+          first-context @editor
+          first-result (p/deferred)
+          calls (atom [])
+          ops [[:delete-blocks [[(random-uuid)] {}]]]]
+      (-> (p/with-redefs [util/node-test? false
+                          state/get-current-repo #(deref repo)
+                          state/get-route-match (constantly nil)
+                          state/get-editor-info #(deref editor)
+                          state/<invoke-db-worker
+                          (fn [api requested-repo & args]
+                            (swap! calls conj [api requested-repo args])
+                            (if (and (= api :thread-api/apply-outliner-ops)
+                                     (= requested-repo "captured-context-repo")
+                                     (= 1 (count (filter #(= :thread-api/apply-outliner-ops (first %)) @calls))))
+                              first-result
+                              (p/resolved {:result :saved})))]
+            (let [first-request (db-transact/apply-outliner-ops nil ops {})
+                  first-outcome (p/catch first-request (fn [error] {:error error}))
+                  _ (reset! editor nil)
+                  second-request (db-transact/apply-outliner-ops nil ops {})]
+              (p/let [_ (p/delay 0)
+                      _ (is (= [:thread-api/apply-outliner-ops] (mapv first @calls)))
+                      _ (reset! repo "switched-context-repo")
+                      _ (reset! editor {:selected-block-uuids [(random-uuid)]})
+                      _ (do (p/reject! first-result (js/Error. "expected request rejection"))
+                            nil)
+                      first-error first-outcome
+                      second-value second-request]
+                (is (instance? js/Error (:error first-error)))
+                (is (= :saved second-value))
+                (is (= [:thread-api/apply-outliner-ops :thread-api/apply-outliner-ops]
+                       (mapv first @calls)))
+                (let [mutations (filter #(= :thread-api/apply-outliner-ops (first %)) @calls)
+                      options (map #(second (nth % 2)) mutations)]
+                  (is (= ["captured-context-repo" "captured-context-repo"] (mapv second mutations)))
+                  (is (every? #(contains? % :pending-editor-info) options)
+                      "Explicit nil must be sent rather than inheriting pending worker context.")
+                  (is (= [first-context nil] (mapv :pending-editor-info options)))))))
+          (p/catch (fn [error] (is false (str "Unexpected test failure: " error))))
+          (p/finally done)))))
+
 (deftest operation-row-uuids-contains-only-changed-rows-in-order-test
   (let [block-a (random-uuid)
         block-b (random-uuid)
@@ -140,8 +185,13 @@
                  :deleted {}
                  :children {}
                  :affected-keys #{[:graph]}}
+          editor-info {:block-uuid current-block-id
+                       :container-id 1
+                       :start-pos 0
+                       :end-pos 3}
           original-flush-sync (.-flushSync react-dom)
-          calls (atom [])]
+          calls (atom [])
+          worker-calls (atom [])]
       (set! (.-flushSync react-dom)
             (fn [f]
               (swap! calls conj :commit-start)
@@ -155,13 +205,11 @@
                             true)
                           state/get-current-repo (constantly repo)
                           state/get-route-match (constantly nil)
-                          state/get-editor-info (constantly nil)
+                          state/get-editor-info (constantly editor-info)
                           state/<invoke-db-worker
-                          (fn [api & _args]
+                          (fn [api & args]
+                            (swap! worker-calls conj (into [api] args))
                             (case api
-                              :thread-api/undo-redo-set-pending-editor-info
-                              (p/resolved nil)
-
                               :thread-api/apply-outliner-ops
                               (p/resolved {:result ::persisted
                                            :delta delta
@@ -178,6 +226,10 @@
                             (fn [rows]
                               (swap! calls conj [:editor-callback rows]))})]
               (is (= ::persisted value))
+              (is (= 1 (count @worker-calls))
+                  "Pending editor info and the mutation must share one worker roundtrip.")
+              (is (= :thread-api/apply-outliner-ops (ffirst @worker-calls)))
+              (is (= editor-info (get-in @worker-calls [0 3 :pending-editor-info])))
               (is (= [:commit-start :delta :commit-end
                       :commit-start :editor-callback :commit-end]
                      (mapv #(if (vector? %) (first %) %) @calls)))

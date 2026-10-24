@@ -1,9 +1,11 @@
 (ns frontend.components.block.reactivity-test
   (:require ["react" :as react]
+            ["react-dom/server" :as react-dom-server]
             [cljs.test :refer [async deftest is testing use-fixtures]]
-            [frontend.components.block]
+            [frontend.components.block :as block-component]
             [frontend.db.hooks :as db-hooks]
             [frontend.db.subs :as subs]
+            [frontend.rfx :as rfx]
             [goog.object :as gobj]
             [promesa.core :as p]))
 
@@ -62,7 +64,7 @@
     (gobj/set react "useCallback" (fn [callback _deps] callback))
     (gobj/set react "useSyncExternalStore" replacement)
     (try
-      (f)
+      (with-redefs [rfx/use-sub (constantly nil)] (f))
       (finally
         (gobj/set react "useRef" original-use-ref)
         (gobj/set react "useCallback" original-use-callback)
@@ -118,6 +120,33 @@
         next-props #js {:args [nil current-block [child-a child-b] nil nil]}]
     (is (false? (compare-props previous-props next-props))
         "A child membership change must rerender the loaded block row.")))
+
+(deftest linked-references-keeps-hooks-stable-across-count-threshold-test
+  (let [block-uuid (random-uuid)
+        hook-count (atom 0)
+        previous-react (gobj/get js/globalThis "React")]
+    (gobj/set js/globalThis "React" react)
+    (try
+      (let [counts (mapv (fn [bundled-count]
+                           (reset! hook-count 0)
+                           (with-use-sync-external-store
+                             (fn [_subscribe get-snapshot _get-server-snapshot]
+                               (swap! hook-count inc)
+                               (get-snapshot))
+                             #(.renderToStaticMarkup
+                               react-dom-server
+                               (block-component/block-linked-references
+                                {:block/uuid block-uuid
+                                 :block.temp/refs-count bundled-count})))
+                           @hook-count)
+                         [500 nil 500])]
+        (is (pos? (second counts)))
+        (is (apply = counts)
+            "Switching between bundled and deferred counts must preserve React's hook sequence."))
+      (finally
+        (if (some? previous-react)
+          (gobj/set js/globalThis "React" previous-react)
+          (js-delete js/globalThis "React"))))))
 
 (deftest the-same-uuid-shares-one-load-across-main-and-sidebar-test
   (async done

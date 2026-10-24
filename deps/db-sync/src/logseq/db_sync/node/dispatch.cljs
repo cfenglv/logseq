@@ -6,7 +6,10 @@
             [logseq.db-sync.platform.core :as platform]
             [logseq.db-sync.worker.handler.assets :as assets-handler]
             [logseq.db-sync.worker.handler.index :as index-handler]
+            [logseq.db-sync.worker.dispatch :as worker-dispatch]
+            [logseq.db-sync.worker.asset-link :as asset-link]
             [logseq.db-sync.worker.handler.sync :as sync-handler]
+            [logseq.db-sync.worker.handler.user-navigation :as navigation-handler]
             [logseq.db-sync.worker.http :as http]
             [promesa.core :as p]))
 
@@ -28,7 +31,24 @@
       (= path "/health")
       (http/json-response :worker/health {:ok true})
 
-      (or (= path "/graphs")
+      (and (= "POST" method) (= path "/user/navigation/init"))
+      (navigation-handler/<handle-public
+       request env
+       (fn [graph-id payload]
+         (let [ctx (graph/get-or-create-graph registry deps graph-id)
+               target (js/URL. (str (.-origin url) "/user-navigation/init"))]
+           (.set (.-searchParams target) "graph-id" graph-id)
+           (sync-handler/handle-http ctx (js/Request. (.toString target)
+                                                     #js {:method "POST" :body payload
+                                                          :headers #js {"content-type" "application/transit+json"}})))))
+
+      ;; Semantic REST API (MCP/code-mode surface) — same dispatch as the worker.
+      (or (= path "/openapi.json")
+          (string/starts-with? path "/api/"))
+      (worker-dispatch/handle-worker-fetch request env)
+
+      (or (= path "/user/profile")
+          (= path "/graphs")
           (string/starts-with? path "/graphs/"))
       (index-handler/handle-fetch index-self request)
 
@@ -39,12 +59,13 @@
       (if (= method "OPTIONS")
         (assets-handler/handle request env)
         (if-let [{:keys [graph-id]} (assets-handler/parse-asset-path path)]
-          (if (admin-token-valid? request env)
-            (assets-handler/handle request env)
-            (p/let [access-resp (index-handler/graph-access-response request env graph-id)]
-              (if (.-ok access-resp)
-                (assets-handler/handle request env)
-                access-resp)))
+          (p/let [signed-download? (when (= method "GET") (asset-link/<valid-request? request env))]
+            (if (or signed-download? (admin-token-valid? request env))
+              (assets-handler/handle request env)
+              (p/let [access-resp (index-handler/graph-access-response request env graph-id)]
+                (if (.-ok access-resp)
+                  (assets-handler/handle request env)
+                  access-resp))))
           (http/bad-request "invalid asset path")))
 
       (= method "OPTIONS")
@@ -52,7 +73,9 @@
 
       (string/starts-with? path "/sync/")
       (if-let [{:keys [graph-id tail]} (node-routes/parse-sync-path path)]
-        (if (seq graph-id)
+        (if (or (= tail "/semantic") (string/starts-with? tail "/semantic/") (= tail "/user-navigation/init"))
+          (http/not-found)
+          (if (seq graph-id)
           (if (= method "OPTIONS")
             (common/options-response)
             (if (admin-token-valid? request env)
@@ -69,7 +92,7 @@
                     (let [rewritten (platform/request (.toString new-url) request)]
                       (sync-handler/handle-http ctx rewritten)))
                   access-resp))))
-          (http/bad-request "missing graph id"))
+            (http/bad-request "missing graph id")))
         (http/bad-request "missing graph id"))
 
       :else

@@ -590,6 +590,7 @@
         calc? (calc-mode? attr)
         [calc-lines set-calc-lines!] (hooks/use-state #(when calc? (calc/eval-lines code)))
         current-theme (rfx/use-sub [:ui/theme])
+        code-font-family (rfx/use-sub [:ui/editor-font :code :family])
         radix-color? (rfx/use-sub [:ui/radix-color])
         code-options (hooks/use-memo #(atom options) [id])
         last-theme (hooks/use-memo #(atom (theme-name current-theme radix-color?)) [id])
@@ -614,6 +615,13 @@
        (when calc?
          (set-calc-lines! (calc/eval-lines code))))
      [id code calc?])
+    (hooks/use-effect!
+     (fn []
+       ;; Measure after the theme effect applies the font variable, without
+       ;; replacing editor contents or its undo history.
+       (let [frame (js/requestAnimationFrame #(some-> @editor-atom .refresh))]
+         #(js/cancelAnimationFrame frame)))
+     [id code-font-family])
     (hooks/use-effect!
      (fn []
        (let [next-theme (theme-name current-theme radix-color?)

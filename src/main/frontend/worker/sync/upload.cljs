@@ -5,6 +5,7 @@
    [datascript.core :as d]
    [frontend.worker-common.util :as worker-util]
    [frontend.worker.state :as worker-state]
+   [frontend.worker.shared-service :as shared-service]
    [frontend.worker.sync.apply-txs :as sync-apply]
    [frontend.worker.sync.auth :as sync-auth]
    [frontend.worker.sync.client-op :as client-op]
@@ -249,6 +250,7 @@
       (fail-fast :db-sync/missing-field {:repo repo :field :graph-id}))
     (set-graph-sync-metadata! repo graph-id graph-e2ee?)
     (ensure-client-graph-uuid! repo graph-id)
+    (shared-service/broadcast-to-clients! :user-navigation/source-changed {:repo repo :graph-id graph-id})
     {:graph-id graph-id
      :graph-e2ee? graph-e2ee?}))
 
@@ -367,8 +369,9 @@
                             (sync-crypt/<ensure-graph-aes-key repo graph-id))
                   _ (when (and graph-e2ee? (nil? aes-key))
                       (fail-fast :db-sync/missing-field {:repo repo :field :aes-key}))]
-            (let [snapshot-checksum (sync-checksum/recompute-checksum @source-conn)]
-              (client-op/update-local-checksum repo snapshot-checksum)
+            (let [db @source-conn
+                  snapshot-checksum (sync-checksum/recompute-checksum db)]
+              (client-op/update-local-checksum repo snapshot-checksum (:max-tx db))
               (p/let [_ (update-progress {:sub-type :upload-progress
                                           :message (if graph-e2ee? "Encrypting..." "Preparing...")})
                       {:keys [db] :as temp} (<prepare-upload-temp-sqlite!

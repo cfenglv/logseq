@@ -7,6 +7,15 @@
             [logseq.e2e.util :as util]
             [wally.main :as w]))
 
+(defn- last-page-block-content
+  "Property values mount a nested .ls-block .block-content. Clicking that
+  0-width editor is not opening the last page block."
+  []
+  (let [blocks (w/-query ".ls-page-blocks .page-blocks-inner .ls-block .block-content:not(.property-block-container, .property-block-container *)")]
+    (when (zero? (.count blocks))
+      (throw (ex-info "No page block content" {})))
+    (.last blocks)))
+
 (defn open-last-block
   "Open the last existing block or pressing add button to create a new block"
   [& {:keys [in-retry?]}]
@@ -14,10 +23,9 @@
   (assert/assert-in-normal-mode?)
 
   (let [blocks-count (util/page-blocks-count)
-        last-block (-> (if (zero? blocks-count)
-                         (w/query ".ls-page-blocks .block-add-button")
-                         (w/query ".ls-page-blocks .page-blocks-inner .ls-block .block-content"))
-                       (last))]
+        last-block (if (zero? blocks-count)
+                     (last (w/query ".ls-page-blocks .block-add-button"))
+                     (last-page-block-content))]
     (w/click last-block)
     (if in-retry?
       (assert/assert-editor-mode)
@@ -56,20 +64,23 @@
     (is (some? last-id))
     (util/move-cursor-to-end)
     (k/enter)
-    (let [new-editor (focus-new-block! last-id)]
-      (.focus new-editor))
-    (when (seq title)
-      (util/press-seq title))
-    (assert/assert-editor-mode)
-    (loop [i 20]
-      (if (= title (util/get-edit-content))
-        true
-        (if (zero? i)
-          (is (= title (util/get-edit-content))
-              "new block editor should settle on the expected content")
-          (do
-            (util/wait-timeout 50)
-            (recur (dec i))))))))
+    (let [new-editor (focus-new-block! last-id)
+          new-input (.first (.locator new-editor "textarea"))]
+      (.focus new-input)
+      (when (seq title)
+        (.pressSequentially new-input title))
+      (assert/assert-editor-mode)
+      (loop [i 20]
+        (let [content (.inputValue new-input)]
+          (if (= title content)
+            true
+            (if (zero? i)
+              (throw (ex-info "new block editor did not settle on the expected content"
+                              {:expected title
+                               :actual content}))
+              (do
+                (util/wait-timeout 50)
+                (recur (dec i))))))))))
 
 ;; TODO: support tree
 (defn new-blocks

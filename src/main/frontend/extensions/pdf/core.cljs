@@ -15,6 +15,8 @@
                                                      pdf-toolbar]]
             [frontend.extensions.pdf.utils :as pdf-utils]
             [frontend.extensions.pdf.windows :as pdf-windows]
+            [frontend.handler.assets :as assets-handler]
+            [frontend.handler.literature :as literature-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.property :as property-handler]
             [frontend.modules.shortcut.core :as shortcut]
@@ -46,7 +48,7 @@
   (let [*mounted? (hooks/use-ref false)
         ref-hl (rfx/use-sub [:pdf/ref-highlight])
         ref-hl-key (when ref-hl
-                     (str (:id ref-hl) ":" (:page ref-hl)))]
+                     (str (:id ref-hl) ":" (:page ref-hl) ":" (:request-id ref-hl)))]
     (hooks/use-effect!
      (fn []
        (let [scroll-timer (when (and viewer ref-hl)
@@ -142,9 +144,9 @@
         ^js body (some-> (.-ownerDocument cnt) (.-body))
         key-alt? (= (some-> body (.-dataset) (.-activeKeystroke)) "Alt")
         auto-open-ctx-menu? (rfx/use-sub [:pdf/auto-open-ctx-menu?])
-        head-height 0                                       ;; 48 temp
-        top (- (+ (:y point) (.-scrollTop cnt)) head-height)
-        left (+ (:x point) (.-scrollLeft cnt))
+        cnt-rect (.getBoundingClientRect cnt)
+        top (- (+ (:y point) (.-scrollTop cnt)) (.-top cnt-rect))
+        left (- (+ (:x point) (.-scrollLeft cnt)) (.-left cnt-rect))
         id (:id highlight)
         new? (nil? id)
         new-&-highlight-mode? (and @*highlight-mode? new?)
@@ -166,7 +168,7 @@
                              (util/copy-to-clipboard!
                               (or (:text content) (pdf-utils/fix-selection-text-breakline (.toString selection)))
                               :owner-window owner-win)
-                             (pdf-utils/clear-all-selection))
+                             (pdf-utils/clear-all-selection owner-win))
 
                            "link"
                            (pdf-assets/goto-block-ref! highlight)
@@ -199,7 +201,7 @@
 
                                  (reset! *highlight-last-color (keyword action)))))))
 
-                       (and clear? (js/setTimeout #(clear-ctx-menu!) 68))))]
+                       (when clear? (clear-ctx-menu!))))]
 
     (hooks/use-effect!
      (fn []
@@ -447,29 +449,31 @@
                          (hooks/set-ref! *page-el nil)
                          (hooks/set-ref! *page-rect nil))
 
-        calc-coords! (fn [page-x page-y]
+        calc-coords! (fn [client-x client-y]
                        (when cnt-el
                          (let [cnt-rect    (hooks/deref *cnt-rect)
                                cnt-rect    (or cnt-rect (bean/->clj (.toJSON (.getBoundingClientRect cnt-el))))
                                page-rect   (hooks/deref *page-rect)
                                [start-x, start-y] (hooks/deref *start-xy)
-                               dx-left?    (> start-x page-x)
-                               dy-top?     (> start-y page-y)
+                               dx-left?    (> start-x client-x)
+                               dy-top?     (> start-y client-y)
                                page-left   (:left page-rect)
                                page-right  (:right page-rect)
                                page-top    (:top page-rect)
                                page-bottom (:bottom page-rect)
                                _           (hooks/set-ref! *cnt-rect cnt-rect)]
 
-                           {:x (-> page-x
+                           {:x (-> client-x
                                    (#(if dx-left?
                                        (if (< % page-left) page-left %)
                                        (if (> % page-right) page-right %)))
+                                   (- (:left cnt-rect))
                                    (+ (.-scrollLeft cnt-el)))
-                            :y (-> page-y
+                            :y (-> client-y
                                    (#(if dy-top?
                                        (if (< % page-top) page-top %)
                                        (if (> % page-bottom) page-bottom %)))
+                                   (- (:top cnt-rect))
                                    (+ (.-scrollTop cnt-el)))})))
 
         calc-rect               (fn [start end]
@@ -482,7 +486,7 @@
 
         fn-move                 (hooks/use-callback
                                  (fn [^js/MouseEvent e]
-                                   (set-end! (calc-coords! (.-pageX e) (.-pageY e))))
+                                   (set-end! (calc-coords! (.-clientX e) (.-clientY e))))
                                  [])]
 
     (hooks/use-effect!
@@ -492,7 +496,7 @@
                           (if (should-start e)
                             (let [target (.-target e)
                                   page-el (.closest target ".page")
-                                  [x y] [(.-pageX e) (.-pageY e)]]
+                                  [x y] [(.-clientX e) (.-clientY e)]]
                               (hooks/set-ref! *start-el target)
                               (hooks/set-ref! *start-xy [x y])
                               (hooks/set-ref! *page-el page-el)
@@ -508,7 +512,7 @@
 
                fn-end   (fn [^js/MouseEvent e]
                           (when-let [start-el (hooks/deref *start-el)]
-                            (let [end  (calc-coords! (.-pageX e) (.-pageY e))
+                            (let [end  (calc-coords! (.-clientX e) (.-clientY e))
                                   rect (calc-rect start end)]
 
                               (if (and (> (:width rect) 10)
@@ -954,8 +958,11 @@
     (hooks/use-effect!
      (fn []
        (-> (p/let [data (pdf-assets/db-based-load-hls-data$ pdf-current)
-                   {:keys [highlights extra]} data]
-             (set-initial-page! (or (when-let [page (:page extra)]
+                   {:keys [highlights extra]} data
+                   reference (state/get-state :pdf/ref-highlight)
+                   reference-page (some #(when (= (:id reference) (:id %)) (:page %)) highlights)]
+             (set-initial-page! (or reference-page
+                                   (when-let [page (:page extra)]
                                       (util/safe-parse-int page)) 1))
              (set-initial-scale! (or (:scale extra) "auto"))
              (set-hls-state! {:initial-hls highlights :latest-hls highlights :extra extra :loaded true}))
@@ -985,7 +992,9 @@
                             :supportsMouseWheelZoomCtrlKey true
                             :supportsMouseWheelZoomMetaKey true}]
          (set-loader-state! {:status :loading})
-         (-> (get-doc$ (clj->js opts))
+         (-> (p/let [_ (when (:enabled? (literature-handler/load-settings (state/get-current-repo)))
+                        (assets-handler/<ensure-asset-file-content! (state/get-current-repo) block))]
+               (get-doc$ (clj->js opts)))
              (p/then (fn [doc]
                        (set-loader-state! {:pdf-document doc :status :completed})))
              (p/catch #(set-loader-state! {:error %})))
@@ -998,6 +1007,14 @@
        (when-let [error (:error loader-state)]
          (js/console.error "[PDF loader]" (:error loader-state))
          (case (.-name error)
+           "AssetContentMismatchError"
+           (do
+             (notification/show!
+              (t :pdf/content-mismatch-error (.-message error))
+              :error
+              false)
+             (state/set-state! :pdf/current nil))
+
            "MissingPDFException"
            (do
              (notification/show!
@@ -1025,15 +1042,23 @@
                         (set-doc-password! password))]
                   (pdf-password-input on-password-fn)))))
 
-           (do
-             (notification/show!
-              (t :pdf/generic-error (.-name error) (.-message error))
-              :error
-              false)
-             (state/set-state! :pdf/current nil)))))
+           ;; A web address the viewer cannot fetch (the site sends no CORS
+           ;; headers to the app) opens in the browser, as the link did before
+           ;; it became an asset.
+           (let [ext-url (:logseq.property.asset/external-url block)]
+             (if (and (string? ext-url) (re-find #"^https?://" ext-url))
+               (do
+                 (util/open-url ext-url)
+                 (state/set-state! :pdf/current nil))
+               (do
+                 (notification/show!
+                  (t :pdf/generic-error (.-name error) (.-message error))
+                  :error
+                  false)
+                 (state/set-state! :pdf/current nil)))))))
      [(:error loader-state)])
 
-    [:> (.-Provider highlights-ctx) {:value hls-state}
+    [:> (.-Provider highlights-ctx) #js {:value hls-state}
      [:div.extensions__pdf-loader {:ref *doc-ref}
       (let [status-doc    (:status loader-state)
             initial-hls   (:initial-hls hls-state)
@@ -1062,26 +1087,10 @@
 
 (hsx/defc pdf-container
   [{:keys [identity] :as pdf-current}]
-  (let [[prepared set-prepared!] (hooks/use-state false)
-        [ready set-ready!] (hooks/use-state false)]
-
-    ;; load assets
-    (hooks/use-effect!
-     (fn []
-       (set-prepared! true))
-     [])
-
-    ;; refresh loader
-    (hooks/use-effect!
-     (fn []
-       (js/setTimeout #(set-ready! true) 100)
-       #(set-ready! false))
-     [identity])
-
-    [:div.extensions__pdf-container
-     {:id (str "pdf-layout-container_" identity)}
-     (when (and prepared identity ready)
-       (pdf-loader pdf-current))]))
+  [:div.extensions__pdf-container
+   {:id (str "pdf-layout-container_" identity)}
+   (when identity
+     ^{:key identity} (pdf-loader pdf-current))])
 
 (hsx/defc playground-effects
   [active]

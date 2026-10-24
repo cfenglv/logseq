@@ -4,7 +4,7 @@
             ["node:os" :as os]
             ["node:path" :as node-path]))
 
-(def ^:private helper-timeout-ms 2000)
+(def ^:private helper-timeout-ms 10000)
 
 (defn app-bundle-path
   [executable-path]

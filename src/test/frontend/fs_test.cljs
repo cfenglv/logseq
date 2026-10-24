@@ -1,11 +1,14 @@
 (ns frontend.fs-test
   (:require ["fs" :as fs-node]
+            ["fs/promises" :as fsp]
             ["path" :as node-path]
             [cljs.test :refer [is]]
+            [electron.ipc :as ipc]
             [frontend.fs :as fs]
             [frontend.test.helper :as test-helper :include-macros true :refer [deftest-async]]
             [frontend.test.node-fixtures :as node-fixtures]
             [frontend.test.node-helper :as test-node-helper]
+            [frontend.util :as util]
             [promesa.core :as p]))
 
 (deftest-async create-if-not-exists-creates-correctly
@@ -57,3 +60,34 @@
         (p/catch (fn [error]
                    (is (some? error))))
         (p/finally #(fs-node/rmdirSync dir)))))
+
+(deftest-async write-file-creates-missing-parent-dir-test
+  {:before (node-fixtures/setup-get-fs!)
+   :after (node-fixtures/restore-get-fs!)}
+  (let [repo-dir (node-path/resolve (test-node-helper/create-tmp-dir))
+        export-css-path (node-path/join repo-dir "logseq" "export.css")
+        ipc-calls (atom [])]
+    (is (not (fs-node/existsSync (node-path/join repo-dir "logseq")))
+        "precondition: logseq/ dir is missing")
+    (-> (p/with-redefs [util/electron? (constantly true)
+                        fs/get-fs (constantly fs/node-backend)
+                        ipc/ipc (fn [op & args]
+                                  (swap! ipc-calls conj op)
+                                  (case op
+                                    "stat" (p/resolved nil)
+                                    "mkdir-recur" (fsp/mkdir (first args) #js {:recursive true})
+                                    "writeFile" (fsp/writeFile (second args) (nth args 2))))]
+          (p/do!
+           (fs/write-file! export-css-path ".foo { color: red; }")
+           (is (fs-node/existsSync (node-path/join repo-dir "logseq"))
+               "first write creates missing logseq/ parent dir")
+           (is (fs-node/existsSync export-css-path)
+               "first write creates missing export.css")
+           (is (= ".foo { color: red; }"
+                  (str (fs-node/readFileSync export-css-path))))
+           (is (= ["mkdir-recur" "writeFile"] @ipc-calls)
+               "first write uses the native recursive mkdir, not stat's nil-as-success result")))
+        (p/finally
+         (fn []
+           (when (fs-node/existsSync repo-dir)
+             (fs-node/rmSync repo-dir #js {:recursive true :force true})))))))

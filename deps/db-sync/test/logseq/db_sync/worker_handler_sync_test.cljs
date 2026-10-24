@@ -161,6 +161,42 @@
                               (is false (str error))
                               (done)))))))))
 
+(deftest checksum-diagnostics-refreshes-connected-peers-only-when-anchor-changes-test
+  (async done
+         (with-memory-sql-async
+           (fn [sql]
+             (storage/init-schema! sql)
+             (let [conn (storage/open-conn sql)
+                   sent (atom [])
+                   peer #js {:readyState 1
+                             :send (fn [raw]
+                                     (swap! sent conj (protocol/parse-message raw)))}
+                   self #js {:sql sql :conn conn :schema-ready true
+                             :state #js {:getWebSockets (fn [] #js [peer])}}
+                   _ (d/transact! conn [{:block/uuid (random-uuid)
+                                        :block/name "rollout checksum page"
+                                        :block/title "Rollout checksum page"}])
+                   expected (sync-checksum/recompute-checksum @conn)
+                   before-t (storage/get-t sql)
+                   _ (is (not= "0000000000000000" expected))
+                   _ (storage/set-checksum! sql "0000000000000000")]
+               (-> (p/let [_ (#'sync-handler/<checksum-diagnostics-response
+                              self "synthetic-rollout" false)
+                           _ (is (= [{:type "hello" :t before-t
+                                      :checksum expected
+                                      :capabilities sync-handler/server-capabilities}]
+                                    @sent))
+                           _ (is (= before-t (storage/get-t sql))
+                                 "Refreshing a derived anchor must not append a graph transaction")
+                           _ (#'sync-handler/<checksum-diagnostics-response
+                              self "synthetic-rollout" false)]
+                     (is (= 1 (count @sent))
+                         "A current anchor must not trigger another refresh"))
+                   (p/then (fn [] (done)))
+                   (p/catch (fn [error]
+                              (is false (str error))
+                              (done)))))))))
+
 (deftest checksum-diagnostics-does-not-overwrite-a-newer-anchor-test
   (with-memory-sql
     (fn [sql]
@@ -1028,7 +1064,7 @@
                    request (semantic-json-request
                             "/semantic/tasks?graph-id=graph-1" "POST"
                             {:title "Atomic task" :status "TODO" :priority "HIGH"
-                             :scheduled 20260713 :deadline 20260714})]
+                             :scheduled 1783900800000 :deadline 1783987200000})]
                (d/listen! conn ::semantic-create-task-tx
                           #(swap! tx-reports conj %))
                (-> (p/let [response (sync-handler/handle-http self request)
@@ -1039,8 +1075,8 @@
                      (is (= 1 (count (d/datoms @conn :avet :block/journal-day))))
                      (is (= "logseq.property/status.todo" (get-in body [:status :ident])))
                      (is (= "logseq.property/priority.high" (get-in body [:priority :ident])))
-                     (is (= 20260713 (:scheduled body)))
-                     (is (= 20260714 (:deadline body))))
+                     (is (= 1783900800000 (:scheduled body)))
+                     (is (= 1783987200000 (:deadline body))))
                    (p/then (fn [] (done)))
                    (p/catch (fn [error]
                               (d/unlisten! conn ::semantic-create-task-tx)
@@ -2179,6 +2215,68 @@
           (is (= 70 (block-title-prefix-count @conn "large-op-block-")))
           (is (= 3 (block-title-prefix-count @conn "large-dependency-"))))))))
 
+(deftest tx-batch-keeps-value-replacement-in-one-chunk-test
+  (testing "a large tx keeps a cardinality-one retract/add pair in one chunk"
+    (with-memory-sql
+      (fn [sql]
+        (storage/init-schema! sql)
+        (let [conn (storage/open-conn sql)
+              ;; Enable the db-graph transact validation that rejects a block
+              ;; left without a required attribute.
+              _ (d/transact! conn [{:db/ident :logseq.kv/db-type
+                                    :kv/value "db"}])
+              page-uuid (random-uuid)
+              block-uuid (random-uuid)
+              _ (d/transact! conn [{:block/uuid page-uuid
+                                    :block/name "replacement-page"
+                                    :block/title "replacement-page"}
+                                   {:block/uuid block-uuid
+                                    :block/title "replacement-block"
+                                    :block/page [:block/uuid page-uuid]
+                                    :block/parent [:block/uuid page-uuid]
+                                    :block/order "a0"
+                                    :block/created-at 1
+                                    :block/updated-at 1}])
+              page-ref [:block/uuid page-uuid]
+              block-ref [:block/uuid block-uuid]
+              t-before (storage/get-t sql)
+              filler (vec
+                      (mapcat (fn [idx]
+                                (let [eid (str "replacement-filler-" idx)]
+                                  [[:db/add eid :block/uuid (random-uuid)]
+                                   [:db/add eid :block/title (str "replacement-filler-" idx)]
+                                   [:db/add eid :block/page page-ref]
+                                   [:db/add eid :block/parent page-ref]
+                                   [:db/add eid :block/order "a0"]
+                                   [:db/add eid :block/created-at idx]
+                                   [:db/add eid :block/updated-at idx]]))
+                              (range 72)))
+              ;; The :block/updated-at retract and add straddle the chunk
+              ;; boundary; split apart, the retract leaves the block without a
+              ;; required attribute and the chunk is rejected.
+              tx-data (vec (concat [[:db/retract block-ref :block/updated-at 1]]
+                                   filler
+                                   [[:db/add block-ref :block/updated-at 2]]))
+              tx-entry {:tx (protocol/tx->transit tx-data)
+                        :tx-id (random-uuid)
+                        :outliner-op :save-block}
+              self #js {:sql sql
+                        :conn conn
+                        :schema-ready true}
+              tx-report-count (atom 0)
+              response (try
+                         (d/listen! conn ::replacement-chunks
+                                    (fn [_tx-report]
+                                      (swap! tx-report-count inc)))
+                         (with-redefs [ws/broadcast! (fn [& _] nil)]
+                           (sync-handler/handle-tx-batch! self nil [tx-entry] t-before))
+                         (finally
+                           (d/unlisten! conn ::replacement-chunks)))]
+          (is (= "tx/batch/ok" (:type response)))
+          (is (= 1 @tx-report-count))
+          (is (= 2 (:block/updated-at (d/entity @conn block-ref))))
+          (is (= 72 (block-title-prefix-count @conn "replacement-filler-"))))))))
+
 (deftest tx-batch-applies-large-delete-entry-with-descendants-across-chunks-test
   (testing "delete-blocks descendant expansion is still applied in ordered chunks"
     (with-memory-sql
@@ -3273,7 +3371,10 @@
                               ([self* conn* entry context]
                                (if (= 6 (swap! apply-attempts inc))
                                  (throw (js/Error. "simulated Durable Object reset"))
-                                 (apply-entry* self* conn* entry context))))
+                                 ;; The CLJS multi-arity dispatcher consults the
+                                 ;; var again; call it with its original binding.
+                                 (with-redefs [sync-handler/apply-tx-entry! apply-entry*]
+                                   (apply-entry* self* conn* entry context)))))
                             ws/broadcast! (fn [& _] nil)]
                 (sync-handler/handle-tx-batch!
                  #js {:sql sql :conn conn :schema-ready true}

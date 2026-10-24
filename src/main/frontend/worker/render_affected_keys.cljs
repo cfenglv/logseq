@@ -413,15 +413,13 @@
         (values (:block/tags source))))
 
 (defn- bidirectional-property?
-  [db attr enabled-class-ids]
+  [db attr]
   (when (and (qualified-keyword? attr)
              (string/includes? (namespace attr) ".property"))
-    (let [property (entity-at db attr)
-          property-class-ids (into #{} (keep :db/id)
-                                   (values (:logseq.property/classes property)))]
+    (let [property (entity-at db attr)]
       (and (= :db.type/ref (:db/valueType property))
            (not (recycled? property))
-           (some property-class-ids enabled-class-ids)))))
+           (seq (:logseq.property/classes property))))))
 
 (defn- bidirectional-target-uuids
   [db source-id]
@@ -435,7 +433,7 @@
       (into #{}
             (comp
              (filter (fn [[attr _]]
-                       (bidirectional-property? db attr enabled-class-ids)))
+                       (bidirectional-property? db attr)))
              (mapcat (comp values val))
              (keep (fn [target]
                      (when (and (not= source-id (:db/id target))

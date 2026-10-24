@@ -6,8 +6,9 @@
             [clojure.string :as string]
             [dommy.core :as d]
             [electron.ipc :as ipc]
-            [frontend.components.avatar :as avatar]
-            [frontend.components.block :as component-block]
+            [frontend.components.user-profile :as user-profile]
+            [frontend.components.block.breadcrumb :as block-breadcrumb]
+            [frontend.components.block.breadcrumb-model :as breadcrumb-model]
             [frontend.components.email :as email-component]
             [frontend.components.export :as export]
             [frontend.components.page-menu :as page-menu]
@@ -27,12 +28,12 @@
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.route :as route-handler]
             [frontend.handler.user :as user-handler]
+            [frontend.handler.user-profile :as profile-handler]
             [frontend.mobile.util :as mobile-util]
             [frontend.rfx :as rfx]
             [frontend.state :as state]
             [frontend.ui :as ui]
             [frontend.util :as util]
-            [frontend.util.email :as email-util]
             [frontend.util.entity :as entity]
             [frontend.version :refer [version]]
             [logseq.common.config :as common-config]
@@ -66,16 +67,29 @@
               graph))
           (state/get-repos))))
 
+(defn <load-rtc-graph-uuid
+  [repo db-worker-ready?]
+  (when (and repo db-worker-ready?)
+    (state/<invoke-db-worker :thread-api/get-rtc-graph-uuid repo)))
+
 (defn- use-db-rtc-uuid
   [repo]
-  (let [[db-rtc-uuid set-db-rtc-uuid!] (hooks/use-state nil)]
+  (let [[db-rtc-uuid set-db-rtc-uuid!] (hooks/use-state nil)
+        db-worker-ready? (hooks/use-atom-value state/db-worker-ready?)]
     (hooks/use-effect!
      (fn []
-       (when repo
-         (p/let [graph-uuid (state/<invoke-db-worker :thread-api/get-rtc-graph-uuid repo)]
-           (set-db-rtc-uuid! graph-uuid)))
-       nil)
-     [repo])
+       (if-let [rtc-graph-uuid-request (<load-rtc-graph-uuid repo db-worker-ready?)]
+         (let [cancelled? (atom false)]
+           (-> rtc-graph-uuid-request
+               (p/then (fn [graph-uuid]
+                         (when-not @cancelled?
+                           (set-db-rtc-uuid! graph-uuid))))
+               (p/catch (fn [_] nil)))
+           #(reset! cancelled? true))
+         (do
+           (set-db-rtc-uuid! nil)
+           nil)))
+     [repo db-worker-ready?])
     db-rtc-uuid))
 
 (defn- current-remote-rtc-graph
@@ -107,7 +121,6 @@
 (hsx/defc rtc-collaborators
   []
   (let [rtc-graph-id (use-db-rtc-uuid (state/get-current-repo))
-        config (rfx/use-sub [:config])
         online-users (rfx/use-sub [:rtc/state :online-users])]
     (when rtc-graph-id
       [:div.rtc-collaborators.flex.gap-1.text-sm.bg-gray-01.items-center
@@ -122,17 +135,14 @@
        (when (seq online-users)
          (for [{user-email :user/email
                 user-name :user/name
-                user-uuid :user/uuid} online-users
+                user-uuid :user/uuid :as user} online-users
                :when user-name
                :let [key (str "rtc-user-" (or user-uuid user-email user-name))]]
            ^{:key key}
            [:<>
-            (avatar/user-avatar
+            (user-profile/user-avatar user
              {:class "w-5 h-5"
               :style {:app-region "no-drag"}
-              :title (email-util/display-email user-email config)
-              :name user-name
-              :uuid user-uuid
               :fallback-props {:style {:font-size 11}}})]))])))
 
 (hsx/defc left-menu-button
@@ -232,9 +242,20 @@
                      :icon (ui/icon "user")})
 
                   (when login? {:hr true})
+                  (when (and login? (profile-handler/current-context))
+                    {:title (t :account/profile)
+                     :options {:on-click user-profile/open!}
+                     :icon (ui/icon "user-edit")})
                   (when login?
                     {:item [:span.flex.flex-col.relative.group.pt-1.w-full
-                            [:b.leading-none (user-handler/username)]
+                            [:span.flex.items-center.gap-2
+                             (user-profile/user-avatar {:user/uuid (user-handler/user-uuid)
+                                                        :user/name (user-handler/username)
+                                                        :user/email (user-handler/email)}
+                                                       {:class "w-6 h-6" :tooltip? false})
+                             [:b.leading-none (user-profile/name-label {:user/uuid (user-handler/user-uuid)
+                                                                       :user/name (user-handler/username)
+                                                                       :user/email (user-handler/email)})]]
                             [:small.opacity-70
                              (email-component/email-address {:email (user-handler/email)})]
                             (ui/tooltip
@@ -466,16 +487,24 @@
 
 (hsx/defc ready-block-breadcrumb
   [page-uuid]
-  (let [page (db-hooks/use-block page-uuid)]
-    (when page
-      (when (and (entity/page? page) (:block/parent page))
-        [:div.ls-block-breadcrumb
-         [:div.text-sm
-          (component-block/breadcrumb {}
-                                      (state/get-current-repo)
-                                      (:block/uuid page)
-                                      {:header? true
-                                       :block page})]]))))
+  (let [page (db-hooks/use-block page-uuid)
+        breadcrumb-data (db-hooks/use-resource [:block-breadcrumb page-uuid 16])
+        page-with-breadcrumb (when (and page breadcrumb-data)
+                               (assoc page
+                                      :block.temp/breadcrumb
+                                      (breadcrumb-model/resource-ancestors breadcrumb-data)
+                                      :block.temp/breadcrumb-ref-titles
+                                      (:ref-titles breadcrumb-data)))]
+    (when (and page-with-breadcrumb
+               (entity/page? page-with-breadcrumb)
+               (:block/parent page-with-breadcrumb))
+      [:div.ls-block-breadcrumb
+       [:div.text-sm
+        (block-breadcrumb/breadcrumb {}
+                                    (state/get-current-repo)
+                                    (:block/uuid page-with-breadcrumb)
+                                    {:header? true
+                                     :block page-with-breadcrumb})]])))
 
 (hsx/defc block-breadcrumb
   [page-name]

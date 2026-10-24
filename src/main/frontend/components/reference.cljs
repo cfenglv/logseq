@@ -52,14 +52,16 @@
   [page-uuid config]
   (let [page-entity (db-hooks/use-block page-uuid)
         refs-total-count (db-hooks/use-resource [:block-ref-count page-uuid])]
-    (when (and page-entity
-               (number? refs-total-count)
-               (pos? refs-total-count))
+    (when (and page-entity (number? refs-total-count)
+               (or (pos? refs-total-count) (:logseq.property/literature-item? page-entity)))
       (ui/catch-error
        (ui/component-error
         "Linked References: Unexpected error.")
        [:div.references
-        (references-aux page-entity (assoc config :refs-total-count refs-total-count))]))))
+        (if (pos? refs-total-count)
+          (references-aux page-entity (assoc config :refs-total-count refs-total-count))
+          [:div.flex.items-center.gap-2.text-sm.text-muted-foreground
+           (t :view/linked-references) [:span refs-total-count]])]))))
 
 (hsx/defc unlinked-references
   [page-uuid config]

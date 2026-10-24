@@ -1,7 +1,7 @@
 (ns frontend.components.block.comments
   (:require [clojure.string :as string]
             [dommy.core :as dom]
-            [frontend.components.avatar :as avatar]
+            [frontend.components.user-profile :as user-profile]
             [frontend.components.block.comments-model :as comments-model]
             [frontend.components.icon :as icon-component]
             [frontend.config :as config]
@@ -324,6 +324,8 @@
    {:keys [block-content-or-editor block-reactions]}]
   (let [[editing? set-editing!] (hooks/use-state false)
         {:keys [author avatar-src author-uuid body created-at]} (comments-model/comment-row comment-block)
+        display (user-profile/use-display {:user/uuid author-uuid :user/name author :avatar-src avatar-src}
+                                          (not (:publishing? config)))
         show-author? (comments-model/comment-author-visible? current-user-uuid)
         comment-uuid (:block/uuid comment-block)
         edit-input-id (str "edit-block-" comment-uuid)
@@ -334,16 +336,13 @@
         placeholder (t :block.comments/placeholder)]
     [:div.ls-comment-row
      (when show-author?
-       (avatar/user-avatar
+       (user-profile/avatar-view display
         {:class "ls-comment-avatar"
-         :title author
-         :name author
-         :uuid author-uuid
-         :avatar-src avatar-src}))
+         :tooltip? false}))
      [:div.ls-comment-main
       [:div.ls-comment-meta
        (when show-author?
-         [:span.ls-comment-author author])
+         [:span.ls-comment-author (:name display)])
        (when time-label
          [:span.ls-comment-time {:title time-title} time-label])]
       (if editing?
