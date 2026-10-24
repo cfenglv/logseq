@@ -26,7 +26,7 @@ const releasePolicy = readReleasePolicy(
 const releaseId = 424242;
 const sourceFullSha = "a".repeat(40);
 const replacementSourceFullSha = "b".repeat(40);
-const targetVersion = "2.0.2-selfhost.1";
+const targetVersion = releasePolicy.sourceVersion;
 
 function digest(bytes) {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;

@@ -304,7 +304,7 @@ test("electron-updater GitHubProvider resolves six latest channels and exact sig
 
 test("native AppUpdater accepts newer versions and rejects invalid versions or downgrades", async () => {
   const updater = {
-    currentVersion: parse("2.0.1-selfhost.7"),
+    currentVersion: parse("2.0.2-selfhost.1"),
     allowDowngrade: false,
     isUpdateSupported: () => true,
     isUserWithinRollout: () => true,
@@ -314,12 +314,15 @@ test("native AppUpdater accepts newer versions and rejects invalid versions or d
   }), true);
   updater.currentVersion = parse(releasePolicy.sourceVersion);
   assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
+    version: releasePolicy.sourceVersion,
+  }), false);
+  assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
     version: releasePolicy.syntheticForwardTargetVersion,
   }), true);
   for (const version of ["2.0.3-selfhost.1", "2.1.0-selfhost.1"])
     assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, { version }), true);
   assert.equal(await AppUpdater.prototype.isUpdateAvailable.call(updater, {
-    version: "2.0.1-selfhost.7",
+    version: "2.0.2-selfhost.1",
   }), false);
   await assert.rejects(AppUpdater.prototype.isUpdateAvailable.call(updater, {
     version: "invalid",

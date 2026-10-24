@@ -1206,6 +1206,7 @@
  :literature.organization/privacy-description "仅查询 DOI/arXiv，不上传 PDF。"
  :literature.organization/resume-action "继续自动入库"
  :literature.organization/summary "已处理 {1} · 入库 {2} · 待确认 {3}"
+ :literature.organization/sync-repair-paused-status "同步修复未完成，导入已暂停"
  :literature.organization/title "自动识别文献信息并入库"
  :literature.organization/unavailable-count "附件未就绪 {1}"
 

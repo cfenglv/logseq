@@ -93,6 +93,7 @@ function fixture(context, mode) {
     "scripts/lib/selfhost6-update-feed.mjs",
     "resources/updater/project-update-signature.mjs",
     "resources/updater/selfhost-release-policy.json",
+    `docs/releases/${version}.md`,
   ];
   for (const name of files) {
     const destination = path.join(root, "release-source", name);
@@ -145,6 +146,7 @@ function fixture(context, mode) {
     "needs.selfhost-release-verifier.outputs.product-source-sha": newSource,
     "env.SELFHOST6_TARGET_VERSION": version,
     "steps.publish-draft.outputs.id": String(releaseId),
+    "steps.draft-inputs.outputs.release-notes-path": "",
     ...Object.fromEntries(Object.entries(secrets).map(([key, value]) => [`secrets.${key}`, value])),
   };
   const expand = (value) => String(value).replace(/\$\{\{\s*(.*?)\s*\}\}/g, (_, key) => {
@@ -159,20 +161,32 @@ function fixture(context, mode) {
       PATH: `${path.join(root, "bin")}${path.delimiter}${process.env.PATH}`,
       GH_TOKEN: "synthetic-token", GITHUB_REPOSITORY: "example/release-fixture",
       RUNNER_TEMP: path.join(root, "temp"), SELFHOST6_TARGET_VERSION: version,
+      GITHUB_OUTPUT: path.join(root, "github-output"),
       DRAFT_TEST_CONTENTS_PERMISSION: workflow.jobs["selfhost-release"].permissions.contents,
       DRAFT_TEST_STATE: statePath,
       ...Object.fromEntries(Object.entries(step.env ?? {}).map(([key, value]) => [key, expand(value)])),
     };
-    return spawnSync("bash", ["-e", "-o", "pipefail", "-c", expand(step.run)], {
+    const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", expand(step.run)], {
       cwd: root, env, encoding: "utf8", timeout: 15000,
     });
+    if (step === before && result.status === 0) {
+      const output = env.GITHUB_OUTPUT;
+      const entry = fs.existsSync(output) && fs.readFileSync(output, "utf8")
+        .split("\n").find((line) => line.startsWith("release-notes-path="));
+      expressions["steps.draft-inputs.outputs.release-notes-path"] = entry ? entry.slice("release-notes-path=".length) : "";
+    }
+    return result;
   };
   const json = (name) => JSON.parse(fs.readFileSync(path.join(root, "temp", name), "utf8"));
   const deletionList = () => fs.readFileSync(path.join(root, "temp/selfhost-draft-obsolete-asset-ids.txt"), "utf8");
   const action = () => {
     assert.equal(publish.uses, "softprops/action-gh-release@v2");
     assert.equal(publish.with.body, undefined, "the action must preserve edited release notes");
-    assert.equal(publish.with.body_path, undefined, "the action must not replace edited release notes");
+    assert.equal(before.id, "draft-inputs");
+    assert.equal(publish.with.body_path, "${{ steps.draft-inputs.outputs.release-notes-path }}");
+    const notesPath = expand(publish.with.body_path);
+    assert.equal(notesPath, mode === "create" ? `release-source/docs/releases/${version}.md` : "",
+      "only first creation may supply release notes");
     for (const [key, value] of Object.entries({ draft: true, prerelease: false, make_latest: false,
       fail_on_unmatched_files: true, overwrite_files: true })) assert.equal(publish.with[key], value);
     const names = expand(publish.with.files).trim().split(/\s+/).map((name) => path.basename(name));
@@ -184,6 +198,10 @@ function fixture(context, mode) {
     if (!target) {
       target = { ...release, target_commitish: newSource, body: null };
       current.releases.push(target);
+    }
+    if (notesPath) {
+      target.body = fs.readFileSync(path.join(root, notesPath), "utf8");
+      assert.ok(target.body.trim(), "new Draft release notes must not be empty");
     }
     Object.assign(target, { assets, name: expand(publish.with.name),
       target_commitish: expand(publish.with.target_commitish) });
@@ -214,7 +232,7 @@ function verifyCompleted(input, expectedBody = releaseNotes) {
   assert.equal(input.state().calls.some(({ method }) => method === "POST"), false);
 }
 
-test("actual Draft workflow: absent target creates a new Draft and passes its ID downstream", (context) => {
+test("actual Draft workflow: absent target creates a new Draft with release notes and passes its ID downstream", (context) => {
   const input = fixture(context, "create");
   success(input.run(before));
   assert.deepEqual(input.json("selfhost-draft-tag-refs-before.json"), []);
@@ -223,7 +241,15 @@ test("actual Draft workflow: absent target creates a new Draft and passes its ID
   success(input.run(remove));
   assert.equal(input.state().calls.every(({ method }) => method === "GET"), true);
   input.action();
-  verifyCompleted(input, null);
+  verifyCompleted(input, fs.readFileSync(path.join(repoRoot, `docs/releases/${version}.md`), "utf8"));
+});
+
+test("actual Draft workflow: missing release notes stop first creation before any mutation", (context) => {
+  const input = fixture(context, "create");
+  fs.unlinkSync(path.join(input.root, `release-source/docs/releases/${version}.md`));
+  assert.equal(input.run(before).status, 1);
+  assert.equal(input.state().calls.every(({ method }) => method === "GET"), true);
+  assert.deepEqual(input.state().releases, [input.oldRelease]);
 });
 
 test("actual Draft workflow: frozen target replaces only obsolete assets and remains a Draft", (context) => {
@@ -298,33 +324,21 @@ test("actual Draft workflow: absent or partial binding cannot adopt an existing 
   }
 });
 
-test("actual bridge input workflow: protected Draft access downloads and verifies all thirty-five files", (context) => {
+test("actual Draft workflow: current release cannot invoke legacy bridge inputs", (context) => {
   const input = fixture(context, "replace");
-  for (const name of ["scripts", "resources"]) fs.cpSync(
-    path.join(input.root, "release-source", name), path.join(input.root, name), { recursive: true });
-  input.action();
   const originalReleases = input.state().releases;
   const job = workflow.jobs["selfhost-bridge-build-inputs"];
+  assert.equal(job.permissions.contents, "write");
   const download = job.steps.find(({ name }) => name === "Download and verify the existing final Draft");
-  const run = (permission) => input.run({
+  const result = input.run({
     ...download,
     env: {
       ...download.env,
       SELFHOST_DRAFT_RELEASE_ID: String(releaseId), FINAL_SOURCE_FULL_SHA: newSource,
-      DRAFT_TEST_CONTENTS_PERMISSION: permission,
-      DRAFT_TEST_DOWNLOAD_DIRECTORY: path.join(input.root, "release-assets"),
     },
   });
-  const denied = run("read");
-  assert.equal(denied.status, 1);
-  assert.match(denied.stderr, /Resource not accessible by integration \(HTTP 403\)/);
+  assert.equal(result.status, 1);
   assert.equal(fs.existsSync(path.join(input.root, "final-release-assets")), false);
-  const result = run(job.permissions.contents);
-  success(result);
-  assert.deepEqual(JSON.parse(result.stdout), { status: "draft-staging-verified" });
-  assert.deepEqual(fs.readdirSync(path.join(input.root, "final-release-assets")).sort(),
-    input.assets.map(({ name }) => name).sort());
-  assert.equal(input.state().calls.filter(({ method }) => method === "DOWNLOAD").length, 1);
-  assert.equal(input.state().calls.every(({ method }) => method === "GET" || method === "DOWNLOAD"), true);
+  assert.deepEqual(input.state().calls, []);
   assert.deepEqual(input.state().releases, originalReleases);
 });

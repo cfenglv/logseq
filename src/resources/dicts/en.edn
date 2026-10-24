@@ -1206,6 +1206,7 @@
  :literature.organization/privacy-description "Queries DOI/arXiv metadata without uploading PDFs."
  :literature.organization/resume-action "Continue auto-import"
  :literature.organization/summary "Checked {1} · Added {2} · Review {3}"
+ :literature.organization/sync-repair-paused-status "Paused: sync repair is incomplete"
  :literature.organization/title "Auto-fill metadata and add PDFs"
  :literature.organization/unavailable-count "Files unavailable: {1}"
 

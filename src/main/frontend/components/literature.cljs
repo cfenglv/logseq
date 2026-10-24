@@ -625,8 +625,10 @@
             :paused
             [:<>
              [:span.opacity-60
-              (t (if (= :metadata-unavailable (:reason task))
-                   :literature.organization/network-paused :literature.organization/paused))]
+              (t (case (:reason task)
+                   :metadata-unavailable :literature.organization/network-paused
+                   :repair-active :literature.organization/sync-repair-paused-status
+                   :literature.organization/paused))]
              (shui/button {:variant :ghost :size :sm :data-literature-organize-resume true
                            :on-click #(<start-organization! repo (:allow-online? task))}
                           (ui/icon "player-play" {:size 16})
@@ -644,13 +646,15 @@
       (contains? #{:pending :retrying :busy} status) {:i18n-key :asset.literature/identification-pending}
       (= :file-not-local reason) {:i18n-key :literature.organization/file-unavailable}
       (= :metadata-unavailable reason) {:i18n-key :literature.organization/network-paused}
+      (= :repair-active reason) {:i18n-key :literature.organization/sync-repair-paused-status}
       (= :password reason) {:i18n-key :literature/pending-password}
       (contains? #{:parse-error :read-error :pdfjs-unavailable} reason) {:i18n-key :literature/pending-unreadable}
       (and review (not= :not-run status)) {:i18n-key :literature/pending-status})))
 
 (hsx/defc unregistered-pdfs
   [repo]
-  (let [[result set-result!] (hooks/use-state {:status :loading :assets []})
+  (let [_language (rfx/use-sub [:preferred-language])
+        [result set-result!] (hooks/use-state {:status :loading :assets []})
         local-reviews (rfx/use-sub [:literature/review-candidates repo])
         [include-kept? set-include-kept!] (hooks/use-state false)
         *request-id (hooks/use-memo #(atom 0) [])

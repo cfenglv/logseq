@@ -869,6 +869,9 @@ async function startGraph({ storage, repo, script, owner = 'cli', createEmpty = 
       if (createEmpty) args.push('--create-empty-db');
       args.push(...extraArgs);
       const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1' };
+      // Native fetch supports HTTP(S) proxies, not SOCKS settings.
+      const proxies = [env.http_proxy, env.HTTP_PROXY, env.https_proxy, env.HTTPS_PROXY].filter(Boolean);
+      if (owner === 'electron' && proxies.every(proxy => /^https?:\/\//i.test(proxy))) env.NODE_USE_ENV_PROXY = '1';
       if (owner === 'electron' && !extraArgs.includes('--embedding-endpoint')) delete env.LOGSEQ_EMBEDDINGS_URL;
       const child = cp.spawn(process.execPath, args, { detached: owner !== 'electron',
         stdio: 'ignore', env });

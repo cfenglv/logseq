@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -27,6 +28,26 @@ import {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const policyPath = path.join(repoRoot, "resources/updater/selfhost-release-policy.json");
+
+test("candidate version CLI writes the current and synthetic identities", (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "candidate-version-entry-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const script = path.join(root, "scripts/selfhost6/set-candidate-version.mjs");
+  const source = path.join(root, "src/main/frontend/version.cljs");
+  fs.mkdirSync(path.dirname(script), { recursive: true });
+  fs.mkdirSync(path.dirname(source), { recursive: true });
+  fs.copyFileSync(path.join(repoRoot, "scripts/selfhost6/set-candidate-version.mjs"), script);
+  fs.copyFileSync(path.join(repoRoot, "src/main/frontend/version.cljs"), source);
+  const policy = readReleasePolicy(policyPath);
+  for (const version of [policy.syntheticForwardTargetVersion, policy.sourceVersion]) {
+    const result = spawnSync(process.execPath, [script, "--version", version], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(fs.readFileSync(source, "utf8").includes(`(defonce version "${version}")`));
+  }
+  const current = fs.readFileSync(source, "utf8");
+  assert.notEqual(spawnSync(process.execPath, [script, "--version", "invalid"]).status, 0);
+  assert.equal(fs.readFileSync(source, "utf8"), current);
+});
 
 test("source and synthetic forward versions bind only the final public source identity", () => {
   const policy = readReleasePolicy(policyPath);
@@ -60,8 +81,8 @@ test("source and synthetic forward versions bind only the final public source id
   };
   const source = buildTargetManifest({ ...common, targetVersion: policy.sourceVersion });
   const target = buildTargetManifest({ ...common, targetVersion: policy.syntheticForwardTargetVersion });
-  assert.equal(policy.sourceVersion, "2.0.2-selfhost.1");
-  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.2");
+  assert.equal(policy.sourceVersion, "2.0.2-selfhost.2");
+  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.3");
   assert.equal(source["release-line-id"], target["release-line-id"]);
   assert.equal(source["target-source-full-sha"], target["target-source-full-sha"]);
   assert.equal(source["target-source-full-sha"], finalPublicSourceSha);
@@ -186,7 +207,7 @@ test("packaging configuration requires the generated target manifest", () => {
   const builder = fs.readFileSync(path.join(repoRoot, "resources/electron-builder.yml"), "utf8");
   assert.match(builder, /from: updater\/TARGET_BUILD_MANIFEST\.json\n\s+to: updater\/TARGET_BUILD_MANIFEST\.json/);
   const version = fs.readFileSync(path.join(repoRoot, "src/main/frontend/version.cljs"), "utf8");
-  assert.match(version, /defonce version "2\.0\.2-selfhost\.1"/);
+  assert.match(version, /defonce version "2\.0\.2-selfhost\.2"/);
   const gulpfile = fs.readFileSync(path.join(repoRoot, "gulpfile.js"), "utf8");
   assert.ok(gulpfile.includes('match(/defonce version "([^"]+)"/)?.[1]'));
 });

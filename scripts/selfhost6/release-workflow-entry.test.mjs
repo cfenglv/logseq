@@ -14,6 +14,24 @@ const workflow = parse(fs.readFileSync(path.join(repo, ".github/workflows/build-
 const sourceSha = "b".repeat(40);
 const hash = (algorithm, payload) => createHash(algorithm).update(payload).digest(algorithm === "sha512" ? "base64" : "hex");
 
+test("current Draft routing preserves every release gate and excludes bridge and upstream builds", () => {
+  const ref = `release/${workflow.env.SELFHOST6_TARGET_VERSION}`;
+  const values = {
+    "github.event_name": "workflow_dispatch", "github.ref_name": ref,
+    "github.event.inputs.git-ref": ref, "github.event.inputs.build-target": "stable",
+    "github.event.inputs.selfhost-operation": "stage-draft", "github.event.inputs.is-draft": "true",
+    "github.event.inputs.build-android": "false",
+  };
+  const enabled = (name) => Function(`return (${workflow.jobs[name].if.slice(3, -2)
+    .replace(/github\.[\w.-]+/g, (key) => { assert.ok(Object.hasOwn(values, key), key); return JSON.stringify(values[key]); })})`)();
+  for (const name of ["resolve-release-source", "selfhost-release"]) assert.equal(enabled(name), true, name);
+  for (const name of ["upstream-compile-cljs", "build-android", "selfhost-bridge-build-inputs", "selfhost-release-bridge"])
+    assert.equal(enabled(name), false, name);
+  assert.deepEqual(workflow.jobs["release-source-gate"].needs, ["resolve-release-source", "source-preflight"]);
+  assert.deepEqual(workflow.jobs["compile-cljs"].needs, ["release-source-gate", "rtc-browser-e2e"]);
+  assert.deepEqual(workflow.jobs["selfhost-release"].needs, ["release-source-gate", "selfhost-release-verifier"]);
+});
+
 test("actual release signing shell hands its 35 files to both verifier CLI entries", async (context) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "release-workflow-entry-")));
   context.after(() => fs.rmSync(root, { recursive: true, force: true }));
