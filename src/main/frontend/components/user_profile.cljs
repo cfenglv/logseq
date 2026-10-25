@@ -91,6 +91,43 @@
   (assoc (select-keys saved [:display-name :avatar-png-base64 :email :username])
          :expected-revision (:profile-revision saved)))
 
+(hsx/defc profile-fields
+  [{:keys [draft default-display preview disabled? image-loading? file-input file-selection
+           set-image-loading! set-draft! select-image! choose-image!]}]
+  [:<>
+   [:div.flex.items-center.gap-4
+    [:button.relative.inline-flex.flex-none.rounded-full
+     {:type "button" :disabled disabled? :aria-label (t :account/profile-change-avatar-action)
+      :on-click choose-image!}
+     (avatar-view preview {:class "w-16 h-16" :fallback-props {:style {:font-size 22}} :tooltip? false})
+     [:span.absolute.flex.h-6.w-6.items-center.justify-center.rounded-full.border.border-input.bg-background
+      {:class "-bottom-0.5 -right-0.5" :aria-hidden true} (ui/icon "camera" {:size 14})]]
+    [:div.flex.flex-col.gap-2
+     [:div.flex.items-center.gap-2
+      (shui/button {:type "button" :variant :outline :size :sm :disabled disabled?
+                    :on-click choose-image!}
+                   (t :account/profile-change-avatar-action))
+      (when (:avatar-png-base64 draft)
+        (shui/button {:type "button" :variant :ghost :size :sm :disabled disabled?
+                      :on-click #(do (hooks/set-ref! file-selection nil)
+                                     (set-image-loading! false)
+                                     (set-draft! (assoc draft :avatar-png-base64 nil)))}
+                     (t :account/profile-remove-avatar-action)))]
+     [:p.text-xs.opacity-60 (t :account/profile-avatar-hint)]
+     (when image-loading? [:p.text-xs (t :ui/loading)])]
+    [:input.hidden {:ref file-input :type "file" :accept "image/png,image/jpeg,image/webp"
+                    :disabled disabled? :on-change select-image!}]]
+   [:div.flex.flex-col.gap-2
+    [:label.flex.flex-col.gap-2.text-sm.font-medium
+     (t :account/profile-display-name-label)
+     (shui/input {:value (or (:display-name draft) "") :disabled disabled?
+                  :placeholder (:name default-display)
+                  :on-change #(set-draft! (assoc draft :display-name (util/evalue %)))})]
+    [:p.text-xs.opacity-60 (t :account/profile-display-name-hint)]]
+   [:div.flex.flex-col.gap-2.text-sm
+    [:span.font-medium (t :account/email)]
+    (email-component/email-address {:email (:email draft) :class "opacity-70"})]])
+
 (hsx/defc profile-editor []
   (let [context (rfx/use-sub [:user-profile/state :context])
         config (rfx/use-sub [:config])
@@ -174,39 +211,10 @@
     [:form.ls-user-profile.flex.w-full.max-w-md.flex-col.gap-6 {:on-submit save!}
      (if loading?
        [:p (t :ui/loading)]
-       [:<>
-        [:div.flex.items-center.gap-4
-         [:button.relative.inline-flex.flex-none.rounded-full
-          {:type "button" :disabled disabled? :aria-label (t :account/profile-change-avatar-action)
-           :on-click choose-image!}
-          (avatar-view preview {:class "w-16 h-16" :fallback-props {:style {:font-size 22}} :tooltip? false})
-          [:span.absolute.flex.h-6.w-6.items-center.justify-center.rounded-full.border.border-input.bg-background
-           {:class "-bottom-0.5 -right-0.5" :aria-hidden true} (ui/icon "camera" {:size 14})]]
-         [:div.flex.flex-col.gap-2
-          [:div.flex.items-center.gap-2
-           (shui/button {:type "button" :variant :outline :size :sm :disabled disabled?
-                         :on-click choose-image!}
-                        (t :account/profile-change-avatar-action))
-           (when (:avatar-png-base64 draft)
-             (shui/button {:type "button" :variant :ghost :size :sm :disabled disabled?
-                           :on-click #(do (hooks/set-ref! file-selection nil)
-                                          (set-image-loading! false)
-                                          (set-draft! (assoc draft :avatar-png-base64 nil)))}
-                          (t :account/profile-remove-avatar-action)))]
-          [:p.text-xs.opacity-60 (t :account/profile-avatar-hint)]
-          (when image-loading? [:p.text-xs (t :ui/loading)])]
-         [:input.hidden {:ref file-input :type "file" :accept "image/png,image/jpeg,image/webp"
-                         :disabled disabled? :on-change select-image!}]]
-        [:div.flex.flex-col.gap-2
-         [:label.flex.flex-col.gap-2.text-sm.font-medium
-          (t :account/profile-display-name-label)
-          (shui/input {:value (or (:display-name draft) "") :disabled disabled?
-                       :placeholder (:name default-display)
-                       :on-change #(set-draft! (assoc draft :display-name (util/evalue %)))})]
-         [:p.text-xs.opacity-60 (t :account/profile-display-name-hint)]]
-        [:div.flex.flex-col.gap-2.text-sm
-         [:span.font-medium (t :account/email)]
-         (email-component/email-address {:email (:email draft) :class "opacity-70"})]])
+       (profile-fields {:draft draft :default-display default-display :preview preview :disabled? disabled?
+                        :image-loading? image-loading? :file-input file-input :file-selection file-selection
+                        :set-image-loading! set-image-loading! :set-draft! set-draft!
+                        :select-image! select-image! :choose-image! choose-image!}))
      (when error [:p.text-sm.text-red-rx-09 {:role "alert"} error])
      [:div.flex.justify-end.gap-2
       (shui/button {:type "button" :variant :ghost :size :sm
