@@ -209,7 +209,7 @@ test("candidate workflow builds only the frozen desktop matrix and never publish
     "linux-arm64",
   ]);
   assert.match(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /options:\n\s+- 2\.0\.2-selfhost\.2\n\s+- 2\.0\.2-selfhost\.3/);
+  assert.match(workflow, /options:\n\s+- 2\.0\.2-selfhost\.3\n\s+- 2\.0\.2-selfhost\.4/);
   assert.match(workflow, /permissions:\n\s+contents: read/);
   assert.match(workflow, /environment: selfhost-release-signing/);
   assert.equal((workflow.match(/LOGSEQ_PROJECT_UPDATE_SIGNING_KEY_PKCS8_BASE64/g) ?? []).length, 2);
@@ -225,10 +225,10 @@ test("the mature desktop action stages one complete traditional draft and stops"
   )[0];
   assert.match(legacyWorkflow, /name: Build-Desktop-Release/);
   assert.equal((legacyWorkflow.match(/^name: Build-Desktop-Release$/gm) ?? []).length, 1);
-  assert.match(legacyWorkflow, /SELFHOST6_TARGET_VERSION: '2\.0\.2-selfhost\.2'/);
+  assert.match(legacyWorkflow, /SELFHOST6_TARGET_VERSION: '2\.0\.2-selfhost\.3'/);
   assert.match(legacyWorkflow, /selfhost-operation:[\s\S]*stage-draft[\s\S]*bridge-published-\.7/);
   assert.match(selfhostReleaseJobs, /selfhost-operation == 'stage-draft'/);
-  assert.match(selfhostReleaseJobs, /github\.ref_name == 'release\/2\.0\.2-selfhost\.2'/);
+  assert.match(selfhostReleaseJobs, /github\.ref_name == 'release\/2\.0\.2-selfhost\.3'/);
   const bridgeJob = legacyWorkflow.split('\n  selfhost-release-bridge:')[1];
   assert.match(bridgeJob, /test "\$\{SELFHOST6_TARGET_VERSION\}" = '2\.0\.2-selfhost\.1'/);
   assert.match(bridgeJob, /github\.ref_name == 'release\/2\.0\.2-selfhost\.1'/);
