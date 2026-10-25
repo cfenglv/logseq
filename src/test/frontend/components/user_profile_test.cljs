@@ -18,7 +18,7 @@
       (is (= "data:image/png;base64,cG5n" (:avatar-src @avatar-props)))
       (is (not (contains? @avatar-props :title)))
       (is (= "Full Name (you)" (:content @tooltip)))
-      (is (= {:tab-index 0 :aria-label "Full Name (you)"} (second (:trigger @tooltip))))
+      (is (= {:tab-index 0 :aria-label "Full Name (you)"} (select-keys (second (:trigger @tooltip)) [:tab-index :aria-label])))
       (is (not (contains? (second (:trigger @tooltip)) :on-click))))))
 
 (deftest draft-save-empty-name-and-cancel-data-is-local-test

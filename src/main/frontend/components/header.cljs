@@ -252,7 +252,7 @@
                              (user-profile/user-avatar {:user/uuid (user-handler/user-uuid)
                                                         :user/name (user-handler/username)
                                                         :user/email (user-handler/email)}
-                                                       {:class "w-6 h-6" :tooltip? false})
+                                                       {:class "w-6 h-6" :fallback-props {:style {:font-size 12}} :tooltip? false})
                              [:b.leading-none (user-profile/name-label {:user/uuid (user-handler/user-uuid)
                                                                        :user/name (user-handler/username)
                                                                        :user/email (user-handler/email)})]]

@@ -1358,7 +1358,7 @@
                 can-remove? (and manager? member?)]
             [:div.flex.flex-row.items-center.gap-2
              {:key (str "user-" (or user-uuid user-name))}
-             (user-profile/user-avatar user {:class "w-6 h-6" :tooltip? false})
+             (user-profile/user-avatar user {:class "w-6 h-6" :fallback-props {:style {:font-size 12}} :tooltip? false})
              [:div (user-profile/name-label user)]
              (when user-email
                (email-component/email-address {:email user-email
@@ -1871,13 +1871,15 @@
      (fn []
        (state/load-app-user-cfgs)
        (state/load-electron-app-base-info)
-       (let [active-tab (if (and (= _active-tab :ai) (not (util/electron?)))
-                          :advanced
-                          _active-tab)]
-         (when (keyword? active-tab)
-           (reset! *active [active-tab nil])))
        #(state/close-settings!))
      [])
+    (hooks/use-effect!
+     (fn []
+       (when (keyword? _active-tab)
+         (reset! *active [(if (and (= _active-tab :ai) (not (util/electron?)))
+                           :advanced _active-tab) nil]))
+       nil)
+     [_active-tab])
 
     [:div#settings.cp__settings-main
      (settings-effect active)
@@ -1891,6 +1893,8 @@
                  [:account (t :settings/account) (ui/icon "user-circle")])
                [:general (t :settings/general) (ui/icon "adjustments")]
                [:editor (t :settings/editor) (ui/icon "writing")]
+               (when (and logged-in? (profile-handler/current-context))
+                 [:profile (t :account/profile) (ui/icon "user-circle")])
                [:keymap (t :settings/keymap) (ui/icon "keyboard")]
                (when (util/electron?)
                  [:ai (t :settings/ai) (ui/icon "wand")])
@@ -1926,7 +1930,9 @@
 
       [:article
        [:header.cp__settings-header
-        [:h1.cp__settings-category-title (t (keyword (str "settings/" (name (first active)))))]]
+        [:h1.cp__settings-category-title (if (= :profile (first active))
+                                               (t :account/profile)
+                                               (t (keyword (str "settings/" (name (first active))))))]]
 
       (case (first active)
 
@@ -1944,6 +1950,11 @@
 
         :editor
         (settings-editor)
+
+        :profile
+        (when (and logged-in? (profile-handler/current-context))
+          ^{:key identity-key}
+          [user-profile/profile-editor])
 
         :keymap
         (shortcut/shortcut-keymap-x)
