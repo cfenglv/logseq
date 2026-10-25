@@ -333,6 +333,20 @@
                  missing-uuid (conj missing-uuid))))
       (-> result distinct vec))))
 
+(defn- retryable-tx-error?
+  [error]
+  (loop [current-error error]
+    (if current-error
+      (let [data (ex-data current-error)]
+        ;; Data errors need repair, not repeated uploads. Preserve unknown
+        ;; failures in the outbox because storage can fail after any write.
+        (if (or (:error data)
+                (contains? data :errors)
+                (= :db-sync/empty-delete-tx (:type data)))
+          false
+          (recur (ex-cause current-error))))
+      true)))
+
 (def ^:private delete-outliner-ops
   #{:delete-blocks
     :delete-page})
@@ -485,11 +499,13 @@
        (import-snapshot-rows! sql "kvs" rows)))))
 
 (defn- apply-client-tx-meta
-  [request-context outliner-op]
+  [request-context {:keys [outliner-op tx-id]}]
   (cond-> (merge {:op :apply-client-tx}
                  (request-context->tx-meta request-context))
     outliner-op
     (assoc :outliner-op outliner-op)
+    tx-id
+    (assoc :tx-id tx-id)
     (= outliner-op :db-migrate)
     (assoc :db-migrate? true
            :skip-validate-db? true)))
@@ -595,7 +611,7 @@
 (defn- apply-large-tx-entry!
   [self conn tx-data {:keys [tx-id outliner-op] :as tx-entry} request-context]
   (let [db-before @conn
-        tx-meta (apply-client-tx-meta request-context outliner-op)
+        tx-meta (apply-client-tx-meta request-context {:outliner-op outliner-op :tx-id tx-id})
         sql (when self (.-sql ^js self))
         prev-t (when sql (storage/get-t sql))
         prev-checksum (when sql (storage/get-checksum sql))
@@ -641,7 +657,7 @@
                                           vec)]
                  (storage/append-tx! sql new-t
                                      (common/write-transit normalized-data)
-                                     (common/now-ms) outliner-op)
+                                     (common/now-ms) outliner-op tx-id)
                  (storage/set-t! sql new-t)))
              (storage/set-checksum!
               sql
@@ -669,7 +685,6 @@
                    :outliner-op outliner-op
                    :tx-count (count tx-data)
                    :chunk-count @chunk-count})
-        (reset! conn db-before)
         (throw error)))))
 
 (defn- upload-state-error
@@ -832,7 +847,7 @@
 (defn- sanitize-tx-entry
   [db {:keys [tx outliner-op] :as tx-entry}]
   (let [input-tx-data (or (::decoded-tx-data tx-entry)
-                          (protocol/transit->tx tx))
+                        (protocol/transit->tx tx))
         tx-data (tx-sanitize/sanitize-tx db
                                          input-tx-data
                                          {:drop-missing-retract-ops? (or (= outliner-op :fix)
@@ -844,55 +859,63 @@
      :tx-data tx-data
      :tx-entry tx-entry}))
 
+(defn- confirm-empty-tx!
+  [sql {:keys [tx-id outliner-op]}]
+  (when tx-id
+    (let [new-t (inc (storage/get-t sql))]
+      (storage/append-tx! sql new-t (protocol/tx->transit []) (common/now-ms) outliner-op tx-id)
+      (storage/set-t! sql new-t)
+      true)))
+
 (defn- apply-tx-entry!
   ([conn tx-entry]
    (apply-tx-entry! nil conn tx-entry nil))
   ([self conn {:keys [outliner-op] :as tx-entry} request-context]
    (let [db-before @conn
          sql (when self (.-sql ^js self))
-         sanitized (sanitize-tx-entry db-before tx-entry)
-         input-tx-data (:input-tx-data sanitized)
-         tx-data (:tx-data sanitized)
-         sanitized-entry (:tx-entry sanitized)]
-     (if (and (not= outliner-op :db-migrate)
-              (large-tx? tx-data))
-       (apply-large-tx-entry! self conn tx-data sanitized-entry request-context)
-       (try
-         ((if sql
-            #(storage/with-sql-transaction! sql %)
-            (fn [f] (f)))
-          (fn []
-            (let [applied?
-                  (if (seq tx-data)
-                    (try
-                      (ldb/transact! conn tx-data (apply-client-tx-meta request-context outliner-op))
-                      true
-                      (catch :default e
-                        ;; Rebase/fix txs are inferred from local history and can become stale
-                        ;; when concurrent remote edits remove referenced entities before upload.
-                        ;; Treat stale :entity-id/missing rebases/fixes as no-op so sync can continue.
-                        (if (and (contains? #{:rebase :fix} outliner-op)
-                                 (= :entity-id/missing (:error (ex-data e))))
-                          (do
-                            (log/warn :db-sync/drop-stale-rebase-tx
-                                      {:outliner-op outliner-op
-                                       :tx-data tx-data
-                                       :error (str e)})
-                            false)
-                          (throw e))))
-                    (if (and (contains? delete-outliner-ops outliner-op)
-                             (empty? input-tx-data))
-                      (throw (ex-info "delete tx input is empty"
-                                      {:type :db-sync/empty-delete-tx
-                                       :outliner-op outliner-op}))
-                      false))]
-              (when sql
-                (storage/record-applied-client-tx!
-                 sql (::identity tx-entry) (::payload-digest tx-entry)))
-              applied?)))
-         (catch :default error
-           (reset! conn db-before)
-           (throw error)))))))
+         apply-entry (fn []
+                       (let [{:keys [input-tx-data tx-data]} (sanitize-tx-entry db-before tx-entry)
+                             t-before (when sql (storage/get-t sql))
+                             large? (and (not= outliner-op :db-migrate) (large-tx? tx-data))
+                             applied? (if (seq tx-data)
+                                        (if large?
+                                          (apply-large-tx-entry! self conn tx-data tx-entry request-context)
+                                          (do
+                                            (ldb/transact! conn tx-data (apply-client-tx-meta request-context tx-entry))
+                                            true))
+                                        (if (and (contains? delete-outliner-ops outliner-op)
+                                                 (empty? input-tx-data))
+                                          (throw (ex-info "delete tx input is empty"
+                                                          {:type :db-sync/empty-delete-tx
+                                                           :outliner-op outliner-op}))
+                                          false))]
+                         (when (and sql (not large?))
+                            (storage/record-applied-client-tx!
+                             sql (::identity tx-entry) (::payload-digest tx-entry)))
+                         ;; A successful no-op also needs a durable confirmation after a lost response.
+                         (if (and sql (= t-before (storage/get-t sql)))
+                           (boolean (confirm-empty-tx! sql tx-entry))
+                           applied?)))]
+     (try
+       (if sql
+         (storage/with-sql-transaction! sql apply-entry)
+         (apply-entry))
+       (catch :default e
+         (reset! conn db-before)
+         ;; Rebase/fix txs are inferred from history and can become stale after remote deletes.
+         (if (and (contains? #{:rebase :fix} outliner-op)
+                  (= :entity-id/missing (:error (ex-data e))))
+           (do
+             (log/warn :db-sync/drop-stale-rebase-tx
+                       {:outliner-op outliner-op :tx (:tx tx-entry) :error (str e)})
+             (if sql
+               (boolean (storage/with-sql-transaction!
+                         sql
+                         #(do (storage/record-applied-client-tx!
+                               sql (::identity tx-entry) (::payload-digest tx-entry))
+                              (confirm-empty-tx! sql tx-entry))))
+               false))
+           (throw e)))))))
 
 (defn- apply-tx! [^js self tx-entries applied-identities request-context]
   (let [sql (.-sql self)]
@@ -974,7 +997,9 @@
                    ;; Broadcast once per processed batch after tx-log/checksum settle.
                    (ws/broadcast! self sender {:type "changed" :t t}))
                  (cond-> {:type "tx/batch/ok"
-                          :t t}
+                          :t-before t-before
+                          :t t
+                          :txs (storage/fetch-tx-since (.-sql self) t-before)}
                    (string? checksum) (assoc :checksum checksum)))))
            (catch :default e
              (let [new-t (t-now self)
@@ -987,6 +1012,7 @@
                  (ws/broadcast! self sender {:type "changed" :t new-t}))
                (cond-> {:type "tx/reject"
                         :reason "db transact failed"
+                        :retryable (retryable-tx-error? e)
                         :error-detail (str e)
                         :t new-t}
                  (seq successful-tx-ids) (assoc :success-tx-ids successful-tx-ids)
@@ -1132,6 +1158,7 @@
                                    snapshot-content-encoding)]
             (http/json-response :sync/snapshot-download
                                 (cond-> {:ok true
+                                         :t (t-now self)
                                          :key key
                                          :url url}
                                   content-encoding
@@ -1296,7 +1323,7 @@
 
 (defn handle-http [^js self request]
   (letfn [(with-cors-error [resp]
-            (if (instance? js/Promise resp)
+            (if (or (p/promise? resp) (instance? js/Promise resp))
               (.catch resp
                       (fn [e]
                         (log/error :db-sync/http-error {:error e})

@@ -480,3 +480,38 @@
     (is (every? #(= :raw-number (:logseq.property/type (d/entity @conn %)))
                 [:logseq.property.view/gallery-card-width
                  :logseq.property.view/gallery-card-height]))))
+
+(deftest migrate-65-36-preserves-both-65-35-origins
+  (doseq [origin [:selfhost :official]]
+    (let [conn (d/create-conn db-schema/schema)
+          block-uuid #uuid "33333333-3333-3333-3333-333333333333"
+          asset-uuid #uuid "33333333-3333-4333-8333-333333333334"
+          file-attrs {:block/scheduled 20240102
+                      :block/deadline 20240103
+                      :block/marker "NOW"
+                      :block/priority "B"
+                      :block/properties-text-values {:key "value"}
+                      :block/invalid-properties #{"@key"}}]
+      (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+      (when (= origin :official)
+        (d/transact! conn (mapv #(vector :db/retractEntity %) db-property/literature-property-idents)))
+      (d/transact! conn [{:db/ident :logseq.kv/schema-version
+                         :kv/value {:major 65 :minor 35}}
+                        {:block/uuid asset-uuid :block/title "Existing PDF"
+                         :block/tags :logseq.class/Asset :logseq.property.asset/type "pdf"}
+                        (merge {:block/uuid block-uuid :block/title "Task text"
+                                :block/link [:block/uuid asset-uuid]
+                                :logseq.property/heading 2} file-attrs)])
+      (let [result (db-migrate/migrate conn)
+            block (d/entity @conn [:block/uuid block-uuid])]
+        (is (every? #(nil? (entities-with @conn %)) (keys file-attrs)))
+        (is (= {:block/title "Task text" :logseq.property/heading 2}
+               (select-keys block [:block/title :logseq.property/heading])))
+        (is (= asset-uuid (get-in block [:block/link :block/uuid])))
+        (is (= "Existing PDF" (:block/title (d/entity @conn [:block/uuid asset-uuid]))))
+        (is (every? #(d/entity @conn %) db-property/literature-property-idents))
+        (is (= {:major 65 :minor 36}
+               (:kv/value (d/entity @conn :logseq.kv/schema-version))))
+        (is (= (set (keys file-attrs))
+               (set (get-in result [:upgrade-result-coll 0 :migrate-updates :delete-properties]))))
+        (is (nil? (db-migrate/migrate conn)))))))

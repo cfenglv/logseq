@@ -623,7 +623,6 @@
  :editor.slash/node-embed-desc "在此处嵌入一个节点"
  :editor.slash/node-reference "节点引用"
  :editor.slash/node-reference-desc "创建一个指向节点（页面或块）的引用"
- :editor.slash/normal-text "正常文本"
  :editor.slash/normal-text-desc "清除标题并设为正常文本"
  :editor.slash/number-children "为子节点编号"
  :editor.slash/number-list "编号列表"
@@ -2271,6 +2270,7 @@
 
  :view/add-new-view "添加新视图"
  :view/all "全部"
+ :view/error "视图错误："
  :view/export-edn "导出 EDN"
  :view/linked-references "已链接的引用"
  :view/more-options "视图选项"
@@ -2349,6 +2349,10 @@
  :view.table/sort-groups-order "分组排序方向"
  :view.table/total-refs-count "总引用数"
  :view.table/unpin "取消固定"
+
+ :web.test-site/help-test "我想帮忙测试"
+ :web.test-site/open-app "打开 app.logseq.com"
+ :web.test-site/warning "test.logseq.com 用于测试新功能，可能不稳定。如果你正在用 Logseq 处理正式工作，请切换到 app.logseq.com。"
 
  :window/close "关闭"
  :window/exit-fullscreen "退出全屏"

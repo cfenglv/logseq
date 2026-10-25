@@ -623,7 +623,6 @@
  :editor.slash/node-embed-desc "Embed a node here"
  :editor.slash/node-reference "Node reference"
  :editor.slash/node-reference-desc "Create a backlink to a node (a page or a block)"
- :editor.slash/normal-text "Normal text"
  :editor.slash/normal-text-desc "Clear heading and set to normal text"
  :editor.slash/number-children "Number children"
  :editor.slash/number-list "Number list"
@@ -2271,6 +2270,7 @@
 
  :view/add-new-view "Add new view"
  :view/all "All"
+ :view/error "View error:"
  :view/export-edn "Export EDN"
  :view/linked-references "Linked references"
  :view/more-options "View options"
@@ -2349,6 +2349,10 @@
  :view.table/sort-groups-order "Sort groups order"
  :view.table/total-refs-count "Total refs count"
  :view.table/unpin "Unpin"
+
+ :web.test-site/help-test "I want to help test"
+ :web.test-site/open-app "Open app.logseq.com"
+ :web.test-site/warning "test.logseq.com is for testing new features and may be unstable. If you're using Logseq for real work, please switch to app.logseq.com."
 
  :window/close "Close"
  :window/exit-fullscreen "Exit full screen"

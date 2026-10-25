@@ -44,6 +44,15 @@
         block)
       block)))
 
+(defn math-block-formula
+  "The formula of a title written as 1 display math ($$E=mc^2$$), nil for any
+  other title. A math block's title is the formula alone; a save of the
+  editor's text from before the block became a math block brings the $$ back."
+  [title]
+  (let [block (standalone-display-block {:block/title title})]
+    (when (= :math (:logseq.property.node/display-type block))
+      (:block/title block))))
+
 (defn extract-blocks
   "Wrapper around logseq.graph-parser.block/extract-blocks that adds in system state
 and handles unexpected failure."
@@ -63,7 +72,9 @@ and handles unexpected failure."
                    heading (get-in block [:block/properties :heading])
                    heading (when (or (true? heading) (and (integer? heading) (<= 1 heading 6)))
                              heading)]
-               (cond-> (dissoc block :block/format :block/properties :block/macros :block/properties-order)
+               (cond-> (dissoc block :block/format :block/properties :block/macros :block/properties-order
+                               :block/scheduled :block/deadline :block/marker :block/priority
+                               :block/properties-text-values :block/invalid-properties)
                  heading
                  (assoc :logseq.property/heading heading))))
            blocks))

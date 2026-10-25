@@ -282,13 +282,11 @@ export const writeClipboard = ({text, html, blocks}, ownerWindow) => {
   copiedBlocksMemoryCache.text = text
   copiedBlocksMemoryCache.blocks = blocks || null
 
-  return navigator.permissions.query({
-    name: "clipboard-write"
-  }).then((result) => {
-    if (result.state != "granted" && result.state != "prompt"){
-      console.debug("Copy without `clipboard-write` permission")
-      return false
-    }
+  // Write right away, within the user's click: Safari refuses a clipboard
+  // write that waits for another promise first, and Firefox and Safari have
+  // no `clipboard-write` permission to query. A refused write rejects and
+  // is logged below.
+  {
     let promise_written = null
     if (typeof ClipboardItem !== "undefined") {
       let data = [new ClipboardItem({
@@ -329,7 +327,7 @@ export const writeClipboard = ({text, html, blocks}, ownerWindow) => {
       console.warn("Clipboard write failed", e.name)
       return false
     })
-  })
+  }
 }
 
 export const toPosixPath = (input) => {

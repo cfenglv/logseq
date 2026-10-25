@@ -32,6 +32,7 @@
 (s/def ::sync-server-url string?)
 (s/def ::publish-server-url string?)
 (s/def ::ls-mobile-tabs (s/coll-of string? :kind vector?))
+(s/def ::test-site-banner-dismissed boolean?)
 ;; Dynamic keys which aren't as easily validated:
 ;; :ls-pdf-last-page-*
 ;; :ls-js-allowed-*
@@ -74,4 +75,5 @@
             :copy/export-block-text-other-options
             ::sync-server-url
             ::publish-server-url
-            ::ls-mobile-tabs]))
+            ::ls-mobile-tabs
+            ::test-site-banner-dismissed]))

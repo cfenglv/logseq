@@ -1,6 +1,5 @@
 (ns logseq.db-sync.protocol
-  (:require [clojure.walk :as walk]
-            [goog.crypt :as gcrypt]
+  (:require [goog.crypt :as gcrypt]
             [goog.crypt.Sha256]
             [logseq.db-sync.common :as common]))
 
@@ -54,12 +53,6 @@
                (subs uuid-hex 16 20) "-"
                (subs uuid-hex 20 32)))))
 
-(defn- stringify-uuid
-  [value]
-  (if (uuid? value)
-    (str value)
-    value))
-
 (defn parse-message [raw]
   (try
     (let [data (js->clj (js/JSON.parse raw) :keywordize-keys true)]
@@ -69,11 +62,14 @@
       nil)))
 
 (defn encode-message [m]
-  (js/JSON.stringify
-   (clj->js (walk/postwalk stringify-uuid m))))
+  (common/json-stringify m))
 
 (defn transit->tx [value]
-  (common/read-transit value))
+  (try
+    (common/read-transit value)
+    (catch :default error
+      (throw (ex-info "Invalid transaction payload"
+                      {:error :db-sync/invalid-field} error)))))
 
 (defn tx->transit [tx-data]
   (common/write-transit tx-data))

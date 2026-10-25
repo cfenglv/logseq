@@ -101,6 +101,7 @@
 
 (def tx-log-entry-schema
   [:map
+   [:tx-id {:optional true} :uuid]
    [:t :int]
    [:tx :string]
    [:outliner-op {:optional true} [:maybe :keyword]]])
@@ -152,6 +153,7 @@
    [:t {:optional true} :int]
    [:success-tx-ids {:optional true} [:sequential :uuid]]
    [:failed-tx-id {:optional true} :uuid]
+   [:retryable {:optional true} :boolean]
    [:missing-block-uuids {:optional true} [:sequential :uuid]]
    [:error-detail {:optional true} :string]
    [:data {:optional true} :string]])
@@ -182,8 +184,10 @@
 (def tx-batch-ok-schema
   [:map
    [:type [:= "tx/batch/ok"]]
+   [:t-before {:optional true} :int]
    [:t :int]
-   [:checksum {:optional true} :string]])
+   [:checksum {:optional true} :string]
+   [:txs {:optional true} [:sequential tx-log-entry-schema]]])
 
 (def ws-server-message-schema
   [:multi {:dispatch :type}
@@ -343,6 +347,7 @@
 (def snapshot-download-response-schema
   [:map
    [:ok :boolean]
+   [:t :int]
    [:key :string]
    [:url :string]
    [:content-encoding {:optional true} [:maybe :string]]])
