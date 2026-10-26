@@ -9,8 +9,7 @@
 ;; instead of having no control over its behavior at require time
 (glogi-console/install!)
 
-(defonce _error-log-handler
-  (do (log/add-handler diagnostics/record-renderer-error!) true))
+(log/add-handler diagnostics/record-renderer-error!)
 
 (if config/dev?
   (log/set-levels {:glogi/root :info})

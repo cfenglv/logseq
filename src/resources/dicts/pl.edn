@@ -1696,7 +1696,6 @@
  :ui/deleted "Usunięto"
  :ui/dont-remind-me-again "Nie przypominaj mi ponownie"
  :ui/empty "Puste"
- :ui/error-boundary-error "Błąd przechwycony przez UI!\n {1}"
  :ui/export "Eksportuj"
  :ui/false "Fałsz"
  :ui/fix "Napraw!"

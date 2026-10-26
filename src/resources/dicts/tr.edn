@@ -1866,7 +1866,6 @@
  :ui/deleted "Silindi"
  :ui/dont-remind-me-again "Bir daha hatırlatma"
  :ui/empty "Boş"
- :ui/error-boundary-error "Arayüz tarafından yakalanan hata!\n {1}"
  :ui/export "Dışa Aktar"
  :ui/false "Yanlış"
  :ui/fix "Düzelt!"

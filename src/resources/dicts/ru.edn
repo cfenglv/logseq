@@ -1696,7 +1696,6 @@
  :ui/deleted "Удалено"
  :ui/dont-remind-me-again "Больше не напоминать"
  :ui/empty "Пусто"
- :ui/error-boundary-error "Ошибка перехвачена интерфейсом!\n {1}"
  :ui/export "Экспорт"
  :ui/false "Ложь"
  :ui/fix "Исправить!"

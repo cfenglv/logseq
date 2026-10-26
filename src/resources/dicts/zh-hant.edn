@@ -1739,7 +1739,6 @@
  :ui/deleted "已刪除"
  :ui/dont-remind-me-again "不再提醒"
  :ui/empty "空"
- :ui/error-boundary-error "UI 攔截到錯誤！\n {1}"
  :ui/export "匯出"
  :ui/false "否"
  :ui/fix "修復它!"

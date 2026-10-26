@@ -1696,7 +1696,6 @@
  :ui/deleted "Eliminato"
  :ui/dont-remind-me-again "Non ricordarmelo più"
  :ui/empty "Vuoto"
- :ui/error-boundary-error "Errore rilevato dall'interfaccia!\n {1}"
  :ui/export "Esporta"
  :ui/false "Falso"
  :ui/fix "Correggi!"

@@ -1867,7 +1867,6 @@
  :ui/deleted "Видалено"
  :ui/dont-remind-me-again "Більше не нагадувати"
  :ui/empty "Порожньо"
- :ui/error-boundary-error "Помилка перехоплена інтерфейсом!\n {1}"
  :ui/export "Експорт"
  :ui/false "Хибно"
  :ui/fix "Виправити!"

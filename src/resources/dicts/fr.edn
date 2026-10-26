@@ -1696,7 +1696,6 @@
  :ui/deleted "Supprimé"
  :ui/dont-remind-me-again "Ne plus me le rappeler"
  :ui/empty "Vide"
- :ui/error-boundary-error "Erreur interceptée par l'interface !\n {1}"
  :ui/export "Exporter"
  :ui/false "Faux"
  :ui/fix "Corriger !"
