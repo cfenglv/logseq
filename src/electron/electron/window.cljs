@@ -8,6 +8,7 @@
             [electron.configs :as cfgs]
             [electron.context-menu :as context-menu]
             [electron.db-worker :as db-worker]
+            [electron.diagnostics :as diagnostics]
             [electron.i18n :refer [t]]
             [electron.logger :as logger]
             [electron.spell-check :as spell-check]
@@ -165,6 +166,9 @@
           context-menu-handler
           (context-menu/setup-context-menu! win)
 
+          renderer-gone-handler
+          (fn [_event details] (diagnostics/renderer-gone! details))
+
           window-open-handler
           (fn [^js details]
             (let [url         (.-url details)
@@ -195,6 +199,7 @@
                   (bean/->js))))]
 
       (doto web-contents
+        (.on "render-process-gone" renderer-gone-handler)
         (.on "will-navigate" will-navigate-handler)
         (.on "did-start-navigation" #(.send web-contents "persist-zoom-level" (.getZoomLevel web-contents)))
         (.on "page-title-updated" #(.send web-contents "restore-zoom-level"))
@@ -209,6 +214,7 @@
       ;; clear
       (fn []
         (doto web-contents
+          (.off "render-process-gone" renderer-gone-handler)
           (.off "context-menu" context-menu-handler)
           (.off "will-navigate" will-navigate-handler))
 

@@ -3,6 +3,7 @@
   (:require [clojure.pprint :as pprint]
             [clojure.string :as string]
             [frontend.config :as config]
+            [frontend.components.diagnostics :as diagnostics-ui]
             [frontend.db.async :as db-async]
             [frontend.handler.db-based.rtc-flows :as rtc-flows]
             [frontend.context.i18n :refer [locale-format-date t]]
@@ -222,6 +223,7 @@
       (t :sync/more-debug-info)]
      (when expand-debug?
        [:div.rtc-info-debug
+        (diagnostics-ui/status-panel repo {})
         [:pre.select-text
          (-> (cond-> {:pending-local-ops pending-local-ops}
                download-logs (assoc :download download-logs)

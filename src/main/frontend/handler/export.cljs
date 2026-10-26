@@ -144,13 +144,21 @@
       (.setAttribute anchor "download" filename)
       (.click anchor))))
 
+(defn <export-sqlite-file!
+  "Export through the existing worker and return the actual created file."
+  [repo]
+  (p/let [result (ipc/ipc :db-export-as repo (file-name repo "sqlite"))
+          path (or (:path result) (some-> result .-path))]
+    (when-not (seq path)
+      (throw (ex-info "SQLite export did not produce a file" {:code :export/not-created})))
+    path))
+
 (defn export-repo-as-sqlite-db!
   [repo]
   (let [filename (file-name repo "sqlite")]
     (->
      (if (util/electron?)
-       (p/let [result (ipc/ipc :db-export-as repo filename)
-               path (or (:path result) (some-> result .-path))]
+       (p/let [path (<export-sqlite-file! repo)]
          (when path
            (notification/show! (t :export/sqlite-db-exported path) :success false)))
        (p/let [data (persist-db/<export-db repo {:return-data? true})]

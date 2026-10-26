@@ -342,6 +342,8 @@
 
       ;; graph-uuid -> ...
       :rtc/state                             {}
+      :rtc/repair-status                     nil
+      :diagnostics/quit-error                nil
       :rtc/editing-users-by-block            {}
       :rtc/loading-graphs?                   nil
       ;; only latest rtc-log stored here, derive a log stream from state when needed.

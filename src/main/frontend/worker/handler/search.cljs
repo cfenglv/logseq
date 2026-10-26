@@ -548,7 +548,10 @@
                   (p/catch (fn [error]
                              (when-not (= :search/stale-index-build (:type (ex-data error)))
                                (log/error :search/index-build-failed {:repo repo
-                                                                      :error error}))))
+                                                                      :error error})
+                               (report-search-index-progress!
+                                repo {:build-id build-id :status :failed
+                                      :error-message (or (ex-message error) (.-message error) (str error))}))))
                   (p/finally (fn []
                                (when (= build-id (get @*search-index-build-ids repo))
                                  (report-search-index-progress! repo {:build-id build-id

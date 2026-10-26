@@ -11,7 +11,7 @@
   (rebuild-pages-indice! [_this]
     (state/<invoke-db-worker :thread-api/search-build-pages-indice repo))
   (rebuild-blocks-indice! [_this]
-    (state/<invoke-db-worker :thread-api/search-build-blocks-indice-in-worker (state/get-current-repo) true))
+    (state/<invoke-db-worker :thread-api/search-build-blocks-indice-in-worker repo true))
   (transact-blocks! [_this {:keys [blocks-to-remove-set
                                    blocks-to-add]}]
     (let [repo (state/get-current-repo)]

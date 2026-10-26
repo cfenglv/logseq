@@ -26,6 +26,9 @@
 
 (defn ^:large-vars/cleanup-todo listen-to-electron!
   []
+  (safe-api-call "diagnostics-quit-failed"
+                 (fn [data]
+                   (state/set-state! :diagnostics/quit-error (bean/->clj data))))
   (safe-api-call "graph-lifecycle"
                  (fn [data]
                    (let [{:keys [repo phase generation]} (bean/->clj data)]

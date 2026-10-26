@@ -10,6 +10,7 @@
             [electron.configs :as cfgs]
             [electron.db :as db]
             [electron.db-worker :as db-worker]
+            [electron.diagnostics :as diagnostics]
             [electron.embedding-server :as embedding-server]
             [electron.exceptions :as exceptions]
             [electron.handler :as handler]
@@ -18,6 +19,7 @@
             [electron.logger :as logger]
             [electron.release-warning :as release-warning]
             [electron.server :as server]
+            [electron.state :as electron-state]
             [electron.updater :refer [init-updater] :as updater]
             [electron.url :refer [logseq-url-handler]]
             [electron.utils :refer [*win mac? dev? get-win-from-sender
@@ -221,6 +223,8 @@
          (.removeHandler ipcMain call-app-channel)
          (.removeHandler ipcMain call-win-channel))))
 
+(declare finish-quit! report-quit-error!)
+
 (defn- set-app-menu! []
   (let [about-fn (fn []
                    (.showMessageBox dialog (clj->js {:title "Logseq"
@@ -271,10 +275,14 @@
         template (conj template
                        (if mac?
                          {:role "help"
-                          :submenu [{:label (t :electron/official-docs)
+                          :submenu [{:label (t :bug-report.diagnostics/app-log)
+                                     :click #(diagnostics/open-log! :app nil)}
+                                    {:label (t :electron/official-docs)
                                      :click #(.openExternal shell "https://docs.logseq.com/")}]}
                          {:role "help"
-                          :submenu [{:label (t :electron/official-docs)
+                          :submenu [{:label (t :bug-report.diagnostics/app-log)
+                                     :click #(diagnostics/open-log! :app nil)}
+                                    {:label (t :electron/official-docs)
                                      :click #(.openExternal shell "https://docs.logseq.com/")}
                                     {:role "about"
                                      :label (t :electron/about)
@@ -473,13 +481,28 @@
                          :update-prepared? #(not @*quit-dirty?)
                          :stop! #(-> (db-worker/<stop-for-quit! db-worker/manager)
                                      (p/then (fn [_] (embedding-server/stop!))))
-                         :quit! #(.quit app')
-                         :on-error! #(logger/error :electron/quit-failed %)}))
+                         :quit! #(finish-quit! app')
+                         :on-error! report-quit-error!}))
 
                   (.on app' "activate" #(when @*win (.show win))))))
              (p/catch (fn [error]
                         (logger/error :electron/worker-upgrade-failed error)
                         (.quit app')))))))
+
+(defn finish-quit!
+  "Schedule a requested relaunch only after the normal worker shutdown succeeded."
+  [^js application]
+  (when (:relaunch-on-quit? @electron-state/state)
+    (electron-state/set-state! :relaunch-on-quit? false)
+    (.relaunch application))
+  (.quit application))
+
+(defn report-quit-error!
+  [error]
+  (electron-state/set-state! :relaunch-on-quit? false)
+  (logger/error :electron/quit-failed error)
+  (send-to-renderer "diagnostics-quit-failed"
+                    {:message (or (.-message error) (str error))}))
 
 (defn main []
   (configure-qualification-command-line!)

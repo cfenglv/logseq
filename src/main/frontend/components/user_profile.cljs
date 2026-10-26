@@ -44,7 +44,8 @@
   [{:keys [name user-id avatar-src] :user-profile/keys [self?]} {:keys [tooltip?] :or {tooltip? true} :as props}]
   (let [image (avatar/user-avatar
                (merge (dissoc props :tooltip? :title)
-                      {:name name :uuid user-id :avatar-src avatar-src :image-props {:alt ""}}))]
+                      {:name name :uuid user-id :avatar-src avatar-src
+                       :image-props {:alt "" :on-context-menu util/stop}}))]
     (if tooltip?
       (let [label (if self? (t :account/self-name-tooltip name) name)]
         (ui/tooltip

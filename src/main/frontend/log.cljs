@@ -1,12 +1,16 @@
 (ns frontend.log
   "System-component-like ns that encapsulates logging functionality"
   (:require [frontend.config :as config]
+            [frontend.diagnostics :as diagnostics]
             [lambdaisland.glogi :as log]
             [lambdaisland.glogi.console :as glogi-console]))
 
 ;; TODO: Move code below into a fn to behave like a system component
 ;; instead of having no control over its behavior at require time
 (glogi-console/install!)
+
+(defonce _error-log-handler
+  (do (log/add-handler diagnostics/record-renderer-error!) true))
 
 (if config/dev?
   (log/set-levels {:glogi/root :info})

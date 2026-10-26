@@ -15,7 +15,7 @@
                              :i18n-args [msg stack]}))
 
   ;; for debug log
-  (logger/error uncaughtExceptionChan (str e)))
+  (logger/error uncaughtExceptionChan (or (.-stack e) (str e))))
 
 (defn setup-exception-listeners!
   []

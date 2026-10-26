@@ -16,6 +16,7 @@
             [electron.configs :as cfgs]
             [electron.db :as db]
             [electron.db-worker :as db-worker]
+            [electron.diagnostics :as diagnostics]
             [electron.embedding-server :as embedding-server]
             [electron.find-in-page :as find]
             [electron.graph-switch-flow :as graph-switch-flow]
@@ -34,6 +35,7 @@
             [logseq.cli.server :as cli-server]
             [logseq.common.config :as common-config]
             [logseq.common.graph :as common-graph]
+            [logseq.common.graph-dir :as graph-dir]
             [logseq.common.graph-registry :as graph-registry]
             [logseq.db.sqlite.util :as sqlite-util]
             [promesa.core :as p]))
@@ -73,6 +75,23 @@
   (when-let [full-path (utils/to-native-win-path! full-path)]
     (logger/info ::open-file-in-folder full-path)
     (.showItemInFolder shell full-path)))
+
+(defn- window-graph-directory
+  [window]
+  (let [manager-state @(:state db-worker/manager)
+        repo-key (get-in manager-state [:window->repo (.-id window)])
+        {:keys [repo storage]} (get-in manager-state [:repos repo-key :runtime])]
+    (when (and repo storage)
+      (node-path/join (.-graphsDir ^js storage) (graph-dir/repo->encoded-graph-dir-name repo)))))
+
+(defmethod handle :diagnostics/context [_window _]
+  (diagnostics/context))
+
+(defmethod handle :diagnostics/record-error [_window [_ record]]
+  (diagnostics/record-renderer-error! record))
+
+(defmethod handle :diagnostics/open-log [window [_ source]]
+  (diagnostics/open-log! source (when (= source :sync) (window-graph-directory window))))
 
 (defmethod handle :literature/show-zotero-companion [_window _]
   (let [source (node-path/join (.getAppPath app) "zotero-companion.xpi")
@@ -384,7 +403,8 @@
                    (catch :default _e false)))))
 
 (defmethod handle :relaunchApp []
-  (.relaunch app) (.quit app))
+  (state/set-state! :relaunch-on-quit? true)
+  (.quit app))
 
 (defmethod handle :quitApp []
   (.quit app))

@@ -15,46 +15,52 @@
             [logseq.shui.ui :as shui]
             [promesa.core :as p]))
 
+(defn repair-result-message
+  [{:keys [claimed? requested? operation reason disposition]}]
+  (cond
+    (or (= :local-only disposition) (= :local-only (:disposition operation)))
+    (t :sync/repair-local-only-warning)
+    (or claimed? requested?) (t :sync/repair-start-feedback)
+    operation (t :sync/repair-busy-feedback)
+    (= :context-changed reason) (t :sync/repair-context-changed-warning)
+    :else (t :sync/repair-unavailable-warning)))
+
+(defn <request-repair-for-repo!
+  "Confirmed repair execution shared by the normal dialog and the recovery page."
+  [repo]
+  (p/do
+    (if-not (= repo (state/get-current-repo))
+      {:claimed? false :reason :context-changed}
+      (p/let [{local-operation :operation}
+              (state/<invoke-db-worker :thread-api/db-sync-repair-status repo)]
+        (cond
+          (not= repo (state/get-current-repo))
+          {:claimed? false :reason :context-changed}
+
+          (= :local-only (:disposition local-operation))
+          (do
+            (notification/show! (t :sync/repair-start-feedback) :info)
+            (p/let [result (state/<invoke-db-worker :thread-api/db-sync-retry-repair
+                                                  repo (:operation-id local-operation))]
+              (assoc result :requested? (not= :local-only (:disposition result)))))
+
+          :else (state/<invoke-db-worker :thread-api/db-sync-request-repair repo))))))
+
 (defn ^:export request-repair!
   []
   (if-let [repo (when (util/electron?) (state/get-current-repo))]
-    (-> (shui/dialog-confirm!
-         (t :sync/repair-confirm-desc)
-         {:id :sync-repair
-          :title (t :sync/repair-confirm-title)
-          :cancel-label (t :ui/cancel)
-          :ok-label (t :ui/confirm)})
-        (p/then
-         (fn [_]
-           (if-not (= repo (state/get-current-repo))
-             (notification/show! (t :sync/repair-context-changed-warning) :warning)
-             (p/let [{local-operation :operation} (state/<invoke-db-worker :thread-api/db-sync-repair-status repo)]
-               (if-not (= repo (state/get-current-repo))
-                 (notification/show! (t :sync/repair-context-changed-warning) :warning)
-                 (if (= :local-only (:disposition local-operation))
-                   (do
-                     (notification/show! (t :sync/repair-start-feedback) :info)
-                     (state/<invoke-db-worker :thread-api/db-sync-retry-repair repo (:operation-id local-operation)))
-                   (p/let [{:keys [claimed? operation reason]}
-                           (state/<invoke-db-worker :thread-api/db-sync-request-repair repo)]
-                     (when (= repo (state/get-current-repo))
-                       (cond
-                         claimed?
-                         (notification/show! (t :sync/repair-start-feedback) :info)
-
-                         (= :local-only (:disposition operation))
-                         (notification/show! (t :sync/repair-local-only-warning) :warning false)
-
-                         operation
-                         (notification/show! (t :sync/repair-busy-feedback) :info)
-
-                         (= :context-changed reason)
-                         (notification/show! (t :sync/repair-context-changed-warning) :warning)
-
-                         :else
-                         (notification/show! (t :sync/repair-unavailable-warning) :warning))))))))))
+    (-> (shui/dialog-confirm! (t :sync/repair-confirm-desc)
+                              {:id :sync-repair :title (t :sync/repair-confirm-title)
+                               :cancel-label (t :ui/cancel) :ok-label (t :ui/confirm)})
+        (p/then (fn [_] (<request-repair-for-repo! repo)))
+        (p/then (fn [result]
+                  (when (= repo (state/get-current-repo))
+                    (notification/show! (repair-result-message result)
+                                        (if (or (:claimed? result) (:requested? result)
+                                                (and (:operation result)
+                                                     (not= :local-only (get-in result [:operation :disposition]))))
+                                          :info :warning)))))
         (p/catch (fn [error]
-                   ;; The existing confirmation dialog rejects with false/nil on cancel.
                    (when error
                      (log/error :db-sync/repair-request-failed error)
                      (notification/show! (t :sync/repair-request-error) :error)))))

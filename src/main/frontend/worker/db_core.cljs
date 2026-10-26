@@ -506,6 +506,25 @@
        :operation (:operation record)
        :prepared-swap? (some? (:prepared-swap record))})))
 
+(defn- notify-repair-state!
+  "Observe lifecycle transitions only; never adds work to ordinary saves."
+  [repo result]
+  (try
+    (let [{:keys [operation committed prepared-swap?]} (repair-operation-status repo)]
+      (shared-service/broadcast-to-clients!
+       :rtc-repair-state
+       {:repo repo :at (js/Date.now)
+        :operation (when operation
+                     (select-keys operation [:operation-id :disposition :next-retry-at-ms
+                                             :last-error :target-projection-epoch]))
+        :committed (select-keys committed [:projection-epoch])
+        :prepared-swap? prepared-swap?
+        :completed? (true? (:completed? result))
+        :operation-id (:operation-id result)}))
+    (catch :default error
+      (log/warn :db-sync/repair-status-notification-failed {:error error})))
+  result)
+
 (defn- record-repair-failure!
   [repo operation-id {:keys [disposition next-retry-at-ms error-type at-ms]}]
   (when-not (and (contains? #{:repairing :local-only} disposition)
@@ -1714,7 +1733,9 @@
 
 (def-thread-api :thread-api/db-sync-claim-repair
   [repo graph-id start-basis]
-  (claim-repair-operation! repo graph-id start-basis))
+  (let [result (claim-repair-operation! repo graph-id start-basis)]
+    (when (:claimed? result) (notify-repair-state! repo result))
+    result))
 
 (def-thread-api :thread-api/db-sync-build-repair-staging
   [repo operation-id]
@@ -1722,7 +1743,7 @@
 
 (def-thread-api :thread-api/db-sync-commit-repair
   [repo operation-id]
-  (<commit-repair-staging! repo operation-id))
+  (p/then (<commit-repair-staging! repo operation-id) #(notify-repair-state! repo %)))
 
 (def-thread-api :thread-api/db-sync-repair-status
   [repo]
@@ -1734,15 +1755,16 @@
 
 (def-thread-api :thread-api/db-sync-record-repair-failure
   [repo operation-id transition]
-  (record-repair-failure! repo operation-id transition))
+  (notify-repair-state! repo (record-repair-failure! repo operation-id transition)))
 
 (def-thread-api :thread-api/db-sync-claim-repair-retry
   [repo operation-id explicit? now-ms]
-  (claim-repair-retry! repo operation-id explicit? now-ms))
+  (notify-repair-state! repo (claim-repair-retry! repo operation-id explicit? now-ms)))
 
 (def-thread-api :thread-api/db-sync-complete-repair
   [repo operation-id verification]
   (let [result (complete-repair-operation! repo operation-id verification)]
+    (notify-repair-state! repo result)
     (p/let [cleanup (<cleanup-previous-artifact! repo)]
       (shared-service/broadcast-to-clients!
        :notification
@@ -1866,6 +1888,7 @@
          :log
          :add-repo
          :rtc-log
+         :rtc-repair-state
          :rtc-sync-state])))
 
 (defn- <init-service!

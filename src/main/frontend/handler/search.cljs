@@ -110,12 +110,14 @@
   ([]
    (rebuild-indices! false))
   ([notice?]
+   (rebuild-indices! (state/get-current-repo) notice?))
+  ([repo notice?]
    (println "Starting to rebuild search indices!")
-   (when-let [repo (state/get-current-repo)]
+   (when repo
      (when notice?
        (state/set-state! [:search/index-build-notify-repos repo] true))
      (p/do!
-      (search/rebuild-indices!)))))
+      (search/rebuild-indices! repo)))))
 
 (defn highlight-exact-query
   [content q]

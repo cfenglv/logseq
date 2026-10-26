@@ -1,25 +1,20 @@
 (ns frontend.page
   "Provides root component for both Logseq app and publishing build"
   (:require [frontend.components.container :as container]
+            [frontend.components.error-screen :as error-screen]
             [frontend.components.plugins :as plugin]
             [frontend.config :as config]
-            [frontend.context.i18n :refer [interpolate-sentence t]]
-            [frontend.handler.export :as export]
-            [frontend.handler.notification :as notification]
+            [frontend.context.i18n :refer [t]]
             [frontend.handler.plugin :as plugin-handler]
             [frontend.handler.route :as route-handler]
-            [frontend.handler.search :as search-handler]
             [frontend.rfx :as rfx]
             [frontend.routes :as routes]
             [frontend.state :as state]
             [frontend.ui :as ui]
-            [frontend.util :as util]
             [io.factorhouse.hsx.core :as hsx]
             [logseq.shui.hooks :as hooks]
-            [logseq.shui.toaster.core :as shui-toaster]
             [logseq.shui.ui :as shui]
-            [reitit.frontend.easy :as rfe]
-            ))
+            [reitit.frontend.easy :as rfe]))
 
 (defn- setup-fns!
   []
@@ -29,95 +24,6 @@
      (ui/setup-viewport-listeners!))
     (catch :default _e
       nil)))
-
-(hsx/defc helpful-default-error-screen
-  "This screen is displayed when the UI has crashed hard. It provides the user
-  with basic troubleshooting steps to get them back to a working state. This
-  component is purposefully stupid simple as it needs to render under any number
-  of broken conditions"
-  []
-  ;; This layout emulates most of container/sidebar
-  (let [current-repo (state/get-current-repo)]
-    [:div#main-container.cp__sidebar-main-layout.flex-1.flex
-     [:div.#app-container
-      [:div#left-container
-       [:div#main-container.cp__sidebar-main-layout.flex-1.flex
-        [:div#main-content-container.scrollbar-spacing.w-full.flex.justify-center
-          [:div.cp__sidebar-main-content
-           [:div.flex.justify-center.px-4.py-10.sm:px-6.sm:py-14
-            [:div.w-full.max-w-3xl.flex.flex-col.gap-10.sm:gap-14
-             [:div.w-full.max-w-2xl.mx-auto
-              [:div.flex.flex-col.items-start.gap-3.mb-6
-               [:div.icon-box.p-1.rounded (ui/icon "bug" {:style {:font-size ui/icon-size}})]
-               [:div.text-2xl.font-bold (t :page/something-went-wrong)]
-               [:div.text-lg.leading-8 (t :page/logseq-is-having-a-problem)]]
-              [:div
-               ;; TODO: Enable once multi-window case doesn't result in possible data loss
-               #_[:div.flex.flex-row.justify-between.align-items.mb-2
-                  [:div.flex.flex-col.items-start
-                   [:div.text-2xs.uppercase (t :page/step "1")]
-                   [:div [:span.font-bold (t :plugin/reload)] (str " " (t :page/the-app))]]
-                  [:div (ui/icon "command") (ui/icon "letter-r")]]
-               [:div.flex.flex-col.gap-4.sm:flex-row.sm:items-center.sm:justify-between.py-4
-                [:div.flex.flex-col.items-start.pr-4
-                 [:div.text-2xs.font-bold.uppercase.toned-down (t :page/step "1")]
-                 [:div.leading-8
-                  [:span.highlighted.font-bold (t :page/rebuild)]
-                  [:span.toned-down (str " " (t :page/search-index))]]]
-                [:div.sm:self-start
-                 (ui/button (t :page/try)
-                            :small? true
-                            :on-click (fn []
-                                        (search-handler/rebuild-indices! true)))]]
-               [:div.flex.flex-col.gap-4.sm:flex-row.sm:items-center.sm:justify-between.separator-top.py-4
-                [:div.flex.flex-col.items-start.pr-4
-                 [:div.text-2xs.font-bold.uppercase.toned-down (t :page/step "2")]
-                 [:div.leading-8
-                  [:span.highlighted.font-bold (t :page/relaunch)]
-                  [:span.toned-down (str " " (t :page/the-app))]]
-                 [:div.text-xs.leading-6.toned-down (t :page/relaunch-desc)]]
-                [:div.sm:self-start
-                 (shui/shortcut ["cmd" (if (util/electron?) "q" "r")])]]
-               [:div.flex.flex-col.gap-4.sm:flex-row.sm:items-center.sm:justify-between.separator-top.py-4
-                [:div.flex.flex-col.items-start.pr-4
-                 [:div.text-2xs.font-bold.uppercase.toned-down (t :page/step "3")]
-                 [:div.leading-8
-                  [:span.highlighted.font-bold (t :ui/export)]
-                  [:span.toned-down (str " " (t :page/current-graph-as-sqlite-db))]]
-                 [:div.text-xs.leading-6.toned-down (t :page/send-db-for-debugging)]
-                 [:a#download-as-sqlite-db.hidden]]
-                [:div.sm:self-start
-                 (ui/button (t :export/graph)
-                            :small? true
-                            :on-click #(export/export-repo-as-sqlite-db! current-repo))]]
-               [:div.flex.flex-col.gap-4.sm:flex-row.sm:items-center.sm:justify-between.separator-top.py-4
-                [:div.flex.flex-col.items-start.pr-4
-                 [:div.text-2xs.font-bold.uppercase.toned-down (t :page/step "4")]
-                 [:div.leading-8
-                  [:span.highlighted.font-bold (t :page/clear)]
-                  [:span.toned-down (str " " (t :page/local-storage))]]
-                 [:div.text-xs.leading-6.toned-down (t :page/clear-local-storage-desc)]]
-                [:div.sm:self-start
-                 (ui/button (t :page/try)
-                            :small? true
-                            :on-click (fn []
-                                        (.clear js/localStorage)
-                                        (notification/show! (t :page/cleared) :success)))]]]
-              [:div.max-w-2xl.mx-auto.mt-6.space-y-2.text-base.leading-8
-               [:p.m-0
-                (interpolate-sentence
-                 (t :page/open-all-graphs-desc)
-                 :links
-                 [{:on-click (fn []
-                               (if (util/capacitor?)
-                                 (state/pub-event! [:mobile/set-tab "graphs"])
-                                 (route-handler/redirect-to-all-graphs)))}])]
-               [:p.m-0
-                (interpolate-sentence
-                 (t :page/open-issue-desc)
-                 :links
-                 [{:href "https://github.com/logseq/logseq/issues/new?labels=from:in-app&template=bug_report.yaml"}])]]]]]]]]]]
-     (shui-toaster/install-toaster)]))
 
 (hsx/defc not-found
   []
@@ -179,12 +85,11 @@
    [])
   (if-let [route-match (rfx/use-sub [:route-match])]
     (when (:view (:data route-match))
-      (ui/catch-error-and-notify
-       (helpful-default-error-screen)
+      (error-screen/boundary
        [:<>
         (container/root-container
          route-match
-         (route-view route-match))
+         (error-screen/boundary (route-view route-match) true))
         (when config/lsp-enabled?
           (plugin/hook-daemon-renderers))]))
     (not-found)))

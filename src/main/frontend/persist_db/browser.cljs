@@ -54,7 +54,7 @@
   nil)
 
 (def-thread-api :thread-api/search-index-build-progress
-  [repo {:keys [build-id status progress processed total]
+  [repo {:keys [build-id status progress processed total error-message]
          input-stage :stage}]
   (let [prev-state (get (state/get-state) :search/index-build)
         current-repo (state/get-current-repo)
@@ -65,7 +65,7 @@
                (not= :vector-index input-stage))
       (case status
         :idle
-        (when-not (= :completed (:status prev-state))
+        (when-not (contains? #{:completed :failed} (:status prev-state))
           (clear-search-index-progress-hide-timeout!)
           (state/set-state! :search/index-build
                             (cond-> (assoc (or prev-state {})
@@ -75,6 +75,16 @@
                                            :stage stage
                                            :repo repo)
                               build-id (assoc :build-id build-id))))
+
+        :failed
+        (do
+          (clear-search-index-progress-hide-timeout!)
+          (state/set-state! :search/index-build
+                            {:repo repo :build-id build-id :status :failed
+                             :running? false :visible? false :error-message error-message})
+          (when (true? (get-in (state/get-state) [:search/index-build-notify-repos repo]))
+            (state/set-state! [:search/index-build-notify-repos repo] false)
+            (notification/show! (t :search/indices-rebuild-failed error-message) :error)))
 
         :running
         (do

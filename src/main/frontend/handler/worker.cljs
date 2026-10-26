@@ -46,6 +46,10 @@
   (let [state data]
     (state/pub-event! [:rtc/sync-state state])))
 
+(defmethod handle :rtc-repair-state [_ _worker data]
+  (when (= (:repo data) (state/get-current-repo))
+    (state/set-state! :rtc/repair-status data)))
+
 (defmethod handle :rtc-asset-upload-download-progress [_ _worker {:keys [repo asset-id progress]}]
   (when (and (seq repo) (seq asset-id) (map? progress))
     (state/update-state!
