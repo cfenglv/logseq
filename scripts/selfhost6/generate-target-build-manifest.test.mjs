@@ -81,8 +81,8 @@ test("source and synthetic forward versions bind only the final public source id
   };
   const source = buildTargetManifest({ ...common, targetVersion: policy.sourceVersion });
   const target = buildTargetManifest({ ...common, targetVersion: policy.syntheticForwardTargetVersion });
-  assert.equal(policy.sourceVersion, "2.0.2-selfhost.3");
-  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.4");
+  assert.equal(policy.sourceVersion, "2.0.2-selfhost.4");
+  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.5");
   assert.equal(source["release-line-id"], target["release-line-id"]);
   assert.equal(source["target-source-full-sha"], target["target-source-full-sha"]);
   assert.equal(source["target-source-full-sha"], finalPublicSourceSha);
@@ -207,7 +207,7 @@ test("packaging configuration requires the generated target manifest", () => {
   const builder = fs.readFileSync(path.join(repoRoot, "resources/electron-builder.yml"), "utf8");
   assert.match(builder, /from: updater\/TARGET_BUILD_MANIFEST\.json\n\s+to: updater\/TARGET_BUILD_MANIFEST\.json/);
   const version = fs.readFileSync(path.join(repoRoot, "src/main/frontend/version.cljs"), "utf8");
-  assert.match(version, /defonce version "2\.0\.2-selfhost\.3"/);
+  assert.match(version, /defonce version "2\.0\.2-selfhost\.4"/);
   const gulpfile = fs.readFileSync(path.join(repoRoot, "gulpfile.js"), "utf8");
   assert.ok(gulpfile.includes('match(/defonce version "([^"]+)"/)?.[1]'));
 });
