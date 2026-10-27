@@ -77,7 +77,7 @@ let parse_tokens argv =
                       positional rest)
             | Some key -> (
                 match Vec.pop_front rest with
-                | Some (value, tail) when not (is_option value) ->
+                | Some (value, tail) when (key = "input" && value = "-") || not (is_option value) ->
                     loop
                       (Vec.push_back options (key, Some value))
                       positional tail
@@ -227,6 +227,15 @@ let allowed_options_for_path path =
     option_names [| "id"; "page"; "force" |]
   else if path2_any path "remove" (option_names [| "tag"; "property" |]) then
     option_names [| "id"; "name" |]
+  else if Vec.length path = 2 && Vec.nth path 0 = "literature" then
+    (match Vec.nth path 1 with
+     | "list" -> option_names [|"limit"; "before"|]
+     | "search" -> option_names [|"content"|]
+     | "show" -> option_names [|"uuid"|]
+     | "import" -> option_names [|"target-page"; "input"; "dry-run"|]
+     | "update" -> option_names [|"uuid"; "input"; "dry-run"|]
+     | "attach" -> option_names [|"uuid"; "asset-uuid"; "path"|]
+     | _ -> Vec.empty)
   else if path2 path "upsert" "block" then
     option_names
       [|
@@ -543,7 +552,9 @@ let validate_options path options =
   Error.bind (validate_known_options path options) (fun () ->
       Error.bind (validate_boolean_option_values options) (fun () ->
           Error.bind (validate_global_values options) (fun () ->
-              validate_option_values path options)))
+              if Vec.length path = 2 && Vec.nth path 0 = "literature" then
+                Error.bind (validate_integer_option "limit" options) (fun () -> validate_integer_option "before" options)
+              else validate_option_values path options)))
 
 let sync_config_key_or_error = function
   | None -> Ok None
@@ -836,6 +847,14 @@ let parse ?stdin argv =
       (Example (Example.Parsed_example { selector }))
   else
     match positional_array with
+    | [| "literature"; operation |] ->
+        (match Literature.kind_of_string operation with
+         | None -> Error (Error.unknown_command ("unknown literature operation: " ^ operation))
+         | Some kind -> make [|"literature"; operation|]
+             (Literature {kind;uuid=option_value "uuid" options;content=option_value "content" options;
+                input=option_value "input" options;stdin;target_page=option_value "target-page" options;
+                asset_uuid=option_value "asset-uuid" options;path=option_value "path" options;
+                dry_run=option_present "dry-run" options;limit=int_option "limit" options;before=int64_option "before" options}))
     | [| "graph"; "list" |] ->
         make [| "graph"; "list" |] (Graph Graph.Parsed_list)
     | [| "graph"; "create" |] ->

@@ -39,6 +39,8 @@ type code =
   | E2ee_password_not_found
   | Entity_not_found
   | Exception
+  | Literature_operation_blocked
+  | Literature_partial_import
   | External_asset
   | Graph_already_exists
   | Graph_db_not_empty
@@ -195,6 +197,8 @@ let code_to_string = function
   | E2ee_password_not_found -> "e2ee-password-not-found"
   | Entity_not_found -> "entity-not-found"
   | Exception -> "exception"
+  | Literature_operation_blocked -> "literature-operation-blocked"
+  | Literature_partial_import -> "literature-partial-import"
   | External_asset -> "external-asset"
   | Graph_already_exists -> "graph-already-exists"
   | Graph_db_not_empty -> "graph-db-not-empty"

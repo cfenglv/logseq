@@ -1,5 +1,6 @@
 type parsed_command =
   | Version
+  | Literature of Literature.parsed
   | Graph of Graph.parsed
   | List of List_command.parsed
   | Upsert of Upsert.parsed

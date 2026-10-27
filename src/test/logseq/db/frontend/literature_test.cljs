@@ -2787,3 +2787,55 @@
       (outliner-op/apply-ops! conn (:ops plan) {})
       (is (= destination-page
              (:block/uuid (:block/parent (d/entity @conn [:block/uuid (:paper-uuid plan)]))))))))
+
+(deftest manual-cli-import-supports-arxiv-and-identifier-free-records
+  (let [conn (create-literature-conn)
+        records [{:title "CLI arXiv paper" :arxiv "arXiv:2601.00002v2" :authors "A. Example"}
+                 {:title "CLI manual paper" :uuid paper-c :date "2026"}
+                 {:title "CLI title only"}]]
+    (doseq [record records]
+      (let [before @conn
+            plan (literature/build-import-paper-plan @conn destination-page record)]
+        (is (= :ready (:status plan)))
+        (is (identical? before @conn))
+        (outliner-op/apply-ops! conn (:ops plan) {})
+        (let [paper (d/entity @conn [:block/uuid (:paper-uuid plan)])]
+          (is (= (:title record) (:block/title paper)))
+          (is (= destination-page (:block/uuid (:block/parent paper))))
+          (is (empty? (:logseq.property/literature-source-key paper))))))
+    (let [again (literature/build-import-paper-plan @conn destination-page
+                                                  {:title "Must not replace" :arxiv "2601.00002"})]
+      (is (= :existing (:status again)))
+      (is (= "CLI arXiv paper" (:block/title (d/entity @conn [:block/uuid (:paper-uuid again)])))))
+    (is (= :existing (:status (literature/build-import-paper-plan @conn destination-page
+                                                                {:title "No replacement" :uuid paper-c}))))
+    (is (empty? (:errors (db-validate/validate-db @conn))))))
+
+(deftest manual-cli-patch-preserves-identities-and-supports-explicit-clearing
+  (let [conn (create-literature-conn)
+        original-assets (set (map :block/uuid (:logseq.property/literature-assets
+                                               (d/entity @conn [:block/uuid paper-a]))))
+        plan (literature/build-update-paper-plan @conn paper-a
+                                                 {:title "CLI changed title" :authors nil :citekey "Example2026"})]
+    (is (= :ready (:status plan)))
+    (outliner-op/apply-ops! conn (:ops plan) {})
+    (let [paper (d/entity @conn [:block/uuid paper-a])]
+      (is (= "CLI changed title" (:block/title paper)))
+      (is (nil? (:logseq.property/literature-authors paper)))
+      (is (= "Example2026" (:block/title (:logseq.property/literature-citekey paper))))
+      (is (= original-assets (set (map :block/uuid (:logseq.property/literature-assets paper)))))
+      (is (= "10.1234/example" (:block/title (:logseq.property/literature-doi paper)))))
+    (let [manual (literature/build-update-paper-plan @conn paper-no-id {:authors "Manual Example"})]
+      (is (= :ready (:status manual)))
+      (outliner-op/apply-ops! conn (:ops manual) {})
+      (is (= :unchanged (:status (literature/build-update-paper-plan @conn paper-no-id {:authors "Manual Example"})))))
+    (is (empty? (:errors (db-validate/validate-db @conn))))))
+
+(deftest manual-cli-conflicts-and-invalid-fields-do-not-mutate-the-graph
+  (let [conn (create-literature-conn)
+        before @conn]
+    (is (= :identifier-conflict (:reason (literature/build-update-paper-plan @conn paper-a {:doi "10.9999/other"}))))
+    (is (= :missing-title (:reason (literature/build-update-paper-plan @conn paper-a {:title nil}))))
+    (is (= :unsupported-metadata-field (:reason (literature/build-update-paper-plan @conn paper-a {:source-key "invented"}))))
+    (is (= :destination-unavailable (:reason (literature/build-import-paper-plan @conn pdf-a {:title "No invalid parent"}))))
+    (is (identical? before @conn))))

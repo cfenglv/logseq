@@ -330,11 +330,11 @@
                                          (literature/search-papers-for-candidate
                                           @conn (uuid id))))))
                         distinct
-                        (take literature-search-result-limit)
+                        (take (inc literature-search-result-limit))
                         vec)]
         {:status :ok
-         :papers papers
-         :truncated? truncated?}))))
+         :papers (subvec papers 0 (min literature-search-result-limit (count papers)))
+         :truncated? (or truncated? (> (count papers) literature-search-result-limit))}))))
 
 (def-thread-api :thread-api/search-upsert-blocks
   [repo blocks]

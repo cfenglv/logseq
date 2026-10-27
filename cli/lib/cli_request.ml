@@ -1,5 +1,6 @@
 type parsed_command =
   | Version
+  | Literature of Literature.parsed
   | Graph of Graph.parsed
   | List of List_command.parsed
   | Upsert of Upsert.parsed
@@ -30,6 +31,7 @@ let make ~globals ~path ~command ~raw_args =
 let command_id t =
   match t.command with
   | Version -> Command_id.Version
+  | Literature p -> Literature.command_id p
   | Graph p -> Graph.command_id p
   | List p -> List_command.command_id p
   | Upsert p -> Upsert.command_id p

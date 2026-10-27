@@ -19,3 +19,5 @@ type action = {
 val scope_of_parsed : parsed -> scope
 
 include Command_spec.S with type parsed := parsed and type action := action
+
+val hidden : Melange_edn_melange.any -> bool

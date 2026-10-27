@@ -48,11 +48,11 @@ else process.exitCode = 2;
 }
 
 test("packaging writes the exact platform target manifest and rejects a version split", context => {
-  const valid = fixture(context, "2.0.2-selfhost.4");
+  const valid = fixture(context, "2.0.2-selfhost.5");
   const environment = {
     ...process.env,
     SELFHOST6_SOURCE_FULL_SHA: "a".repeat(40),
-    SELFHOST6_TARGET_VERSION: "2.0.2-selfhost.4",
+    SELFHOST6_TARGET_VERSION: "2.0.2-selfhost.5",
     SELFHOST6_TARGET_PLATFORM: "linux",
     SELFHOST6_TARGET_ARCH: "arm64",
   };
@@ -62,7 +62,7 @@ test("packaging writes the exact platform target manifest and rejects a version 
     fs.readFileSync(path.join(valid.updater, "TARGET_BUILD_MANIFEST.json"), "utf8"),
   );
   assert.equal(manifest["target-source-full-sha"], "a".repeat(40));
-  assert.equal(manifest["target-version"], "2.0.2-selfhost.4");
+  assert.equal(manifest["target-version"], "2.0.2-selfhost.5");
   assert.equal(manifest.platform, "linux");
   assert.equal(manifest.arch, "arm64");
 
@@ -74,7 +74,7 @@ test("packaging writes the exact platform target manifest and rejects a version 
 });
 
 test("packaging infers immutable build identity when callers omit repeated parameters", context => {
-  const valid = fixture(context, "2.0.2-selfhost.4");
+  const valid = fixture(context, "2.0.2-selfhost.5");
   const bin = fakeGit(valid.root);
   const environment = {
     ...process.env,
@@ -90,9 +90,9 @@ test("packaging infers immutable build identity when callers omit repeated param
     fs.readFileSync(path.join(valid.updater, "TARGET_BUILD_MANIFEST.json"), "utf8"),
   );
   assert.equal(manifest["target-source-full-sha"], "b".repeat(40));
-  assert.equal(manifest["target-version"], "2.0.2-selfhost.4");
+  assert.equal(manifest["target-version"], "2.0.2-selfhost.5");
 
-  const dirty = fixture(context, "2.0.2-selfhost.4");
+  const dirty = fixture(context, "2.0.2-selfhost.5");
   const dirtyBin = fakeGit(dirty.root, { dirty: true });
   const dirtyResult = spawnSync(process.execPath, [dirty.script], {
     encoding: "utf8",
@@ -103,11 +103,11 @@ test("packaging infers immutable build identity when callers omit repeated param
 });
 
 test("win32 arm64 prepares the native reader before the admitted target manifest", context => {
-  const valid = fixture(context, "2.0.2-selfhost.4");
+  const valid = fixture(context, "2.0.2-selfhost.5");
   const environment = {
     ...process.env,
     SELFHOST6_SOURCE_FULL_SHA: "a".repeat(40),
-    SELFHOST6_TARGET_VERSION: "2.0.2-selfhost.4",
+    SELFHOST6_TARGET_VERSION: "2.0.2-selfhost.5",
     SELFHOST6_TARGET_PLATFORM: "win32",
     SELFHOST6_TARGET_ARCH: "arm64",
   };

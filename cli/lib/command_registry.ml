@@ -230,6 +230,12 @@ let options_for_command =
   | Command_id.Version | Graph_list | Graph_switch | Graph_remove | Graph_info
   | Graph_backup_list ->
       empty
+  | Literature_list -> Vec.of_array [|value "limit" "n" "Page size, 1-50 (default 50)"; value "before" "id" "Continue before next-before from the preceding page"|]
+  | Literature_search -> Vec.singleton (value ~required:true "content" "text" "Search text; results may be truncated")
+  | Literature_show -> Vec.singleton (value ~required:true "uuid" "uuid" "Literature UUID")
+  | Literature_import -> Vec.of_array [|value ~required:true "target-page" "page" "Destination page"; value ~required:true "input" "path" "JSON object/array file or - for stdin"; flag "dry-run" "Preview without graph writes"|]
+  | Literature_update -> Vec.of_array [|value ~required:true "uuid" "uuid" "Literature UUID"; value ~required:true "input" "path" "JSON patch file or - for stdin"; flag "dry-run" "Preview without graph writes"|]
+  | Literature_attach -> Vec.of_array [|value ~required:true "uuid" "uuid" "Literature UUID"; value "asset-uuid" "uuid" "Existing PDF Asset UUID"; value "path" "path" "Local PDF to import and link"|]
   | Graph_create ->
       Vec.of_array [| flag "enable-sync" "Enable sync"; e2ee_password_option |]
   | Graph_validate ->
@@ -485,6 +491,7 @@ let top_level_group_doc = function
   | "debug" -> Some "Debug commands"
   | "graph" -> Some "Manage graphs"
   | "list" -> Some "List graph entities"
+  | "literature" -> Some "Inspect and manage literature"
   | "remove" -> Some "Remove graph entities"
   | "search" -> Some "Search graph entities"
   | "server" -> Some "Manage db-worker-node servers"

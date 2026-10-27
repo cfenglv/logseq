@@ -217,6 +217,7 @@
                     (swap! calls conj [ops opts])
                     {:status :linked})]
       (doseq [invoke [#(auto-pdf! "synthetic-auto" asset-uuid evidence)
+                      #(link! "synthetic-auto" asset-uuid paper-uuid)
                       #(link! "synthetic-auto" asset-uuid paper-uuid
                               {:automatic? true :source-context context})]]
         (is (= {:status :deferred :reason :repair-active} (invoke))))

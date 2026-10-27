@@ -40,6 +40,12 @@ type t =
   | Query
   | Query_list
   | Show
+  | Literature_list
+  | Literature_search
+  | Literature_show
+  | Literature_import
+  | Literature_update
+  | Literature_attach
   | Debug_pull
   | Doctor
   | Sync_status

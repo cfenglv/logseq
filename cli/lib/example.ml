@@ -95,6 +95,12 @@ let default_entries =
           "logseq list node --graph my-graph --properties status,priority \
            --sort updated-at --order desc";
         |];
+      entry [| "literature"; "list" |] [|"logseq literature list --graph demo --limit 20 --output json"|];
+      entry [| "literature"; "search" |] [|"logseq literature search --graph demo --content 'Example' --output json"|];
+      entry [| "literature"; "show" |] [|"logseq literature show --graph demo --uuid 00000000-0000-4000-8000-000000000001 --output json"|];
+      entry [| "literature"; "import" |] [|"logseq literature import --graph demo --target-page Literature --input ./papers.json --dry-run --output json"|];
+      entry [| "literature"; "update" |] [|"logseq literature update --graph demo --uuid 00000000-0000-4000-8000-000000000001 --input ./patch.json --output json"|];
+      entry [| "literature"; "attach" |] [|"logseq literature attach --graph demo --uuid 00000000-0000-4000-8000-000000000001 --path ./paper.pdf --output json"|];
       entry [| "list"; "asset" |]
         [|
           "logseq list asset --graph my-graph";

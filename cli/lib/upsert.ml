@@ -2808,11 +2808,21 @@ let execute_create_asset mode config repo path create_action =
                               (graph_assets_dir config repo)
                               (block_uuid ^ "." ^ asset_type)
                           in
+                          let destination_existed = Cli_unix.file_exists destination in
+                          let cleanup_unregistered () =
+                            bind (pull_asset_by_uuid invoke_config repo block_uuid)
+                              (fun registered ->
+                                if not destination_existed && Edn_util.is_null registered
+                                   && Cli_unix.file_exists destination then
+                                  Cli_unix.remove_tree destination;
+                                pure ())
+                          in
                           try
                             copy_file path destination;
-                            bind (Add.execute_add_block ~extra_ops:Vec.empty add_action config mode)
+                            catch (bind (Add.execute_add_block ~extra_ops:Vec.empty add_action config mode)
                               (fun result ->
-                                if Cli_result.is_error result then pure result
+                                if Cli_result.is_error result then
+                                  bind (cleanup_unregistered ()) (fun () -> pure result)
                                 else
                                   match result_ids_of_create_result result with
                                   | Some ids ->
@@ -2825,8 +2835,12 @@ let execute_create_asset mode config repo path create_action =
                                         (Cli_result.error
                                            ~command:Command_id.Upsert_asset mode
                                            (Error.make Error.Asset_create_failed
-                                              "asset block not created")))
+                                              "asset block not created"))))
+                              (fun exn -> bind (cleanup_unregistered ())
+                                (fun () -> Cli_effect.error exn))
                           with exn ->
+                            if not destination_existed && Cli_unix.file_exists destination then
+                              Cli_unix.remove_tree destination;
                             pure
                               (Cli_result.error ~command:Command_id.Upsert_asset
                                  mode

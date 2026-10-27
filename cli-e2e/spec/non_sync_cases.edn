@@ -40,7 +40,16 @@
    :expect {:exit 0},
    :cmds ["{{cli}} completion {{completion-selector}}"]}},
  :cases
- [{:id "global-help",
+ [{:id "literature-agent-workflow"
+   :cmds ["python3 '{{repo-root}}/cli-e2e/scripts/literature.py' --cli '{{repo-root}}/static/logseq-cli.js' --root-dir {{root-dir-arg}} --config {{config-path-arg}} --graph {{graph-arg}}"]
+   :cleanup ["{{cli}} --root-dir {{root-dir-arg}} --config {{config-path-arg}} --output json server stop --graph {{graph-arg}}"]
+   :expect {:exit 0 :stdout-contains ["literature agent workflow passed"]}
+   :covers {:commands ["literature list" "literature search" "literature show"
+                       "literature import" "literature update" "literature attach"]
+            :options {:literature ["--uuid" "--content" "--input" "--target-page"
+                                   "--asset-uuid" "--path" "--dry-run" "--limit" "--before"]}}
+   :tags [:literature]}
+  {:id "global-help",
    :cmds ["{{cli}} --help"],
    :expect
    {:exit 0,

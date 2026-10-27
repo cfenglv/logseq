@@ -442,3 +442,25 @@ let read_input ~format ~path =
     in
     Cli_effect.pure result
   with exn -> Cli_effect.pure (Error (Error.exception_error exn))
+
+let thread_api_literature_search config ~repo ~content =
+  invoke config (thread_api_method "literature-search-papers") (Vec.of_array [|repo_value repo; Edn_util.string content|])
+
+let thread_api_db_sync_repair_status config ~repo =
+  invoke config (thread_api_method "db-sync-repair-status") (Vec.singleton (repo_value repo))
+
+let thread_api_literature_import config ~repo ~destination ~record ~dry_run =
+  invoke config (thread_api_method "literature-import-paper") (Vec.of_array [|repo_value repo; destination; record; Edn_util.bool dry_run|])
+
+let thread_api_literature_update config ~repo ~uuid ~patch ~dry_run =
+  invoke config (thread_api_method "literature-update-paper") (Vec.of_array [|repo_value repo; Edn_util.uuid uuid; patch; Edn_util.bool dry_run|])
+
+let thread_api_literature_link config ~repo ~paper_uuid ~asset_uuid =
+  invoke config (thread_api_method "literature-link-pdf") (Vec.of_array [|repo_value repo; Edn_util.uuid asset_uuid; Edn_util.uuid paper_uuid|])
+
+let thread_api_literature_reusable_pdf config ~repo ~checksum =
+  invoke config (thread_api_method "literature-find-reusable-pdf-by-checksum") (Vec.of_array [|repo_value repo; Edn_util.string checksum|])
+
+let thread_api_literature_pdf_filename config ~repo ~asset_uuid ~filename =
+  let filenames = Edn_util.map_vec (Vec.singleton (Edn_util.uuid asset_uuid, Edn_util.vector_vec (Vec.singleton (Edn_util.string filename)))) in
+  invoke config (thread_api_method "literature-add-pdf-filenames") (Vec.of_array [|repo_value repo; filenames|])

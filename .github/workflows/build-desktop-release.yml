@@ -94,7 +94,7 @@ env:
   OCAML_VERSION: '5.4.0'
   OPAM_VERSION: '2.5.2'
   OPAM_X86_64_LINUX_SHA512: '508a128cec8ddf06e763db56232818481a4eee7725fb725c08f543b4aefa0daa23042ec89a4dcb4fe8eac99c53c219196c715eec46b4f1f6769b47782f79943a'
-  SELFHOST6_TARGET_VERSION: '2.0.2-selfhost.4'
+  SELFHOST6_TARGET_VERSION: '2.0.2-selfhost.5'
 
 permissions:
   contents: read
@@ -102,7 +102,7 @@ permissions:
 jobs:
   upstream-compile-cljs:
     name: compile-cljs (upstream desktop)
-    if: ${{ github.ref_name != 'release/2.0.2-selfhost.4' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.4' && github.event.inputs.selfhost-operation != 'build-offline-bridge' }}
+    if: ${{ github.ref_name != 'release/2.0.2-selfhost.5' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.5' && github.event.inputs.selfhost-operation != 'build-offline-bridge' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Check build options
@@ -726,7 +726,7 @@ jobs:
   # reuse workflow via workflow_call
   build-android:
     uses: ./.github/workflows/build-android.yml
-    if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-android == 'true') && github.ref_name != 'release/2.0.2-selfhost.4' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.4' && github.event.inputs.selfhost-operation != 'build-offline-bridge' }}
+    if: ${{ (github.event_name == 'schedule' || github.event.inputs.build-android == 'true') && github.ref_name != 'release/2.0.2-selfhost.5' && github.event.inputs.git-ref != 'release/2.0.2-selfhost.5' && github.event.inputs.selfhost-operation != 'build-offline-bridge' }}
     with:
       build-target: "${{ github.event.inputs.build-target }}"
       # if scheduled, use production mode
@@ -737,7 +737,7 @@ jobs:
       SENTRY_AUTH_TOKEN: "${{ secrets.SENTRY_AUTH_TOKEN }}"
 
   resolve-release-source:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.2-selfhost.4' && github.event.inputs.git-ref == 'release/2.0.2-selfhost.4' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.ref_name == 'release/2.0.2-selfhost.5' && github.event.inputs.git-ref == 'release/2.0.2-selfhost.5' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     outputs:
@@ -753,7 +753,7 @@ jobs:
       - name: Freeze requested release source
         id: source
         run: |
-          test "$GITHUB_REF_NAME" = 'release/2.0.2-selfhost.4'
+          test "$GITHUB_REF_NAME" = 'release/2.0.2-selfhost.5'
           echo "ref=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
@@ -815,7 +815,7 @@ jobs:
           SOURCE_REF: ${{ needs.resolve-release-source.outputs.source-ref }}
           SOURCE_SHA: ${{ needs.resolve-release-source.outputs.source-sha }}
         run: |
-          test "$SOURCE_REF" = 'release/2.0.2-selfhost.4'
+          test "$SOURCE_REF" = 'release/2.0.2-selfhost.5'
           test -n "$SOURCE_SHA"
 
   rtc-browser-e2e:
@@ -1720,7 +1720,7 @@ jobs:
           if-no-files-found: error
 
   selfhost-release:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.event.inputs.is-draft == 'true' && github.ref_name == 'release/2.0.2-selfhost.4' && github.event.inputs.git-ref == 'release/2.0.2-selfhost.4' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.selfhost-operation == 'stage-draft' && github.event.inputs.build-target == 'stable' && github.event.inputs.is-draft == 'true' && github.ref_name == 'release/2.0.2-selfhost.5' && github.event.inputs.git-ref == 'release/2.0.2-selfhost.5' }}
     needs: [ release-source-gate, selfhost-release-verifier ]
     runs-on: ubuntu-22.04
     timeout-minutes: 30

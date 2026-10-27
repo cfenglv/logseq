@@ -181,3 +181,6 @@ include Command_spec.S with type parsed := parsed and type action := action
 
 val repo : action -> Cli_primitive.repo
 val graph : action -> Cli_primitive.graph
+
+val graph_assets_dir : Cli_config.t -> Cli_primitive.repo -> string
+val ensure_asset_file_metadata : string -> (string * int * string) Error.build_result

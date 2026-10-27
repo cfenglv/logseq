@@ -23,6 +23,7 @@ Use `logseq` to inspect and edit graph entities, run Datascript queries, and con
 - `upsert block`, `upsert page`, `upsert tag`, `upsert property`, `upsert task`, `upsert asset`
 - `remove block`, `remove page`, `remove tag`, `remove property`
 - `query`, `query list`, `show`, `search block|page|property|tag`
+- `literature list|search|show|import|update|attach`
 - Graph Management:
 - `graph list|create|switch|remove|validate|info|export|import|backup list|backup create|backup restore|backup remove`
 - `server list|cleanup|start|stop|restart`
@@ -63,6 +64,16 @@ Use `logseq` to inspect and edit graph entities, run Datascript queries, and con
 - Use `logseq list ...`, `logseq show ...`, or `logseq query ...` first to discover valid ids/uuids.
 - For graph transfer flows, keep `graph export --file` and `graph import --input` paths consistent.
 - Quote `--content` values with single quotes in shell examples, for example `--content 'Block content'`, so markdown backticks are not interpreted by the shell.
+
+## Literature for agents
+
+- Discover the current input contract with `logseq literature <operation> --help` and generated examples with `logseq example literature`.
+- Use `--output json`; import and update accept a JSON file or `--input -` for stdin. Import accepts an object or array and needs a non-empty title; update is one patch. Fields are `title`, `authors` (one string), `date`, `publication`, `type`, `doi`, `arxiv`, `url`, and `citekey`.
+- Import returns each input index, outcome, and Paper UUID. A matching DOI/arXiv reuses the existing Paper without replacing its metadata. Update explicitly supplied fields; omitted fields stay unchanged and null clears optional fields. Use `--dry-run` to preview.
+- Carry the returned UUID into show/update/attach. Follow list's `next-before` while `has-more` is true; honor search truncation and unavailable-index errors.
+- Attach accepts either an existing `--asset-uuid` or a local PDF `--path`. On partial failure, use the returned Asset UUID to retry only the link. Existing Paper/PDF ownership is not silently reassigned.
+- Show returns bibliography plus PDF availability and a local path when present. A remote-only file needs the existing `sync asset download` workflow; enqueue acceptance does not mean the PDF is ready. Use your PDF reading tool once the file is local. Metadata import does not fetch online metadata or run PDF identification.
+- Parse both success data and structured errors. Batch errors retain per-item results. A successful local transaction is not a remote sync acknowledgement; use existing `sync status` when that distinction matters.
 
 ## Structured block writes
 

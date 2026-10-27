@@ -17,8 +17,8 @@ export function readReleasePolicy(policyPath) {
   const policy = JSON.parse(fs.readFileSync(policyPath, "utf8"));
   assert.equal(policy.schemaVersion, 1);
   assert.equal(policy.releaseLineId, "selfhost-official-architecture-v1");
-  assert.equal(policy.sourceVersion, "2.0.2-selfhost.4");
-  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.5");
+  assert.equal(policy.sourceVersion, "2.0.2-selfhost.5");
+  assert.equal(policy.syntheticForwardTargetVersion, "2.0.2-selfhost.6");
   assert.equal(policy.bundleIdentity, "com.logseq.logseq");
   assert.equal(policy.forwardUpdateChannel, "latest");
   assert.deepEqual(policy.provider, {

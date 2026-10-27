@@ -30,6 +30,8 @@
 (defkeyword :literature/rename-pdf-titles "An explicit native transaction naming PDF Assets after their Paper.")
 (defkeyword :annotation-count "The selected PDF's annotation count.")
 (defkeyword :reference-count "The selected PDF's user reference count.")
+(defkeyword :unsupported-metadata-field "An explicit bibliography input contained an unknown field.")
+(defkeyword :invalid-paper-uuid "The supplied manual bibliography UUID is invalid.")
 
 (def identifier-properties
   {:doi :logseq.property/literature-doi
@@ -1553,6 +1555,26 @@
         {:status :blocked :reason :metadata-plan-stale})
       (build-accepted-metadata-plan db paper-uuid plan accepted-changes))))
 
+(defn- build-insert-paper-plan
+  [db destination paper-uuid record]
+  (let [insert-tx (:tx-data
+                   (outliner-core/insert-blocks
+                    db [{:block/uuid paper-uuid :block/title (:title record)
+                         :logseq.property/literature-item? true}]
+                    destination
+                    {:outliner-op :insert-blocks :keep-uuid? true :bottom? true :sibling? false}))
+        inserted-db (d/db-with db insert-tx)
+        metadata-plan (build-source-record-metadata-plan inserted-db paper-uuid record true)
+        metadata-tx (when (= :manual (:status metadata-plan))
+                      (build-accepted-metadata-plan
+                       inserted-db paper-uuid metadata-plan
+                       (mapv metadata-change-signature (:changes metadata-plan))))]
+    (if (or (= :already-imported (:status metadata-plan))
+            (= :ready (:status metadata-tx)))
+      {:status :ready :paper-uuid paper-uuid
+       :ops [[:transact [(into (vec insert-tx) (get-in metadata-tx [:ops 0 1 0])) {}]]]}
+      metadata-plan)))
+
 (defn build-add-doi-paper-plan
   "Adds a DOI-only bibliography item using ordinary native block/property txs.
    An existing exact DOI always wins without changing its metadata."
@@ -1580,22 +1602,92 @@
       (d/entity db [:block/uuid paper-uuid])
       {:status :blocked :reason :paper-uuid-conflict}
       :else
-      (let [insert-tx (:tx-data
-                       (outliner-core/insert-blocks
-                        db [{:block/uuid paper-uuid :block/title title
-                             :logseq.property/literature-item? true}]
-                        destination
-                        {:outliner-op :insert-blocks :keep-uuid? true :bottom? true :sibling? false}))
-            inserted-db (d/db-with db insert-tx)
-            metadata-plan (build-source-record-metadata-plan
-                           inserted-db paper-uuid (merge record identifiers) true)
-            metadata-tx (build-accepted-metadata-plan
-                         inserted-db paper-uuid metadata-plan
-                         (mapv metadata-change-signature (:changes metadata-plan)))
-            _ (assert (= :ready (:status metadata-tx)))
-            tx-data (into (vec insert-tx) (get-in metadata-tx [:ops 0 1 0]))]
-        {:status :ready :paper-uuid paper-uuid
-         :ops [[:transact [tx-data {}]]]}))))
+      (build-insert-paper-plan db destination paper-uuid
+                               (assoc (merge record identifiers) :title title)))))
+
+(defn- manual-record-error
+  [record allow-uuid?]
+  (let [fields (cond-> (set (map :field source-record-metadata-fields))
+                 allow-uuid? (conj :uuid))]
+    (cond
+      (not (map? record)) :invalid-metadata
+      (some #(not (contains? fields %)) (keys record)) :unsupported-metadata-field
+      (some (fn [[field value]]
+              (and (not= :uuid field) (some? value) (not (string? value)))) record)
+      :invalid-metadata
+      (and (contains? record :uuid) (not (uuid? (:uuid record)))) :invalid-paper-uuid
+      (and (contains? record :title) (string/blank? (:title record))) :missing-title
+      :else nil)))
+
+(defn build-import-paper-plan
+  "Imports an explicit bibliography record without a renderer or source binding."
+  [db destination-page-uuid record]
+  (if-let [reason (manual-record-error record true)]
+    {:status :blocked :reason reason}
+    (let [identifiers (normalize-identifiers (select-keys record [:doi :arxiv]))
+          title (some-> (:title record) string/trim not-empty)
+          matched (find-paper-by-identifiers db identifiers)
+          paper-uuid (or (source-record-paper-uuid identifiers) (:uuid record) (random-uuid))
+          existing (d/entity db [:block/uuid paper-uuid])
+          destination (when (uuid? destination-page-uuid)
+                        (d/entity db [:block/uuid destination-page-uuid]))]
+      (cond
+        (not (available? db)) {:status :blocked :reason :disabled}
+        (nil? title) {:status :blocked :reason :missing-title}
+        (= :conflict (:status matched))
+        {:status :blocked :reason :identifier-conflict :papers (:papers matched)}
+        (= :found (:status matched))
+        {:status :existing :paper-uuid (:block/uuid (first (:papers matched)))}
+        (and existing (live-literature-paper db paper-uuid))
+        {:status :existing :paper-uuid paper-uuid}
+        existing {:status :blocked :reason :paper-uuid-conflict}
+        (not (and (ldb/internal-page? destination)
+                  (not (ldb/class? destination)) (not (ldb/property? destination))
+                  (not (ldb/built-in? destination)) (not (ldb/hidden? destination))))
+        {:status :blocked :reason :destination-unavailable}
+        :else (build-insert-paper-plan db destination paper-uuid
+                                      (assoc (merge record identifiers) :title title))))))
+
+(defn build-update-paper-plan
+  "Patches explicit fields on one live Paper using the existing native property transactions."
+  [db paper-uuid patch]
+  (if-let [reason (manual-record-error patch false)]
+    {:status :blocked :reason reason}
+    (let [paper (live-literature-paper db paper-uuid)
+          identifiers (normalize-identifiers
+                       (into {} (map (fn [[field property]]
+                                       [field (if (contains? patch field)
+                                                (get patch field)
+                                                (:value (property-value-state paper property)))])
+                                     identifier-properties)))
+          matched (find-paper-by-identifiers db identifiers)
+          other-papers (filterv #(not= paper-uuid (:block/uuid %)) (:papers matched))]
+      (cond
+        (not (available? db)) {:status :blocked :reason :disabled}
+        (nil? paper) {:status :blocked :reason :paper-unavailable}
+        (seq other-papers) {:status :blocked :reason :identifier-conflict :papers other-papers}
+        :else
+        (let [changes (->> source-record-metadata-fields
+                           (keep (fn [{:keys [field property]}]
+                                   (when (contains? patch field)
+                                     (let [source (normalize-metadata-value field (get patch field))
+                                           current (if (= :block/title property)
+                                                     {:value (:block/title paper)}
+                                                     (property-value-state paper property))]
+                                       (when-not (= source (normalize-metadata-value field (:value current)))
+                                         (merge current {:field field :property property
+                                                         :current (:value current) :source source}))))))
+                           vec)
+              tx-data (into []
+                            (mapcat (fn [{:keys [property source value-node-uuid] :as change}]
+                                      (if (nil? source)
+                                        [[:db/retract [:block/uuid paper-uuid] property
+                                          [:block/uuid value-node-uuid]]]
+                                        (build-metadata-change-tx-data db paper-uuid change)))) changes)]
+          {:status (if (seq changes) :ready :unchanged)
+           :paper-uuid paper-uuid
+           :changes (mapv #(select-keys % [:field :current :source]) changes)
+           :ops (if (seq tx-data) [[:transact [tx-data {}]]] [])})))))
 
 (defn build-auto-register-pdf-plan
   "Checks a fixed-source record against PDF evidence before creating or

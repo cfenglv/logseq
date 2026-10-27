@@ -1,5 +1,6 @@
 type t =
   | Version
+  | Literature of Literature.action
   | Graph of Graph.action
   | List of List_command.action
   | Upsert of Upsert.action

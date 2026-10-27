@@ -41,6 +41,8 @@ type code =
   | E2ee_password_not_found
   | Entity_not_found
   | Exception
+  | Literature_operation_blocked
+  | Literature_partial_import
   | External_asset
   | Graph_already_exists
   | Graph_db_not_empty

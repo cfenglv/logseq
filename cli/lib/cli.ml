@@ -14,6 +14,7 @@ let command_metadata () =
   Vec.fold_left Vec.append Vec.empty
     (Vec.of_array
        [|
+         Literature.metadata ();
          Graph.metadata ();
          List_command.metadata ();
          Upsert.metadata ();
@@ -112,7 +113,7 @@ let parse_tokens argv =
                       positional rest)
             | Some key -> (
                 match Vec.pop_front rest with
-                | Some (value, tail) when not (is_option value) ->
+                | Some (value, tail) when (key = "input" && value = "-") || not (is_option value) ->
                     loop
                       (Vec.push_back options (key, Some value))
                       positional tail
@@ -127,6 +128,13 @@ let stdin_required_for_show_id argv =
   && Vec.peek_front positional = "show"
   && option_present "id" options
   && Option.is_none (option_value "id" options)
+
+let stdin_required_for_literature argv =
+  let options, positional = parse_tokens argv in
+  not (option_present "help" options || option_present "version" options)
+  && Vec.length positional = 2 && Vec.nth positional 0 = "literature"
+  && List.mem (Vec.nth positional 1) ["import"; "update"]
+  && option_value "input" options = Some "-"
 
 let read_stdin_all () = Cli_unix.read_stdin_all ()
 
@@ -289,7 +297,7 @@ let parse_args : type marker.
   let input =
     match input.stdin with
     | Some _ -> input
-    | None when stdin_required_for_show_id input.argv ->
+    | None when stdin_required_for_show_id input.argv || stdin_required_for_literature input.argv ->
         { input with stdin = Some (read_stdin_all ()) }
     | None -> input
   in

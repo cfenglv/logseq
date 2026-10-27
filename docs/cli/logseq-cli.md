@@ -563,3 +563,26 @@ helper options such as `:include-uuid?`, `:shallow-copy?`, and
 `:include-children?` are not part of the public contract. Unknown, misplaced,
 or inapplicable keys and invalid values produce `invalid-options` diagnostics
 with their option paths and corrective guidance.
+
+## Literature commands
+
+`logseq literature` operates on the existing graph bibliography. It does not require a desktop window and uses the graph's normal db-worker and transaction/sync pipeline.
+
+| Command | Input and behavior |
+| --- | --- |
+| `literature list` | `--limit` (1–50, default 50), optional `--before`. JSON returns `items`, `has-more`, `next-before`. |
+| `literature search --content TEXT` | Existing literature index, with `truncated` reported. An unavailable/rebuilding index is an error, not an empty result. |
+| `literature show --uuid UUID` | Complete bibliography and PDF Asset identities, filenames, local availability and local paths when present. |
+| `literature import --target-page PAGE --input FILE` | JSON object or array, or `--input -` for stdin; optional `--dry-run`. Reuses matching DOI/arXiv without overwriting existing metadata. |
+| `literature update --uuid UUID --input FILE` | JSON patch, also supports stdin and `--dry-run`. Omitted fields are preserved; null clears optional fields. |
+| `literature attach --uuid PAPER --asset-uuid ASSET` | Link an existing PDF, or use `--path FILE.pdf` to import/reuse a local PDF and link it. The two input selectors are mutually exclusive. |
+
+Metadata fields: `title`, `authors`, `date`, `publication`, `type`, `doi`, `arxiv`, `url`, `citekey`. Values are strings or null; authors use the existing single-string representation. Import requires a non-empty title; a title patch cannot be empty. Identifier-free imports may include a `uuid` string for stable repeated submission. No identifiers means ordinary new-record semantics; equal titles do not authorize merging. DOI/arXiv fields identify supplied metadata and do not trigger online lookup.
+
+```json
+{"title":"Example paper","authors":"Alice Example; Bob Example","doi":"10.1234/example-paper"}
+```
+
+Use `logseq example literature` for command examples. JSON stdout contains one result. Success uses the existing `status: ok` / `data` envelope; blocked/partial outcomes exit nonzero and use `status: error` / `error`, retaining per-item outcomes and `input-index` for imports. Keep the returned `paper-uuid` / `asset-uuid` to continue instead of repeating a completed import or file copy.
+
+PDF availability is local-file presence, not a full hash verification. For remote-only assets use the existing `sync asset download --graph GRAPH --uuid ASSET` command and check again after download; that command acknowledges enqueueing. Local writes remain available offline and use normal RTC later. Local success does not assert that every peer has acknowledged the change.

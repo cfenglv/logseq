@@ -40,6 +40,12 @@ type t =
   | Query
   | Query_list
   | Show
+  | Literature_list
+  | Literature_search
+  | Literature_show
+  | Literature_import
+  | Literature_update
+  | Literature_attach
   | Debug_pull
   | Doctor
   | Sync_status
@@ -113,6 +119,12 @@ let table =
       (Remove_page, "remove-page", path [| "remove"; "page" |]);
       (Remove_tag, "remove-tag", path [| "remove"; "tag" |]);
       (Remove_property, "remove-property", path [| "remove"; "property" |]);
+      (Literature_list, "literature-list", path [| "literature"; "list" |]);
+      (Literature_search, "literature-search", path [| "literature"; "search" |]);
+      (Literature_show, "literature-show", path [| "literature"; "show" |]);
+      (Literature_import, "literature-import", path [| "literature"; "import" |]);
+      (Literature_update, "literature-update", path [| "literature"; "update" |]);
+      (Literature_attach, "literature-attach", path [| "literature"; "attach" |]);
       (Query, "query", path [| "query" |]);
       (Query_list, "query-list", path [| "query"; "list" |]);
       (Show, "show", path [| "show" |]);
@@ -159,7 +171,7 @@ let is_write = function
   | Remove_block | Remove_page | Remove_tag | Remove_property | Sync_start
   | Sync_stop | Sync_upload | Sync_download | Sync_asset_download
   | Sync_ensure_keys | Sync_grant_access | Sync_config_set | Sync_config_unset
-  | Login | Logout | Skill_install ->
+  | Login | Logout | Skill_install | Literature_import | Literature_update | Literature_attach ->
       true
   | _ -> false
 

@@ -1,5 +1,6 @@
 type t =
   | Version
+  | Literature of Literature.action
   | Graph of Graph.action
   | List of List_command.action
   | Upsert of Upsert.action
@@ -35,6 +36,7 @@ let build config request =
   let result =
     match request.Cli_request.command with
     | Cli_request.Version -> Ok Version
+    | Literature parsed -> Error.map (fun action -> Literature action) (Literature.build config request.globals parsed)
     | Graph parsed ->
         Error.bind (Graph.build config request.globals parsed) (fun action ->
             Ok (Graph action))
@@ -96,6 +98,7 @@ let execute action config =
       Cli_effect.pure
         (Cli_result.ok ~command:Command_id.Version mode
            (Message (version_output ())))
+  | Literature action -> Literature.execute action config
   | Graph action -> Graph.execute action config
   | List action -> List_command.execute action config
   | Upsert action -> Upsert.execute action config

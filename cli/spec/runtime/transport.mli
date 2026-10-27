@@ -5,6 +5,7 @@ type invoke_config = {
 }
 
 type event_type = Cli_primitive.keyword
+val thread_api_db_sync_repair_status : invoke_config -> repo:Cli_primitive.repo -> Melange_edn_melange.any Cli_effect.t
 type event_payload = Melange_edn_melange.any
 type event_subscription = { close : unit -> unit Cli_effect.t }
 
@@ -188,3 +189,10 @@ val thread_api_verify_and_save_e2ee_password :
   refresh_token:string ->
   password:string ->
   Melange_edn_melange.any Cli_effect.t
+
+val thread_api_literature_search : invoke_config -> repo:Cli_primitive.repo -> content:string -> Melange_edn_melange.any Cli_effect.t
+val thread_api_literature_import : invoke_config -> repo:Cli_primitive.repo -> destination:Melange_edn_melange.any -> record:Melange_edn_melange.any -> dry_run:bool -> Melange_edn_melange.any Cli_effect.t
+val thread_api_literature_update : invoke_config -> repo:Cli_primitive.repo -> uuid:string -> patch:Melange_edn_melange.any -> dry_run:bool -> Melange_edn_melange.any Cli_effect.t
+val thread_api_literature_link : invoke_config -> repo:Cli_primitive.repo -> paper_uuid:string -> asset_uuid:string -> Melange_edn_melange.any Cli_effect.t
+val thread_api_literature_reusable_pdf : invoke_config -> repo:Cli_primitive.repo -> checksum:string -> Melange_edn_melange.any Cli_effect.t
+val thread_api_literature_pdf_filename : invoke_config -> repo:Cli_primitive.repo -> asset_uuid:string -> filename:string -> Melange_edn_melange.any Cli_effect.t
