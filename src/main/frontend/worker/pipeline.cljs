@@ -78,14 +78,15 @@
 (defn- ensure-template-journal-pages
   [db blocks]
   (reduce
-   (fn [{:keys [db tx-data] :as result} journal-day]
+   (fn [{:keys [db tx-data] :as acc} journal-day]
      (if (ldb/get-journal-page-by-day db journal-day)
-       result
+       acc
        (let [{page-tx-data :tx-data} (outliner-page/create db (journal-title db journal-day) {:journal? true})]
          (when-not (seq page-tx-data)
            (throw (ex-info "failed to create template journal page" {:journal-day journal-day})))
-         {:db (:db-after (d/with db page-tx-data))
-          :tx-data (concat tx-data page-tx-data)})))
+         (let [page-report (d/with db page-tx-data)]
+           {:db (:db-after page-report)
+            :tx-data (into tx-data (:tx-data page-report))}))))
    {:db db
     :tx-data []}
    (outliner-template/dynamic-template-journal-days blocks)))
@@ -126,37 +127,40 @@
         tag-additions (->> (:tx-data tx-report)
                            (filter (fn [d] (and (= (:a d) :block/tags) (:added d))))
                            (group-by :e))
-        insertion-inputs (mapcat
-                          (fn [[e datoms]]
-                            (let [templates (->> (set (map :v datoms))
-                                                 (mapcat tag->templates)
-                                                 distinct
-                                                 (sort-by :block/created-at))]
-                              (map (fn [template]
-                                     {:object-id e
-                                      :blocks (raw-template-blocks template)})
-                                   templates)))
-                          tag-additions)
+        insertion-inputs (map (fn [[e datoms]]
+                                (let [templates (->> (set (map :v datoms))
+                                                     (mapcat tag->templates)
+                                                     distinct
+                                                     (sort-by :block/created-at))]
+                                  {:object-id e
+                                   :blocks (mapcat raw-template-blocks templates)}))
+                              tag-additions)
         {db-with-pages :db page-tx-data :tx-data} (ensure-template-journal-pages db (mapcat :blocks insertion-inputs))
-        insert-tx-data (mapcat
-                        (fn [{:keys [object-id blocks]}]
-                          (let [object (d/entity db-with-pages object-id)
-                                blocks-to-insert (outliner-template/resolve-dynamic-template-blocks db-with-pages object blocks)]
-                            (when (seq blocks-to-insert)
-                              (let [result (outliner-core/insert-blocks
-                                            db-with-pages blocks-to-insert object
-                                            {:sibling? false
-                                             :keep-uuid? journal-template?
-                                             :outliner-op :insert-template-blocks})]
-                                (concat
-                                 (:tx-data result)
-                                 (mapcat (fn [block]
-                                           (when-let [refs (seq (outliner-pipeline/block-content-refs db-with-pages block))]
-                                             [{:db/id (:db/id block)
-                                               :block/refs refs}]))
-                                         (:blocks result)))))))
-                        insertion-inputs)]
-    (concat page-tx-data insert-tx-data)))
+        result (reduce
+                (fn [{:keys [db tx-data] :as acc} {:keys [object-id blocks]}]
+                  (let [object (d/entity db object-id)
+                        blocks-to-insert (outliner-template/resolve-dynamic-template-blocks db object blocks)]
+                    (if (seq blocks-to-insert)
+                      (let [insertion (outliner-core/insert-blocks
+                                       db blocks-to-insert object
+                                       {:sibling? false
+                                        :keep-uuid? journal-template?
+                                        :outliner-op :insert-template-blocks})
+                            template-report (d/with db
+                                              (concat
+                                               (:tx-data insertion)
+                                               (mapcat (fn [block]
+                                                         (when-let [refs (seq (outliner-pipeline/block-content-refs db block))]
+                                                           [{:db/id (:db/id block)
+                                                             :block/refs refs}]))
+                                                       (:blocks insertion))))]
+                        {:db (:db-after template-report)
+                         ;; Separate target pages must not reuse insert-blocks' temporary ids.
+                         :tx-data (into tx-data (:tx-data template-report))})
+                      acc)))
+                {:db db-with-pages :tx-data (vec page-tx-data)}
+                insertion-inputs)]
+    (:tx-data result)))
 
 (defn- fix-page-tags
   "Add missing attributes and remove #Page when inserting or updating block/title with inline tags"
@@ -560,10 +564,21 @@
         insert-templates-tx (when-not (or (rtc-tx-or-download-graph? tx-meta)
                                           (:undo? tx-meta)
                                           (:db-sync/replayed-tx-data? tx-meta))
-                              (insert-tag-templates
-                               (cond-> (assoc tx-report :db-after template-db)
-                                 template-result
-                                 (update :tx-data concat (:tx-data template-result)))))
+                              (try
+                                (insert-tag-templates
+                                 (cond-> (assoc tx-report :db-after template-db)
+                                   template-result
+                                   (update :tx-data concat (:tx-data template-result))))
+                                (catch :default error
+                                  (if (= :notification (:type (ex-data error)))
+                                    (throw error)
+                                    (throw (ex-info "Tag template insertion failed"
+                                                    {:type :notification
+                                                     :payload {:message (str "Template insert error: " (ex-message error))
+                                                               :i18n-key :editor/template-insert-error
+                                                               :i18n-args [(ex-message error)]
+                                                               :type :error}}
+                                                    error))))))
         created-by-tx (add-created-by-ref-hook db-before db-after tx-data tx-meta)]
     (concat before-template-tx-data
             insert-templates-tx

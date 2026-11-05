@@ -1072,6 +1072,53 @@
         ;; return global fn back to previous behavior
         (ldb/register-transact-pipeline-fn! identity)))))
 
+(deftest inherited-tag-templates-keep-both-trees-test
+  (doseq [target-titles [["First target"] ["First target" "Second target"]]]
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "First target"}
+                   :blocks [{:block/title "existing first"}]}
+                  {:page {:block/title "Second target"}
+                   :blocks [{:block/title "existing second"}]}
+                  {:page {:block/title "Templates"}
+                   :blocks [{:block/title "parent template"
+                             :build/children [{:block/title "parent <% current page %>"
+                                               :build/children [{:block/title "parent leaf"}]}]}
+                            {:block/title "child template"
+                             :build/children [{:block/title "child root"
+                                               :build/children [{:block/title "child leaf"}]}]}]}]
+                 :classes {:ParentTag {}
+                           :ChildTag {:build/class-extends [:ParentTag]}}})
+          parent-tag (ldb/get-page @conn "ParentTag")
+          child-tag (ldb/get-page @conn "ChildTag")
+          targets (mapv #(ldb/get-page @conn %) target-titles)]
+      (doseq [[title tag] [["parent template" parent-tag] ["child template" child-tag]]]
+        (ldb/transact! conn [[:db/add (:db/id (db-test/find-block-by-content @conn title))
+                              :logseq.property/template-applied-to (:db/id tag)]]))
+      (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+      (try
+        (outliner-op/apply-ops! conn
+                               [[:batch-set-property [(mapv :block/uuid targets)
+                                                      :block/tags (:db/id child-tag) {}]]]
+                               {})
+        (doseq [target targets]
+          (let [page (d/entity @conn (:db/id target))
+                blocks (vec (rest (ldb/get-block-and-children @conn (:block/uuid page))))
+                parent-block (some #(when (= (:block/raw-title %)
+                                             (str "parent " (page-ref/->page-ref (:block/uuid page)))) %)
+                                   blocks)]
+            (is (some #(= (:db/id child-tag) (:db/id %)) (:block/tags page)))
+            (is (= 5 (count blocks)) "The existing block and both complete templates remain")
+            (is (= #{"parent leaf" "child root" "child leaf"}
+                   (set (filter #{"parent leaf" "child root" "child leaf"} (map :block/title blocks)))))
+            (is (= [(:block/uuid page)] (mapv :block/uuid (:block/refs parent-block))))
+            (is (= 2 (count (filter :logseq.property/used-template blocks))))
+            (is (every? (fn [siblings]
+                          (= (count siblings) (count (distinct (map :block/order siblings)))))
+                        (vals (group-by #(get-in % [:block/parent :db/id]) blocks))))))
+        (finally
+          (ldb/register-transact-pipeline-fn! identity))))))
+
 (deftest tag-template-insertion-creates-missing-journal-ref-test
   (let [today (date-time-util/ms->journal-day (js/Date.))
         tomorrow (date-time-util/ms->journal-day (+ (js/Date.now) (* 24 60 60 1000)))

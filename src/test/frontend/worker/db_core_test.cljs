@@ -57,6 +57,7 @@
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]
             [logseq.db.sqlite.export :as sqlite-export]
             [logseq.db.test.helper :as db-test]
+            [logseq.outliner.core :as outliner-core]
             [promesa.core :as p]
             [shadow.resource :as rc]))
 
@@ -1002,6 +1003,52 @@
          (is (= :db.cardinality/one (:db/cardinality result)))
          (is (= (:db/id result)
                 (:db/id (#'block-handler/resolve-block-entity @conn :user.property/test-property)))))))))
+
+(deftest tag-template-failure-notifies-without-partial-write-test
+  (restoring-worker-state
+   (fn []
+     (let [conn (db-test/create-conn-with-blocks
+                 {:pages-and-blocks
+                  [{:page {:block/title "Target"}
+                    :blocks [{:block/title "existing content"}]}
+                   {:page {:block/title "Templates"}
+                    :blocks [{:block/title "template root"
+                              :build/children [{:block/title "template content"}]}]}]
+                  :classes {:ExampleTag {}}})
+           target (ldb/get-page @conn "Target")
+           tag (ldb/get-page @conn "ExampleTag")
+           template (db-test/find-block-by-content @conn "template root")
+           calls (atom [])
+           cause (js/Error. "synthetic template failure")
+           previous-pipeline @ldb/*transact-pipeline-fn]
+       (ldb/transact! conn [[:db/add (:db/id template)
+                              :logseq.property/template-applied-to (:db/id tag)]])
+       (reset! worker-state/*datascript-conns {test-repo conn})
+       (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+       (try
+         (let [before @conn]
+           (with-redefs [outliner-core/insert-blocks (fn [& _] (throw cause))
+                         shared-service/broadcast-to-clients! (fn [event payload]
+                                                               (swap! calls conj [event payload]))]
+             (try
+               ((get-thread-api :thread-api/apply-outliner-ops)
+                test-repo
+                [[:batch-set-property [[(:block/uuid target)] :block/tags (:db/id tag) {}]]]
+                {})
+               (is false "Template failure must reject the operation")
+               (catch :default error
+                 (is (= :notification (:type (ex-data error))))
+                 (is (identical? cause (ex-cause error))))))
+           (is (identical? before @conn) "The tag and partial template must not be committed")
+           (is (= 1 (count @calls)))
+           (let [[event payload] (first @calls)]
+             (is (= :notification event))
+             (is (= :error (second payload)))
+             (is (= {:i18n-key :editor/template-insert-error
+                     :i18n-args ["synthetic template failure"]}
+                    (last payload)))))
+         (finally
+           (ldb/register-transact-pipeline-fn! previous-pipeline)))))))
 
 (deftest apply-outliner-ops-reports-each-worker-phase-test
   (restoring-worker-state
