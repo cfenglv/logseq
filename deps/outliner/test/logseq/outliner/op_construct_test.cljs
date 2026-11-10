@@ -7,6 +7,7 @@
             [logseq.db.frontend.property :as db-property]
             [logseq.db.test.helper :as db-test]
             [logseq.outliner.core :as outliner-core]
+            [logseq.outliner.op :as outliner-op]
             [logseq.outliner.op.construct :as op-construct]
             [logseq.outliner.page :as outliner-page]
             [logseq.outliner.property :as outliner-property]))
@@ -24,8 +25,11 @@
 
 (deftest derive-history-outliner-ops-canonicalizes-create-page-and-builds-delete-inverse-test
   (testing "create-page forward op keeps created uuid and reverse op deletes that page"
-    (let [conn (db-test/create-conn-with-blocks {:pages-and-blocks []})
-          page-uuid (random-uuid)
+    (let [page-uuid (random-uuid)
+          conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks [{:page {:block/title "Created Page"
+                                            :block/uuid page-uuid}
+                                     :blocks []}]})
           tx-data [{:e 1 :a :block/title :v "Created Page" :added true}
                    {:e 1 :a :block/uuid :v page-uuid :added true}]
           tx-meta {:outliner-op :create-page
@@ -50,18 +54,19 @@
           {:keys [forward-outliner-ops inverse-outliner-ops]}
           (op-construct/derive-history-outliner-ops db-before (:db-after report)
                                                   (:tx-data report) tx-meta)
-          [_ [title opts]] (first forward-outliner-ops)
-          replay (outliner-page/create db-before title opts)
-          db-replayed (:db-after (d/with db-before (:tx-data replay) (:tx-meta replay)))
+          created-ids (mapv #(get-in % [1 1 :uuid]) (filter #(= :create-page (first %)) forward-outliner-ops))
+          replay-conn (d/conn-from-db db-before)
+          _ (outliner-op/apply-ops! replay-conn forward-outliner-ops {})
+          db-replayed @replay-conn
           identities (fn [db]
                        (into {} (keep (fn [id]
                                         (let [node (d/entity db id)]
                                           (when (contains? #{"ns" "child"} (:block/title node))
                                             [(:block/title node) (:block/uuid node)]))))
                              (d/q '[:find [?e ...] :where [?e :block/uuid]] db)))]
-      (is (= page-uuid (:uuid opts)))
-      (is (= 2 (count (:namespace-page-uuids opts))))
-      (is (= (mapv (fn [id] [:delete-page [id {}]]) (reverse (:namespace-page-uuids opts)))
+      (is (= page-uuid (last created-ids)))
+      (is (= 2 (count created-ids)))
+      (is (= (mapv (fn [id] [:delete-page [id {}]]) (reverse created-ids))
              inverse-outliner-ops))
       (is (= (identities (:db-after report)) (identities db-replayed))))))
 
@@ -95,18 +100,17 @@
           report (d/with db-before tx-data tx-meta)
           {:keys [forward-outliner-ops inverse-outliner-ops]}
           (op-construct/derive-history-outliner-ops db-before (:db-after report) (:tx-data report) tx-meta)
-          opts (get-in forward-outliner-ops [0 1 1])
-          ids (:namespace-page-uuids opts)
-          replay (outliner-page/create db-before title opts)
-          db-replayed (:db-after (d/with db-before (:tx-data replay) (:tx-meta replay)))]
-      (is (= page-uuid (:uuid opts)))
-      (is (= 3 (count ids)))
-      (is (nil? (first ids)))
-      (is (= [[:delete-page [(last ids) {}]] [:delete-page [(second ids) {}]]]
+          ids (mapv #(get-in % [1 1 :uuid]) (filter #(= :create-page (first %)) forward-outliner-ops))
+          replay-conn (d/conn-from-db db-before)
+          _ (outliner-op/apply-ops! replay-conn forward-outliner-ops {})
+          db-replayed @replay-conn]
+      (is (= page-uuid (last ids)))
+      (is (= 2 (count ids)))
+      (is (= (mapv (fn [id] [:delete-page [id {}]]) (reverse ids))
              inverse-outliner-ops))
       (is (= (:block/uuid (ldb/get-page db-before "Root"))
              (:block/uuid (ldb/get-page db-replayed "Root"))))
-      (doseq [id (rest ids)]
+      (doseq [id ids]
         (is (= (:block/name (d/entity (:db-after report) [:block/uuid id]))
                (:block/name (d/entity db-replayed [:block/uuid id])))))))
 
@@ -132,7 +136,8 @@
                                            :logseq.property.class/extends (:db/id middle)]) tx-meta)
         {:keys [forward-outliner-ops inverse-outliner-ops]}
         (op-construct/derive-history-outliner-ops db-before (:db-after report) (:tx-data report) tx-meta)]
-    (is (= [nil nil page-uuid] (get-in forward-outliner-ops [0 1 1 :namespace-page-uuids])))
+    (is (= [page-uuid]
+           (mapv #(get-in % [1 1 :uuid]) (filter #(= :create-page (first %)) forward-outliner-ops))))
     (is (= [[:delete-page [page-uuid {}]]] inverse-outliner-ops))))
 
 (deftest derive-history-outliner-ops-handles-replace-empty-target-insert-inverse-test
@@ -677,12 +682,16 @@
 
     (testing ":create-page"
       (let [page-uuid (random-uuid)
+            conn2 (db-test/create-conn-with-blocks
+                   {:pages-and-blocks [{:page {:block/title "P2"
+                                               :block/uuid page-uuid}
+                                        :blocks []}]})
             tx-data [{:e 1 :a :block/title :v "P2" :added true}
                      {:e 1 :a :block/uuid :v page-uuid :added true}]
             {:keys [inverse-outliner-ops]}
             (op-construct/derive-history-outliner-ops
-             @conn @conn tx-data {:outliner-op :create-page
-                                  :outliner-ops [[:create-page ["P2" {:redirect? false}]]]})]
+             @conn2 @conn2 tx-data {:outliner-op :create-page
+                                    :outliner-ops [[:create-page ["P2" {:redirect? false}]]]})]
         (is (= [[:delete-page [page-uuid {}]]]
                inverse-outliner-ops))))
 
@@ -763,3 +772,28 @@
                                        {:parent-original nil
                                         :logical-outdenting? nil}]]]
              inverse-outliner-ops)))))
+
+(deftest move-blocks-preserves-document-order-across-parents-test
+  (testing "moving a nested block and its following top-level block keeps document order"
+    (let [conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "source"}
+                   :blocks [{:block/title "b"
+                             :build/children [{:block/title "b1"}
+                                              {:block/title "b2"}]}
+                            {:block/title "c"}]}
+                  {:page {:block/title "target"} :blocks []}]})
+          b (db-test/find-block-by-content @conn "b")
+          b2 (db-test/find-block-by-content @conn "b2")
+          c (db-test/find-block-by-content @conn "c")
+          _ (d/transact! conn [{:db/id (:db/id b) :block/order "a"}
+                               {:db/id (:db/id b2) :block/order "z"}
+                               {:db/id (:db/id c) :block/order "m"}])]
+      (outliner-core/move-blocks! conn
+                                 [(d/entity @conn (:db/id b2)) (d/entity @conn (:db/id c))]
+                                 (db-test/find-page-by-title @conn "target")
+                                 {:sibling? false})
+      (is (= ["b2" "c"]
+             (->> (:block/_parent (db-test/find-page-by-title @conn "target"))
+                  ldb/sort-by-order
+                  (mapv :block/title)))))))

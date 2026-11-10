@@ -163,12 +163,15 @@ function ownershipAvailable(ctx) {
   handle.release();
   return true;
 }
-async function createGraph(storage, repo) {
+async function createGraph(storage, repo, exclusive = false) {
   const ctx = context(storage, repo);
   return withLease(ctx, 'create', async () => {
     const current = state(ctx);
     requireRenameFinished(ctx);
-    if (current.phase === 'available' && fs.existsSync(ctx.graphDir)) return current.generation;
+    if (current.phase === 'available' && fs.existsSync(ctx.graphDir)) {
+      if (exclusive) fail('Graph already exists', 'graph-already-exists');
+      return current.generation;
+    }
     if (current.deletion && !current.deletion.moved && fs.existsSync(ctx.graphDir))
       fail('Graph deletion must finish before recreation');
     await stopUnderLease(ctx, current, true);
@@ -848,13 +851,14 @@ async function normalizeGraphDirectories(storage) {
     return readGraphDirectoryRenames(storage);
   });
 }
-async function deleteGraph(storage, repo, commit) {
+async function deleteGraph(storage, repo, commit, generation) {
   const ctx = context(storage, repo);
   const observed = snapshot(storage, repo);
   return withLease(ctx, 'delete', async () => {
     const current = state(ctx);
     requireRenameFinished(ctx);
-    if (observed && observed.generation !== current.generation)
+    if ((generation && generation !== current.generation) ||
+        (observed && observed.generation !== current.generation))
       fail('Graph generation changed', 'graph-not-exists');
     if (observed?.deletion && observed.deletion.id !== current.deletion?.id)
       fail('Graph deletion operation changed', 'graph-not-exists');

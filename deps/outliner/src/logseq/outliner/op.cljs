@@ -628,6 +628,10 @@
                [_ [blocks target-id insert-opts]] (first (get-in result [:tx-meta :outliner-ops]))
                op-entry (case op
                           :save-block (first (get-in result [:tx-meta :outliner-ops]))
+                          :upsert-property (let [[_ schema property-opts] args]
+                                             [:upsert-property [(:db/ident result) schema property-opts]])
+                          :create-page (let [[title page-opts] args]
+                                         [:create-page [title (assoc page-opts :uuid (second result))]])
                           :insert-blocks (when result [:insert-blocks [blocks target-id insert-opts]])
                           :apply-template (when result [:apply-template [(first args) target-id
                                                                          (assoc insert-opts :template-blocks blocks)]])

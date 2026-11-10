@@ -858,3 +858,20 @@ test('a responsive released worker must still exit before graph deletion', async
   await lifecycle.deleteGraph(store, 'demo');
   assert.equal(lifecycle.pidExists(worker.pid), false);
 });
+
+
+test('exclusive creation and stale deletion preserve the existing graph', async t => {
+  const root = fixture(t);
+  const store = storage(root);
+  const generation = await lifecycle.createGraph(store, 'demo', true);
+  const graphDir = path.join(root, 'graphs', 'demo');
+  const marker = path.join(graphDir, 'keep.txt');
+  fs.writeFileSync(marker, 'existing graph');
+  await assert.rejects(lifecycle.createGraph(store, 'demo', true),
+    { code: 'graph-already-exists' });
+  await assert.rejects(lifecycle.deleteGraph(store, 'demo', undefined, 'stale-generation'),
+    { code: 'graph-not-exists' });
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'existing graph');
+  assert.equal(lifecycle.snapshot(store, 'demo').generation, generation);
+  assert.equal((await lifecycle.deleteGraph(store, 'demo', undefined, generation)).existed, true);
+});

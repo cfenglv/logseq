@@ -112,3 +112,41 @@
            (fn [error]
              (is false (str error))))
           (p/finally done)))))
+
+(deftest existing-graph-source-path-test
+  (doseq [[source kind graph-name]
+          [["/backup/Notes.zip" :sqlite-zip "Notes"]
+           ["C:\\backup\\Notes.ZIP" :sqlite-zip "Notes"]
+           ["/backup/logseq_db_Notes/db.sqlite" :sqlite-file "Notes"]
+           ["C:\\backup\\logseq_db_Notes\\db.sqlite" :sqlite-file "Notes"]
+           ["/backup/logseq_db_Notes" :graph-dir "Notes"]
+           ["" nil nil]
+           [nil nil nil]]]
+    (is (= [kind graph-name]
+           [(import-handler/classify-existing-graph-path source)
+            (import-handler/suggested-graph-name source)]))))
+
+(deftest import-existing-local-graph-rejects-missing-sqlite-test
+  (async done
+    (let [notifications (atom [])
+          imports (atom [])]
+      (-> (p/with-redefs [fs/file-exists? (fn [_path]
+                                            (p/resolved false))
+                          import-handler/import-from-sqlite-db!
+                          (fn [& args]
+                            (swap! imports conj args)
+                            (p/resolved nil))
+                          notification/show! (fn [content status & _]
+                                               (swap! notifications conj [content status]))]
+            (import-handler/<import-existing-local-graph!
+             "/tmp/not-a-graph"
+             "Notes"
+             #(swap! imports conj :finished)))
+          (p/then
+           (fn []
+             (is (empty? @imports))
+             (is (= [:error] (mapv second @notifications)))))
+          (p/catch
+           (fn [error]
+             (is false (str error))))
+          (p/finally done)))))

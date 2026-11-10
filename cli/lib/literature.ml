@@ -224,7 +224,7 @@ let ensure_destination config invoke repo title =
   destination_page invoke repo title >>= fun page ->
   if not (Edn_util.is_null page) then Cli_effect.pure (Ok page)
   else
-    let options : Upsert.page_opts = {id=None; page=Some title; restore=false; update_tags_edn=None; remove_tags_edn=None; update_properties_edn=None; remove_properties_edn=None} in
+    let options : Upsert.page_opts = {id=None; page=Some title; rename=None; restore=false; update_tags_edn=None; remove_tags_edn=None; update_properties_edn=None; remove_properties_edn=None} in
     match Upsert.build config (Global_opts.create ()) (Upsert.Parsed_page options) with
     | Error err -> Cli_effect.pure (Error err)
     | Ok plan -> Upsert.execute plan config >>= fun result ->

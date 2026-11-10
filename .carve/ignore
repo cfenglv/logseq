@@ -17,6 +17,8 @@ frontend.fs/readdir
 frontend.handler.user/<ensure-id&access-token
 ;; Referenced in comment
 frontend.image/get-orientation
+;; Referenced in comment / reserved for future feature-matrix
+frontend.handler.user/alpha-or-beta-user?
 ;; placeholder fn
 frontend.publishing/stop
 ;; For debugging
