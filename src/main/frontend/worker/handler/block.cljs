@@ -16,7 +16,8 @@
    [logseq.common.util :as common-util]
    [logseq.db :as ldb]
    [logseq.db.common.initial-data :as common-initial-data]
-   [logseq.db.common.reference :as db-reference]))
+   [logseq.db.common.reference :as db-reference]
+   [logseq.outliner.template-lineage :as template-lineage]))
 
 (defkeywords
   :block.temp/class-property-idents {:doc "Properties inherited from the node's classes for rendering."})
@@ -55,6 +56,7 @@
   #{:block/children
     :block/properties
     :block/properties-text-values
+    :logseq.property/template-source-block
     ;; Legacy many-ref; migrate deletes this attr. 4k-movies still stores
     ;; a copy of :block/refs here and expanding it doubled snapshot work.
     :block/path-refs})
@@ -473,7 +475,7 @@
 
 (defn- plain-render-block?
   [db block]
-  (empty? (remove #{:block/tags}
+  (empty? (remove #{:block/tags :logseq.property/template-source-block}
                   (property-handler/block-property-keys db block))))
 
 (defn- block-positioned-properties-map
@@ -558,7 +560,11 @@
                               include-collapsed-children? include-property-block?]
                        :or {include-collapsed-children? false}}]
   (when-let [block (resolve-block-entity db id-or-page-name)]
-    (let [block-refs-count? (some #{:block.temp/refs-count} properties)
+    (let [excluded-attrs (if (or include-property-block?
+                                (some #{:logseq.property/template-source-block} properties))
+                           #{}
+                           #{:logseq.property/template-source-block})
+          block-refs-count? (some #{:block.temp/refs-count} properties)
           children (when children?
                      (if include-property-block?
                        (->> (ldb/get-block-and-children
@@ -575,7 +581,8 @@
                       (map (fn [child]
                              (let [child-map-base
                                    (worker-plain/entity-forward-map
-                                    db child {:include-derived? (not include-property-block?)})
+                                    db child {:include-derived? (not include-property-block?)
+                                              :exclude-attrs excluded-attrs})
                                    child-map (cond
                                                render-data?
                                                (assoc-render-property-data db child child-map-base)
@@ -588,7 +595,7 @@
                                (cond-> child-map
                                  (not include-property-block?)
                                  (assoc :block.temp/property-keys
-                                        (property-handler/block-property-keys db child)
+                                        (vec (remove excluded-attrs (property-handler/block-property-keys db child)))
                                         :block.temp/has-children?
                                         (block-has-children? db (:db/id child))))))
                            children))
@@ -596,6 +603,7 @@
                                       (property-handler/entity-direct-map db block [:db/id :db/ident :block/uuid :block/name :block/tags])
                                       (worker-plain/entity-forward-map
                                        db block {:properties properties
+                                                 :exclude-attrs excluded-attrs
                                                  :include-derived? (not include-property-block?)}))
                                (and (not include-property-block?)
                                     (or render-data? (empty? properties)))
@@ -603,7 +611,7 @@
                                       (property-handler/display-properties-for-block db block)))
                              (cond-> (not include-property-block?)
                                (assoc :block.temp/property-keys
-                                      (property-handler/block-property-keys db block))))
+                                      (vec (remove excluded-attrs (property-handler/block-property-keys db block))))))
           block-map (cond
                       root-render-data?
                       (assoc-root-render-data db block block-map-base)
@@ -707,13 +715,26 @@
   [repo requests]
   (get-blocks-response repo requests))
 
+(def-thread-api :thread-api/template-source-context
+  [repo id]
+  (when-let [db (some-> (worker-state/get-datascript-conn repo) deref)]
+    (when-let [block (resolve-block-entity db id)]
+      (when (template-lineage/owning-template block)
+        {:block (worker-plain/entity-forward-map
+                 db block {:properties [:block/uuid :block/title :logseq.property/template-source-block]
+                           :include-derived? false})
+         :property (worker-plain/entity-forward-map
+                    db (d/entity db :logseq.property/template-source-block)
+                    {:include-derived? false})}))))
+
 (def-thread-api :thread-api/get-block-refs
   [repo id]
   (when-let [conn (worker-state/get-datascript-conn repo)]
     (->> (db-reference/get-linked-references @conn id)
          :ref-blocks
          (keep (fn [block]
-                 (some-> (worker-plain/entity-forward-map @conn block {})
+                 (some-> (worker-plain/entity-forward-map
+                          @conn block {:exclude-attrs #{:logseq.property/template-source-block}})
                          worker-plain/with-explicit-ref-fields-recursive))))))
 
 (def-thread-api :thread-api/get-block-source

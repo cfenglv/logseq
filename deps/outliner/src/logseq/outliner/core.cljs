@@ -17,6 +17,7 @@
             [logseq.outliner.datascript :as ds]
             [logseq.outliner.page :as outliner-page]
             [logseq.outliner.pipeline :as outliner-pipeline]
+            [logseq.outliner.template-lineage :as template-lineage]
             [logseq.outliner.tree :as otree]
             [logseq.outliner.tx-meta :as outliner-tx-meta]
             [logseq.outliner.validate :as outliner-validate]
@@ -802,8 +803,10 @@
         page? (dissoc :block/page)))))
 
 (defn- build-insert-blocks-tx
-  [db target-block blocks uuids get-new-id {:keys [sibling? outliner-op replace-empty-target? insert-template? keep-block-order?]}]
-  (let [block-ids (set (map :block/uuid blocks))
+  [db target-block blocks uuids get-new-id {:keys [sibling? outliner-op replace-empty-target? insert-template? keep-block-order?] template-aliases :template/aliases}]
+  (let [source-ids (into {} (map (fn [block]
+                                 [(or (:block.temp/template-source-uuid block) (:block/uuid block))
+                                  (:block/uuid block)])) blocks)
         target-page (get-target-block-page target-block sibling?)
         orders (get-block-orders blocks target-block sibling? keep-block-order?)
         batch-uuids (set (vals uuids))]
@@ -821,9 +824,14 @@
                 _ (assert (and parent order) (str "Parent or order is nil: " {:parent parent :order order}))
                 template-ref-block-ids (when insert-template?
                                          (when-let [block (d/entity db (:db/id block))]
-                                           (let [ref-ids (set (map :block/uuid (:block/refs block)))]
-                                             (->> (set/intersection block-ids ref-ids)
-                                                  (remove #{(:block/uuid block)})))))
+                                           (into {}
+                                                 (keep (fn [reference]
+                                                         (let [source-id (:block/uuid reference)
+                                                               source-id (get template-aliases source-id source-id)]
+                                                           (when-let [destination (and (not= source-id (:block/uuid block))
+                                                                                      (get uuids (get source-ids source-id source-id)))]
+                                                             [source-id destination]))))
+                                                 (:block/refs block))))
                 m {:db/id (:db/id block)
                    :block/uuid uuid'
                    :block/parent parent
@@ -834,10 +842,10 @@
                             (update :block/title
                                     (fn [value]
                                       (if (seq template-ref-block-ids)
-                                        (reduce (fn [value id]
+                                        (reduce (fn [value [id destination]]
                                                   (string/replace value
                                                                   (page-ref/->page-ref id)
-                                                                  (page-ref/->page-ref (uuids id))))
+                                                                  (page-ref/->page-ref destination)))
                                                 value
                                                 template-ref-block-ids)
                                         value))))
@@ -852,7 +860,8 @@
                                                :outliner-op outliner-op})]
             (recur (if (seq page-txs) (:db-after (d/with db page-txs)) db)
                    (inc idx) (rest blocks)
-                   (conj entries [(update-property-ref-when-paste result uuids) page-txs])))
+                   (conj entries [(template-lineage/materialize-source
+                                   db (update-property-ref-when-paste result uuids) batch-uuids) page-txs])))
           (recur db (inc idx) (rest blocks) (conj entries nil)))
         entries))))
 
@@ -1090,6 +1099,7 @@
   [db blocks target-block {:keys [_sibling? keep-uuid? keep-block-order?
                                   outliner-op outliner-real-op replace-empty-target? update-timestamps?
                                   insert-template? created-from-property]
+                           template-aliases :template/aliases
                            :as opts
                            :or {update-timestamps? true}}]
   {:pre [(seq blocks)]}
@@ -1110,7 +1120,10 @@
                                       b)
                                  dissoc-keys (concat [:block/tx-id]
                                                      (when (and (contains? #{:insert-template-blocks :paste} outliner-op)
-                                                                (not (contains? #{:paste-text} outliner-real-op)))
+                                                                (not (contains? #{:paste-text} outliner-real-op))
+                                                                ;; Concrete template history already stores final refs;
+                                                                ;; redo deliberately skips recalculating them.
+                                                                (not (and insert-template? (seq (:template-blocks opts)))))
                                                        [:block/refs]))]
                              (apply dissoc b' dissoc-keys))
                            b))
@@ -1151,7 +1164,8 @@
                           :keep-uuid? keep-uuid?
                           :keep-block-order? keep-block-order?
                           :outliner-op outliner-op
-                          :insert-template? insert-template?}
+                          :insert-template? insert-template?
+                          :template/aliases template-aliases}
             {:keys [id->new-uuid uuid->new-uuid blocks-tx page-txs]}
             (insert-blocks-aux db blocks' target-block insert-opts)]
         (if (some (fn [b] (or (nil? (:block/parent b)) (nil? (:block/order b)))) blocks-tx)

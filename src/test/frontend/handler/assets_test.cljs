@@ -1,8 +1,10 @@
 (ns frontend.handler.assets-test
   (:require [cljs.test :refer [async deftest is testing]]
             [frontend.config :as config]
+            [frontend.context.i18n :as i18n]
             [frontend.fs :as fs]
             [frontend.handler.assets :as assets]
+            [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [frontend.util :as util]
             [promesa.core :as p]))
@@ -10,6 +12,29 @@
 (defn- uint8->vec
   [^js payload]
   (js->clj (js/Array.from payload)))
+
+(deftest remote-download-errors-do-not-report-a-missing-local-file-test
+  (async done
+    (let [repo "synthetic-download-errors"
+          asset {:block/uuid (random-uuid)
+                 :logseq.property.asset/type "pdf"
+                 :logseq.property.asset/remote-metadata {:type "pdf"}}
+          failures (atom [:asset-download-auth-failed :asset-download-failed])
+          messages (atom [])]
+      (-> (p/with-redefs
+            [state/get-current-repo (constantly repo)
+             state/<invoke-db-worker (fn [& _]
+                                       (let [code (first @failures)]
+                                         (swap! failures subvec 1)
+                                         (p/rejected (ex-info "synthetic download failure" {:code code}))))
+             i18n/t (fn [key & _] key)
+             notification/show! (fn [message _] (swap! messages conj message))]
+            (assets/maybe-request-remote-asset-download! repo asset false)
+            (assets/maybe-request-remote-asset-download! repo asset false)
+            (p/let [_ (p/delay 0)]
+              (is (= [:asset/download-auth-error :asset/download-error] @messages))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
 
 (deftest damaged-asset-recovery-must-restore-registered-content-test
   (async done

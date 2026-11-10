@@ -102,6 +102,8 @@
  :asset/create-local-copy-warning "正在从外部资源创建本地附件。PDF 批注功能需要本地附件才能正常使用。"
  :asset/create-title "创建附件"
  :asset/delete "删除图片"
+ :asset/download-auth-error "无法验证下载 {1} 所需的登录状态，请重试或重新登录。"
+ :asset/download-error "无法下载 {1}，请重试。"
  :asset/downloading "下载中"
  :asset/drop-hint "拖放文件到此处，或点击选择文件"
  :asset/edit-title "编辑附件"
@@ -694,6 +696,10 @@
  :editor.slash/upload-asset "上传资源"
  :editor.slash/upload-asset-desc "上传图片、PDF、DOCX 等类型的文件"
  :editor.slash/yesterday-desc "插入昨天的日期"
+
+ :editor.template/associate-source "关联模板来源…"
+ :editor.template/invalid-source "请选择模板内的来源块，不能选择此块自身或它的副本。"
+ :editor.template/unlink-source "解除模板来源关联"
 
  :electron/about "关于 Logseq"
  :electron/add-to-dictionary "添加到字典"
@@ -1851,6 +1857,7 @@
  :property.built-in/table-sorting "视图排序"
  :property.built-in/tags "标签"
  :property.built-in/template-applied-to "应用模板到标签"
+ :property.built-in/template-source-block "模板来源块"
  :property.built-in/title "节点标题"
  :property.built-in/type "属性类型"
  :property.built-in/ui-position "属性位置"

@@ -359,17 +359,34 @@
       (when (not (js/isNaN length))
         length))))
 
+(defn- asset-download-error
+  [error]
+  (let [data (ex-data error)
+        auth-error? (or (= 401 (get-in data [:data :status]))
+                        (contains? #{:missing-refresh-token :missing-oauth-token-url
+                                     :missing-oauth-client-id :auth-refresh-failed
+                                     :auth-refresh-empty-id-token}
+                                   (:code data)))]
+    (ex-info (if (= :rtc.exception/download-asset-failed (:type data))
+               (ex-message error)
+               "download asset failed")
+             (cond-> {:type :rtc.exception/download-asset-failed
+                      :code (if auth-error? :asset-download-auth-failed :asset-download-failed)}
+               (:data data) (assoc :data (:data data)))
+             error)))
+
 (defn download-remote-asset!
   [repo graph-id asset-uuid asset-type & [verify-content?]]
   (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
     (if (and (seq base) (seq graph-id) (seq asset-type))
-      (-> (p/let [aes-key (graph-aes-key
+      (-> (p/let [token (sync-auth/<resolve-ws-token)
+                  aes-key (graph-aes-key
                            repo graph-id
                            (fn [tag data]
                              (throw (ex-info (name tag) data))))
                   asset-id (str asset-uuid)
                   get-url (sync-large-title/asset-url base graph-id asset-id asset-type)
-                  headers (sync-auth/auth-headers (worker-state/get-id-token))
+                  headers (sync-auth/auth-headers token)
                   request-opts (cond-> {:method "GET"}
                                  (seq headers) (assoc :headers headers))
                   ^js resp (js/fetch get-url
@@ -402,13 +419,8 @@
                                        :data {:reason :content-mismatch
                                               :asset-uuid asset-uuid}})))]
             (<write-asset-bytes! repo asset-id asset-type asset-file))
-          (p/catch
-           (fn [e]
-             (if (= :rtc.exception/download-asset-failed (:type (ex-data e)))
-               (p/rejected e)
-               (p/rejected (ex-info "download asset failed"
-                                    {:type :rtc.exception/download-asset-failed}
-                                    e))))))
+          (p/catch (fn [error]
+                     (p/rejected (asset-download-error error)))))
       (p/rejected (ex-info "missing asset download info"
                            {:repo repo
                             :asset-uuid asset-uuid

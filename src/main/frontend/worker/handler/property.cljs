@@ -470,7 +470,7 @@
 (defn entity-direct-map
   [db entity keys]
   (if (de/entity? entity)
-    (select-keys (worker-plain/entity-forward-map db entity {}) keys)
+    (select-keys (worker-plain/entity-forward-map db entity {:properties keys :include-derived? false}) keys)
     (select-keys entity keys)))
 
 (defn- display-property-description
@@ -577,7 +577,8 @@
   (let [properties (if (de/entity? block)
                      (->> (d/datoms db :eavt (:db/id block))
                           (keep (fn [{:keys [a v]}]
-                                  (when (db-property/property? a)
+                                  (when (and (db-property/property? a)
+                                             (not= a :logseq.property/template-source-block))
                                     [a (display-property-value db a v)])))
                           (reduce (fn [result [property-id value]]
                                     (if (= :db.cardinality/many

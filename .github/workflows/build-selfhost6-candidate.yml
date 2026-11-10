@@ -11,8 +11,8 @@ on:
         type: choice
         required: true
         options:
-          - 2.0.2-selfhost.5
           - 2.0.2-selfhost.6
+          - 2.0.2-selfhost.7
 
 permissions:
   contents: read

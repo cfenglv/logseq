@@ -11,6 +11,7 @@
             [logseq.db.sqlite.export :as sqlite-export]
             [logseq.outliner.core :as outliner-core]
             [logseq.outliner.template :as outliner-template]
+            [logseq.outliner.template-lineage :as template-lineage]
             [logseq.outliner.page :as outliner-page]
             [logseq.outliner.property :as outliner-property]
             [logseq.outliner.recycle :as outliner-recycle]
@@ -404,16 +405,7 @@
 (defn- template-children-blocks
   [db template-id]
   (when-let [template (d/entity db template-id)]
-    (let [template-blocks (some->> (ldb/get-block-and-children db (:block/uuid template)
-                                                               {:include-property-block? true})
-                                   rest)]
-      (when (seq template-blocks)
-        (cons (assoc (into {} (first template-blocks))
-                     :db/id (:db/id (first template-blocks))
-                     :logseq.property/used-template (:db/id template))
-              (map (fn [block]
-                     (assoc (into {} block) :db/id (:db/id block)))
-                   (rest template-blocks)))))))
+    (template-lineage/prepare-blocks db template)))
 
 (defn- journal-title
   [db journal-day]

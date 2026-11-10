@@ -697,6 +697,10 @@
                                               :public? false
                                               :hide? true
                                               :classes #{:logseq.class/Template}}}
+     :logseq.property/template-source-block {:title "Template source block"
+                                             :schema {:type :node
+                                                      :public? false
+                                                      :hide? true}}
      :logseq.property/template-applied-to {:title "Apply template to tags"
                                            :schema {:type :class
                                                     :cardinality :many

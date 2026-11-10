@@ -510,11 +510,28 @@
         (is (= asset-uuid (get-in block [:block/link :block/uuid])))
         (is (= "Existing PDF" (:block/title (d/entity @conn [:block/uuid asset-uuid]))))
         (is (every? #(d/entity @conn %) db-property/literature-property-idents))
-        (is (= {:major 65 :minor 36}
+        (is (= db-schema/version
                (:kv/value (d/entity @conn :logseq.kv/schema-version))))
         (is (= (set (keys file-attrs))
                (set (get-in result [:upgrade-result-coll 0 :migrate-updates :delete-properties]))))
         (is (nil? (db-migrate/migrate conn)))))))
+
+(deftest migrate-65-37-adds-private-template-source-without-changing-content
+  (let [conn (d/create-conn db-schema/schema)]
+    (d/transact! conn (sqlite-create-graph/build-db-initial-data ""))
+    (d/transact! conn [[:db/retractEntity :logseq.property/template-source-block]
+                      {:db/ident :logseq.kv/schema-version :kv/value {:major 65 :minor 36}}
+                      {:block/uuid #uuid "44444444-4444-4444-8444-444444444444"
+                       :block/title "Existing full template content"}])
+    (let [content-before (d/pull @conn '[*] [:block/uuid #uuid "44444444-4444-4444-8444-444444444444"])]
+      (db-migrate/migrate conn)
+      (let [property (d/entity @conn :logseq.property/template-source-block)]
+        (is (= :node (:logseq.property/type property)))
+        (is (false? (:logseq.property/public? property)))
+        (is (true? (:logseq.property/hide? property))))
+      (is (= content-before (d/pull @conn '[*] [:block/uuid #uuid "44444444-4444-4444-8444-444444444444"])))
+      (is (= db-schema/version (:kv/value (d/entity @conn :logseq.kv/schema-version)))))
+    (is (nil? (db-migrate/migrate conn)))))
 
 (deftest upgrade-version-skips-existing-property
   (let [conn (d/create-conn db-schema/schema)

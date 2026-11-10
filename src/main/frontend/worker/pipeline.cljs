@@ -15,6 +15,7 @@
             [logseq.db.common.entity-plus :as entity-plus]
             [logseq.db.common.order :as db-order]
             [logseq.db.frontend.class :as db-class]
+            [logseq.db.frontend.content :as db-content]
             [logseq.db.frontend.property.build :as db-property-build]
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]
             [logseq.db.sqlite.export :as sqlite-export]
@@ -23,7 +24,8 @@
             [logseq.outliner.datascript-report :as ds-report]
             [logseq.outliner.page :as outliner-page]
             [logseq.outliner.pipeline :as outliner-pipeline]
-            [logseq.outliner.template :as outliner-template]))
+            [logseq.outliner.template :as outliner-template]
+            [logseq.outliner.template-lineage :as template-lineage]))
 
 (def ^:private rtc-tx-or-download-graph?
   (let [p (some-fn :rtc-op? :rtc-tx? :rtc-download-graph? :transact-remote?)]
@@ -109,21 +111,7 @@
                            (cond->> templates
                              journal-page
                              (map (fn [t] (assoc t :journal journal-page))))))
-        raw-template-blocks (fn [template]
-                              ;; Skip childless templates; (assoc nil ...) would create a nil-title block.
-                              (when-let [template-children (next (ldb/get-block-and-children db (:block/uuid template)
-                                                                                            {:include-property-block? true}))]
-                                (->> (cons (assoc (first template-children)
-                                                  :logseq.property/used-template (:db/id template))
-                                           (rest template-children))
-                                     (map (fn [block]
-                                            (cond->
-                                             (assoc (into {} block) :db/id (:db/id block))
-                                              (:journal template)
-                                              (assoc :block/uuid
-                                                     (common-uuid/gen-journal-template-block
-                                                      (:block/uuid (:journal template))
-                                                      (:block/uuid block)))))))))
+        raw-template-blocks #(template-lineage/prepare-blocks db %)
         tag-additions (->> (:tx-data tx-report)
                            (filter (fn [d] (and (= (:a d) :block/tags) (:added d))))
                            (group-by :e))
@@ -131,13 +119,21 @@
                                 (let [templates (->> (set (map :v datoms))
                                                      (mapcat tag->templates)
                                                      distinct
-                                                     (sort-by :block/created-at))]
+                                                     (sort-by :block/created-at))
+                                      {:keys [blocks aliases]}
+                                      (template-lineage/coalesce db (mapcat raw-template-blocks templates))
+                                      blocks (if journal-page
+                                               (mapv #(assoc % :block/uuid
+                                                             (common-uuid/gen-journal-template-block
+                                                              (:block/uuid journal-page) (:block/uuid %)))
+                                                     blocks)
+                                               blocks)]
                                   {:object-id e
-                                   :blocks (mapcat raw-template-blocks templates)}))
+                                   :blocks blocks :aliases aliases}))
                               tag-additions)
         {db-with-pages :db page-tx-data :tx-data} (ensure-template-journal-pages db (mapcat :blocks insertion-inputs))
         result (reduce
-                (fn [{:keys [db tx-data] :as acc} {:keys [object-id blocks]}]
+                (fn [{:keys [db tx-data] :as acc} {:keys [object-id blocks aliases]}]
                   (let [object (d/entity db object-id)
                         blocks-to-insert (outliner-template/resolve-dynamic-template-blocks db object blocks)]
                     (if (seq blocks-to-insert)
@@ -145,14 +141,20 @@
                                        db blocks-to-insert object
                                        {:sibling? false
                                         :keep-uuid? journal-template?
+                                        :insert-template? true
+                                        :template/aliases aliases
                                         :outliner-op :insert-template-blocks})
                             template-report (d/with db
                                               (concat
                                                (:tx-data insertion)
+                                               ;; Resolve copied-node refs in this insertion's transaction;
+                                               ;; those UUIDs do not exist in the pre-insert db yet.
                                                (mapcat (fn [block]
-                                                         (when-let [refs (seq (outliner-pipeline/block-content-refs db block))]
+                                                         (when-let [refs (seq (db-content/get-matched-ids
+                                                                              (or (:block/raw-title block)
+                                                                                  (:block/title block))))]
                                                            [{:db/id (:db/id block)
-                                                             :block/refs refs}]))
+                                                             :block/refs (mapv #(vector :block/uuid %) refs)}]))
                                                        (:blocks insertion))))]
                         {:db (:db-after template-report)
                          ;; Separate target pages must not reuse insert-blocks' temporary ids.

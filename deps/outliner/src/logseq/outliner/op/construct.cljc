@@ -566,7 +566,19 @@
                          (into {}))
          blocks* (if (seq uuid-remap)
                    (mapv #(remap-block-lookup-values-by-uuid-map % uuid-remap) blocks*)
-                   blocks*)]
+                   blocks*)
+         ;; Provenance is attached after copying. Capture the actual stored
+         ;; relation, not a source->copy remap that turns it into a self-ref.
+         blocks* (mapv (fn [block]
+                         (let [stored (d/entity db [:block/uuid (:block/uuid block)])
+                               source (-> stored :logseq.property/template-source-block :block/uuid)]
+                           (cond-> (if source
+                                     (assoc block :logseq.property/template-source-block [:block/uuid source])
+                                     (dissoc block :logseq.property/template-source-block))
+                             (:insert-template? opts)
+                             (assoc :block/refs (set (map #(vector :block/uuid (:block/uuid %))
+                                                         (:block/refs stored)))))))
+                       blocks*)]
      [blocks*
       target-ref
       (assoc (dissoc (or opts {}) :outliner-op)

@@ -249,6 +249,7 @@
         important? (string/starts-with? utility "!")
         utility (cond-> utility important? (subs 1))
         group (cond
+                (re-matches #"^whitespace-.+" utility) "whitespace"
                 (re-matches #"^-?h-.+" utility) "h"
                 (re-matches #"^-?min-h-.+" utility) "min-h"
                 (re-matches #"^-?max-h-.+" utility) "max-h"
@@ -1362,5 +1363,5 @@
        "yupResolver" yupResolver
        "yup" yup})
 
-;; export registry to global scope `window.LSUI` for dynamic component rendering in Logseq
-(set! (.-LSUI js/window) registry)
+;; export registry to global scope for dynamic component rendering in Logseq
+(set! (.-LSUI js/globalThis) registry)

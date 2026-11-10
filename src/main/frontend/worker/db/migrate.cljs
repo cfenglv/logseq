@@ -169,7 +169,8 @@
    ["65.35" {:properties db-property/literature-property-idents}]
    ["65.36" {:delete-properties [:block/scheduled :block/deadline :block/marker
                                  :block/priority :block/properties-text-values
-                                 :block/invalid-properties]}]])
+                                 :block/invalid-properties]}]
+   ["65.37" {:properties [:logseq.property/template-source-block]}]])
 
 (let [[major minor] (last (sort (map (comp (juxt :major :minor) db-schema/parse-schema-version first)
                                      schema-version->updates)))]

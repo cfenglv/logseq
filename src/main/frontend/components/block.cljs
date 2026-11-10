@@ -1296,6 +1296,18 @@
                               href
                               img-metadata
                               nil)
+                  (and (= "pdf" asset-type)
+                       (:logseq.property.asset/remote-metadata block)
+                       (string/blank? (:logseq.property.asset/external-url block)))
+                  [:span.inline-flex.items-center.gap-1
+                   [:span.opacity-60 (:block/title block)]
+                   (shui/button
+                    {:variant :ghost
+                     :size :icon
+                     :disabled in-progress?
+                     :aria-label (t :asset/reload-file)
+                     :on-click #(assets-handler/maybe-request-remote-asset-download! repo block false)}
+                    (ui/icon "refresh" {:size 14}))]
                   (and (not gallery-image?)
                        (block-asset/show-missing-file-warning? block file-exists?))
                   (missing-asset-file

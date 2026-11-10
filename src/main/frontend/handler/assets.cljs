@@ -485,10 +485,12 @@
            (fn [error]
              (log/error :db-sync/request-asset-download-failed error)
              (when (= repo (state/get-current-repo))
-               (notification/show!
-                (t :asset/missing-file
-                   (path/path-join common-config/local-assets-dir
-                                   (str (:block/uuid asset-block) "."
-                                        (:logseq.property.asset/type asset-block))))
-                :error)))))
+               (let [file-path (path/path-join common-config/local-assets-dir
+                                               (str (:block/uuid asset-block) "."
+                                                    (:logseq.property.asset/type asset-block)))]
+                 (notification/show!
+                  (if (= :asset-download-auth-failed (:code (ex-data error)))
+                    (t :asset/download-auth-error file-path)
+                    (t :asset/download-error file-path))
+                  :error))))))
       true)))

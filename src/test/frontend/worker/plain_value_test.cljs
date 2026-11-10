@@ -3,8 +3,11 @@
             [datascript.core :as d]
             [frontend.worker.handler.block :as block-handler]
             [frontend.worker.plain-value :as plain-value]
+            [logseq.db :as ldb]
             [logseq.db.frontend.schema :as db-schema]
-            [logseq.db.sqlite.create-graph :as sqlite-create-graph]))
+            [logseq.db.sqlite.create-graph :as sqlite-create-graph]
+            [logseq.db.test.helper :as db-test]
+            [logseq.outliner.op :as outliner-op]))
 
 (defn- property-value-db
   ([property-type target]
@@ -148,3 +151,35 @@
         value (get-in result [:block :block/properties :user.property/related])]
     (is (= target-uuid (:block/uuid value)))
     (is (= "Target" (:block/title value)))))
+
+(deftest template-source-is-not-expanded-in-render-snapshots
+  (let [conn (db-test/create-conn-with-blocks
+              [{:page {:block/title "Source"}
+                :blocks [{:block/title "Original"}]}
+               {:page {:block/title "Copy"}}])
+        source (ldb/get-page @conn "Source")
+        target (ldb/get-page @conn "Copy")]
+    (outliner-op/apply-ops! conn [[:apply-template [(:block/uuid source) (:block/uuid target) {:sibling? false}]]] {})
+    (let [copied (first (:block/_parent (d/entity @conn (:db/id target))))
+          copied-id (:block/uuid copied)
+          source-id (-> copied :logseq.property/template-source-block :block/uuid)
+          conversions (atom 0)
+          original plain-value/attribute-value->plain]
+      (with-redefs [plain-value/attribute-value->plain
+                    (fn [db attr value]
+                      (when (= attr :logseq.property/template-source-block) (swap! conversions inc))
+                      (original db attr value))]
+        (let [render (:block (block-handler/get-block-and-children @conn copied-id {:render-data? true}))]
+          (is (not (contains? render :logseq.property/template-source-block)))
+          (is (not (some #{:logseq.property/template-source-block} (:block.temp/property-keys render))))
+          (is (zero? @conversions)))
+        (let [render (get-in (block-handler/canonical-blocks @conn [copied-id]) [:blocks copied-id])]
+          (is (not (contains? render :logseq.property/template-source-block)))
+          (is (zero? @conversions)))
+        (let [raw (:block (block-handler/get-block-and-children
+                           @conn copied-id {:include-property-block? true}))
+              explicit (:block (block-handler/get-block-and-children
+                                @conn copied-id {:properties [:logseq.property/template-source-block]}))]
+          (is (= source-id (-> raw :logseq.property/template-source-block :block/uuid)))
+          (is (= source-id (-> explicit :logseq.property/template-source-block :block/uuid)))
+          (is (= 2 @conversions)))))))

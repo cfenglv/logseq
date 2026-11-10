@@ -199,6 +199,7 @@
           own-property-keys (when include-derived?
                               (->> (d/datoms db :eavt (:db/id entity))
                                    (map :a)
+                                   (remove excluded-attrs)
                                    distinct
                                    (filter db-property/property?)
                                    vec))]

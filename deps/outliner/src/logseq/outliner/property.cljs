@@ -19,6 +19,7 @@
             [logseq.db.sqlite.util :as sqlite-util]
             [logseq.outliner.core :as outliner-core]
             [logseq.outliner.page :as outliner-page]
+            [logseq.outliner.template-lineage :as template-lineage]
             [logseq.outliner.validate :as outliner-validate]
             [malli.core :as m]
             [malli.error :as me]
@@ -188,6 +189,14 @@
 (defn- build-property-value-tx-data
   [conn block property-id value]
   (when (some? value)
+    (when (= property-id :logseq.property/template-source-block)
+      (let [source (d/entity @conn value)]
+        (when-not (or (= :logseq.property/empty-placeholder (:db/ident source))
+                      (template-lineage/valid-source? block source))
+          (throw (ex-info "Invalid template source block"
+                          {:type :notification
+                           :payload {:type :error
+                                     :i18n-key :editor.template/invalid-source}})))))
     (let [old-value (get block property-id)
           property (d/entity @conn property-id)
           multiple-values? (= :db.cardinality/many (:db/cardinality property))

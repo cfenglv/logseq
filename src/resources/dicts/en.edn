@@ -102,6 +102,8 @@
  :asset/create-local-copy-warning "Creating a local asset from an external one. PDF annotations require a local asset to work properly."
  :asset/create-title "Create asset"
  :asset/delete "Delete image"
+ :asset/download-auth-error "Unable to authenticate the download of {1}. Please retry or sign in again."
+ :asset/download-error "Unable to download {1}. Please try again."
  :asset/downloading "Downloading"
  :asset/drop-hint "Drag 'n' drop files here, or click to select files"
  :asset/edit-title "Edit asset"
@@ -694,6 +696,10 @@
  :editor.slash/upload-asset "Upload an asset"
  :editor.slash/upload-asset-desc "Upload file types like image, PDF, DOCX, etc."
  :editor.slash/yesterday-desc "Insert the date of yesterday"
+
+ :editor.template/associate-source "Link template source…"
+ :editor.template/invalid-source "Choose a source block inside a template. A block cannot use itself or its copies as its source."
+ :editor.template/unlink-source "Unlink template source"
 
  :electron/about "About Logseq"
  :electron/add-to-dictionary "Add to dictionary"
@@ -1851,6 +1857,7 @@
  :property.built-in/table-sorting "View sorting"
  :property.built-in/tags "Tags"
  :property.built-in/template-applied-to "Apply template to tags"
+ :property.built-in/template-source-block "Template source block"
  :property.built-in/title "Node title"
  :property.built-in/type "Property type"
  :property.built-in/ui-position "Property position"

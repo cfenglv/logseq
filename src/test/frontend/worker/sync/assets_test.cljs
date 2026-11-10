@@ -7,6 +7,7 @@
             [frontend.worker.state :as worker-state]
             [frontend.worker.sync :as db-sync]
             [frontend.worker.sync.assets :as sync-assets]
+            [frontend.worker.sync.auth :as sync-auth]
             [frontend.worker.sync.client-op :as client-op]
             [frontend.worker.sync.presence :as sync-presence]
             [logseq.db :as ldb]
@@ -29,6 +30,59 @@
   (if (fn? task)
     (task)
     (p/resolved nil)))
+
+(deftest download-refreshes-expired-token-before-http-test
+  (async done
+    (let [repo "synthetic-expired-download"
+          asset-uuid (random-uuid)
+          token (fn [exp] (str "header." (js/btoa (js/JSON.stringify #js {:exp exp})) ".signature"))
+          fresh-token (token (+ (quot (js/Date.now) 1000) 3600))
+          refreshes (atom 0)
+          headers (atom [])
+          writes (atom 0)]
+      (-> (p/with-redefs
+            [worker-state/*state (atom {:auth/id-token (token 1)
+                                       :auth/refresh-token "synthetic-refresh"
+                                       :auth/oauth-token-url "http://127.0.0.1:1/oauth2/token"
+                                       :auth/oauth-client-id "synthetic-client"})
+             worker-state/*db-sync-config (atom {:http-base "http://127.0.0.1:1"})
+             platform/current (constantly {:env {:runtime :node :owner-source :electron}})
+             sync-assets/graph-aes-key (fn [& _] (p/resolved nil))
+             js/fetch (fn [url options]
+                        (if (= url "http://127.0.0.1:1/oauth2/token")
+                          (do (swap! refreshes inc)
+                              (p/resolved #js {:ok true
+                                               :text #(p/resolved (js/JSON.stringify #js {:id_token fresh-token}))}))
+                          (do (swap! headers conj (aget options "headers" "authorization"))
+                              (p/resolved #js {:ok true :status 200
+                                               :headers #js {:get (constantly "4")}
+                                               :arrayBuffer #(p/resolved (.-buffer (js/Uint8Array. #js [37 80 68 70])))}))))
+             platform/asset-write-bytes! (fn [& _] (swap! writes inc) (p/resolved nil))
+             shared-service/broadcast-to-clients! (fn [& _] nil)]
+            (p/let [_ (sync-assets/download-remote-asset! repo "synthetic-graph" asset-uuid "pdf")
+                    _ (sync-assets/download-remote-asset! repo "synthetic-graph" asset-uuid "pdf")]
+              (is (= 1 @refreshes))
+              (is (= (repeat 2 (str "Bearer " fresh-token)) @headers))
+              (is (= 2 @writes))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
+
+(deftest download-auth-preparation-failure-stops-http-test
+  (async done
+    (let [requests (atom 0)]
+      (-> (p/with-redefs
+            [worker-state/*db-sync-config (atom {:http-base "http://127.0.0.1:1"})
+             sync-auth/<resolve-ws-token (fn [] (p/rejected (ex-info "synthetic refresh failure"
+                                                                   {:code :auth-refresh-failed :status 401})))
+             js/fetch (fn [& _] (swap! requests inc) (p/rejected (js/Error. "unexpected HTTP")))]
+            (p/let [error (-> (sync-assets/download-remote-asset! "synthetic-refresh-failure"
+                                                                  "synthetic-graph" (random-uuid) "pdf")
+                             (p/catch ex-data))]
+              (is (= :asset-download-auth-failed (:code error)))
+              (is (nil? (:status error)))
+              (is (zero? @requests))))
+          (p/catch (fn [error] (is false (str error))))
+          (p/finally done)))))
 
 (deftest request-asset-download-skips-existing-local-asset-test
   (async done
@@ -491,6 +545,7 @@
                  (p/with-redefs [worker-state/*db-sync-config (atom {:http-base "http://127.0.0.1:1"})
                                  worker-state/get-datascript-conn (constantly conn)
                                  worker-state/get-id-token (constantly nil)
+                                 sync-auth/<resolve-ws-token (fn [] (p/resolved "synthetic-token"))
                                  sync-assets/graph-aes-key (fn [& _] (p/resolved nil))
                                  js/fetch (fn [& _]
                                             (p/resolved #js {:ok true :status 200
