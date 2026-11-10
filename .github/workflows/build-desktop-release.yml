@@ -1436,7 +1436,7 @@ jobs:
             platform: darwin
             arch: x64
           - id: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             platform: darwin
             arch: arm64
           - id: win32-x64
