@@ -1121,44 +1121,48 @@
           (ldb/register-transact-pipeline-fn! identity))))))
 
 (deftest inherited-complete-template-reuses-proven-common-nodes-test
-  (let [summary-id (random-uuid)
-        common-title (str "Common " (page-ref/->page-ref summary-id))
-        conn (db-test/create-conn-with-blocks
-              {:pages-and-blocks
-               [{:page {:block/title "Base" :build/tags [:logseq.class/Template]}
-                 :blocks [{:block/title common-title
-                           :build/children [{:block/title "Base note"}]}
-                          {:block/uuid summary-id :block/title "Summary"}]}
-                {:page {:block/title "Extended" :build/tags [:logseq.class/Template]}}
-                {:page {:block/title "Target"} :blocks [{:block/title "Existing"}]}]
-               :classes {:ParentTag {} :ChildTag {:build/class-extends [:ParentTag]}}})
-        base (ldb/get-page @conn "Base")
-        extended (ldb/get-page @conn "Extended")
-        target (ldb/get-page @conn "Target")
-        child (ldb/get-page @conn "ChildTag")]
-    (outliner-op/apply-ops! conn [[:apply-template [(:block/uuid base) (:block/uuid extended)
-                                                 {:sibling? false}]]] {})
-    (let [heading (some #(when (string/starts-with? (:block/raw-title %) "Common ") %)
-                        (:block/_parent (d/entity @conn (:db/id extended))))]
-      (outliner-core/insert-blocks! conn [{:block/title "Extra"}] heading {:sibling? false}))
-    (doseq [[template tag] [[base (ldb/get-page @conn "ParentTag")] [extended child]]]
-      (ldb/transact! conn [[:db/add (:db/id template) :logseq.property/template-applied-to (:db/id tag)]]))
-    (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
-    (try
-      (outliner-op/apply-ops! conn [[:batch-set-property [[(:block/uuid target)] :block/tags (:db/id child) {}]]] {})
-      (let [blocks (vec (rest (ldb/get-block-and-children @conn (:block/uuid target))))]
-        (is (= 5 (count blocks)))
-        (let [summary (some #(when (= "Summary" (:block/title %)) %) blocks)
-              heading (some #(when (string/starts-with? (:block/raw-title %) "Common ") %) blocks)]
-          (is (= (str "Common " (page-ref/->page-ref (:block/uuid summary))) (:block/raw-title heading)))
-          (is (= [(:block/uuid summary)] (mapv :block/uuid (:block/refs heading)))))
-        (is (= 4 (count (filter :logseq.property/template-source-block blocks))))
-        (is (every? #(not= (:block/uuid %) (-> % :logseq.property/template-source-block :block/uuid))
-                    (filter :logseq.property/template-source-block blocks)))
-        (is (every? (fn [siblings]
-                      (= (count siblings) (count (distinct (map :block/order siblings)))))
-                    (vals (group-by #(get-in % [:block/parent :db/id]) blocks)))))
-      (finally (ldb/register-transact-pipeline-fn! identity)))))
+  (doseq [created-at-values [[1 2] [2 1]]]
+    (let [summary-id (random-uuid)
+          common-title (str "Common " (page-ref/->page-ref summary-id))
+          conn (db-test/create-conn-with-blocks
+                {:pages-and-blocks
+                 [{:page {:block/title "Base" :build/tags [:logseq.class/Template]}
+                   :blocks [{:block/title common-title
+                             :build/children [{:block/title "Base note"}]}
+                            {:block/uuid summary-id :block/title "Summary"}]}
+                  {:page {:block/title "Extended" :build/tags [:logseq.class/Template]}}
+                  {:page {:block/title "Target"} :blocks [{:block/title "Existing"}]}]
+                 :classes {:ParentTag {} :ChildTag {:build/class-extends [:ParentTag]}}})
+          base (ldb/get-page @conn "Base")
+          extended (ldb/get-page @conn "Extended")
+          target (ldb/get-page @conn "Target")
+          child (ldb/get-page @conn "ChildTag")]
+      (ldb/register-transact-pipeline-fn! worker-pipeline/transact-pipeline)
+      (try
+        (outliner-op/apply-ops! conn [[:apply-template [(:block/uuid base) (:block/uuid extended)
+                                                     {:sibling? false}]]] {})
+        (let [heading (some #(when (string/starts-with? (:block/raw-title %) "Common ") %)
+                            (:block/_parent (d/entity @conn (:db/id extended))))]
+          (is (seq (:block/refs heading)) "The copied fixture must pass through the worker reference parser")
+          (outliner-core/insert-blocks! conn [{:block/title "Extra"}] heading {:sibling? false}))
+        (doseq [[template tag created-at] [[base (ldb/get-page @conn "ParentTag") (first created-at-values)]
+                                           [extended child (second created-at-values)]]]
+          (ldb/transact! conn [[:db/add (:db/id template) :logseq.property/template-applied-to (:db/id tag)]
+                               [:db/add (:db/id template) :block/created-at created-at]]))
+        (outliner-op/apply-ops! conn [[:batch-set-property [[(:block/uuid target)] :block/tags (:db/id child) {}]]] {})
+        (let [blocks (vec (rest (ldb/get-block-and-children @conn (:block/uuid target))))]
+          (is (= 5 (count blocks)))
+          (let [summary (some #(when (= "Summary" (:block/title %)) %) blocks)
+                heading (some #(when (string/starts-with? (:block/raw-title %) "Common ") %) blocks)]
+            (is (= (str "Common " (page-ref/->page-ref (:block/uuid summary))) (:block/raw-title heading)))
+            (is (= [(:block/uuid summary)] (mapv :block/uuid (:block/refs heading)))))
+          (is (= 4 (count (filter :logseq.property/template-source-block blocks))))
+          (is (every? #(not= (:block/uuid %) (-> % :logseq.property/template-source-block :block/uuid))
+                      (filter :logseq.property/template-source-block blocks)))
+          (is (every? (fn [siblings]
+                        (= (count siblings) (count (distinct (map :block/order siblings)))))
+                      (vals (group-by #(get-in % [:block/parent :db/id]) blocks)))))
+        (finally (ldb/register-transact-pipeline-fn! identity))))))
 
 (deftest concrete-template-redo-retains-references-without-recalculation-test
   (let [summary-id (random-uuid)
