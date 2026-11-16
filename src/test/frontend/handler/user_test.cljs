@@ -210,9 +210,8 @@
       (try
         (with-mocked-local-storage
           (fn []
-            (with-redefs [state/<invoke-db-worker (fn [op & _]
-                                                    (swap! ops* conj op)
-                                                    (p/resolved nil))
+            ;; Background RTC listeners use this path separately from direct cleanup.
+            (with-redefs [state/<invoke-db-worker (fn [& _] (p/resolved nil))
                           state/clear-user-info! (fn [] nil)
                           state/pub-event! (fn [& _] nil)
                           user-handler/clear-tokens (fn [] nil)]
@@ -283,7 +282,8 @@
                                 "CognitoIdentityServiceProvider.synthetic.refreshToken" "synthetic-refresh"
                                 "user-groups" "#{:synthetic}"})
         (fn []
-          (with-redefs [util/electron? (constantly true)
+          (with-redefs [state/<invoke-db-worker (fn [& _] (p/resolved nil))
+                        util/electron? (constantly true)
                         util/node-test? false
                         ipc/ipc (fn [op _ path content]
                                   (swap! writes conj [op path (js->clj (js/JSON.parse content) :keywordize-keys true)])
