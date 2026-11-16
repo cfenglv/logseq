@@ -747,6 +747,7 @@
  :encryption/init-key-pair "初始化 E2EE 加密密钥对"
  :encryption/init-key-pair-error "初始化密钥对错误：{1}"
  :encryption/key-unavailable "密钥不可用"
+ :encryption/login-required "请重新登录以访问加密密钥。"
  :encryption/password-not-matched "两次输入的密码不一致"
  :encryption/password-updated-successfully "密码更新成功！"
  :encryption/private-key "私钥 (base64)"

@@ -485,7 +485,7 @@
   []
   (if @state/*db-worker
     (-> (p/do!
-         (state/pub-event! [:rtc/sync-app-state])
+         (rtc-handler/<sync-auth-state-to-db-worker!)
          (state/<invoke-db-worker :thread-api/set-db-sync-config
                                   {:enabled? true
                                    :ws-url (config/db-sync-ws-url)

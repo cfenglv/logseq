@@ -911,3 +911,73 @@
                (p/catch (fn [error]
                           (is false (str error))
                           (finish-async-test! done)))))))
+
+(deftest encryption-read-waits-for-complete-auth-and-uses-refreshed-token-test
+  (async done
+    (let [old-state (state/get-state)
+          ensured (p/deferred)
+          sync-requested (p/deferred)
+          synced (p/deferred)
+          calls (atom [])]
+      (state/replace-state! (assoc old-state :git/current-repo nil
+                                  :auth/id-token "expired-id"
+                                  :auth/access-token "old-access"
+                                  :auth/refresh-token "synthetic-refresh"))
+      (-> (p/with-redefs [user-handler/<ensure-id&access-token! (fn [] ensured)
+                          user-handler/user-uuid (constantly "synthetic-user")
+                          state/<invoke-db-worker
+                          (fn [method & args]
+                            (swap! calls conj (into [method] args))
+                            (case method
+                              :thread-api/sync-app-state
+                              (do (p/resolve! sync-requested nil) synced)
+                              :thread-api/get-user-rsa-key-pair
+                              (p/resolved {:public-key "synthetic-public-key"})))]
+            (let [request (db-sync/<get-user-rsa-key-pair)]
+              (p/let [_ (p/resolved nil)]
+                (is (empty? @calls))
+                (state/set-state! :auth/id-token "refreshed-id")
+                (state/set-state! :auth/access-token "refreshed-access")
+                (p/resolve! ensured nil)
+                (p/let [_ sync-requested]
+                  (is (= 1 (count @calls)))
+                  (let [payload (second (first @calls))]
+                    (is (= "refreshed-id" (:auth/id-token payload)))
+                    (is (= "synthetic-refresh" (:auth/refresh-token payload)))
+                    (is (not (contains? payload :git/current-repo))))
+                  (p/resolve! synced nil)
+                  (p/let [result request]
+                    (is (= {:public-key "synthetic-public-key"} result))
+                    (is (= [:thread-api/get-user-rsa-key-pair "refreshed-id" "synthetic-user"]
+                           (second @calls))))))))
+          (p/catch #(is false (str %)))
+          (p/finally (fn [] (state/replace-state! old-state) (done)))))))
+
+(deftest encryption-read-without-session-requires-login-before-worker-request-test
+  (async done
+    (let [old-state (state/get-state)]
+      (state/set-auth-refresh-token nil)
+      (-> (p/with-redefs [user-handler/<ensure-id&access-token!
+                          (fn [] (is false "No token refresh without a session"))
+                          state/<invoke-db-worker
+                          (fn [& _] (is false "No key access or initialization without a session"))]
+            (db-sync/<get-user-rsa-key-pair))
+          (p/then (fn [_] (is false "Expected login-required")))
+          (p/catch (fn [error] (is (= :login-required (:type (ex-data error))))))
+          (p/finally (fn [] (state/replace-state! old-state) (done)))))))
+
+(deftest encryption-read-retains-session-and-network-error-test
+  (async done
+    (let [old-state (state/get-state)
+          failure (ex-info "Synthetic network failure" {:type :network})]
+      (state/replace-state! (assoc old-state :auth/id-token "synthetic-id"
+                                  :auth/refresh-token "synthetic-refresh"))
+      (-> (p/with-redefs [user-handler/<ensure-id&access-token! #(p/rejected failure)
+                          state/<invoke-db-worker (fn [& _] (is false "No key request after refresh failure"))]
+            (db-sync/<get-user-rsa-key-pair))
+          (p/then (fn [_] (is false "Expected network error")))
+          (p/catch (fn [error]
+                     (is (identical? failure error))
+                     (is (= "synthetic-id" (state/get-auth-id-token)))
+                     (is (= "synthetic-refresh" (state/get-auth-refresh-token)))))
+          (p/finally (fn [] (state/replace-state! old-state) (done)))))))

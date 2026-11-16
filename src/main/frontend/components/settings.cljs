@@ -1762,17 +1762,28 @@
     [:div.panel-wrap.is-encryption.mb-8
      (hooks/use-effect!
       (fn []
-        (when (and user-uuid token)
-          (-> (p/let [r (state/<invoke-db-worker :thread-api/get-user-rsa-key-pair token user-uuid)]
-                (set-rsa-key-pair! r))
-              (p/catch set-get-key-err!))
-          (-> (p/let [{:keys [password]} (state/<invoke-db-worker :thread-api/get-e2ee-password refresh-token)]
-                (set-current-password! password))
-              (p/catch (fn [_] (set-current-password! ""))))))
-      [user-uuid token])
+        (let [active? (atom true)]
+          (set-get-key-err! nil)
+          (set-rsa-key-pair! :not-inited)
+          (when (and user-uuid token)
+            (-> (p/let [r (rtc-handler/<get-user-rsa-key-pair)]
+                  (when @active? (set-rsa-key-pair! r)))
+                (p/catch (fn [error]
+                           (when @active? (set-get-key-err! error)))))
+            (-> (p/let [{:keys [password]} (state/<invoke-db-worker :thread-api/get-e2ee-password refresh-token)]
+                  (when @active? (set-current-password! password)))
+                (p/catch (fn [_] (when @active? (set-current-password! ""))))))
+          #(reset! active? false)))
+      [user-uuid token refresh-token])
      [:div.flex.flex-col.gap-2.mt-4
-      (when (and user-uuid token)
-        (cond
+      (cond
+          (or (string/blank? refresh-token)
+              (= :login-required (:type (ex-data get-key-err))))
+            [:div.flex.flex-col.items-start.gap-2
+             [:p (t :encryption/login-required)]
+             (shui/button {:variant :outline :size :sm
+                           :on-click #(state/pub-event! [:user/login])}
+                          (t :ui/login))]
           get-key-err
           [:p (t :encryption/fetch-key-pair-error get-key-err)]
           (= rsa-key-pair :not-inited)
@@ -1787,7 +1798,7 @@
                                                        token
                                                        refresh-token
                                                        user-uuid)
-                              (p/let [r (state/<invoke-db-worker :thread-api/get-user-rsa-key-pair token user-uuid)]
+                              (p/let [r (rtc-handler/<get-user-rsa-key-pair)]
                                 (set-rsa-key-pair! r)))
                              (p/catch set-init-key-err!)))}
             (t :encryption/init-key-pair))]
@@ -1818,7 +1829,7 @@
                                          :forgot? forgot?
                                          :set-forgot! set-forgot!
                                          :refresh-token refresh-token
-                                         :user-uuid user-uuid})])))]]))
+                                         :user-uuid user-uuid})]))]]))
 
 (hsx/defc mcp-server-row
   [t]

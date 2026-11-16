@@ -18,10 +18,16 @@
          (.call (.-hasOwnProperty (.-prototype js/Object))
                 js/globalThis
                 "localStorage")
-         mocked-storage #js {:clear (fn [] nil)
-                             :setItem (fn [& _] nil)
-                             :getItem (fn [k] (get items k))
-                             :removeItem (fn [& _] nil)}]
+         mocked-storage (clj->js items)]
+     (js/Object.defineProperties
+      mocked-storage
+      #js {:clear #js {:value (fn [] (doseq [key (js/Object.keys mocked-storage)]
+                                      (js/Reflect.deleteProperty mocked-storage key)))}
+           :setItem #js {:value (fn [key value] (aset mocked-storage key (js/String value)))}
+           :getItem #js {:value (fn [key] (when (.call (.-hasOwnProperty (.-prototype js/Object))
+                                                     mocked-storage key)
+                                          (aget mocked-storage key)))}
+           :removeItem #js {:value (fn [key] (js/Reflect.deleteProperty mocked-storage key))}})
      (js/Object.defineProperty js/globalThis
                                "localStorage"
                                #js {:value mocked-storage
@@ -198,7 +204,9 @@
     (let [ops* (atom [])
           old-worker @state/*db-worker
           old-login-user (:auth/current-login-user (state/get-state))]
-      (reset! state/*db-worker :worker)
+      (reset! state/*db-worker (fn [method & _]
+                                   (swap! ops* conj method)
+                                   (p/resolved nil)))
       (try
         (with-mocked-local-storage
           (fn []
@@ -209,8 +217,10 @@
                           state/pub-event! (fn [& _] nil)
                           user-handler/clear-tokens (fn [] nil)]
               (user-handler/logout)
-              (is (= :thread-api/clear-e2ee-password
-                     (first @ops*))))))
+              (is (= [:thread-api/sync-app-state
+                      :thread-api/db-sync-stop
+                      :thread-api/clear-e2ee-password]
+                     @ops*)))))
         (finally
           (state/set-state! :auth/current-login-user old-login-user)
           (reset! state/*db-worker old-worker))))))
@@ -243,3 +253,61 @@
         (finally
           (state/set-state! :auth/current-login-user old-login-user)
           (reset! state/*db-worker old-worker))))))
+
+(deftest logout-clears-only-account-state-and-preserves-device-settings-test
+  (async done
+    (let [old-state (state/get-state)
+          old-worker @state/*db-worker
+          calls (atom [])
+          writes (atom [])
+          events (atom [])
+          device-settings {"sync-server-url" "https://sync.example.invalid"
+                           "theme" "dark"
+                           "radix-color" "violet"
+                           "editor-font" "{:notes {:family \"Synthetic Font\"}}"
+                           "preferred-language" "zh-CN"
+                           "unrelated-device-setting" "keep"}]
+      (state/replace-state! (assoc old-state
+                                  :auth/id-token "synthetic-id"
+                                  :auth/access-token "synthetic-access"
+                                  :auth/refresh-token "synthetic-refresh"
+                                  :user/info {:uuid "synthetic-user"}
+                                  :system/info {:home-dir "/tmp/isolated-auth"}))
+      (reset! state/*db-worker (fn [method & args]
+                               (swap! calls conj (into [method] args))
+                               (p/resolved nil)))
+      (with-mocked-local-storage
+        (merge device-settings {"id-token" "synthetic-id"
+                                "access-token" "synthetic-access"
+                                "refresh-token" "synthetic-refresh"
+                                "CognitoIdentityServiceProvider.synthetic.refreshToken" "synthetic-refresh"
+                                "user-groups" "#{:synthetic}"})
+        (fn []
+          (with-redefs [util/electron? (constantly true)
+                        util/node-test? false
+                        ipc/ipc (fn [op _ path content]
+                                  (swap! writes conj [op path (js->clj (js/JSON.parse content) :keywordize-keys true)])
+                                  (p/resolved nil))
+                        state/pub-event! #(swap! events conj %)]
+            (let [cleared (user-handler/logout)]
+              (doseq [[key value] device-settings]
+                (is (= value (.getItem js/localStorage key))))
+              (doseq [key ["id-token" "access-token" "refresh-token"
+                           "CognitoIdentityServiceProvider.synthetic.refreshToken" "user-groups"]]
+                (is (not (seq (.getItem js/localStorage key)))))
+              (is (nil? (:user/info (state/get-state))))
+              (is (not (user-handler/logged-in?)))
+              (is (= [[:user/logout]] @events))
+              (is (= [[:thread-api/sync-app-state
+                       {:auth/id-token nil :auth/access-token nil :auth/refresh-token nil :user/info nil}]
+                      [:thread-api/db-sync-stop]
+                      [:thread-api/clear-e2ee-password]] @calls))
+              (is (= ["writeFile" "/tmp/isolated-auth/logseq/auth.json"] (take 2 (first @writes))))
+              (is (= {:id-token nil :access-token nil :refresh-token nil}
+                     (select-keys (nth (first @writes) 2) [:id-token :access-token :refresh-token])))
+              (-> cleared
+                  (p/catch #(is false (str %)))
+                  (p/finally (fn []
+                               (state/replace-state! old-state)
+                               (reset! state/*db-worker old-worker)
+                               (done)))))))))))

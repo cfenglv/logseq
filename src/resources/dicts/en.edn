@@ -747,6 +747,7 @@
  :encryption/init-key-pair "Init E2EE encrypt-key-pair"
  :encryption/init-key-pair-error "Init key-pair err: {1}"
  :encryption/key-unavailable "Key unavailable"
+ :encryption/login-required "Sign in again to access your encryption keys."
  :encryption/password-not-matched "Password not matched"
  :encryption/password-updated-successfully "Password updated successfully!"
  :encryption/private-key "Private key (base64)"

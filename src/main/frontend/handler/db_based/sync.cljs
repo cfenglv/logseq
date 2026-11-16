@@ -275,11 +275,20 @@
       (log/info :db-sync/stop-skipped {:reason :db-worker-not-ready})
       (p/resolved nil))))
 
-(defn- <sync-auth-state-to-db-worker!
+(defn <sync-auth-state-to-db-worker!
   []
   (p/let [_ (user-handler/<ensure-id&access-token!)
           payload (user-handler/sync-app-state-payload)]
     (state/<invoke-db-worker :thread-api/sync-app-state payload)))
+
+(defn <get-user-rsa-key-pair
+  []
+  (p/let [_ (when-not (user-handler/logged-in?)
+             (throw (ex-info "Sign in to access encryption keys" {:type :login-required})))
+          _ (<sync-auth-state-to-db-worker!)]
+    (state/<invoke-db-worker :thread-api/get-user-rsa-key-pair
+                             (state/get-auth-id-token)
+                             (user-handler/user-uuid))))
 
 (defn <rtc-start!
   [repo & {:keys [_stop-before-start?] :as _opts}]

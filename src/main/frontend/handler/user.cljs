@@ -288,12 +288,15 @@
   (auto-fill-refresh-token-from-cognito!)
   (state/pub-event! [:user/fetch-info-and-graphs]))
 
-(defn- clear-e2ee-password!
+(defn- clear-worker-session!
   []
-  (when @state/*db-worker
-    (-> (state/<invoke-db-worker :thread-api/clear-e2ee-password)
+  (when-let [worker @state/*db-worker]
+    (-> (p/all [(worker :thread-api/sync-app-state
+                       {:auth/id-token nil :auth/access-token nil :auth/refresh-token nil :user/info nil})
+                (worker :thread-api/db-sync-stop)
+                (worker :thread-api/clear-e2ee-password)])
         (p/catch (fn [error]
-                   (js/console.warn :clear-e2ee-password-failed error)
+                   (js/console.warn :logout-worker-cleanup-failed error)
                    nil)))))
 
 (defn ^:export login-with-username-password-e2e
@@ -323,12 +326,13 @@
           {:id-token id-token :access-token access-token :refresh-token refresh-token})))))
 
 (defn logout []
-  (clear-e2ee-password!)
-  (clear-tokens)
-  (.clear js/localStorage)
-  (state/clear-user-info!)
-  (state/pub-event! [:user/logout])
-  (state/set-state! :auth/current-login-user :logout))
+  (let [cleared (clear-worker-session!)]
+    (clear-tokens)
+    (state/clear-user-info!)
+    (state/set-state! :user/info nil)
+    (state/pub-event! [:user/logout])
+    (state/set-state! :auth/current-login-user :logout)
+    cleared))
 
 (defn upgrade []
   (let [base-upgrade-url "https://logseqdemo.lemonsqueezy.com/checkout/buy/13e194b5-c927-41a8-af58-ed1a36d6000d"
