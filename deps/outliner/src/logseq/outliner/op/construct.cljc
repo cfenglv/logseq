@@ -223,6 +223,7 @@
                                      (and nil-refs?
                                           (not (contains? block-refs [:block/uuid ref-uuid])))))
                                missing-refs)
+        retracted-lookups (into #{} (map (fn [{:block/keys [uuid]}] [:block/uuid uuid])) retracted-refs)
         tag-lookups (->> (:block/tags block)
                          (filter (fn [v]
                                    (and (vector? v)
@@ -255,7 +256,13 @@
                                (db-content/content-id-ref->page retracted-refs))))
 
                  (seq missing-ref-by-lookup)
-                 (-> (update :block/refs rewrite-retracted-refs)
+                 (-> (update :block/refs
+                             (fn [values]
+                               (rewrite-retracted-refs
+                                (remove (fn [value]
+                                          (retracted-lookups
+                                           (if-let [uuid (:block/uuid value)] [:block/uuid uuid] value)))
+                                        values))))
                      (update :block/tags rewrite-retracted-refs)))]
     (dissoc block' rebase-refs-key rebase-created-refs-key)))
 

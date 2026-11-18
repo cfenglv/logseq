@@ -339,19 +339,18 @@
                                        (when (and (= :db/add action) (= :block/uuid attr)
                                                   (contains? ref-uuids value)) value)))
                              (:tx local-tx))]
-      ;; This known recording defect has correct durable datoms. Ambiguous
-      ;; records must abort the outer atomic rebase, not enter its drop catch.
-      (when-not (and (= 1 (count titles)) (string? (first titles))
-                     (= 1 (count saves)) (every? :block/uuid ref-blocks))
-        (throw (ex-info "Cannot normalize save history from its transaction"
-                        {:tx-id (:tx-id local-tx) :block/uuid block-id})))
-      [:save-block
-       [(cond-> (assoc (dissoc block op-construct/rebase-created-refs-key)
-                        :block/title (first titles)
-                        :block/refs refs
-                        op-construct/rebase-refs-key ref-blocks)
-          (seq created-refs) (assoc op-construct/rebase-created-refs-key created-refs))
-        opts]])
+      ;; Some older saves recorded a placeholder even though their durable
+      ;; datoms identify the real reference. Otherwise replay the saved op.
+      (if (and (= 1 (count titles)) (string? (first titles))
+               (= 1 (count saves)) (seq ref-blocks) (every? :block/uuid ref-blocks))
+        [:save-block
+         [(cond-> (assoc (dissoc block op-construct/rebase-created-refs-key)
+                         :block/title (first titles)
+                         :block/refs refs
+                         op-construct/rebase-refs-key ref-blocks)
+            (seq created-refs) (assoc op-construct/rebase-created-refs-key created-refs))
+          opts]]
+        entry))
     entry))
 
 (defn- rebase-history-ops

@@ -503,11 +503,11 @@
         first-ref [:block/uuid first-uuid]
         second-ref [:block/uuid second-uuid]]
     (doseq [[tags expected]
-            [[[first-id] #{first-ref}]
-             [[first-id second-id] #{first-ref second-ref}]
+            [[[first-id] [first-ref]]
+             [[first-id second-id] [first-ref second-ref]]
              [first-ref first-ref]
-             [[first-ref second-ref] #{first-ref second-ref}]
-             [[:logseq.class/Tag :logseq.class/Class] #{:logseq.class/Tag :logseq.class/Class}]
+             [[first-ref second-ref] [first-ref second-ref]]
+             [[:logseq.class/Tag :logseq.class/Class] [:logseq.class/Tag :logseq.class/Class]]
              [first-id first-ref]
              [#{first-id} #{first-ref}]
              [(list first-id) #{first-ref}]
@@ -567,8 +567,7 @@
                     [[:insert-blocks [[block] (:block/uuid target) {:sibling? true}]]])
         insert-payload (get-in insert-ops [0 1 0 0])
         rewritten (op-construct/rewrite-block-title-with-retracted-refs db-before payload)]
-    (is (= (set (map (fn [ref] [:block/uuid (:block/uuid ref)]) refs))
-           (:block/refs payload)))
+    (is (= refs (:block/refs payload)))
     (is (= expected-refs (get payload op-construct/rebase-refs-key)))
     (is (= [created-uuid] (get payload op-construct/rebase-created-refs-key)))
     (is (not (contains? payload :block.temp/ast-title)))
@@ -603,10 +602,11 @@
                :block/title (str "See [[" recovered-uuid "]] and [[" deleted-uuid "]]")
                :block/refs #{nil [:block/uuid deleted-uuid]}
                op-construct/rebase-refs-key [{:block/uuid recovered-uuid :block/title "Keep"}
-                                             {:block/uuid deleted-uuid :block/title "Former"}]}]
+                                             {:block/uuid deleted-uuid :block/title "Former"}]}
+        rewritten (op-construct/rewrite-block-title-with-retracted-refs @(db-test/create-conn) block)]
     (is (= (str "See [[" recovered-uuid "]] and Former")
-           (:block/title (op-construct/rewrite-block-title-with-retracted-refs
-                          @(db-test/create-conn) block))))))
+           (:block/title rewritten)))
+    (is (= [recovered-uuid] (mapv :block/uuid (:block/refs rewritten))))))
 
 (deftest derive-history-outliner-ops-insert-blocks-resolves-retracted-ref-id-from-tx-data-test
   (testing "insert-blocks should canonicalize block ref attrs when ref entity is retracted in current tx"
@@ -625,14 +625,15 @@
           tag-id (:db/id (d/entity @conn [:block/uuid tag-uuid]))
           tx-report (d/with @conn [[:db/retractEntity tag-id]] {})
           block-uuid (random-uuid)]
-      (doseq [tags [#{tag-id} [tag-id]]]
+      (doseq [[tags expected] [[#{tag-id} #{[:block/uuid tag-uuid]}]
+                               [[tag-id] [[:block/uuid tag-uuid]]]]]
         (let [tx-meta {:outliner-op :insert-blocks
                        :outliner-ops [[:insert-blocks [[{:block/uuid block-uuid
                                                        :block/title "new child"
                                                        :block/tags tags}]
                                                      target-id
                                                      {:sibling? true}]]]}]
-          (is (= #{[:block/uuid tag-uuid]}
+          (is (= expected
                  (get-in (op-construct/derive-history-outliner-ops
                           @conn (:db-after tx-report) (:tx-data tx-report) tx-meta)
                          [:forward-outliner-ops 0 1 0 0 :block/tags]))))))))

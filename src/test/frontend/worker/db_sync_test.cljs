@@ -747,7 +747,7 @@
                                       [:forward-outliner-ops 0 1 0 :block/refs])))
             (upload-pending-and-assert-converged! conn remote-conn)))))))
 
-(deftest rebase-ambiguous-reference-history-keeps-local-input-and-pending-test
+(deftest rebase-ambiguous-reference-history-retains-failed-operations-test
   (let [{:keys [conn client-ops-conn child1 child2 child3]} (setup-parent-child)
         remote-conn (d/conn-from-db @conn)]
     (with-datascript-conns
@@ -760,19 +760,19 @@
                               ["First save" "Second save"])
                     local-tx-meta)
         (let [pending (first (sync-apply/pending-txs test-repo))
-              tx-id (:tx-id pending)]
+              tx-id (:tx-id pending)
+              forward (assoc-in (:forward-outliner-ops pending) [0 1 0 :block/refs] #{nil})]
           (client-op/upsert-local-tx-entry!
            test-repo (assoc pending :normalized-tx-data (:tx pending) :reversed-tx-data (:reversed-tx pending)
-                           :forward-outliner-ops (assoc-in (:forward-outliner-ops pending)
-                                                           [0 1 0 :block/refs] #{nil})))
-          (is (= "Cannot normalize save history from its transaction"
-                 (with-silenced-console-error
-                   #(try (sync-apply/apply-remote-tx! test-repo nil
-                                                    (:tx-data (ldb/transact! remote-conn
-                                                                            [[:db/add (:db/id child3) :block/title "Peer edit"]])))
-                         nil (catch :default e (ex-message e))))))
-          (is (= "Second save" (:block/title (d/entity @conn (:db/id child1)))))
-          (is (= [tx-id] (mapv :tx-id (sync-apply/pending-txs test-repo)))))))))
+                           :forward-outliner-ops forward))
+          (sync-apply/apply-remote-tx! test-repo nil
+                                     (:tx-data (ldb/transact! remote-conn
+                                                             [[:db/add (:db/id child3) :block/title "Peer edit"]])))
+          (is (= "Peer edit" (:block/title (d/entity @conn (:db/id child3)))))
+          (is (empty? (sync-apply/pending-txs test-repo)))
+          (is (= 1 (aget (client-op-tx-row client-ops-conn tx-id) "failed")))
+          (is (= forward (:forward-outliner-ops
+                          (client-op/get-local-tx-entry test-repo tx-id)))))))))
 
 (deftest rebase-save-new-page-reference-and-insert-sibling-test
   (doseq [persisted-bad-history? [false true]
