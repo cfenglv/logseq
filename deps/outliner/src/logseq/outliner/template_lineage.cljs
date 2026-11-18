@@ -134,6 +134,47 @@
                      :else value)])))
         (into {} block)))
 
+(defn- legacy-template-pair
+  [db blocks]
+  (let [templates (group-by :block.temp/template-root-uuid blocks)
+        pairs (keep (fn [[template-id [head :as extension]]]
+                      ;; Preparation stamps the first block with the current template.
+                      (let [source (:logseq.property/used-template (d/entity db (:db/id head)))
+                            source-id (:block/uuid source)
+                            base (get templates source-id)]
+                        (when (and base (not= source-id template-id) (not (ldb/recycled? source)))
+                          [base extension])))
+                    templates)
+        [base extension] (first pairs)]
+    (when (and (= 1 (count pairs))
+               (not-any? :logseq.property/used-template (rest extension)))
+      [base extension])))
+
+(defn- legacy-identities
+  "Match a complete legacy copy by stored semantics and sibling order."
+  [db parent-id [base extension]]
+  (let [base-children (group-by parent-id base)
+        extension-children (group-by parent-id extension)
+        semantics #(semantic-node db % {} #{(:block/uuid %)})]
+    (letfn [(match-children [identities base-parent extension-parent]
+              (if-let [siblings (get base-children base-parent)]
+                (let [candidates (group-by (comp semantics second)
+                                           (map-indexed vector (get extension-children extension-parent)))
+                      matches (mapv #(get candidates (semantics %)) siblings)]
+                  (when (and (every? #(= 1 (count %)) matches)
+                             (apply < -1 (map ffirst matches)))
+                    (reduce (fn [result [base-block [_ extension-block]]]
+                              (let [base-id (:block/uuid base-block)
+                                    extension-id (:block/uuid extension-block)]
+                                (or (match-children (assoc result base-id base-id extension-id base-id)
+                                                    base-id extension-id)
+                                    (reduced nil))))
+                            identities (map vector siblings (map first matches)))))
+                identities))]
+      (let [identities (match-children {} nil nil)]
+        (when (= (:block/uuid (first base)) (get identities (:block/uuid (first extension))))
+          identities)))))
+
 (defn- rewrite-block
   [db block aliases]
   (reduce-kv
@@ -178,17 +219,24 @@
   "Keep official template selection. Only reuse equal, unambiguous source nodes."
   [db blocks]
   (let [blocks (vec blocks)
+        multiple-templates? (> (count (set (map :block.temp/template-root-uuid blocks))) 1)
+        explicit-source? (and multiple-templates? (some :logseq.property/template-source-block blocks))
+        legacy-pair (when (and multiple-templates? (not explicit-source?))
+                      (legacy-template-pair db blocks))
         unchanged {:blocks blocks :aliases {}}]
-    (if (or (< (count (set (map :block.temp/template-root-uuid blocks))) 2)
-            (not-any? :logseq.property/template-source-block blocks))
+    (if-not (or explicit-source? legacy-pair)
       unchanged
       (let [by-id (into {} (map (juxt :block/uuid identity)) blocks)
-            identities (into {} (keep (fn [node-id]
-                                       (when-let [source (origin db node-id)]
-                                         [node-id source]))) (keys by-id))
-            groups (group-by #(get identities (:block/uuid %) (:block/uuid %)) blocks)
             parent-id (fn [block] (let [node-id (ref-uuid db (:block/parent block))]
                                    (when (contains? by-id node-id) node-id)))
+            identities (if explicit-source?
+                         (into {} (keep (fn [node-id]
+                                          (when-let [source (origin db node-id)]
+                                            [node-id source]))) (keys by-id))
+                         (when (= (count by-id) (count blocks))
+                           (legacy-identities db parent-id legacy-pair)))
+            groups (when (seq identities)
+                     (group-by #(get identities (:block/uuid %) (:block/uuid %)) blocks))
             parent-key (fn [block] (some-> (parent-id block) identities))
             eligible-groups
             (into {}

@@ -186,6 +186,7 @@
   [_target block-id property-default-value?]
   (let [[block set-block!] (hooks/use-state nil)
         [template-source set-template-source!] (hooks/use-state nil)
+        source-block (get-in template-source [:block :logseq.property/template-source-block])
         simple-commands (rfx/use-sub [:plugin/simple-commands])
         developer-mode? (rfx/use-sub [:ui/developer-mode?])
         [set-icon-sub-menu-open? set-icon-sub-menu-open] (hooks/use-state false)
@@ -235,10 +236,10 @@
             (property-value/property-value-select-node
              (:block template-source) (:property template-source)
              {:on-chosen #(do (state/hide-custom-context-menu!) (shui/popup-hide!))} {})]
-           (when (:logseq.property/template-source-block (:block template-source))
+           (when (and source-block (not= :logseq.property/empty-placeholder (:db/ident source-block)))
              (shui/dropdown-menu-item
-              {:on-click #(property-handler/remove-block-property!
-                           block-id :logseq.property/template-source-block)}
+              {:on-click #(property-handler/set-block-property!
+                           block-id :logseq.property/template-source-block :logseq.property/empty-placeholder)}
               (t :editor.template/unlink-source))))))
 
          (shui/dropdown-menu-separator)

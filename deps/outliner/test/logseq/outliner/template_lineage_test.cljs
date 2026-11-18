@@ -1,5 +1,5 @@
 (ns logseq.outliner.template-lineage-test
-  (:require [cljs.test :refer [deftest is]]
+  (:require [cljs.test :refer [deftest is testing]]
             [datascript.core :as d]
             [logseq.common.util.page-ref :as page-ref]
             [logseq.db :as ldb]
@@ -99,6 +99,47 @@
     (let [{:keys [blocks aliases]} (lineage/coalesce @conn (prepared conn [base extended]))]
       (is (= 6 (count blocks)))
       (is (empty? aliases)))))
+
+(deftest legacy-used-template-reuses-a-unique-complete-tree
+  (let [conn (db-test/create-conn-with-blocks
+              {:pages-and-blocks
+               [{:page {:block/title "Base" :build/tags [:logseq.class/Template]}
+                 :blocks [{:block/title "Section"
+                           :build/properties {:logseq.property/heading 2}
+                           :build/children [{:block/title "Shared note"}]}
+                          {:block/title "Summary"}]}
+                {:page {:block/title "Extension" :build/tags [:logseq.class/Template]}}]})
+        base (ldb/get-page @conn "Base")
+        extension (ldb/get-page @conn "Extension")]
+    (outliner-op/apply-ops! conn [[:apply-template [(:block/uuid base) (:block/uuid extension) {:sibling? false}]]] {})
+    (ldb/transact! conn (mapv #(vector :db/retract (:db/id %) :logseq.property/template-source-block)
+                             (body conn extension)))
+    (outliner-core/insert-blocks! conn [{:block/title "Added note"}] (section conn extension) {:sibling? false})
+    (let [apply-both (fn [db] (lineage/coalesce db (mapcat #(lineage/prepare-blocks db %) [base extension])))
+          head (section conn extension)
+          added (by-title conn extension "Added note")
+          {:keys [blocks aliases]} (apply-both @conn)]
+      (is (= 3 (count aliases)))
+      (is (= (mapv :block/title (body conn extension)) (mapv :block/title blocks)))
+      (doseq [[scenario tx] [["Absent stored marker" [:db/retract (:db/id head) :logseq.property/used-template]]
+                             ["Changed property" [:db/add (:db/id head) :logseq.property/heading 3]]
+                             ["Ambiguous sibling" [:db/add (:db/id added) :block/title "Shared note"]]]]
+        (testing scenario
+          (let [{:keys [blocks aliases]} (apply-both (d/db-with @conn [tx]))]
+            (is (= 7 (count blocks)))
+            (is (empty? aliases)))))
+      (testing "The unlink operation leaves an explicit empty source"
+        (outliner-op/apply-ops! conn [[:set-block-property
+                                      [(:block/uuid head) :logseq.property/template-source-block
+                                       (:db/id (section conn base))]]] {})
+        (outliner-op/apply-ops! conn [[:set-block-property
+                                      [(:block/uuid head) :logseq.property/template-source-block
+                                       :logseq.property/empty-placeholder]]] {})
+        (is (= :logseq.property/empty-placeholder
+               (some-> (section conn extension) :logseq.property/template-source-block :db/ident)))
+        (let [{:keys [blocks aliases]} (apply-both @conn)]
+          (is (= 7 (count blocks)))
+          (is (empty? aliases)))))))
 
 (deftest incompatible-source-order-keeps-official-stacking
   (let [{:keys [conn base extended]} (fixture)
