@@ -622,7 +622,7 @@
                      (nil? (:outliner-op opts)))
                 (assoc :outliner-op default-outliner-op)
 
-                (= :rename-page single-op-outliner-op)
+                (= :rename-page default-outliner-op)
                 (assoc :data (let [[page-uuid new-title] (second (first ops))
                                    page (d/entity @conn [:block/uuid page-uuid])]
                                {:page-id (:db/id page)
