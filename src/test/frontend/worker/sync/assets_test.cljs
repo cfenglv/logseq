@@ -627,7 +627,9 @@
                                        :content-encoding "gzip"
                                        :decoded-size 3240})
                                  (aset "arrayBuffer" (fn [] body-p))))))
-           (-> (p/with-redefs [sync-assets/graph-aes-key
+           (-> (p/with-redefs [sync-auth/<resolve-ws-token
+                               (fn [] (p/resolved "synthetic-progress-token"))
+                               sync-assets/graph-aes-key
                                (fn [_repo _graph-id _fail-fast-f]
                                  (p/resolved nil))
                                platform/current
