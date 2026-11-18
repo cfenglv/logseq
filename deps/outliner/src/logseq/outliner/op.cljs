@@ -341,6 +341,11 @@
 
 (def ^:private ops-validator (m/validator ops-schema))
 
+(defn validate-ops!
+  "Validates canonical operation shapes before any graph changes."
+  [ops]
+  (assert (ops-validator ops) ops))
+
 (defn- reaction-user-id
   [reaction]
   (:db/id (:logseq.property/created-by-ref reaction)))
@@ -595,19 +600,27 @@
   [[op _args]]
   (= :batch-import-edn op))
 
-(defn apply-ops!
+(defn operation-options
+  "Builds common batch metadata while preserving caller execution options.
+
+  | Option | Meaning |
+  | --- | --- |
+  | `:outliner-op` | Transaction label; defaults to the operation for a single-operation batch. |
+  | `:db-sync/tx-id` | Transaction UUID; generated when absent. |
+  | `:additional-tx` | Additional datoms to apply once after the operations. |
+  | `:current-block` | Execution context excluded from committed metadata. |
+
+  Other caller options are forwarded. Connection, local-transaction and import
+  metadata are derived here for both canonical and raw-content batches."
   [conn ops opts]
-  (assert (ops-validator ops) ops)
-  (let [semantic-ops (atom [])
-        single-op-outliner-op (when (= 1 (count ops))
-                                (first (first ops)))
-        opts' (cond-> (assoc opts
+  (let [default-outliner-op (when (= 1 (count ops)) (ffirst ops))
+        options (cond-> (assoc opts
                              :transact-opts {:conn conn}
                              :local-tx? true
                              :db-sync/tx-id (or (:db-sync/tx-id opts) (random-uuid)))
-                (and single-op-outliner-op
+                (and default-outliner-op
                      (nil? (:outliner-op opts)))
-                (assoc :outliner-op single-op-outliner-op)
+                (assoc :outliner-op default-outliner-op)
 
                 (= :rename-page single-op-outliner-op)
                 (assoc :data (let [[page-uuid new-title] (second (first ops))
@@ -617,7 +630,14 @@
                                 :new-name new-title}))
 
                 (some import-edn-op? ops)
-                (assoc ::sqlite-export/imported-data? true))
+                (assoc ::sqlite-export/imported-data? true))]
+    options))
+
+(defn apply-ops!
+  [conn ops opts]
+  (validate-ops! ops)
+  (let [semantic-ops (atom [])
+        opts' (operation-options conn ops opts)
         *result (atom nil)]
 
     (ldb/batch-transact-with-temp-conn!

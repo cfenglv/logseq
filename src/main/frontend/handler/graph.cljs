@@ -90,7 +90,8 @@
                                       {:graph-id tab-graph-id}))))]
     (or url-target-repo
         tab-target-repo
-        current-repo
+        (when (repo-exists? current-repo)
+          current-repo)
         (:url (first repos)))))
 
 (defn prepare-startup-repo!

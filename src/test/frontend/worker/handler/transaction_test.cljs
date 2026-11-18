@@ -13,6 +13,7 @@
             [logseq.db.frontend.literature :as literature]
             [logseq.db.sqlite.build :as sqlite-build]
             [logseq.db.test.helper :as db-test]
+            [logseq.outliner.input :as outliner-input]
             [logseq.outliner.op :as outliner-op]
             [logseq.outliner.op.construct :as op-construct]
             [logseq.outliner.property :as outliner-property]
@@ -660,7 +661,7 @@
         hydration-calls (atom 0)]
     (try
       (reset! worker-state/*datascript-conns {repo conn})
-      (with-redefs [outliner-op/apply-ops! (fn [_conn _ops _opts]
+      (with-redefs [outliner-input/apply-ops! (fn [_conn _ops _opts]
                                              result)
                     db-listener/take-outliner-op-delta!
                     (fn [requested-perf-id]

@@ -15,6 +15,16 @@ let option_value key options =
 
 let option_present key options = Vec.mem_assoc key options
 
+let validate_graph_option options =
+  let count =
+    Vec.fold_left
+      (fun count (key, _) -> if key = "graph" then count + 1 else count)
+      0 options
+  in
+  if count > 1 then
+    Error (Error.invalid_options "Option --graph may only be specified once")
+  else Ok ()
+
 let normalize_key = function
   | "-g" -> Some "graph"
   | "-o" -> Some "output"
@@ -550,12 +560,14 @@ let validate_option_values path options =
       else Ok ())
 
 let validate_options path options =
-  Error.bind (validate_known_options path options) (fun () ->
-      Error.bind (validate_boolean_option_values options) (fun () ->
-          Error.bind (validate_global_values options) (fun () ->
-              if Vec.length path = 2 && Vec.nth path 0 = "literature" then
-                Error.bind (validate_integer_option "limit" options) (fun () -> validate_integer_option "before" options)
-              else validate_option_values path options)))
+  Error.bind (validate_graph_option options) (fun () ->
+      Error.bind (validate_known_options path options) (fun () ->
+          Error.bind (validate_boolean_option_values options) (fun () ->
+              Error.bind (validate_global_values options) (fun () ->
+                  if Vec.length path = 2 && Vec.nth path 0 = "literature" then
+                    Error.bind (validate_integer_option "limit" options) (fun () ->
+                        validate_integer_option "before" options)
+                  else validate_option_values path options))))
 
 let sync_config_key_or_error = function
   | None -> Ok None

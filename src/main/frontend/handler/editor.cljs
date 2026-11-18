@@ -317,7 +317,9 @@
 
 (defn- start-pending-new-block!
   []
-  (state/set-state! :editor/pending-new-block {:typed-text ""}))
+  (state/set-state! :editor/pending-new-block
+                    {:typed-text ""
+                     :source-uuid (:block/uuid (state/get-edit-block))}))
 
 (defn- pending-new-block
   []
@@ -339,15 +341,39 @@
     (state/update-state! :editor/pending-new-block
                          #(assoc % :tab-indent? indent?))))
 
+(defn- pending-new-block-delete-on-backspace?
+  "Backspace deletes the pending block only once the editor has moved off
+  the source block and the caret is at 0. Until then .-target is still the
+  source textarea (an empty source always reports caret 0), including
+  while a queued Tab indent is still in flight."
+  [pending current-edit-uuid e]
+  (boolean
+   (and (:source-uuid pending)
+        current-edit-uuid
+        (not= current-edit-uuid (:source-uuid pending))
+        (zero? (util/get-selection-start (.-target e))))))
+
+(defn- apply-pending-new-block-backspace
+  "Before landing, Backspace trims the last buffered character and is a no-op
+  when there is nothing to trim (it does not delete the in-flight block).
+  After landing, caret 0 still deletes the new block."
+  [pending delete-block?]
+  (cond
+    delete-block?
+    (assoc pending :delete? true)
+
+    (seq (:typed-text pending))
+    (assoc pending :typed-text (subs (:typed-text pending) 0 (dec (count (:typed-text pending)))))
+
+    :else
+    pending))
+
 (defn- backspace-pending-new-block!
   [delete-block?]
   (when (pending-new-block?)
     (state/update-state!
      :editor/pending-new-block
-     (fn [{:keys [typed-text] :as pending}]
-       (if (and (seq typed-text) (not delete-block?))
-         (assoc pending :typed-text (subs typed-text 0 (dec (count typed-text))))
-         (assoc pending :delete? true))))))
+     #(apply-pending-new-block-backspace % delete-block?))))
 
 (defn- clear-pending-new-block!
   []
@@ -1061,7 +1087,7 @@
   (delete-block-inner! repo (get-state)))
 
 (defn delete-blocks!
-  [_repo block-uuids blocks dom-blocks mobile-action-bar?]
+  [_repo block-uuids blocks dom-blocks mobile-action-bar? & [opts]]
   (when (seq block-uuids)
     (let [uuid->dom-block (zipmap block-uuids dom-blocks)
           block (first blocks)
@@ -1082,7 +1108,7 @@
            edit-block-fn
            (assoc :editor/edit-block-fn edit-block-fn))
          (when (seq blocks)
-           (outliner-op/delete-blocks! blocks nil))
+           (outliner-op/delete-blocks! blocks opts))
          (when (seq journals)
            (doseq [journal journals]
              (outliner-op/delete-page! (:block/uuid journal)))))))))
@@ -1315,11 +1341,10 @@
                      top-level-blocks (block-handler/get-top-level-blocks blocks)]
                  (when-not (every? ldb/recycled? top-level-blocks)
                    (when (seq top-level-blocks)
-                     ;; Delete the selected nodes only. Page nodes unlink their
-                     ;; namespace parent in INode/-del; expanding a page to its
-                     ;; content would wipe the child page (db-test#1242).
-                     ;; Regular blocks still retract their subtree there.
-                     (delete-blocks! repo (map :block/uuid top-level-blocks) top-level-blocks dom-blocks mobile-action-bar?))))))))))))
+                     ;; Page nodes unlink without deleting their content.
+                     ;; Asset-containing cuts preserve the subtree and its incoming references.
+                     (delete-blocks! repo (map :block/uuid top-level-blocks) top-level-blocks dom-blocks mobile-action-bar?
+                                     {:cut? copy?}))))))))))))
 
 (def url-regex
   "Didn't use link/plain-link as it is incorrectly detects words as urls."
@@ -2171,15 +2196,14 @@
     (cursor/move-cursor-forward input 2)))
 
 (defn- paste-block-cleanup
-  [_repo block page _exclude-properties _format content-update-fn keep-uuid?]
+  [_repo block page _exclude-properties _format content-update-fn]
   (let [new-content
         (if content-update-fn
           (content-update-fn (:block/title block))
           (:block/title block))]
-    (merge (cond-> block
-             (not keep-uuid?) (dissoc :block/uuid))
-           {:block/page {:db/id [:block/uuid (:block/uuid page)]}
-            :block/title new-content})))
+    (assoc block
+           :block/page {:db/id [:block/uuid (:block/uuid page)]}
+           :block/title new-content)))
 
 (defn- edit-last-block-after-inserted!
   [result]
@@ -2196,15 +2220,6 @@
   (let [ids (set (map :db/id blocks))]
     (some? (some #(ids (block-parent-id %)) blocks))))
 
-(defn- unrecycle-tx-data
-  [root]
-  (let [root-id [:block/uuid (:block/uuid root)]]
-    [[:db/retract root-id :logseq.property/deleted-at]
-     [:db/retract root-id :logseq.property/deleted-by-ref]
-     [:db/retract root-id :logseq.property.recycle/original-parent]
-     [:db/retract root-id :logseq.property.recycle/original-page]
-     [:db/retract root-id :logseq.property.recycle/original-order]]))
-
 (defn paste-blocks
   "Given a vec of blocks, insert them into the target page.
    keep-uuid?: if true, keep the uuid provided in the block structure."
@@ -2213,6 +2228,7 @@
                   target-block
                   sibling?
                   keep-uuid?
+                  cut?
                   revert-cut-txs
                   skip-empty-target?
                   ops-only?
@@ -2237,12 +2253,16 @@
                                        (and target-block-has-children? (= (count blocks) 1))))]
     (p/let [target-block' (if (and empty-target? target-block-has-children? paste-nested-blocks?)
                             (<left-sibling-or-parent (state/get-current-repo) target-block)
-                            target-block)]
-      (let [existing-blocks (filter :block/uuid blocks)
+                            target-block)
+            current-blocks (when cut?
+                             (db-async/<get-blocks (state/get-current-repo)
+                                                  (keep :block/uuid blocks) {:children? false}))]
+      (let [existing-blocks (filter :block/uuid
+                                   (if cut? (unwrap-block-results current-blocks) blocks))
             move-from-recycle? (and keep-uuid?
                                     (seq existing-blocks)
                                     (or (seq revert-cut-txs)
-                                        (every? ldb/recycled? existing-blocks)))
+                                        (every? ldb/recycled? (block-handler/get-top-level-blocks existing-blocks))))
             sibling? (cond
                        (and paste-nested-blocks? empty-target?)
                        (= (block-parent-id target-block') (block-parent-id target-block))
@@ -2261,10 +2281,10 @@
                                   :additional-tx revert-cut-txs
                                   :ui/page-id (:ui/page-id opts)}
                                  (when target-block'
-                                   (let [top-level-blocks (block-handler/get-top-level-blocks existing-blocks)
-                                         unrecycle-tx (mapcat unrecycle-tx-data top-level-blocks)]
-                                     (when (seq unrecycle-tx)
-                                       (outliner-op/transact! unrecycle-tx nil))
+                                   (let [top-level-blocks (block-handler/get-top-level-blocks existing-blocks)]
+                                     (doseq [block top-level-blocks
+                                             :when (ldb/recycled? block)]
+                                       (outliner-op/restore-recycled! (:block/uuid block)))
                                      (outliner-op/move-blocks! top-level-blocks target-block'
                                                                {:sibling? sibling?
                                                                 :outliner-op :paste}))))
@@ -2276,7 +2296,7 @@
                                    (let [format (get target-block' :block/format :markdown)
                                          repo (state/get-current-repo)
                                          blocks' (map (fn [block]
-                                                        (paste-block-cleanup repo block page exclude-properties format content-update-fn keep-uuid?))
+                                                        (paste-block-cleanup repo block page exclude-properties format content-update-fn))
                                                       blocks)]
                                      (outliner-op/insert-blocks! blocks' target-block' {:sibling? sibling?
                                                                                         :outliner-op :paste
@@ -3041,7 +3061,11 @@
       (pending-new-block?)
       (do
         (util/stop e)
-        (backspace-pending-new-block! (zero? (util/get-selection-start (.-target e)))))
+        (backspace-pending-new-block!
+         (pending-new-block-delete-on-backspace?
+          (pending-new-block)
+          (:block/uuid (state/get-edit-block))
+          e)))
 
       (= input element)
       (let [id (state/get-edit-input-id)

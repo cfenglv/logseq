@@ -377,14 +377,14 @@
 
 (defn download-remote-asset!
   [repo graph-id asset-uuid asset-type & [verify-content?]]
-  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)]
+  (let [base (sync-auth/http-base-url @worker-state/*db-sync-config)
+        asset-id (str asset-uuid)]
     (if (and (seq base) (seq graph-id) (seq asset-type))
       (-> (p/let [token (sync-auth/<resolve-ws-token)
                   aes-key (graph-aes-key
                            repo graph-id
                            (fn [tag data]
                              (throw (ex-info (name tag) data))))
-                  asset-id (str asset-uuid)
                   get-url (sync-large-title/asset-url base graph-id asset-id asset-type)
                   headers (sync-auth/auth-headers token)
                   request-opts (cond-> {:method "GET"}
@@ -396,12 +396,11 @@
                       (throw (ex-info "download asset failed"
                                       {:type :rtc.exception/download-asset-failed
                                        :data {:status status}})))
+                  ;; In-flight total may be encoded wire size; completion uses decoded size.
                   total (or (parse-content-length resp) 0)
                   _ (notify-asset-progress! repo asset-id :download 0 total)
                   body (.arrayBuffer resp)
                   body-size (.-byteLength body)
-                  total' (if (pos? total) total body-size)
-                  _ (notify-asset-progress! repo asset-id :download body-size total')
                   asset-file
                   (if (not aes-key)
                     body
@@ -417,10 +416,14 @@
                       (throw (ex-info "downloaded asset content mismatch"
                                       {:type :rtc.exception/download-asset-failed
                                        :data {:reason :content-mismatch
-                                              :asset-uuid asset-uuid}})))]
-            (<write-asset-bytes! repo asset-id asset-type asset-file))
-          (p/catch (fn [error]
-                     (p/rejected (asset-download-error error)))))
+                                              :asset-uuid asset-uuid}})))
+                  written (<write-asset-bytes! repo asset-id asset-type asset-file)]
+            (notify-asset-progress! repo asset-id :download body-size body-size)
+            written)
+          (p/catch
+           (fn [error]
+             (notify-asset-progress! repo asset-id :download 0 0)
+             (p/rejected (asset-download-error error)))))
       (p/rejected (ex-info "missing asset download info"
                            {:repo repo
                             :asset-uuid asset-uuid

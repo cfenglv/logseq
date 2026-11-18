@@ -15,6 +15,7 @@
             [frontend.context.i18n :as i18n]
             [frontend.db.projection-cutover :as projection-cutover]
             [frontend.db.restore :as db-restore]
+            [frontend.db.subs :as db-subs]
             [frontend.error :as error]
             [frontend.handler.command-palette :as command-palette]
             [frontend.handler.e2ee]
@@ -53,6 +54,35 @@
           (when-not (error/ignored? message)
             (log/error :exception error)))))
 
+(defn- clear-stale-current-repo!
+  []
+  (when (state/get-current-repo)
+    (state/set-current-repo! nil)
+    (db-subs/reset-graph! nil)))
+
+(defn- discard-unregistered-current-repo!
+  [registered-repos]
+  (let [current (state/get-current-repo)
+        registered (set registered-repos)]
+    (when (and current (not (contains? registered current)))
+      (log/warn :event :startup/stale-current-repo :repo current)
+      (clear-stale-current-repo!))))
+
+(defn- <discard-missing-electron-current-repo!
+  "Drop a last-opened graph that is no longer on disk before starting its worker.
+
+  Desktop `getGraphs` lists directories without starting a runtime, so this does
+  not depend on Electron preserving IPC error codes."
+  []
+  (if-not (util/electron?)
+    (p/resolved nil)
+    (-> (p/let [names (ipc/ipc "getGraphs")]
+          (discard-unregistered-current-repo!
+           (map str (bean/->clj names))))
+        (p/catch (fn [error]
+                   (log/warn :event :startup/list-graphs-failed :error error)
+                   nil)))))
+
 (defn restore-and-setup!
   [repo]
   (when repo
@@ -80,13 +110,40 @@
                 (state/set-db-restoring! false))))))
         (p/then
          (fn []
-           (js/console.log "db restored, setting up repo hooks")
+           (log/info :event :db-restored)
 
            (page-handler/init-commands!)
 
            (page-handler/watch-for-date!)))
         (p/catch (fn [error]
-                   (log/error :exception error))))))
+                   (log/error :exception error)
+                   (when (error/graph-absent-error? error)
+                     (clear-stale-current-repo!)
+                     (state/set-db-restoring! false)
+                     (throw error)))))))
+
+(defn- <restore-or-demo!
+  [repo]
+  (if (nil? repo)
+    (repo-handler/new-db! config/demo-repo)
+    (-> (restore-and-setup! repo)
+        (p/catch (fn [error]
+                   (if (error/graph-absent-error? error)
+                     (repo-handler/new-db! config/demo-repo)
+                     (throw error)))))))
+
+(defn <open-startup-repo!
+  "Opens the resolved startup graph. A missing graph falls back to the next
+  registered repo, then to the demo graph."
+  [repo repos]
+  (if (nil? repo)
+    (repo-handler/new-db! config/demo-repo)
+    (-> (restore-and-setup! repo)
+        (p/catch (fn [error]
+                   (if (error/graph-absent-error? error)
+                     (<restore-or-demo!
+                      (:url (first (remove #(= repo (:url %)) repos))))
+                     (throw error)))))))
 
 (defn- handle-connection-change
   [e]
@@ -183,6 +240,7 @@
                      desktop-url-target (when desktop?
                                           (graph-handler/prepare-startup-repo!
                                            desktop-registry desktop-raw-url-target desktop-renames))
+                     _ (<discard-missing-electron-current-repo!)
                      _ (persist-db/<start-runtime!)
                      _ (log/info ::db-worker-spent-time (- (util/time-ms) t2))
                      repos (repo-handler/get-repos)
@@ -203,10 +261,8 @@
                            url-target
                            (graph-handler/get-tab-graph)
                            (state/get-current-repo))
-                     _ (if (empty? repos)
-                         (repo-handler/new-db! config/demo-repo)
-                         (restore-and-setup! repo))
-                     _ (when target-repo
+                     _ (<open-startup-repo! repo repos)
+                     _ (when (and target-repo (= target-repo (state/get-current-repo)))
                          (apply-url-target-route! url-target))]
                (set-network-watcher!)
                (when (mobile-util/native-platform?)
