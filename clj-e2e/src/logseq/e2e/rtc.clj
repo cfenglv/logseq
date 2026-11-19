@@ -11,6 +11,11 @@
   (let [loc (w/get-by-test-id "rtc-tx")]
     (edn/read-string (w/text-content loc))))
 
+(defn wait-for-sync-queues!
+  []
+  ;; Retained failed edits remain visible after the sync queues drain.
+  (w/wait-for "button.cloud.on:is(.idle,.failed):not(.syncing):not(.queuing)" {:timeout 35000}))
+
 (defmacro with-wait-tx-updated
   "exec body, then wait for the rtc-tx update.
   Return the updated rtc-tx{:local-tx ..., :remote-tx ...}"
@@ -24,7 +29,7 @@
      (loop [i# 15]
        (when (zero? i#) (throw (ex-info "wait-tx-updated failed" {:old m# :new (get-rtc-tx)})))
        (util/wait-timeout 500)
-       (w/wait-for "button.cloud.on.idle" {:timeout 35000})
+       (wait-for-sync-queues!)
        (util/wait-timeout 1000)
        (let [new-m# (get-rtc-tx)
              new-local-tx# (or (:local-tx new-m#) 0)
@@ -46,7 +51,7 @@
                       {:update-to new-tx
                        :last-rtc-tx last-rtc-tx})))
     (util/wait-timeout 1000)
-    (w/wait-for "button.cloud.on.idle" {:timeout 35000})
+    (wait-for-sync-queues!)
     (let [m (get-rtc-tx)
           local-tx (or (:local-tx m) 0)
           ;; remote-tx (or (:remote-tx m) 0)
