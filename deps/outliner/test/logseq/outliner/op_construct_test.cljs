@@ -567,7 +567,8 @@
                     [[:insert-blocks [[block] (:block/uuid target) {:sibling? true}]]])
         insert-payload (get-in insert-ops [0 1 0 0])
         rewritten (op-construct/rewrite-block-title-with-retracted-refs db-before payload)]
-    (is (= refs (:block/refs payload)))
+    (is (= (mapv (fn [ref] [:block/uuid (:block/uuid ref)]) refs)
+           (:block/refs payload)))
     (is (= expected-refs (get payload op-construct/rebase-refs-key)))
     (is (= [created-uuid] (get payload op-construct/rebase-created-refs-key)))
     (is (not (contains? payload :block.temp/ast-title)))

@@ -571,7 +571,9 @@
               :block/tags [{:db/ident :logseq.class/Page}]
               :logseq.property/deleted-at 1}]
     (try
-      (with-redefs [db-subs/apply-delta! (constantly true)
+      (with-redefs [db-subs/future-projection? (constantly false)
+                    db-subs/current-projection? (constantly true)
+                    db-subs/apply-delta! (constantly true)
                     state/get-current-page (constantly nil)
                     state/sidebar-remove-deleted-block! (constantly nil)
                     state/pub-event! (constantly nil)]

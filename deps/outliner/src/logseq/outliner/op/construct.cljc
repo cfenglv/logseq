@@ -98,22 +98,16 @@
      (and (vector? v) (= 2 (count v)) (get-in db [:schema (first v) :db/unique]))
      (stable-entity-ref-with-tx-data db tx-data v)
 
-     (vector? v)
-     (mapv (fn [ref-value]
-             ;; Reference maps carry creation data for replay.
-             (if (or (map? ref-value) (de/entity? ref-value))
-               ref-value
-               (stable-entity-ref-with-tx-data db tx-data ref-value)))
-           v)
-
      (or (set? v) (sequential? v))
-     (into #{} (map (fn [ref-value]
-                      (let [ref-uuid (:block/uuid ref-value)]
-                        (if (and (map? ref-value)
-                                 (uuid? ref-uuid)
-                                 (nil? (d/entity db [:block/uuid ref-uuid])))
-                          (dissoc ref-value :db/id)
-                          (stable-entity-ref-with-tx-data db tx-data ref-value)))))
+     (into (if (vector? v) [] #{})
+           (map (fn [ref-value]
+                  (let [ref-uuid (:block/uuid ref-value)]
+                    ;; Only unresolved reference maps carry creation data.
+                    (if (and (map? ref-value)
+                             (uuid? ref-uuid)
+                             (nil? (d/entity db [:block/uuid ref-uuid])))
+                      (dissoc ref-value :db/id)
+                      (stable-entity-ref-with-tx-data db tx-data ref-value)))))
            v)
      :else (stable-entity-ref-with-tx-data db tx-data v))))
 
@@ -217,18 +211,20 @@
         missing-refs (remove (fn [ref-entity] (d/entity db [:block/uuid (:block/uuid ref-entity)])) refs)
         block-refs (set (:block/refs block))
         nil-refs? (contains? block-refs nil)
+        tag-lookups (into #{}
+                          (filter (fn [v]
+                                    (and (vector? v)
+                                         (= :block/uuid (first v)))))
+                          (:block/tags block))
         ;; Replay recreates the references behind a nil, so their links stay.
         retracted-refs (remove (fn [{ref-uuid :block/uuid}]
                                  (or (contains? created-ref-uuids ref-uuid)
+                                     ;; An explicit tag edit recreates the tag and its reference together.
+                                     (contains? tag-lookups [:block/uuid ref-uuid])
                                      (and nil-refs?
                                           (not (contains? block-refs [:block/uuid ref-uuid])))))
                                missing-refs)
         retracted-lookups (into #{} (map (fn [{:block/keys [uuid]}] [:block/uuid uuid])) retracted-refs)
-        tag-lookups (->> (:block/tags block)
-                         (filter (fn [v]
-                                   (and (vector? v)
-                                        (= :block/uuid (first v)))))
-                         set)
         missing-ref-by-lookup (get-missing-ref-by-lookup missing-refs tag-lookups)
         rewrite-retracted-refs (fn [v]
                                  (let [rewrite-ref (fn [block-ref]

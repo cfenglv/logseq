@@ -7663,7 +7663,7 @@
                 {:keys [tx-id forward-outliner-ops inverse-outliner-ops]} (first pending)]
             (is (= 1 (count pending)))
             (is (some? (client-op-tx-row client-ops-conn tx-id)))
-            (is (= #{[:block/uuid class-uuid]}
+            (is (= [[:block/uuid class-uuid]]
                    (get-in forward-outliner-ops [0 1 0 0 :block/tags])))
             (is (= block-uuid
                    (get-in forward-outliner-ops [0 1 0 0 :block/uuid])))

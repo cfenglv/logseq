@@ -90,7 +90,8 @@
               (swap! requests conj (:resources request))
               (if (some #{(second deleted-key)} (:resources request))
                 (p/rejected (ex-info "Missing renderer resource entity" {:block-uuid :deleted}))
-                (p/resolved {:basis-rev 1
+                (p/resolved {:projection-epoch 0
+                             :basis-rev 1
                              :groups {live-key [live-key]}
                              :slots {live-key {:value 3}}}))))
       (reset! state/db-worker-ready? true)
@@ -100,7 +101,7 @@
         (-> (p/all [live (p/catch deleted (fn [error] [:rejected (ex-message error)]))])
             (p/then
              (fn [[live-value deleted-value]]
-               (is (= {:basis-rev 1 :slots {live-key {:value 3}}} live-value)
+               (is (= {:projection-epoch 0 :basis-rev 1 :slots {live-key {:value 3}}} live-value)
                    "a resource batched with a failing one still loads")
                (is (= [:rejected "Missing renderer resource entity"] deleted-value)
                    "the failing resource is still rejected with the worker's error")
@@ -138,7 +139,8 @@
                               (p/rejected (js/Error. "Resource unavailable"))
 
                               :else
-                              (p/resolved {:basis-rev 1
+                              (p/resolved {:projection-epoch 0
+                                           :basis-rev 1
                                            :groups {live-key [live-key]}
                                            :slots {live-key {:value 3}}})))]
             (reset! state/db-worker-ready? true)
@@ -152,7 +154,7 @@
                                          (p/catch failed ex-message)])
                                  (p/then (p/delay 1000)
                                          #(throw (js/Error. "Snapshot loads did not complete")))])]
-                  (is (= {:basis-rev 1 :slots {live-key {:value 3}}}
+                  (is (= {:projection-epoch 0 :basis-rev 1 :slots {live-key {:value 3}}}
                          first-value next-value)
                       "Both callers receive the live resource snapshot.")
                   (is (= "Resource unavailable" failed-value))))))
